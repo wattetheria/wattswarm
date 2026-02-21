@@ -13,5 +13,3 @@ pub mod types {
 pub mod run_queue;
 
 pub use run_queue::*;
-
-pub mod run_queue_legacy;

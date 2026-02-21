@@ -1,7 +1,7 @@
 use crate::crypto::candidate_hash;
 use crate::error::SwarmError;
 use crate::params;
-use crate::storage::rusqlite::{Connection, OptionalExtension, types::ValueRef};
+use crate::storage::pg::{Connection, OptionalExtension, types::ValueRef};
 use crate::types::{Candidate, Event, TaskContract, TaskTerminalState, VerifierResult, VoteChoice};
 use anyhow::{Context, Result};
 use serde_json::Value;
@@ -9,10 +9,10 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-pub mod rusqlite;
+pub mod pg;
 
 #[derive(Clone)]
-pub struct SqliteStore {
+pub struct PgStore {
     conn: Arc<Mutex<Connection>>,
 }
 
@@ -128,7 +128,7 @@ pub struct TaskStageUsageRow {
     pub finalize_used: u64,
 }
 
-impl SqliteStore {
+impl PgStore {
     /// Begin an IMMEDIATE transaction on the underlying connection.
     ///
     /// # Safety contract
@@ -172,7 +172,7 @@ mod schema;
 fn query_table_json(
     conn: &Connection,
     sql: &str,
-    params: impl rusqlite::Params,
+    params: impl pg::Params,
 ) -> Result<Vec<serde_json::Value>> {
     let mut stmt = conn.prepare(sql)?;
     let rows = stmt.query_map(params, |row| {

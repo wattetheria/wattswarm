@@ -6,7 +6,6 @@ edition = "2024"
 [features]
 default = ["storage-postgres"]
 storage-postgres = []
-storage-sqlite = []
 test-utils = []
 
 [dependencies]

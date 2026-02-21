@@ -1,6 +1,6 @@
 use super::*;
 
-impl SqliteStore {
+impl PgStore {
     pub fn export_knowledge_by_task(&self, task_id: &str) -> Result<serde_json::Value> {
         let conn = self
             .conn
@@ -9,25 +9,36 @@ impl SqliteStore {
 
         let decision_memory = query_table_json(
             &conn,
-            "SELECT task_id, epoch, final_commit_hash, finalized_at, winning_candidate_hash, output_digest, result_summary, reason_codes_json, policy_snapshot_digest, task_type, input_digest, output_schema_digest, policy_id, policy_params_digest
+            "SELECT task_id, epoch, final_commit_hash,
+                    (EXTRACT(EPOCH FROM finalized_at) * 1000)::BIGINT AS finalized_at,
+                    winning_candidate_hash, output_digest, result_summary, reason_codes_json, policy_snapshot_digest, task_type, input_digest, output_schema_digest, policy_id, policy_params_digest
              FROM decision_memory WHERE task_id = ?1 ORDER BY epoch ASC",
             params![task_id],
         )?;
         let evidence_summary = query_table_json(
             &conn,
-            "SELECT cid, mime, size_bytes, source_hint_digest, added_at, availability_confirmations_count
+            "SELECT cid, mime, size_bytes, source_hint_digest,
+                    (EXTRACT(EPOCH FROM added_at) * 1000)::BIGINT AS added_at,
+                    availability_confirmations_count
              FROM evidence_summary ORDER BY added_at DESC LIMIT 200",
             params![],
         )?;
         let runtime_metrics = query_table_json(
             &conn,
-            "SELECT runtime_id, profile_id, task_type, window_start, window_end, finalize_rate, timeout_rate, crash_rate, invalid_output_rate, median_latency_ms, cost_units, reject_reason_distribution, sample_count, finalize_count, timeout_count, crash_count, invalid_output_count, reuse_hit_rate_exact, reuse_hit_rate_similar, reuse_candidate_accept_rate, time_to_finality_p50, time_to_finality_p95, expired_rate, cost_units_per_finalized_task_p50, cost_units_per_finalized_task_p95, verify_cost_ratio, invalid_event_reject_count, fork_prevented_count, da_fetch_fail_rate
+            "SELECT runtime_id, profile_id, task_type,
+                    (EXTRACT(EPOCH FROM window_start) * 1000)::BIGINT AS window_start,
+                    (EXTRACT(EPOCH FROM window_end) * 1000)::BIGINT AS window_end,
+                    finalize_rate, timeout_rate, crash_rate, invalid_output_rate, median_latency_ms, cost_units, reject_reason_distribution, sample_count, finalize_count, timeout_count, crash_count, invalid_output_count, reuse_hit_rate_exact, reuse_hit_rate_similar, reuse_candidate_accept_rate, time_to_finality_p50, time_to_finality_p95, expired_rate, cost_units_per_finalized_task_p50, cost_units_per_finalized_task_p95, verify_cost_ratio, invalid_event_reject_count, fork_prevented_count, da_fetch_fail_rate
              FROM runtime_metrics ORDER BY window_end DESC LIMIT 200",
             params![],
         )?;
         let task_settlement = query_table_json(
             &conn,
-            "SELECT task_id, epoch, finalized_at, window_end_at, bad_feedback_exists, bad_feedback_at
+            "SELECT task_id, epoch,
+                    (EXTRACT(EPOCH FROM finalized_at) * 1000)::BIGINT AS finalized_at,
+                    (EXTRACT(EPOCH FROM window_end_at) * 1000)::BIGINT AS window_end_at,
+                    bad_feedback_exists,
+                    CASE WHEN bad_feedback_at IS NULL THEN NULL ELSE (EXTRACT(EPOCH FROM bad_feedback_at) * 1000)::BIGINT END AS bad_feedback_at
              FROM task_settlement WHERE task_id = ?1 ORDER BY epoch ASC",
             params![task_id],
         )?;
@@ -39,26 +50,35 @@ impl SqliteStore {
         )?;
         let reputation_state_raw = query_table_json(
             &conn,
-            "SELECT runtime_id, profile_id, stability_reputation, quality_reputation, last_updated_at
+            "SELECT runtime_id, profile_id, stability_reputation, quality_reputation,
+                    (EXTRACT(EPOCH FROM last_updated_at) * 1000)::BIGINT AS last_updated_at
              FROM reputation_state ORDER BY last_updated_at DESC LIMIT 200",
             params![],
         )?;
         let reputation_state = with_reputation_decimal(reputation_state_raw);
         let knowledge_lookups = query_table_json(
             &conn,
-            "SELECT task_id, task_type, input_digest, lookup_time, hit_count, hits_digest, reuse_applied
+            "SELECT task_id, task_type, input_digest,
+                    (EXTRACT(EPOCH FROM lookup_time) * 1000)::BIGINT AS lookup_time,
+                    hit_count, hits_digest, reuse_applied
              FROM knowledge_lookups WHERE task_id = ?1 ORDER BY lookup_time DESC",
             params![task_id],
         )?;
         let advisory_state = query_table_json(
             &conn,
-            "SELECT advisory_id, policy_id, suggested_policy_hash, status, created_at, approved_by, approved_at, applied_policy_hash, applied_at
+            "SELECT advisory_id, policy_id, suggested_policy_hash, status,
+                    (EXTRACT(EPOCH FROM created_at) * 1000)::BIGINT AS created_at,
+                    approved_by,
+                    CASE WHEN approved_at IS NULL THEN NULL ELSE (EXTRACT(EPOCH FROM approved_at) * 1000)::BIGINT END AS approved_at,
+                    applied_policy_hash,
+                    CASE WHEN applied_at IS NULL THEN NULL ELSE (EXTRACT(EPOCH FROM applied_at) * 1000)::BIGINT END AS applied_at
              FROM advisory_state ORDER BY created_at DESC",
             params![],
         )?;
         let unknown_reason_observations = query_table_json(
             &conn,
-            "SELECT task_id, unknown_reason_code, peer_protocol_version, local_protocol_version, author_node_id, observed_at
+            "SELECT task_id, unknown_reason_code, peer_protocol_version, local_protocol_version, author_node_id,
+                    (EXTRACT(EPOCH FROM observed_at) * 1000)::BIGINT AS observed_at
              FROM unknown_reason_observations WHERE task_id = ?1 ORDER BY observed_at DESC",
             params![task_id],
         )?;
@@ -83,19 +103,25 @@ impl SqliteStore {
             .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
         let knowledge_lookups = query_table_json(
             &conn,
-            "SELECT task_id, task_type, input_digest, lookup_time, hit_count, hits_digest, reuse_applied
+            "SELECT task_id, task_type, input_digest,
+                    (EXTRACT(EPOCH FROM lookup_time) * 1000)::BIGINT AS lookup_time,
+                    hit_count, hits_digest, reuse_applied
              FROM knowledge_lookups WHERE task_type = ?1 ORDER BY lookup_time DESC",
             params![task_type],
         )?;
         let runtime_metrics = query_table_json(
             &conn,
-            "SELECT runtime_id, profile_id, task_type, window_start, window_end, finalize_rate, timeout_rate, crash_rate, invalid_output_rate, median_latency_ms, cost_units, reject_reason_distribution, sample_count, finalize_count, timeout_count, crash_count, invalid_output_count, reuse_hit_rate_exact, reuse_hit_rate_similar, reuse_candidate_accept_rate, time_to_finality_p50, time_to_finality_p95, expired_rate, cost_units_per_finalized_task_p50, cost_units_per_finalized_task_p95, verify_cost_ratio, invalid_event_reject_count, fork_prevented_count, da_fetch_fail_rate
+            "SELECT runtime_id, profile_id, task_type,
+                    (EXTRACT(EPOCH FROM window_start) * 1000)::BIGINT AS window_start,
+                    (EXTRACT(EPOCH FROM window_end) * 1000)::BIGINT AS window_end,
+                    finalize_rate, timeout_rate, crash_rate, invalid_output_rate, median_latency_ms, cost_units, reject_reason_distribution, sample_count, finalize_count, timeout_count, crash_count, invalid_output_count, reuse_hit_rate_exact, reuse_hit_rate_similar, reuse_candidate_accept_rate, time_to_finality_p50, time_to_finality_p95, expired_rate, cost_units_per_finalized_task_p50, cost_units_per_finalized_task_p95, verify_cost_ratio, invalid_event_reject_count, fork_prevented_count, da_fetch_fail_rate
              FROM runtime_metrics WHERE task_type = ?1 ORDER BY window_end DESC",
             params![task_type],
         )?;
         let unknown_reason_observations = query_table_json(
             &conn,
-            "SELECT task_id, unknown_reason_code, peer_protocol_version, local_protocol_version, author_node_id, observed_at
+            "SELECT task_id, unknown_reason_code, peer_protocol_version, local_protocol_version, author_node_id,
+                    (EXTRACT(EPOCH FROM observed_at) * 1000)::BIGINT AS observed_at
              FROM unknown_reason_observations
              WHERE task_id IN (SELECT task_id FROM task_projection WHERE json_extract(contract_json, '$.task_type') = ?1)
              ORDER BY observed_at DESC LIMIT 200",
@@ -119,7 +145,8 @@ impl SqliteStore {
             .lock()
             .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
         conn.query_row(
-            "SELECT commit_hash, candidate_hash, verifier_result_hash, execution_id, created_at
+            "SELECT commit_hash, candidate_hash, verifier_result_hash, execution_id,
+                    (EXTRACT(EPOCH FROM created_at) * 1000)::BIGINT AS created_at
              FROM vote_commits WHERE task_id = ?1 AND voter_node_id = ?2",
             params![task_id, voter_node_id],
             |r| {
@@ -147,7 +174,7 @@ impl SqliteStore {
             .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
         conn.execute(
             "INSERT INTO vote_reveals(task_id, voter_node_id, candidate_id, candidate_hash, vote, salt, verifier_result_hash, valid, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, TIMESTAMPTZ 'epoch' + (?9::bigint * INTERVAL '1 millisecond'))
              ON CONFLICT(task_id, voter_node_id) DO UPDATE SET
                candidate_id = excluded.candidate_id,
                candidate_hash = excluded.candidate_hash,

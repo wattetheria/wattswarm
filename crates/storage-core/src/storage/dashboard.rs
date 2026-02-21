@@ -1,6 +1,6 @@
 use super::*;
 
-impl SqliteStore {
+impl PgStore {
     pub fn list_task_ids_recent(&self, limit: usize) -> Result<Vec<String>> {
         let conn = self
             .conn
@@ -30,11 +30,7 @@ impl SqliteStore {
             |r| {
                 let json: String = r.get(0)?;
                 let candidate: Candidate = serde_json::from_str(&json).map_err(|e| {
-                    rusqlite::Error::FromSqlConversionFailure(
-                        0,
-                        rusqlite::types::Type::Text,
-                        Box::new(e),
-                    )
+                    pg::Error::FromSqlConversionFailure(0, pg::types::Type::Text, Box::new(e))
                 })?;
                 Ok(candidate)
             },

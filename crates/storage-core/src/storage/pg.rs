@@ -28,14 +28,14 @@ pub enum ErrorCode {
 }
 
 #[derive(Debug, Clone)]
-pub struct SqliteFailureError {
+pub struct DbFailureError {
     pub code: ErrorCode,
 }
 
 #[derive(Debug)]
 pub enum Error {
     QueryReturnedNoRows,
-    SqliteFailure(SqliteFailureError, Option<String>),
+    DbFailure(DbFailureError, Option<String>),
     FromSqlConversionFailure(usize, types::Type, Box<dyn StdError + Send + Sync>),
     Db(String),
 }
@@ -44,7 +44,7 @@ impl Display for Error {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
             Error::QueryReturnedNoRows => write!(f, "query returned no rows"),
-            Error::SqliteFailure(_, msg) => {
+            Error::DbFailure(_, msg) => {
                 write!(f, "sql failure: {}", msg.as_deref().unwrap_or("unknown"))
             }
             Error::FromSqlConversionFailure(idx, _, err) => {
@@ -66,10 +66,7 @@ fn map_db_err(err: postgres::Error) -> Error {
         } else {
             ErrorCode::Unknown
         };
-        return Error::SqliteFailure(
-            SqliteFailureError { code },
-            Some(db_err.message().to_owned()),
-        );
+        return Error::DbFailure(DbFailureError { code }, Some(db_err.message().to_owned()));
     }
     Error::Db(err.to_string())
 }
@@ -80,6 +77,8 @@ fn default_pg_url() -> String {
         .or_else(|| std::env::var("WATTSWARM_PG_URL").ok())
         .unwrap_or_else(|| "postgres://postgres:postgres@127.0.0.1:55432/wattswarm".to_owned())
 }
+
+const PRIMARY_SCHEMA: &str = "public";
 
 fn sanitize_ident(raw: &str) -> String {
     let mut out = String::with_capacity(raw.len().max(8));
@@ -109,6 +108,15 @@ fn schema_from_path(path: &Path) -> String {
     sanitize_ident(&format!("ws_{}", &digest[..16]))
 }
 
+fn isolate_by_path_enabled() -> bool {
+    std::env::var("WATTSWARM_PG_ISOLATE_BY_PATH")
+        .ok()
+        .is_some_and(|v| {
+            let trimmed = v.trim().to_ascii_lowercase();
+            trimmed == "1" || trimmed == "true" || trimmed == "yes"
+        })
+}
+
 #[derive(Clone)]
 pub struct Connection {
     inner: Arc<Inner>,
@@ -121,23 +129,32 @@ struct Inner {
 
 impl Connection {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
-        let schema = schema_from_path(path.as_ref());
-        Self::connect_for_schema(schema)
+        if isolate_by_path_enabled() {
+            let schema = schema_from_path(path.as_ref());
+            Self::connect_for_schema(schema, true)
+        } else {
+            Self::connect_for_schema(PRIMARY_SCHEMA.to_owned(), false)
+        }
     }
 
     pub fn open_in_memory() -> Result<Self> {
-        let schema = sanitize_ident(&format!("ws_mem_{}", uuid::Uuid::new_v4().simple()));
-        Self::connect_for_schema(schema)
+        let schema = sanitize_ident(&format!("ws_test_{}", uuid::Uuid::new_v4().simple()));
+        Self::connect_for_schema(schema, true)
     }
 
-    fn connect_for_schema(schema: String) -> Result<Self> {
+    fn connect_for_schema(schema: String, create_schema: bool) -> Result<Self> {
         let url = default_pg_url();
         let mut client = Client::connect(&url, NoTls).map_err(map_db_err)?;
-        let ddl = format!(
-            "CREATE SCHEMA IF NOT EXISTS {schema};
-             SET search_path TO {schema};"
-        );
-        client.batch_execute(&ddl).map_err(map_db_err)?;
+        if create_schema {
+            let ddl = format!(
+                "CREATE SCHEMA IF NOT EXISTS {schema};
+                 SET search_path TO {schema}, {PRIMARY_SCHEMA};"
+            );
+            client.batch_execute(&ddl).map_err(map_db_err)?;
+        } else {
+            let ddl = format!("SET search_path TO {PRIMARY_SCHEMA};");
+            client.batch_execute(&ddl).map_err(map_db_err)?;
+        }
         Ok(Self {
             inner: Arc::new(Inner {
                 client: Mutex::new(client),
@@ -906,10 +923,10 @@ impl<T> OptionalExtension<T> for Result<T> {
 #[macro_export]
 macro_rules! params {
     () => {
-        Vec::<$crate::storage::rusqlite::ParamValue>::new()
+        Vec::<$crate::storage::pg::ParamValue>::new()
     };
     ($($value:expr),+ $(,)?) => {{
-        vec![$($crate::storage::rusqlite::to_param_value(&$value)),+]
+        vec![$($crate::storage::pg::to_param_value(&$value)),+]
     }};
 }
 

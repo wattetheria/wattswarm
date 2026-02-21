@@ -18,7 +18,6 @@ path = "../wattswarm-runtime/src/main.rs"
 [features]
 default = ["storage-postgres", "runtime-http", "discovery-udp"]
 storage-postgres = ["wattswarm-storage-core/storage-postgres"]
-storage-sqlite = ["wattswarm-storage-core/storage-sqlite"]
 runtime-http = []
 runtime-mock = []
 discovery-udp = ["wattswarm-control-plane/discovery-udp"]

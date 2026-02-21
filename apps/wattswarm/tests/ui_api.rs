@@ -12,6 +12,11 @@ async fn json_from(res: axum::response::Response) -> Value {
 
 #[tokio::test]
 async fn ui_supports_core_cli_operations() {
+    // Safety: this test binary contains only this test and sets the env var
+    // before any store connections are opened.
+    unsafe {
+        std::env::set_var("WATTSWARM_PG_ISOLATE_BY_PATH", "1");
+    }
     let dir = tempdir().unwrap();
     let state_dir = dir.path().join("state");
     std::fs::create_dir_all(&state_dir).unwrap();

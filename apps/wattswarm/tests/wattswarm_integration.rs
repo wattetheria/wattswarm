@@ -9,7 +9,7 @@ use wattswarm::runtime::{
     ExecuteRequest, ExecuteResponse, RuntimeCapabilities, RuntimeClient, VerifyRequest,
     VerifyResponse,
 };
-use wattswarm::storage::{RuntimeMetricObservation, SqliteStore};
+use wattswarm::storage::{PgStore, RuntimeMetricObservation};
 use wattswarm::types::{
     Acceptance, Assignment, Budget, BudgetMode, Candidate, ClaimPolicy, ClaimRole, EpochEndReason,
     EvidencePolicy, ExploreAssignment, ExploreStopPolicy, FeedbackCapabilityPolicy,
@@ -162,7 +162,7 @@ fn mk_contract(
 }
 
 fn mk_node(identity: NodeIdentity, membership: Membership) -> Node {
-    Node::new(identity, SqliteStore::open_in_memory().unwrap(), membership).unwrap()
+    Node::new(identity, PgStore::open_in_memory().unwrap(), membership).unwrap()
 }
 
 #[test]
@@ -2317,7 +2317,7 @@ fn knowledge_lookup_ignores_error_only_decision_memory_entries() {
 
 #[test]
 fn runtime_metrics_cost_units_accumulates_with_observations() {
-    let store = SqliteStore::open_in_memory().unwrap();
+    let store = PgStore::open_in_memory().unwrap();
     let obs_1 = RuntimeMetricObservation {
         runtime_id: "rt",
         profile_id: "p",

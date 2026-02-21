@@ -35,10 +35,10 @@ CREATE TABLE IF NOT EXISTS run_steps (
   status TEXT NOT NULL,
   attempt INTEGER NOT NULL DEFAULT 0,
   max_attempts INTEGER NOT NULL DEFAULT 1,
-  next_run_at BIGINT NOT NULL,
+  next_run_at TIMESTAMPTZ NOT NULL,
   lease_id TEXT,
   lease_owner TEXT,
-  lease_until BIGINT,
+  lease_until TIMESTAMPTZ,
   task_id TEXT,
   result_json TEXT,
   error_text TEXT,
@@ -68,6 +68,8 @@ CREATE INDEX IF NOT EXISTS idx_run_events_run_id ON run_events(run_id, id DESC);
             ensure_run_queue_timestamp_column(&mut client, "run_steps", column)?;
         }
         ensure_run_queue_timestamp_column(&mut client, "run_events", "created_at")?;
+        ensure_run_queue_timestamp_column(&mut client, "run_steps", "next_run_at")?;
+        ensure_run_queue_timestamp_column(&mut client, "run_steps", "lease_until")?;
         Ok(())
     }
 }

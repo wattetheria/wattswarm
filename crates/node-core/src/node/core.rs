@@ -3,7 +3,7 @@ use super::*;
 impl Node {
     pub fn new(
         identity: NodeIdentity,
-        store: SqliteStore,
+        store: PgStore,
         genesis_membership: Membership,
     ) -> Result<Self> {
         let policy_registry = PolicyRegistry::with_builtin();
@@ -14,8 +14,10 @@ impl Node {
             peers: HashSet::new(),
             genesis_membership: genesis_membership.clone(),
         };
-        this.store
-            .put_membership(&serde_json::to_string(&genesis_membership)?)?;
+        if this.store.load_membership()?.is_none() {
+            this.store
+                .put_membership(&serde_json::to_string(&genesis_membership)?)?;
+        }
         Ok(this)
     }
 
@@ -25,7 +27,7 @@ impl Node {
         for role in roles {
             membership.grant(&identity.node_id(), *role);
         }
-        Self::new(identity, SqliteStore::open_in_memory()?, membership)
+        Self::new(identity, PgStore::open_in_memory()?, membership)
     }
 
     pub fn node_id(&self) -> String {

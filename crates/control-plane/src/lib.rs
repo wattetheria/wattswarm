@@ -22,8 +22,8 @@ pub mod types {
     pub use wattswarm_protocol::types::*;
 }
 
-pub mod task_template;
 pub mod control;
+pub mod task_template;
 pub mod udp_announce;
 
 pub use control::*;

@@ -1,4 +1,5 @@
 use anyhow::Result;
+use postgres::Transaction;
 use serde_json::json;
 use std::path::Path;
 use std::thread;
@@ -66,27 +67,29 @@ impl PgRunQueue {
             );
         }
 
-        let mut node = open_node(state_dir, db_path)?;
-        let policy_hash = node
-            .policy_registry()
-            .binding_for("vp.schema_only.v1", json!({}))?
-            .policy_hash;
         let task_id = format!("run-{}-{}-{}", step.run_id, step.agent_id, step.attempt);
-        let mut contract: TaskContract = sample_contract(&task_id, policy_hash);
-        contract.task_type = step.task_type.clone();
-        contract.inputs = build_step_inputs(&step.shared_inputs, &step.prompt, &step.agent_id);
+        let run_result = (|| -> Result<serde_json::Value> {
+            let mut node = open_node(state_dir, db_path)?;
+            let policy_hash = node
+                .policy_registry()
+                .binding_for("vp.schema_only.v1", json!({}))?
+                .policy_hash;
+            let mut contract: TaskContract = sample_contract(&task_id, policy_hash);
+            contract.task_type = step.task_type.clone();
+            contract.inputs = build_step_inputs(&step.shared_inputs, &step.prompt, &step.agent_id);
 
-        let run_result = run_real_task_flow(
-            &mut node,
-            state_dir,
-            RealTaskRunRequest {
-                executor: step.executor.clone(),
-                profile: step.profile.clone(),
-                task_id: Some(task_id.clone()),
-                task_file: None,
-                task_contract: Some(contract),
-            },
-        );
+            run_real_task_flow(
+                &mut node,
+                state_dir,
+                RealTaskRunRequest {
+                    executor: step.executor.clone(),
+                    profile: step.profile.clone(),
+                    task_id: Some(task_id.clone()),
+                    task_file: None,
+                    task_contract: Some(contract),
+                },
+            )
+        })();
 
         match run_result {
             Ok(result) => self.finish_step_terminal(
@@ -114,6 +117,37 @@ impl PgRunQueue {
         }
     }
 
+    fn recover_expired_leases_tx(&self, tx: &mut Transaction<'_>, now: i64) -> Result<u64> {
+        let recovered = tx.execute(
+            "UPDATE run_steps s
+             SET status = $1,
+                 lease_id = NULL,
+                 lease_owner = NULL,
+                 lease_until = NULL,
+                 next_run_at = TIMESTAMPTZ 'epoch' + ($2::bigint * INTERVAL '1 millisecond'),
+                 updated_at = TIMESTAMPTZ 'epoch' + ($2::bigint * INTERVAL '1 millisecond'),
+                 error_text = CASE
+                     WHEN s.error_text IS NULL OR s.error_text = '' THEN 'lease expired; recovered'
+                     ELSE s.error_text
+                 END
+             FROM runs r
+             WHERE s.run_id = r.run_id
+               AND r.status IN ($3, $4, $5)
+               AND s.status = $6
+               AND s.lease_until IS NOT NULL
+               AND s.lease_until < TIMESTAMPTZ 'epoch' + ($2::bigint * INTERVAL '1 millisecond')",
+            &[
+                &STEP_STATUS_RETRY_WAIT,
+                &now,
+                &RUN_STATUS_QUEUED,
+                &RUN_STATUS_RUNNING,
+                &RUN_STATUS_CANCELLING,
+                &STEP_STATUS_LEASED,
+            ],
+        )?;
+        Ok(recovered as u64)
+    }
+
     fn claim_steps(
         &self,
         worker_id: &str,
@@ -124,6 +158,7 @@ impl PgRunQueue {
         let lease_until = now.saturating_add(lease_ms as i64);
         let mut client = self.connect()?;
         let mut tx = client.transaction()?;
+        let _recovered = self.recover_expired_leases_tx(&mut tx, now)?;
         let rows = tx.query(
             "SELECT s.step_id, s.run_id, s.agent_id, s.executor, s.profile, s.prompt, s.attempt, s.max_attempts,
                     r.task_type, r.shared_inputs_json, r.retry_policy_json, r.status
@@ -131,7 +166,7 @@ impl PgRunQueue {
              JOIN runs r ON r.run_id = s.run_id
              WHERE r.status IN ($1, $2, $3)
                AND s.status IN ($4, $5)
-               AND s.next_run_at <= $6
+               AND s.next_run_at <= TIMESTAMPTZ 'epoch' + ($6::bigint * INTERVAL '1 millisecond')
              ORDER BY s.priority DESC, s.next_run_at ASC, s.created_at ASC
              LIMIT $7
              FOR UPDATE SKIP LOCKED",
@@ -155,7 +190,10 @@ impl PgRunQueue {
             let lease_id = Uuid::new_v4().to_string();
             let updated = tx.execute(
                 "UPDATE run_steps
-                 SET status = $2, lease_id = $3, lease_owner = $4, lease_until = $5,
+                 SET status = $2,
+                     lease_id = $3,
+                     lease_owner = $4,
+                     lease_until = TIMESTAMPTZ 'epoch' + ($5::bigint * INTERVAL '1 millisecond'),
                      attempt = attempt + 1, updated_at = TIMESTAMPTZ 'epoch' + ($6::bigint * INTERVAL '1 millisecond'), started_at = COALESCE(started_at, TIMESTAMPTZ 'epoch' + ($6::bigint * INTERVAL '1 millisecond'))
                  WHERE step_id = $1",
                 &[
@@ -215,7 +253,9 @@ impl PgRunQueue {
         let updated = tx.execute(
             "UPDATE run_steps
              SET status = $3, lease_id = NULL, lease_owner = NULL, lease_until = NULL,
-                 next_run_at = $4, error_text = $5, updated_at = TIMESTAMPTZ 'epoch' + ($6::bigint * INTERVAL '1 millisecond')
+                 next_run_at = TIMESTAMPTZ 'epoch' + ($4::bigint * INTERVAL '1 millisecond'),
+                 error_text = $5,
+                 updated_at = TIMESTAMPTZ 'epoch' + ($6::bigint * INTERVAL '1 millisecond')
              WHERE step_id = $1 AND lease_id = $2 AND status = $7",
             &[
                 &step.step_id,

@@ -4,11 +4,14 @@ use std::process::Stdio;
 use std::thread;
 use std::time::Duration;
 use tempfile::tempdir;
+use uuid::Uuid;
 use wattswarm::cli::sample_contract;
 use wattswarm::policy::PolicyRegistry;
 
 fn cmd() -> std::process::Command {
-    std::process::Command::new(assert_cmd::cargo::cargo_bin!("wattswarm"))
+    let mut cmd = std::process::Command::new(assert_cmd::cargo::cargo_bin!("wattswarm"));
+    cmd.env("WATTSWARM_PG_ISOLATE_BY_PATH", "1");
+    cmd
 }
 
 struct ChildGuard(std::process::Child);
@@ -103,7 +106,8 @@ fn cli_submit_watch_and_decision() {
         .binding_for("vp.schema_only.v1", serde_json::json!({}))
         .unwrap()
         .policy_hash;
-    let contract = sample_contract("task-cli", policy_hash);
+    let task_id = format!("task-cli-{}", Uuid::new_v4().simple());
+    let contract = sample_contract(&task_id, policy_hash);
     let task_file = dir.path().join("task.json");
     std::fs::create_dir_all(&state_dir).unwrap();
     std::fs::write(&task_file, serde_json::to_vec_pretty(&contract).unwrap()).unwrap();
@@ -129,11 +133,11 @@ fn cli_submit_watch_and_decision() {
             db,
             "task",
             "watch",
-            "task-cli",
+            &task_id,
         ])
         .assert()
         .success()
-        .stdout(predicate::str::contains("task=task-cli"));
+        .stdout(predicate::str::contains(format!("task={task_id}")));
 
     cmd()
         .args([
@@ -143,11 +147,11 @@ fn cli_submit_watch_and_decision() {
             db,
             "task",
             "decision",
-            "task-cli",
+            &task_id,
         ])
         .assert()
         .success()
-        .stdout(predicate::str::contains("task=task-cli"));
+        .stdout(predicate::str::contains(format!("task={task_id}")));
 
     let out = dir.path().join("knowledge.json");
     cmd()
@@ -159,7 +163,7 @@ fn cli_submit_watch_and_decision() {
             "knowledge",
             "export",
             "--task_id",
-            "task-cli",
+            &task_id,
             "--out",
             out.to_str().unwrap(),
         ])

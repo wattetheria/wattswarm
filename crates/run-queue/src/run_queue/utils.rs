@@ -37,7 +37,7 @@ pub(crate) fn ensure_run_queue_timestamp_column(
         "ALTER TABLE {table}
          ALTER COLUMN {column}
          TYPE TIMESTAMPTZ
-         USING to_timestamp({column} / 1000.0)"
+         USING TIMESTAMPTZ 'epoch' + ({column} * INTERVAL '1 millisecond')"
     );
     client.batch_execute(&sql)?;
     Ok(())

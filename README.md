@@ -59,7 +59,7 @@ You can remove or ignore `ui/*` and still run the kernel fully via CLI/runtime A
 - `wattswarm knowledge export --task_id <...> --out <file>`
 - `wattswarm ui --listen 127.0.0.1:7788`
 
-Note: `--db` is now used as a logical storage namespace key (schema identity), not a local SQLite file.
+Note: storage is PostgreSQL-only on the `public` schema. `--db` is kept for CLI backward compatibility and no longer changes schema/database routing.
 
 UI (`/`) exposes API-backed controls for all CLI operation groups:
 - Node: up/down/status

@@ -1,7 +1,7 @@
 use crate::crypto::{NodeIdentity, candidate_hash, vote_commit_hash};
 use crate::node::{Node, finality_sign};
 use crate::runtime::{HttpRuntimeClient, RuntimeClient};
-use crate::storage::SqliteStore;
+use crate::storage::PgStore;
 use crate::task_template::sample_contract;
 use crate::types::{
     ClaimRole, FinalityProof, Membership, Role, TaskContract, VoteChoice, VoteCommitPayload,
@@ -10,6 +10,7 @@ use crate::types::{
 use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
@@ -69,8 +70,14 @@ pub fn open_node(state_dir: &Path, db_path: &Path) -> Result<Node> {
         membership.grant(&identity.node_id(), role);
     }
 
-    let mut node = Node::new(identity, SqliteStore::open(db_path)?, membership)?;
-    node.replay_rebuild_projection()?;
+    let mut node = Node::new(identity, PgStore::open(db_path)?, membership)?;
+    let replay_on_open = env::var("WATTSWARM_REPLAY_ON_OPEN").ok().is_some_and(|v| {
+        let t = v.trim().to_ascii_lowercase();
+        t == "1" || t == "true" || t == "yes"
+    });
+    if replay_on_open {
+        node.replay_rebuild_projection()?;
+    }
     if let Ok(peers) = load_discovered_peers(&discovered_peers_path(state_dir)) {
         for peer_id in peers {
             if peer_id != self_node_id {

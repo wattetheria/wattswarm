@@ -1,6 +1,6 @@
 use super::*;
 
-impl SqliteStore {
+impl PgStore {
     pub fn append_event(&self, event: &Event) -> Result<u64> {
         let event_json = serde_json::to_string(event)?;
         let conn = self
@@ -10,7 +10,7 @@ impl SqliteStore {
         let seq: i64 = conn
             .query_row(
                 "INSERT INTO events(event_id, protocol_version, task_id, epoch, event_kind, author_node_id, created_at, event_json)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, TIMESTAMPTZ 'epoch' + (?7::bigint * INTERVAL '1 millisecond'), ?8)
                  RETURNING seq",
                 params![
                     event.event_id,
@@ -72,11 +72,7 @@ impl SqliteStore {
             let seq: i64 = row.get(0)?;
             let json: String = row.get(1)?;
             let event: Event = serde_json::from_str(&json).map_err(|e| {
-                rusqlite::Error::FromSqlConversionFailure(
-                    1,
-                    rusqlite::types::Type::Text,
-                    Box::new(e),
-                )
+                pg::Error::FromSqlConversionFailure(1, pg::types::Type::Text, Box::new(e))
             })?;
             Ok((seq as u64, event))
         })?;
@@ -99,11 +95,7 @@ impl SqliteStore {
             let seq: i64 = row.get(0)?;
             let json: String = row.get(1)?;
             let event: Event = serde_json::from_str(&json).map_err(|e| {
-                rusqlite::Error::FromSqlConversionFailure(
-                    1,
-                    rusqlite::types::Type::Text,
-                    Box::new(e),
-                )
+                pg::Error::FromSqlConversionFailure(1, pg::types::Type::Text, Box::new(e))
             })?;
             Ok((seq as u64, event))
         })?;

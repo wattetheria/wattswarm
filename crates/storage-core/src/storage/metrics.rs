@@ -1,14 +1,18 @@
 use super::*;
 
-impl SqliteStore {
+impl PgStore {
     pub fn get_advisory_state(&self, advisory_id: &str) -> Result<Option<AdvisoryStateRow>> {
         let conn = self
             .conn
             .lock()
             .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
         conn.query_row(
-            "SELECT advisory_id, policy_id, suggested_policy_hash, status, created_at,
-                    approved_by, approved_at, applied_policy_hash, applied_at
+            "SELECT advisory_id, policy_id, suggested_policy_hash, status,
+                    (EXTRACT(EPOCH FROM created_at) * 1000)::BIGINT AS created_at,
+                    approved_by,
+                    CASE WHEN approved_at IS NULL THEN NULL ELSE (EXTRACT(EPOCH FROM approved_at) * 1000)::BIGINT END AS approved_at,
+                    applied_policy_hash,
+                    CASE WHEN applied_at IS NULL THEN NULL ELSE (EXTRACT(EPOCH FROM applied_at) * 1000)::BIGINT END AS applied_at
              FROM advisory_state WHERE advisory_id = ?1",
             params![advisory_id],
             |r| {
@@ -42,7 +46,7 @@ impl SqliteStore {
             .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
         conn.execute(
             "INSERT INTO advisory_state(advisory_id, policy_id, suggested_policy_hash, status, created_at)
-             VALUES (?1, ?2, ?3, 'created', ?4)",
+             VALUES (?1, ?2, ?3, 'created', TIMESTAMPTZ 'epoch' + (?4::bigint * INTERVAL '1 millisecond'))",
             params![
                 advisory_id,
                 policy_id,
@@ -65,7 +69,9 @@ impl SqliteStore {
             .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
         conn.execute(
             "UPDATE advisory_state
-             SET status = 'approved', approved_by = ?2, approved_at = ?3
+             SET status = 'approved',
+                 approved_by = ?2,
+                 approved_at = TIMESTAMPTZ 'epoch' + (?3::bigint * INTERVAL '1 millisecond')
              WHERE advisory_id = ?1",
             params![advisory_id, admin_node_id, approved_at as i64],
         )?;
@@ -84,7 +90,9 @@ impl SqliteStore {
             .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
         conn.execute(
             "UPDATE advisory_state
-             SET status = 'applied', applied_policy_hash = ?2, applied_at = ?3
+             SET status = 'applied',
+                 applied_policy_hash = ?2,
+                 applied_at = TIMESTAMPTZ 'epoch' + (?3::bigint * INTERVAL '1 millisecond')
              WHERE advisory_id = ?1",
             params![advisory_id, applied_policy_hash, applied_at as i64],
         )?;
@@ -106,7 +114,7 @@ impl SqliteStore {
             .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
         conn.execute(
             "INSERT INTO unknown_reason_observations(task_id, unknown_reason_code, peer_protocol_version, local_protocol_version, author_node_id, observed_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+             VALUES (?1, ?2, ?3, ?4, ?5, TIMESTAMPTZ 'epoch' + (?6::bigint * INTERVAL '1 millisecond'))",
             params![
                 task_id,
                 unknown_reason_code as i64,
@@ -133,7 +141,8 @@ impl SqliteStore {
                         latency_samples_json, reject_reason_distribution, cost_units
                  FROM runtime_metrics
                  WHERE runtime_id = ?1 AND profile_id = ?2 AND task_type = ?3
-                   AND window_start = ?4 AND window_end = ?5",
+                   AND window_start = TIMESTAMPTZ 'epoch' + (?4::bigint * INTERVAL '1 millisecond')
+                   AND window_end = TIMESTAMPTZ 'epoch' + (?5::bigint * INTERVAL '1 millisecond')",
                 params![
                     obs.runtime_id,
                     obs.profile_id,
@@ -237,7 +246,10 @@ impl SqliteStore {
                 cost_units_per_finalized_task_p50, cost_units_per_finalized_task_p95,
                 verify_cost_ratio, invalid_event_reject_count, fork_prevented_count, da_fetch_fail_rate
              ) VALUES (
-                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18,
+                ?1, ?2, ?3,
+                TIMESTAMPTZ 'epoch' + (?4::bigint * INTERVAL '1 millisecond'),
+                TIMESTAMPTZ 'epoch' + (?5::bigint * INTERVAL '1 millisecond'),
+                ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18,
                 ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30
              )
              ON CONFLICT(runtime_id, profile_id, task_type, window_start, window_end) DO UPDATE SET
@@ -328,7 +340,7 @@ impl SqliteStore {
         };
         conn.execute(
             "INSERT INTO reputation_state(runtime_id, profile_id, stability_reputation, quality_reputation, last_updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5)
+             VALUES (?1, ?2, ?3, ?4, TIMESTAMPTZ 'epoch' + (?5::bigint * INTERVAL '1 millisecond'))
              ON CONFLICT(runtime_id, profile_id) DO UPDATE SET
                stability_reputation = excluded.stability_reputation,
                quality_reputation = excluded.quality_reputation,

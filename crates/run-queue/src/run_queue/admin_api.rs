@@ -41,7 +41,7 @@ impl PgRunQueue {
                     step_id, run_id, agent_id, executor, profile, prompt, weight, priority,
                     status, attempt, max_attempts, next_run_at, created_at, updated_at
                  )
-                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,0,$10,$11,TIMESTAMPTZ 'epoch' + ($11::bigint * INTERVAL '1 millisecond'),TIMESTAMPTZ 'epoch' + ($11::bigint * INTERVAL '1 millisecond'))",
+                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,0,$10,TIMESTAMPTZ 'epoch' + ($11::bigint * INTERVAL '1 millisecond'),TIMESTAMPTZ 'epoch' + ($11::bigint * INTERVAL '1 millisecond'),TIMESTAMPTZ 'epoch' + ($11::bigint * INTERVAL '1 millisecond'))",
                 &[
                     &step_id,
                     &spec.run_id,
@@ -96,7 +96,9 @@ impl PgRunQueue {
         )?;
         tx.execute(
             "UPDATE run_steps
-             SET status = $2, next_run_at = $3, updated_at = TIMESTAMPTZ 'epoch' + ($3::bigint * INTERVAL '1 millisecond')
+             SET status = $2,
+                 next_run_at = TIMESTAMPTZ 'epoch' + ($3::bigint * INTERVAL '1 millisecond'),
+                 updated_at = TIMESTAMPTZ 'epoch' + ($3::bigint * INTERVAL '1 millisecond')
              WHERE run_id = $1 AND status IN ($4, $5)",
             &[
                 &run_id,
@@ -180,7 +182,14 @@ impl PgRunQueue {
 
         let moved = tx.execute(
             "UPDATE run_steps
-             SET status = $2, next_run_at = $3, lease_id = NULL, lease_owner = NULL, lease_until = NULL, error_text = NULL, updated_at = TIMESTAMPTZ 'epoch' + ($3::bigint * INTERVAL '1 millisecond'), finished_at = NULL
+             SET status = $2,
+                 next_run_at = TIMESTAMPTZ 'epoch' + ($3::bigint * INTERVAL '1 millisecond'),
+                 lease_id = NULL,
+                 lease_owner = NULL,
+                 lease_until = NULL,
+                 error_text = NULL,
+                 updated_at = TIMESTAMPTZ 'epoch' + ($3::bigint * INTERVAL '1 millisecond'),
+                 finished_at = NULL
              WHERE run_id = $1 AND status IN ($4, $5)",
             &[
                 &run_id,

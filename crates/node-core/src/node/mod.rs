@@ -15,8 +15,8 @@ use crate::reason_codes::{
     REASON_TASK_EXPIRED, REASON_TASK_TIMEOUT, REASON_UNKNOWN, is_protocol_reason_code,
 };
 use crate::runtime::{ExecuteRequest, RuntimeClient, VerifyRequest, verifier_result_from_response};
-use crate::storage::rusqlite::ErrorCode;
-use crate::storage::{RuntimeMetricObservation, SqliteStore, TaskProjectionRow, VoteRevealRow};
+use crate::storage::pg::ErrorCode;
+use crate::storage::{PgStore, RuntimeMetricObservation, TaskProjectionRow, VoteRevealRow};
 use crate::types::{
     Candidate, CandidateProposedPayload, ClaimPayload, ClaimReleasePayload, ClaimRenewPayload,
     ClaimRole, DecisionCommittedPayload, DecisionFinalizedPayload, EpochEndReason, Event,
@@ -34,7 +34,7 @@ use std::collections::HashSet;
 
 pub struct Node {
     pub identity: NodeIdentity,
-    pub store: SqliteStore,
+    pub store: PgStore,
     policy_registry: PolicyRegistry,
     peers: HashSet<String>,
     genesis_membership: Membership,
@@ -127,9 +127,9 @@ pub fn build_event_for_external(
 fn is_duplicate_event_error(err: &anyhow::Error) -> bool {
     err.chain().any(|cause| {
         cause
-            .downcast_ref::<crate::storage::rusqlite::Error>()
+            .downcast_ref::<crate::storage::pg::Error>()
             .map(|e| match e {
-                crate::storage::rusqlite::Error::SqliteFailure(inner, message) => {
+                crate::storage::pg::Error::DbFailure(inner, message) => {
                     inner.code == ErrorCode::ConstraintViolation
                         && message
                             .as_deref()

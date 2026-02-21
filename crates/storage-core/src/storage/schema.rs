@@ -16,7 +16,46 @@ fn column_exists(conn: &Connection, table: &str, column: &str) -> bool {
     .unwrap_or(false)
 }
 
-impl SqliteStore {
+fn column_data_type(conn: &Connection, table: &str, column: &str) -> Result<Option<String>> {
+    conn.query_row(
+        "SELECT data_type
+         FROM information_schema.columns
+         WHERE table_schema = current_schema()
+           AND table_name = ?1
+           AND column_name = ?2
+         LIMIT 1",
+        params![table, column],
+        |r| r.get(0),
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+fn ensure_timestamp_column(conn: &Connection, table: &str, column: &str) -> Result<()> {
+    let Some(data_type) = column_data_type(conn, table, column)? else {
+        return Ok(());
+    };
+    if data_type == "timestamp with time zone" {
+        return Ok(());
+    }
+    if data_type != "bigint" {
+        return Err(SwarmError::Storage(format!(
+            "unsupported time column type {}.{}: {}",
+            table, column, data_type
+        ))
+        .into());
+    }
+    let sql = format!(
+        "ALTER TABLE {table}
+         ALTER COLUMN {column}
+         TYPE TIMESTAMPTZ
+         USING TIMESTAMPTZ 'epoch' + ({column} * INTERVAL '1 millisecond')"
+    );
+    conn.execute_batch(&sql)?;
+    Ok(())
+}
+
+impl PgStore {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let conn = Connection::open(path)?;
         Self::initialize(conn)
@@ -28,11 +67,19 @@ impl SqliteStore {
     }
 
     fn initialize(conn: Connection) -> Result<Self> {
+        const INIT_LOCK_KEY: i64 = 0x7773_696e_6974; // "wsinit"
+
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "FULL")?;
+        conn.query_row(
+            "SELECT pg_advisory_lock(?1)",
+            params![INIT_LOCK_KEY],
+            |_| Ok(()),
+        )?;
 
-        conn.execute_batch(
-            "
+        let init_result: Result<()> = (|| {
+            conn.execute_batch(
+                "
             CREATE TABLE IF NOT EXISTS events (
                 seq BIGSERIAL PRIMARY KEY,
                 event_id TEXT NOT NULL UNIQUE,
@@ -41,7 +88,7 @@ impl SqliteStore {
                 epoch BIGINT NOT NULL,
                 event_kind TEXT NOT NULL,
                 author_node_id TEXT NOT NULL,
-                created_at BIGINT NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL,
                 event_json TEXT NOT NULL
             );
 
@@ -60,7 +107,7 @@ impl SqliteStore {
                 role TEXT NOT NULL,
                 claimer_node_id TEXT NOT NULL,
                 execution_id TEXT NOT NULL,
-                lease_until BIGINT NOT NULL,
+                lease_until TIMESTAMPTZ NOT NULL,
                 PRIMARY KEY(task_id, role)
             );
 
@@ -96,7 +143,7 @@ impl SqliteStore {
                 candidate_id TEXT NOT NULL,
                 verifier_node_id TEXT NOT NULL,
                 evidence_digest TEXT NOT NULL,
-                created_at BIGINT NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL,
                 PRIMARY KEY(task_id, candidate_id, verifier_node_id, evidence_digest)
             );
 
@@ -107,7 +154,7 @@ impl SqliteStore {
                 commit_hash TEXT NOT NULL,
                 verifier_result_hash TEXT NOT NULL,
                 execution_id TEXT NOT NULL,
-                created_at BIGINT NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL,
                 PRIMARY KEY(task_id, voter_node_id)
             );
 
@@ -120,7 +167,7 @@ impl SqliteStore {
                 salt TEXT NOT NULL,
                 verifier_result_hash TEXT NOT NULL,
                 valid BIGINT NOT NULL,
-                created_at BIGINT NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL,
                 PRIMARY KEY(task_id, voter_node_id)
             );
 
@@ -148,7 +195,7 @@ impl SqliteStore {
                 task_id TEXT NOT NULL,
                 epoch BIGINT NOT NULL,
                 final_commit_hash TEXT NOT NULL,
-                finalized_at BIGINT NOT NULL,
+                finalized_at TIMESTAMPTZ NOT NULL,
                 winning_candidate_hash TEXT NOT NULL,
                 output_digest TEXT NOT NULL,
                 result_summary TEXT NOT NULL,
@@ -168,7 +215,7 @@ impl SqliteStore {
                 mime TEXT NOT NULL,
                 size_bytes BIGINT NOT NULL,
                 source_hint_digest TEXT NOT NULL,
-                added_at BIGINT NOT NULL,
+                added_at TIMESTAMPTZ NOT NULL,
                 availability_confirmations_count BIGINT NOT NULL
             );
 
@@ -176,8 +223,8 @@ impl SqliteStore {
                 runtime_id TEXT NOT NULL,
                 profile_id TEXT NOT NULL,
                 task_type TEXT NOT NULL,
-                window_start BIGINT NOT NULL,
-                window_end BIGINT NOT NULL,
+                window_start TIMESTAMPTZ NOT NULL,
+                window_end TIMESTAMPTZ NOT NULL,
                 finalize_rate DOUBLE PRECISION NOT NULL,
                 timeout_rate DOUBLE PRECISION NOT NULL,
                 crash_rate DOUBLE PRECISION NOT NULL,
@@ -209,10 +256,10 @@ impl SqliteStore {
             CREATE TABLE IF NOT EXISTS task_settlement (
                 task_id TEXT NOT NULL,
                 epoch BIGINT NOT NULL,
-                finalized_at BIGINT NOT NULL,
-                window_end_at BIGINT NOT NULL,
+                finalized_at TIMESTAMPTZ NOT NULL,
+                window_end_at TIMESTAMPTZ NOT NULL,
                 bad_feedback_exists BIGINT NOT NULL DEFAULT 0,
-                bad_feedback_at BIGINT,
+                bad_feedback_at TIMESTAMPTZ,
                 PRIMARY KEY(task_id, epoch)
             );
 
@@ -241,7 +288,7 @@ impl SqliteStore {
                 profile_id TEXT NOT NULL,
                 stability_reputation BIGINT NOT NULL,
                 quality_reputation BIGINT NOT NULL,
-                last_updated_at BIGINT NOT NULL,
+                last_updated_at TIMESTAMPTZ NOT NULL,
                 PRIMARY KEY(runtime_id, profile_id)
             );
 
@@ -249,7 +296,7 @@ impl SqliteStore {
                 task_id TEXT NOT NULL,
                 task_type TEXT NOT NULL,
                 input_digest TEXT NOT NULL,
-                lookup_time BIGINT NOT NULL,
+                lookup_time TIMESTAMPTZ NOT NULL,
                 hit_count BIGINT NOT NULL,
                 hits_digest TEXT NOT NULL,
                 reuse_applied BIGINT NOT NULL
@@ -267,11 +314,11 @@ impl SqliteStore {
                 policy_id TEXT NOT NULL,
                 suggested_policy_hash TEXT NOT NULL,
                 status TEXT NOT NULL,
-                created_at BIGINT NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL,
                 approved_by TEXT,
-                approved_at BIGINT,
+                approved_at TIMESTAMPTZ,
                 applied_policy_hash TEXT,
-                applied_at BIGINT
+                applied_at TIMESTAMPTZ
             );
 
             CREATE TABLE IF NOT EXISTS unknown_reason_observations (
@@ -281,165 +328,200 @@ impl SqliteStore {
                 peer_protocol_version TEXT NOT NULL,
                 local_protocol_version TEXT NOT NULL,
                 author_node_id TEXT NOT NULL,
-                observed_at BIGINT NOT NULL
+                observed_at TIMESTAMPTZ NOT NULL
             );
             ",
-        )?;
+            )?;
 
-        // Backward-compatible migration for pre-existing local db files.
-        // (table, column, ALTER TABLE statement)
-        let migrations: &[(&str, &str, &str)] = &[
-            (
-                "task_projection",
-                "retry_attempt",
-                "ALTER TABLE task_projection ADD COLUMN retry_attempt BIGINT NOT NULL DEFAULT 0",
-            ),
-            (
-                "events",
-                "protocol_version",
-                "ALTER TABLE events ADD COLUMN protocol_version TEXT NOT NULL DEFAULT '0.1.0'",
-            ),
-            (
-                "candidates",
-                "candidate_hash",
-                "ALTER TABLE candidates ADD COLUMN candidate_hash TEXT NOT NULL DEFAULT ''",
-            ),
-            (
-                "vote_commits",
-                "candidate_hash",
-                "ALTER TABLE vote_commits ADD COLUMN candidate_hash TEXT NOT NULL DEFAULT ''",
-            ),
-            (
-                "vote_reveals",
-                "candidate_hash",
-                "ALTER TABLE vote_reveals ADD COLUMN candidate_hash TEXT NOT NULL DEFAULT ''",
-            ),
-            (
-                "decision_memory",
-                "task_type",
-                "ALTER TABLE decision_memory ADD COLUMN task_type TEXT NOT NULL DEFAULT ''",
-            ),
-            (
-                "decision_memory",
-                "input_digest",
-                "ALTER TABLE decision_memory ADD COLUMN input_digest TEXT NOT NULL DEFAULT ''",
-            ),
-            (
-                "decision_memory",
-                "output_schema_digest",
-                "ALTER TABLE decision_memory ADD COLUMN output_schema_digest TEXT NOT NULL DEFAULT ''",
-            ),
-            (
-                "decision_memory",
-                "policy_id",
-                "ALTER TABLE decision_memory ADD COLUMN policy_id TEXT NOT NULL DEFAULT ''",
-            ),
-            (
-                "decision_memory",
-                "policy_params_digest",
-                "ALTER TABLE decision_memory ADD COLUMN policy_params_digest TEXT NOT NULL DEFAULT ''",
-            ),
-            (
-                "runtime_metrics",
-                "sample_count",
-                "ALTER TABLE runtime_metrics ADD COLUMN sample_count BIGINT NOT NULL DEFAULT 0",
-            ),
-            (
-                "runtime_metrics",
-                "finalize_count",
-                "ALTER TABLE runtime_metrics ADD COLUMN finalize_count BIGINT NOT NULL DEFAULT 0",
-            ),
-            (
-                "runtime_metrics",
-                "timeout_count",
-                "ALTER TABLE runtime_metrics ADD COLUMN timeout_count BIGINT NOT NULL DEFAULT 0",
-            ),
-            (
-                "runtime_metrics",
-                "crash_count",
-                "ALTER TABLE runtime_metrics ADD COLUMN crash_count BIGINT NOT NULL DEFAULT 0",
-            ),
-            (
-                "runtime_metrics",
-                "invalid_output_count",
-                "ALTER TABLE runtime_metrics ADD COLUMN invalid_output_count BIGINT NOT NULL DEFAULT 0",
-            ),
-            (
-                "runtime_metrics",
-                "latency_samples_json",
-                "ALTER TABLE runtime_metrics ADD COLUMN latency_samples_json TEXT NOT NULL DEFAULT '[]'",
-            ),
-            (
-                "runtime_metrics",
-                "reuse_hit_rate_exact",
-                "ALTER TABLE runtime_metrics ADD COLUMN reuse_hit_rate_exact DOUBLE PRECISION NOT NULL DEFAULT 0",
-            ),
-            (
-                "runtime_metrics",
-                "reuse_hit_rate_similar",
-                "ALTER TABLE runtime_metrics ADD COLUMN reuse_hit_rate_similar DOUBLE PRECISION NOT NULL DEFAULT 0",
-            ),
-            (
-                "runtime_metrics",
-                "reuse_candidate_accept_rate",
-                "ALTER TABLE runtime_metrics ADD COLUMN reuse_candidate_accept_rate DOUBLE PRECISION NOT NULL DEFAULT 0",
-            ),
-            (
-                "runtime_metrics",
-                "time_to_finality_p50",
-                "ALTER TABLE runtime_metrics ADD COLUMN time_to_finality_p50 BIGINT NOT NULL DEFAULT 0",
-            ),
-            (
-                "runtime_metrics",
-                "time_to_finality_p95",
-                "ALTER TABLE runtime_metrics ADD COLUMN time_to_finality_p95 BIGINT NOT NULL DEFAULT 0",
-            ),
-            (
-                "runtime_metrics",
-                "expired_rate",
-                "ALTER TABLE runtime_metrics ADD COLUMN expired_rate DOUBLE PRECISION NOT NULL DEFAULT 0",
-            ),
-            (
-                "runtime_metrics",
-                "cost_units_per_finalized_task_p50",
-                "ALTER TABLE runtime_metrics ADD COLUMN cost_units_per_finalized_task_p50 DOUBLE PRECISION NOT NULL DEFAULT 0",
-            ),
-            (
-                "runtime_metrics",
-                "cost_units_per_finalized_task_p95",
-                "ALTER TABLE runtime_metrics ADD COLUMN cost_units_per_finalized_task_p95 DOUBLE PRECISION NOT NULL DEFAULT 0",
-            ),
-            (
-                "runtime_metrics",
-                "verify_cost_ratio",
-                "ALTER TABLE runtime_metrics ADD COLUMN verify_cost_ratio DOUBLE PRECISION NOT NULL DEFAULT 0",
-            ),
-            (
-                "runtime_metrics",
-                "invalid_event_reject_count",
-                "ALTER TABLE runtime_metrics ADD COLUMN invalid_event_reject_count BIGINT NOT NULL DEFAULT 0",
-            ),
-            (
-                "runtime_metrics",
-                "fork_prevented_count",
-                "ALTER TABLE runtime_metrics ADD COLUMN fork_prevented_count BIGINT NOT NULL DEFAULT 0",
-            ),
-            (
-                "runtime_metrics",
-                "da_fetch_fail_rate",
-                "ALTER TABLE runtime_metrics ADD COLUMN da_fetch_fail_rate DOUBLE PRECISION NOT NULL DEFAULT 0",
-            ),
-            (
-                "verifier_results",
-                "passed",
-                "ALTER TABLE verifier_results ADD COLUMN passed BIGINT NOT NULL DEFAULT 0",
-            ),
-        ];
-        for (table, column, alter_stmt) in migrations {
-            if !column_exists(&conn, table, column) {
-                conn.execute(alter_stmt, params![])?;
+            // Backward-compatible migration for pre-existing local db files.
+            // (table, column, ALTER TABLE statement)
+            let migrations: &[(&str, &str, &str)] = &[
+                (
+                    "task_projection",
+                    "retry_attempt",
+                    "ALTER TABLE task_projection ADD COLUMN retry_attempt BIGINT NOT NULL DEFAULT 0",
+                ),
+                (
+                    "events",
+                    "protocol_version",
+                    "ALTER TABLE events ADD COLUMN protocol_version TEXT NOT NULL DEFAULT '0.1.0'",
+                ),
+                (
+                    "candidates",
+                    "candidate_hash",
+                    "ALTER TABLE candidates ADD COLUMN candidate_hash TEXT NOT NULL DEFAULT ''",
+                ),
+                (
+                    "vote_commits",
+                    "candidate_hash",
+                    "ALTER TABLE vote_commits ADD COLUMN candidate_hash TEXT NOT NULL DEFAULT ''",
+                ),
+                (
+                    "vote_reveals",
+                    "candidate_hash",
+                    "ALTER TABLE vote_reveals ADD COLUMN candidate_hash TEXT NOT NULL DEFAULT ''",
+                ),
+                (
+                    "decision_memory",
+                    "task_type",
+                    "ALTER TABLE decision_memory ADD COLUMN task_type TEXT NOT NULL DEFAULT ''",
+                ),
+                (
+                    "decision_memory",
+                    "input_digest",
+                    "ALTER TABLE decision_memory ADD COLUMN input_digest TEXT NOT NULL DEFAULT ''",
+                ),
+                (
+                    "decision_memory",
+                    "output_schema_digest",
+                    "ALTER TABLE decision_memory ADD COLUMN output_schema_digest TEXT NOT NULL DEFAULT ''",
+                ),
+                (
+                    "decision_memory",
+                    "policy_id",
+                    "ALTER TABLE decision_memory ADD COLUMN policy_id TEXT NOT NULL DEFAULT ''",
+                ),
+                (
+                    "decision_memory",
+                    "policy_params_digest",
+                    "ALTER TABLE decision_memory ADD COLUMN policy_params_digest TEXT NOT NULL DEFAULT ''",
+                ),
+                (
+                    "runtime_metrics",
+                    "sample_count",
+                    "ALTER TABLE runtime_metrics ADD COLUMN sample_count BIGINT NOT NULL DEFAULT 0",
+                ),
+                (
+                    "runtime_metrics",
+                    "finalize_count",
+                    "ALTER TABLE runtime_metrics ADD COLUMN finalize_count BIGINT NOT NULL DEFAULT 0",
+                ),
+                (
+                    "runtime_metrics",
+                    "timeout_count",
+                    "ALTER TABLE runtime_metrics ADD COLUMN timeout_count BIGINT NOT NULL DEFAULT 0",
+                ),
+                (
+                    "runtime_metrics",
+                    "crash_count",
+                    "ALTER TABLE runtime_metrics ADD COLUMN crash_count BIGINT NOT NULL DEFAULT 0",
+                ),
+                (
+                    "runtime_metrics",
+                    "invalid_output_count",
+                    "ALTER TABLE runtime_metrics ADD COLUMN invalid_output_count BIGINT NOT NULL DEFAULT 0",
+                ),
+                (
+                    "runtime_metrics",
+                    "latency_samples_json",
+                    "ALTER TABLE runtime_metrics ADD COLUMN latency_samples_json TEXT NOT NULL DEFAULT '[]'",
+                ),
+                (
+                    "runtime_metrics",
+                    "reuse_hit_rate_exact",
+                    "ALTER TABLE runtime_metrics ADD COLUMN reuse_hit_rate_exact DOUBLE PRECISION NOT NULL DEFAULT 0",
+                ),
+                (
+                    "runtime_metrics",
+                    "reuse_hit_rate_similar",
+                    "ALTER TABLE runtime_metrics ADD COLUMN reuse_hit_rate_similar DOUBLE PRECISION NOT NULL DEFAULT 0",
+                ),
+                (
+                    "runtime_metrics",
+                    "reuse_candidate_accept_rate",
+                    "ALTER TABLE runtime_metrics ADD COLUMN reuse_candidate_accept_rate DOUBLE PRECISION NOT NULL DEFAULT 0",
+                ),
+                (
+                    "runtime_metrics",
+                    "time_to_finality_p50",
+                    "ALTER TABLE runtime_metrics ADD COLUMN time_to_finality_p50 BIGINT NOT NULL DEFAULT 0",
+                ),
+                (
+                    "runtime_metrics",
+                    "time_to_finality_p95",
+                    "ALTER TABLE runtime_metrics ADD COLUMN time_to_finality_p95 BIGINT NOT NULL DEFAULT 0",
+                ),
+                (
+                    "runtime_metrics",
+                    "expired_rate",
+                    "ALTER TABLE runtime_metrics ADD COLUMN expired_rate DOUBLE PRECISION NOT NULL DEFAULT 0",
+                ),
+                (
+                    "runtime_metrics",
+                    "cost_units_per_finalized_task_p50",
+                    "ALTER TABLE runtime_metrics ADD COLUMN cost_units_per_finalized_task_p50 DOUBLE PRECISION NOT NULL DEFAULT 0",
+                ),
+                (
+                    "runtime_metrics",
+                    "cost_units_per_finalized_task_p95",
+                    "ALTER TABLE runtime_metrics ADD COLUMN cost_units_per_finalized_task_p95 DOUBLE PRECISION NOT NULL DEFAULT 0",
+                ),
+                (
+                    "runtime_metrics",
+                    "verify_cost_ratio",
+                    "ALTER TABLE runtime_metrics ADD COLUMN verify_cost_ratio DOUBLE PRECISION NOT NULL DEFAULT 0",
+                ),
+                (
+                    "runtime_metrics",
+                    "invalid_event_reject_count",
+                    "ALTER TABLE runtime_metrics ADD COLUMN invalid_event_reject_count BIGINT NOT NULL DEFAULT 0",
+                ),
+                (
+                    "runtime_metrics",
+                    "fork_prevented_count",
+                    "ALTER TABLE runtime_metrics ADD COLUMN fork_prevented_count BIGINT NOT NULL DEFAULT 0",
+                ),
+                (
+                    "runtime_metrics",
+                    "da_fetch_fail_rate",
+                    "ALTER TABLE runtime_metrics ADD COLUMN da_fetch_fail_rate DOUBLE PRECISION NOT NULL DEFAULT 0",
+                ),
+                (
+                    "verifier_results",
+                    "passed",
+                    "ALTER TABLE verifier_results ADD COLUMN passed BIGINT NOT NULL DEFAULT 0",
+                ),
+            ];
+            for (table, column, alter_stmt) in migrations {
+                if !column_exists(&conn, table, column) {
+                    conn.execute(alter_stmt, params![])?;
+                }
             }
-        }
+
+            let timestamp_columns: &[(&str, &str)] = &[
+                ("events", "created_at"),
+                ("leases", "lease_until"),
+                ("evidence_available", "created_at"),
+                ("vote_commits", "created_at"),
+                ("vote_reveals", "created_at"),
+                ("decision_memory", "finalized_at"),
+                ("evidence_summary", "added_at"),
+                ("runtime_metrics", "window_start"),
+                ("runtime_metrics", "window_end"),
+                ("task_settlement", "finalized_at"),
+                ("task_settlement", "window_end_at"),
+                ("task_settlement", "bad_feedback_at"),
+                ("reputation_state", "last_updated_at"),
+                ("knowledge_lookups", "lookup_time"),
+                ("advisory_state", "created_at"),
+                ("advisory_state", "approved_at"),
+                ("advisory_state", "applied_at"),
+                ("unknown_reason_observations", "observed_at"),
+            ];
+            for (table, column) in timestamp_columns {
+                ensure_timestamp_column(&conn, table, column)?;
+            }
+            Ok(())
+        })();
+
+        let unlock_result = conn.query_row(
+            "SELECT pg_advisory_unlock(?1)",
+            params![INIT_LOCK_KEY],
+            |_| Ok(()),
+        );
+
+        init_result?;
+        unlock_result?;
 
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),

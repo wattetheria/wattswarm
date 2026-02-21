@@ -1,6 +1,6 @@
 use super::*;
 
-impl SqliteStore {
+impl PgStore {
     pub fn upsert_task_contract(&self, contract: &TaskContract, epoch: u64) -> Result<()> {
         let contract_json = serde_json::to_string(contract)?;
         let conn = self
@@ -33,9 +33,9 @@ impl SqliteStore {
                 let finalized_candidate_id: Option<String> = r.get(4)?;
                 let retry_attempt: i64 = r.get(5)?;
                 let contract: TaskContract = serde_json::from_str(&contract_json).map_err(|e| {
-                    rusqlite::Error::FromSqlConversionFailure(
+                    pg::Error::FromSqlConversionFailure(
                         0,
-                        rusqlite::types::Type::Text,
+                        pg::types::Type::Text,
                         Box::new(e),
                     )
                 })?;
@@ -205,7 +205,7 @@ impl SqliteStore {
             .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
         conn.execute(
             "INSERT INTO evidence_available(task_id, candidate_id, verifier_node_id, evidence_digest, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5)
+             VALUES (?1, ?2, ?3, ?4, TIMESTAMPTZ 'epoch' + (?5::bigint * INTERVAL '1 millisecond'))
              ON CONFLICT(task_id, candidate_id, verifier_node_id, evidence_digest)
              DO UPDATE SET created_at = excluded.created_at",
             params![
@@ -342,7 +342,7 @@ impl SqliteStore {
             .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
         conn.execute(
             "INSERT INTO leases(task_id, role, claimer_node_id, execution_id, lease_until)
-             VALUES (?1, ?2, ?3, ?4, ?5)
+             VALUES (?1, ?2, ?3, ?4, TIMESTAMPTZ 'epoch' + (?5::bigint * INTERVAL '1 millisecond'))
              ON CONFLICT(task_id, role) DO UPDATE SET
               claimer_node_id = excluded.claimer_node_id,
               execution_id = excluded.execution_id,
@@ -364,7 +364,8 @@ impl SqliteStore {
             .lock()
             .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
         conn.query_row(
-            "SELECT task_id, role, claimer_node_id, execution_id, lease_until
+            "SELECT task_id, role, claimer_node_id, execution_id,
+                    (EXTRACT(EPOCH FROM lease_until) * 1000)::BIGINT AS lease_until
              FROM leases WHERE task_id = ?1 AND role = ?2",
             params![task_id, role],
             |r| {
@@ -446,11 +447,7 @@ impl SqliteStore {
             |r| {
                 let json: String = r.get(0)?;
                 let c: Candidate = serde_json::from_str(&json).map_err(|e| {
-                    rusqlite::Error::FromSqlConversionFailure(
-                        0,
-                        rusqlite::types::Type::Text,
-                        Box::new(e),
-                    )
+                    pg::Error::FromSqlConversionFailure(0, pg::types::Type::Text, Box::new(e))
                 })?;
                 Ok(c)
             },
@@ -474,11 +471,7 @@ impl SqliteStore {
             |r| {
                 let json: String = r.get(0)?;
                 let c: Candidate = serde_json::from_str(&json).map_err(|e| {
-                    rusqlite::Error::FromSqlConversionFailure(
-                        0,
-                        rusqlite::types::Type::Text,
-                        Box::new(e),
-                    )
+                    pg::Error::FromSqlConversionFailure(0, pg::types::Type::Text, Box::new(e))
                 })?;
                 Ok(c)
             },
@@ -577,11 +570,7 @@ impl SqliteStore {
         let rows = stmt.query_map(params![task_id, candidate_id], |r| {
             let json: String = r.get(0)?;
             let parsed: VerifierResult = serde_json::from_str(&json).map_err(|e| {
-                rusqlite::Error::FromSqlConversionFailure(
-                    0,
-                    rusqlite::types::Type::Text,
-                    Box::new(e),
-                )
+                pg::Error::FromSqlConversionFailure(0, pg::types::Type::Text, Box::new(e))
             })?;
             Ok(parsed)
         })?;
@@ -606,7 +595,7 @@ impl SqliteStore {
             .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
         conn.execute(
             "INSERT INTO vote_commits(task_id, voter_node_id, candidate_hash, commit_hash, verifier_result_hash, execution_id, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, TIMESTAMPTZ 'epoch' + (?7::bigint * INTERVAL '1 millisecond'))
              ON CONFLICT(task_id, voter_node_id) DO UPDATE SET
                candidate_hash = excluded.candidate_hash,
                commit_hash = excluded.commit_hash,
@@ -631,8 +620,10 @@ impl SqliteStore {
             .conn
             .lock()
             .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
-        let mut stmt =
-            conn.prepare("SELECT voter_node_id, created_at FROM vote_commits WHERE task_id = ?1")?;
+        let mut stmt = conn.prepare(
+            "SELECT voter_node_id, (EXTRACT(EPOCH FROM created_at) * 1000)::BIGINT AS created_at
+             FROM vote_commits WHERE task_id = ?1",
+        )?;
         let rows = stmt.query_map(params![task_id], |r| {
             Ok(VoteCommitMetaRow {
                 voter_node_id: r.get(0)?,
@@ -707,7 +698,8 @@ impl SqliteStore {
             .lock()
             .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
         conn.query_row(
-            "SELECT MIN(created_at) FROM events WHERE task_id = ?1 AND event_kind = 'TaskCreated'",
+            "SELECT CASE WHEN MIN(created_at) IS NULL THEN NULL ELSE (EXTRACT(EPOCH FROM MIN(created_at)) * 1000)::BIGINT END
+             FROM events WHERE task_id = ?1 AND event_kind = 'TaskCreated'",
             params![task_id],
             |r| r.get::<_, Option<i64>>(0),
         )
@@ -729,7 +721,14 @@ impl SqliteStore {
             .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
         conn.execute(
             "INSERT INTO task_settlement(task_id, epoch, finalized_at, window_end_at, bad_feedback_exists, bad_feedback_at)
-             VALUES (?1, ?2, ?3, ?4, COALESCE((SELECT bad_feedback_exists FROM task_settlement WHERE task_id = ?1 AND epoch = ?2), 0), COALESCE((SELECT bad_feedback_at FROM task_settlement WHERE task_id = ?1 AND epoch = ?2), NULL))
+             VALUES (
+               ?1,
+               ?2,
+               TIMESTAMPTZ 'epoch' + (?3::bigint * INTERVAL '1 millisecond'),
+               TIMESTAMPTZ 'epoch' + (?4::bigint * INTERVAL '1 millisecond'),
+               COALESCE((SELECT bad_feedback_exists FROM task_settlement WHERE task_id = ?1 AND epoch = ?2), 0),
+               COALESCE((SELECT bad_feedback_at FROM task_settlement WHERE task_id = ?1 AND epoch = ?2), NULL)
+             )
              ON CONFLICT(task_id, epoch) DO UPDATE SET
                finalized_at = excluded.finalized_at,
                window_end_at = excluded.window_end_at,
@@ -752,7 +751,8 @@ impl SqliteStore {
             .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
         conn.execute(
             "UPDATE task_settlement
-             SET bad_feedback_exists = 1, bad_feedback_at = ?3
+             SET bad_feedback_exists = 1,
+                 bad_feedback_at = TIMESTAMPTZ 'epoch' + (?3::bigint * INTERVAL '1 millisecond')
              WHERE task_id = ?1 AND epoch = ?2 AND bad_feedback_exists = 0",
             params![task_id, epoch as i64, bad_feedback_at as i64],
         )?;
@@ -765,7 +765,11 @@ impl SqliteStore {
             .lock()
             .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
         conn.query_row(
-            "SELECT task_id, epoch, finalized_at, window_end_at, bad_feedback_exists, bad_feedback_at
+            "SELECT task_id, epoch,
+                    (EXTRACT(EPOCH FROM finalized_at) * 1000)::BIGINT AS finalized_at,
+                    (EXTRACT(EPOCH FROM window_end_at) * 1000)::BIGINT AS window_end_at,
+                    bad_feedback_exists,
+                    CASE WHEN bad_feedback_at IS NULL THEN NULL ELSE (EXTRACT(EPOCH FROM bad_feedback_at) * 1000)::BIGINT END AS bad_feedback_at
              FROM task_settlement
              WHERE task_id = ?1
              ORDER BY epoch DESC
@@ -871,7 +875,7 @@ impl SqliteStore {
             .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
         conn.execute(
             "INSERT INTO knowledge_lookups(task_id, task_type, input_digest, lookup_time, hit_count, hits_digest, reuse_applied)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+             VALUES (?1, ?2, ?3, TIMESTAMPTZ 'epoch' + (?4::bigint * INTERVAL '1 millisecond'), ?5, ?6, ?7)",
             params![
                 task_id,
                 task_type,
@@ -899,7 +903,7 @@ impl SqliteStore {
             .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
         conn.execute(
             "INSERT INTO evidence_summary(cid, mime, size_bytes, source_hint_digest, added_at, availability_confirmations_count)
-             VALUES (?1, ?2, ?3, ?4, ?5, 1)
+             VALUES (?1, ?2, ?3, ?4, TIMESTAMPTZ 'epoch' + (?5::bigint * INTERVAL '1 millisecond'), 1)
              ON CONFLICT(cid) DO UPDATE SET
                mime = excluded.mime,
                size_bytes = excluded.size_bytes,
@@ -935,7 +939,7 @@ impl SqliteStore {
             .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
         conn.execute(
             "INSERT INTO decision_memory(task_id, epoch, final_commit_hash, finalized_at, winning_candidate_hash, output_digest, result_summary, reason_codes_json, policy_snapshot_digest, task_type, input_digest, output_schema_digest, policy_id, policy_params_digest, deprecated_as_exact)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, COALESCE((SELECT deprecated_as_exact FROM decision_memory WHERE task_id = ?1 AND epoch = ?2), 0))
+             VALUES (?1, ?2, ?3, TIMESTAMPTZ 'epoch' + (?4::bigint * INTERVAL '1 millisecond'), ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, COALESCE((SELECT deprecated_as_exact FROM decision_memory WHERE task_id = ?1 AND epoch = ?2), 0))
              ON CONFLICT(task_id, epoch) DO UPDATE SET
                final_commit_hash = excluded.final_commit_hash,
                finalized_at = excluded.finalized_at,
@@ -1028,7 +1032,8 @@ impl SqliteStore {
         let mut stmt = conn.prepare(
             "SELECT task_id, epoch, final_commit_hash, winning_candidate_hash, result_summary,
                     reason_codes_json, input_digest, output_schema_digest, policy_id,
-                    policy_params_digest, deprecated_as_exact, finalized_at
+                    policy_params_digest, deprecated_as_exact,
+                    (EXTRACT(EPOCH FROM finalized_at) * 1000)::BIGINT AS finalized_at
              FROM decision_memory
              WHERE task_type = ?1
                AND winning_candidate_hash <> ''
