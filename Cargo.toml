@@ -1,0 +1,46 @@
+[workspace]
+resolver = "2"
+members = [
+  "crates/protocol",
+  "crates/crypto",
+  "crates/policy-engine",
+  "crates/runtime-client",
+  "crates/storage-core",
+  "crates/node-core",
+  "crates/control-plane",
+  "crates/run-queue",
+  "apps/wattswarm",
+  "apps/wattswarm-runtime",
+]
+
+[workspace.dependencies]
+anyhow = "1.0"
+axum = "0.7"
+base64 = "0.22"
+chrono = { version = "0.4", features = ["serde", "clock"] }
+clap = { version = "4.5", features = ["derive"] }
+ed25519-dalek = { version = "2.1", features = ["rand_core"] }
+hex = "0.4"
+postgres = "0.19"
+rand = "0.8"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+thiserror = "2.0"
+tokio = { version = "1.42", features = ["macros", "rt-multi-thread", "net"] }
+uuid = { version = "1.11", features = ["v4", "serde"] }
+
+assert_cmd = "2.0"
+predicates = "3.1"
+tempfile = "3.14"
+tower = "0.5"
+
+wattswarm-protocol = { path = "crates/protocol" }
+wattswarm-crypto = { path = "crates/crypto" }
+wattswarm-policy-engine = { path = "crates/policy-engine" }
+wattswarm-runtime-client = { path = "crates/runtime-client" }
+wattswarm-storage-core = { path = "crates/storage-core" }
+wattswarm-node-core = { path = "crates/node-core" }
+wattswarm-control-plane = { path = "crates/control-plane" }
+wattswarm-run-queue = { path = "crates/run-queue" }

@@ -1,0 +1,99 @@
+services:
+  postgres:
+    image: postgres:16
+    container_name: wattswarm-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${WATTSWARM_PG_DB:-wattswarm}
+      POSTGRES_USER: ${WATTSWARM_PG_USER:-postgres}
+      POSTGRES_PASSWORD: ${WATTSWARM_PG_PASSWORD:-postgres}
+    ports:
+      - "${WATTSWARM_PG_HOST_PORT:-55432}:5432"
+    volumes:
+      - wattswarm_pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${WATTSWARM_PG_USER:-postgres} -d ${WATTSWARM_PG_DB:-wattswarm}"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  kernel:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: wattswarm-kernel
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      runtime:
+        condition: service_healthy
+    environment:
+      WATTSWARM_PG_URL: postgres://${WATTSWARM_PG_USER:-postgres}:${WATTSWARM_PG_PASSWORD:-postgres}@postgres:5432/${WATTSWARM_PG_DB:-wattswarm}
+      WATTSWARM_STATE_DIR: /var/lib/wattswarm
+      WATTSWARM_UI_LISTEN: 0.0.0.0:7788
+      WATTSWARM_BOOTSTRAP_EXECUTOR_NAME: rt
+      WATTSWARM_BOOTSTRAP_EXECUTOR_URL: http://runtime:8787
+      WATTSWARM_UDP_ANNOUNCE_ENABLED: ${WATTSWARM_UDP_ANNOUNCE_ENABLED:-false}
+      WATTSWARM_UDP_ANNOUNCE_MODE: ${WATTSWARM_UDP_ANNOUNCE_MODE:-multicast}
+      WATTSWARM_UDP_ANNOUNCE_ADDR: ${WATTSWARM_UDP_ANNOUNCE_ADDR:-239.255.42.99}
+      WATTSWARM_UDP_ANNOUNCE_PORT: ${WATTSWARM_UDP_ANNOUNCE_PORT:-37931}
+    volumes:
+      - wattswarm_state_data:/var/lib/wattswarm
+    ports:
+      - "${WATTSWARM_UI_PORT:-7788}:7788"
+
+  runtime:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: wattswarm-runtime
+    restart: unless-stopped
+    entrypoint: ["/app/target/release/wattswarm-runtime"]
+    command: ["--listen", "0.0.0.0:8787"]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8787/health > /dev/null"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 5s
+    ports:
+      - "${WATTSWARM_RUNTIME_PORT:-8787}:8787"
+
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: wattswarm-worker
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      runtime:
+        condition: service_healthy
+      kernel:
+        condition: service_started
+    environment:
+      WATTSWARM_PG_URL: postgres://${WATTSWARM_PG_USER:-postgres}:${WATTSWARM_PG_PASSWORD:-postgres}@postgres:5432/${WATTSWARM_PG_DB:-wattswarm}
+      WATTSWARM_STATE_DIR: /var/lib/wattswarm
+      WATTSWARM_DB_NAME: wattswarm.db
+      WATTSWARM_WORKER_CONCURRENCY: ${WATTSWARM_WORKER_CONCURRENCY:-16}
+      WATTSWARM_WORKER_POLL_MS: ${WATTSWARM_WORKER_POLL_MS:-250}
+      WATTSWARM_WORKER_LEASE_MS: ${WATTSWARM_WORKER_LEASE_MS:-30000}
+    volumes:
+      - wattswarm_state_data:/var/lib/wattswarm
+    entrypoint: ["/bin/sh", "-lc"]
+    command:
+      - >
+        exec /app/target/release/wattswarm
+        --state-dir "$$WATTSWARM_STATE_DIR"
+        --db "$$WATTSWARM_DB_NAME"
+        run --pg-url "$$WATTSWARM_PG_URL"
+        worker
+        --concurrency "$$WATTSWARM_WORKER_CONCURRENCY"
+        --poll-ms "$$WATTSWARM_WORKER_POLL_MS"
+        --lease-ms "$$WATTSWARM_WORKER_LEASE_MS"
+
+volumes:
+  wattswarm_pg_data:
+  wattswarm_state_data:

@@ -1,0 +1,20 @@
+[package]
+name = "wattswarm-storage-core"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+default = ["storage-postgres"]
+storage-postgres = []
+storage-sqlite = []
+test-utils = []
+
+[dependencies]
+anyhow = { workspace = true }
+chrono = { workspace = true }
+hex = { workspace = true }
+postgres = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+wattswarm-crypto = { workspace = true }
+wattswarm-protocol = { workspace = true }

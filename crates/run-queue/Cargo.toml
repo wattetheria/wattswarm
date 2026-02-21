@@ -1,0 +1,19 @@
+[package]
+name = "wattswarm-run-queue"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+default = ["postgres"]
+postgres = []
+legacy = []
+
+[dependencies]
+anyhow = { workspace = true }
+chrono = { workspace = true }
+postgres = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+wattswarm-control-plane = { workspace = true }
+wattswarm-protocol = { workspace = true }

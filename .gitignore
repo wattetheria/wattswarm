@@ -1,0 +1,25 @@
+# Build
+/target/
+
+# Runtime state
+.wattswarm/
+.ws-dev/
+*.db
+*.db-wal
+*.db-shm
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Logs
+*.log
+
+AGENTS.md

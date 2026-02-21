@@ -1,0 +1,54 @@
+[package]
+name = "wattswarm"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "wattswarm"
+path = "src/lib.rs"
+
+[[bin]]
+name = "wattswarm"
+path = "src/main.rs"
+
+[[bin]]
+name = "wattswarm-runtime"
+path = "../wattswarm-runtime/src/main.rs"
+
+[features]
+default = ["storage-postgres", "runtime-http", "discovery-udp"]
+storage-postgres = ["wattswarm-storage-core/storage-postgres"]
+storage-sqlite = ["wattswarm-storage-core/storage-sqlite"]
+runtime-http = []
+runtime-mock = []
+discovery-udp = ["wattswarm-control-plane/discovery-udp"]
+run-queue-legacy = ["wattswarm-run-queue/legacy"]
+ui = []
+test-utils = ["wattswarm-storage-core/test-utils"]
+
+[dependencies]
+anyhow = { workspace = true }
+axum = { workspace = true }
+chrono = { workspace = true }
+clap = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+uuid = { workspace = true }
+
+wattswarm-protocol = { workspace = true }
+wattswarm-crypto = { workspace = true }
+wattswarm-policy-engine = { workspace = true }
+wattswarm-runtime-client = { workspace = true }
+wattswarm-storage-core = { workspace = true }
+wattswarm-node-core = { workspace = true }
+wattswarm-control-plane = { workspace = true }
+wattswarm-run-queue = { workspace = true }
+
+[dev-dependencies]
+assert_cmd = { workspace = true }
+base64 = { workspace = true }
+predicates = { workspace = true }
+tempfile = { workspace = true }
+tower = { workspace = true }
