@@ -344,7 +344,6 @@ mod tests {
             eprintln!("skip run-queue admin_api tests: postgres not reachable");
             return None;
         }
-        queue.init_schema().expect("init schema");
         Some(queue)
     }
 
@@ -399,6 +398,7 @@ mod tests {
         let Some(_db_lock) = DbTestLock::acquire(&queue) else {
             return;
         };
+        queue.init_schema().expect("init schema");
         if shared_db_is_busy(&queue) {
             eprintln!("skip admin_api db test: shared database has active external runs");
             return;
@@ -434,6 +434,7 @@ mod tests {
         let Some(_db_lock) = DbTestLock::acquire(&queue) else {
             return;
         };
+        queue.init_schema().expect("init schema");
         if shared_db_is_busy(&queue) {
             eprintln!("skip admin_api db test: shared database has active external runs");
             return;
@@ -500,6 +501,7 @@ mod tests {
         let Some(_db_lock) = DbTestLock::acquire(&queue) else {
             return;
         };
+        queue.init_schema().expect("init schema");
         if shared_db_is_busy(&queue) {
             eprintln!("skip admin_api db test: shared database has active external runs");
             return;
