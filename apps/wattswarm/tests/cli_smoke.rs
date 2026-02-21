@@ -202,6 +202,186 @@ fn cli_executors_add_and_list() {
 }
 
 #[test]
+fn cli_peers_and_log_replay_verify() {
+    let dir = tempdir().unwrap();
+    let state_dir = dir.path().join("state");
+    let db = "test.db";
+
+    cmd()
+        .args([
+            "--state-dir",
+            state_dir.to_str().unwrap(),
+            "--db",
+            db,
+            "node",
+            "up",
+        ])
+        .assert()
+        .success();
+
+    cmd()
+        .args([
+            "--state-dir",
+            state_dir.to_str().unwrap(),
+            "--db",
+            db,
+            "peers",
+            "list",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("["));
+
+    cmd()
+        .args([
+            "--state-dir",
+            state_dir.to_str().unwrap(),
+            "--db",
+            db,
+            "log",
+            "replay",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("replayed"));
+
+    cmd()
+        .args([
+            "--state-dir",
+            state_dir.to_str().unwrap(),
+            "--db",
+            db,
+            "log",
+            "verify",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("verified"));
+}
+
+#[test]
+fn cli_knowledge_export_requires_exactly_one_selector() {
+    let dir = tempdir().unwrap();
+    let state_dir = dir.path().join("state");
+    let db = "test.db";
+    let out = dir.path().join("knowledge.json");
+
+    cmd()
+        .args([
+            "--state-dir",
+            state_dir.to_str().unwrap(),
+            "--db",
+            db,
+            "knowledge",
+            "export",
+            "--task_type",
+            "resume_review",
+            "--task_id",
+            "task-1",
+            "--out",
+            out.to_str().unwrap(),
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "knowledge export requires exactly one of --task_type or --task_id",
+        ));
+
+    cmd()
+        .args([
+            "--state-dir",
+            state_dir.to_str().unwrap(),
+            "--db",
+            db,
+            "knowledge",
+            "export",
+            "--out",
+            out.to_str().unwrap(),
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "knowledge export requires exactly one of --task_type or --task_id",
+        ));
+}
+
+#[test]
+fn cli_run_queue_lifecycle_smoke() {
+    let dir = tempdir().unwrap();
+    let state_dir = dir.path().join("state");
+    let run_id = format!("run-cli-{}", Uuid::new_v4().simple());
+    let spec_file = dir.path().join("run.json");
+    std::fs::create_dir_all(&state_dir).unwrap();
+    std::fs::write(
+        &spec_file,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "run_id": run_id,
+            "task_type": "resume_review",
+            "shared_inputs": {"city":"San Francisco"},
+            "agents": [
+                {
+                    "agent_id": "a1",
+                    "executor": "rt",
+                    "profile": "default",
+                    "prompt": "review"
+                }
+            ]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    cmd()
+        .args([
+            "run",
+            "--pg-url",
+            "postgres://postgres:postgres@127.0.0.1:55432/wattswarm",
+            "init",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("run queue schema initialized"));
+
+    cmd()
+        .args(["run", "submit", spec_file.to_str().unwrap(), "--kickoff"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"ok\": true"))
+        .stdout(predicate::str::contains(&run_id));
+
+    cmd()
+        .args(["run", "watch", &run_id])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(&run_id))
+        .stdout(predicate::str::contains("\"status\":"));
+
+    cmd()
+        .args(["run", "events", &run_id, "--limit", "1"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("RUN_"));
+
+    cmd()
+        .args(["run", "cancel", &run_id])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("cancel requested"));
+
+    cmd()
+        .args(["run", "result", &run_id])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"status\": \"CANCELL"));
+
+    cmd()
+        .args(["run", "retry", "run-does-not-exist"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("run not found"));
+}
+
+#[test]
 fn cli_run_real_flow_with_http_runtime() {
     if std::env::var("WATTSWARM_ENABLE_NETWORK_TESTS").as_deref() != Ok("1") {
         return;
