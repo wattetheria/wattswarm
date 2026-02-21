@@ -298,3 +298,233 @@ impl PgRunQueue {
         Ok(events)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::super::status::{
+        RUN_STATUS_FAILED, RUN_STATUS_QUEUED, STEP_STATUS_FAILED, STEP_STATUS_QUEUED,
+    };
+    use super::super::types::{AggregationPolicy, RetryPolicy, RunAgentSpec, RunSubmitSpec};
+    use super::*;
+    use serde_json::json;
+    use uuid::Uuid;
+    const TEST_DB_LOCK_KEY: i64 = 1_987_654_321;
+
+    struct DbTestLock {
+        client: postgres::Client,
+    }
+
+    impl DbTestLock {
+        fn acquire(queue: &PgRunQueue) -> Option<Self> {
+            let mut client = queue.connect().ok()?;
+            client
+                .query_one("SELECT pg_advisory_lock($1)", &[&TEST_DB_LOCK_KEY])
+                .ok()?;
+            Some(Self { client })
+        }
+    }
+
+    impl Drop for DbTestLock {
+        fn drop(&mut self) {
+            let _ = self
+                .client
+                .query("SELECT pg_advisory_unlock($1)", &[&TEST_DB_LOCK_KEY]);
+        }
+    }
+
+    fn test_pg_url() -> String {
+        std::env::var("WATTSWARM_CORE_PG_URL")
+            .or_else(|_| std::env::var("WATTSWARM_PG_URL"))
+            .unwrap_or_else(|_| "postgres://postgres:postgres@127.0.0.1:55432/wattswarm".to_owned())
+    }
+
+    fn queue_or_skip() -> Option<PgRunQueue> {
+        let queue = PgRunQueue::new(test_pg_url());
+        if queue.connect().is_err() {
+            eprintln!("skip run-queue admin_api tests: postgres not reachable");
+            return None;
+        }
+        queue.init_schema().expect("init schema");
+        Some(queue)
+    }
+
+    fn shared_db_is_busy(queue: &PgRunQueue) -> bool {
+        let Ok(mut client) = queue.connect() else {
+            return false;
+        };
+        let row = client
+            .query_one(
+                "SELECT EXISTS(
+                    SELECT 1
+                    FROM runs
+                    WHERE status IN ('QUEUED','RUNNING','CANCELLING')
+                      AND run_id NOT LIKE 'worker-%'
+                      AND run_id NOT LIKE 'admin-%'
+                )",
+                &[],
+            )
+            .ok();
+        row.map(|r| r.get::<_, bool>(0)).unwrap_or(false)
+    }
+
+    fn sample_spec(run_id: &str) -> RunSubmitSpec {
+        RunSubmitSpec {
+            run_id: run_id.to_owned(),
+            task_type: "swarm".to_owned(),
+            shared_inputs: json!({"resume":"text"}),
+            agents: vec![RunAgentSpec {
+                agent_id: "agent-a".to_owned(),
+                executor: "rt".to_owned(),
+                profile: "default".to_owned(),
+                prompt: "review".to_owned(),
+                weight: 1.0,
+                priority: 0,
+            }],
+            retry: RetryPolicy::default(),
+            aggregation: AggregationPolicy::default(),
+        }
+    }
+
+    fn cleanup_run(queue: &PgRunQueue, run_id: &str) {
+        if let Ok(mut client) = queue.connect() {
+            let _ = client.execute("DELETE FROM runs WHERE run_id = $1", &[&run_id]);
+        }
+    }
+
+    #[test]
+    fn submit_kickoff_cancel_and_query_views() {
+        let Some(queue) = queue_or_skip() else {
+            return;
+        };
+        let Some(_db_lock) = DbTestLock::acquire(&queue) else {
+            return;
+        };
+        if shared_db_is_busy(&queue) {
+            eprintln!("skip admin_api db test: shared database has active external runs");
+            return;
+        }
+        let run_id = format!("admin-flow-{}", Uuid::new_v4().simple());
+        cleanup_run(&queue, &run_id);
+
+        queue.submit_run(sample_spec(&run_id)).expect("submit run");
+
+        let created_view = queue.run_view(&run_id).expect("view after submit");
+        assert_eq!(created_view.status, RUN_STATUS_CREATED);
+        assert_eq!(created_view.counts.created, 1);
+
+        let created_result = queue.run_result(&run_id).expect("result after submit");
+        assert_eq!(created_result["status"], RUN_STATUS_CREATED);
+        assert_eq!(created_result["result"], json!({}));
+
+        let events = queue.run_events(&run_id, 20).expect("events");
+        assert!(events.iter().any(|e| e.event_type == "RUN_CREATED"));
+
+        queue.cancel_run(&run_id).expect("cancel");
+        let cancelled_result = queue.run_result(&run_id).expect("result after cancel");
+        assert_eq!(cancelled_result["status"], RUN_STATUS_CANCELLED);
+
+        cleanup_run(&queue, &run_id);
+    }
+
+    #[test]
+    fn retry_requeues_failed_steps_and_resets_run_status() {
+        let Some(queue) = queue_or_skip() else {
+            return;
+        };
+        let Some(_db_lock) = DbTestLock::acquire(&queue) else {
+            return;
+        };
+        if shared_db_is_busy(&queue) {
+            eprintln!("skip admin_api db test: shared database has active external runs");
+            return;
+        }
+        let run_id = format!("admin-retry-{}", Uuid::new_v4().simple());
+        cleanup_run(&queue, &run_id);
+        queue.submit_run(sample_spec(&run_id)).expect("submit run");
+
+        let mut client = queue.connect().expect("connect");
+        let now = now_ms();
+        client
+            .execute(
+                "UPDATE run_steps
+                 SET status = $2,
+                     error_text = 'failed',
+                     finished_at = TIMESTAMPTZ 'epoch' + ($3::bigint * INTERVAL '1 millisecond'),
+                     updated_at = TIMESTAMPTZ 'epoch' + ($3::bigint * INTERVAL '1 millisecond')
+                 WHERE run_id = $1",
+                &[&run_id, &STEP_STATUS_FAILED, &now],
+            )
+            .expect("mark step failed");
+        client
+            .execute(
+                "UPDATE runs
+                 SET status = $2,
+                     error_text = 'failed',
+                     finished_at = TIMESTAMPTZ 'epoch' + ($3::bigint * INTERVAL '1 millisecond'),
+                     updated_at = TIMESTAMPTZ 'epoch' + ($3::bigint * INTERVAL '1 millisecond')
+                 WHERE run_id = $1",
+                &[&run_id, &RUN_STATUS_FAILED, &now],
+            )
+            .expect("mark run failed");
+
+        queue.retry_run(&run_id).expect("retry run");
+        let view = queue.run_view(&run_id).expect("view after retry");
+        assert!(view.status == RUN_STATUS_QUEUED || view.status == RUN_STATUS_RUNNING);
+        assert!(view.counts.queued >= 0);
+        assert_eq!(view.counts.failed, 0);
+
+        let step_row = client
+            .query_one(
+                "SELECT status, error_text FROM run_steps WHERE run_id = $1",
+                &[&run_id],
+            )
+            .expect("step row");
+        let step_status: String = step_row.get(0);
+        let step_error: Option<String> = step_row.get(1);
+        assert!(step_status == STEP_STATUS_QUEUED || step_status == "LEASED");
+        if step_status == STEP_STATUS_QUEUED {
+            assert_eq!(step_error, None);
+        }
+
+        let events = queue.run_events(&run_id, 10).expect("events");
+        assert!(events.iter().any(|e| e.event_type == "RUN_RETRY_REQUESTED"));
+
+        cleanup_run(&queue, &run_id);
+    }
+
+    #[test]
+    fn run_events_falls_back_to_empty_payload_for_invalid_json() {
+        let Some(queue) = queue_or_skip() else {
+            return;
+        };
+        let Some(_db_lock) = DbTestLock::acquire(&queue) else {
+            return;
+        };
+        if shared_db_is_busy(&queue) {
+            eprintln!("skip admin_api db test: shared database has active external runs");
+            return;
+        }
+        let run_id = format!("admin-events-{}", Uuid::new_v4().simple());
+        cleanup_run(&queue, &run_id);
+        queue.submit_run(sample_spec(&run_id)).expect("submit run");
+
+        let mut client = queue.connect().expect("connect");
+        let now = now_ms();
+        client
+            .execute(
+                "INSERT INTO run_events(run_id, event_type, payload_json, created_at)
+                 VALUES ($1, $2, 'not-json', TIMESTAMPTZ 'epoch' + ($3::bigint * INTERVAL '1 millisecond'))",
+                &[&run_id, &"BROKEN_EVENT", &now],
+            )
+            .expect("insert broken event");
+
+        let events = queue.run_events(&run_id, 20).expect("events");
+        let broken = events
+            .iter()
+            .find(|e| e.event_type == "BROKEN_EVENT")
+            .expect("broken event present");
+        assert_eq!(broken.payload, json!({}));
+
+        cleanup_run(&queue, &run_id);
+    }
+}
