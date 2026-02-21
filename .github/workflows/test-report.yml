@@ -100,15 +100,14 @@ jobs:
       - name: Prepare coverage directory
         run: mkdir -p target/test-report
 
-      - name: Generate coverage (LCOV + HTML)
-        run: cargo llvm-cov --workspace --lcov --output-path target/test-report/lcov.info --html --output-dir target/test-report/html
+      - name: Generate coverage (HTML)
+        run: cargo llvm-cov --workspace --html --output-dir target/test-report/html
 
       - name: Upload coverage report
         uses: actions/upload-artifact@v4
         with:
           name: rust-coverage-report
           path: |
-            target/test-report/lcov.info
             target/test-report/html
 
   deploy-coverage-pages:
