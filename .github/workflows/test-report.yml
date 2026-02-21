@@ -5,6 +5,15 @@ on:
     branches: ["**"]
   pull_request:
 
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: "pages"
+  cancel-in-progress: false
+
 jobs:
   rust-tests-and-reports:
     runs-on: ubuntu-latest
@@ -65,3 +74,26 @@ jobs:
             target/test-report/lcov.info
             target/test-report/coverage-summary.txt
             target/test-report/html
+
+  deploy-coverage-pages:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: rust-tests-and-reports
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Download test reports
+        uses: actions/download-artifact@v4
+        with:
+          name: rust-test-report
+          path: coverage-report
+
+      - name: Upload coverage site artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: coverage-report/html
+
+      - name: Deploy coverage site
+        id: deployment
+        uses: actions/deploy-pages@v4
