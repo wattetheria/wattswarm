@@ -46,7 +46,9 @@ jobs:
         run: mkdir -p target/test-report
 
       - name: Run tests (JUnit)
-        run: cargo nextest run --workspace --junit-file target/test-report/junit.xml
+        # Newer cargo-nextest versions don't support --junit-file CLI flag;
+        # use nextest config to keep JUnit output stable across versions.
+        run: cargo nextest run --workspace --config-file .config/nextest.toml
 
       - name: Generate coverage (LCOV + HTML + summary)
         run: |
