@@ -1,9 +1,50 @@
+use wattswarm_storage_core::storage::pg::ErrorCode;
 use wattswarm_storage_core::storage::pg::{
     Connection, Error, OptionalExtension, ParamValue, types::ValueRef,
 };
 
+use std::sync::{Mutex, OnceLock};
+
 fn open_test_connection() -> Connection {
     Connection::open_in_memory().expect("open in-memory pg-backed schema")
+}
+
+static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+    ENV_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+struct EnvVarGuard {
+    key: &'static str,
+    prev: Option<String>,
+}
+
+impl EnvVarGuard {
+    fn set(key: &'static str, value: &str) -> Self {
+        let prev = std::env::var(key).ok();
+        // SAFETY: tests serialize env mutations via ENV_LOCK.
+        unsafe {
+            std::env::set_var(key, value);
+        }
+        Self { key, prev }
+    }
+}
+
+impl Drop for EnvVarGuard {
+    fn drop(&mut self) {
+        // SAFETY: tests serialize env mutations via ENV_LOCK.
+        unsafe {
+            if let Some(prev) = &self.prev {
+                std::env::set_var(self.key, prev);
+            } else {
+                std::env::remove_var(self.key);
+            }
+        }
+    }
 }
 
 #[test]
@@ -129,4 +170,113 @@ fn to_param_value_handles_option_and_unit_variants() {
         wattswarm_storage_core::storage::pg::to_param_value(()),
         ParamValue::Null
     ));
+    assert!(matches!(
+        wattswarm_storage_core::storage::pg::to_param_value(Option::<&str>::Some("a")),
+        ParamValue::Text(v) if v == "a"
+    ));
+    assert!(matches!(
+        wattswarm_storage_core::storage::pg::to_param_value(Option::<u64>::Some(7)),
+        ParamValue::I64(7)
+    ));
+    assert!(matches!(
+        wattswarm_storage_core::storage::pg::to_param_value(Option::<i32>::Some(9)),
+        ParamValue::I64(9)
+    ));
+    assert!(matches!(
+        wattswarm_storage_core::storage::pg::to_param_value(Option::<f64>::Some(1.5)),
+        ParamValue::F64(v) if (v - 1.5).abs() < 1e-9
+    ));
+}
+
+#[test]
+fn query_map_empty_result_keeps_column_names_empty() {
+    let conn = open_test_connection();
+    conn.execute_batch("CREATE TABLE empty_rows (x BIGINT)")
+        .expect("create table");
+
+    let mut stmt = conn
+        .prepare("SELECT x FROM empty_rows WHERE x > 0")
+        .expect("prepare query");
+    let mapped = stmt
+        .query_map(wattswarm_storage_core::params![], |r| {
+            r.get::<usize, i64>(0)
+        })
+        .expect("query map");
+    let rows: Vec<i64> = mapped.collect::<Result<_, _>>().expect("collect mapped");
+
+    assert!(rows.is_empty());
+    assert!(stmt.column_names().is_empty());
+}
+
+#[test]
+fn db_constraint_violation_maps_to_constraint_error_code() {
+    let conn = open_test_connection();
+    conn.execute_batch("CREATE TABLE uniq_case (v TEXT UNIQUE)")
+        .expect("create table");
+    conn.execute(
+        "INSERT INTO uniq_case(v) VALUES (?1)",
+        wattswarm_storage_core::params!["dup"],
+    )
+    .expect("insert first row");
+
+    let err = conn
+        .execute(
+            "INSERT INTO uniq_case(v) VALUES (?1)",
+            wattswarm_storage_core::params!["dup"],
+        )
+        .expect_err("duplicate insert should fail");
+    assert!(matches!(
+        err,
+        Error::DbFailure(ref failure, _) if failure.code == ErrorCode::ConstraintViolation
+    ));
+}
+
+#[test]
+fn option_cell_decoding_covers_multiple_pg_types() {
+    let conn = open_test_connection();
+    conn.query_row(
+        "SELECT
+            NULL::TEXT AS t,
+            NULL::BOOL AS b,
+            NULL::DOUBLE PRECISION AS f,
+            NULL::BIGINT AS i",
+        wattswarm_storage_core::params![],
+        |row| {
+            assert_eq!(row.get::<usize, Option<String>>(0)?, None);
+            assert_eq!(row.get::<usize, Option<bool>>(1)?, None);
+            assert_eq!(row.get::<usize, Option<f64>>(2)?, None);
+            assert_eq!(row.get::<usize, Option<u64>>(3)?, None);
+            Ok(())
+        },
+    )
+    .expect("decode option cells");
+}
+
+#[test]
+fn open_with_path_isolation_uses_distinct_schemas() {
+    let _env_guard = env_lock();
+    let _isolate = EnvVarGuard::set("WATTSWARM_PG_ISOLATE_BY_PATH", "1");
+
+    let dir = std::env::temp_dir();
+    let path_a = dir.join(format!("ws-pg-a-{}.db", uuid::Uuid::new_v4().simple()));
+    let path_b = dir.join(format!("ws-pg-b-{}.db", uuid::Uuid::new_v4().simple()));
+
+    let conn_a = Connection::open(&path_a).expect("open connection A");
+    let conn_b = Connection::open(&path_b).expect("open connection B");
+
+    conn_a
+        .execute_batch("CREATE TABLE iso_only (id BIGINT); INSERT INTO iso_only(id) VALUES (1)")
+        .expect("setup isolated table in A");
+
+    let count_b = conn_b
+        .query_row(
+            "SELECT COUNT(1)
+             FROM information_schema.tables
+             WHERE table_schema = current_schema()
+               AND table_name = 'iso_only'",
+            wattswarm_storage_core::params![],
+            |r| r.get::<usize, i64>(0),
+        )
+        .expect("count table in B");
+    assert_eq!(count_b, 0);
 }
