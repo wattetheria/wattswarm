@@ -173,3 +173,112 @@ pub fn verifier_result_from_response(
         policy_hash: policy.policy_hash.clone(),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::reason_codes::{
+        REASON_EVIDENCE_TIMEOUT, REASON_EVIDENCE_UNREACHABLE, REASON_SCHEMA_INVALID,
+    };
+    use serde_json::json;
+
+    fn sample_policy() -> PolicyBinding {
+        PolicyBinding {
+            policy_id: "vp.schema_only.v1".to_owned(),
+            policy_version: "1".to_owned(),
+            policy_hash: "hash-1".to_owned(),
+            policy_params: json!({}),
+        }
+    }
+
+    #[test]
+    fn http_runtime_client_url_joins_without_double_slash() {
+        let client = HttpRuntimeClient::new("http://127.0.0.1:8787/");
+        assert_eq!(client.url("/health"), "http://127.0.0.1:8787/health");
+        assert_eq!(
+            client.url("/capabilities"),
+            "http://127.0.0.1:8787/capabilities"
+        );
+    }
+
+    #[test]
+    fn verifier_result_uses_explicit_status_when_present() {
+        let response = VerifyResponse {
+            verification_status: Some(VerificationStatus::Inconclusive),
+            passed: true,
+            score: 0.9,
+            reason_codes: vec![],
+            verifier_result_hash: "vr-hash".to_owned(),
+            provider_family: "pf".to_owned(),
+            model_id: "m1".to_owned(),
+        };
+        let result = verifier_result_from_response(
+            response,
+            "c1".to_owned(),
+            "e1".to_owned(),
+            &sample_policy(),
+        );
+        assert_eq!(result.verification_status, VerificationStatus::Inconclusive);
+        assert!(result.passed);
+    }
+
+    #[test]
+    fn verifier_result_infers_passed_status() {
+        let response = VerifyResponse {
+            verification_status: None,
+            passed: true,
+            score: 1.0,
+            reason_codes: vec![],
+            verifier_result_hash: "vr-hash".to_owned(),
+            provider_family: "pf".to_owned(),
+            model_id: "m1".to_owned(),
+        };
+        let result = verifier_result_from_response(
+            response,
+            "c1".to_owned(),
+            "e1".to_owned(),
+            &sample_policy(),
+        );
+        assert_eq!(result.verification_status, VerificationStatus::Passed);
+    }
+
+    #[test]
+    fn verifier_result_infers_inconclusive_for_evidence_reasons() {
+        let response = VerifyResponse {
+            verification_status: None,
+            passed: false,
+            score: 0.2,
+            reason_codes: vec![REASON_EVIDENCE_UNREACHABLE, REASON_EVIDENCE_TIMEOUT],
+            verifier_result_hash: "vr-hash".to_owned(),
+            provider_family: "pf".to_owned(),
+            model_id: "m1".to_owned(),
+        };
+        let result = verifier_result_from_response(
+            response,
+            "c1".to_owned(),
+            "e1".to_owned(),
+            &sample_policy(),
+        );
+        assert_eq!(result.verification_status, VerificationStatus::Inconclusive);
+    }
+
+    #[test]
+    fn verifier_result_infers_failed_for_non_evidence_reasons() {
+        let response = VerifyResponse {
+            verification_status: None,
+            passed: false,
+            score: 0.2,
+            reason_codes: vec![REASON_SCHEMA_INVALID],
+            verifier_result_hash: "vr-hash".to_owned(),
+            provider_family: "pf".to_owned(),
+            model_id: "m1".to_owned(),
+        };
+        let result = verifier_result_from_response(
+            response,
+            "c1".to_owned(),
+            "e1".to_owned(),
+            &sample_policy(),
+        );
+        assert_eq!(result.verification_status, VerificationStatus::Failed);
+    }
+}

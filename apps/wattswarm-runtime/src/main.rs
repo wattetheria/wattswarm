@@ -166,3 +166,137 @@ async fn verify(
     };
     Ok(Json(response))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wattswarm::types::{Candidate, PolicyBinding};
+
+    fn sample_state() -> AppState {
+        AppState {
+            capabilities: RuntimeCapabilities {
+                task_types: vec!["swarm".to_owned()],
+                profiles: vec!["default".to_owned()],
+                provider_family: "swarm-runtime".to_owned(),
+                model_id: "swarm-model-v1".to_owned(),
+            },
+            policies: Arc::new(PolicyRegistry::with_builtin()),
+        }
+    }
+
+    fn sample_policy_binding(state: &AppState) -> PolicyBinding {
+        state
+            .policies
+            .binding_for("vp.schema_only.v1", json!({}))
+            .expect("builtin policy binding")
+    }
+
+    fn sample_execute_request(policy_hash: String) -> ExecuteRequest {
+        let mut contract = wattswarm::task_template::sample_contract("task-1", policy_hash);
+        contract.output_schema = json!({
+            "type": "object",
+            "required": ["answer"],
+            "properties": {
+                "answer": {"type": "string"}
+            }
+        });
+        ExecuteRequest {
+            task_id: "task-1".to_owned(),
+            execution_id: "exec-1".to_owned(),
+            task_type: "swarm".to_owned(),
+            inputs: json!({"prompt": "hello"}),
+            profile: "default".to_owned(),
+            task_contract: contract,
+            stage: "explore".to_owned(),
+            attempt_id: "attempt-1".to_owned(),
+            seed_bundle: None,
+        }
+    }
+
+    #[test]
+    fn split_csv_trims_and_drops_empty_items() {
+        assert_eq!(
+            split_csv(" swarm , , default,verify "),
+            vec![
+                "swarm".to_owned(),
+                "default".to_owned(),
+                "verify".to_owned()
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_builds_candidate_output_and_evidence() {
+        let state = sample_state();
+        let policy = sample_policy_binding(&state);
+        let req = sample_execute_request(policy.policy_hash);
+
+        let Json(resp) = execute(State(state), Json(req)).await.expect("execute ok");
+        assert_eq!(resp.candidate_output["answer"], json!("default::hello"));
+        assert_eq!(resp.evidence_inline.len(), 1);
+        assert_eq!(resp.evidence_refs.len(), 1);
+        assert_eq!(resp.evidence_refs[0].mime, "application/json");
+        assert!(
+            resp.evidence_refs[0]
+                .producer
+                .contains("swarm-runtime/swarm-model-v1")
+        );
+    }
+
+    #[tokio::test]
+    async fn verify_returns_bad_request_for_invalid_policy_binding() {
+        let state = sample_state();
+        let req = VerifyRequest {
+            candidate: Candidate {
+                candidate_id: "c1".to_owned(),
+                execution_id: "e1".to_owned(),
+                output: json!({"answer":"ok"}),
+                evidence_inline: vec![],
+                evidence_refs: vec![],
+            },
+            output_schema: json!({
+                "type":"object",
+                "required":["answer"],
+                "properties":{"answer":{"type":"string"}}
+            }),
+            policy: PolicyBinding {
+                policy_id: "vp.schema_only.v1".to_owned(),
+                policy_version: "1".to_owned(),
+                policy_hash: "invalid-hash".to_owned(),
+                policy_params: json!({}),
+            },
+        };
+
+        let err = verify(State(state), Json(req))
+            .await
+            .expect_err("should fail");
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert!(err.1.contains("policy binding invalid"));
+    }
+
+    #[tokio::test]
+    async fn verify_returns_passed_status_for_valid_candidate() {
+        let state = sample_state();
+        let policy = sample_policy_binding(&state);
+        let req = VerifyRequest {
+            candidate: Candidate {
+                candidate_id: "c1".to_owned(),
+                execution_id: "e1".to_owned(),
+                output: json!({"answer":"ok"}),
+                evidence_inline: vec![],
+                evidence_refs: vec![],
+            },
+            output_schema: json!({
+                "type":"object",
+                "required":["answer"],
+                "properties":{"answer":{"type":"string"}}
+            }),
+            policy,
+        };
+
+        let Json(resp) = verify(State(state), Json(req)).await.expect("verify ok");
+        assert_eq!(resp.verification_status, Some(VerificationStatus::Passed));
+        assert!(resp.passed);
+        assert_eq!(resp.score, 1.0);
+    }
+}

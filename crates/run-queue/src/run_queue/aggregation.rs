@@ -146,3 +146,89 @@ fn pick_majority(counter: &HashMap<String, u32>) -> Option<String> {
     pairs.sort_by(|a, b| b.1.cmp(a.1).then_with(|| a.0.cmp(b.0)));
     pairs.first().map(|(key, _)| (*key).clone())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        bump_vote, extract_step_conclusion, normalize_text, parse_json_value, pick_majority,
+    };
+    use serde_json::json;
+    use std::collections::HashMap;
+
+    #[test]
+    fn parse_json_value_defaults_to_empty_object() {
+        assert_eq!(parse_json_value(None), json!({}));
+        assert_eq!(parse_json_value(Some("not-json")), json!({}));
+    }
+
+    #[test]
+    fn parse_json_value_parses_valid_json() {
+        assert_eq!(
+            parse_json_value(Some(r#"{"x":1,"y":"ok"}"#)),
+            json!({"x": 1, "y": "ok"})
+        );
+    }
+
+    #[test]
+    fn extract_step_conclusion_prefers_candidate_output() {
+        let result = json!({
+            "candidate_output": {"decision":"approve","answer":"yes"},
+            "decision": "reject"
+        });
+        assert_eq!(
+            extract_step_conclusion(&result),
+            json!({"decision":"approve","answer":"yes"})
+        );
+    }
+
+    #[test]
+    fn extract_step_conclusion_parses_json_result_summary() {
+        let result = json!({
+            "result_summary": "{\"decision\":\"accept\",\"answer\":\"done\"}"
+        });
+        assert_eq!(
+            extract_step_conclusion(&result),
+            json!({"decision":"accept","answer":"done"})
+        );
+    }
+
+    #[test]
+    fn extract_step_conclusion_falls_back_to_raw_summary_or_null() {
+        let plain_summary = json!({"result_summary":"summary text"});
+        assert_eq!(
+            extract_step_conclusion(&plain_summary),
+            json!("summary text")
+        );
+
+        let bare = json!({"decision":"accept","answer":"ok"});
+        assert_eq!(extract_step_conclusion(&bare), bare);
+
+        let empty = json!({"x":1});
+        assert_eq!(extract_step_conclusion(&empty), serde_json::Value::Null);
+    }
+
+    #[test]
+    fn normalize_text_trims_and_uppercases() {
+        assert_eq!(normalize_text("  hello  "), Some("HELLO".to_owned()));
+        assert_eq!(normalize_text("\n\t "), None);
+    }
+
+    #[test]
+    fn bump_vote_accumulates_counts() {
+        let mut votes = HashMap::new();
+        bump_vote(&mut votes, "ACCEPT");
+        bump_vote(&mut votes, "ACCEPT");
+        bump_vote(&mut votes, "REJECT");
+        assert_eq!(votes.get("ACCEPT"), Some(&2));
+        assert_eq!(votes.get("REJECT"), Some(&1));
+    }
+
+    #[test]
+    fn pick_majority_returns_most_voted_key() {
+        let mut votes = HashMap::new();
+        votes.insert("APPROVE".to_owned(), 3);
+        votes.insert("REJECT".to_owned(), 1);
+        assert_eq!(pick_majority(&votes), Some("APPROVE".to_owned()));
+        assert_eq!(pick_majority(&HashMap::new()), None);
+    }
+}
