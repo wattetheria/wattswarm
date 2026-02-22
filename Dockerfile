@@ -4,6 +4,10 @@ WORKDIR /app
 
 RUN cargo install cargo-chef --locked
 
+FROM chef AS dev
+
+RUN cargo install cargo-watch --locked
+
 FROM chef AS planner
 
 COPY Cargo.toml Cargo.lock ./
