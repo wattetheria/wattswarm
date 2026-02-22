@@ -237,7 +237,9 @@ impl PgStore {
                 winning_candidate_hash TEXT NOT NULL,
                 output_digest TEXT NOT NULL,
                 result_summary TEXT NOT NULL,
+                quorum_result_json TEXT NOT NULL DEFAULT '{}',
                 reason_codes_json TEXT NOT NULL,
+                reason_details TEXT NOT NULL DEFAULT '{}',
                 policy_snapshot_digest TEXT NOT NULL,
                 task_type TEXT NOT NULL DEFAULT '',
                 input_digest TEXT NOT NULL DEFAULT '',
@@ -338,6 +340,8 @@ impl PgStore {
                 input_digest TEXT NOT NULL,
                 lookup_time TIMESTAMPTZ NOT NULL,
                 hit_count BIGINT NOT NULL,
+                exact_hit_count BIGINT NOT NULL DEFAULT 0,
+                similar_hit_count BIGINT NOT NULL DEFAULT 0,
                 hits_digest TEXT NOT NULL,
                 reuse_applied BOOLEAN NOT NULL DEFAULT FALSE
             );
@@ -430,6 +434,16 @@ impl PgStore {
                     "decision_memory",
                     "deprecated_as_exact",
                     "ALTER TABLE decision_memory ADD COLUMN deprecated_as_exact BOOLEAN NOT NULL DEFAULT FALSE",
+                ),
+                (
+                    "decision_memory",
+                    "quorum_result_json",
+                    "ALTER TABLE decision_memory ADD COLUMN quorum_result_json TEXT NOT NULL DEFAULT '{}'",
+                ),
+                (
+                    "decision_memory",
+                    "reason_details",
+                    "ALTER TABLE decision_memory ADD COLUMN reason_details TEXT NOT NULL DEFAULT '{}'",
                 ),
                 (
                     "runtime_metrics",
@@ -540,6 +554,16 @@ impl PgStore {
                     "verifier_results",
                     "passed",
                     "ALTER TABLE verifier_results ADD COLUMN passed BOOLEAN NOT NULL DEFAULT FALSE",
+                ),
+                (
+                    "knowledge_lookups",
+                    "exact_hit_count",
+                    "ALTER TABLE knowledge_lookups ADD COLUMN exact_hit_count BIGINT NOT NULL DEFAULT 0",
+                ),
+                (
+                    "knowledge_lookups",
+                    "similar_hit_count",
+                    "ALTER TABLE knowledge_lookups ADD COLUMN similar_hit_count BIGINT NOT NULL DEFAULT 0",
                 ),
                 (
                     "knowledge_lookups",

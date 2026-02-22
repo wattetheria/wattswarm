@@ -27,9 +27,14 @@ This repository now contains a Rust-first v0.1 implementation of:
 - Finality proof verification and anti-fork finalize rule
 - Knowledge Store tables on PostgreSQL: decision/evidence/metrics/settlement/reputation/lookups
 - Active knowledge lookup with EXACT/SIMILAR hit typing and `seed_bundle` injection to `/execute`
+- Seed bundle guardrails with strict size caps (bundle/hit payload/reason summary/constraints) and automatic fallback to `EXPLORE` when oversized
 - Explore early-stop controls (`explore.topk`, `explore.stop.no_new_evidence_rounds`)
+- Reuse budget gating for DECIDE path (`reuse_max_attempts`, `reuse_verify_time_ms`, `reuse_verify_cost_units`)
 - Reuse blacklist enforcement (`reuse_blacklist`) and `REUSE_REJECT_RECORDED` downgrade handling
 - Automatic `REUSE_REJECT_RECORDED` emission during timeout reconciliation when reject quorum is reached for a reused candidate
+- Decision memory persistence now includes `quorum_result_json` and `reason_details` snapshots for finalize/error/expiry auditing
+- Knowledge lookup persistence now includes `exact_hit_count` and `similar_hit_count` per lookup row
+- Runtime metrics now compute true p95 latency from samples and track `reuse_hit_rate_exact`, `reuse_hit_rate_similar`, `reuse_candidate_accept_rate`
 - Advisory workflow state machine (`ADVISORY_CREATED` -> `ADVISORY_APPROVED` -> `ADVISORY_APPLIED`)
 - `POLICY_TUNED` validation bound to approved advisory records
 - Unknown reason-code observability export (unknown code + peer/local protocol versions)

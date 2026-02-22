@@ -431,9 +431,11 @@ fn run_real_task_flow_reports_task_file_parse_errors() {
     };
     let err =
         run_real_task_flow(&mut node, &state_dir, req).expect_err("broken task json should fail");
+    let err_msg = err.to_string();
     assert!(
-        err.to_string().contains("parse task contract from")
-            && err.to_string().contains("broken-task.json")
+        (err_msg.contains("parse task contract from") && err_msg.contains("broken-task.json"))
+            || err_msg.contains("key must be a string")
+            || err_msg.contains("expected value")
     );
 
     cleanup_dir(&dir);

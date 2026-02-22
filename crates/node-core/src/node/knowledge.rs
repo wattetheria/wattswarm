@@ -1,5 +1,24 @@
 use super::*;
 
+const MAX_SEED_BUNDLE_BYTES: usize = 65_536;
+const MAX_SEED_HIT_REUSE_PAYLOAD_BYTES: usize = 32_768;
+const MAX_SEED_HIT_REASON_SUMMARY_BYTES: usize = 4_096;
+const MAX_SEED_CONSTRAINT_BYTES: usize = 8_192;
+
+fn json_bytes_len(value: &serde_json::Value) -> Result<usize> {
+    Ok(serde_json::to_vec(value)?.len())
+}
+
+fn sanitize_seed_hit(hit: &KnowledgeHit) -> Result<Option<KnowledgeHit>> {
+    if json_bytes_len(&hit.reuse_payload)? > MAX_SEED_HIT_REUSE_PAYLOAD_BYTES {
+        return Ok(None);
+    }
+    if json_bytes_len(&hit.reason_codes_summary)? > MAX_SEED_HIT_REASON_SUMMARY_BYTES {
+        return Ok(None);
+    }
+    Ok(Some(hit.clone()))
+}
+
 impl Node {
     pub(crate) fn record_knowledge_lookup(
         &self,
@@ -10,6 +29,14 @@ impl Node {
         hits: &[KnowledgeHit],
     ) -> Result<()> {
         let input_digest = sha256_hex(&serde_json::to_vec(&contract.inputs)?);
+        let exact_hit_count = hits
+            .iter()
+            .filter(|h| h.hit_type == KnowledgeHitType::Exact)
+            .count() as u32;
+        let similar_hit_count = hits
+            .iter()
+            .filter(|h| h.hit_type == KnowledgeHitType::Similar)
+            .count() as u32;
         let hit_refs: Vec<_> = hits
             .iter()
             .take(5)
@@ -30,6 +57,8 @@ impl Node {
             &input_digest,
             lookup_time,
             hit_count,
+            exact_hit_count,
+            similar_hit_count,
             &hits_digest,
             reuse_applied,
         )?;
@@ -105,39 +134,91 @@ impl Node {
     ) -> Result<Option<SeedBundle>> {
         let mut selected = Vec::new();
         if reuse_applied {
-            selected.extend(
-                hits.iter()
-                    .filter(|h| h.hit_type == KnowledgeHitType::Exact)
-                    .take(1)
-                    .cloned(),
-            );
+            for hit in hits
+                .iter()
+                .filter(|h| h.hit_type == KnowledgeHitType::Exact)
+                .take(1)
+            {
+                if let Some(sanitized) = sanitize_seed_hit(hit)? {
+                    selected.push(sanitized);
+                }
+            }
         }
-        selected.extend(
-            hits.iter()
-                .filter(|h| h.hit_type == KnowledgeHitType::Similar)
-                .take(5)
-                .cloned(),
-        );
+        for hit in hits
+            .iter()
+            .filter(|h| h.hit_type == KnowledgeHitType::Similar)
+            .take(5)
+        {
+            if let Some(sanitized) = sanitize_seed_hit(hit)? {
+                selected.push(sanitized);
+            }
+        }
         if selected.is_empty() {
             return Ok(None);
         }
 
-        let blacklist = self.store.list_reuse_blacklist(task_id, epoch)?;
-        Ok(Some(SeedBundle {
+        let mut blacklist = self.store.list_reuse_blacklist(task_id, epoch)?;
+        let mut must_consider_claims = vec![
+            format!(
+                "policy:{}:{}",
+                contract.acceptance.verifier_policy.policy_id,
+                contract.acceptance.verifier_policy.policy_version
+            ),
+            format!("task_type:{}", contract.task_type),
+        ];
+        loop {
+            let constraints = SeedConstraints {
+                must_consider_claims: must_consider_claims.clone(),
+                must_avoid_blacklist_candidate_hashes: blacklist.clone(),
+            };
+            let constraints_bytes = serde_json::to_vec(&constraints)?.len();
+            if constraints_bytes <= MAX_SEED_CONSTRAINT_BYTES {
+                break;
+            }
+            if !blacklist.is_empty() {
+                blacklist.pop();
+                continue;
+            }
+            if must_consider_claims.len() > 1 {
+                must_consider_claims.pop();
+                continue;
+            }
+            return Ok(None);
+        }
+
+        let mut bundle = SeedBundle {
             seed_type: "SIMILAR_HITS_V1".to_owned(),
             hits: selected,
             constraints: SeedConstraints {
-                must_consider_claims: vec![
-                    format!(
-                        "policy:{}:{}",
-                        contract.acceptance.verifier_policy.policy_id,
-                        contract.acceptance.verifier_policy.policy_version
-                    ),
-                    format!("task_type:{}", contract.task_type),
-                ],
+                must_consider_claims,
                 must_avoid_blacklist_candidate_hashes: blacklist,
             },
-        }))
+        };
+
+        while serde_json::to_vec(&bundle)?.len() > MAX_SEED_BUNDLE_BYTES {
+            if bundle.hits.len() > 1 {
+                bundle.hits.pop();
+                continue;
+            }
+            if !bundle
+                .constraints
+                .must_avoid_blacklist_candidate_hashes
+                .is_empty()
+            {
+                bundle
+                    .constraints
+                    .must_avoid_blacklist_candidate_hashes
+                    .pop();
+                continue;
+            }
+            if bundle.constraints.must_consider_claims.len() > 1 {
+                bundle.constraints.must_consider_claims.pop();
+                continue;
+            }
+            return Ok(None);
+        }
+
+        Ok(Some(bundle))
     }
 
     pub(crate) fn record_unknown_reason_observations(
@@ -180,6 +261,8 @@ impl Node {
             .any(|code| *code == REASON_TASK_TIMEOUT || *code == REASON_EVIDENCE_TIMEOUT);
         let crash = result.reason_codes.contains(&REASON_RUNTIME_CRASH);
         let invalid_output = result.reason_codes.contains(&REASON_INVALID_OUTPUT);
+        let (reuse_hit_exact, reuse_hit_similar, reuse_applied) =
+            self.store.lookup_hit_profile(task_id)?;
         let reject_reason_codes: Vec<u16> = if result.passed {
             Vec::new()
         } else {
@@ -198,6 +281,9 @@ impl Node {
             latency_ms,
             cost_units: task.contract.budget.cost_units,
             reject_reason_codes: &reject_reason_codes,
+            reuse_hit_exact,
+            reuse_hit_similar,
+            reuse_applied,
         };
         self.store.upsert_runtime_metric_observation(&observation)
     }

@@ -233,7 +233,9 @@ fn export_and_vote_checkpoint_membership_paths_work() {
             "winner-hash",
             "output-digest",
             &serde_json::json!({"winner":"cand-1"}),
+            &serde_json::json!({"approvals":1,"rejects":0,"quorum_threshold":1}),
             &[101, 202],
+            &serde_json::json!({"reason":"ok"}),
             "policy-snapshot",
             task_type,
             "input-digest",
@@ -267,6 +269,9 @@ fn export_and_vote_checkpoint_membership_paths_work() {
             latency_ms: 120,
             cost_units: 9,
             reject_reason_codes: &reject_codes,
+            reuse_hit_exact: true,
+            reuse_hit_similar: false,
+            reuse_applied: true,
         })
         .expect("upsert runtime metric");
 
@@ -297,6 +302,8 @@ fn export_and_vote_checkpoint_membership_paths_work() {
             "input-digest",
             1_700_000_002_500,
             1,
+            1,
+            0,
             "hits-digest",
             true,
         )

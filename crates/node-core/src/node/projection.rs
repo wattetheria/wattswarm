@@ -178,6 +178,28 @@ impl Node {
                     &task.contract.acceptance.verifier_policy,
                 )?);
                 let reason_codes: Vec<u16> = vec![REASON_SCHEMA_OK];
+                let approvals = self.store.count_valid_votes_for_candidate_hash(
+                    &payload.task_id,
+                    &payload.winning_candidate_hash,
+                    VoteChoice::Approve,
+                )?;
+                let rejects = self.store.count_valid_votes_for_candidate_hash(
+                    &payload.task_id,
+                    &payload.winning_candidate_hash,
+                    VoteChoice::Reject,
+                )?;
+                let reveal_voter_count =
+                    self.store.list_vote_reveal_voters(&payload.task_id)?.len();
+                let quorum_result = serde_json::json!({
+                    "approvals": approvals,
+                    "rejects": rejects,
+                    "quorum_threshold": task.contract.acceptance.quorum_threshold,
+                    "reveal_voter_count": reveal_voter_count
+                });
+                let reason_details = serde_json::json!({
+                    "status": "FINALIZED",
+                    "candidate_id": payload.candidate_id
+                });
                 self.store.put_decision_memory(
                     &payload.task_id,
                     payload.epoch,
@@ -186,7 +208,9 @@ impl Node {
                     &payload.winning_candidate_hash,
                     &output_digest,
                     &candidate.output,
+                    &quorum_result,
                     &reason_codes,
+                    &reason_details,
                     &policy_snapshot_digest,
                     &task.contract.task_type,
                     &sha256_hex(&serde_json::to_vec(&task.contract.inputs)?),
@@ -211,6 +235,12 @@ impl Node {
                 let policy_snapshot_digest = sha256_hex(&serde_json::to_vec(
                     &task.contract.acceptance.verifier_policy,
                 )?);
+                let reason_details = serde_json::json!({
+                    "message": payload.message,
+                    "custom_reason_namespace": payload.custom_reason_namespace.as_deref(),
+                    "custom_reason_code": payload.custom_reason_code.as_deref(),
+                    "custom_reason_message": payload.custom_reason_message.as_deref()
+                });
                 self.store.put_decision_memory(
                     &payload.task_id,
                     event.epoch,
@@ -219,7 +249,9 @@ impl Node {
                     "",
                     "",
                     &serde_json::json!({"task_error": payload.message}),
+                    &serde_json::json!({}),
                     &payload.reason_codes,
+                    &reason_details,
                     &policy_snapshot_digest,
                     &task.contract.task_type,
                     &sha256_hex(&serde_json::to_vec(&task.contract.inputs)?),
@@ -257,7 +289,9 @@ impl Node {
                         "",
                         "",
                         &serde_json::json!({"expired": true}),
+                        &serde_json::json!({}),
                         &[REASON_TASK_EXPIRED],
+                        &serde_json::json!({"reason":"expiry_ms reached"}),
                         &policy_snapshot_digest,
                         &task.contract.task_type,
                         &sha256_hex(&serde_json::to_vec(&task.contract.inputs)?),

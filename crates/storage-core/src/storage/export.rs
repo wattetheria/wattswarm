@@ -11,7 +11,9 @@ impl PgStore {
             &conn,
             "SELECT task_id, epoch, final_commit_hash,
                     (EXTRACT(EPOCH FROM finalized_at) * 1000)::BIGINT AS finalized_at,
-                    winning_candidate_hash, output_digest, result_summary, reason_codes_json, policy_snapshot_digest, task_type, input_digest, output_schema_digest, policy_id, policy_params_digest
+                    winning_candidate_hash, output_digest, result_summary, quorum_result_json,
+                    reason_codes_json, reason_details, policy_snapshot_digest, task_type,
+                    input_digest, output_schema_digest, policy_id, policy_params_digest
              FROM decision_memory WHERE task_id = $1 ORDER BY epoch ASC",
             params![task_id],
         )?;
@@ -62,7 +64,7 @@ impl PgStore {
             &conn,
             "SELECT task_id, task_type, input_digest,
                     (EXTRACT(EPOCH FROM lookup_time) * 1000)::BIGINT AS lookup_time,
-                    hit_count, hits_digest, reuse_applied
+                    hit_count, exact_hit_count, similar_hit_count, hits_digest, reuse_applied
              FROM knowledge_lookups WHERE task_id = $1 ORDER BY lookup_time DESC",
             params![task_id],
         )?;
@@ -107,7 +109,7 @@ impl PgStore {
             &conn,
             "SELECT task_id, task_type, input_digest,
                     (EXTRACT(EPOCH FROM lookup_time) * 1000)::BIGINT AS lookup_time,
-                    hit_count, hits_digest, reuse_applied
+                    hit_count, exact_hit_count, similar_hit_count, hits_digest, reuse_applied
              FROM knowledge_lookups WHERE task_type = $1 ORDER BY lookup_time DESC",
             params![task_type],
         )?;

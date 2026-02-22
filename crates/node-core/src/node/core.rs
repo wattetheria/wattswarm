@@ -669,9 +669,17 @@ impl Node {
         let exact_hit_exists = lookup_hits
             .iter()
             .any(|hit| hit.hit_type == KnowledgeHitType::Exact);
-        let reuse_attempts = self.store.count_reuse_applied_lookups(task_id)?;
-        let reuse_allowed =
-            exact_hit_exists && reuse_attempts < task.contract.budget.reuse_max_attempts;
+        let (reuse_attempts, _) = self.store.reuse_applied_lookup_stats(task_id)?;
+        let reuse_attempt_within_limit = reuse_attempts < task.contract.budget.reuse_max_attempts;
+        let reuse_cost_within_limit =
+            u64::from(reuse_attempts) < task.contract.budget.reuse_verify_cost_units;
+        let task_created_at = self.store.task_created_at(task_id)?.unwrap_or(created_at);
+        let reuse_time_within_limit =
+            created_at <= task_created_at.saturating_add(task.contract.budget.reuse_verify_time_ms);
+        let reuse_allowed = exact_hit_exists
+            && reuse_attempt_within_limit
+            && reuse_cost_within_limit
+            && reuse_time_within_limit;
         let seed_bundle = self.seed_bundle_from_hits(
             task_id,
             epoch,
@@ -679,11 +687,17 @@ impl Node {
             &task.contract,
             reuse_allowed,
         )?;
+        let exact_seed_available = seed_bundle.as_ref().is_some_and(|bundle| {
+            bundle
+                .hits
+                .iter()
+                .any(|hit| hit.hit_type == KnowledgeHitType::Exact)
+        });
         self.record_knowledge_lookup(
             &task.contract,
             created_at,
             usize::min(lookup_hits.len(), 5) as u32,
-            reuse_allowed,
+            reuse_allowed && exact_seed_available,
             &lookup_hits,
         )?;
         let blacklist_non_empty = self
@@ -691,7 +705,7 @@ impl Node {
             .list_reuse_blacklist(task_id, epoch)?
             .iter()
             .any(|_| true);
-        let stage = if reuse_allowed {
+        let stage = if reuse_allowed && exact_seed_available {
             "DECIDE".to_owned()
         } else if blacklist_non_empty {
             "DIVERGE_MODE".to_owned()

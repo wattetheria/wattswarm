@@ -165,6 +165,41 @@ fn mk_node(identity: NodeIdentity, membership: Membership) -> Node {
     Node::new(identity, PgStore::open_in_memory().unwrap(), membership).unwrap()
 }
 
+fn seed_exact_decision_memory(
+    node: &Node,
+    history_task_id: &str,
+    contract: &TaskContract,
+    summary: serde_json::Value,
+) {
+    let policy_snapshot_digest =
+        sha256_hex(&serde_json::to_vec(&contract.acceptance.verifier_policy).unwrap());
+    let input_digest = sha256_hex(&serde_json::to_vec(&contract.inputs).unwrap());
+    let output_schema_digest = sha256_hex(&serde_json::to_vec(&contract.output_schema).unwrap());
+    let policy_params_digest = sha256_hex(
+        &serde_json::to_vec(&contract.acceptance.verifier_policy.policy_params).unwrap(),
+    );
+    node.store
+        .put_decision_memory(
+            history_task_id,
+            1,
+            &format!("final-{history_task_id}"),
+            10,
+            "winner-hash",
+            "output-digest",
+            &summary,
+            &serde_json::json!({"approvals": 1, "rejects": 0, "quorum_threshold": 1}),
+            &[REASON_SCHEMA_OK],
+            &serde_json::json!({"status":"FINALIZED"}),
+            &policy_snapshot_digest,
+            &contract.task_type,
+            &input_digest,
+            &output_schema_digest,
+            &contract.acceptance.verifier_policy.policy_id,
+            &policy_params_digest,
+        )
+        .unwrap();
+}
+
 #[test]
 fn single_machine_loop_submit_to_finalize() {
     let id = identity(1);
@@ -1953,6 +1988,160 @@ fn knowledge_lookup_exact_switches_execute_stage_to_decide_with_seed() {
 }
 
 #[test]
+fn knowledge_lookup_reuse_time_budget_forces_explore_stage() {
+    let id = identity(141);
+    let membership = membership_all(&[id.node_id()]);
+    let mut node = mk_node(id, membership);
+    let policy_hash = node
+        .policy_registry()
+        .binding_for("vp.schema_only.v1", serde_json::json!({}))
+        .unwrap()
+        .policy_hash;
+
+    let mut contract = mk_contract("task-reuse-time-budget", policy_hash, 1_000_000, 1);
+    contract.budget.reuse_verify_time_ms = 5;
+    node.submit_task(contract.clone(), 1, 100).unwrap();
+    seed_exact_decision_memory(
+        &node,
+        "task-reuse-time-budget-history",
+        &contract,
+        serde_json::json!({"answer":"seeded"}),
+    );
+    node.claim_task(
+        "task-reuse-time-budget",
+        ClaimRole::Propose,
+        "exec-reuse-time",
+        7_000,
+        1,
+        110,
+    )
+    .unwrap();
+
+    let observed_stage = Arc::new(Mutex::new(String::new()));
+    let observed_stage_clone = observed_stage.clone();
+    let runtime = MockRuntime {
+        execute: Box::new(move |req| {
+            *observed_stage_clone.lock().unwrap() = req.stage.clone();
+            Ok(ExecuteResponse {
+                candidate_output: serde_json::json!({
+                    "answer": "from-runtime",
+                    "confidence": 0.9,
+                    "check_summary": "ok"
+                }),
+                evidence_inline: vec![],
+                evidence_refs: vec![wattswarm::types::ArtifactRef {
+                    uri: "https://example.com/r".to_owned(),
+                    digest: "sha256:r".to_owned(),
+                    size_bytes: 1,
+                    mime: "text/plain".to_owned(),
+                    created_at: 1,
+                    producer: "runtime/default".to_owned(),
+                }],
+            })
+        }),
+        verify: Box::new(|_| Err(anyhow!("unused"))),
+    };
+
+    node.auto_execute_with_runtime(
+        &runtime,
+        "task-reuse-time-budget",
+        "default",
+        "exec-reuse-time",
+        1,
+        120,
+    )
+    .unwrap();
+
+    assert_eq!(*observed_stage.lock().unwrap(), "EXPLORE");
+    assert_eq!(
+        node.store
+            .count_reuse_applied_lookups("task-reuse-time-budget")
+            .unwrap(),
+        0
+    );
+}
+
+#[test]
+fn seed_bundle_drops_oversized_hits_and_falls_back_to_explore() {
+    let id = identity(142);
+    let membership = membership_all(&[id.node_id()]);
+    let mut node = mk_node(id, membership);
+    let policy_hash = node
+        .policy_registry()
+        .binding_for("vp.schema_only.v1", serde_json::json!({}))
+        .unwrap()
+        .policy_hash;
+
+    let contract = mk_contract("task-seed-size-guard", policy_hash, 1_000_000, 1);
+    node.submit_task(contract.clone(), 1, 100).unwrap();
+    let oversized = "x".repeat(40_000);
+    seed_exact_decision_memory(
+        &node,
+        "task-seed-size-guard-history",
+        &contract,
+        serde_json::json!({"answer": oversized}),
+    );
+    node.claim_task(
+        "task-seed-size-guard",
+        ClaimRole::Propose,
+        "exec-seed-size",
+        7_000,
+        1,
+        110,
+    )
+    .unwrap();
+
+    let observed = Arc::new(Mutex::new((String::new(), false)));
+    let observed_clone = observed.clone();
+    let runtime = MockRuntime {
+        execute: Box::new(move |req| {
+            let has_seed = req
+                .seed_bundle
+                .as_ref()
+                .is_some_and(|bundle| !bundle.hits.is_empty());
+            *observed_clone.lock().unwrap() = (req.stage.clone(), has_seed);
+            Ok(ExecuteResponse {
+                candidate_output: serde_json::json!({
+                    "answer": "from-runtime",
+                    "confidence": 0.9,
+                    "check_summary": "ok"
+                }),
+                evidence_inline: vec![],
+                evidence_refs: vec![wattswarm::types::ArtifactRef {
+                    uri: "https://example.com/r".to_owned(),
+                    digest: "sha256:r".to_owned(),
+                    size_bytes: 1,
+                    mime: "text/plain".to_owned(),
+                    created_at: 1,
+                    producer: "runtime/default".to_owned(),
+                }],
+            })
+        }),
+        verify: Box::new(|_| Err(anyhow!("unused"))),
+    };
+
+    node.auto_execute_with_runtime(
+        &runtime,
+        "task-seed-size-guard",
+        "default",
+        "exec-seed-size",
+        1,
+        120,
+    )
+    .unwrap();
+
+    let (stage, has_seed) = observed.lock().unwrap().clone();
+    assert_eq!(stage, "EXPLORE");
+    assert!(!has_seed);
+    assert_eq!(
+        node.store
+            .count_reuse_applied_lookups("task-seed-size-guard")
+            .unwrap(),
+        0
+    );
+}
+
+#[test]
 fn advisory_requires_created_approved_applied_before_policy_tuned() {
     let id = identity(42);
     let membership = membership_all(&[id.node_id()]);
@@ -2768,9 +2957,16 @@ fn runtime_metrics_cost_units_accumulates_with_observations() {
         latency_ms: 100,
         cost_units: 100,
         reject_reason_codes: &[],
+        reuse_hit_exact: false,
+        reuse_hit_similar: true,
+        reuse_applied: false,
     };
     let obs_2 = RuntimeMetricObservation {
         cost_units: 250,
+        latency_ms: 220,
+        reuse_hit_exact: true,
+        reuse_hit_similar: false,
+        reuse_applied: true,
         ..obs_1
     };
     store.upsert_runtime_metric_observation(&obs_1).unwrap();
@@ -2780,6 +2976,19 @@ fn runtime_metrics_cost_units_accumulates_with_observations() {
     let metrics = exported["runtime_metrics"].as_array().unwrap();
     assert_eq!(metrics.len(), 1);
     assert_eq!(metrics[0]["cost_units"].as_i64(), Some(350));
+    assert_eq!(metrics[0]["time_to_finality_p95"].as_i64(), Some(220));
+    let exact_rate = metrics[0]["reuse_hit_rate_exact"]
+        .as_f64()
+        .unwrap_or_default();
+    let similar_rate = metrics[0]["reuse_hit_rate_similar"]
+        .as_f64()
+        .unwrap_or_default();
+    let accept_rate = metrics[0]["reuse_candidate_accept_rate"]
+        .as_f64()
+        .unwrap_or_default();
+    assert!((exact_rate - 0.5).abs() < 0.0001);
+    assert!((similar_rate - 0.5).abs() < 0.0001);
+    assert!((accept_rate - 0.5).abs() < 0.0001);
 }
 
 #[test]

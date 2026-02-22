@@ -119,6 +119,9 @@ pub struct RuntimeMetricObservation<'a> {
     pub latency_ms: u64,
     pub cost_units: u64,
     pub reject_reason_codes: &'a [u16],
+    pub reuse_hit_exact: bool,
+    pub reuse_hit_similar: bool,
+    pub reuse_applied: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -208,6 +211,20 @@ fn median_u64(values: &[u64]) -> Option<u64> {
     } else {
         Some((sorted[mid - 1] + sorted[mid]) / 2)
     }
+}
+
+fn percentile_u64(values: &[u64], percentile: u8) -> Option<u64> {
+    if values.is_empty() {
+        return None;
+    }
+    if percentile >= 100 {
+        return values.iter().copied().max();
+    }
+    let mut sorted = values.to_vec();
+    sorted.sort_unstable();
+    let n = sorted.len();
+    let rank = ((usize::from(percentile) * (n.saturating_sub(1))) + 99) / 100;
+    sorted.get(rank).copied()
 }
 
 fn with_reputation_decimal(rows: Vec<serde_json::Value>) -> Vec<serde_json::Value> {

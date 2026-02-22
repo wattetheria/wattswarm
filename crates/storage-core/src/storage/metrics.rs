@@ -138,7 +138,8 @@ impl PgStore {
         let existing = conn
             .query_row(
                 "SELECT sample_count, finalize_count, timeout_count, crash_count, invalid_output_count,
-                        latency_samples_json, reject_reason_distribution, cost_units
+                        latency_samples_json, reject_reason_distribution, cost_units,
+                        reuse_hit_rate_exact, reuse_hit_rate_similar, reuse_candidate_accept_rate
                  FROM runtime_metrics
                  WHERE runtime_id = $1 AND profile_id = $2 AND task_type = $3
                    AND window_start = TIMESTAMPTZ 'epoch' + ($4::bigint * INTERVAL '1 millisecond')
@@ -160,6 +161,9 @@ impl PgStore {
                         r.get::<_, String>(5)?,
                         r.get::<_, String>(6)?,
                         r.get::<_, i64>(7)?,
+                        r.get::<_, f64>(8)?,
+                        r.get::<_, f64>(9)?,
+                        r.get::<_, f64>(10)?,
                     ))
                 },
             )
@@ -174,8 +178,23 @@ impl PgStore {
             mut latency_samples,
             mut reject_dist,
             mut total_cost_units,
+            mut reuse_hit_rate_exact,
+            mut reuse_hit_rate_similar,
+            mut reuse_candidate_accept_rate,
         ) = match existing {
-            Some((a, b, c, d, e, latency_json, reject_json, cost_units)) => (
+            Some((
+                a,
+                b,
+                c,
+                d,
+                e,
+                latency_json,
+                reject_json,
+                cost_units,
+                exact_rate,
+                similar_rate,
+                accept_rate,
+            )) => (
                 a,
                 b,
                 c,
@@ -184,10 +203,14 @@ impl PgStore {
                 serde_json::from_str::<Vec<u64>>(&latency_json).unwrap_or_default(),
                 serde_json::from_str::<BTreeMap<String, u64>>(&reject_json).unwrap_or_default(),
                 cost_units,
+                exact_rate,
+                similar_rate,
+                accept_rate,
             ),
-            None => (0, 0, 0, 0, 0, Vec::new(), BTreeMap::new(), 0),
+            None => (0, 0, 0, 0, 0, Vec::new(), BTreeMap::new(), 0, 0.0, 0.0, 0.0),
         };
 
+        let prev_sample_count = sample_count;
         sample_count += 1;
         if obs.finalized {
             finalize_count += 1;
@@ -216,6 +239,7 @@ impl PgStore {
         total_cost_units = total_cost_units.saturating_add(obs.cost_units as i64);
 
         let median_latency_ms = median_u64(&latency_samples).unwrap_or(0) as i64;
+        let p95_latency_ms = percentile_u64(&latency_samples, 95).unwrap_or(0) as i64;
         let denom = sample_count.max(1) as f64;
         let finalize_rate = finalize_count as f64 / denom;
         let timeout_rate = timeout_count as f64 / denom;
@@ -230,8 +254,22 @@ impl PgStore {
             (timeout_count as f64 + invalid_output_count as f64) / denom
         };
         let time_to_finality_p50 = median_latency_ms;
-        let time_to_finality_p95 = median_latency_ms.saturating_mul(2);
-        let reuse_candidate_accept_rate = finalize_rate;
+        let time_to_finality_p95 = p95_latency_ms;
+        let sample_count_f = sample_count as f64;
+        let prev_weight = prev_sample_count as f64;
+        let current_exact = if obs.reuse_hit_exact { 1.0 } else { 0.0 };
+        let current_similar = if obs.reuse_hit_similar { 1.0 } else { 0.0 };
+        let current_accept = if obs.reuse_applied && obs.finalized {
+            1.0
+        } else {
+            0.0
+        };
+        reuse_hit_rate_exact =
+            ((reuse_hit_rate_exact * prev_weight) + current_exact) / sample_count_f;
+        reuse_hit_rate_similar =
+            ((reuse_hit_rate_similar * prev_weight) + current_similar) / sample_count_f;
+        reuse_candidate_accept_rate =
+            ((reuse_candidate_accept_rate * prev_weight) + current_accept) / sample_count_f;
         let da_fetch_fail_rate = timeout_rate;
 
         conn.execute(
@@ -297,8 +335,8 @@ impl PgStore {
                 crash_count,
                 invalid_output_count,
                 serde_json::to_string(&latency_samples)?,
-                0.0_f64,
-                0.0_f64,
+                reuse_hit_rate_exact,
+                reuse_hit_rate_similar,
                 reuse_candidate_accept_rate,
                 time_to_finality_p50,
                 time_to_finality_p95,

@@ -878,6 +878,49 @@ impl PgStore {
         Ok(count as u32)
     }
 
+    pub fn reuse_applied_lookup_stats(&self, task_id: &str) -> Result<(u32, Option<u64>)> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
+        let (count, first_at) = conn.query_row(
+            "SELECT COUNT(1) AS reuse_count,
+                    CASE
+                      WHEN MIN(lookup_time) IS NULL THEN NULL
+                      ELSE (EXTRACT(EPOCH FROM MIN(lookup_time)) * 1000)::BIGINT
+                    END AS first_lookup_at
+             FROM knowledge_lookups
+             WHERE task_id = $1 AND reuse_applied = TRUE",
+            params![task_id],
+            |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Option<i64>>(1)?)),
+        )?;
+        Ok((count as u32, first_at.map(|v| v as u64)))
+    }
+
+    pub fn lookup_hit_profile(&self, task_id: &str) -> Result<(bool, bool, bool)> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
+        let (exact_hits, similar_hits, reuse_applied) = conn.query_row(
+            "SELECT
+                COALESCE(SUM(exact_hit_count), 0)::BIGINT,
+                COALESCE(SUM(similar_hit_count), 0)::BIGINT,
+                COALESCE(SUM(CASE WHEN reuse_applied THEN 1 ELSE 0 END), 0)::BIGINT
+             FROM knowledge_lookups
+             WHERE task_id = $1",
+            params![task_id],
+            |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, i64>(2)?,
+                ))
+            },
+        )?;
+        Ok((exact_hits > 0, similar_hits > 0, reuse_applied > 0))
+    }
+
     pub fn find_reject_candidate_hash_with_quorum(
         &self,
         task_id: &str,
@@ -1035,6 +1078,8 @@ impl PgStore {
         input_digest: &str,
         lookup_time: u64,
         hit_count: u32,
+        exact_hit_count: u32,
+        similar_hit_count: u32,
         hits_digest: &str,
         reuse_applied: bool,
     ) -> Result<()> {
@@ -1043,14 +1088,16 @@ impl PgStore {
             .lock()
             .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
         conn.execute(
-            "INSERT INTO knowledge_lookups(task_id, task_type, input_digest, lookup_time, hit_count, hits_digest, reuse_applied)
-             VALUES ($1, $2, $3, TIMESTAMPTZ 'epoch' + ($4::bigint * INTERVAL '1 millisecond'), $5, $6, $7)",
+            "INSERT INTO knowledge_lookups(task_id, task_type, input_digest, lookup_time, hit_count, exact_hit_count, similar_hit_count, hits_digest, reuse_applied)
+             VALUES ($1, $2, $3, TIMESTAMPTZ 'epoch' + ($4::bigint * INTERVAL '1 millisecond'), $5, $6, $7, $8, $9)",
             params![
                 task_id,
                 task_type,
                 input_digest,
                 lookup_time as i64,
                 hit_count as i64,
+                exact_hit_count as i64,
+                similar_hit_count as i64,
                 hits_digest,
                 reuse_applied
             ],
@@ -1094,7 +1141,9 @@ impl PgStore {
         winning_candidate_hash: &str,
         output_digest: &str,
         result_summary: &serde_json::Value,
+        quorum_result: &serde_json::Value,
         reason_codes: &[u16],
+        reason_details: &serde_json::Value,
         policy_snapshot_digest: &str,
         task_type: &str,
         input_digest: &str,
@@ -1107,15 +1156,17 @@ impl PgStore {
             .lock()
             .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
         conn.execute(
-            "INSERT INTO decision_memory(task_id, epoch, final_commit_hash, finalized_at, winning_candidate_hash, output_digest, result_summary, reason_codes_json, policy_snapshot_digest, task_type, input_digest, output_schema_digest, policy_id, policy_params_digest, deprecated_as_exact)
-             VALUES ($1, $2, $3, TIMESTAMPTZ 'epoch' + ($4::bigint * INTERVAL '1 millisecond'), $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, COALESCE((SELECT deprecated_as_exact FROM decision_memory WHERE task_id = $1 AND epoch = $2), FALSE))
+            "INSERT INTO decision_memory(task_id, epoch, final_commit_hash, finalized_at, winning_candidate_hash, output_digest, result_summary, quorum_result_json, reason_codes_json, reason_details, policy_snapshot_digest, task_type, input_digest, output_schema_digest, policy_id, policy_params_digest, deprecated_as_exact)
+             VALUES ($1, $2, $3, TIMESTAMPTZ 'epoch' + ($4::bigint * INTERVAL '1 millisecond'), $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, COALESCE((SELECT deprecated_as_exact FROM decision_memory WHERE task_id = $1 AND epoch = $2), FALSE))
              ON CONFLICT(task_id, epoch) DO UPDATE SET
                final_commit_hash = excluded.final_commit_hash,
                finalized_at = excluded.finalized_at,
                winning_candidate_hash = excluded.winning_candidate_hash,
                output_digest = excluded.output_digest,
                result_summary = excluded.result_summary,
+               quorum_result_json = excluded.quorum_result_json,
                reason_codes_json = excluded.reason_codes_json,
+               reason_details = excluded.reason_details,
                policy_snapshot_digest = excluded.policy_snapshot_digest,
                task_type = excluded.task_type,
                input_digest = excluded.input_digest,
@@ -1131,7 +1182,9 @@ impl PgStore {
                 winning_candidate_hash,
                 output_digest,
                 serde_json::to_string(result_summary)?,
+                serde_json::to_string(quorum_result)?,
                 serde_json::to_string(reason_codes)?,
+                serde_json::to_string(reason_details)?,
                 policy_snapshot_digest,
                 task_type,
                 input_digest,
