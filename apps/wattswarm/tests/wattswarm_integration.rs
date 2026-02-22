@@ -1616,6 +1616,156 @@ fn implicit_stability_delta_uses_deterministic_fixed_point() {
 }
 
 #[test]
+fn finalize_applies_due_implicit_settlement_bonus() {
+    let id = identity(40);
+    let membership = membership_all(&[id.node_id()]);
+    let mut node = mk_node(id, membership);
+    let policy_hash = node
+        .policy_registry()
+        .binding_for("vp.schema_only.v1", serde_json::json!({}))
+        .unwrap()
+        .policy_hash;
+
+    let mut contract = mk_contract("task-implicit-bonus", policy_hash.clone(), 1_000_000, 1);
+    contract.acceptance.settlement.window_ms = 0;
+    node.submit_task(contract, 1, 10).unwrap();
+    node.claim_task(
+        "task-implicit-bonus",
+        ClaimRole::Propose,
+        "exec-implicit-p",
+        5_000,
+        1,
+        20,
+    )
+    .unwrap();
+    node.propose_candidate(
+        "task-implicit-bonus",
+        Candidate {
+            candidate_id: "cand-implicit".to_owned(),
+            execution_id: "exec-implicit-p".to_owned(),
+            output: serde_json::json!({"answer":"ok"}),
+            evidence_inline: vec![],
+            evidence_refs: vec![wattswarm::types::ArtifactRef {
+                uri: "https://example.com/implicit".to_owned(),
+                digest: "sha256:implicit".to_owned(),
+                size_bytes: 1,
+                mime: "text/plain".to_owned(),
+                created_at: 1,
+                producer: "r/p".to_owned(),
+            }],
+        },
+        1,
+        30,
+    )
+    .unwrap();
+    node.claim_task(
+        "task-implicit-bonus",
+        ClaimRole::Verify,
+        "exec-implicit-v",
+        5_000,
+        1,
+        40,
+    )
+    .unwrap();
+    node.evidence_available(
+        "task-implicit-bonus",
+        "cand-implicit",
+        "exec-implicit-v",
+        "sha256:implicit",
+        1,
+        45,
+    )
+    .unwrap();
+    node.submit_verifier_result(
+        "task-implicit-bonus",
+        wattswarm::types::VerifierResult {
+            candidate_id: "cand-implicit".to_owned(),
+            execution_id: "exec-implicit-v".to_owned(),
+            verification_status: VerificationStatus::Passed,
+            passed: true,
+            score: 1.0,
+            reason_codes: vec![REASON_SCHEMA_OK],
+            verifier_result_hash: "vrh-implicit".to_owned(),
+            provider_family: "pf".to_owned(),
+            model_id: "m".to_owned(),
+            policy_id: "vp.schema_only.v1".to_owned(),
+            policy_version: "1".to_owned(),
+            policy_hash: policy_hash.clone(),
+        },
+        1,
+        50,
+    )
+    .unwrap();
+
+    let candidate_hash_v = candidate_hash(
+        &node
+            .store
+            .get_candidate_by_id("task-implicit-bonus", "cand-implicit")
+            .unwrap()
+            .unwrap(),
+    )
+    .unwrap();
+    let commit_hash = vote_commit_hash(VoteChoice::Approve, "s-implicit", "vrh-implicit");
+    node.submit_vote_commit(
+        wattswarm::types::VoteCommitPayload {
+            task_id: "task-implicit-bonus".to_owned(),
+            candidate_id: "cand-implicit".to_owned(),
+            candidate_hash: candidate_hash_v.clone(),
+            execution_id: "exec-implicit-v".to_owned(),
+            verifier_result_hash: "vrh-implicit".to_owned(),
+            commit_hash,
+        },
+        1,
+        60,
+    )
+    .unwrap();
+    node.submit_vote_reveal(
+        wattswarm::types::VoteRevealPayload {
+            task_id: "task-implicit-bonus".to_owned(),
+            candidate_id: "cand-implicit".to_owned(),
+            candidate_hash: candidate_hash_v,
+            execution_id: "exec-implicit-v".to_owned(),
+            verifier_result_hash: "vrh-implicit".to_owned(),
+            vote: VoteChoice::Approve,
+            salt: "s-implicit".to_owned(),
+        },
+        1,
+        70,
+    )
+    .unwrap();
+    node.commit_decision("task-implicit-bonus", 1, "cand-implicit", 80)
+        .unwrap();
+    let proof = wattswarm::types::FinalityProof {
+        threshold: 1,
+        signatures: vec![finality_sign(
+            &node.identity,
+            "task-implicit-bonus",
+            1,
+            "cand-implicit",
+        )],
+    };
+    node.finalize_decision("task-implicit-bonus", 1, "cand-implicit", proof, 90)
+        .unwrap();
+
+    let settlement = node
+        .store
+        .get_task_settlement("task-implicit-bonus")
+        .unwrap()
+        .unwrap();
+    assert!(settlement.implicit_settled);
+    assert_eq!(settlement.implicit_settled_at, Some(90));
+
+    let exported = node
+        .store
+        .export_knowledge_by_task("task-implicit-bonus")
+        .unwrap();
+    let stability = exported["reputation_state"][0]["stability_reputation"]
+        .as_i64()
+        .unwrap_or(0);
+    assert!(stability > 0);
+}
+
+#[test]
 fn knowledge_lookup_exact_switches_execute_stage_to_decide_with_seed() {
     let id = identity(41);
     let membership = membership_all(&[id.node_id()]);
@@ -2240,6 +2390,293 @@ fn reuse_blacklist_prevents_same_candidate_hash_reproposal() {
     assert!(
         node.propose_candidate("task-reuse-live", live_candidate, 1, 180)
             .is_err()
+    );
+}
+
+#[test]
+fn reconcile_timeouts_auto_records_reuse_reject_quorum() {
+    let id = identity(143);
+    let membership = membership_all(&[id.node_id()]);
+    let mut node = mk_node(id, membership);
+    let policy_hash = node
+        .policy_registry()
+        .binding_for("vp.schema_only.v1", serde_json::json!({}))
+        .unwrap()
+        .policy_hash;
+
+    node.submit_task(
+        mk_contract("task-reuse-auto-ref", policy_hash.clone(), 1_000_000, 1),
+        1,
+        10,
+    )
+    .unwrap();
+    node.claim_task(
+        "task-reuse-auto-ref",
+        ClaimRole::Propose,
+        "exec-auto-ref-p",
+        5_000,
+        1,
+        20,
+    )
+    .unwrap();
+    node.propose_candidate(
+        "task-reuse-auto-ref",
+        Candidate {
+            candidate_id: "cand-auto-ref".to_owned(),
+            execution_id: "exec-auto-ref-p".to_owned(),
+            output: serde_json::json!({"answer":"ref"}),
+            evidence_inline: vec![],
+            evidence_refs: vec![wattswarm::types::ArtifactRef {
+                uri: "https://example.com/auto-ref".to_owned(),
+                digest: "sha256:auto-ref".to_owned(),
+                size_bytes: 1,
+                mime: "text/plain".to_owned(),
+                created_at: 1,
+                producer: "r/p".to_owned(),
+            }],
+        },
+        1,
+        30,
+    )
+    .unwrap();
+    node.claim_task(
+        "task-reuse-auto-ref",
+        ClaimRole::Verify,
+        "exec-auto-ref-v",
+        5_000,
+        1,
+        40,
+    )
+    .unwrap();
+    node.evidence_available(
+        "task-reuse-auto-ref",
+        "cand-auto-ref",
+        "exec-auto-ref-v",
+        "sha256:auto-ref",
+        1,
+        45,
+    )
+    .unwrap();
+    node.submit_verifier_result(
+        "task-reuse-auto-ref",
+        wattswarm::types::VerifierResult {
+            candidate_id: "cand-auto-ref".to_owned(),
+            execution_id: "exec-auto-ref-v".to_owned(),
+            verification_status: VerificationStatus::Passed,
+            passed: true,
+            score: 1.0,
+            reason_codes: vec![REASON_SCHEMA_OK],
+            verifier_result_hash: "vrh-auto-ref".to_owned(),
+            provider_family: "pf".to_owned(),
+            model_id: "m".to_owned(),
+            policy_id: "vp.schema_only.v1".to_owned(),
+            policy_version: "1".to_owned(),
+            policy_hash: policy_hash.clone(),
+        },
+        1,
+        50,
+    )
+    .unwrap();
+    let ref_candidate_hash = candidate_hash(
+        &node
+            .store
+            .get_candidate_by_id("task-reuse-auto-ref", "cand-auto-ref")
+            .unwrap()
+            .unwrap(),
+    )
+    .unwrap();
+    let ref_commit_hash = vote_commit_hash(VoteChoice::Approve, "salt-auto-ref", "vrh-auto-ref");
+    node.submit_vote_commit(
+        wattswarm::types::VoteCommitPayload {
+            task_id: "task-reuse-auto-ref".to_owned(),
+            candidate_id: "cand-auto-ref".to_owned(),
+            candidate_hash: ref_candidate_hash.clone(),
+            execution_id: "exec-auto-ref-v".to_owned(),
+            verifier_result_hash: "vrh-auto-ref".to_owned(),
+            commit_hash: ref_commit_hash,
+        },
+        1,
+        60,
+    )
+    .unwrap();
+    node.submit_vote_reveal(
+        wattswarm::types::VoteRevealPayload {
+            task_id: "task-reuse-auto-ref".to_owned(),
+            candidate_id: "cand-auto-ref".to_owned(),
+            candidate_hash: ref_candidate_hash,
+            execution_id: "exec-auto-ref-v".to_owned(),
+            verifier_result_hash: "vrh-auto-ref".to_owned(),
+            vote: VoteChoice::Approve,
+            salt: "salt-auto-ref".to_owned(),
+        },
+        1,
+        70,
+    )
+    .unwrap();
+    node.commit_decision("task-reuse-auto-ref", 1, "cand-auto-ref", 80)
+        .unwrap();
+    let proof = wattswarm::types::FinalityProof {
+        threshold: 1,
+        signatures: vec![finality_sign(
+            &node.identity,
+            "task-reuse-auto-ref",
+            1,
+            "cand-auto-ref",
+        )],
+    };
+    let ref_finalize = node
+        .finalize_decision("task-reuse-auto-ref", 1, "cand-auto-ref", proof, 90)
+        .unwrap();
+
+    node.submit_task(
+        mk_contract("task-reuse-auto-live", policy_hash, 1_000_000, 1),
+        1,
+        100,
+    )
+    .unwrap();
+    node.claim_task(
+        "task-reuse-auto-live",
+        ClaimRole::Propose,
+        "exec-auto-live-p",
+        7_000,
+        1,
+        110,
+    )
+    .unwrap();
+    let runtime_exec = MockRuntime {
+        execute: Box::new(|_| {
+            Ok(ExecuteResponse {
+                candidate_output: serde_json::json!({
+                    "answer": "reuse-live",
+                    "confidence": 0.8,
+                    "check_summary": "reuse-attempt"
+                }),
+                evidence_inline: vec![],
+                evidence_refs: vec![wattswarm::types::ArtifactRef {
+                    uri: "https://example.com/auto-live".to_owned(),
+                    digest: "sha256:auto-live".to_owned(),
+                    size_bytes: 1,
+                    mime: "text/plain".to_owned(),
+                    created_at: 1,
+                    producer: "r/p".to_owned(),
+                }],
+            })
+        }),
+        verify: Box::new(|_| Err(anyhow!("unused"))),
+    };
+    node.auto_execute_with_runtime(
+        &runtime_exec,
+        "task-reuse-auto-live",
+        "default",
+        "exec-auto-live-p",
+        1,
+        120,
+    )
+    .unwrap();
+    let live_candidate = node
+        .store
+        .get_candidate_by_id("task-reuse-auto-live", "cand-exec-auto-live-p")
+        .unwrap()
+        .unwrap();
+    let live_hash = candidate_hash(&live_candidate).unwrap();
+    node.claim_task(
+        "task-reuse-auto-live",
+        ClaimRole::Verify,
+        "exec-auto-live-v",
+        7_000,
+        1,
+        130,
+    )
+    .unwrap();
+    node.evidence_available(
+        "task-reuse-auto-live",
+        "cand-exec-auto-live-p",
+        "exec-auto-live-v",
+        "sha256:auto-live",
+        1,
+        135,
+    )
+    .unwrap();
+    node.submit_verifier_result(
+        "task-reuse-auto-live",
+        wattswarm::types::VerifierResult {
+            candidate_id: "cand-exec-auto-live-p".to_owned(),
+            execution_id: "exec-auto-live-v".to_owned(),
+            verification_status: VerificationStatus::Failed,
+            passed: false,
+            score: 0.0,
+            reason_codes: vec![REASON_SCHEMA_OK],
+            verifier_result_hash: "vrh-auto-live".to_owned(),
+            provider_family: "pf".to_owned(),
+            model_id: "m".to_owned(),
+            policy_id: "vp.schema_only.v1".to_owned(),
+            policy_version: "1".to_owned(),
+            policy_hash: node
+                .task_view("task-reuse-auto-live")
+                .unwrap()
+                .unwrap()
+                .contract
+                .acceptance
+                .verifier_policy
+                .policy_hash,
+        },
+        1,
+        140,
+    )
+    .unwrap();
+    let reject_commit_hash =
+        vote_commit_hash(VoteChoice::Reject, "salt-auto-live", "vrh-auto-live");
+    node.submit_vote_commit(
+        wattswarm::types::VoteCommitPayload {
+            task_id: "task-reuse-auto-live".to_owned(),
+            candidate_id: "cand-exec-auto-live-p".to_owned(),
+            candidate_hash: live_hash.clone(),
+            execution_id: "exec-auto-live-v".to_owned(),
+            verifier_result_hash: "vrh-auto-live".to_owned(),
+            commit_hash: reject_commit_hash,
+        },
+        1,
+        150,
+    )
+    .unwrap();
+    node.submit_vote_reveal(
+        wattswarm::types::VoteRevealPayload {
+            task_id: "task-reuse-auto-live".to_owned(),
+            candidate_id: "cand-exec-auto-live-p".to_owned(),
+            candidate_hash: live_hash.clone(),
+            execution_id: "exec-auto-live-v".to_owned(),
+            verifier_result_hash: "vrh-auto-live".to_owned(),
+            vote: VoteChoice::Reject,
+            salt: "salt-auto-live".to_owned(),
+        },
+        1,
+        160,
+    )
+    .unwrap();
+
+    let emitted = node.reconcile_timeouts(1, 10_000).unwrap();
+    let reject_payload = emitted.iter().find_map(|event| match &event.payload {
+        wattswarm::types::EventPayload::ReuseRejectRecorded(payload) => Some(payload.clone()),
+        _ => None,
+    });
+    assert!(emitted.iter().any(|event| {
+        matches!(
+            event.payload,
+            wattswarm::types::EventPayload::TaskRetryScheduled(_)
+        )
+    }));
+    let reject_payload = reject_payload.expect("reuse reject record should be emitted");
+    assert_eq!(reject_payload.task_id, "task-reuse-auto-live");
+    assert_eq!(reject_payload.candidate_hash, live_hash);
+    assert_eq!(reject_payload.decision_ref.task_id, "task-reuse-auto-ref");
+    assert_eq!(
+        reject_payload.decision_ref.final_commit_hash,
+        ref_finalize.event_id
+    );
+    assert!(
+        node.store
+            .is_reuse_blacklisted("task-reuse-auto-live", 1, &reject_payload.candidate_hash)
+            .unwrap()
     );
 }
 

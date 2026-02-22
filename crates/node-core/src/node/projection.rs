@@ -363,6 +363,7 @@ impl Node {
             }
             self.refresh_task_cost_report(task_id, event.epoch)?;
         }
+        self.apply_due_implicit_settlements(event.created_at)?;
         Ok(())
     }
 

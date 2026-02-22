@@ -38,7 +38,9 @@ impl PgStore {
                     (EXTRACT(EPOCH FROM finalized_at) * 1000)::BIGINT AS finalized_at,
                     (EXTRACT(EPOCH FROM window_end_at) * 1000)::BIGINT AS window_end_at,
                     bad_feedback_exists,
-                    CASE WHEN bad_feedback_at IS NULL THEN NULL ELSE (EXTRACT(EPOCH FROM bad_feedback_at) * 1000)::BIGINT END AS bad_feedback_at
+                    CASE WHEN bad_feedback_at IS NULL THEN NULL ELSE (EXTRACT(EPOCH FROM bad_feedback_at) * 1000)::BIGINT END AS bad_feedback_at,
+                    implicit_settled,
+                    CASE WHEN implicit_settled_at IS NULL THEN NULL ELSE (EXTRACT(EPOCH FROM implicit_settled_at) * 1000)::BIGINT END AS implicit_settled_at
              FROM task_settlement WHERE task_id = $1 ORDER BY epoch ASC",
             params![task_id],
         )?;

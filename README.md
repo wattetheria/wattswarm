@@ -6,6 +6,7 @@ This repository now contains a Rust-first v0.1 implementation of:
 - P2P-style node sync primitives (gossip/backfill/anti-entropy/checkpoint)
 - SEL append-only event log on PostgreSQL + replayable projections
 - PostgreSQL-backed run queue for multi-agent orchestration (`runs`, `run_steps`, `run_events`)
+- Run queue aggregation policy supports optional quorum (`aggregation.quorum`) and deterministic tie behavior (tie => no final pick)
 - Claim/Lease/Renew scheduling and execution-id idempotency checks
 - Lease validity with clock-skew tolerance window (`CLOCK_SKEW_TOLERANCE_MS`)
 - Task lifecycle events (create/claim/execute/verify/vote/commit/finalize/error/retry/expire)
@@ -28,11 +29,13 @@ This repository now contains a Rust-first v0.1 implementation of:
 - Active knowledge lookup with EXACT/SIMILAR hit typing and `seed_bundle` injection to `/execute`
 - Explore early-stop controls (`explore.topk`, `explore.stop.no_new_evidence_rounds`)
 - Reuse blacklist enforcement (`reuse_blacklist`) and `REUSE_REJECT_RECORDED` downgrade handling
+- Automatic `REUSE_REJECT_RECORDED` emission during timeout reconciliation when reject quorum is reached for a reused candidate
 - Advisory workflow state machine (`ADVISORY_CREATED` -> `ADVISORY_APPROVED` -> `ADVISORY_APPLIED`)
 - `POLICY_TUNED` validation bound to approved advisory records
 - Unknown reason-code observability export (unknown code + peer/local protocol versions)
 - Continuous task mode support (`task_mode=CONTINUOUS`, `budget.mode=EPOCH_RENEW`, `EPOCH_ENDED`)
 - Settlement feedback event (`TASK_FEEDBACK_REPORTED`) with authority signature validation
+- Implicit settlement execution for no-BAD windows, applied to stability reputation with deterministic fixed-point delta
 - Runtime HTTP integration (`/health`, `/capabilities`, `/execute`, `/verify`)
 - CLI command surface required by v0.1
 - Reference runtime binary for real end-to-end runs: `wattswarm-runtime`
@@ -59,7 +62,7 @@ You can remove or ignore `ui/*` and still run the kernel fully via CLI/runtime A
 - `wattswarm knowledge export --task_id <...> --out <file>`
 - `wattswarm ui --listen 127.0.0.1:7788`
 
-Note: storage is PostgreSQL-only on the `public` schema. `--store` is the logical local store identifier and does not change PostgreSQL routing.
+Note: storage is PostgreSQL-only. Default schema is `public`; override with `WATTSWARM_PG_SCHEMA=<schema>`. `--store` is a logical local store identifier and does not change PostgreSQL routing.
 
 UI (`/`) exposes API-backed controls for all CLI operation groups:
 - Node: up/down/status
@@ -84,6 +87,10 @@ Run queue uses PostgreSQL as shared scheduler storage and supports:
 - Step leasing with `FOR UPDATE SKIP LOCKED` and lease metadata (`lease_id/lease_until`)
 - Retry with exponential backoff (`RETRY_WAIT -> QUEUED`)
 - Run-level aggregation output in `runs.result_json` (`final_decision`/`final_answer` + per-step conclusions)
+- Aggregation policy behavior:
+  - optional `aggregation.quorum` threshold
+  - tie returns `null` final selection (no alphabetical tie-break)
+  - below quorum returns `null` final selection
 - Human-readable DB time columns (`created_at/updated_at/started_at/finished_at`) stored as `TIMESTAMPTZ`
 - Run-level control plane APIs via CLI:
   - create (`run submit`)
@@ -107,7 +114,7 @@ Queue implementation is DB-native on PostgreSQL tables and does not require extr
 - Runtime behavior: kernel forwards `inputs` as-is to runtime `/execute`. URL/path values are references only; kernel does not auto-fetch remote pages or read local files.
 - Size guidance: keep `shared_inputs` concise and prefer references over large blobs. Event/payload size limits are enforced by kernel validation.
 
-## Docker Quick Start (PostgreSQL + Kernel + Runtime + Worker)
+## Docker Quick Start (PostgreSQL + Kernel + Runtime + Worker, Hot Reload Enabled)
 
 Start PostgreSQL, kernel, runtime, and worker together:
 
@@ -139,6 +146,12 @@ Worker container startup behavior:
 - starts a long-running queue worker loop (`run worker`)
 - continuously claims `run_steps` in `QUEUED/RETRY_WAIT` and executes them
 - updates step/run status until terminal state (`FINALIZED/FAILED/CANCELLED`)
+
+Hot reload behavior in current compose:
+
+- `kernel`, `runtime`, `worker` use `cargo watch` in containers.
+- local source is bind-mounted (`.:/app`), so Rust code changes trigger auto rebuild + process restart.
+- no manual `docker compose restart` is needed for normal source edits.
 
 Worker tuning env vars:
 

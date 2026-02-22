@@ -510,6 +510,7 @@ impl Node {
     }
 
     pub fn reconcile_timeouts(&mut self, epoch: u64, now: u64) -> Result<Vec<Event>> {
+        self.apply_due_implicit_settlements(now)?;
         let task_ids = self.store.list_open_task_ids()?;
         let mut emitted = Vec::new();
         for task_id in task_ids {
@@ -555,6 +556,12 @@ impl Node {
                 continue;
             }
 
+            if let Some(reject_event) =
+                self.maybe_emit_reuse_reject_record(&task_id, &task, epoch, now)?
+            {
+                emitted.push(reject_event);
+            }
+
             let next_attempt = task.retry_attempt.saturating_add(1);
             let run_at = now.saturating_add(task.contract.acceptance.vote.reveal_deadline_ms);
             if let Ok(event) = self.schedule_retry(&task_id, next_attempt, run_at, epoch, now) {
@@ -562,6 +569,87 @@ impl Node {
             }
         }
         Ok(emitted)
+    }
+
+    fn maybe_emit_reuse_reject_record(
+        &mut self,
+        task_id: &str,
+        task: &TaskProjectionRow,
+        epoch: u64,
+        created_at: u64,
+    ) -> Result<Option<Event>> {
+        if self.store.count_reuse_applied_lookups(task_id)? == 0 {
+            return Ok(None);
+        }
+        let Some(candidate_hash) = self.store.find_reject_candidate_hash_with_quorum(
+            task_id,
+            task.contract.acceptance.quorum_threshold,
+        )?
+        else {
+            return Ok(None);
+        };
+        if self
+            .store
+            .is_reuse_blacklisted(task_id, epoch, &candidate_hash)?
+        {
+            return Ok(None);
+        }
+
+        let Some(exact_hit) = self
+            .lookup_knowledge_hits(&task.contract)?
+            .into_iter()
+            .find(|hit| hit.hit_type == KnowledgeHitType::Exact)
+        else {
+            return Ok(None);
+        };
+
+        let reject_voters = self
+            .store
+            .list_reject_voters_for_candidate_hash(task_id, &candidate_hash)?;
+        if reject_voters.is_empty() {
+            return Ok(None);
+        }
+        let mut reason_codes = self
+            .store
+            .list_reason_codes_for_candidate_hash(task_id, &candidate_hash)?;
+        if reason_codes.is_empty() {
+            reason_codes.push(REASON_UNKNOWN);
+        }
+        reason_codes.sort_unstable();
+        reason_codes.dedup();
+
+        let payload = crate::types::ReuseRejectRecordedPayload {
+            task_id: task_id.to_owned(),
+            decision_ref: exact_hit.decision_ref,
+            candidate_hash,
+            reject_quorum_proof: reject_voters
+                .into_iter()
+                .map(|voter| format!("reject-vote:{voter}"))
+                .collect(),
+            reason_codes,
+        };
+        match self.emit_at(
+            epoch,
+            EventPayload::ReuseRejectRecorded(payload),
+            created_at,
+        ) {
+            Ok(event) => Ok(Some(event)),
+            Err(err) => {
+                let ignorable = err
+                    .downcast_ref::<SwarmError>()
+                    .map(|e| {
+                        matches!(
+                            e,
+                            SwarmError::InvalidEvent(_)
+                                | SwarmError::Conflict(_)
+                                | SwarmError::Unauthorized(_)
+                                | SwarmError::NotFound(_)
+                        )
+                    })
+                    .unwrap_or(false);
+                if ignorable { Ok(None) } else { Err(err) }
+            }
+        }
     }
 
     pub fn auto_execute_with_runtime(

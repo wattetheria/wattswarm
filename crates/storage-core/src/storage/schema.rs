@@ -298,6 +298,8 @@ impl PgStore {
                 window_end_at TIMESTAMPTZ NOT NULL,
                 bad_feedback_exists BOOLEAN NOT NULL DEFAULT FALSE,
                 bad_feedback_at TIMESTAMPTZ,
+                implicit_settled BOOLEAN NOT NULL DEFAULT FALSE,
+                implicit_settled_at TIMESTAMPTZ,
                 PRIMARY KEY(task_id, epoch)
             );
 
@@ -337,7 +339,7 @@ impl PgStore {
                 lookup_time TIMESTAMPTZ NOT NULL,
                 hit_count BIGINT NOT NULL,
                 hits_digest TEXT NOT NULL,
-                reuse_applied BIGINT NOT NULL
+                reuse_applied BOOLEAN NOT NULL DEFAULT FALSE
             );
 
             CREATE TABLE IF NOT EXISTS reuse_blacklist (
@@ -525,9 +527,24 @@ impl PgStore {
                     "ALTER TABLE task_settlement ADD COLUMN bad_feedback_exists BOOLEAN NOT NULL DEFAULT FALSE",
                 ),
                 (
+                    "task_settlement",
+                    "implicit_settled",
+                    "ALTER TABLE task_settlement ADD COLUMN implicit_settled BOOLEAN NOT NULL DEFAULT FALSE",
+                ),
+                (
+                    "task_settlement",
+                    "implicit_settled_at",
+                    "ALTER TABLE task_settlement ADD COLUMN implicit_settled_at TIMESTAMPTZ",
+                ),
+                (
                     "verifier_results",
                     "passed",
                     "ALTER TABLE verifier_results ADD COLUMN passed BOOLEAN NOT NULL DEFAULT FALSE",
+                ),
+                (
+                    "knowledge_lookups",
+                    "reuse_applied",
+                    "ALTER TABLE knowledge_lookups ADD COLUMN reuse_applied BOOLEAN NOT NULL DEFAULT FALSE",
                 ),
             ];
             for (table, column, alter_stmt) in migrations {
@@ -549,6 +566,7 @@ impl PgStore {
                 ("task_settlement", "finalized_at"),
                 ("task_settlement", "window_end_at"),
                 ("task_settlement", "bad_feedback_at"),
+                ("task_settlement", "implicit_settled_at"),
                 ("reputation_state", "last_updated_at"),
                 ("knowledge_lookups", "lookup_time"),
                 ("advisory_state", "created_at"),
@@ -574,6 +592,8 @@ impl PgStore {
                 "bad_feedback_exists",
                 Some("FALSE"),
             )?;
+            ensure_boolean_column(&conn, "task_settlement", "implicit_settled", Some("FALSE"))?;
+            ensure_boolean_column(&conn, "knowledge_lookups", "reuse_applied", Some("FALSE"))?;
             Ok(())
         })();
 

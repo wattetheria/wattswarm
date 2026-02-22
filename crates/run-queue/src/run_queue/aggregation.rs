@@ -3,7 +3,7 @@ use postgres::Transaction;
 use serde_json::{Value, json};
 use std::collections::HashMap;
 
-use super::types::{RunStepCounts, default_aggregation_mode};
+use super::types::{AggregationPolicy, RunStepCounts, default_aggregation_mode};
 
 pub(crate) fn build_run_summary_tx(
     tx: &mut Transaction<'_>,
@@ -11,22 +11,24 @@ pub(crate) fn build_run_summary_tx(
     final_status: &str,
     counts: &RunStepCounts,
 ) -> Result<(Value, Value)> {
-    let aggregation_mode = tx
+    let (aggregation_mode, aggregation_quorum) = tx
         .query_opt(
             "SELECT aggregation_policy_json FROM runs WHERE run_id = $1",
             &[&run_id],
         )?
         .and_then(|row| {
             let raw: String = row.get(0);
-            serde_json::from_str::<Value>(&raw).ok()
+            serde_json::from_str::<AggregationPolicy>(&raw).ok()
         })
-        .and_then(|policy| {
-            policy
-                .get("mode")
-                .and_then(Value::as_str)
-                .map(str::to_owned)
+        .map(|policy| {
+            let mode = if policy.mode.trim().is_empty() {
+                default_aggregation_mode()
+            } else {
+                policy.mode
+            };
+            (mode, policy.quorum.filter(|v| *v > 0))
         })
-        .unwrap_or_else(default_aggregation_mode);
+        .unwrap_or_else(|| (default_aggregation_mode(), None));
 
     let step_rows = tx.query(
         "SELECT step_id, agent_id, executor, profile, status, attempt, task_id, result_json, error_text
@@ -74,8 +76,8 @@ pub(crate) fn build_run_summary_tx(
         }));
     }
 
-    let final_decision = pick_majority(&decision_votes);
-    let final_answer = pick_majority(&answer_votes);
+    let final_decision = pick_majority(&decision_votes, aggregation_quorum);
+    let final_answer = pick_majority(&answer_votes, aggregation_quorum);
     let aggregation_overview = json!({
         "mode": aggregation_mode,
         "final_decision": final_decision.clone(),
@@ -141,10 +143,22 @@ fn bump_vote(counter: &mut HashMap<String, u32>, key: &str) {
     *counter.entry(key.to_owned()).or_insert(0) += 1;
 }
 
-fn pick_majority(counter: &HashMap<String, u32>) -> Option<String> {
-    let mut pairs: Vec<(&String, &u32)> = counter.iter().collect();
-    pairs.sort_by(|a, b| b.1.cmp(a.1).then_with(|| a.0.cmp(b.0)));
-    pairs.first().map(|(key, _)| (*key).clone())
+fn pick_majority(counter: &HashMap<String, u32>, quorum: Option<u32>) -> Option<String> {
+    let max_count = counter.values().copied().max()?;
+    if let Some(threshold) = quorum
+        && max_count < threshold
+    {
+        return None;
+    }
+    let mut winners = counter
+        .iter()
+        .filter(|(_, count)| **count == max_count)
+        .map(|(key, _)| key);
+    let winner = winners.next()?;
+    if winners.next().is_some() {
+        return None;
+    }
+    Some(winner.clone())
 }
 
 #[cfg(test)]
@@ -228,7 +242,25 @@ mod tests {
         let mut votes = HashMap::new();
         votes.insert("APPROVE".to_owned(), 3);
         votes.insert("REJECT".to_owned(), 1);
-        assert_eq!(pick_majority(&votes), Some("APPROVE".to_owned()));
-        assert_eq!(pick_majority(&HashMap::new()), None);
+        assert_eq!(pick_majority(&votes, None), Some("APPROVE".to_owned()));
+        assert_eq!(pick_majority(&HashMap::new(), None), None);
+    }
+
+    #[test]
+    fn pick_majority_returns_none_on_tie() {
+        let mut votes = HashMap::new();
+        votes.insert("APPROVE".to_owned(), 2);
+        votes.insert("REJECT".to_owned(), 2);
+        assert_eq!(pick_majority(&votes, None), None);
+    }
+
+    #[test]
+    fn pick_majority_honors_quorum_threshold() {
+        let mut votes = HashMap::new();
+        votes.insert("APPROVE".to_owned(), 2);
+        votes.insert("REJECT".to_owned(), 1);
+
+        assert_eq!(pick_majority(&votes, Some(3)), None);
+        assert_eq!(pick_majority(&votes, Some(2)), Some("APPROVE".to_owned()));
     }
 }

@@ -71,6 +71,8 @@ pub struct TaskSettlementRow {
     pub window_end_at: u64,
     pub bad_feedback_exists: bool,
     pub bad_feedback_at: Option<u64>,
+    pub implicit_settled: bool,
+    pub implicit_settled_at: Option<u64>,
 }
 
 #[derive(Debug, Clone)]

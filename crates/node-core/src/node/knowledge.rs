@@ -273,6 +273,59 @@ impl Node {
         Ok(())
     }
 
+    pub(crate) fn apply_due_implicit_settlements(&self, now: u64) -> Result<()> {
+        let due = self.store.list_due_implicit_settlements(now, 128)?;
+        for (task_id, epoch) in due {
+            let task = match self.require_task(&task_id) {
+                Ok(task) => task,
+                Err(_) => {
+                    self.store
+                        .mark_task_implicit_settled(&task_id, epoch, now)?;
+                    continue;
+                }
+            };
+            let Some(candidate_id) = self
+                .store
+                .finalized_candidate_id_at_epoch(&task_id, epoch)?
+            else {
+                self.store
+                    .mark_task_implicit_settled(&task_id, epoch, now)?;
+                continue;
+            };
+            let results = self
+                .store
+                .list_verifier_results_for_candidate(&task_id, &candidate_id)?;
+            let delta = implicit_stability_delta_units(
+                1,
+                task.contract.acceptance.settlement.implicit_weight,
+                task.contract
+                    .acceptance
+                    .settlement
+                    .implicit_diminishing_returns
+                    .w,
+                task.contract
+                    .acceptance
+                    .settlement
+                    .implicit_diminishing_returns
+                    .k,
+            )?;
+            if delta != 0 {
+                for result in results {
+                    self.store.adjust_reputation(
+                        &result.provider_family,
+                        &result.model_id,
+                        delta,
+                        0,
+                        now,
+                    )?;
+                }
+            }
+            self.store
+                .mark_task_implicit_settled(&task_id, epoch, now)?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn refresh_task_cost_report(&self, task_id: &str, epoch: u64) -> Result<()> {
         let usage = self.store.get_stage_usage(task_id, epoch)?.unwrap_or(
             crate::storage::TaskStageUsageRow {

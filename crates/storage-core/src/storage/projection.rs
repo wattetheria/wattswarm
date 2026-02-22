@@ -721,20 +721,27 @@ impl PgStore {
             .lock()
             .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
         conn.execute(
-            "INSERT INTO task_settlement(task_id, epoch, finalized_at, window_end_at, bad_feedback_exists, bad_feedback_at)
+            "INSERT INTO task_settlement(
+                task_id, epoch, finalized_at, window_end_at, bad_feedback_exists, bad_feedback_at,
+                implicit_settled, implicit_settled_at
+             )
              VALUES (
                $1,
                $2,
                TIMESTAMPTZ 'epoch' + ($3::bigint * INTERVAL '1 millisecond'),
                TIMESTAMPTZ 'epoch' + ($4::bigint * INTERVAL '1 millisecond'),
                COALESCE((SELECT bad_feedback_exists FROM task_settlement WHERE task_id = $1 AND epoch = $2), FALSE),
-               COALESCE((SELECT bad_feedback_at FROM task_settlement WHERE task_id = $1 AND epoch = $2), NULL)
+               COALESCE((SELECT bad_feedback_at FROM task_settlement WHERE task_id = $1 AND epoch = $2), NULL),
+               COALESCE((SELECT implicit_settled FROM task_settlement WHERE task_id = $1 AND epoch = $2), FALSE),
+               COALESCE((SELECT implicit_settled_at FROM task_settlement WHERE task_id = $1 AND epoch = $2), NULL)
              )
              ON CONFLICT(task_id, epoch) DO UPDATE SET
                finalized_at = excluded.finalized_at,
                window_end_at = excluded.window_end_at,
                bad_feedback_exists = excluded.bad_feedback_exists,
-               bad_feedback_at = excluded.bad_feedback_at",
+               bad_feedback_at = excluded.bad_feedback_at,
+               implicit_settled = excluded.implicit_settled,
+               implicit_settled_at = excluded.implicit_settled_at",
             params![task_id, epoch as i64, finalized_at as i64, window_end_at as i64],
         )?;
         Ok(())
@@ -770,7 +777,9 @@ impl PgStore {
                     (EXTRACT(EPOCH FROM finalized_at) * 1000)::BIGINT AS finalized_at,
                     (EXTRACT(EPOCH FROM window_end_at) * 1000)::BIGINT AS window_end_at,
                     bad_feedback_exists,
-                    CASE WHEN bad_feedback_at IS NULL THEN NULL ELSE (EXTRACT(EPOCH FROM bad_feedback_at) * 1000)::BIGINT END AS bad_feedback_at
+                    CASE WHEN bad_feedback_at IS NULL THEN NULL ELSE (EXTRACT(EPOCH FROM bad_feedback_at) * 1000)::BIGINT END AS bad_feedback_at,
+                    implicit_settled,
+                    CASE WHEN implicit_settled_at IS NULL THEN NULL ELSE (EXTRACT(EPOCH FROM implicit_settled_at) * 1000)::BIGINT END AS implicit_settled_at
              FROM task_settlement
              WHERE task_id = $1
              ORDER BY epoch DESC
@@ -784,8 +793,73 @@ impl PgStore {
                     window_end_at: r.get::<_, i64>(3)? as u64,
                     bad_feedback_exists: r.get::<_, bool>(4)?,
                     bad_feedback_at: r.get::<_, Option<i64>>(5)?.map(|v| v as u64),
+                    implicit_settled: r.get::<_, bool>(6)?,
+                    implicit_settled_at: r.get::<_, Option<i64>>(7)?.map(|v| v as u64),
                 })
             },
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    pub fn list_due_implicit_settlements(
+        &self,
+        now: u64,
+        limit: u32,
+    ) -> Result<Vec<(String, u64)>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
+        let mut stmt = conn.prepare(
+            "SELECT task_id, epoch
+             FROM task_settlement
+             WHERE bad_feedback_exists = FALSE
+               AND implicit_settled = FALSE
+               AND window_end_at <= TIMESTAMPTZ 'epoch' + ($1::bigint * INTERVAL '1 millisecond')
+             ORDER BY window_end_at ASC
+             LIMIT $2",
+        )?;
+        let rows = stmt.query_map(params![now as i64, limit as i64], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as u64))
+        })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
+    pub fn mark_task_implicit_settled(
+        &self,
+        task_id: &str,
+        epoch: u64,
+        settled_at: u64,
+    ) -> Result<bool> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
+        let changed = conn.execute(
+            "UPDATE task_settlement
+             SET implicit_settled = TRUE,
+                 implicit_settled_at = TIMESTAMPTZ 'epoch' + ($3::bigint * INTERVAL '1 millisecond')
+             WHERE task_id = $1 AND epoch = $2 AND implicit_settled = FALSE",
+            params![task_id, epoch as i64, settled_at as i64],
+        )?;
+        Ok(changed > 0)
+    }
+
+    pub fn finalized_candidate_id_at_epoch(
+        &self,
+        task_id: &str,
+        epoch: u64,
+    ) -> Result<Option<String>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
+        conn.query_row(
+            "SELECT candidate_id FROM finalizations WHERE task_id = $1 AND epoch = $2",
+            params![task_id, epoch as i64],
+            |r| r.get(0),
         )
         .optional()
         .map_err(Into::into)
@@ -797,11 +871,105 @@ impl PgStore {
             .lock()
             .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
         let count = conn.query_row(
-            "SELECT COUNT(1) FROM knowledge_lookups WHERE task_id = $1 AND reuse_applied = 1",
+            "SELECT COUNT(1) FROM knowledge_lookups WHERE task_id = $1 AND reuse_applied = TRUE",
             params![task_id],
             |r| r.get::<_, i64>(0),
         )?;
         Ok(count as u32)
+    }
+
+    pub fn find_reject_candidate_hash_with_quorum(
+        &self,
+        task_id: &str,
+        quorum: u32,
+    ) -> Result<Option<String>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
+        let mut stmt = conn.prepare(
+            "SELECT candidate_hash, COUNT(1) AS cnt
+             FROM vote_reveals
+             WHERE task_id = $1
+               AND vote = 'reject'
+               AND valid = TRUE
+               AND candidate_hash <> ''
+             GROUP BY candidate_hash",
+        )?;
+        let rows = stmt.query_map(params![task_id], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as u32))
+        })?;
+        let pairs = rows.collect::<std::result::Result<Vec<_>, _>>()?;
+        let max_count = pairs.iter().map(|(_, count)| *count).max();
+        let Some(max_count) = max_count else {
+            return Ok(None);
+        };
+        if max_count < quorum {
+            return Ok(None);
+        }
+        let mut winners = pairs
+            .into_iter()
+            .filter(|(_, count)| *count == max_count)
+            .map(|(hash, _)| hash);
+        let winner = winners.next();
+        if winners.next().is_some() {
+            return Ok(None);
+        }
+        Ok(winner)
+    }
+
+    pub fn list_reject_voters_for_candidate_hash(
+        &self,
+        task_id: &str,
+        candidate_hash: &str,
+    ) -> Result<Vec<String>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
+        let mut stmt = conn.prepare(
+            "SELECT voter_node_id
+             FROM vote_reveals
+             WHERE task_id = $1
+               AND candidate_hash = $2
+               AND vote = 'reject'
+               AND valid = TRUE
+             ORDER BY voter_node_id ASC",
+        )?;
+        let rows = stmt.query_map(params![task_id, candidate_hash], |r| r.get::<_, String>(0))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
+    pub fn list_reason_codes_for_candidate_hash(
+        &self,
+        task_id: &str,
+        candidate_hash: &str,
+    ) -> Result<Vec<u16>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
+        let mut stmt = conn.prepare(
+            "SELECT vr.result_json
+             FROM verifier_results vr
+             JOIN candidates c
+               ON c.task_id = vr.task_id
+              AND c.candidate_id = vr.candidate_id
+             WHERE vr.task_id = $1
+               AND c.candidate_hash = $2",
+        )?;
+        let rows = stmt.query_map(params![task_id, candidate_hash], |r| r.get::<_, String>(0))?;
+        let mut set = std::collections::BTreeSet::new();
+        for row in rows {
+            let raw = row?;
+            if let Ok(parsed) = serde_json::from_str::<VerifierResult>(&raw) {
+                for code in parsed.reason_codes {
+                    set.insert(code);
+                }
+            }
+        }
+        Ok(set.into_iter().collect())
     }
 
     pub fn add_reuse_blacklist(
@@ -884,7 +1052,7 @@ impl PgStore {
                 lookup_time as i64,
                 hit_count as i64,
                 hits_digest,
-                if reuse_applied { 1 } else { 0 }
+                reuse_applied
             ],
         )?;
         Ok(())

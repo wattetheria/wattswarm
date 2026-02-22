@@ -1,5 +1,6 @@
 use std::sync::{Mutex, OnceLock};
 
+use wattswarm_storage_core::storage::PgStore;
 use wattswarm_storage_core::storage::pg::ErrorCode;
 use wattswarm_storage_core::storage::pg::{
     Connection, Error, OptionalExtension, ParamValue, types::ValueRef,
@@ -220,6 +221,66 @@ fn postgres_json_path_query_works() {
             )
             .expect("json path should work");
         assert_eq!(extracted, "9");
+    });
+}
+
+#[test]
+fn legacy_bigint_bool_columns_are_migrated_to_boolean() {
+    with_test_schema(|| {
+        let conn = open_test_connection();
+        conn.execute_batch(
+            "
+            DROP TABLE IF EXISTS verifier_results;
+            DROP TABLE IF EXISTS knowledge_lookups;
+            CREATE TABLE verifier_results (
+                task_id TEXT NOT NULL,
+                candidate_id TEXT NOT NULL,
+                verifier_node_id TEXT NOT NULL,
+                result_json TEXT NOT NULL,
+                passed BIGINT NOT NULL DEFAULT 0,
+                PRIMARY KEY(task_id, candidate_id, verifier_node_id)
+            );
+            CREATE TABLE knowledge_lookups (
+                task_id TEXT NOT NULL,
+                task_type TEXT NOT NULL,
+                input_digest TEXT NOT NULL,
+                lookup_time TIMESTAMPTZ NOT NULL,
+                hit_count BIGINT NOT NULL,
+                hits_digest TEXT NOT NULL,
+                reuse_applied BIGINT NOT NULL DEFAULT 0
+            );
+            ",
+        )
+        .expect("create legacy tables");
+
+        let store = PgStore::open("legacy-bool-migration.state").expect("open store");
+        drop(store);
+
+        let passed_type = conn
+            .query_row(
+                "SELECT data_type
+                 FROM information_schema.columns
+                 WHERE table_schema = current_schema()
+                   AND table_name = 'verifier_results'
+                   AND column_name = 'passed'",
+                wattswarm_storage_core::params![],
+                |r| r.get::<usize, String>(0),
+            )
+            .expect("passed type");
+        assert_eq!(passed_type, "boolean");
+
+        let reuse_type = conn
+            .query_row(
+                "SELECT data_type
+                 FROM information_schema.columns
+                 WHERE table_schema = current_schema()
+                   AND table_name = 'knowledge_lookups'
+                   AND column_name = 'reuse_applied'",
+                wattswarm_storage_core::params![],
+                |r| r.get::<usize, String>(0),
+            )
+            .expect("reuse_applied type");
+        assert_eq!(reuse_type, "boolean");
     });
 }
 
