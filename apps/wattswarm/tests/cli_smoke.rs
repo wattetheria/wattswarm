@@ -7,10 +7,11 @@ use tempfile::tempdir;
 use uuid::Uuid;
 use wattswarm::cli::sample_contract;
 use wattswarm::policy::PolicyRegistry;
+use wattswarm_storage_core::storage::pg::Connection;
 
-fn cmd() -> std::process::Command {
+fn cmd(schema: &str) -> std::process::Command {
     let mut cmd = std::process::Command::new(assert_cmd::cargo::cargo_bin!("wattswarm"));
-    cmd.env("WATTSWARM_PG_ISOLATE_BY_PATH", "1");
+    cmd.env("WATTSWARM_PG_SCHEMA", schema);
     cmd
 }
 
@@ -39,30 +40,67 @@ fn wait_for_runtime(base_url: &str) {
     panic!("runtime did not become healthy: {}", base_url);
 }
 
+fn reset_test_schema(schema: &str) {
+    let conn = Connection::open("cli-smoke-schema-reset").expect("open pg connection");
+    conn.execute_batch(&format!(
+        "DROP SCHEMA IF EXISTS {schema} CASCADE;
+         CREATE SCHEMA {schema};"
+    ))
+    .expect("reset cli test schema");
+}
+
+fn drop_test_schema(schema: &str) {
+    let conn = Connection::open("cli-smoke-schema-drop").expect("open pg connection");
+    let _ = conn.execute_batch(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE;"));
+}
+
+struct CliSchemaGuard {
+    name: String,
+}
+
+impl CliSchemaGuard {
+    fn new() -> Self {
+        let name = format!("test_cli_{}", Uuid::new_v4().simple());
+        reset_test_schema(&name);
+        Self { name }
+    }
+
+    fn as_str(&self) -> &str {
+        &self.name
+    }
+}
+
+impl Drop for CliSchemaGuard {
+    fn drop(&mut self) {
+        drop_test_schema(&self.name);
+    }
+}
+
 #[test]
 fn cli_node_lifecycle_and_log_head() {
     let dir = tempdir().unwrap();
     let state_dir = dir.path().join("state");
-    let db = "test.db";
+    let store = "test.state";
+    let schema = CliSchemaGuard::new();
 
-    cmd()
+    cmd(schema.as_str())
         .args([
             "--state-dir",
             state_dir.to_str().unwrap(),
-            "--db",
-            db,
+            "--store",
+            store,
             "node",
             "up",
         ])
         .assert()
         .success();
 
-    cmd()
+    cmd(schema.as_str())
         .args([
             "--state-dir",
             state_dir.to_str().unwrap(),
-            "--db",
-            db,
+            "--store",
+            store,
             "node",
             "status",
         ])
@@ -71,24 +109,24 @@ fn cli_node_lifecycle_and_log_head() {
         .stdout(predicate::str::contains("\"running\":true"))
         .stdout(predicate::str::contains("\"local_protocol_version\""));
 
-    cmd()
+    cmd(schema.as_str())
         .args([
             "--state-dir",
             state_dir.to_str().unwrap(),
-            "--db",
-            db,
+            "--store",
+            store,
             "log",
             "head",
         ])
         .assert()
         .success();
 
-    cmd()
+    cmd(schema.as_str())
         .args([
             "--state-dir",
             state_dir.to_str().unwrap(),
-            "--db",
-            db,
+            "--store",
+            store,
             "node",
             "down",
         ])
@@ -100,7 +138,8 @@ fn cli_node_lifecycle_and_log_head() {
 fn cli_submit_watch_and_decision() {
     let dir = tempdir().unwrap();
     let state_dir = dir.path().join("state");
-    let db = "test.db";
+    let store = "test.state";
+    let schema = CliSchemaGuard::new();
 
     let policy_hash = PolicyRegistry::with_builtin()
         .binding_for("vp.schema_only.v1", serde_json::json!({}))
@@ -112,12 +151,12 @@ fn cli_submit_watch_and_decision() {
     std::fs::create_dir_all(&state_dir).unwrap();
     std::fs::write(&task_file, serde_json::to_vec_pretty(&contract).unwrap()).unwrap();
 
-    cmd()
+    cmd(schema.as_str())
         .args([
             "--state-dir",
             state_dir.to_str().unwrap(),
-            "--db",
-            db,
+            "--store",
+            store,
             "task",
             "submit",
             task_file.to_str().unwrap(),
@@ -125,12 +164,12 @@ fn cli_submit_watch_and_decision() {
         .assert()
         .success();
 
-    cmd()
+    cmd(schema.as_str())
         .args([
             "--state-dir",
             state_dir.to_str().unwrap(),
-            "--db",
-            db,
+            "--store",
+            store,
             "task",
             "watch",
             &task_id,
@@ -139,12 +178,12 @@ fn cli_submit_watch_and_decision() {
         .success()
         .stdout(predicate::str::contains(format!("task={task_id}")));
 
-    cmd()
+    cmd(schema.as_str())
         .args([
             "--state-dir",
             state_dir.to_str().unwrap(),
-            "--db",
-            db,
+            "--store",
+            store,
             "task",
             "decision",
             &task_id,
@@ -154,12 +193,12 @@ fn cli_submit_watch_and_decision() {
         .stdout(predicate::str::contains(format!("task={task_id}")));
 
     let out = dir.path().join("knowledge.json");
-    cmd()
+    cmd(schema.as_str())
         .args([
             "--state-dir",
             state_dir.to_str().unwrap(),
-            "--db",
-            db,
+            "--store",
+            store,
             "knowledge",
             "export",
             "--task_id",
@@ -176,8 +215,9 @@ fn cli_submit_watch_and_decision() {
 fn cli_executors_add_and_list() {
     let dir = tempdir().unwrap();
     let state_dir = dir.path().join("state");
+    let schema = CliSchemaGuard::new();
 
-    cmd()
+    cmd(schema.as_str())
         .args([
             "--state-dir",
             state_dir.to_str().unwrap(),
@@ -189,7 +229,7 @@ fn cli_executors_add_and_list() {
         .assert()
         .success();
 
-    cmd()
+    cmd(schema.as_str())
         .args([
             "--state-dir",
             state_dir.to_str().unwrap(),
@@ -205,26 +245,27 @@ fn cli_executors_add_and_list() {
 fn cli_peers_and_log_replay_verify() {
     let dir = tempdir().unwrap();
     let state_dir = dir.path().join("state");
-    let db = "test.db";
+    let store = "test.state";
+    let schema = CliSchemaGuard::new();
 
-    cmd()
+    cmd(schema.as_str())
         .args([
             "--state-dir",
             state_dir.to_str().unwrap(),
-            "--db",
-            db,
+            "--store",
+            store,
             "node",
             "up",
         ])
         .assert()
         .success();
 
-    cmd()
+    cmd(schema.as_str())
         .args([
             "--state-dir",
             state_dir.to_str().unwrap(),
-            "--db",
-            db,
+            "--store",
+            store,
             "peers",
             "list",
         ])
@@ -232,12 +273,12 @@ fn cli_peers_and_log_replay_verify() {
         .success()
         .stdout(predicate::str::contains("["));
 
-    cmd()
+    cmd(schema.as_str())
         .args([
             "--state-dir",
             state_dir.to_str().unwrap(),
-            "--db",
-            db,
+            "--store",
+            store,
             "log",
             "replay",
         ])
@@ -245,12 +286,12 @@ fn cli_peers_and_log_replay_verify() {
         .success()
         .stdout(predicate::str::contains("replayed"));
 
-    cmd()
+    cmd(schema.as_str())
         .args([
             "--state-dir",
             state_dir.to_str().unwrap(),
-            "--db",
-            db,
+            "--store",
+            store,
             "log",
             "verify",
         ])
@@ -263,15 +304,16 @@ fn cli_peers_and_log_replay_verify() {
 fn cli_knowledge_export_requires_exactly_one_selector() {
     let dir = tempdir().unwrap();
     let state_dir = dir.path().join("state");
-    let db = "test.db";
+    let store = "test.state";
     let out = dir.path().join("knowledge.json");
+    let schema = CliSchemaGuard::new();
 
-    cmd()
+    cmd(schema.as_str())
         .args([
             "--state-dir",
             state_dir.to_str().unwrap(),
-            "--db",
-            db,
+            "--store",
+            store,
             "knowledge",
             "export",
             "--task_type",
@@ -287,12 +329,12 @@ fn cli_knowledge_export_requires_exactly_one_selector() {
             "knowledge export requires exactly one of --task_type or --task_id",
         ));
 
-    cmd()
+    cmd(schema.as_str())
         .args([
             "--state-dir",
             state_dir.to_str().unwrap(),
-            "--db",
-            db,
+            "--store",
+            store,
             "knowledge",
             "export",
             "--out",
@@ -310,6 +352,7 @@ fn cli_run_queue_lifecycle_smoke() {
     let dir = tempdir().unwrap();
     let state_dir = dir.path().join("state");
     let run_id = format!("run-cli-{}", Uuid::new_v4().simple());
+    let schema = CliSchemaGuard::new();
     let spec_file = dir.path().join("run.json");
     std::fs::create_dir_all(&state_dir).unwrap();
     std::fs::write(
@@ -331,7 +374,7 @@ fn cli_run_queue_lifecycle_smoke() {
     )
     .unwrap();
 
-    cmd()
+    cmd(schema.as_str())
         .args([
             "run",
             "--pg-url",
@@ -342,39 +385,39 @@ fn cli_run_queue_lifecycle_smoke() {
         .success()
         .stdout(predicate::str::contains("run queue schema initialized"));
 
-    cmd()
+    cmd(schema.as_str())
         .args(["run", "submit", spec_file.to_str().unwrap(), "--kickoff"])
         .assert()
         .success()
         .stdout(predicate::str::contains("\"ok\": true"))
         .stdout(predicate::str::contains(&run_id));
 
-    cmd()
+    cmd(schema.as_str())
         .args(["run", "watch", &run_id])
         .assert()
         .success()
         .stdout(predicate::str::contains(&run_id))
         .stdout(predicate::str::contains("\"status\":"));
 
-    cmd()
+    cmd(schema.as_str())
         .args(["run", "events", &run_id, "--limit", "1"])
         .assert()
         .success()
         .stdout(predicate::str::contains("RUN_"));
 
-    cmd()
+    cmd(schema.as_str())
         .args(["run", "cancel", &run_id])
         .assert()
         .success()
         .stdout(predicate::str::contains("cancel requested"));
 
-    cmd()
+    cmd(schema.as_str())
         .args(["run", "result", &run_id])
         .assert()
         .success()
         .stdout(predicate::str::contains("\"status\": \"CANCELL"));
 
-    cmd()
+    cmd(schema.as_str())
         .args(["run", "retry", "run-does-not-exist"])
         .assert()
         .failure()
@@ -389,7 +432,8 @@ fn cli_run_real_flow_with_http_runtime() {
 
     let dir = tempdir().unwrap();
     let state_dir = dir.path().join("state");
-    let db = "test.db";
+    let store = "test.state";
+    let schema = CliSchemaGuard::new();
 
     let listener = match std::net::TcpListener::bind("127.0.0.1:0") {
         Ok(listener) => listener,
@@ -409,12 +453,12 @@ fn cli_run_real_flow_with_http_runtime() {
     let _guard = ChildGuard(runtime_child);
     wait_for_runtime(&base_url);
 
-    cmd()
+    cmd(schema.as_str())
         .args([
             "--state-dir",
             state_dir.to_str().unwrap(),
-            "--db",
-            db,
+            "--store",
+            store,
             "executors",
             "add",
             "rt-real",
@@ -423,12 +467,12 @@ fn cli_run_real_flow_with_http_runtime() {
         .assert()
         .success();
 
-    cmd()
+    cmd(schema.as_str())
         .args([
             "--state-dir",
             state_dir.to_str().unwrap(),
-            "--db",
-            db,
+            "--store",
+            store,
             "task",
             "run-real",
             "--executor",
@@ -445,12 +489,12 @@ fn cli_run_real_flow_with_http_runtime() {
             "\"terminal_state\": \"Finalized\"",
         ));
 
-    cmd()
+    cmd(schema.as_str())
         .args([
             "--state-dir",
             state_dir.to_str().unwrap(),
-            "--db",
-            db,
+            "--store",
+            store,
             "task",
             "decision",
             "task-real-cli",

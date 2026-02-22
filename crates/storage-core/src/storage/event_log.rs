@@ -10,7 +10,7 @@ impl PgStore {
         let seq: i64 = conn
             .query_row(
                 "INSERT INTO events(event_id, protocol_version, task_id, epoch, event_kind, author_node_id, created_at, event_json)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, TIMESTAMPTZ 'epoch' + (?7::bigint * INTERVAL '1 millisecond'), ?8)
+                 VALUES ($1, $2, $3, $4, $5, $6, TIMESTAMPTZ 'epoch' + ($7::bigint * INTERVAL '1 millisecond'), $8)
                  RETURNING seq",
                 params![
                     event.event_id,
@@ -50,7 +50,7 @@ impl PgStore {
         let mut stmt = conn.prepare(
             "SELECT protocol_version, COUNT(DISTINCT author_node_id) as node_count
              FROM events
-             WHERE author_node_id != ?1
+             WHERE author_node_id != $1
              GROUP BY protocol_version
              ORDER BY protocol_version ASC",
         )?;
@@ -67,7 +67,7 @@ impl PgStore {
             .lock()
             .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
         let mut stmt =
-            conn.prepare("SELECT seq, event_json FROM events WHERE seq > ?1 ORDER BY seq ASC")?;
+            conn.prepare("SELECT seq, event_json FROM events WHERE seq > $1 ORDER BY seq ASC")?;
         let rows = stmt.query_map(params![from_exclusive as i64], |row| {
             let seq: i64 = row.get(0)?;
             let json: String = row.get(1)?;
@@ -87,9 +87,9 @@ impl PgStore {
             .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
         let mut stmt = conn.prepare(
             "SELECT seq, event_json FROM events
-             WHERE seq > ?1
+             WHERE seq > $1
              ORDER BY seq ASC
-             LIMIT ?2",
+             LIMIT $2",
         )?;
         let rows = stmt.query_map(params![from_exclusive as i64, limit as i64], |row| {
             let seq: i64 = row.get(0)?;

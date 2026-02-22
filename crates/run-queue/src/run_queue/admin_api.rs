@@ -308,6 +308,7 @@ mod tests {
     use super::*;
     use serde_json::json;
     use uuid::Uuid;
+    const TEST_SCHEMA: &str = "test";
     const TEST_DB_LOCK_KEY: i64 = 1_987_654_321;
 
     struct DbTestLock {
@@ -315,8 +316,8 @@ mod tests {
     }
 
     impl DbTestLock {
-        fn acquire(queue: &PgRunQueue) -> Option<Self> {
-            let mut client = queue.connect().ok()?;
+        fn acquire() -> Option<Self> {
+            let mut client = postgres::Client::connect(&test_pg_url(), postgres::NoTls).ok()?;
             client
                 .query_one("SELECT pg_advisory_lock($1)", &[&TEST_DB_LOCK_KEY])
                 .ok()?;
@@ -338,32 +339,26 @@ mod tests {
             .unwrap_or_else(|_| "postgres://postgres:postgres@127.0.0.1:55432/wattswarm".to_owned())
     }
 
+    fn reset_test_schema_or_skip() -> bool {
+        let Ok(mut client) = postgres::Client::connect(&test_pg_url(), postgres::NoTls) else {
+            eprintln!("skip run-queue admin_api tests: postgres not reachable");
+            return false;
+        };
+        client
+            .batch_execute(&format!(
+                "DROP SCHEMA IF EXISTS {TEST_SCHEMA} CASCADE;
+                 CREATE SCHEMA {TEST_SCHEMA};"
+            ))
+            .is_ok()
+    }
+
     fn queue_or_skip() -> Option<PgRunQueue> {
-        let queue = PgRunQueue::new(test_pg_url());
+        let queue = PgRunQueue::with_schema(test_pg_url(), TEST_SCHEMA);
         if queue.connect().is_err() {
             eprintln!("skip run-queue admin_api tests: postgres not reachable");
             return None;
         }
         Some(queue)
-    }
-
-    fn shared_db_is_busy(queue: &PgRunQueue) -> bool {
-        let Ok(mut client) = queue.connect() else {
-            return false;
-        };
-        let row = client
-            .query_one(
-                "SELECT EXISTS(
-                    SELECT 1
-                    FROM runs
-                    WHERE status IN ('QUEUED','RUNNING','CANCELLING')
-                      AND run_id NOT LIKE 'worker-%'
-                      AND run_id NOT LIKE 'admin-%'
-                )",
-                &[],
-            )
-            .ok();
-        row.map(|r| r.get::<_, bool>(0)).unwrap_or(false)
     }
 
     fn sample_spec(run_id: &str) -> RunSubmitSpec {
@@ -392,17 +387,16 @@ mod tests {
 
     #[test]
     fn submit_kickoff_cancel_and_query_views() {
+        let Some(_db_lock) = DbTestLock::acquire() else {
+            return;
+        };
+        if !reset_test_schema_or_skip() {
+            return;
+        }
         let Some(queue) = queue_or_skip() else {
             return;
         };
-        let Some(_db_lock) = DbTestLock::acquire(&queue) else {
-            return;
-        };
         queue.init_schema().expect("init schema");
-        if shared_db_is_busy(&queue) {
-            eprintln!("skip admin_api db test: shared database has active external runs");
-            return;
-        }
         let run_id = format!("admin-flow-{}", Uuid::new_v4().simple());
         cleanup_run(&queue, &run_id);
 
@@ -428,17 +422,16 @@ mod tests {
 
     #[test]
     fn retry_requeues_failed_steps_and_resets_run_status() {
+        let Some(_db_lock) = DbTestLock::acquire() else {
+            return;
+        };
+        if !reset_test_schema_or_skip() {
+            return;
+        }
         let Some(queue) = queue_or_skip() else {
             return;
         };
-        let Some(_db_lock) = DbTestLock::acquire(&queue) else {
-            return;
-        };
         queue.init_schema().expect("init schema");
-        if shared_db_is_busy(&queue) {
-            eprintln!("skip admin_api db test: shared database has active external runs");
-            return;
-        }
         let run_id = format!("admin-retry-{}", Uuid::new_v4().simple());
         cleanup_run(&queue, &run_id);
         queue.submit_run(sample_spec(&run_id)).expect("submit run");
@@ -495,17 +488,16 @@ mod tests {
 
     #[test]
     fn run_events_falls_back_to_empty_payload_for_invalid_json() {
+        let Some(_db_lock) = DbTestLock::acquire() else {
+            return;
+        };
+        if !reset_test_schema_or_skip() {
+            return;
+        }
         let Some(queue) = queue_or_skip() else {
             return;
         };
-        let Some(_db_lock) = DbTestLock::acquire(&queue) else {
-            return;
-        };
         queue.init_schema().expect("init schema");
-        if shared_db_is_busy(&queue) {
-            eprintln!("skip admin_api db test: shared database has active external runs");
-            return;
-        }
         let run_id = format!("admin-events-{}", Uuid::new_v4().simple());
         cleanup_run(&queue, &run_id);
         queue.submit_run(sample_spec(&run_id)).expect("submit run");

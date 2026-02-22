@@ -13,10 +13,12 @@ use wattswarm_control_plane::control::{
     discovered_peers_path, executor_registry_path, load_discovered_peers, load_executor_registry,
     local_node_id, open_node, run_real_task_flow, save_discovered_peers, save_executor_registry,
 };
+use wattswarm_control_plane::storage::storage::pg::Connection;
 use wattswarm_control_plane::task_template::sample_contract;
 use wattswarm_control_plane::udp_announce::{announce_startup, maybe_start_listener};
 
 static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+const TEST_DB_LOCK_KEY: i64 = 1_987_654_321;
 
 fn env_lock() -> std::sync::MutexGuard<'static, ()> {
     ENV_LOCK
@@ -63,7 +65,7 @@ struct EnvVarGuard {
 impl EnvVarGuard {
     fn set(key: &'static str, value: &str) -> Self {
         let prev = std::env::var(key).ok();
-        // SAFETY: tests serialize env mutations via ENV_LOCK.
+        // SAFETY: tests serialize env mutations via ENV_LOCK when needed.
         unsafe {
             std::env::set_var(key, value);
         }
@@ -73,13 +75,62 @@ impl EnvVarGuard {
 
 impl Drop for EnvVarGuard {
     fn drop(&mut self) {
-        // SAFETY: tests serialize env mutations via ENV_LOCK.
+        // SAFETY: tests serialize env mutations via ENV_LOCK when needed.
         unsafe {
             if let Some(prev) = &self.prev {
                 std::env::set_var(self.key, prev);
             } else {
                 std::env::remove_var(self.key);
             }
+        }
+    }
+}
+
+struct DbTestLock {
+    conn: Connection,
+}
+
+impl DbTestLock {
+    fn acquire() -> Self {
+        let conn = Connection::open("control-db-lock").expect("open db lock connection");
+        conn.query_row(
+            "SELECT pg_advisory_lock($1)",
+            wattswarm_storage_core::params![TEST_DB_LOCK_KEY],
+            |_| Ok(()),
+        )
+        .expect("acquire advisory lock");
+        Self { conn }
+    }
+}
+
+impl Drop for DbTestLock {
+    fn drop(&mut self) {
+        let _ = self.conn.query_row(
+            "SELECT pg_advisory_unlock($1)",
+            wattswarm_storage_core::params![TEST_DB_LOCK_KEY],
+            |_| Ok(()),
+        );
+    }
+}
+
+fn reset_test_schema(schema: &str) {
+    let prev_schema = std::env::var("WATTSWARM_PG_SCHEMA").ok();
+    // SAFETY: tests serialize env mutations via ENV_LOCK.
+    unsafe {
+        std::env::remove_var("WATTSWARM_PG_SCHEMA");
+    }
+    let conn = Connection::open("schema-reset").expect("open pg connection");
+    conn.execute_batch(&format!(
+        "DROP SCHEMA IF EXISTS {schema} CASCADE;
+         CREATE SCHEMA {schema};"
+    ))
+    .expect("reset test schema");
+    // SAFETY: tests serialize env mutations via ENV_LOCK.
+    unsafe {
+        if let Some(value) = prev_schema {
+            std::env::set_var("WATTSWARM_PG_SCHEMA", value);
+        } else {
+            std::env::remove_var("WATTSWARM_PG_SCHEMA");
         }
     }
 }
@@ -277,10 +328,14 @@ fn local_node_id_is_stable_for_same_state_dir() {
 
 #[test]
 fn run_real_task_flow_returns_clear_error_when_executor_missing() {
+    let _guard = env_lock();
+    let _db_lock = DbTestLock::acquire();
+    reset_test_schema("test");
+    let _schema_guard = EnvVarGuard::set("WATTSWARM_PG_SCHEMA", "test");
     let dir = temp_test_dir("run-real-missing-executor");
     let state_dir = dir.join("state");
     fs::create_dir_all(&state_dir).expect("create state dir");
-    let db_path = state_dir.join("test.db");
+    let db_path = state_dir.join("test.state");
 
     let mut node = open_node(&state_dir, &db_path).expect("open node");
     let req = RealTaskRunRequest {
@@ -303,10 +358,14 @@ fn run_real_task_flow_returns_clear_error_when_executor_missing() {
 
 #[test]
 fn run_real_task_flow_rejects_unsupported_profile() {
+    let _guard = env_lock();
+    let _db_lock = DbTestLock::acquire();
+    reset_test_schema("test");
+    let _schema_guard = EnvVarGuard::set("WATTSWARM_PG_SCHEMA", "test");
     let dir = temp_test_dir("run-real-unsupported-profile");
     let state_dir = dir.join("state");
     fs::create_dir_all(&state_dir).expect("create state dir");
-    let db_path = state_dir.join("test.db");
+    let db_path = state_dir.join("test.state");
     let stub = RuntimeStub::start(&["other-profile"]);
 
     save_executor_registry(
@@ -338,10 +397,14 @@ fn run_real_task_flow_rejects_unsupported_profile() {
 
 #[test]
 fn run_real_task_flow_reports_task_file_parse_errors() {
+    let _guard = env_lock();
+    let _db_lock = DbTestLock::acquire();
+    reset_test_schema("test");
+    let _schema_guard = EnvVarGuard::set("WATTSWARM_PG_SCHEMA", "test");
     let dir = temp_test_dir("run-real-task-file-parse");
     let state_dir = dir.join("state");
     fs::create_dir_all(&state_dir).expect("create state dir");
-    let db_path = state_dir.join("test.db");
+    let db_path = state_dir.join("test.state");
     let stub = RuntimeStub::start(&["default"]);
 
     save_executor_registry(
@@ -378,13 +441,14 @@ fn run_real_task_flow_reports_task_file_parse_errors() {
 
 #[test]
 fn run_real_task_flow_completes_with_stub_runtime() {
-    let _env_lock = env_lock();
-    let _pg_iso = EnvVarGuard::set("WATTSWARM_PG_ISOLATE_BY_PATH", "1");
-
+    let _guard = env_lock();
+    let _db_lock = DbTestLock::acquire();
+    reset_test_schema("test");
+    let _schema_guard = EnvVarGuard::set("WATTSWARM_PG_SCHEMA", "test");
     let dir = temp_test_dir("run-real-success");
     let state_dir = dir.join("state");
     fs::create_dir_all(&state_dir).expect("create state dir");
-    let db_path = state_dir.join("test.db");
+    let db_path = state_dir.join("test.state");
     let stub = RuntimeStub::start(&["default"]);
 
     save_executor_registry(

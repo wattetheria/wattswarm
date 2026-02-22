@@ -17,7 +17,7 @@ pub(crate) fn ensure_run_queue_timestamp_column(
         .query_opt(
             "SELECT data_type
              FROM information_schema.columns
-             WHERE table_schema = 'public' AND table_name = $1 AND column_name = $2",
+             WHERE table_schema = current_schema() AND table_name = $1 AND column_name = $2",
             &[&table, &column],
         )?
         .ok_or_else(|| anyhow!("missing column {}.{}", table, column))?

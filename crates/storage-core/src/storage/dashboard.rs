@@ -9,7 +9,7 @@ impl PgStore {
         let mut stmt = conn.prepare(
             "SELECT task_id FROM task_projection
              ORDER BY epoch DESC, task_id DESC
-             LIMIT ?1",
+             LIMIT $1",
         )?;
         let rows = stmt.query_map(params![limit as i64], |r| r.get::<_, String>(0))?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
@@ -23,7 +23,7 @@ impl PgStore {
             .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
         conn.query_row(
             "SELECT candidate_json FROM candidates
-             WHERE task_id = ?1
+             WHERE task_id = $1
              ORDER BY candidate_id DESC
              LIMIT 1",
             params![task_id],
@@ -50,7 +50,7 @@ impl PgStore {
             .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
         let count = conn.query_row(
             "SELECT COUNT(1) FROM verifier_results
-             WHERE task_id = ?1 AND candidate_id = ?2",
+             WHERE task_id = $1 AND candidate_id = $2",
             params![task_id, candidate_id],
             |r| r.get::<_, i64>(0),
         )?;
@@ -65,7 +65,7 @@ impl PgStore {
         let exists = conn.query_row(
             "SELECT EXISTS(
                 SELECT 1 FROM vote_commits
-                WHERE task_id = ?1 AND execution_id = ?2
+                WHERE task_id = $1 AND execution_id = $2
             )",
             params![task_id, execution_id],
             |r| r.get::<_, i64>(0),

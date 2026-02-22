@@ -23,8 +23,8 @@ pub struct Cli {
     #[arg(long, default_value = ".wattswarm")]
     state_dir: PathBuf,
 
-    #[arg(long, default_value = "wattswarm.db")]
-    db: PathBuf,
+    #[arg(long = "store", default_value = "wattswarm.state")]
+    store: PathBuf,
 }
 
 #[derive(Subcommand, Debug)]
@@ -196,21 +196,21 @@ pub fn run() -> Result<()> {
     let cli = Cli::parse();
     fs::create_dir_all(&cli.state_dir)?;
 
-    let db_path = if cli.db.is_absolute() {
-        cli.db
+    let store_path = if cli.store.is_absolute() {
+        cli.store
     } else {
-        cli.state_dir.join(cli.db)
+        cli.state_dir.join(cli.store)
     };
 
     match cli.command {
-        RootCommand::Node(cmd) => handle_node(cmd, &cli.state_dir, &db_path),
-        RootCommand::Peers(cmd) => handle_peers(cmd, &cli.state_dir, &db_path),
-        RootCommand::Log(cmd) => handle_log(cmd, &cli.state_dir, &db_path),
+        RootCommand::Node(cmd) => handle_node(cmd, &cli.state_dir, &store_path),
+        RootCommand::Peers(cmd) => handle_peers(cmd, &cli.state_dir, &store_path),
+        RootCommand::Log(cmd) => handle_log(cmd, &cli.state_dir, &store_path),
         RootCommand::Executors(cmd) => handle_executors(cmd, &cli.state_dir),
-        RootCommand::Task(cmd) => handle_task(cmd, &cli.state_dir, &db_path),
-        RootCommand::Run(cmd) => handle_run(cmd, &cli.state_dir, &db_path),
-        RootCommand::Knowledge(cmd) => handle_knowledge(cmd, &cli.state_dir, &db_path),
-        RootCommand::Ui(cmd) => crate::ui::run(cli.state_dir, db_path, cmd.listen),
+        RootCommand::Task(cmd) => handle_task(cmd, &cli.state_dir, &store_path),
+        RootCommand::Run(cmd) => handle_run(cmd, &cli.state_dir, &store_path),
+        RootCommand::Knowledge(cmd) => handle_knowledge(cmd, &cli.state_dir, &store_path),
+        RootCommand::Ui(cmd) => crate::ui::run(cli.state_dir, store_path, cmd.listen),
     }
 }
 

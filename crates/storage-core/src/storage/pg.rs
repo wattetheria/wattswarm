@@ -102,19 +102,12 @@ fn sanitize_ident(raw: &str) -> String {
     out
 }
 
-fn schema_from_path(path: &Path) -> String {
-    let raw = path.to_string_lossy();
-    let digest = crate::crypto::sha256_hex(raw.as_bytes());
-    sanitize_ident(&format!("ws_{}", &digest[..16]))
-}
-
-fn isolate_by_path_enabled() -> bool {
-    std::env::var("WATTSWARM_PG_ISOLATE_BY_PATH")
+fn configured_schema_name() -> String {
+    std::env::var("WATTSWARM_PG_SCHEMA")
         .ok()
-        .is_some_and(|v| {
-            let trimmed = v.trim().to_ascii_lowercase();
-            trimmed == "1" || trimmed == "true" || trimmed == "yes"
-        })
+        .map(|v| sanitize_ident(v.trim()))
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| PRIMARY_SCHEMA.to_owned())
 }
 
 #[derive(Clone)]
@@ -124,25 +117,47 @@ pub struct Connection {
 
 struct Inner {
     client: Mutex<Client>,
-    _schema: String,
+    schema: String,
+    database_url: String,
+    cleanup_on_drop: bool,
+}
+
+impl Drop for Inner {
+    fn drop(&mut self) {
+        if !self.cleanup_on_drop || self.schema == PRIMARY_SCHEMA {
+            return;
+        }
+        let mut client = match Client::connect(&self.database_url, NoTls) {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+        let ddl = format!("DROP SCHEMA IF EXISTS {} CASCADE;", self.schema);
+        let _ = client.batch_execute(&ddl);
+    }
 }
 
 impl Connection {
-    pub fn open(path: impl AsRef<Path>) -> Result<Self> {
-        if isolate_by_path_enabled() {
-            let schema = schema_from_path(path.as_ref());
-            Self::connect_for_schema(schema, true)
-        } else {
-            Self::connect_for_schema(PRIMARY_SCHEMA.to_owned(), false)
-        }
+    pub fn open(_path: impl AsRef<Path>) -> Result<Self> {
+        // Keep the `path` parameter for CLI/API backward compatibility.
+        // PostgreSQL-only mode defaults to `public`.
+        // Optional explicit schema selection is controlled by WATTSWARM_PG_SCHEMA.
+        let schema = configured_schema_name();
+        let create_schema = schema != PRIMARY_SCHEMA;
+        Self::connect_for_schema(schema, create_schema, false)
     }
 
     pub fn open_in_memory() -> Result<Self> {
         let schema = sanitize_ident(&format!("ws_test_{}", uuid::Uuid::new_v4().simple()));
-        Self::connect_for_schema(schema, true)
+        // Test-only "in-memory" mode is schema-backed in PostgreSQL.
+        // Auto-clean the schema on drop to avoid long-term schema clutter.
+        Self::connect_for_schema(schema, true, true)
     }
 
-    fn connect_for_schema(schema: String, create_schema: bool) -> Result<Self> {
+    fn connect_for_schema(
+        schema: String,
+        create_schema: bool,
+        cleanup_on_drop: bool,
+    ) -> Result<Self> {
         let url = default_pg_url();
         let mut client = Client::connect(&url, NoTls).map_err(map_db_err)?;
         if create_schema {
@@ -158,18 +173,11 @@ impl Connection {
         Ok(Self {
             inner: Arc::new(Inner {
                 client: Mutex::new(client),
-                _schema: schema,
+                schema,
+                database_url: url,
+                cleanup_on_drop,
             }),
         })
-    }
-
-    pub fn pragma_update<V: ToString>(
-        &self,
-        _schema_name: Option<&str>,
-        _pragma: &str,
-        _value: V,
-    ) -> Result<()> {
-        Ok(())
     }
 
     pub fn execute_batch(&self, sql: &str) -> Result<()> {
@@ -178,8 +186,7 @@ impl Connection {
             .client
             .lock()
             .map_err(|_| Error::Db("mutex poisoned".to_owned()))?;
-        let translated = translate_sql(sql);
-        client.batch_execute(&translated).map_err(map_db_err)?;
+        client.batch_execute(sql).map_err(map_db_err)?;
         Ok(())
     }
 
@@ -189,10 +196,9 @@ impl Connection {
             .client
             .lock()
             .map_err(|_| Error::Db("mutex poisoned".to_owned()))?;
-        let translated = translate_sql(sql);
         let values = params.to_values();
         let refs = build_param_refs(&values);
-        Ok(client.execute(&translated, &refs).map_err(map_db_err)? as usize)
+        Ok(client.execute(sql, &refs).map_err(map_db_err)? as usize)
     }
 
     pub fn query_row<P, F, T>(&self, sql: &str, params: P, f: F) -> Result<T>
@@ -205,10 +211,9 @@ impl Connection {
             .client
             .lock()
             .map_err(|_| Error::Db("mutex poisoned".to_owned()))?;
-        let translated = translate_sql(sql);
         let values = params.to_values();
         let refs = build_param_refs(&values);
-        let maybe = client.query_opt(&translated, &refs).map_err(map_db_err)?;
+        let maybe = client.query_opt(sql, &refs).map_err(map_db_err)?;
         let row = maybe.ok_or(Error::QueryReturnedNoRows)?;
         f(&Row::new(row))
     }
@@ -244,10 +249,9 @@ impl Statement {
             .client
             .lock()
             .map_err(|_| Error::Db("mutex poisoned".to_owned()))?;
-        let translated = translate_sql(&self.sql);
         let values = params.to_values();
         let refs = build_param_refs(&values);
-        let rows = client.query(&translated, &refs).map_err(map_db_err)?;
+        let rows = client.query(&self.sql, &refs).map_err(map_db_err)?;
         if let Some(row) = rows.first() {
             self.column_names = row.columns().iter().map(|c| c.name().to_owned()).collect();
         }
@@ -779,133 +783,6 @@ fn build_param_refs(values: &[ParamValue]) -> Vec<&(dyn ToSql + Sync)> {
         .collect()
 }
 
-fn split_json_extract_args(args: &str) -> Option<(&str, &str)> {
-    let mut depth = 0i32;
-    let mut in_single_quote = false;
-    let chars: Vec<(usize, char)> = args.char_indices().collect();
-    let mut i = 0usize;
-    while i < chars.len() {
-        let (idx, ch) = chars[i];
-        match ch {
-            '\'' => {
-                if in_single_quote {
-                    if i + 1 < chars.len() && chars[i + 1].1 == '\'' {
-                        i += 1;
-                    } else {
-                        in_single_quote = false;
-                    }
-                } else {
-                    in_single_quote = true;
-                }
-            }
-            '(' if !in_single_quote => depth += 1,
-            ')' if !in_single_quote && depth > 0 => depth -= 1,
-            ',' if !in_single_quote && depth == 0 => {
-                return Some((args[..idx].trim(), args[idx + 1..].trim()));
-            }
-            _ => {}
-        }
-        i += 1;
-    }
-    None
-}
-
-fn rewrite_json_extract_call(args: &str) -> Option<String> {
-    let (json_expr, path_expr) = split_json_extract_args(args)?;
-    let path_literal = path_expr.strip_prefix('\'')?.strip_suffix('\'')?;
-    let dotted = path_literal.strip_prefix("$.")?;
-    if dotted.is_empty() || dotted.contains('[') || dotted.contains(']') {
-        return None;
-    }
-    let parts: Vec<&str> = dotted.split('.').collect();
-    if parts.iter().any(|part| {
-        part.is_empty()
-            || !part
-                .chars()
-                .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
-    }) {
-        return None;
-    }
-    if parts.len() == 1 {
-        return Some(format!("({json_expr}::jsonb ->> '{}')", parts[0]));
-    }
-    Some(format!(
-        "({json_expr}::jsonb #>> '{{{}}}')",
-        parts.join(",")
-    ))
-}
-
-fn translate_json_extract_calls(sql: &str) -> String {
-    const NEEDLE: &str = "json_extract(";
-    let mut out = String::with_capacity(sql.len() + 16);
-    let mut rest = sql;
-    while let Some(pos) = rest.find(NEEDLE) {
-        out.push_str(&rest[..pos]);
-        rest = &rest[pos + NEEDLE.len()..];
-        let mut depth = 1i32;
-        let mut close_idx = None;
-        for (idx, ch) in rest.char_indices() {
-            match ch {
-                '(' => depth += 1,
-                ')' => {
-                    depth -= 1;
-                    if depth == 0 {
-                        close_idx = Some(idx);
-                        break;
-                    }
-                }
-                _ => {}
-            }
-        }
-        let Some(end_idx) = close_idx else {
-            out.push_str(NEEDLE);
-            out.push_str(rest);
-            return out;
-        };
-        let inner = &rest[..end_idx];
-        if let Some(rewritten) = rewrite_json_extract_call(inner) {
-            out.push_str(&rewritten);
-        } else {
-            out.push_str(NEEDLE);
-            out.push_str(inner);
-            out.push(')');
-        }
-        rest = &rest[end_idx + 1..];
-    }
-    out.push_str(rest);
-    out
-}
-
-fn translate_sql(sql: &str) -> String {
-    let mut out = String::with_capacity(sql.len() + 8);
-    let mut chars = sql.chars().peekable();
-    let mut anon_index = 1usize;
-    while let Some(ch) = chars.next() {
-        if ch == '?' {
-            let mut digits = String::new();
-            while let Some(peek) = chars.peek() {
-                if peek.is_ascii_digit() {
-                    digits.push(*peek);
-                    chars.next();
-                } else {
-                    break;
-                }
-            }
-            if digits.is_empty() {
-                out.push('$');
-                out.push_str(&anon_index.to_string());
-                anon_index += 1;
-            } else {
-                out.push('$');
-                out.push_str(&digits);
-            }
-        } else {
-            out.push(ch);
-        }
-    }
-    translate_json_extract_calls(&out)
-}
-
 pub trait OptionalExtension<T> {
     fn optional(self) -> Result<Option<T>>;
 }
@@ -928,53 +805,4 @@ macro_rules! params {
     ($($value:expr),+ $(,)?) => {{
         vec![$($crate::storage::pg::to_param_value(&$value)),+]
     }};
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn translate_sql_rewrites_positional_placeholders() {
-        let sql = "SELECT * FROM t WHERE a = ?1 AND b = ?2";
-        let translated = translate_sql(sql);
-        assert_eq!(translated, "SELECT * FROM t WHERE a = $1 AND b = $2");
-    }
-
-    #[test]
-    fn translate_sql_rewrites_anonymous_placeholders() {
-        let sql = "SELECT * FROM t WHERE a = ? AND b = ?";
-        let translated = translate_sql(sql);
-        assert_eq!(translated, "SELECT * FROM t WHERE a = $1 AND b = $2");
-    }
-
-    #[test]
-    fn translate_sql_rewrites_json_extract_single_path() {
-        let sql = "SELECT task_id FROM task_projection WHERE json_extract(contract_json, '$.task_type') = ?1";
-        let translated = translate_sql(sql);
-        assert!(translated.contains("(contract_json::jsonb ->> 'task_type') = $1"));
-    }
-
-    #[test]
-    fn translate_sql_rewrites_json_extract_nested_path() {
-        let sql = "SELECT json_extract(payload_json, '$.meta.score') FROM t";
-        let translated = translate_sql(sql);
-        assert!(translated.contains("(payload_json::jsonb #>> '{meta,score}')"));
-    }
-
-    #[test]
-    fn translate_sql_keeps_unsupported_json_extract_path() {
-        let sql = "SELECT json_extract(payload_json, '$.items[0]') FROM t";
-        let translated = translate_sql(sql);
-        assert!(translated.contains("json_extract(payload_json, '$.items[0]')"));
-    }
-
-    #[test]
-    fn translate_sql_rewrites_multiple_json_extract_calls() {
-        let sql = "SELECT json_extract(a, '$.x'), json_extract(b, '$.y.z') FROM t WHERE c = ?1";
-        let translated = translate_sql(sql);
-        assert!(translated.contains("(a::jsonb ->> 'x')"));
-        assert!(translated.contains("(b::jsonb #>> '{y,z}')"));
-        assert!(translated.contains("c = $1"));
-    }
 }

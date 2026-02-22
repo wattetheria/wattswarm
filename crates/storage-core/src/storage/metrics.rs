@@ -13,7 +13,7 @@ impl PgStore {
                     CASE WHEN approved_at IS NULL THEN NULL ELSE (EXTRACT(EPOCH FROM approved_at) * 1000)::BIGINT END AS approved_at,
                     applied_policy_hash,
                     CASE WHEN applied_at IS NULL THEN NULL ELSE (EXTRACT(EPOCH FROM applied_at) * 1000)::BIGINT END AS applied_at
-             FROM advisory_state WHERE advisory_id = ?1",
+             FROM advisory_state WHERE advisory_id = $1",
             params![advisory_id],
             |r| {
                 Ok(AdvisoryStateRow {
@@ -46,7 +46,7 @@ impl PgStore {
             .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
         conn.execute(
             "INSERT INTO advisory_state(advisory_id, policy_id, suggested_policy_hash, status, created_at)
-             VALUES (?1, ?2, ?3, 'created', TIMESTAMPTZ 'epoch' + (?4::bigint * INTERVAL '1 millisecond'))",
+             VALUES ($1, $2, $3, 'created', TIMESTAMPTZ 'epoch' + ($4::bigint * INTERVAL '1 millisecond'))",
             params![
                 advisory_id,
                 policy_id,
@@ -70,9 +70,9 @@ impl PgStore {
         conn.execute(
             "UPDATE advisory_state
              SET status = 'approved',
-                 approved_by = ?2,
-                 approved_at = TIMESTAMPTZ 'epoch' + (?3::bigint * INTERVAL '1 millisecond')
-             WHERE advisory_id = ?1",
+                 approved_by = $2,
+                 approved_at = TIMESTAMPTZ 'epoch' + ($3::bigint * INTERVAL '1 millisecond')
+             WHERE advisory_id = $1",
             params![advisory_id, admin_node_id, approved_at as i64],
         )?;
         Ok(())
@@ -91,9 +91,9 @@ impl PgStore {
         conn.execute(
             "UPDATE advisory_state
              SET status = 'applied',
-                 applied_policy_hash = ?2,
-                 applied_at = TIMESTAMPTZ 'epoch' + (?3::bigint * INTERVAL '1 millisecond')
-             WHERE advisory_id = ?1",
+                 applied_policy_hash = $2,
+                 applied_at = TIMESTAMPTZ 'epoch' + ($3::bigint * INTERVAL '1 millisecond')
+             WHERE advisory_id = $1",
             params![advisory_id, applied_policy_hash, applied_at as i64],
         )?;
         Ok(())
@@ -114,7 +114,7 @@ impl PgStore {
             .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
         conn.execute(
             "INSERT INTO unknown_reason_observations(task_id, unknown_reason_code, peer_protocol_version, local_protocol_version, author_node_id, observed_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, TIMESTAMPTZ 'epoch' + (?6::bigint * INTERVAL '1 millisecond'))",
+             VALUES ($1, $2, $3, $4, $5, TIMESTAMPTZ 'epoch' + ($6::bigint * INTERVAL '1 millisecond'))",
             params![
                 task_id,
                 unknown_reason_code as i64,
@@ -140,9 +140,9 @@ impl PgStore {
                 "SELECT sample_count, finalize_count, timeout_count, crash_count, invalid_output_count,
                         latency_samples_json, reject_reason_distribution, cost_units
                  FROM runtime_metrics
-                 WHERE runtime_id = ?1 AND profile_id = ?2 AND task_type = ?3
-                   AND window_start = TIMESTAMPTZ 'epoch' + (?4::bigint * INTERVAL '1 millisecond')
-                   AND window_end = TIMESTAMPTZ 'epoch' + (?5::bigint * INTERVAL '1 millisecond')",
+                 WHERE runtime_id = $1 AND profile_id = $2 AND task_type = $3
+                   AND window_start = TIMESTAMPTZ 'epoch' + ($4::bigint * INTERVAL '1 millisecond')
+                   AND window_end = TIMESTAMPTZ 'epoch' + ($5::bigint * INTERVAL '1 millisecond')",
                 params![
                     obs.runtime_id,
                     obs.profile_id,
@@ -246,11 +246,11 @@ impl PgStore {
                 cost_units_per_finalized_task_p50, cost_units_per_finalized_task_p95,
                 verify_cost_ratio, invalid_event_reject_count, fork_prevented_count, da_fetch_fail_rate
              ) VALUES (
-                ?1, ?2, ?3,
-                TIMESTAMPTZ 'epoch' + (?4::bigint * INTERVAL '1 millisecond'),
-                TIMESTAMPTZ 'epoch' + (?5::bigint * INTERVAL '1 millisecond'),
-                ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18,
-                ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30
+                $1, $2, $3,
+                TIMESTAMPTZ 'epoch' + ($4::bigint * INTERVAL '1 millisecond'),
+                TIMESTAMPTZ 'epoch' + ($5::bigint * INTERVAL '1 millisecond'),
+                $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18,
+                $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30
              )
              ON CONFLICT(runtime_id, profile_id, task_type, window_start, window_end) DO UPDATE SET
                 finalize_rate = excluded.finalize_rate,
@@ -329,7 +329,7 @@ impl PgStore {
         let existing = conn
             .query_row(
                 "SELECT stability_reputation, quality_reputation FROM reputation_state
-                 WHERE runtime_id = ?1 AND profile_id = ?2",
+                 WHERE runtime_id = $1 AND profile_id = $2",
                 params![runtime_id, profile_id],
                 |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)),
             )
@@ -340,7 +340,7 @@ impl PgStore {
         };
         conn.execute(
             "INSERT INTO reputation_state(runtime_id, profile_id, stability_reputation, quality_reputation, last_updated_at)
-             VALUES (?1, ?2, ?3, ?4, TIMESTAMPTZ 'epoch' + (?5::bigint * INTERVAL '1 millisecond'))
+             VALUES ($1, $2, $3, $4, TIMESTAMPTZ 'epoch' + ($5::bigint * INTERVAL '1 millisecond'))
              ON CONFLICT(runtime_id, profile_id) DO UPDATE SET
                stability_reputation = excluded.stability_reputation,
                quality_reputation = excluded.quality_reputation,

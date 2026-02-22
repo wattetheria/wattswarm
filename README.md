@@ -59,7 +59,7 @@ You can remove or ignore `ui/*` and still run the kernel fully via CLI/runtime A
 - `wattswarm knowledge export --task_id <...> --out <file>`
 - `wattswarm ui --listen 127.0.0.1:7788`
 
-Note: storage is PostgreSQL-only on the `public` schema. `--db` is kept for CLI backward compatibility and no longer changes schema/database routing.
+Note: storage is PostgreSQL-only on the `public` schema. `--store` is the logical local store identifier and does not change PostgreSQL routing.
 
 UI (`/`) exposes API-backed controls for all CLI operation groups:
 - Node: up/down/status
@@ -203,11 +203,11 @@ Example:
 cargo run --bin wattswarm-runtime -- --listen 127.0.0.1:8787
 
 # terminal B: kernel orchestration
-cargo run --bin wattswarm -- --state-dir ./.ws-dev --db wattswarm.db node up
-cargo run --bin wattswarm -- --state-dir ./.ws-dev --db wattswarm.db executors add rt http://127.0.0.1:8787
-cargo run --bin wattswarm -- --state-dir ./.ws-dev --db wattswarm.db task submit ./task.json
-cargo run --bin wattswarm -- --state-dir ./.ws-dev --db wattswarm.db task run-real --executor rt --profile default --task-id task-1
-cargo run --bin wattswarm -- --state-dir ./.ws-dev --db wattswarm.db task decision task-1
+cargo run --bin wattswarm -- --state-dir ./.ws-dev --store wattswarm.state node up
+cargo run --bin wattswarm -- --state-dir ./.ws-dev --store wattswarm.state executors add rt http://127.0.0.1:8787
+cargo run --bin wattswarm -- --state-dir ./.ws-dev --store wattswarm.state task submit ./task.json
+cargo run --bin wattswarm -- --state-dir ./.ws-dev --store wattswarm.state task run-real --executor rt --profile default --task-id task-1
+cargo run --bin wattswarm -- --state-dir ./.ws-dev --store wattswarm.state task decision task-1
 ```
 
 `task.json` is the boundary object between your independent project and the kernel.
@@ -221,20 +221,20 @@ Example:
 
 ```bash
 # register multiple runtimes
-cargo run --bin wattswarm -- --state-dir ./.ws-dev --db wattswarm.db executors add rt-local http://127.0.0.1:8787
-cargo run --bin wattswarm -- --state-dir ./.ws-dev --db wattswarm.db executors add rt-openclaw https://openclaw.example.com
-cargo run --bin wattswarm -- --state-dir ./.ws-dev --db wattswarm.db executors add rt-cloud https://api.example.com/runtime
+cargo run --bin wattswarm -- --state-dir ./.ws-dev --store wattswarm.state executors add rt-local http://127.0.0.1:8787
+cargo run --bin wattswarm -- --state-dir ./.ws-dev --store wattswarm.state executors add rt-openclaw https://openclaw.example.com
+cargo run --bin wattswarm -- --state-dir ./.ws-dev --store wattswarm.state executors add rt-cloud https://api.example.com/runtime
 
 # inspect and health-check
-cargo run --bin wattswarm -- --state-dir ./.ws-dev --db wattswarm.db executors list
-cargo run --bin wattswarm -- --state-dir ./.ws-dev --db wattswarm.db executors check rt-openclaw
+cargo run --bin wattswarm -- --state-dir ./.ws-dev --store wattswarm.state executors list
+cargo run --bin wattswarm -- --state-dir ./.ws-dev --store wattswarm.state executors check rt-openclaw
 ```
 
 Runtime selection is explicit per task run:
 
 ```bash
-cargo run --bin wattswarm -- --state-dir ./.ws-dev --db wattswarm.db task run-real --executor rt-local --profile default --task-id task-local-1
-cargo run --bin wattswarm -- --state-dir ./.ws-dev --db wattswarm.db task run-real --executor rt-openclaw --profile default --task-id task-openclaw-1
+cargo run --bin wattswarm -- --state-dir ./.ws-dev --store wattswarm.state task run-real --executor rt-local --profile default --task-id task-local-1
+cargo run --bin wattswarm -- --state-dir ./.ws-dev --store wattswarm.state task run-real --executor rt-openclaw --profile default --task-id task-openclaw-1
 ```
 
 Notes:
@@ -310,7 +310,7 @@ CI workflow:
 Launch UI console:
 
 ```bash
-cargo run --bin wattswarm -- --state-dir ./.ws-dev --db wattswarm.db ui --listen 127.0.0.1:7788
+cargo run --bin wattswarm -- --state-dir ./.ws-dev --store wattswarm.state ui --listen 127.0.0.1:7788
 ```
 
 Open:
@@ -339,10 +339,10 @@ cargo run --bin wattswarm-runtime -- --listen 127.0.0.1:8787
 In another terminal, run a real end-to-end task flow:
 
 ```bash
-cargo run --bin wattswarm -- --state-dir ./.ws-dev --db wattswarm.db node up
-cargo run --bin wattswarm -- --state-dir ./.ws-dev --db wattswarm.db executors add rt http://127.0.0.1:8787
-cargo run --bin wattswarm -- --state-dir ./.ws-dev --db wattswarm.db task run-real --executor rt --profile default --task-id task-real-1
-cargo run --bin wattswarm -- --state-dir ./.ws-dev --db wattswarm.db task decision task-real-1
+cargo run --bin wattswarm -- --state-dir ./.ws-dev --store wattswarm.state node up
+cargo run --bin wattswarm -- --state-dir ./.ws-dev --store wattswarm.state executors add rt http://127.0.0.1:8787
+cargo run --bin wattswarm -- --state-dir ./.ws-dev --store wattswarm.state task run-real --executor rt --profile default --task-id task-real-1
+cargo run --bin wattswarm -- --state-dir ./.ws-dev --store wattswarm.state task decision task-real-1
 ```
 
 `task run-real` executes the full chain:

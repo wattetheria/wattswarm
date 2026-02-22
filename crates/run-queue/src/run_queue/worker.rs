@@ -145,7 +145,7 @@ impl PgRunQueue {
                 &STEP_STATUS_LEASED,
             ],
         )?;
-        Ok(recovered as u64)
+        Ok(recovered)
     }
 
     fn claim_steps(
@@ -485,7 +485,7 @@ mod tests {
                     once: true,
                 },
                 Path::new("."),
-                Path::new("wattswarm.db"),
+                Path::new("wattswarm.state"),
             )
             .expect("run worker once");
     }
@@ -634,7 +634,11 @@ mod tests {
         claimed.run_status = RUN_STATUS_CANCELLING.to_owned();
 
         queue
-            .process_step(claimed.clone(), Path::new("."), Path::new("wattswarm.db"))
+            .process_step(
+                claimed.clone(),
+                Path::new("."),
+                Path::new("wattswarm.state"),
+            )
             .expect("process cancelling");
 
         let row = client

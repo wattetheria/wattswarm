@@ -115,10 +115,10 @@ fn extract_step_conclusion(step_result: &Value) -> Value {
         return candidate_output.clone();
     }
     if let Some(summary) = step_result.get("result_summary") {
-        if let Some(raw) = summary.as_str() {
-            if let Ok(parsed) = serde_json::from_str::<Value>(raw) {
-                return parsed;
-            }
+        if let Some(raw) = summary.as_str()
+            && let Ok(parsed) = serde_json::from_str::<Value>(raw)
+        {
+            return parsed;
         }
         return summary.clone();
     }

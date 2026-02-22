@@ -12,18 +12,34 @@ use super::utils::{accumulate_counts, step_counts_tx};
 #[derive(Debug, Clone)]
 pub struct PgRunQueue {
     pub(crate) database_url: String,
+    pub(crate) schema: Option<String>,
 }
 
 impl PgRunQueue {
     pub fn new(database_url: impl Into<String>) -> Self {
         Self {
             database_url: database_url.into(),
+            schema: None,
+        }
+    }
+
+    pub fn with_schema(database_url: impl Into<String>, schema: impl AsRef<str>) -> Self {
+        Self {
+            database_url: database_url.into(),
+            schema: Some(sanitize_ident(schema.as_ref())),
         }
     }
 
     pub(crate) fn connect(&self) -> Result<Client> {
-        Client::connect(&self.database_url, NoTls)
-            .map_err(|err| anyhow!("connect postgres {}: {err}", self.database_url))
+        let mut client = Client::connect(&self.database_url, NoTls)
+            .map_err(|err| anyhow!("connect postgres {}: {err}", self.database_url))?;
+        if let Some(schema) = &self.schema {
+            client.batch_execute(&format!(
+                "CREATE SCHEMA IF NOT EXISTS {schema};
+                 SET search_path TO {schema}, public;"
+            ))?;
+        }
+        Ok(client)
     }
 
     pub(crate) fn finalize_run_if_terminal_tx(
@@ -124,6 +140,28 @@ impl PgRunQueue {
         }
         Ok(())
     }
+}
+
+fn sanitize_ident(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len().max(8));
+    for ch in raw.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '_' {
+            out.push(ch.to_ascii_lowercase());
+        } else {
+            out.push('_');
+        }
+    }
+    if out.is_empty() {
+        out.push_str("ws");
+    }
+    if !out
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+    {
+        out.insert(0, '_');
+    }
+    out
 }
 
 #[cfg(test)]

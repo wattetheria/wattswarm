@@ -5,8 +5,8 @@ fn column_exists(conn: &Connection, table: &str, column: &str) -> bool {
         "SELECT 1
          FROM information_schema.columns
          WHERE table_schema = current_schema()
-           AND table_name = ?1
-           AND column_name = ?2
+           AND table_name = $1
+           AND column_name = $2
          LIMIT 1",
         params![table, column],
         |_| Ok(1_i64),
@@ -21,8 +21,8 @@ fn column_data_type(conn: &Connection, table: &str, column: &str) -> Result<Opti
         "SELECT data_type
          FROM information_schema.columns
          WHERE table_schema = current_schema()
-           AND table_name = ?1
-           AND column_name = ?2
+           AND table_name = $1
+           AND column_name = $2
          LIMIT 1",
         params![table, column],
         |r| r.get(0),
@@ -55,6 +55,46 @@ fn ensure_timestamp_column(conn: &Connection, table: &str, column: &str) -> Resu
     Ok(())
 }
 
+fn ensure_boolean_column(
+    conn: &Connection,
+    table: &str,
+    column: &str,
+    default_value: Option<&str>,
+) -> Result<()> {
+    let Some(data_type) = column_data_type(conn, table, column)? else {
+        return Ok(());
+    };
+    if data_type == "boolean" {
+        return Ok(());
+    }
+    if data_type != "bigint" && data_type != "integer" && data_type != "smallint" {
+        return Err(SwarmError::Storage(format!(
+            "unsupported bool column type {}.{}: {}",
+            table, column, data_type
+        ))
+        .into());
+    }
+    let mut sql = format!(
+        "ALTER TABLE {table}
+         ALTER COLUMN {column}
+         DROP DEFAULT;
+         ALTER TABLE {table}
+         ALTER COLUMN {column}
+         TYPE BOOLEAN
+         USING ({column} <> 0)"
+    );
+    if let Some(default_value) = default_value {
+        sql.push_str(&format!(
+            ";
+             ALTER TABLE {table}
+             ALTER COLUMN {column}
+             SET DEFAULT {default_value}"
+        ));
+    }
+    conn.execute_batch(&sql)?;
+    Ok(())
+}
+
 impl PgStore {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let conn = Connection::open(path)?;
@@ -69,10 +109,8 @@ impl PgStore {
     fn initialize(conn: Connection) -> Result<Self> {
         const INIT_LOCK_KEY: i64 = 0x7773_696e_6974; // "wsinit"
 
-        conn.pragma_update(None, "journal_mode", "WAL")?;
-        conn.pragma_update(None, "synchronous", "FULL")?;
         conn.query_row(
-            "SELECT pg_advisory_lock(?1)",
+            "SELECT pg_advisory_lock($1)",
             params![INIT_LOCK_KEY],
             |_| Ok(()),
         )?;
@@ -126,7 +164,7 @@ impl PgStore {
                 candidate_id TEXT NOT NULL,
                 verifier_node_id TEXT NOT NULL,
                 result_json TEXT NOT NULL,
-                passed BIGINT NOT NULL DEFAULT 0,
+                passed BOOLEAN NOT NULL DEFAULT FALSE,
                 PRIMARY KEY(task_id, candidate_id, verifier_node_id)
             );
 
@@ -166,7 +204,7 @@ impl PgStore {
                 vote TEXT NOT NULL,
                 salt TEXT NOT NULL,
                 verifier_result_hash TEXT NOT NULL,
-                valid BIGINT NOT NULL,
+                valid BOOLEAN NOT NULL,
                 created_at TIMESTAMPTZ NOT NULL,
                 PRIMARY KEY(task_id, voter_node_id)
             );
@@ -206,7 +244,7 @@ impl PgStore {
                 output_schema_digest TEXT NOT NULL DEFAULT '',
                 policy_id TEXT NOT NULL DEFAULT '',
                 policy_params_digest TEXT NOT NULL DEFAULT '',
-                deprecated_as_exact BIGINT NOT NULL DEFAULT 0,
+                deprecated_as_exact BOOLEAN NOT NULL DEFAULT FALSE,
                 PRIMARY KEY(task_id, epoch)
             );
 
@@ -258,7 +296,7 @@ impl PgStore {
                 epoch BIGINT NOT NULL,
                 finalized_at TIMESTAMPTZ NOT NULL,
                 window_end_at TIMESTAMPTZ NOT NULL,
-                bad_feedback_exists BIGINT NOT NULL DEFAULT 0,
+                bad_feedback_exists BOOLEAN NOT NULL DEFAULT FALSE,
                 bad_feedback_at TIMESTAMPTZ,
                 PRIMARY KEY(task_id, epoch)
             );
@@ -387,6 +425,11 @@ impl PgStore {
                     "ALTER TABLE decision_memory ADD COLUMN policy_params_digest TEXT NOT NULL DEFAULT ''",
                 ),
                 (
+                    "decision_memory",
+                    "deprecated_as_exact",
+                    "ALTER TABLE decision_memory ADD COLUMN deprecated_as_exact BOOLEAN NOT NULL DEFAULT FALSE",
+                ),
+                (
                     "runtime_metrics",
                     "sample_count",
                     "ALTER TABLE runtime_metrics ADD COLUMN sample_count BIGINT NOT NULL DEFAULT 0",
@@ -477,9 +520,14 @@ impl PgStore {
                     "ALTER TABLE runtime_metrics ADD COLUMN da_fetch_fail_rate DOUBLE PRECISION NOT NULL DEFAULT 0",
                 ),
                 (
+                    "task_settlement",
+                    "bad_feedback_exists",
+                    "ALTER TABLE task_settlement ADD COLUMN bad_feedback_exists BOOLEAN NOT NULL DEFAULT FALSE",
+                ),
+                (
                     "verifier_results",
                     "passed",
-                    "ALTER TABLE verifier_results ADD COLUMN passed BIGINT NOT NULL DEFAULT 0",
+                    "ALTER TABLE verifier_results ADD COLUMN passed BOOLEAN NOT NULL DEFAULT FALSE",
                 ),
             ];
             for (table, column, alter_stmt) in migrations {
@@ -511,11 +559,26 @@ impl PgStore {
             for (table, column) in timestamp_columns {
                 ensure_timestamp_column(&conn, table, column)?;
             }
+
+            ensure_boolean_column(&conn, "vote_reveals", "valid", None)?;
+            ensure_boolean_column(&conn, "verifier_results", "passed", Some("FALSE"))?;
+            ensure_boolean_column(
+                &conn,
+                "decision_memory",
+                "deprecated_as_exact",
+                Some("FALSE"),
+            )?;
+            ensure_boolean_column(
+                &conn,
+                "task_settlement",
+                "bad_feedback_exists",
+                Some("FALSE"),
+            )?;
             Ok(())
         })();
 
         let unlock_result = conn.query_row(
-            "SELECT pg_advisory_unlock(?1)",
+            "SELECT pg_advisory_unlock($1)",
             params![INIT_LOCK_KEY],
             |_| Ok(()),
         );
