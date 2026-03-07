@@ -62,5 +62,5 @@ pub mod ui;
 #[path = "../../../ui/ui_template.rs"]
 pub mod ui_template;
 
-#[path = "../../cli/cli.rs"]
+#[path = "../../wattswarm-cli/cli.rs"]
 pub mod cli;
