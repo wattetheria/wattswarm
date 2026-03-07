@@ -6,7 +6,8 @@ This repository now contains a Rust-first v0.1 implementation of:
 - P2P-style node sync primitives (gossip/backfill/anti-entropy/checkpoint)
 - SEL append-only event log on PostgreSQL + replayable projections
 - PostgreSQL-backed run queue for multi-agent orchestration (`runs`, `run_steps`, `run_events`)
-- Run queue aggregation policy supports optional quorum (`aggregation.quorum`) and deterministic tie behavior (tie => no final pick)
+- Run queue aggregation policy supports optional quorum (`aggregation.quorum`), tie resolver chain (`aggregation.tie_policy`), and independent null resolver chain (`aggregation.null_policy`)
+- Default tie resolver is deterministic `STOCHASTIC` for tie-only paths; null paths use independent default `null_policy` chain
 - Claim/Lease/Renew scheduling and execution-id idempotency checks
 - Lease validity with clock-skew tolerance window (`CLOCK_SKEW_TOLERANCE_MS`)
 - Task lifecycle events (create/claim/execute/verify/vote/commit/finalize/error/retry/expire)
@@ -94,8 +95,17 @@ Run queue uses PostgreSQL as shared scheduler storage and supports:
 - Run-level aggregation output in `runs.result_json` (`final_decision`/`final_answer` + per-step conclusions)
 - Aggregation policy behavior:
   - optional `aggregation.quorum` threshold
-  - tie returns `null` final selection (no alphabetical tie-break)
-  - below quorum returns `null` final selection
+  - tie path and null path are handled independently
+  - tie path uses `aggregation.tie_policy.chain` (`REEXPLORE`, `CONFIDENCE_WEIGHTED`, `REPUTATION_WEIGHTED`, `STOCHASTIC`)
+  - null path uses `aggregation.null_policy.chain` (`REEXPLORE`, `FINALIZE_NULL`)
+  - tie `REEXPLORE`: emits `RUN_TIE_REEXPLORE_TRIGGERED`, injects `_aggregation_signal.type=NEED_MORE_EVIDENCE`, and requeues terminal steps
+  - null `REEXPLORE`: emits `RUN_NULL_REEXPLORE_TRIGGERED`, injects `_aggregation_signal` (`NEED_DECISION` / `NEED_STEP_RECOVERY` / `NEED_MORE_EVIDENCE`) and requeues terminal steps
+  - `CONFIDENCE_WEIGHTED`: sums per-value confidence and chooses unique max
+  - `REPUTATION_WEIGHTED`: sums per-value `agent_reputation_units` and chooses unique max
+  - `STOCHASTIC`: deterministic pseudo-random tie break from hashed seed
+  - default tie behavior uses `tie_policy.enabled_on=["TIE"]` and `tie_policy.chain=["STOCHASTIC"]`
+  - default null behavior uses `null_policy.enabled_on=["EMPTY","QUORUM_NULL"]` and `null_policy.chain=["REEXPLORE","FINALIZE_NULL"]`
+  - result payload now includes `aggregation.resolution_paths` and `aggregation.null_resolution` for monitoring
 - Human-readable DB time columns (`created_at/updated_at/started_at/finished_at`) stored as `TIMESTAMPTZ`
 - Run-level control plane APIs via CLI:
   - create (`run submit`)

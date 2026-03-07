@@ -330,6 +330,11 @@ pub fn run_real_task_flow(
         .get("answer")
         .and_then(Value::as_str)
         .map(str::to_owned);
+    let evidence_digests = candidate
+        .evidence_refs
+        .iter()
+        .map(|r| r.digest.clone())
+        .collect::<Vec<_>>();
     Ok(json!({
         "task_id": contract.task_id,
         "candidate_id": candidate_id,
@@ -338,6 +343,7 @@ pub fn run_real_task_flow(
         "provider_family": capabilities.provider_family,
         "model_id": capabilities.model_id,
         "candidate_output": candidate.output,
+        "evidence_digests": evidence_digests,
         "final_decision": final_decision,
         "final_answer": final_answer,
         "terminal_state": format!("{:?}", view.terminal_state),

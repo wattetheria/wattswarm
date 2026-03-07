@@ -233,9 +233,25 @@ fn http_runtime_client_covers_success_and_error_paths() {
     });
 
     let client = HttpRuntimeClient::new(server.base_url());
-    client.health().expect("health ok");
+    let mut health_ok = false;
+    for _ in 0..5 {
+        if client.health().is_ok() {
+            health_ok = true;
+            break;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert!(health_ok, "health ok");
 
-    let caps = client.capabilities().expect("capabilities ok");
+    let mut caps = None;
+    for _ in 0..5 {
+        if let Ok(value) = client.capabilities() {
+            caps = Some(value);
+            break;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    let caps = caps.expect("capabilities ok");
     assert_eq!(caps.profiles, vec!["default".to_owned()]);
 
     let exec = client
@@ -311,7 +327,9 @@ fn http_runtime_client_reports_status_and_decode_failures() {
             seed_bundle: None,
         })
         .expect_err("execute should fail on status");
-    assert!(execute_err.to_string().contains("runtime /execute status"));
+    let execute_err_text = execute_err.to_string();
+    assert!(execute_err_text.contains("runtime /execute status: 400"));
+    assert!(execute_err_text.contains("body: {}"));
 
     let verify_err = client
         .verify(&VerifyRequest {

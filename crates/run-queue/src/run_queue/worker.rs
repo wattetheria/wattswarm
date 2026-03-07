@@ -101,7 +101,8 @@ impl PgRunQueue {
             ),
             Err(err) => {
                 let err_text = format!("{err:#}");
-                if step.attempt < step.max_attempts {
+                if step.attempt < step.max_attempts && !Self::is_non_retryable_step_error(&err_text)
+                {
                     let delay_ms = retry_delay_ms(step.retry_policy.backoff_ms, step.attempt);
                     self.finish_step_retry_wait(&step, &err_text, now_ms().saturating_add(delay_ms))
                 } else {
@@ -115,6 +116,15 @@ impl PgRunQueue {
                 }
             }
         }
+    }
+
+    fn is_non_retryable_step_error(err_text: &str) -> bool {
+        let lower = err_text.to_ascii_lowercase();
+        if lower.contains("forced offline by policy") {
+            return true;
+        }
+        extract_status_code(err_text, "runtime /execute status: ")
+            .is_some_and(|code| (400..500).contains(&code))
     }
 
     fn recover_expired_leases_tx(&self, tx: &mut Transaction<'_>, now: i64) -> Result<u64> {
@@ -335,13 +345,31 @@ impl PgRunQueue {
     }
 }
 
+fn extract_status_code(err_text: &str, marker: &str) -> Option<u16> {
+    let start = err_text.find(marker)?;
+    let tail = &err_text[start + marker.len()..];
+    let digits: String = tail
+        .chars()
+        .skip_while(|ch| !ch.is_ascii_digit())
+        .take_while(|ch| ch.is_ascii_digit())
+        .take(3)
+        .collect();
+    if digits.len() != 3 {
+        return None;
+    }
+    digits.parse::<u16>().ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::status::{
         RUN_STATUS_CANCELLED, RUN_STATUS_CANCELLING, RUN_STATUS_RUNNING, STEP_STATUS_CANCELLED,
         STEP_STATUS_LEASED, STEP_STATUS_RETRY_WAIT, STEP_STATUS_SUCCEEDED,
     };
-    use super::super::types::{AggregationPolicy, RetryPolicy, RunAgentSpec, RunSubmitSpec};
+    use super::super::types::{
+        AggregationPolicy, NullPolicy, NullResolverMode, ReExplorePolicy, RetryPolicy,
+        RunAgentSpec, RunSubmitSpec, TiePolicy, TieResolverMode,
+    };
     use super::*;
     use serde_json::json;
     use std::path::Path;
@@ -422,6 +450,34 @@ mod tests {
             }],
             retry: RetryPolicy::default(),
             aggregation: AggregationPolicy::default(),
+        }
+    }
+
+    fn sample_spec_two_agents(run_id: &str, aggregation: AggregationPolicy) -> RunSubmitSpec {
+        RunSubmitSpec {
+            run_id: run_id.to_owned(),
+            task_type: "swarm".to_owned(),
+            shared_inputs: json!({"resume":"text"}),
+            agents: vec![
+                RunAgentSpec {
+                    agent_id: "agent-a".to_owned(),
+                    executor: "rt".to_owned(),
+                    profile: "default".to_owned(),
+                    prompt: "review".to_owned(),
+                    weight: 1.0,
+                    priority: 1_000_000,
+                },
+                RunAgentSpec {
+                    agent_id: "agent-b".to_owned(),
+                    executor: "rt".to_owned(),
+                    profile: "default".to_owned(),
+                    prompt: "review".to_owned(),
+                    weight: 1.0,
+                    priority: 999_999,
+                },
+            ],
+            retry: RetryPolicy::default(),
+            aggregation,
         }
     }
 
@@ -739,5 +795,192 @@ mod tests {
         assert!(events.iter().any(|e| e.event_type == "RUN_FINALIZED"));
 
         cleanup_run(&queue, &run_id);
+    }
+
+    #[test]
+    fn tie_with_default_policy_resolves_via_stochastic() {
+        let _guard = test_guard();
+        let Some(queue) = queue_or_skip() else {
+            return;
+        };
+        let Some(_db_lock) = DbTestLock::acquire(&queue) else {
+            return;
+        };
+        queue.init_schema().expect("init schema");
+        if shared_db_is_busy(&queue) {
+            eprintln!("skip worker db test: shared database has active external runs");
+            return;
+        }
+        purge_worker_runs(&queue);
+        let run_id = format!("worker-tie-default-{}", Uuid::new_v4().simple());
+        cleanup_run(&queue, &run_id);
+        queue
+            .submit_run(sample_spec_two_agents(
+                &run_id,
+                AggregationPolicy::default(),
+            ))
+            .expect("submit");
+        queue.kickoff_run(&run_id).expect("kickoff");
+
+        let mut client = queue.connect().expect("connect");
+        let now = now_ms();
+        client
+            .execute(
+                "UPDATE runs
+                 SET status = $2, updated_at = TIMESTAMPTZ 'epoch' + ($3::bigint * INTERVAL '1 millisecond')
+                 WHERE run_id = $1",
+                &[&run_id, &RUN_STATUS_RUNNING, &now],
+            )
+            .expect("mark running");
+        client
+            .execute(
+                "UPDATE run_steps
+                 SET status = $3,
+                     result_json = CASE
+                       WHEN agent_id = 'agent-a' THEN '{\"candidate_output\":{\"decision\":\"approve\",\"answer\":\"x\"}}'
+                       ELSE '{\"candidate_output\":{\"decision\":\"reject\",\"answer\":\"y\"}}'
+                     END,
+                     updated_at = TIMESTAMPTZ 'epoch' + ($2::bigint * INTERVAL '1 millisecond'),
+                     finished_at = TIMESTAMPTZ 'epoch' + ($2::bigint * INTERVAL '1 millisecond')
+                 WHERE run_id = $1",
+                &[&run_id, &now, &STEP_STATUS_SUCCEEDED],
+            )
+            .expect("mark steps done");
+
+        let mut tx = client.transaction().expect("tx");
+        queue
+            .finalize_run_if_terminal_tx(&mut tx, &run_id, now)
+            .expect("finalize");
+        tx.commit().expect("commit");
+
+        let result = queue.run_result(&run_id).expect("run result");
+        assert_eq!(result["status"], "FINALIZED");
+        let final_decision = result["result"]["aggregation"]["final_decision"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(final_decision == "APPROVE" || final_decision == "REJECT");
+        assert_ne!(
+            result["result"]["aggregation"]["final_decision"],
+            serde_json::Value::Null
+        );
+
+        cleanup_run(&queue, &run_id);
+    }
+
+    #[test]
+    fn reexplore_policy_requeues_run_and_emits_signal_event() {
+        let _guard = test_guard();
+        let Some(queue) = queue_or_skip() else {
+            return;
+        };
+        let Some(_db_lock) = DbTestLock::acquire(&queue) else {
+            return;
+        };
+        queue.init_schema().expect("init schema");
+        if shared_db_is_busy(&queue) {
+            eprintln!("skip worker db test: shared database has active external runs");
+            return;
+        }
+        purge_worker_runs(&queue);
+        let run_id = format!("worker-reexplore-{}", Uuid::new_v4().simple());
+        cleanup_run(&queue, &run_id);
+
+        let aggregation = AggregationPolicy {
+            mode: "all_done".to_owned(),
+            quorum: Some(3),
+            tie_policy: TiePolicy {
+                chain: vec![TieResolverMode::Stochastic],
+                ..TiePolicy::default()
+            },
+            null_policy: NullPolicy {
+                chain: vec![NullResolverMode::ReExplore, NullResolverMode::FinalizeNull],
+                reexplore: ReExplorePolicy {
+                    max_tie_iterations: 1,
+                    no_new_evidence_rounds: 1,
+                    require_new_evidence: false,
+                },
+                ..NullPolicy::default()
+            },
+        };
+        queue
+            .submit_run(sample_spec_two_agents(&run_id, aggregation))
+            .expect("submit");
+        queue.kickoff_run(&run_id).expect("kickoff");
+
+        let mut client = queue.connect().expect("connect");
+        let now = now_ms();
+        client
+            .execute(
+                "UPDATE runs
+                 SET status = $2, updated_at = TIMESTAMPTZ 'epoch' + ($3::bigint * INTERVAL '1 millisecond')
+                 WHERE run_id = $1",
+                &[&run_id, &RUN_STATUS_RUNNING, &now],
+            )
+            .expect("mark running");
+        client
+            .execute(
+                "UPDATE run_steps
+                 SET status = $3,
+                     result_json = CASE
+                       WHEN agent_id = 'agent-a' THEN '{\"candidate_output\":{\"decision\":\"approve\",\"answer\":\"x\"},\"evidence_digests\":[\"ev-a-1\"]}'
+                       ELSE '{\"candidate_output\":{\"decision\":\"approve\",\"answer\":\"x\"},\"evidence_digests\":[\"ev-b-1\"]}'
+                     END,
+                     updated_at = TIMESTAMPTZ 'epoch' + ($2::bigint * INTERVAL '1 millisecond'),
+                     finished_at = TIMESTAMPTZ 'epoch' + ($2::bigint * INTERVAL '1 millisecond')
+                 WHERE run_id = $1",
+                &[&run_id, &now, &STEP_STATUS_SUCCEEDED],
+            )
+            .expect("mark steps done");
+
+        let mut tx = client.transaction().expect("tx");
+        queue
+            .finalize_run_if_terminal_tx(&mut tx, &run_id, now)
+            .expect("reexplore transition");
+        tx.commit().expect("commit");
+
+        let view = queue.run_view(&run_id).expect("run view");
+        assert!(
+            view.status == RUN_STATUS_QUEUED || view.status == RUN_STATUS_RUNNING,
+            "unexpected run status after reexplore: {}",
+            view.status
+        );
+        assert!(view.counts.queued + view.counts.leased >= 1);
+        assert_eq!(view.counts.succeeded, 0);
+
+        let signal_row = client
+            .query_one(
+                "SELECT shared_inputs_json FROM runs WHERE run_id = $1",
+                &[&run_id],
+            )
+            .expect("shared inputs");
+        let shared_inputs_raw: String = signal_row.get(0);
+        let shared_inputs: serde_json::Value =
+            serde_json::from_str(&shared_inputs_raw).expect("shared inputs json");
+        assert_eq!(
+            shared_inputs["_aggregation_signal"]["type"],
+            serde_json::Value::String("NEED_MORE_EVIDENCE".to_owned())
+        );
+
+        let events = queue.run_events(&run_id, 20).expect("events");
+        assert!(
+            events
+                .iter()
+                .any(|e| e.event_type == "RUN_NULL_REEXPLORE_TRIGGERED")
+        );
+
+        cleanup_run(&queue, &run_id);
+    }
+
+    #[test]
+    fn non_retryable_error_detection_is_generic() {
+        assert!(PgRunQueue::is_non_retryable_step_error(
+            "runtime execute failed: runtime /execute status: 422 Unprocessable Entity; body: bad input"
+        ));
+        assert!(PgRunQueue::is_non_retryable_step_error(
+            "runtime execute failed: runtime /execute status: 500 Internal Server Error; body: {\"error\":\"[fault_injection] role=dev forced offline by policy\"}"
+        ));
+        assert!(!PgRunQueue::is_non_retryable_step_error(
+            "runtime execute failed: runtime /execute status: 500 Internal Server Error; body: temporary upstream outage"
+        ));
     }
 }

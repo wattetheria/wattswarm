@@ -9,6 +9,7 @@ mod worker;
 
 pub use queue::PgRunQueue;
 pub use types::{
-    AggregationPolicy, RetryPolicy, RunAgentSpec, RunEvent, RunStepCounts, RunSubmitSpec, RunView,
+    AggregationPolicy, NullPolicy, NullResolverMode, NullTrigger, RetryPolicy, RunAgentSpec,
+    RunEvent, RunStepCounts, RunSubmitSpec, RunView, TiePolicy, TieResolverMode, TieTrigger,
     WorkerOptions,
 };

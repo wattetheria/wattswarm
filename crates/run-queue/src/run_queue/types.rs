@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
+use std::collections::HashMap;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RetryPolicy {
@@ -23,6 +24,10 @@ pub struct AggregationPolicy {
     #[serde(default = "default_aggregation_mode")]
     pub mode: String,
     pub quorum: Option<u32>,
+    #[serde(default)]
+    pub tie_policy: TiePolicy,
+    #[serde(default)]
+    pub null_policy: NullPolicy,
 }
 
 impl Default for AggregationPolicy {
@@ -30,9 +35,168 @@ impl Default for AggregationPolicy {
         Self {
             mode: default_aggregation_mode(),
             quorum: None,
+            tie_policy: TiePolicy::default(),
+            null_policy: NullPolicy::default(),
         }
     }
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum TieTrigger {
+    QuorumNull,
+    Tie,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum TieResolverMode {
+    #[serde(rename = "REEXPLORE")]
+    ReExplore,
+    ConfidenceWeighted,
+    ReputationWeighted,
+    Stochastic,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TiePolicy {
+    #[serde(default = "default_tie_enabled_on")]
+    pub enabled_on: Vec<TieTrigger>,
+    #[serde(default = "default_tie_chain")]
+    pub chain: Vec<TieResolverMode>,
+    #[serde(default)]
+    pub reexplore: ReExplorePolicy,
+    #[serde(default)]
+    pub confidence_weighted: ConfidenceWeightedPolicy,
+    #[serde(default)]
+    pub reputation_weighted: ReputationWeightedPolicy,
+    #[serde(default)]
+    pub stochastic: StochasticPolicy,
+}
+
+impl Default for TiePolicy {
+    fn default() -> Self {
+        Self {
+            enabled_on: default_tie_enabled_on(),
+            chain: default_tie_chain(),
+            reexplore: ReExplorePolicy::default(),
+            confidence_weighted: ConfidenceWeightedPolicy::default(),
+            reputation_weighted: ReputationWeightedPolicy::default(),
+            stochastic: StochasticPolicy::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum NullTrigger {
+    Empty,
+    QuorumNull,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum NullResolverMode {
+    #[serde(rename = "REEXPLORE")]
+    ReExplore,
+    FinalizeNull,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NullPolicy {
+    #[serde(default = "default_null_enabled_on")]
+    pub enabled_on: Vec<NullTrigger>,
+    #[serde(default = "default_null_chain")]
+    pub chain: Vec<NullResolverMode>,
+    #[serde(default)]
+    pub reexplore: ReExplorePolicy,
+}
+
+impl Default for NullPolicy {
+    fn default() -> Self {
+        Self {
+            enabled_on: default_null_enabled_on(),
+            chain: default_null_chain(),
+            reexplore: ReExplorePolicy::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReExplorePolicy {
+    #[serde(default = "default_reexplore_max_tie_iterations")]
+    pub max_tie_iterations: u32,
+    #[serde(default = "default_reexplore_no_new_evidence_rounds")]
+    pub no_new_evidence_rounds: u32,
+    #[serde(default = "default_true")]
+    pub require_new_evidence: bool,
+}
+
+impl Default for ReExplorePolicy {
+    fn default() -> Self {
+        Self {
+            max_tie_iterations: default_reexplore_max_tie_iterations(),
+            no_new_evidence_rounds: default_reexplore_no_new_evidence_rounds(),
+            require_new_evidence: default_true(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConfidenceWeightedPolicy {
+    #[serde(default = "default_decision_confidence_field")]
+    pub decision_confidence_field: String,
+    #[serde(default = "default_answer_confidence_field")]
+    pub answer_confidence_field: String,
+    #[serde(default = "default_confidence_field")]
+    pub confidence_field: String,
+    #[serde(default = "default_confidence_fallback")]
+    pub default_confidence: f64,
+}
+
+impl Default for ConfidenceWeightedPolicy {
+    fn default() -> Self {
+        Self {
+            decision_confidence_field: default_decision_confidence_field(),
+            answer_confidence_field: default_answer_confidence_field(),
+            confidence_field: default_confidence_field(),
+            default_confidence: default_confidence_fallback(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum MissingReputationPolicy {
+    Skip,
+    Uniform,
+}
+
+impl Default for MissingReputationPolicy {
+    fn default() -> Self {
+        Self::Skip
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReputationWeightedPolicy {
+    #[serde(default)]
+    pub agent_reputation_units: HashMap<String, i64>,
+    #[serde(default)]
+    pub missing_reputation: MissingReputationPolicy,
+}
+
+impl Default for ReputationWeightedPolicy {
+    fn default() -> Self {
+        Self {
+            agent_reputation_units: HashMap::new(),
+            missing_reputation: MissingReputationPolicy::Skip,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct StochasticPolicy {}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunAgentSpec {
@@ -129,6 +293,50 @@ pub(crate) fn default_backoff_ms() -> u64 {
 
 pub(crate) fn default_aggregation_mode() -> String {
     "all_done".to_owned()
+}
+
+fn default_tie_enabled_on() -> Vec<TieTrigger> {
+    vec![TieTrigger::Tie]
+}
+
+fn default_tie_chain() -> Vec<TieResolverMode> {
+    vec![TieResolverMode::Stochastic]
+}
+
+fn default_null_enabled_on() -> Vec<NullTrigger> {
+    vec![NullTrigger::Empty, NullTrigger::QuorumNull]
+}
+
+fn default_null_chain() -> Vec<NullResolverMode> {
+    vec![NullResolverMode::ReExplore, NullResolverMode::FinalizeNull]
+}
+
+fn default_reexplore_max_tie_iterations() -> u32 {
+    1
+}
+
+fn default_reexplore_no_new_evidence_rounds() -> u32 {
+    1
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_decision_confidence_field() -> String {
+    "decision_confidence".to_owned()
+}
+
+fn default_answer_confidence_field() -> String {
+    "answer_confidence".to_owned()
+}
+
+fn default_confidence_field() -> String {
+    "confidence".to_owned()
+}
+
+fn default_confidence_fallback() -> f64 {
+    0.5
 }
 
 pub(crate) fn default_profile() -> String {

@@ -10,7 +10,7 @@ use crate::types::{
     ArtifactRef, Candidate, PolicyBinding, SeedBundle, TaskContract, VerificationStatus,
     VerifierResult,
 };
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -111,15 +111,23 @@ impl RuntimeClient for HttpRuntimeClient {
     }
 
     fn execute(&self, req: &ExecuteRequest) -> Result<ExecuteResponse> {
-        self.client
+        let response = self
+            .client
             .post(self.url("/execute"))
             .json(req)
             .send()
-            .context("runtime /execute request")?
-            .error_for_status()
-            .context("runtime /execute status")?
-            .json()
-            .context("runtime /execute decode")
+            .context("runtime /execute request")?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let body = response
+                .text()
+                .map(|raw| summarize_error_body(&raw))
+                .unwrap_or_else(|err| format!("<read body failed: {err}>"));
+            return Err(anyhow!("runtime /execute status: {status}; body: {body}"));
+        }
+
+        response.json().context("runtime /execute decode")
     }
 
     fn verify(&self, req: &VerifyRequest) -> Result<VerifyResponse> {
@@ -133,6 +141,25 @@ impl RuntimeClient for HttpRuntimeClient {
             .json()
             .context("runtime /verify decode")
     }
+}
+
+const MAX_ERROR_BODY_CHARS: usize = 512;
+
+fn summarize_error_body(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return "<empty>".to_owned();
+    }
+
+    let mut out = String::with_capacity(trimmed.len().min(MAX_ERROR_BODY_CHARS));
+    for (i, ch) in trimmed.chars().enumerate() {
+        if i >= MAX_ERROR_BODY_CHARS {
+            out.push_str("...<truncated>");
+            break;
+        }
+        out.push(ch);
+    }
+    out
 }
 
 pub fn verifier_result_from_response(

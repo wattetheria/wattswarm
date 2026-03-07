@@ -1,10 +1,12 @@
 use anyhow::{Result, anyhow};
 use postgres::{Client, NoTls, Transaction};
+use serde_json::{Value, json};
 use std::collections::HashSet;
 
-use super::aggregation::build_run_summary_tx;
+use super::aggregation::{AggregationNextAction, build_run_summary_tx};
 use super::status::{
     RUN_STATUS_CANCELLED, RUN_STATUS_CANCELLING, RUN_STATUS_FAILED, RUN_STATUS_FINALIZED,
+    RUN_STATUS_QUEUED, STEP_STATUS_CANCELLED, STEP_STATUS_FAILED, STEP_STATUS_SUCCEEDED,
 };
 use super::types::{RunStepCounts, RunSubmitSpec};
 use super::utils::{accumulate_counts, step_counts_tx};
@@ -64,15 +66,100 @@ impl PgRunQueue {
         } else {
             RUN_STATUS_FAILED
         };
-        let (result_payload, final_event_payload) =
-            build_run_summary_tx(tx, run_id, final_status, &counts)?;
+        let summary = build_run_summary_tx(tx, run_id, final_status, &counts)?;
+        if status != RUN_STATUS_CANCELLING
+            && let AggregationNextAction::ReExplore(directive) = &summary.action
+        {
+            let shared_inputs_raw: String = tx
+                .query_one(
+                    "SELECT shared_inputs_json FROM runs WHERE run_id = $1",
+                    &[&run_id],
+                )?
+                .get(0);
+            let merged_shared_inputs = merge_reexplore_signal(
+                &shared_inputs_raw,
+                &directive.signal_type,
+                &directive.resolution_path,
+                directive.next_iteration,
+                &directive.unresolved_buckets,
+                directive.require_new_evidence,
+                directive.null_primary_kind.as_deref(),
+                directive.null_reason.as_deref(),
+            )?;
+            tx.execute(
+                "UPDATE runs
+                 SET status = $2,
+                     shared_inputs_json = $3,
+                     result_json = NULL,
+                     error_text = NULL,
+                     finished_at = NULL,
+                     updated_at = TIMESTAMPTZ 'epoch' + ($4::bigint * INTERVAL '1 millisecond')
+                 WHERE run_id = $1",
+                &[&run_id, &RUN_STATUS_QUEUED, &merged_shared_inputs, &now],
+            )?;
+            if counts.succeeded > 0 {
+                tx.execute(
+                    "UPDATE run_steps
+                     SET status = $2,
+                         next_run_at = TIMESTAMPTZ 'epoch' + ($3::bigint * INTERVAL '1 millisecond'),
+                         lease_id = NULL,
+                         lease_owner = NULL,
+                         lease_until = NULL,
+                         task_id = NULL,
+                         result_json = NULL,
+                         error_text = NULL,
+                         finished_at = NULL,
+                         updated_at = TIMESTAMPTZ 'epoch' + ($3::bigint * INTERVAL '1 millisecond')
+                     WHERE run_id = $1
+                       AND status = $4",
+                    &[
+                        &run_id,
+                        &super::status::STEP_STATUS_QUEUED,
+                        &now,
+                        &STEP_STATUS_SUCCEEDED,
+                    ],
+                )?;
+            } else {
+                tx.execute(
+                    "UPDATE run_steps
+                     SET status = $2,
+                         next_run_at = TIMESTAMPTZ 'epoch' + ($3::bigint * INTERVAL '1 millisecond'),
+                         lease_id = NULL,
+                         lease_owner = NULL,
+                         lease_until = NULL,
+                         task_id = NULL,
+                         result_json = NULL,
+                         error_text = NULL,
+                         finished_at = NULL,
+                         updated_at = TIMESTAMPTZ 'epoch' + ($3::bigint * INTERVAL '1 millisecond')
+                     WHERE run_id = $1
+                       AND status IN ($4, $5, $6)",
+                    &[
+                        &run_id,
+                        &super::status::STEP_STATUS_QUEUED,
+                        &now,
+                        &STEP_STATUS_SUCCEEDED,
+                        &STEP_STATUS_FAILED,
+                        &STEP_STATUS_CANCELLED,
+                    ],
+                )?;
+            }
+            self.insert_event_tx(
+                tx,
+                run_id,
+                &directive.event_type,
+                &summary.event_payload,
+                now,
+            )?;
+            return Ok(());
+        }
         tx.execute(
             "UPDATE runs
              SET status = $2, result_json = $3, finished_at = TIMESTAMPTZ 'epoch' + ($4::bigint * INTERVAL '1 millisecond'), updated_at = TIMESTAMPTZ 'epoch' + ($4::bigint * INTERVAL '1 millisecond')
              WHERE run_id = $1",
-            &[&run_id, &final_status, &result_payload.to_string(), &now],
+            &[&run_id, &final_status, &summary.result_payload.to_string(), &now],
         )?;
-        self.insert_event_tx(tx, run_id, "RUN_FINALIZED", &final_event_payload, now)?;
+        self.insert_event_tx(tx, run_id, "RUN_FINALIZED", &summary.event_payload, now)?;
         Ok(())
     }
 
@@ -142,6 +229,39 @@ impl PgRunQueue {
     }
 }
 
+fn merge_reexplore_signal(
+    shared_inputs_raw: &str,
+    signal_type: &str,
+    resolution_path: &str,
+    iteration: u32,
+    unresolved_buckets: &[String],
+    require_new_evidence: bool,
+    null_primary_kind: Option<&str>,
+    null_reason: Option<&str>,
+) -> Result<String> {
+    let original = serde_json::from_str::<Value>(shared_inputs_raw).unwrap_or_else(|_| json!({}));
+    let signal = json!({
+        "type": signal_type,
+        "path": resolution_path,
+        "iteration": iteration,
+        "unresolved_buckets": unresolved_buckets,
+        "require_new_evidence": require_new_evidence,
+        "null_primary_kind": null_primary_kind,
+        "null_reason": null_reason
+    });
+    let merged = match original {
+        Value::Object(mut obj) => {
+            obj.insert("_aggregation_signal".to_owned(), signal);
+            Value::Object(obj)
+        }
+        other => json!({
+            "shared_inputs": other,
+            "_aggregation_signal": signal
+        }),
+    };
+    Ok(serde_json::to_string(&merged)?)
+}
+
 fn sanitize_ident(raw: &str) -> String {
     let mut out = String::with_capacity(raw.len().max(8));
     for ch in raw.chars() {
@@ -168,7 +288,10 @@ fn sanitize_ident(raw: &str) -> String {
 mod tests {
     use serde_json::json;
 
-    use super::super::types::{AggregationPolicy, RetryPolicy, RunAgentSpec, RunSubmitSpec};
+    use super::super::types::{
+        AggregationPolicy, NullResolverMode, NullTrigger, RetryPolicy, RunAgentSpec, RunSubmitSpec,
+        TieResolverMode, TieTrigger,
+    };
     use super::super::utils::{build_step_inputs, retry_delay_ms};
     use super::PgRunQueue;
 
@@ -251,6 +374,24 @@ mod tests {
         assert_eq!(spec.retry.max_attempts, 2);
         assert_eq!(spec.retry.backoff_ms, 1_500);
         assert_eq!(spec.aggregation.mode, "all_done");
+        assert!(
+            spec.aggregation
+                .tie_policy
+                .enabled_on
+                .contains(&TieTrigger::Tie)
+        );
+        assert_eq!(
+            spec.aggregation.tie_policy.chain,
+            vec![TieResolverMode::Stochastic]
+        );
+        assert_eq!(
+            spec.aggregation.null_policy.enabled_on,
+            vec![NullTrigger::Empty, NullTrigger::QuorumNull]
+        );
+        assert_eq!(
+            spec.aggregation.null_policy.chain,
+            vec![NullResolverMode::ReExplore, NullResolverMode::FinalizeNull]
+        );
         assert_eq!(spec.agents[0].profile, "default");
         assert_eq!(spec.agents[0].weight, 1.0);
     }
