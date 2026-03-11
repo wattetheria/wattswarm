@@ -96,6 +96,9 @@ The workspace now includes dedicated crates and a control-plane bridge for node-
   - bridges libp2p gossip events into `node-core::ingest_remote`
   - serves global backfill requests from the local event log
   - applies backfill responses into the local node projection pipeline
+  - auto-requests global backfill when a peer connection is established
+  - auto-publishes locally authored events from the node event log into the global gossip topic
+  - can dial peer listen addresses discovered through LAN state (`discovered_peers.json`)
 - `crates/artifact-store`
   - owns the node-local filesystem layout for evidence, checkpoints, snapshots, and event batches
   - provides read/write helpers for byte and JSON payloads
@@ -250,6 +253,7 @@ Optional UDP announce switch (default off):
 - `WATTSWARM_UDP_ANNOUNCE_ADDR=239.255.42.99` (multicast default) or `255.255.255.255` for broadcast
 - `WATTSWARM_UDP_ANNOUNCE_PORT=37931`
 - with switch enabled, startup emits announce payload and UI process listens on the same port and records discovered peer IDs into `--state-dir/discovered_peers.json`
+- when a peer advertise includes a libp2p listen address, that address is also recorded and used by the background network bridge for automatic LAN dialing
 - `peers list` and `/api/peers/list` include the discovered peers loaded from that file
 
 Examples:

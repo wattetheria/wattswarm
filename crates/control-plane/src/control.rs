@@ -33,7 +33,14 @@ pub struct ExecutorRegistry {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct DiscoveredPeersRegistry {
-    pub peers: Vec<String>,
+    pub peers: Vec<DiscoveredPeerRecord>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+pub struct DiscoveredPeerRecord {
+    pub node_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub listen_addr: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -89,6 +96,13 @@ pub fn open_node(state_dir: &Path, db_path: &Path) -> Result<Node> {
 }
 
 pub fn load_discovered_peers(path: &Path) -> Result<Vec<String>> {
+    Ok(load_discovered_peer_records(path)?
+        .into_iter()
+        .map(|record| record.node_id)
+        .collect())
+}
+
+pub fn load_discovered_peer_records(path: &Path) -> Result<Vec<DiscoveredPeerRecord>> {
     if !path.exists() {
         return Ok(Vec::new());
     }
@@ -97,7 +111,13 @@ pub fn load_discovered_peers(path: &Path) -> Result<Vec<String>> {
         return Ok(reg.peers);
     }
     if let Ok(v) = serde_json::from_slice::<Vec<String>>(&raw) {
-        return Ok(v);
+        return Ok(v
+            .into_iter()
+            .map(|node_id| DiscoveredPeerRecord {
+                node_id,
+                listen_addr: None,
+            })
+            .collect());
     }
     Err(anyhow!(
         "parse discovered peers registry from {}",
@@ -106,6 +126,18 @@ pub fn load_discovered_peers(path: &Path) -> Result<Vec<String>> {
 }
 
 pub fn save_discovered_peers(path: &Path, peers: &[String]) -> Result<()> {
+    let records = peers
+        .iter()
+        .cloned()
+        .map(|node_id| DiscoveredPeerRecord {
+            node_id,
+            listen_addr: None,
+        })
+        .collect::<Vec<_>>();
+    save_discovered_peer_records(path, &records)
+}
+
+pub fn save_discovered_peer_records(path: &Path, peers: &[DiscoveredPeerRecord]) -> Result<()> {
     let reg = DiscoveredPeersRegistry {
         peers: peers.to_vec(),
     };
@@ -114,20 +146,42 @@ pub fn save_discovered_peers(path: &Path, peers: &[String]) -> Result<()> {
 }
 
 pub fn add_discovered_peer(state_dir: &Path, peer_node_id: &str) -> Result<bool> {
+    add_discovered_peer_endpoint(state_dir, peer_node_id, None)
+}
+
+pub fn add_discovered_peer_endpoint(
+    state_dir: &Path,
+    peer_node_id: &str,
+    listen_addr: Option<&str>,
+) -> Result<bool> {
     let peer = peer_node_id.trim();
     if peer.is_empty() {
         return Ok(false);
     }
     fs::create_dir_all(state_dir)?;
     let path = discovered_peers_path(state_dir);
-    let mut peers = load_discovered_peers(&path)?;
-    if peers.iter().any(|p| p == peer) {
+    let mut peers = load_discovered_peer_records(&path)?;
+    let listen_addr = listen_addr
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned);
+
+    if let Some(existing) = peers.iter_mut().find(|record| record.node_id == peer) {
+        if listen_addr.is_some() && existing.listen_addr != listen_addr {
+            existing.listen_addr = listen_addr;
+            peers.sort();
+            save_discovered_peer_records(&path, &peers)?;
+            return Ok(true);
+        }
         return Ok(false);
     }
-    peers.push(peer.to_owned());
+    peers.push(DiscoveredPeerRecord {
+        node_id: peer.to_owned(),
+        listen_addr,
+    });
     peers.sort();
     peers.dedup();
-    save_discovered_peers(&path, &peers)?;
+    save_discovered_peer_records(&path, &peers)?;
     Ok(true)
 }
 

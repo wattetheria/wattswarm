@@ -9,9 +9,11 @@ use std::thread;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 use wattswarm_control_plane::control::{
-    ExecutorRegistry, ExecutorRegistryEntry, RealTaskRunRequest, add_discovered_peer,
-    discovered_peers_path, executor_registry_path, load_discovered_peers, load_executor_registry,
-    local_node_id, open_node, run_real_task_flow, save_discovered_peers, save_executor_registry,
+    DiscoveredPeerRecord, ExecutorRegistry, ExecutorRegistryEntry, RealTaskRunRequest,
+    add_discovered_peer, add_discovered_peer_endpoint, discovered_peers_path,
+    executor_registry_path, load_discovered_peer_records, load_discovered_peers,
+    load_executor_registry, local_node_id, open_node, run_real_task_flow, save_discovered_peers,
+    save_executor_registry,
 };
 use wattswarm_control_plane::storage::storage::pg::Connection;
 use wattswarm_control_plane::task_template::sample_contract;
@@ -261,6 +263,20 @@ fn discovered_peers_registry_roundtrip_and_legacy_parse() {
     save_discovered_peers(&path, &peers).expect("save discovered peers");
     let loaded = load_discovered_peers(&path).expect("load discovered peers");
     assert_eq!(loaded, peers);
+    let loaded_records = load_discovered_peer_records(&path).expect("load discovered peer records");
+    assert_eq!(
+        loaded_records,
+        vec![
+            DiscoveredPeerRecord {
+                node_id: "node-b".to_owned(),
+                listen_addr: None,
+            },
+            DiscoveredPeerRecord {
+                node_id: "node-a".to_owned(),
+                listen_addr: None,
+            }
+        ]
+    );
 
     let legacy = vec!["legacy-a", "legacy-b"];
     fs::write(&path, serde_json::to_vec(&legacy).expect("legacy vec json")).expect("write legacy");
@@ -285,10 +301,37 @@ fn add_discovered_peer_dedups_and_sorts() {
     assert!(add_discovered_peer(&dir, "node-a").expect("add node-a"));
     assert!(add_discovered_peer(&dir, "node-b").expect("add node-b"));
     assert!(!add_discovered_peer(&dir, "node-a").expect("add duplicate"));
+    assert!(
+        add_discovered_peer_endpoint(&dir, "node-a", Some("/ip4/127.0.0.1/tcp/4001"))
+            .expect("add node-a endpoint")
+    );
+    assert!(
+        !add_discovered_peer_endpoint(&dir, "node-a", Some("/ip4/127.0.0.1/tcp/4001"))
+            .expect("dedup node-a endpoint")
+    );
     assert!(!add_discovered_peer(&dir, "   ").expect("add empty"));
 
     let peers = load_discovered_peers(&discovered_peers_path(&dir)).expect("load peers");
     assert_eq!(peers, vec!["node-a", "node-b", "node-c"]);
+    let records =
+        load_discovered_peer_records(&discovered_peers_path(&dir)).expect("load peer records");
+    assert_eq!(
+        records,
+        vec![
+            DiscoveredPeerRecord {
+                node_id: "node-a".to_owned(),
+                listen_addr: Some("/ip4/127.0.0.1/tcp/4001".to_owned()),
+            },
+            DiscoveredPeerRecord {
+                node_id: "node-b".to_owned(),
+                listen_addr: None,
+            },
+            DiscoveredPeerRecord {
+                node_id: "node-c".to_owned(),
+                listen_addr: None,
+            }
+        ]
+    );
 
     cleanup_dir(&dir);
 }
@@ -494,7 +537,8 @@ fn udp_announce_startup_and_listener_paths_execute() {
 
     let payload = serde_json::json!({
         "kind": "wattswarm_udp_announce_v1",
-        "node_id": "node-peer"
+        "node_id": "node-peer",
+        "listen_addr": "/ip4/127.0.0.1/tcp/4001"
     })
     .to_string();
 
@@ -514,8 +558,11 @@ fn udp_announce_startup_and_listener_paths_execute() {
 
         let start = Instant::now();
         while start.elapsed() < Duration::from_millis(700) {
-            if let Ok(peers) = load_discovered_peers(&peer_path)
-                && peers.iter().any(|p| p == "node-peer")
+            if let Ok(records) = load_discovered_peer_records(&peer_path)
+                && records.iter().any(|record| {
+                    record.node_id == "node-peer"
+                        && record.listen_addr.as_deref() == Some("/ip4/127.0.0.1/tcp/4001")
+                })
             {
                 found = true;
                 break;

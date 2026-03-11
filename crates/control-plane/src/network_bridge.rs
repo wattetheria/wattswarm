@@ -1,10 +1,13 @@
 use anyhow::{Result, anyhow, bail};
 
+use crate::constants::BACKFILL_BATCH_EVENTS;
+use crate::control::load_discovered_peer_records;
 use crate::network_p2p::{
     BackfillRequest, BackfillRequestId, BackfillResponse, EventEnvelope, GossipMessage, Multiaddr,
     NetworkP2pConfig, NetworkP2pNode, NetworkRuntime, NetworkRuntimeEvent, PeerId, SwarmScope,
 };
 use crate::node::Node;
+use std::collections::HashMap;
 use std::env;
 use std::path::{Path, PathBuf};
 use std::thread;
@@ -105,24 +108,52 @@ fn run_background_network_service(
     let node_id = node.node_id();
     let mut service = NetworkBridgeService::new(NetworkP2pNode::generate(config)?)?;
     let mut announced_listen = false;
+    let mut last_published_seq = node.head_seq()?;
+    let mut next_dial_attempt_at = HashMap::new();
 
     loop {
-        match service.tick(&mut node) {
-            Ok(NetworkBridgeTick::Listening { address }) => {
-                if !announced_listen {
-                    crate::udp_announce::announce_startup(
-                        "p2p-startup",
-                        Some(&address.to_string()),
-                        Some(&node_id),
-                    );
-                    announced_listen = true;
+        let mut did_work = false;
+        loop {
+            match service.try_tick(&mut node) {
+                Ok(Some(NetworkBridgeTick::Listening { address })) => {
+                    did_work = true;
+                    if !announced_listen {
+                        crate::udp_announce::announce_startup(
+                            "p2p-startup",
+                            Some(&address.to_string()),
+                            Some(&node_id),
+                        );
+                        announced_listen = true;
+                    }
+                }
+                Ok(Some(_)) => {
+                    did_work = true;
+                }
+                Ok(None) => break,
+                Err(err) => {
+                    eprintln!("network bridge tick failed: {err}");
+                    thread::sleep(Duration::from_millis(250));
+                    break;
                 }
             }
-            Ok(_) => {}
-            Err(err) => {
-                eprintln!("network bridge tick failed: {err}");
-                thread::sleep(Duration::from_millis(250));
-            }
+        }
+        if dial_discovered_peer_endpoints(
+            &mut service,
+            state_dir,
+            &node_id,
+            &mut next_dial_attempt_at,
+        )? > 0
+        {
+            did_work = true;
+        }
+        let new_last_published_seq =
+            publish_pending_global_events(&mut service, &node, &node_id, last_published_seq)?;
+        if new_last_published_seq != last_published_seq {
+            did_work = true;
+            last_published_seq = new_last_published_seq;
+        }
+        if !did_work {
+            thread::sleep(Duration::from_millis(50));
         }
     }
 }
@@ -169,6 +200,73 @@ pub fn ingest_backfill_response(node: &mut Node, response: &BackfillResponse) ->
         }
     }
     Ok(applied)
+}
+
+const AUTO_PUBLISH_BATCH_LIMIT: usize = 64;
+const DISCOVERY_DIAL_RETRY_AFTER: Duration = Duration::from_secs(3);
+
+pub fn publish_pending_global_events(
+    service: &mut NetworkBridgeService,
+    node: &Node,
+    local_node_id: &str,
+    from_event_seq: u64,
+) -> Result<u64> {
+    let rows = node
+        .store
+        .load_events_page(from_event_seq, AUTO_PUBLISH_BATCH_LIMIT)?;
+    let mut last_published_seq = from_event_seq;
+    for (seq, event) in rows {
+        if event.author_node_id != local_node_id {
+            last_published_seq = seq;
+            continue;
+        }
+        match service.publish_global_event(event) {
+            Ok(()) => last_published_seq = seq,
+            Err(err) if err.to_string().contains("NoPeersSubscribedToTopic") => break,
+            Err(err) => return Err(err),
+        }
+    }
+    Ok(last_published_seq)
+}
+
+pub fn dial_discovered_peer_endpoints(
+    service: &mut NetworkBridgeService,
+    state_dir: &Path,
+    local_node_id: &str,
+    next_attempt_at: &mut HashMap<String, std::time::Instant>,
+) -> Result<usize> {
+    let records = load_discovered_peer_records(&crate::control::discovered_peers_path(state_dir))?;
+    let now = std::time::Instant::now();
+    let mut dialed = 0usize;
+    for record in records {
+        if record.node_id == local_node_id {
+            continue;
+        }
+        let Some(raw_addr) = record.listen_addr.as_deref() else {
+            continue;
+        };
+        let addr = match raw_addr.parse::<Multiaddr>() {
+            Ok(addr) => addr,
+            Err(_) => continue,
+        };
+        if next_attempt_at
+            .get(raw_addr)
+            .is_some_and(|deadline| *deadline > now)
+        {
+            continue;
+        }
+        next_attempt_at.insert(raw_addr.to_owned(), now + DISCOVERY_DIAL_RETRY_AFTER);
+        match service.dial(addr) {
+            Ok(()) => dialed += 1,
+            Err(err)
+                if err
+                    .to_string()
+                    .to_ascii_lowercase()
+                    .contains("duplicate connection") => {}
+            Err(err) => eprintln!("p2p dial failed for {raw_addr}: {err}"),
+        }
+    }
+    Ok(dialed)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -287,6 +385,9 @@ impl NetworkBridgeService {
                 Ok(NetworkBridgeTick::Listening { address })
             }
             NetworkRuntimeEvent::ConnectionEstablished { peer } => {
+                let from_event_seq = node.head_seq()?;
+                let _ =
+                    self.request_global_backfill(&peer, from_event_seq, BACKFILL_BATCH_EVENTS)?;
                 Ok(NetworkBridgeTick::Connected { peer })
             }
             NetworkRuntimeEvent::Gossip {
@@ -348,6 +449,7 @@ mod tests {
     use crate::types::{Membership, Role};
     use crate::{node::Node, task_template::sample_contract};
     use serde_json::json;
+    use std::collections::HashMap;
     use std::env;
 
     fn membership_with_roles(node_ids: &[String]) -> Membership {
@@ -541,5 +643,125 @@ mod tests {
     fn network_enabled_can_be_explicitly_disabled() {
         let _enabled = EnvVarGuard::set(ENV_P2P_ENABLED, Some("false"));
         assert!(!network_enabled_from_env());
+    }
+
+    #[test]
+    fn publish_pending_global_events_publishes_local_rows_and_skips_remote_rows() {
+        let local = NodeIdentity::random();
+        let local_node_id = local.node_id();
+        let remote = NodeIdentity::random();
+        let membership = membership_with_roles(&[local_node_id.clone(), remote.node_id()]);
+        let mut node =
+            Node::new(local, PgStore::open_in_memory().expect("store"), membership).expect("node");
+        let policy_hash = node
+            .policy_registry()
+            .binding_for("vp.schema_only.v1", json!({}))
+            .expect("policy binding")
+            .policy_hash;
+        let mut local_contract = sample_contract("task-publish-local", policy_hash.clone());
+        local_contract.inputs = json!({"prompt":"publish me"});
+        node.submit_task(local_contract, 1, 100)
+            .expect("local task");
+
+        let remote_event = build_event_for_external(
+            &remote,
+            1,
+            101,
+            crate::types::EventPayload::CheckpointCreated(crate::types::CheckpointCreatedPayload {
+                checkpoint_id: "cp-remote".to_owned(),
+                up_to_seq: 1,
+            }),
+        )
+        .expect("remote event");
+        node.ingest_remote(remote_event).expect("ingest remote");
+
+        let mut service = NetworkBridgeService::new(
+            NetworkP2pNode::generate(NetworkP2pConfig {
+                listen_addrs: vec!["/ip4/127.0.0.1/tcp/0".to_owned()],
+                enable_mdns: false,
+                ..NetworkP2pConfig::default()
+            })
+            .expect("network node"),
+        )
+        .expect("network service");
+        let mut peer_node = Node::open_in_memory_with_roles(&[Role::Proposer]).expect("peer node");
+        let mut peer_service = NetworkBridgeService::new(
+            NetworkP2pNode::generate(NetworkP2pConfig {
+                listen_addrs: vec!["/ip4/127.0.0.1/tcp/0".to_owned()],
+                enable_mdns: false,
+                ..NetworkP2pConfig::default()
+            })
+            .expect("peer network node"),
+        )
+        .expect("peer network service");
+
+        for _ in 0..4_096 {
+            let _ = service.try_tick(&mut node).expect("service tick");
+            let _ = peer_service
+                .try_tick(&mut peer_node)
+                .expect("peer service tick");
+            if !service.listen_addrs().is_empty() && !peer_service.listen_addrs().is_empty() {
+                break;
+            }
+            std::thread::yield_now();
+        }
+        service
+            .dial(peer_service.listen_addrs()[0].clone())
+            .expect("dial peer");
+        for _ in 0..4_096 {
+            let _ = service.try_tick(&mut node).expect("service tick");
+            let _ = peer_service
+                .try_tick(&mut peer_node)
+                .expect("peer service tick");
+            std::thread::yield_now();
+        }
+
+        let last = publish_pending_global_events(&mut service, &node, &local_node_id, 0)
+            .expect("publish pending");
+        assert_eq!(last, 2);
+    }
+
+    #[test]
+    fn dial_discovered_peer_endpoints_skips_invalid_self_and_missing_addrs() {
+        let dir = std::env::temp_dir().join(format!(
+            "wattswarm-network-bridge-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        crate::control::save_discovered_peer_records(
+            &crate::control::discovered_peers_path(&dir),
+            &[
+                crate::control::DiscoveredPeerRecord {
+                    node_id: "self".to_owned(),
+                    listen_addr: Some("/ip4/127.0.0.1/tcp/4001".to_owned()),
+                },
+                crate::control::DiscoveredPeerRecord {
+                    node_id: "peer-a".to_owned(),
+                    listen_addr: None,
+                },
+                crate::control::DiscoveredPeerRecord {
+                    node_id: "peer-b".to_owned(),
+                    listen_addr: Some("not-a-multiaddr".to_owned()),
+                },
+            ],
+        )
+        .expect("save discovered peers");
+
+        let mut service = NetworkBridgeService::new(
+            NetworkP2pNode::generate(NetworkP2pConfig {
+                listen_addrs: vec!["/ip4/127.0.0.1/tcp/0".to_owned()],
+                enable_mdns: false,
+                ..NetworkP2pConfig::default()
+            })
+            .expect("network node"),
+        )
+        .expect("network service");
+
+        let mut attempts = HashMap::new();
+        let dialed = dial_discovered_peer_endpoints(&mut service, &dir, "self", &mut attempts)
+            .expect("dial discovered peers");
+        assert_eq!(dialed, 0);
+        assert!(attempts.is_empty());
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

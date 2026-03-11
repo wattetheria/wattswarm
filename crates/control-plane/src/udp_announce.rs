@@ -1,5 +1,5 @@
 use crate::constants::LOCAL_PROTOCOL_VERSION;
-use crate::control::add_discovered_peer;
+use crate::control::add_discovered_peer_endpoint;
 use serde_json::json;
 use std::env;
 use std::net::{Ipv4Addr, SocketAddrV4, UdpSocket};
@@ -123,6 +123,7 @@ fn send_payload(cfg: UdpAnnounceConfig, payload: &str) -> std::io::Result<()> {
 struct AnnouncePacket {
     kind: String,
     node_id: Option<String>,
+    listen_addr: Option<String>,
 }
 
 pub fn maybe_start_listener(state_dir: PathBuf, self_node_id: String) {
@@ -174,7 +175,8 @@ pub fn maybe_start_listener(state_dir: PathBuf, self_node_id: String) {
             if peer_id == self_node_id {
                 continue;
             }
-            let _ = add_discovered_peer(&state_dir, &peer_id);
+            let _ =
+                add_discovered_peer_endpoint(&state_dir, &peer_id, packet.listen_addr.as_deref());
         }
     });
 }
