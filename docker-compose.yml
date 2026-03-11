@@ -34,6 +34,9 @@ services:
       WATTSWARM_STATE_DIR: /var/lib/wattswarm
       WATTSWARM_STORE_NAME: wattswarm.state
       WATTSWARM_UI_LISTEN: 0.0.0.0:7788
+      WATTSWARM_P2P_ENABLED: ${WATTSWARM_P2P_ENABLED:-true}
+      WATTSWARM_P2P_MDNS: ${WATTSWARM_P2P_MDNS:-true}
+      WATTSWARM_P2P_PORT: ${WATTSWARM_P2P_PORT:-4001}
       WATTSWARM_BOOTSTRAP_EXECUTOR_NAME: rt
       WATTSWARM_BOOTSTRAP_EXECUTOR_URL: http://runtime:8787
       WATTSWARM_UDP_ANNOUNCE_ENABLED: ${WATTSWARM_UDP_ANNOUNCE_ENABLED:-false}
@@ -47,6 +50,8 @@ services:
       - wattswarm_state_data:/var/lib/wattswarm
     ports:
       - "${WATTSWARM_UI_PORT:-7788}:7788"
+      - "${WATTSWARM_P2P_HOST_PORT:-4001}:${WATTSWARM_P2P_PORT:-4001}"
+      - "${WATTSWARM_UDP_ANNOUNCE_HOST_PORT:-37931}:${WATTSWARM_UDP_ANNOUNCE_PORT:-37931}/udp"
     entrypoint: ["/bin/sh", "-c"]
     command:
       - >

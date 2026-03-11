@@ -100,10 +100,23 @@ struct SwarmTickRequest {
 pub fn run(state_dir: PathBuf, db_path: PathBuf, listen: String) -> Result<()> {
     fs::create_dir_all(&state_dir)?;
     let node_id = local_node_id(&state_dir).ok();
-    if let Some(id) = &node_id {
-        crate::udp_announce::maybe_start_listener(state_dir.clone(), id.clone());
+    let network_enabled = crate::network_bridge::network_enabled_from_env();
+    if network_enabled {
+        if let Some(id) = &node_id {
+            crate::udp_announce::maybe_start_listener(state_dir.clone(), id.clone());
+        }
     }
-    crate::udp_announce::announce_startup("ui-startup", Some(&listen), node_id.as_deref());
+    if crate::network_bridge::maybe_start_background_network_service(
+        state_dir.clone(),
+        db_path.clone(),
+    )? {
+        eprintln!("wattswarm p2p network enabled");
+    } else {
+        eprintln!("wattswarm p2p network disabled");
+    }
+    if network_enabled {
+        crate::udp_announce::announce_startup("ui-startup", Some(&listen), node_id.as_deref());
+    }
     let state = UiServerState { state_dir, db_path };
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -173,7 +186,9 @@ async fn node_up(State(state): State<UiServerState>) -> Result<Json<Value>, ApiE
             state_path,
             serde_json::to_vec_pretty(&NodeState { running: true })?,
         )?;
-        crate::udp_announce::announce_startup("node-up-api", None, Some(&node.node_id()));
+        if crate::network_bridge::network_enabled_from_env() {
+            crate::udp_announce::announce_startup("node-up-api", None, Some(&node.node_id()));
+        }
         Ok(())
     })
     .await?;

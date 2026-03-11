@@ -221,7 +221,9 @@ fn handle_node(cmd: NodeCommand, state_dir: &Path, db_path: &Path) -> Result<()>
             let node = open_node(state_dir, db_path)?;
             let state = NodeState { running: true };
             fs::write(&state_path, serde_json::to_vec_pretty(&state)?)?;
-            crate::udp_announce::announce_startup("node-up", None, Some(&node.node_id()));
+            if crate::network_bridge::network_enabled_from_env() {
+                crate::udp_announce::announce_startup("node-up", None, Some(&node.node_id()));
+            }
             println!("node is up");
         }
         NodeAction::Down => {

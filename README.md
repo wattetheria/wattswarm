@@ -5,6 +5,7 @@ This repository now contains a Rust-first v0.1 implementation of:
 
 - P2P-style node sync primitives (gossip/backfill/anti-entropy/checkpoint)
 - SEL append-only event log on PostgreSQL + replayable projections
+- Node-local artifact storage layout for evidence/checkpoints/snapshots/event batches
 - PostgreSQL-backed run queue for multi-agent orchestration (`runs`, `run_steps`, `run_events`)
 - Run queue aggregation policy supports optional quorum (`aggregation.quorum`), tie resolver chain (`aggregation.tie_policy`), and independent null resolver chain (`aggregation.null_policy`)
 - Default tie resolver is deterministic `STOCHASTIC` for tie-only paths; null paths use independent default `null_policy` chain
@@ -52,9 +53,67 @@ This repository now contains a Rust-first v0.1 implementation of:
 WattSwarm should be treated as a kernel-first project:
 
 - Kernel/Core: `src/node/*`, `src/storage/*`, `src/policy.rs`, `src/control.rs`, `src/types.rs`
+- Network layer: `crates/network-p2p`
+- Artifact/object storage: `crates/artifact-store`
+- Network-to-kernel bridge: `crates/control-plane/src/network_bridge.rs`
 - UI/Console: `ui/*` (optional operational shell)
 
 You can remove or ignore `ui/*` and still run the kernel fully via CLI/runtime APIs.
+
+## Node Storage Split
+
+WattSwarm now treats node-local storage as layered storage:
+
+- PostgreSQL remains the node-local source of truth for:
+  - SEL event log indexing
+  - replayable projections
+  - leases/votes/finality/task state
+  - knowledge, reputation, runtime metrics, settlement
+  - local run queue and dashboard queries
+- Local filesystem artifacts are the intended home for:
+  - evidence blobs and exported evidence bundles
+  - checkpoint manifests and snapshot files
+  - event batch archives for backfill/bootstrap
+
+This split is local to one node. Nodes do not synchronize PostgreSQL databases with each other.
+Inter-node sync remains protocol-driven: signed events, checkpoint metadata, summaries, and artifact references are exchanged over the network, then re-applied into each node's local store.
+
+## Network Layer
+
+The workspace now includes dedicated crates and a control-plane bridge for node-local storage plus live inter-node sync:
+
+- `crates/network-p2p`
+  - owns scope-aware topic naming (`global` / `region.*` / `local.*`)
+  - defines network envelopes for events, rule broadcasts, checkpoint announcements, and summaries
+  - defines typed backfill request/response messages
+  - builds the minimal libp2p behaviour set used by WattSwarm networking:
+    - gossipsub
+    - identify
+    - request-response (CBOR backfill)
+    - mDNS
+  - exposes a pollable network runtime for listen/dial/publish/backfill flows
+- `crates/control-plane/src/network_bridge.rs`
+  - bridges libp2p gossip events into `node-core::ingest_remote`
+  - serves global backfill requests from the local event log
+  - applies backfill responses into the local node projection pipeline
+- `crates/artifact-store`
+  - owns the node-local filesystem layout for evidence, checkpoints, snapshots, and event batches
+  - provides read/write helpers for byte and JSON payloads
+
+Current coverage in tests:
+
+- unit tests for artifact storage paths/IO
+- unit tests for network topic/backfill/runtime primitives
+- unit tests for bridge ingest and backfill helpers
+- integration tests for two-node global gossip sync and request-response backfill sync
+
+Runtime toggles:
+
+- `WATTSWARM_P2P_ENABLED=true` by default
+- set `WATTSWARM_P2P_ENABLED=false` to run WattSwarm in local-only mode
+- `WATTSWARM_P2P_MDNS=true` by default
+- `WATTSWARM_P2P_PORT=4001` by default
+- `WATTSWARM_P2P_LISTEN_ADDRS` can override the default listen multiaddr list
 
 ## CLI
 
@@ -141,12 +200,14 @@ Default host ports:
 
 - PostgreSQL: `55432` (container `5432`)
 - Kernel UI: `7788`
+- Kernel P2P TCP: `4001`
 - Runtime HTTP: `8787`
+- UDP announce: `37931/udp`
 
 If you need custom host ports:
 
 ```bash
-WATTSWARM_PG_HOST_PORT=56432 WATTSWARM_UI_PORT=8788 WATTSWARM_RUNTIME_PORT=9787 docker compose up -d --build
+WATTSWARM_PG_HOST_PORT=56432 WATTSWARM_UI_PORT=8788 WATTSWARM_P2P_HOST_PORT=5001 WATTSWARM_RUNTIME_PORT=9787 docker compose up -d --build
 ```
 
 Kernel container startup behavior:
@@ -155,6 +216,7 @@ Kernel container startup behavior:
 - runs `run init` automatically (queue schema bootstrap)
 - auto-registers executor `rt -> http://runtime:8787`
 - starts UI server on `0.0.0.0:7788`
+- starts the background libp2p network bridge by default
 
 Worker container startup behavior:
 
@@ -174,6 +236,13 @@ Worker tuning env vars:
 - `WATTSWARM_WORKER_POLL_MS` (default `250`)
 - `WATTSWARM_WORKER_LEASE_MS` (default `30000`)
 
+P2P env vars:
+
+- `WATTSWARM_P2P_ENABLED=true` by default
+- `WATTSWARM_P2P_MDNS=true` by default
+- `WATTSWARM_P2P_PORT=4001`
+- `WATTSWARM_P2P_LISTEN_ADDRS` optional comma-separated multiaddr override
+
 Optional UDP announce switch (default off):
 
 - `WATTSWARM_UDP_ANNOUNCE_ENABLED=true` to enable UDP announce + listener
@@ -191,6 +260,9 @@ WATTSWARM_UDP_ANNOUNCE_ENABLED=true docker compose up -d --build
 
 # broadcast announce
 WATTSWARM_UDP_ANNOUNCE_ENABLED=true WATTSWARM_UDP_ANNOUNCE_MODE=broadcast WATTSWARM_UDP_ANNOUNCE_ADDR=255.255.255.255 docker compose up -d --build
+
+# local-only mode
+WATTSWARM_P2P_ENABLED=false docker compose up -d --build
 ```
 
 UI entrypoints:

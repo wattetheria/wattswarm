@@ -2,6 +2,10 @@ pub mod control {
     pub use wattswarm_control_plane::*;
 }
 
+pub mod network_bridge {
+    pub use wattswarm_control_plane::network_bridge::*;
+}
+
 pub mod run_queue {
     pub use wattswarm_run_queue::*;
 }
@@ -28,6 +32,14 @@ pub mod reason_codes {
 
 pub mod crypto {
     pub use wattswarm_crypto::*;
+}
+
+pub mod artifact_store {
+    pub use wattswarm_artifact_store::*;
+}
+
+pub mod network_p2p {
+    pub use wattswarm_network_p2p::*;
 }
 
 pub mod policy {

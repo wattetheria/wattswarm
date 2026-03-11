@@ -3,6 +3,8 @@ resolver = "2"
 members = [
   "crates/protocol",
   "crates/crypto",
+  "crates/artifact-store",
+  "crates/network-p2p",
   "crates/policy-engine",
   "crates/runtime-client",
   "crates/storage-core",
@@ -21,6 +23,7 @@ chrono = { version = "0.4", features = ["serde", "clock"] }
 clap = { version = "4.5", features = ["derive"] }
 ed25519-dalek = { version = "2.1", features = ["rand_core"] }
 hex = "0.4"
+libp2p = { version = "0.56.0", default-features = false, features = ["cbor", "gossipsub", "identify", "macros", "mdns", "noise", "request-response", "serde", "tcp", "tokio", "yamux"] }
 postgres = "0.19"
 rand = "0.8"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
@@ -38,6 +41,8 @@ tower = "0.5"
 
 wattswarm-protocol = { path = "crates/protocol" }
 wattswarm-crypto = { path = "crates/crypto" }
+wattswarm-artifact-store = { path = "crates/artifact-store" }
+wattswarm-network-p2p = { path = "crates/network-p2p" }
 wattswarm-policy-engine = { path = "crates/policy-engine" }
 wattswarm-runtime-client = { path = "crates/runtime-client" }
 wattswarm-storage-core = { path = "crates/storage-core" }
