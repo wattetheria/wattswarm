@@ -295,6 +295,30 @@ fn export_and_vote_checkpoint_membership_paths_work() {
     store
         .adjust_reputation("rt", "default", 12_345, -600, 1_700_000_002_000)
         .expect("adjust reputation");
+    let reputation = store
+        .get_reputation_snapshot("rt", "default")
+        .expect("get reputation snapshot")
+        .expect("reputation row exists");
+    assert_eq!(reputation.stability_reputation, 12_345);
+    assert_eq!(reputation.quality_reputation, -600);
+    store
+        .put_reputation_snapshot("rt", "default", 9_999, 9_999, 1_700_000_001_000)
+        .expect("put older reputation snapshot");
+    let reputation_after_old = store
+        .get_reputation_snapshot("rt", "default")
+        .expect("get reputation after old snapshot")
+        .expect("reputation row exists");
+    assert_eq!(reputation_after_old.stability_reputation, 12_345);
+    assert_eq!(reputation_after_old.quality_reputation, -600);
+    store
+        .put_reputation_snapshot("rt", "default", 20_000, 30_000, 1_700_000_003_000)
+        .expect("put newer reputation snapshot");
+    let reputation_after_new = store
+        .get_reputation_snapshot("rt", "default")
+        .expect("get reputation after new snapshot")
+        .expect("reputation row exists");
+    assert_eq!(reputation_after_new.stability_reputation, 20_000);
+    assert_eq!(reputation_after_new.quality_reputation, 30_000);
     store
         .put_knowledge_lookup(
             task_id,
@@ -467,7 +491,7 @@ fn export_and_vote_checkpoint_membership_paths_work() {
     );
     assert_eq!(
         export_task["reputation_state"][0]["stability_reputation_decimal"],
-        "1.2345"
+        "2.0000"
     );
 
     let export_task_type = store

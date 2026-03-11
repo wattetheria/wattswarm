@@ -1,6 +1,91 @@
 use super::*;
 
 impl PgStore {
+    pub fn get_reputation_snapshot(
+        &self,
+        runtime_id: &str,
+        profile_id: &str,
+    ) -> Result<Option<ReputationSnapshotRow>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
+        conn.query_row(
+            "SELECT runtime_id, profile_id, stability_reputation, quality_reputation,
+                    (EXTRACT(EPOCH FROM last_updated_at) * 1000)::BIGINT AS last_updated_at
+             FROM reputation_state
+             WHERE runtime_id = $1 AND profile_id = $2",
+            params![runtime_id, profile_id],
+            |r| {
+                Ok(ReputationSnapshotRow {
+                    runtime_id: r.get(0)?,
+                    profile_id: r.get(1)?,
+                    stability_reputation: r.get(2)?,
+                    quality_reputation: r.get(3)?,
+                    last_updated_at: r.get::<_, i64>(4)? as u64,
+                })
+            },
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    pub fn list_reputation_snapshots(&self, limit: usize) -> Result<Vec<ReputationSnapshotRow>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
+        let mut stmt = conn.prepare(
+            "SELECT runtime_id, profile_id, stability_reputation, quality_reputation,
+                    (EXTRACT(EPOCH FROM last_updated_at) * 1000)::BIGINT AS last_updated_at
+             FROM reputation_state
+             ORDER BY last_updated_at DESC
+             LIMIT $1",
+        )?;
+        let rows = stmt.query_map(params![limit as i64], |r| {
+            Ok(ReputationSnapshotRow {
+                runtime_id: r.get(0)?,
+                profile_id: r.get(1)?,
+                stability_reputation: r.get(2)?,
+                quality_reputation: r.get(3)?,
+                last_updated_at: r.get::<_, i64>(4)? as u64,
+            })
+        })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
+    pub fn put_reputation_snapshot(
+        &self,
+        runtime_id: &str,
+        profile_id: &str,
+        stability_reputation: i64,
+        quality_reputation: i64,
+        last_updated_at: u64,
+    ) -> Result<()> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
+        conn.execute(
+            "INSERT INTO reputation_state(runtime_id, profile_id, stability_reputation, quality_reputation, last_updated_at)
+             VALUES ($1, $2, $3, $4, TIMESTAMPTZ 'epoch' + ($5::bigint * INTERVAL '1 millisecond'))
+             ON CONFLICT(runtime_id, profile_id) DO UPDATE SET
+               stability_reputation = excluded.stability_reputation,
+               quality_reputation = excluded.quality_reputation,
+               last_updated_at = excluded.last_updated_at
+             WHERE reputation_state.last_updated_at <= excluded.last_updated_at",
+            params![
+                runtime_id,
+                profile_id,
+                stability_reputation,
+                quality_reputation,
+                last_updated_at as i64
+            ],
+        )?;
+        Ok(())
+    }
+
     pub fn get_advisory_state(&self, advisory_id: &str) -> Result<Option<AdvisoryStateRow>> {
         let conn = self
             .conn

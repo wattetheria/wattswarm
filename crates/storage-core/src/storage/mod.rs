@@ -75,21 +75,35 @@ pub struct TaskSettlementRow {
     pub implicit_settled_at: Option<u64>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
 pub struct DecisionMemoryHitRow {
     pub task_id: String,
     pub epoch: u64,
     pub final_commit_hash: String,
     pub winning_candidate_hash: String,
+    pub output_digest: String,
     pub result_summary: serde_json::Value,
+    pub quorum_result: serde_json::Value,
     pub reason_codes: Vec<u16>,
+    pub reason_details: serde_json::Value,
+    pub policy_snapshot_digest: String,
     pub input_digest: String,
     pub output_schema_digest: String,
     pub policy_id: String,
+    pub task_type: String,
     pub policy_params_digest: String,
     pub deprecated_as_exact: bool,
     pub finalized_at: u64,
     pub confidence_hint: f64,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct ReputationSnapshotRow {
+    pub runtime_id: String,
+    pub profile_id: String,
+    pub stability_reputation: i64,
+    pub quality_reputation: i64,
+    pub last_updated_at: u64,
 }
 
 #[derive(Debug, Clone)]

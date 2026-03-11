@@ -94,10 +94,11 @@ The workspace now includes dedicated crates and a control-plane bridge for node-
   - exposes a pollable network runtime for listen/dial/publish/backfill flows
 - `crates/control-plane/src/network_bridge.rs`
   - bridges libp2p gossip events into `node-core::ingest_remote`
-  - serves global backfill requests from the local event log
+  - serves scope-aware backfill requests from the local event log
   - applies backfill responses into the local node projection pipeline
-  - auto-requests global backfill when a peer connection is established
-  - auto-publishes locally authored events from the node event log into the global gossip topic
+  - auto-requests backfill for every configured scope when a peer connection is established
+  - auto-publishes locally authored events into `global / region / local` topics based on task scope hints
+  - auto-publishes knowledge summaries on finalized decisions and reputation summaries on verifier updates
   - can dial peer listen addresses discovered through LAN state (`discovered_peers.json`)
 - `crates/artifact-store`
   - owns the node-local filesystem layout for evidence, checkpoints, snapshots, and event batches
@@ -109,6 +110,7 @@ Current coverage in tests:
 - unit tests for network topic/backfill/runtime primitives
 - unit tests for bridge ingest and backfill helpers
 - integration tests for two-node global gossip sync and request-response backfill sync
+- integration tests for region/local scoped sync and summary import
 
 Runtime toggles:
 
@@ -117,6 +119,15 @@ Runtime toggles:
 - `WATTSWARM_P2P_MDNS=true` by default
 - `WATTSWARM_P2P_PORT=4001` by default
 - `WATTSWARM_P2P_LISTEN_ADDRS` can override the default listen multiaddr list
+- `WATTSWARM_P2P_REGION_IDS=sol-1,sol-2` subscribes the node to those region scopes
+- `WATTSWARM_P2P_LOCAL_IDS=lab-a` subscribes the node to matching local scopes
+
+Task scope hints:
+
+- default task scope is `global`
+- set `inputs.swarm_scope = "region:<id>"` or `inputs.swarm_scope = "local:<id>"` to route a task into region/local sync
+- object form is also accepted: `{"kind":"region","id":"sol-1"}`
+- `task_type` prefixes `region:<id>:` and `local:<id>:` are supported as a fallback
 
 ## CLI
 
@@ -245,6 +256,8 @@ P2P env vars:
 - `WATTSWARM_P2P_MDNS=true` by default
 - `WATTSWARM_P2P_PORT=4001`
 - `WATTSWARM_P2P_LISTEN_ADDRS` optional comma-separated multiaddr override
+- `WATTSWARM_P2P_REGION_IDS` optional comma-separated region scope subscription list
+- `WATTSWARM_P2P_LOCAL_IDS` optional comma-separated local scope subscription list
 
 Optional UDP announce switch (default off):
 

@@ -1252,8 +1252,9 @@ impl PgStore {
             .lock()
             .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
         let mut stmt = conn.prepare(
-            "SELECT task_id, epoch, final_commit_hash, winning_candidate_hash, result_summary,
-                    reason_codes_json, input_digest, output_schema_digest, policy_id,
+            "SELECT task_id, epoch, final_commit_hash, winning_candidate_hash, output_digest, result_summary,
+                    quorum_result_json, reason_codes_json, reason_details, policy_snapshot_digest,
+                    input_digest, output_schema_digest, policy_id, task_type,
                     policy_params_digest, deprecated_as_exact,
                     (EXTRACT(EPOCH FROM finalized_at) * 1000)::BIGINT AS finalized_at
              FROM decision_memory
@@ -1263,24 +1264,35 @@ impl PgStore {
              LIMIT $2",
         )?;
         let rows = stmt.query_map(params![task_type, limit as i64], |r| {
-            let summary_raw: String = r.get(4)?;
+            let summary_raw: String = r.get(5)?;
             let summary =
                 serde_json::from_str(&summary_raw).unwrap_or_else(|_| serde_json::json!({}));
-            let reason_codes_raw: String = r.get(5)?;
+            let quorum_result_raw: String = r.get(6)?;
+            let quorum_result =
+                serde_json::from_str(&quorum_result_raw).unwrap_or_else(|_| serde_json::json!({}));
+            let reason_codes_raw: String = r.get(7)?;
             let reason_codes = serde_json::from_str(&reason_codes_raw).unwrap_or_default();
+            let reason_details_raw: String = r.get(8)?;
+            let reason_details =
+                serde_json::from_str(&reason_details_raw).unwrap_or_else(|_| serde_json::json!({}));
             Ok(DecisionMemoryHitRow {
                 task_id: r.get(0)?,
                 epoch: r.get::<_, i64>(1)? as u64,
                 final_commit_hash: r.get(2)?,
                 winning_candidate_hash: r.get(3)?,
+                output_digest: r.get(4)?,
                 result_summary: summary,
+                quorum_result,
                 reason_codes,
-                input_digest: r.get(6)?,
-                output_schema_digest: r.get(7)?,
-                policy_id: r.get(8)?,
-                policy_params_digest: r.get(9)?,
-                deprecated_as_exact: r.get::<_, bool>(10)?,
-                finalized_at: r.get::<_, i64>(11)? as u64,
+                reason_details,
+                policy_snapshot_digest: r.get(9)?,
+                input_digest: r.get(10)?,
+                output_schema_digest: r.get(11)?,
+                policy_id: r.get(12)?,
+                task_type: r.get(13)?,
+                policy_params_digest: r.get(14)?,
+                deprecated_as_exact: r.get::<_, bool>(15)?,
+                finalized_at: r.get::<_, i64>(16)? as u64,
                 confidence_hint: 0.5,
             })
         })?;

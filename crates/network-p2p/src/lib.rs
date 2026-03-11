@@ -11,6 +11,7 @@ use libp2p::swarm::{NetworkBehaviour, SwarmEvent, behaviour::toggle::Toggle};
 pub use libp2p::{Multiaddr, PeerId};
 use libp2p::{StreamProtocol, Swarm, SwarmBuilder, identity, noise, tcp, yamux};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::collections::HashSet;
 use wattswarm_protocol::types::Event;
 
@@ -170,11 +171,14 @@ pub struct CheckpointAnnouncement {
     pub artifact_path: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SummaryAnnouncement {
     pub scope: SwarmScope,
     pub summary_kind: String,
-    pub artifact_path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact_path: Option<String>,
+    #[serde(default)]
+    pub payload: Value,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -712,6 +716,20 @@ mod tests {
         let decoded = GossipMessage::decode_json(&bytes).expect("decode");
         assert_eq!(decoded, message);
         assert_eq!(decoded.kind(), TopicKind::Events);
+    }
+
+    #[test]
+    fn summary_messages_roundtrip_as_json() {
+        let message = GossipMessage::Summary(SummaryAnnouncement {
+            scope: SwarmScope::Region("sol-1".to_owned()),
+            summary_kind: "knowledge_task_type_v1".to_owned(),
+            artifact_path: Some("summaries/sol-1/knowledge.json".to_owned()),
+            payload: serde_json::json!({"task_type":"swarm","rows":[{"task_id":"task-1"}]}),
+        });
+        let bytes = message.encode_json().expect("encode");
+        let decoded = GossipMessage::decode_json(&bytes).expect("decode");
+        assert_eq!(decoded, message);
+        assert_eq!(decoded.kind(), TopicKind::Summaries);
     }
 
     #[test]

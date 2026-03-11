@@ -6,10 +6,11 @@ use uuid::Uuid;
 use wattswarm_control_plane::control::add_discovered_peer_endpoint;
 use wattswarm_control_plane::crypto::NodeIdentity;
 use wattswarm_control_plane::network_bridge::{
-    NetworkBridgeService, NetworkBridgeTick, dial_discovered_peer_endpoints,
-    publish_pending_global_events,
+    NetworkBridgeService, NetworkBridgeTick, build_knowledge_summary_for_task_type,
+    build_reputation_summary_for_runtime, dial_discovered_peer_endpoints,
+    publish_pending_global_events, publish_pending_scoped_updates,
 };
-use wattswarm_control_plane::network_p2p::{NetworkP2pConfig, NetworkP2pNode};
+use wattswarm_control_plane::network_p2p::{NetworkP2pConfig, NetworkP2pNode, SwarmScope};
 use wattswarm_control_plane::node::Node;
 use wattswarm_control_plane::storage::PgStore;
 use wattswarm_control_plane::task_template::sample_contract;
@@ -40,13 +41,20 @@ fn make_node(identity: NodeIdentity, membership: Membership) -> Node {
 }
 
 fn make_service() -> NetworkBridgeService {
+    make_service_with_scopes(&[SwarmScope::Global])
+}
+
+fn make_service_with_scopes(scopes: &[SwarmScope]) -> NetworkBridgeService {
     let config = NetworkP2pConfig {
         listen_addrs: vec!["/ip4/127.0.0.1/tcp/0".to_owned()],
         enable_mdns: false,
         ..NetworkP2pConfig::default()
     };
-    NetworkBridgeService::new(NetworkP2pNode::generate(config).expect("network node"))
-        .expect("network service")
+    NetworkBridgeService::new_with_scopes(
+        NetworkP2pNode::generate(config).expect("network node"),
+        scopes,
+    )
+    .expect("network service")
 }
 
 fn pump_once(service: &mut NetworkBridgeService, node: &mut Node) -> Option<NetworkBridgeTick> {
@@ -61,6 +69,30 @@ fn temp_test_dir(prefix: &str) -> PathBuf {
 
 fn cleanup_dir(path: &Path) {
     let _ = fs::remove_dir_all(path);
+}
+
+fn connect_services(
+    dialer: &mut NetworkBridgeService,
+    dialer_node: &mut Node,
+    receiver: &mut NetworkBridgeService,
+    receiver_node: &mut Node,
+) {
+    for _ in 0..4_096 {
+        let _ = pump_once(dialer, dialer_node);
+        let _ = pump_once(receiver, receiver_node);
+        if !dialer.listen_addrs().is_empty() && !receiver.listen_addrs().is_empty() {
+            break;
+        }
+        std::thread::yield_now();
+    }
+    dialer
+        .dial(receiver.listen_addrs()[0].clone())
+        .expect("dial peer");
+    for _ in 0..4_096 {
+        let _ = pump_once(dialer, dialer_node);
+        let _ = pump_once(receiver, receiver_node);
+        std::thread::yield_now();
+    }
 }
 
 #[test]
@@ -318,17 +350,37 @@ fn discovered_peer_endpoint_helper_dials_and_syncs_over_lan_state() {
     .expect("record node a endpoint");
 
     let mut attempts_a = HashMap::new();
-    let mut attempts_b = HashMap::new();
     assert_eq!(
         dial_discovered_peer_endpoints(&mut service_a, &dir_a, &node_a.node_id(), &mut attempts_a)
             .expect("dial discovered peers a"),
         1
     );
-    assert_eq!(
-        dial_discovered_peer_endpoints(&mut service_b, &dir_b, &node_b.node_id(), &mut attempts_b)
-            .expect("dial discovered peers b"),
-        1
-    );
+
+    let peer_a = service_a.local_peer_id();
+    let peer_b = service_b.local_peer_id();
+    let mut a_connected = false;
+    let mut b_connected = false;
+    for _ in 0..4_096 {
+        let tick_a = pump_once(&mut service_a, &mut node_a);
+        let tick_b = pump_once(&mut service_b, &mut node_b);
+        if matches!(
+            tick_a.as_ref(),
+            Some(NetworkBridgeTick::Connected { peer }) if *peer == peer_b
+        ) {
+            a_connected = true;
+        }
+        if matches!(
+            tick_b.as_ref(),
+            Some(NetworkBridgeTick::Connected { peer }) if *peer == peer_a
+        ) {
+            b_connected = true;
+        }
+        if a_connected && b_connected {
+            break;
+        }
+        std::thread::yield_now();
+    }
+    assert!(a_connected && b_connected);
 
     let policy_hash = node_a
         .policy_registry()
@@ -367,5 +419,224 @@ fn discovered_peer_endpoint_helper_dials_and_syncs_over_lan_state() {
     assert!(
         synced,
         "discovered peer endpoint dialing should sync local event"
+    );
+}
+
+#[test]
+fn region_scoped_backfill_only_reaches_region_subscribers() {
+    let identity_a = NodeIdentity::random();
+    let identity_b = NodeIdentity::random();
+    let identity_c = NodeIdentity::random();
+    let membership = membership_with_roles(&[
+        identity_a.node_id(),
+        identity_b.node_id(),
+        identity_c.node_id(),
+    ]);
+    let mut node_a = make_node(identity_a, membership.clone());
+    let mut node_b = make_node(identity_b, membership.clone());
+    let mut node_c = make_node(identity_c, membership);
+    let mut service_a =
+        make_service_with_scopes(&[SwarmScope::Global, SwarmScope::Region("sol-1".to_owned())]);
+    let mut service_b =
+        make_service_with_scopes(&[SwarmScope::Global, SwarmScope::Region("sol-1".to_owned())]);
+    let mut service_c = make_service_with_scopes(&[SwarmScope::Global]);
+
+    let policy_hash = node_a
+        .policy_registry()
+        .binding_for("vp.schema_only.v1", json!({}))
+        .expect("policy binding")
+        .policy_hash;
+    let mut contract = sample_contract("task-region-backfill", policy_hash);
+    contract.task_type = "region:sol-1:swarm".to_owned();
+    contract.inputs = json!({"prompt":"region sync", "swarm_scope":"region:sol-1"});
+    node_a.submit_task(contract, 1, 100).expect("submit task");
+
+    connect_services(&mut service_a, &mut node_a, &mut service_b, &mut node_b);
+    connect_services(&mut service_a, &mut node_a, &mut service_c, &mut node_c);
+
+    let mut region_synced = false;
+    for _ in 0..4_096 {
+        let _ = pump_once(&mut service_a, &mut node_a);
+        let _ = pump_once(&mut service_b, &mut node_b);
+        let _ = pump_once(&mut service_c, &mut node_c);
+        if node_b
+            .task_view("task-region-backfill")
+            .expect("task view")
+            .is_some()
+        {
+            region_synced = true;
+            break;
+        }
+        std::thread::yield_now();
+    }
+
+    assert!(region_synced);
+    assert!(
+        node_c
+            .task_view("task-region-backfill")
+            .expect("task view")
+            .is_none()
+    );
+}
+
+#[test]
+fn local_scoped_live_sync_only_reaches_matching_local_scope() {
+    let identity_a = NodeIdentity::random();
+    let identity_b = NodeIdentity::random();
+    let identity_c = NodeIdentity::random();
+    let membership = membership_with_roles(&[
+        identity_a.node_id(),
+        identity_b.node_id(),
+        identity_c.node_id(),
+    ]);
+    let mut node_a = make_node(identity_a, membership.clone());
+    let mut node_b = make_node(identity_b, membership.clone());
+    let mut node_c = make_node(identity_c, membership);
+    let mut service_a =
+        make_service_with_scopes(&[SwarmScope::Global, SwarmScope::Local("lab-1".to_owned())]);
+    let mut service_b =
+        make_service_with_scopes(&[SwarmScope::Global, SwarmScope::Local("lab-1".to_owned())]);
+    let mut service_c =
+        make_service_with_scopes(&[SwarmScope::Global, SwarmScope::Local("lab-2".to_owned())]);
+
+    connect_services(&mut service_a, &mut node_a, &mut service_b, &mut node_b);
+    connect_services(&mut service_a, &mut node_a, &mut service_c, &mut node_c);
+
+    let policy_hash = node_a
+        .policy_registry()
+        .binding_for("vp.schema_only.v1", json!({}))
+        .expect("policy binding")
+        .policy_hash;
+    let mut contract = sample_contract("task-local-live", policy_hash);
+    contract.task_type = "local:lab-1:swarm".to_owned();
+    contract.inputs = json!({"prompt":"local sync", "swarm_scope":"local:lab-1"});
+    node_a.submit_task(contract, 1, 100).expect("submit task");
+
+    let mut last_published_seq = 0;
+    let mut local_synced = false;
+    for _ in 0..4_096 {
+        last_published_seq = publish_pending_scoped_updates(
+            &mut service_a,
+            &node_a,
+            &node_a.node_id(),
+            last_published_seq,
+        )
+        .expect("publish pending scoped");
+        let _ = pump_once(&mut service_a, &mut node_a);
+        let _ = pump_once(&mut service_b, &mut node_b);
+        let _ = pump_once(&mut service_c, &mut node_c);
+        if node_b
+            .task_view("task-local-live")
+            .expect("task view")
+            .is_some()
+        {
+            local_synced = true;
+            break;
+        }
+        std::thread::yield_now();
+    }
+
+    assert!(local_synced);
+    assert!(
+        node_c
+            .task_view("task-local-live")
+            .expect("task view")
+            .is_none()
+    );
+}
+
+#[test]
+fn summary_gossip_imports_knowledge_and_reputation_into_remote_store() {
+    let identity_a = NodeIdentity::random();
+    let identity_b = NodeIdentity::random();
+    let membership = membership_with_roles(&[identity_a.node_id(), identity_b.node_id()]);
+    let mut node_a = make_node(identity_a, membership.clone());
+    let mut node_b = make_node(identity_b, membership);
+    let mut service_a = make_service();
+    let mut service_b = make_service();
+
+    connect_services(&mut service_a, &mut node_a, &mut service_b, &mut node_b);
+
+    node_a
+        .store
+        .put_decision_memory(
+            "task-summary",
+            1,
+            "commit-1",
+            100,
+            "candidate-hash-1",
+            "output-digest-1",
+            &json!({"answer":"from summary"}),
+            &json!({"quorum":"ok"}),
+            &[100],
+            &json!({"detail":"summary"}),
+            "policy-snap-1",
+            "summary-type",
+            "input-digest-1",
+            "schema-digest-1",
+            "vp.schema_only.v1",
+            "params-digest-1",
+        )
+        .expect("put decision memory");
+    node_a
+        .store
+        .put_reputation_snapshot("runtime-a", "model-a", 1200, 3400, 111)
+        .expect("put reputation snapshot");
+
+    let knowledge =
+        build_knowledge_summary_for_task_type(&node_a, &SwarmScope::Global, "summary-type")
+            .expect("build knowledge summary")
+            .expect("knowledge summary");
+    let reputation = build_reputation_summary_for_runtime(&node_a, "runtime-a", "model-a")
+        .expect("build reputation summary")
+        .expect("reputation summary");
+
+    service_a
+        .publish_summary(knowledge)
+        .expect("publish knowledge");
+    service_a
+        .publish_summary(reputation)
+        .expect("publish reputation");
+
+    let mut imported = false;
+    for _ in 0..4_096 {
+        let _ = pump_once(&mut service_a, &mut node_a);
+        let _ = pump_once(&mut service_b, &mut node_b);
+        if node_b
+            .store
+            .list_decision_memory_hits_by_task_type("summary-type", 8)
+            .expect("list decisions")
+            .len()
+            == 1
+            && node_b
+                .store
+                .get_reputation_snapshot("runtime-a", "model-a")
+                .expect("get reputation")
+                .is_some()
+        {
+            imported = true;
+            break;
+        }
+        std::thread::yield_now();
+    }
+
+    assert!(imported);
+
+    let imported_reputation = node_b
+        .store
+        .get_reputation_snapshot("runtime-a", "model-a")
+        .expect("get imported reputation")
+        .expect("reputation exists");
+    assert_eq!(imported_reputation.stability_reputation, 1200);
+    assert_eq!(imported_reputation.quality_reputation, 3400);
+
+    let imported_decisions = node_b
+        .store
+        .list_decision_memory_hits_by_task_type("summary-type", 8)
+        .expect("list imported decisions");
+    assert_eq!(imported_decisions.len(), 1);
+    assert_eq!(
+        imported_decisions[0].result_summary["answer"],
+        json!("from summary")
     );
 }
