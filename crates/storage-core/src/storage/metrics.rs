@@ -1,7 +1,7 @@
 use super::*;
 
 impl PgStore {
-    pub fn get_reputation_snapshot(
+    pub fn get_local_reputation_snapshot(
         &self,
         runtime_id: &str,
         profile_id: &str,
@@ -30,7 +30,60 @@ impl PgStore {
         .map_err(Into::into)
     }
 
-    pub fn list_reputation_snapshots(&self, limit: usize) -> Result<Vec<ReputationSnapshotRow>> {
+    pub fn get_reputation_snapshot(
+        &self,
+        runtime_id: &str,
+        profile_id: &str,
+    ) -> Result<Option<ReputationSnapshotRow>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
+        conn.query_row(
+            "SELECT runtime_id, profile_id, stability_reputation, quality_reputation, last_updated_at_ms
+             FROM (
+                SELECT runtime_id, profile_id, stability_reputation, quality_reputation,
+                       (EXTRACT(EPOCH FROM last_updated_at) * 1000)::BIGINT AS last_updated_at_ms
+                  FROM reputation_state
+                 WHERE runtime_id = $1 AND profile_id = $2
+                UNION ALL
+                SELECT runtime_id, profile_id, stability_reputation, quality_reputation,
+                       (EXTRACT(EPOCH FROM last_updated_at) * 1000)::BIGINT AS last_updated_at_ms
+                  FROM imported_reputation_state imported_rs
+                 WHERE runtime_id = $1
+                   AND profile_id = $2
+                   AND revoked = FALSE
+                   AND NOT EXISTS (
+                        SELECT 1 FROM summary_revocations revoked_summary
+                        WHERE revoked_summary.summary_id = imported_rs.summary_id
+                   )
+                   AND NOT EXISTS (
+                        SELECT 1 FROM penalized_nodes penalized
+                        WHERE penalized.node_id = imported_rs.source_node_id
+                          AND penalized.block_summaries = TRUE
+                   )
+             ) merged
+             ORDER BY last_updated_at_ms DESC
+             LIMIT 1",
+            params![runtime_id, profile_id],
+            |r| {
+            Ok(ReputationSnapshotRow {
+                runtime_id: r.get(0)?,
+                profile_id: r.get(1)?,
+                stability_reputation: r.get(2)?,
+                quality_reputation: r.get(3)?,
+                last_updated_at: r.get::<_, i64>(4)? as u64,
+            })
+        },
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    pub fn list_local_reputation_snapshots(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<ReputationSnapshotRow>> {
         let conn = self
             .conn
             .lock()
@@ -40,6 +93,48 @@ impl PgStore {
                     (EXTRACT(EPOCH FROM last_updated_at) * 1000)::BIGINT AS last_updated_at
              FROM reputation_state
              ORDER BY last_updated_at DESC
+             LIMIT $1",
+        )?;
+        let rows = stmt.query_map(params![limit as i64], |r| {
+            Ok(ReputationSnapshotRow {
+                runtime_id: r.get(0)?,
+                profile_id: r.get(1)?,
+                stability_reputation: r.get(2)?,
+                quality_reputation: r.get(3)?,
+                last_updated_at: r.get::<_, i64>(4)? as u64,
+            })
+        })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
+    pub fn list_reputation_snapshots(&self, limit: usize) -> Result<Vec<ReputationSnapshotRow>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
+        let mut stmt = conn.prepare(
+            "SELECT runtime_id, profile_id, stability_reputation, quality_reputation, last_updated_at_ms
+             FROM (
+                SELECT runtime_id, profile_id, stability_reputation, quality_reputation,
+                       (EXTRACT(EPOCH FROM last_updated_at) * 1000)::BIGINT AS last_updated_at_ms
+                  FROM reputation_state
+                UNION ALL
+                SELECT runtime_id, profile_id, stability_reputation, quality_reputation,
+                       (EXTRACT(EPOCH FROM last_updated_at) * 1000)::BIGINT AS last_updated_at_ms
+                  FROM imported_reputation_state imported_rs
+                 WHERE revoked = FALSE
+                   AND NOT EXISTS (
+                        SELECT 1 FROM summary_revocations revoked_summary
+                        WHERE revoked_summary.summary_id = imported_rs.summary_id
+                   )
+                   AND NOT EXISTS (
+                        SELECT 1 FROM penalized_nodes penalized
+                        WHERE penalized.node_id = imported_rs.source_node_id
+                          AND penalized.block_summaries = TRUE
+                   )
+             ) merged
+             ORDER BY last_updated_at_ms DESC
              LIMIT $1",
         )?;
         let rows = stmt.query_map(params![limit as i64], |r| {
@@ -82,6 +177,62 @@ impl PgStore {
                 quality_reputation,
                 last_updated_at as i64
             ],
+        )?;
+        Ok(())
+    }
+
+    pub fn put_imported_reputation_snapshot(
+        &self,
+        summary_id: &str,
+        source_node_id: &str,
+        entry: &ReputationSnapshotRow,
+    ) -> Result<()> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
+        conn.execute(
+            "INSERT INTO imported_reputation_state(summary_id, source_node_id, runtime_id, profile_id, stability_reputation, quality_reputation, last_updated_at, revoked)
+             VALUES ($1, $2, $3, $4, $5, $6, TIMESTAMPTZ 'epoch' + ($7::bigint * INTERVAL '1 millisecond'), FALSE)
+             ON CONFLICT(summary_id, runtime_id, profile_id) DO UPDATE SET
+               source_node_id = excluded.source_node_id,
+               stability_reputation = excluded.stability_reputation,
+               quality_reputation = excluded.quality_reputation,
+               last_updated_at = excluded.last_updated_at,
+               revoked = FALSE",
+            params![
+                summary_id,
+                source_node_id,
+                entry.runtime_id,
+                entry.profile_id,
+                entry.stability_reputation,
+                entry.quality_reputation,
+                entry.last_updated_at as i64
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn revoke_imported_reputation_by_summary(&self, summary_id: &str) -> Result<()> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
+        conn.execute(
+            "UPDATE imported_reputation_state SET revoked = TRUE WHERE summary_id = $1",
+            params![summary_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn revoke_imported_reputation_by_source(&self, source_node_id: &str) -> Result<()> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
+        conn.execute(
+            "UPDATE imported_reputation_state SET revoked = TRUE WHERE source_node_id = $1",
+            params![source_node_id],
         )?;
         Ok(())
     }

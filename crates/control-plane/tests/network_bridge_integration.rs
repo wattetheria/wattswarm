@@ -640,3 +640,353 @@ fn summary_gossip_imports_knowledge_and_reputation_into_remote_store() {
         json!("from summary")
     );
 }
+
+#[test]
+fn revoked_event_propagates_and_removes_remote_projection_state() {
+    let identity_a = NodeIdentity::random();
+    let identity_b = NodeIdentity::random();
+    let membership = membership_with_roles(&[identity_a.node_id(), identity_b.node_id()]);
+    let mut node_a = make_node(identity_a, membership.clone());
+    let mut node_b = make_node(identity_b, membership);
+    let mut service_a = make_service();
+    let mut service_b = make_service();
+
+    connect_services(&mut service_a, &mut node_a, &mut service_b, &mut node_b);
+
+    let policy_hash = node_a
+        .policy_registry()
+        .binding_for("vp.schema_only.v1", json!({}))
+        .expect("policy binding")
+        .policy_hash;
+    let mut contract = sample_contract("task-revocation-network", policy_hash);
+    contract.inputs = json!({"prompt":"revoke over network"});
+    let created = node_a.submit_task(contract, 1, 100).expect("submit task");
+
+    let mut last_published_seq = 0;
+    for _ in 0..4_096 {
+        last_published_seq = publish_pending_scoped_updates(
+            &mut service_a,
+            &node_a,
+            &node_a.node_id(),
+            last_published_seq,
+        )
+        .expect("publish task event");
+        let _ = pump_once(&mut service_a, &mut node_a);
+        let _ = pump_once(&mut service_b, &mut node_b);
+        if node_b
+            .task_view("task-revocation-network")
+            .expect("task view")
+            .is_some()
+        {
+            break;
+        }
+        std::thread::yield_now();
+    }
+    assert!(
+        node_b
+            .task_view("task-revocation-network")
+            .expect("task view after sync")
+            .is_some()
+    );
+
+    node_a
+        .revoke_event(&created.event_id, "malicious task", 1, 101)
+        .expect("revoke event");
+
+    let mut revoked = false;
+    for _ in 0..4_096 {
+        last_published_seq = publish_pending_scoped_updates(
+            &mut service_a,
+            &node_a,
+            &node_a.node_id(),
+            last_published_seq,
+        )
+        .expect("publish revoke event");
+        let _ = pump_once(&mut service_a, &mut node_a);
+        let _ = pump_once(&mut service_b, &mut node_b);
+        if node_b
+            .task_view("task-revocation-network")
+            .expect("task view after revoke")
+            .is_none()
+        {
+            revoked = true;
+            break;
+        }
+        std::thread::yield_now();
+    }
+    assert!(revoked);
+}
+
+#[test]
+fn revoked_summary_event_removes_remote_imported_state() {
+    let identity_a = NodeIdentity::random();
+    let identity_b = NodeIdentity::random();
+    let membership = membership_with_roles(&[identity_a.node_id(), identity_b.node_id()]);
+    let mut node_a = make_node(identity_a, membership.clone());
+    let mut node_b = make_node(identity_b, membership);
+    let mut service_a = make_service();
+    let mut service_b = make_service();
+
+    connect_services(&mut service_a, &mut node_a, &mut service_b, &mut node_b);
+
+    node_a
+        .store
+        .put_decision_memory(
+            "task-summary-revoke",
+            1,
+            "commit-revoke",
+            100,
+            "candidate-revoke",
+            "output-revoke",
+            &json!({"answer":"revoke this summary"}),
+            &json!({"quorum":"ok"}),
+            &[100],
+            &json!({"detail":"summary"}),
+            "policy-snap-1",
+            "summary-revoke-type",
+            "input-digest-1",
+            "schema-digest-1",
+            "vp.schema_only.v1",
+            "params-digest-1",
+        )
+        .expect("put decision memory");
+    let knowledge =
+        build_knowledge_summary_for_task_type(&node_a, &SwarmScope::Global, "summary-revoke-type")
+            .expect("build knowledge summary")
+            .expect("knowledge summary");
+
+    service_a
+        .publish_summary(knowledge.clone())
+        .expect("publish knowledge");
+
+    let mut imported = false;
+    for _ in 0..4_096 {
+        let _ = pump_once(&mut service_a, &mut node_a);
+        let _ = pump_once(&mut service_b, &mut node_b);
+        if node_b
+            .store
+            .list_decision_memory_hits_by_task_type("summary-revoke-type", 8)
+            .expect("list imported decisions")
+            .len()
+            == 1
+        {
+            imported = true;
+            break;
+        }
+        std::thread::yield_now();
+    }
+    assert!(imported);
+
+    node_a
+        .revoke_summary(
+            &knowledge.summary_id,
+            &knowledge.summary_kind,
+            "summary was malicious",
+            1,
+            110,
+        )
+        .expect("revoke summary");
+
+    let mut last_published_seq = 0;
+    let mut removed = false;
+    for _ in 0..4_096 {
+        last_published_seq = publish_pending_scoped_updates(
+            &mut service_a,
+            &node_a,
+            &node_a.node_id(),
+            last_published_seq,
+        )
+        .expect("publish summary revoke event");
+        let _ = pump_once(&mut service_a, &mut node_a);
+        let _ = pump_once(&mut service_b, &mut node_b);
+        if node_b
+            .store
+            .list_decision_memory_hits_by_task_type("summary-revoke-type", 8)
+            .expect("list imported decisions after revoke")
+            .is_empty()
+        {
+            removed = true;
+            break;
+        }
+        std::thread::yield_now();
+    }
+    assert!(removed);
+}
+
+#[test]
+fn anti_entropy_syncs_missed_event_without_live_publish() {
+    let identity_a = NodeIdentity::random();
+    let identity_b = NodeIdentity::random();
+    let membership = membership_with_roles(&[identity_a.node_id(), identity_b.node_id()]);
+    let mut node_a = make_node(identity_a, membership.clone());
+    let mut node_b = make_node(identity_b, membership);
+    let mut service_a = make_service();
+    let mut service_b = make_service();
+
+    connect_services(&mut service_a, &mut node_a, &mut service_b, &mut node_b);
+
+    let policy_hash = node_a
+        .policy_registry()
+        .binding_for("vp.schema_only.v1", json!({}))
+        .expect("policy binding")
+        .policy_hash;
+    let mut contract = sample_contract("task-anti-entropy", policy_hash);
+    contract.inputs = json!({"prompt":"catch me via anti entropy"});
+    node_a.submit_task(contract, 1, 100).expect("submit task");
+
+    let mut synced = false;
+    for _ in 0..4_096 {
+        let _ = service_b
+            .run_anti_entropy(&node_b)
+            .expect("run anti entropy");
+        let _ = pump_once(&mut service_b, &mut node_b);
+        let _ = pump_once(&mut service_a, &mut node_a);
+        let _ = pump_once(&mut service_b, &mut node_b);
+        let _ = pump_once(&mut service_a, &mut node_a);
+        if node_b
+            .task_view("task-anti-entropy")
+            .expect("task view")
+            .is_some()
+        {
+            synced = true;
+            break;
+        }
+        std::thread::yield_now();
+    }
+
+    assert!(synced);
+}
+
+#[test]
+fn anti_entropy_uses_scope_specific_cursor_for_recovery() {
+    let identity_a = NodeIdentity::random();
+    let identity_b = NodeIdentity::random();
+    let membership = membership_with_roles(&[identity_a.node_id(), identity_b.node_id()]);
+    let mut node_a = make_node(identity_a, membership.clone());
+    let mut node_b = make_node(identity_b, membership);
+    let mut service_a =
+        make_service_with_scopes(&[SwarmScope::Global, SwarmScope::Region("sol-1".to_owned())]);
+    let mut service_b =
+        make_service_with_scopes(&[SwarmScope::Global, SwarmScope::Region("sol-1".to_owned())]);
+
+    connect_services(&mut service_a, &mut node_a, &mut service_b, &mut node_b);
+
+    let policy_hash = node_a
+        .policy_registry()
+        .binding_for("vp.schema_only.v1", json!({}))
+        .expect("policy binding")
+        .policy_hash;
+    let mut region_contract = sample_contract("task-region-cursor", policy_hash.clone());
+    region_contract.task_type = "region:sol-1:cursor".to_owned();
+    region_contract.inputs = json!({"prompt":"recover region gap", "swarm_scope":"region:sol-1"});
+    node_a
+        .submit_task(region_contract, 1, 100)
+        .expect("submit region task");
+
+    let mut global_contract = sample_contract("task-global-local-head", policy_hash);
+    global_contract.inputs = json!({"prompt":"advance local head"});
+    node_b
+        .submit_task(global_contract, 1, 101)
+        .expect("submit local global task");
+
+    let mut recovered = false;
+    for _ in 0..4_096 {
+        let _ = service_b
+            .run_anti_entropy(&node_b)
+            .expect("run anti entropy");
+        let _ = pump_once(&mut service_b, &mut node_b);
+        let _ = pump_once(&mut service_a, &mut node_a);
+        let _ = pump_once(&mut service_b, &mut node_b);
+        let _ = pump_once(&mut service_a, &mut node_a);
+        if node_b
+            .task_view("task-region-cursor")
+            .expect("task view")
+            .is_some()
+        {
+            recovered = true;
+            break;
+        }
+        std::thread::yield_now();
+    }
+
+    assert!(recovered);
+}
+
+#[test]
+fn reconnect_recovers_missing_events_after_partition_like_disconnect() {
+    let identity_a = NodeIdentity::random();
+    let identity_b = NodeIdentity::random();
+    let membership = membership_with_roles(&[identity_a.node_id(), identity_b.node_id()]);
+    let mut node_a = make_node(identity_a, membership.clone());
+    let mut node_b = make_node(identity_b, membership);
+    let mut service_a = make_service();
+    let mut service_b = make_service();
+
+    connect_services(&mut service_a, &mut node_a, &mut service_b, &mut node_b);
+
+    let policy_hash = node_a
+        .policy_registry()
+        .binding_for("vp.schema_only.v1", json!({}))
+        .expect("policy binding")
+        .policy_hash;
+    let mut first_contract = sample_contract("task-partition-first", policy_hash.clone());
+    first_contract.inputs = json!({"prompt":"before disconnect"});
+    node_a
+        .submit_task(first_contract, 1, 100)
+        .expect("submit first task");
+
+    let mut last_published_seq = 0;
+    for _ in 0..4_096 {
+        last_published_seq = publish_pending_scoped_updates(
+            &mut service_a,
+            &node_a,
+            &node_a.node_id(),
+            last_published_seq,
+        )
+        .expect("publish first task");
+        let _ = pump_once(&mut service_a, &mut node_a);
+        let _ = pump_once(&mut service_b, &mut node_b);
+        if node_b
+            .task_view("task-partition-first")
+            .expect("task view")
+            .is_some()
+        {
+            break;
+        }
+        std::thread::yield_now();
+    }
+    assert!(
+        node_b
+            .task_view("task-partition-first")
+            .expect("task view first")
+            .is_some()
+    );
+
+    drop(service_b);
+
+    let mut second_contract = sample_contract("task-partition-second", policy_hash);
+    second_contract.inputs = json!({"prompt":"after reconnect"});
+    node_a
+        .submit_task(second_contract, 1, 101)
+        .expect("submit second task");
+
+    let mut service_b = make_service();
+    connect_services(&mut service_a, &mut node_a, &mut service_b, &mut node_b);
+
+    let mut recovered = false;
+    for _ in 0..4_096 {
+        let _ = pump_once(&mut service_a, &mut node_a);
+        let _ = pump_once(&mut service_b, &mut node_b);
+        if node_b
+            .task_view("task-partition-second")
+            .expect("task view second")
+            .is_some()
+        {
+            recovered = true;
+            break;
+        }
+        std::thread::yield_now();
+    }
+
+    assert!(recovered);
+}

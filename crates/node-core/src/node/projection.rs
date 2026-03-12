@@ -389,6 +389,63 @@ impl Node {
                     &payload.candidate_hash,
                 )?;
             }
+            EventPayload::EventRevoked(payload) => {
+                self.store.put_event_revocation(
+                    &payload.target_event_id,
+                    &payload.reason,
+                    &event.author_node_id,
+                    event.created_at,
+                )?;
+            }
+            EventPayload::SummaryRevoked(payload) => {
+                self.store.put_summary_revocation(
+                    &payload.target_summary_id,
+                    &payload.summary_kind,
+                    &payload.reason,
+                    &event.author_node_id,
+                    event.created_at,
+                )?;
+                self.store
+                    .revoke_imported_decision_memory_by_summary(&payload.target_summary_id)?;
+                self.store
+                    .revoke_imported_reputation_by_summary(&payload.target_summary_id)?;
+            }
+            EventPayload::NodePenalized(payload) => {
+                self.store.put_node_penalty(
+                    &payload.penalized_node_id,
+                    &payload.reason,
+                    payload.block_summaries,
+                    &event.author_node_id,
+                    event.created_at,
+                )?;
+                for event_id in &payload.revoked_event_ids {
+                    self.store.put_event_revocation(
+                        event_id,
+                        &payload.reason,
+                        &event.author_node_id,
+                        event.created_at,
+                    )?;
+                }
+                for summary_id in &payload.revoked_summary_ids {
+                    self.store.put_summary_revocation(
+                        summary_id,
+                        "penalty_cascade_v1",
+                        &payload.reason,
+                        &event.author_node_id,
+                        event.created_at,
+                    )?;
+                    self.store
+                        .revoke_imported_decision_memory_by_summary(summary_id)?;
+                    self.store
+                        .revoke_imported_reputation_by_summary(summary_id)?;
+                }
+                if payload.block_summaries {
+                    self.store
+                        .revoke_imported_decision_memory_by_source(&payload.penalized_node_id)?;
+                    self.store
+                        .revoke_imported_reputation_by_source(&payload.penalized_node_id)?;
+                }
+            }
         }
         if let Some(task_id) = event.task_id.as_deref() {
             if let Some((stage, cost)) = stage_cost_for_payload(&event.payload) {

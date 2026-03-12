@@ -8,11 +8,11 @@ use crate::network_p2p::{
     SummaryAnnouncement, SwarmScope,
 };
 use crate::node::Node;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::path::{Path, PathBuf};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::runtime::Runtime;
 
 const ENV_P2P_REGION_IDS: &str = "WATTSWARM_P2P_REGION_IDS";
@@ -21,6 +21,28 @@ const KNOWLEDGE_SUMMARY_KIND: &str = "knowledge_task_type_v1";
 const REPUTATION_SUMMARY_KIND: &str = "reputation_runtime_profile_v1";
 const SUMMARY_REPUTATION_LIMIT: usize = 64;
 const SUMMARY_DECISION_MEMORY_LIMIT: u32 = 16;
+const ANTI_ENTROPY_INTERVAL: Duration = Duration::from_secs(15);
+const BACKFILL_RETRY_AFTER: Duration = Duration::from_secs(5);
+const MAX_INFLIGHT_BACKFILLS_PER_PEER: usize = 1;
+const SUMMARY_BACKPRESSURE_HIGH_WATERMARK: u64 = 256;
+const IDLE_NETWORK_SLEEP: Duration = Duration::from_millis(50);
+
+#[derive(Debug, Clone)]
+struct PeerSyncState {
+    inflight_backfills: usize,
+    last_backfill_request_at: Option<Instant>,
+    next_retry_at: Instant,
+}
+
+impl PeerSyncState {
+    fn new(now: Instant) -> Self {
+        Self {
+            inflight_backfills: 0,
+            last_backfill_request_at: None,
+            next_retry_at: now,
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 struct KnowledgeSummaryBundle {
@@ -214,8 +236,11 @@ fn run_background_network_service(
             did_work = true;
             last_published_seq = new_last_published_seq;
         }
+        if service.run_anti_entropy(&node)? > 0 {
+            did_work = true;
+        }
         if !did_work {
-            thread::sleep(Duration::from_millis(50));
+            thread::sleep(IDLE_NETWORK_SLEEP);
         }
     }
 }
@@ -241,6 +266,9 @@ pub fn backfill_response_for_request(
         for (seq, event) in rows {
             from_event_seq = seq;
             next_from_event_seq = seq;
+            if !should_sync_event(node, &event)? {
+                continue;
+            }
             if event_scope(node, &event)? != request.scope {
                 continue;
             }
@@ -276,6 +304,23 @@ pub fn ingest_backfill_response(node: &mut Node, response: &BackfillResponse) ->
 
 const AUTO_PUBLISH_BATCH_LIMIT: usize = 64;
 const DISCOVERY_DIAL_RETRY_AFTER: Duration = Duration::from_secs(3);
+
+fn should_publish_summaries(head_seq: u64, from_event_seq: u64) -> bool {
+    head_seq.saturating_sub(from_event_seq) <= SUMMARY_BACKPRESSURE_HIGH_WATERMARK
+}
+
+fn latest_scoped_event_seq(node: &Node, scope: &SwarmScope) -> Result<u64> {
+    let mut latest = 0u64;
+    for (seq, event) in node.store.load_all_events()? {
+        if !should_sync_event(node, &event)? {
+            continue;
+        }
+        if event_scope(node, &event)? == *scope {
+            latest = seq;
+        }
+    }
+    Ok(latest)
+}
 
 fn parse_scope_hint_string(raw: &str) -> Option<SwarmScope> {
     let trimmed = raw.trim();
@@ -339,7 +384,10 @@ fn event_scope(node: &Node, event: &crate::types::Event) -> Result<SwarmScope> {
         | crate::types::EventPayload::CheckpointCreated(_)
         | crate::types::EventPayload::AdvisoryCreated(_)
         | crate::types::EventPayload::AdvisoryApproved(_)
-        | crate::types::EventPayload::AdvisoryApplied(_) => Ok(SwarmScope::Global),
+        | crate::types::EventPayload::AdvisoryApplied(_)
+        | crate::types::EventPayload::EventRevoked(_)
+        | crate::types::EventPayload::SummaryRevoked(_)
+        | crate::types::EventPayload::NodePenalized(_) => Ok(SwarmScope::Global),
         _ => {
             if let Some(task_id) = event.task_id.as_deref()
                 && let Some(task) = node.task_view(task_id)?
@@ -351,6 +399,34 @@ fn event_scope(node: &Node, event: &crate::types::Event) -> Result<SwarmScope> {
     }
 }
 
+fn should_sync_event(node: &Node, event: &crate::types::Event) -> Result<bool> {
+    if matches!(
+        event.payload,
+        crate::types::EventPayload::EventRevoked(_)
+            | crate::types::EventPayload::SummaryRevoked(_)
+            | crate::types::EventPayload::NodePenalized(_)
+    ) {
+        return Ok(true);
+    }
+    Ok(!node.store.is_event_revoked(&event.event_id)?)
+}
+
+fn build_summary_id(
+    source_node_id: &str,
+    scope: &SwarmScope,
+    summary_kind: &str,
+    payload: &serde_json::Value,
+) -> Result<String> {
+    Ok(crate::crypto::sha256_hex(&serde_json::to_vec(
+        &serde_json::json!({
+            "source_node_id": source_node_id,
+            "scope": scope,
+            "summary_kind": summary_kind,
+            "payload": payload,
+        }),
+    )?))
+}
+
 pub fn build_knowledge_summary_for_task_type(
     node: &Node,
     scope: &SwarmScope,
@@ -358,19 +434,23 @@ pub fn build_knowledge_summary_for_task_type(
 ) -> Result<Option<SummaryAnnouncement>> {
     let decisions = node
         .store
-        .list_decision_memory_hits_by_task_type(task_type, SUMMARY_DECISION_MEMORY_LIMIT)?;
+        .list_local_decision_memory_hits_by_task_type(task_type, SUMMARY_DECISION_MEMORY_LIMIT)?;
     if decisions.is_empty() {
         return Ok(None);
     }
+    let source_node_id = node.node_id();
+    let payload = serde_json::to_value(KnowledgeSummaryBundle {
+        source_node_id: source_node_id.clone(),
+        task_type: task_type.to_owned(),
+        decisions,
+    })?;
     Ok(Some(SummaryAnnouncement {
+        summary_id: build_summary_id(&source_node_id, scope, KNOWLEDGE_SUMMARY_KIND, &payload)?,
+        source_node_id,
         scope: scope.clone(),
         summary_kind: KNOWLEDGE_SUMMARY_KIND.to_owned(),
         artifact_path: None,
-        payload: serde_json::to_value(KnowledgeSummaryBundle {
-            source_node_id: node.node_id(),
-            task_type: task_type.to_owned(),
-            decisions,
-        })?,
+        payload,
     }))
 }
 
@@ -399,17 +479,29 @@ pub fn build_reputation_summary_for_runtime(
     runtime_id: &str,
     profile_id: &str,
 ) -> Result<Option<SummaryAnnouncement>> {
-    let Some(entry) = node.store.get_reputation_snapshot(runtime_id, profile_id)? else {
+    let Some(entry) = node
+        .store
+        .get_local_reputation_snapshot(runtime_id, profile_id)?
+    else {
         return Ok(None);
     };
+    let source_node_id = node.node_id();
+    let payload = serde_json::to_value(ReputationSummaryBundle {
+        source_node_id: source_node_id.clone(),
+        entries: vec![entry],
+    })?;
     Ok(Some(SummaryAnnouncement {
+        summary_id: build_summary_id(
+            &source_node_id,
+            &SwarmScope::Global,
+            REPUTATION_SUMMARY_KIND,
+            &payload,
+        )?,
+        source_node_id,
         scope: SwarmScope::Global,
         summary_kind: REPUTATION_SUMMARY_KIND.to_owned(),
         artifact_path: None,
-        payload: serde_json::to_value(ReputationSummaryBundle {
-            source_node_id: node.node_id(),
-            entries: vec![entry],
-        })?,
+        payload,
     }))
 }
 
@@ -428,39 +520,29 @@ fn reputation_summary_for_event(
 }
 
 pub fn apply_summary_announcement(node: &mut Node, summary: &SummaryAnnouncement) -> Result<()> {
+    if node.store.is_summary_revoked(&summary.summary_id)?
+        || node.store.is_node_penalized(&summary.source_node_id)?
+    {
+        return Ok(());
+    }
     match summary.summary_kind.as_str() {
         KNOWLEDGE_SUMMARY_KIND => {
             let payload: KnowledgeSummaryBundle = serde_json::from_value(summary.payload.clone())?;
             for decision in payload.decisions {
-                node.store.put_decision_memory(
-                    &decision.task_id,
-                    decision.epoch,
-                    &decision.final_commit_hash,
-                    decision.finalized_at,
-                    &decision.winning_candidate_hash,
-                    &decision.output_digest,
-                    &decision.result_summary,
-                    &decision.quorum_result,
-                    &decision.reason_codes,
-                    &decision.reason_details,
-                    &decision.policy_snapshot_digest,
-                    &decision.task_type,
-                    &decision.input_digest,
-                    &decision.output_schema_digest,
-                    &decision.policy_id,
-                    &decision.policy_params_digest,
+                node.store.put_imported_decision_memory(
+                    &summary.summary_id,
+                    &summary.source_node_id,
+                    &decision,
                 )?;
             }
         }
         REPUTATION_SUMMARY_KIND => {
             let payload: ReputationSummaryBundle = serde_json::from_value(summary.payload.clone())?;
             for entry in payload.entries {
-                node.store.put_reputation_snapshot(
-                    &entry.runtime_id,
-                    &entry.profile_id,
-                    entry.stability_reputation,
-                    entry.quality_reputation,
-                    entry.last_updated_at,
+                node.store.put_imported_reputation_snapshot(
+                    &summary.summary_id,
+                    &summary.source_node_id,
+                    &entry,
                 )?;
             }
         }
@@ -479,8 +561,14 @@ pub fn publish_pending_scoped_updates(
         .store
         .load_events_page(from_event_seq, AUTO_PUBLISH_BATCH_LIMIT)?;
     let mut last_published_seq = from_event_seq;
+    let local_node_penalized = node.store.is_node_penalized(local_node_id)?;
+    let publish_summaries = should_publish_summaries(node.head_seq()?, from_event_seq);
     for (seq, event) in rows {
         if event.author_node_id != local_node_id {
+            last_published_seq = seq;
+            continue;
+        }
+        if !should_sync_event(node, &event)? {
             last_published_seq = seq;
             continue;
         }
@@ -490,10 +578,16 @@ pub fn publish_pending_scoped_updates(
             Err(err) if err.to_string().contains("NoPeersSubscribedToTopic") => break,
             Err(err) => return Err(err),
         }
-        if let Some(summary) = knowledge_summary_for_event(node, &event, &scope)? {
+        if publish_summaries
+            && !local_node_penalized
+            && let Some(summary) = knowledge_summary_for_event(node, &event, &scope)?
+        {
             let _ = service.publish_summary(summary);
         }
-        if let Some(summary) = reputation_summary_for_event(node, &event)? {
+        if publish_summaries
+            && !local_node_penalized
+            && let Some(summary) = reputation_summary_for_event(node, &event)?
+        {
             let _ = service.publish_summary(summary);
         }
     }
@@ -557,6 +651,9 @@ pub enum NetworkBridgeTick {
     Connected {
         peer: PeerId,
     },
+    Disconnected {
+        peer: PeerId,
+    },
     EventIngested {
         peer: PeerId,
         event_id: String,
@@ -589,6 +686,8 @@ pub struct NetworkBridgeService {
     runtime: NetworkRuntime,
     tokio_runtime: Runtime,
     subscribed_scopes: Vec<SwarmScope>,
+    peer_sync_state: HashMap<PeerId, PeerSyncState>,
+    connected_peers: HashSet<PeerId>,
 }
 
 impl NetworkBridgeService {
@@ -614,6 +713,8 @@ impl NetworkBridgeService {
             runtime,
             tokio_runtime,
             subscribed_scopes,
+            peer_sync_state: HashMap::new(),
+            connected_peers: HashSet::new(),
         })
     }
 
@@ -685,8 +786,19 @@ impl NetworkBridgeService {
         self.handle_runtime_event(node, event)
     }
 
-    fn request_backfill_for_peer(&mut self, peer: &PeerId, from_event_seq: u64) -> Result<()> {
+    fn request_backfill_for_peer(&mut self, peer: &PeerId, node: &Node) -> Result<bool> {
+        let now = Instant::now();
+        let state = self
+            .peer_sync_state
+            .entry(*peer)
+            .or_insert_with(|| PeerSyncState::new(now));
+        if state.inflight_backfills >= MAX_INFLIGHT_BACKFILLS_PER_PEER || state.next_retry_at > now
+        {
+            return Ok(false);
+        }
+        let mut requests_sent = 0usize;
         for scope in self.subscribed_scopes.clone() {
+            let from_event_seq = latest_scoped_event_seq(node, &scope)?;
             let _guard = self.tokio_runtime.enter();
             let _ = self.runtime.send_backfill_request(
                 peer,
@@ -696,8 +808,63 @@ impl NetworkBridgeService {
                     limit: BACKFILL_BATCH_EVENTS,
                 },
             )?;
+            requests_sent += 1;
         }
-        Ok(())
+        state.inflight_backfills += requests_sent;
+        state.last_backfill_request_at = Some(now);
+        state.next_retry_at = now + BACKFILL_RETRY_AFTER;
+        Ok(requests_sent > 0)
+    }
+
+    pub fn run_anti_entropy(&mut self, node: &Node) -> Result<usize> {
+        let now = Instant::now();
+        let mut requested = 0usize;
+        let peers = self.connected_peers.iter().copied().collect::<Vec<_>>();
+        for peer in peers {
+            let should_request = match self.peer_sync_state.get(&peer) {
+                Some(state) => {
+                    state.inflight_backfills < MAX_INFLIGHT_BACKFILLS_PER_PEER
+                        && state.next_retry_at <= now
+                        && state.last_backfill_request_at.map_or(true, |last| {
+                            now.duration_since(last) >= ANTI_ENTROPY_INTERVAL
+                        })
+                }
+                None => true,
+            };
+            if !should_request {
+                continue;
+            }
+            if self.request_backfill_for_peer(&peer, node)? {
+                requested += 1;
+            }
+        }
+        Ok(requested)
+    }
+
+    fn mark_peer_connected(&mut self, peer: PeerId) {
+        self.connected_peers.insert(peer);
+        self.peer_sync_state
+            .entry(peer)
+            .or_insert_with(|| PeerSyncState::new(Instant::now()));
+    }
+
+    fn mark_peer_disconnected(&mut self, peer: PeerId) {
+        self.connected_peers.remove(&peer);
+        self.peer_sync_state.remove(&peer);
+    }
+
+    fn mark_backfill_completed(&mut self, peer: PeerId) {
+        if let Some(state) = self.peer_sync_state.get_mut(&peer) {
+            state.inflight_backfills = state.inflight_backfills.saturating_sub(1);
+            state.next_retry_at = Instant::now() + ANTI_ENTROPY_INTERVAL;
+        }
+    }
+
+    fn mark_backfill_failed(&mut self, peer: PeerId) {
+        if let Some(state) = self.peer_sync_state.get_mut(&peer) {
+            state.inflight_backfills = state.inflight_backfills.saturating_sub(1);
+            state.next_retry_at = Instant::now() + BACKFILL_RETRY_AFTER;
+        }
     }
 
     pub fn try_tick(&mut self, node: &mut Node) -> Result<Option<NetworkBridgeTick>> {
@@ -729,23 +896,27 @@ impl NetworkBridgeService {
                 Ok(NetworkBridgeTick::Listening { address })
             }
             NetworkRuntimeEvent::ConnectionEstablished { peer } => {
-                let from_event_seq = node.head_seq()?;
-                self.request_backfill_for_peer(&peer, from_event_seq)?;
-                for entry in node
-                    .store
-                    .list_reputation_snapshots(SUMMARY_REPUTATION_LIMIT)?
-                {
-                    let _ = self.publish_summary(SummaryAnnouncement {
-                        scope: SwarmScope::Global,
-                        summary_kind: REPUTATION_SUMMARY_KIND.to_owned(),
-                        artifact_path: None,
-                        payload: serde_json::to_value(ReputationSummaryBundle {
-                            source_node_id: node.node_id(),
-                            entries: vec![entry],
-                        })?,
-                    });
+                self.mark_peer_connected(peer);
+                let _ = self.request_backfill_for_peer(&peer, node)?;
+                if !node.store.is_node_penalized(&node.node_id())? {
+                    for entry in node
+                        .store
+                        .list_local_reputation_snapshots(SUMMARY_REPUTATION_LIMIT)?
+                    {
+                        if let Some(summary) = build_reputation_summary_for_runtime(
+                            node,
+                            &entry.runtime_id,
+                            &entry.profile_id,
+                        )? {
+                            let _ = self.publish_summary(summary);
+                        }
+                    }
                 }
                 Ok(NetworkBridgeTick::Connected { peer })
+            }
+            NetworkRuntimeEvent::ConnectionClosed { peer } => {
+                self.mark_peer_disconnected(peer);
+                Ok(NetworkBridgeTick::Disconnected { peer })
             }
             NetworkRuntimeEvent::Gossip {
                 propagation_source,
@@ -792,20 +963,26 @@ impl NetworkBridgeService {
                 peer,
                 request_id,
                 response,
-            } => Ok(NetworkBridgeTick::BackfillApplied {
-                peer,
-                request_id,
-                events: ingest_backfill_response(node, &response)?,
-            }),
+            } => {
+                self.mark_backfill_completed(peer);
+                Ok(NetworkBridgeTick::BackfillApplied {
+                    peer,
+                    request_id,
+                    events: ingest_backfill_response(node, &response)?,
+                })
+            }
             NetworkRuntimeEvent::BackfillOutboundFailure {
                 peer,
                 request_id,
                 error,
-            } => Ok(NetworkBridgeTick::BackfillFailed {
-                peer,
-                request_id,
-                error,
-            }),
+            } => {
+                self.mark_backfill_failed(peer);
+                Ok(NetworkBridgeTick::BackfillFailed {
+                    peer,
+                    request_id,
+                    error,
+                })
+            }
             NetworkRuntimeEvent::BackfillInboundFailure { peer, error } => {
                 Err(anyhow!("backfill inbound failure from {peer}: {error}"))
             }
@@ -1084,12 +1261,26 @@ mod tests {
     }
 
     #[test]
+    fn summary_publish_is_suppressed_when_backlog_is_high() {
+        assert!(should_publish_summaries(
+            SUMMARY_BACKPRESSURE_HIGH_WATERMARK,
+            0
+        ));
+        assert!(!should_publish_summaries(
+            SUMMARY_BACKPRESSURE_HIGH_WATERMARK + 1,
+            0
+        ));
+    }
+
+    #[test]
     fn apply_summary_announcement_imports_knowledge_and_reputation() {
         let mut node = Node::open_in_memory_with_roles(&[Role::Proposer]).expect("node");
 
         apply_summary_announcement(
             &mut node,
             &SummaryAnnouncement {
+                summary_id: "summary-knowledge-1".to_owned(),
+                source_node_id: "node-a".to_owned(),
                 scope: SwarmScope::Region("sol-1".to_owned()),
                 summary_kind: KNOWLEDGE_SUMMARY_KIND.to_owned(),
                 artifact_path: None,
@@ -1125,6 +1316,8 @@ mod tests {
         apply_summary_announcement(
             &mut node,
             &SummaryAnnouncement {
+                summary_id: "summary-reputation-1".to_owned(),
+                source_node_id: "node-a".to_owned(),
                 scope: SwarmScope::Global,
                 summary_kind: REPUTATION_SUMMARY_KIND.to_owned(),
                 artifact_path: None,
@@ -1157,6 +1350,187 @@ mod tests {
             .expect("reputation row");
         assert_eq!(reputation.stability_reputation, 10);
         assert_eq!(reputation.quality_reputation, 20);
+    }
+
+    #[test]
+    fn summary_revocation_and_penalty_remove_imported_state() {
+        let mut node =
+            Node::open_in_memory_with_roles(&[Role::Proposer, Role::Finalizer]).expect("node");
+
+        apply_summary_announcement(
+            &mut node,
+            &SummaryAnnouncement {
+                summary_id: "summary-knowledge-2".to_owned(),
+                source_node_id: "node-bad".to_owned(),
+                scope: SwarmScope::Global,
+                summary_kind: KNOWLEDGE_SUMMARY_KIND.to_owned(),
+                artifact_path: None,
+                payload: serde_json::to_value(KnowledgeSummaryBundle {
+                    source_node_id: "node-bad".to_owned(),
+                    task_type: "revoked-type".to_owned(),
+                    decisions: vec![crate::storage::DecisionMemoryHitRow {
+                        task_id: "task-revoked-summary".to_owned(),
+                        epoch: 1,
+                        final_commit_hash: "commit-revoked".to_owned(),
+                        winning_candidate_hash: "candidate-revoked".to_owned(),
+                        output_digest: "output-revoked".to_owned(),
+                        result_summary: json!({"answer":"bad summary"}),
+                        quorum_result: json!({"quorum":"ok"}),
+                        reason_codes: vec![100],
+                        reason_details: json!({"detail":"bad"}),
+                        policy_snapshot_digest: "policy-snap".to_owned(),
+                        input_digest: "input-digest".to_owned(),
+                        output_schema_digest: "schema-digest".to_owned(),
+                        policy_id: "vp.schema_only.v1".to_owned(),
+                        task_type: "revoked-type".to_owned(),
+                        policy_params_digest: "params-digest".to_owned(),
+                        deprecated_as_exact: false,
+                        finalized_at: 100,
+                        confidence_hint: 0.5,
+                    }],
+                })
+                .expect("knowledge payload"),
+            },
+        )
+        .expect("apply knowledge summary");
+        apply_summary_announcement(
+            &mut node,
+            &SummaryAnnouncement {
+                summary_id: "summary-reputation-2".to_owned(),
+                source_node_id: "node-bad".to_owned(),
+                scope: SwarmScope::Global,
+                summary_kind: REPUTATION_SUMMARY_KIND.to_owned(),
+                artifact_path: None,
+                payload: serde_json::to_value(ReputationSummaryBundle {
+                    source_node_id: "node-bad".to_owned(),
+                    entries: vec![crate::storage::ReputationSnapshotRow {
+                        runtime_id: "runtime-bad".to_owned(),
+                        profile_id: "model-bad".to_owned(),
+                        stability_reputation: 999,
+                        quality_reputation: 888,
+                        last_updated_at: 101,
+                    }],
+                })
+                .expect("reputation payload"),
+            },
+        )
+        .expect("apply reputation summary");
+
+        assert_eq!(
+            node.store
+                .list_decision_memory_hits_by_task_type("revoked-type", 8)
+                .expect("list decisions")
+                .len(),
+            1
+        );
+        assert!(
+            node.store
+                .get_reputation_snapshot("runtime-bad", "model-bad")
+                .expect("get reputation")
+                .is_some()
+        );
+
+        node.revoke_summary(
+            "summary-knowledge-2",
+            KNOWLEDGE_SUMMARY_KIND,
+            "bad knowledge",
+            1,
+            200,
+        )
+        .expect("revoke summary");
+        assert!(
+            node.store
+                .list_decision_memory_hits_by_task_type("revoked-type", 8)
+                .expect("list decisions after revoke")
+                .is_empty()
+        );
+
+        node.penalize_node(
+            "node-bad",
+            "malicious source",
+            Vec::new(),
+            Vec::new(),
+            1,
+            201,
+        )
+        .expect("penalize node");
+        assert!(
+            node.store
+                .get_reputation_snapshot("runtime-bad", "model-bad")
+                .expect("get reputation after penalty")
+                .is_none()
+        );
+
+        apply_summary_announcement(
+            &mut node,
+            &SummaryAnnouncement {
+                summary_id: "summary-knowledge-3".to_owned(),
+                source_node_id: "node-bad".to_owned(),
+                scope: SwarmScope::Global,
+                summary_kind: KNOWLEDGE_SUMMARY_KIND.to_owned(),
+                artifact_path: None,
+                payload: serde_json::to_value(KnowledgeSummaryBundle {
+                    source_node_id: "node-bad".to_owned(),
+                    task_type: "revoked-type".to_owned(),
+                    decisions: vec![crate::storage::DecisionMemoryHitRow {
+                        task_id: "task-revoked-summary-2".to_owned(),
+                        epoch: 1,
+                        final_commit_hash: "commit-revoked-2".to_owned(),
+                        winning_candidate_hash: "candidate-revoked-2".to_owned(),
+                        output_digest: "output-revoked-2".to_owned(),
+                        result_summary: json!({"answer":"should be ignored"}),
+                        quorum_result: json!({"quorum":"ok"}),
+                        reason_codes: vec![100],
+                        reason_details: json!({"detail":"ignored"}),
+                        policy_snapshot_digest: "policy-snap".to_owned(),
+                        input_digest: "input-digest".to_owned(),
+                        output_schema_digest: "schema-digest".to_owned(),
+                        policy_id: "vp.schema_only.v1".to_owned(),
+                        task_type: "revoked-type".to_owned(),
+                        policy_params_digest: "params-digest".to_owned(),
+                        deprecated_as_exact: false,
+                        finalized_at: 102,
+                        confidence_hint: 0.5,
+                    }],
+                })
+                .expect("knowledge payload"),
+            },
+        )
+        .expect("apply blocked summary");
+        assert!(
+            node.store
+                .list_decision_memory_hits_by_task_type("revoked-type", 8)
+                .expect("list decisions after penalty")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn revoked_event_rebuild_removes_previous_projection_state() {
+        let mut node =
+            Node::open_in_memory_with_roles(&[Role::Proposer, Role::Finalizer]).expect("node");
+        let policy_hash = node
+            .policy_registry()
+            .binding_for("vp.schema_only.v1", json!({}))
+            .expect("policy binding")
+            .policy_hash;
+        let mut contract = sample_contract("task-revoked-event", policy_hash);
+        contract.inputs = json!({"prompt":"revoke me"});
+        let created = node.submit_task(contract, 1, 100).expect("submit task");
+        assert!(
+            node.task_view("task-revoked-event")
+                .expect("task view")
+                .is_some()
+        );
+
+        node.revoke_event(&created.event_id, "malicious task", 1, 101)
+            .expect("revoke event");
+
+        assert!(
+            node.task_view("task-revoked-event")
+                .expect("task view after revoke")
+                .is_none()
+        );
     }
 
     #[test]

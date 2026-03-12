@@ -1,6 +1,7 @@
 use wattswarm_protocol::types::{
-    BudgetMode, CheckpointCreatedPayload, EventKind, EventPayload, Membership, PolicyBinding, Role,
-    TaskContract, TaskExpiredPayload, TaskMode, UnsignedEvent,
+    BudgetMode, CheckpointCreatedPayload, EventKind, EventPayload, EventRevokedPayload, Membership,
+    NodePenalizedPayload, PolicyBinding, Role, SummaryRevokedPayload, TaskContract,
+    TaskExpiredPayload, TaskMode, UnsignedEvent,
 };
 
 #[test]
@@ -33,6 +34,31 @@ fn event_payload_kind_and_task_id_cover_task_and_non_task_variants() {
     });
     assert_eq!(non_task_payload.kind(), EventKind::CheckpointCreated);
     assert_eq!(non_task_payload.task_id(), None);
+
+    let revoked_event_payload = EventPayload::EventRevoked(EventRevokedPayload {
+        target_event_id: "event-1".to_owned(),
+        reason: "bad event".to_owned(),
+    });
+    assert_eq!(revoked_event_payload.kind(), EventKind::EventRevoked);
+    assert_eq!(revoked_event_payload.task_id(), None);
+
+    let revoked_summary_payload = EventPayload::SummaryRevoked(SummaryRevokedPayload {
+        target_summary_id: "summary-1".to_owned(),
+        summary_kind: "knowledge_task_type_v1".to_owned(),
+        reason: "bad summary".to_owned(),
+    });
+    assert_eq!(revoked_summary_payload.kind(), EventKind::SummaryRevoked);
+    assert_eq!(revoked_summary_payload.task_id(), None);
+
+    let penalized_payload = EventPayload::NodePenalized(NodePenalizedPayload {
+        penalized_node_id: "node-bad".to_owned(),
+        reason: "malicious".to_owned(),
+        revoked_event_ids: vec!["event-1".to_owned()],
+        revoked_summary_ids: vec!["summary-1".to_owned()],
+        block_summaries: true,
+    });
+    assert_eq!(penalized_payload.kind(), EventKind::NodePenalized);
+    assert_eq!(penalized_payload.task_id(), None);
 }
 
 #[test]

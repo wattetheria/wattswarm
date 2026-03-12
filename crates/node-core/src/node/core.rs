@@ -76,7 +76,11 @@ impl Node {
             }
             return Err(err.context("append event"));
         }
-        self.apply_to_projection(&event)?;
+        if event_requires_projection_rebuild(&event.payload) {
+            self.replay_rebuild_projection()?;
+        } else {
+            self.apply_to_projection(&event)?;
+        }
         Ok(())
     }
 
@@ -89,11 +93,15 @@ impl Node {
     }
 
     pub fn replay_rebuild_projection(&mut self) -> Result<()> {
+        let events = self.store.load_all_events()?;
+        let revoked_event_ids = collect_revoked_event_ids(&events);
         self.store.clear_projection()?;
         self.store
             .put_membership(&serde_json::to_string(&self.genesis_membership)?)?;
-        let events = self.store.load_all_events()?;
         for (_, event) in events {
+            if !should_apply_event_during_replay(&event, &revoked_event_ids) {
+                continue;
+            }
             self.apply_to_projection(&event)?;
         }
         Ok(())
@@ -509,6 +517,64 @@ impl Node {
         )
     }
 
+    pub fn revoke_event(
+        &mut self,
+        target_event_id: &str,
+        reason: &str,
+        epoch: u64,
+        created_at: u64,
+    ) -> Result<Event> {
+        self.emit_at(
+            epoch,
+            EventPayload::EventRevoked(crate::types::EventRevokedPayload {
+                target_event_id: target_event_id.to_owned(),
+                reason: reason.to_owned(),
+            }),
+            created_at,
+        )
+    }
+
+    pub fn revoke_summary(
+        &mut self,
+        target_summary_id: &str,
+        summary_kind: &str,
+        reason: &str,
+        epoch: u64,
+        created_at: u64,
+    ) -> Result<Event> {
+        self.emit_at(
+            epoch,
+            EventPayload::SummaryRevoked(crate::types::SummaryRevokedPayload {
+                target_summary_id: target_summary_id.to_owned(),
+                summary_kind: summary_kind.to_owned(),
+                reason: reason.to_owned(),
+            }),
+            created_at,
+        )
+    }
+
+    pub fn penalize_node(
+        &mut self,
+        penalized_node_id: &str,
+        reason: &str,
+        revoked_event_ids: Vec<String>,
+        revoked_summary_ids: Vec<String>,
+        epoch: u64,
+        created_at: u64,
+    ) -> Result<Event> {
+        self.emit_at(
+            epoch,
+            EventPayload::NodePenalized(crate::types::NodePenalizedPayload {
+                penalized_node_id: penalized_node_id.to_owned(),
+                reason: reason.to_owned(),
+                revoked_event_ids,
+                revoked_summary_ids,
+                block_summaries: true,
+            }),
+            created_at,
+        )
+    }
+
     pub fn reconcile_timeouts(&mut self, epoch: u64, now: u64) -> Result<Vec<Event>> {
         self.apply_due_implicit_settlements(now)?;
         let task_ids = self.store.list_open_task_ids()?;
@@ -874,5 +940,38 @@ impl Node {
                 Err(err)
             }
         }
+    }
+}
+
+fn event_requires_projection_rebuild(payload: &EventPayload) -> bool {
+    match payload {
+        EventPayload::EventRevoked(_) => true,
+        EventPayload::NodePenalized(payload) => !payload.revoked_event_ids.is_empty(),
+        _ => false,
+    }
+}
+
+fn collect_revoked_event_ids(events: &[(u64, Event)]) -> HashSet<String> {
+    let mut revoked = HashSet::new();
+    for (_, event) in events {
+        match &event.payload {
+            EventPayload::EventRevoked(payload) => {
+                revoked.insert(payload.target_event_id.clone());
+            }
+            EventPayload::NodePenalized(payload) => {
+                revoked.extend(payload.revoked_event_ids.iter().cloned());
+            }
+            _ => {}
+        }
+    }
+    revoked
+}
+
+fn should_apply_event_during_replay(event: &Event, revoked_event_ids: &HashSet<String>) -> bool {
+    match &event.payload {
+        EventPayload::EventRevoked(_)
+        | EventPayload::SummaryRevoked(_)
+        | EventPayload::NodePenalized(_) => true,
+        _ => !revoked_event_ids.contains(&event.event_id),
     }
 }

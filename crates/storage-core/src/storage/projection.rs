@@ -1208,6 +1208,91 @@ impl PgStore {
         Ok(())
     }
 
+    pub fn put_imported_decision_memory(
+        &self,
+        summary_id: &str,
+        source_node_id: &str,
+        decision: &DecisionMemoryHitRow,
+    ) -> Result<()> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
+        conn.execute(
+            "INSERT INTO imported_decision_memory(summary_id, source_node_id, task_id, epoch, final_commit_hash, finalized_at,
+                                                  winning_candidate_hash, output_digest, result_summary, quorum_result_json,
+                                                  reason_codes_json, reason_details, policy_snapshot_digest, task_type,
+                                                  input_digest, output_schema_digest, policy_id, policy_params_digest,
+                                                  deprecated_as_exact, revoked)
+             VALUES ($1, $2, $3, $4, $5, TIMESTAMPTZ 'epoch' + ($6::bigint * INTERVAL '1 millisecond'),
+                     $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, FALSE)
+             ON CONFLICT(summary_id, task_id, epoch) DO UPDATE SET
+               source_node_id = excluded.source_node_id,
+               final_commit_hash = excluded.final_commit_hash,
+               finalized_at = excluded.finalized_at,
+               winning_candidate_hash = excluded.winning_candidate_hash,
+               output_digest = excluded.output_digest,
+               result_summary = excluded.result_summary,
+               quorum_result_json = excluded.quorum_result_json,
+               reason_codes_json = excluded.reason_codes_json,
+               reason_details = excluded.reason_details,
+               policy_snapshot_digest = excluded.policy_snapshot_digest,
+               task_type = excluded.task_type,
+               input_digest = excluded.input_digest,
+               output_schema_digest = excluded.output_schema_digest,
+               policy_id = excluded.policy_id,
+               policy_params_digest = excluded.policy_params_digest,
+               deprecated_as_exact = excluded.deprecated_as_exact,
+               revoked = FALSE",
+            params![
+                summary_id,
+                source_node_id,
+                decision.task_id,
+                decision.epoch as i64,
+                decision.final_commit_hash,
+                decision.finalized_at as i64,
+                decision.winning_candidate_hash,
+                decision.output_digest,
+                serde_json::to_string(&decision.result_summary)?,
+                serde_json::to_string(&decision.quorum_result)?,
+                serde_json::to_string(&decision.reason_codes)?,
+                serde_json::to_string(&decision.reason_details)?,
+                decision.policy_snapshot_digest,
+                decision.task_type,
+                decision.input_digest,
+                decision.output_schema_digest,
+                decision.policy_id,
+                decision.policy_params_digest,
+                decision.deprecated_as_exact,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn revoke_imported_decision_memory_by_summary(&self, summary_id: &str) -> Result<()> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
+        conn.execute(
+            "UPDATE imported_decision_memory SET revoked = TRUE WHERE summary_id = $1",
+            params![summary_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn revoke_imported_decision_memory_by_source(&self, source_node_id: &str) -> Result<()> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
+        conn.execute(
+            "UPDATE imported_decision_memory SET revoked = TRUE WHERE source_node_id = $1",
+            params![source_node_id],
+        )?;
+        Ok(())
+    }
+
     pub fn has_decision_by_final_commit_hash(&self, final_commit_hash: &str) -> Result<bool> {
         let conn = self
             .conn
@@ -1242,7 +1327,7 @@ impl PgStore {
         Ok(exists != 0)
     }
 
-    pub fn list_decision_memory_hits_by_task_type(
+    pub fn list_local_decision_memory_hits_by_task_type(
         &self,
         task_type: &str,
         limit: u32,
@@ -1260,43 +1345,104 @@ impl PgStore {
              FROM decision_memory
              WHERE task_type = $1
                AND winning_candidate_hash <> ''
+               AND NOT EXISTS (
+                    SELECT 1 FROM event_revocations revoked
+                    WHERE revoked.event_id = decision_memory.final_commit_hash
+               )
+             ORDER BY finalized_at DESC
+             LIMIT $2",
+        )?;
+        let rows = stmt.query_map(params![task_type, limit as i64], parse_decision_memory_row)?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
+    pub fn list_decision_memory_hits_by_task_type(
+        &self,
+        task_type: &str,
+        limit: u32,
+    ) -> Result<Vec<DecisionMemoryHitRow>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
+        let mut stmt = conn.prepare(
+            "SELECT task_id, epoch, final_commit_hash, winning_candidate_hash, output_digest, result_summary,
+                    quorum_result_json, reason_codes_json, reason_details, policy_snapshot_digest,
+                    input_digest, output_schema_digest, policy_id, task_type,
+                    policy_params_digest, deprecated_as_exact,
+                    (EXTRACT(EPOCH FROM finalized_at) * 1000)::BIGINT AS finalized_at
+             FROM (
+                SELECT task_id, epoch, final_commit_hash, winning_candidate_hash, output_digest, result_summary,
+                       quorum_result_json, reason_codes_json, reason_details, policy_snapshot_digest,
+                       input_digest, output_schema_digest, policy_id, task_type,
+                       policy_params_digest, deprecated_as_exact, finalized_at
+                  FROM decision_memory local_dm
+                 WHERE task_type = $1
+                   AND winning_candidate_hash <> ''
+                   AND NOT EXISTS (
+                        SELECT 1 FROM event_revocations revoked
+                        WHERE revoked.event_id = local_dm.final_commit_hash
+                   )
+                UNION ALL
+                SELECT task_id, epoch, final_commit_hash, winning_candidate_hash, output_digest, result_summary,
+                       quorum_result_json, reason_codes_json, reason_details, policy_snapshot_digest,
+                       input_digest, output_schema_digest, policy_id, task_type,
+                       policy_params_digest, deprecated_as_exact, finalized_at
+                  FROM imported_decision_memory imported_dm
+                 WHERE task_type = $1
+                   AND winning_candidate_hash <> ''
+                   AND revoked = FALSE
+                   AND NOT EXISTS (
+                        SELECT 1 FROM summary_revocations revoked_summary
+                        WHERE revoked_summary.summary_id = imported_dm.summary_id
+                   )
+                   AND NOT EXISTS (
+                        SELECT 1 FROM penalized_nodes penalized
+                        WHERE penalized.node_id = imported_dm.source_node_id
+                          AND penalized.block_summaries = TRUE
+                   )
+             ) merged
              ORDER BY finalized_at DESC
              LIMIT $2",
         )?;
         let rows = stmt.query_map(params![task_type, limit as i64], |r| {
-            let summary_raw: String = r.get(5)?;
-            let summary =
-                serde_json::from_str(&summary_raw).unwrap_or_else(|_| serde_json::json!({}));
-            let quorum_result_raw: String = r.get(6)?;
-            let quorum_result =
-                serde_json::from_str(&quorum_result_raw).unwrap_or_else(|_| serde_json::json!({}));
-            let reason_codes_raw: String = r.get(7)?;
-            let reason_codes = serde_json::from_str(&reason_codes_raw).unwrap_or_default();
-            let reason_details_raw: String = r.get(8)?;
-            let reason_details =
-                serde_json::from_str(&reason_details_raw).unwrap_or_else(|_| serde_json::json!({}));
-            Ok(DecisionMemoryHitRow {
-                task_id: r.get(0)?,
-                epoch: r.get::<_, i64>(1)? as u64,
-                final_commit_hash: r.get(2)?,
-                winning_candidate_hash: r.get(3)?,
-                output_digest: r.get(4)?,
-                result_summary: summary,
-                quorum_result,
-                reason_codes,
-                reason_details,
-                policy_snapshot_digest: r.get(9)?,
-                input_digest: r.get(10)?,
-                output_schema_digest: r.get(11)?,
-                policy_id: r.get(12)?,
-                task_type: r.get(13)?,
-                policy_params_digest: r.get(14)?,
-                deprecated_as_exact: r.get::<_, bool>(15)?,
-                finalized_at: r.get::<_, i64>(16)? as u64,
-                confidence_hint: 0.5,
-            })
+            parse_decision_memory_row(r)
         })?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
             .map_err(Into::into)
     }
+}
+
+fn parse_decision_memory_row(r: &pg::Row) -> std::result::Result<DecisionMemoryHitRow, pg::Error> {
+    let summary_raw: String = r.get(5)?;
+    let summary = serde_json::from_str(&summary_raw).unwrap_or_else(|_| serde_json::json!({}));
+    let quorum_result_raw: String = r.get(6)?;
+    let quorum_result =
+        serde_json::from_str(&quorum_result_raw).unwrap_or_else(|_| serde_json::json!({}));
+    let reason_codes_raw: String = r.get(7)?;
+    let reason_codes = serde_json::from_str(&reason_codes_raw).unwrap_or_default();
+    let reason_details_raw: String = r.get(8)?;
+    let reason_details =
+        serde_json::from_str(&reason_details_raw).unwrap_or_else(|_| serde_json::json!({}));
+    Ok(DecisionMemoryHitRow {
+        task_id: r.get(0)?,
+        epoch: r.get::<_, i64>(1)? as u64,
+        final_commit_hash: r.get(2)?,
+        winning_candidate_hash: r.get(3)?,
+        output_digest: r.get(4)?,
+        result_summary: summary,
+        quorum_result,
+        reason_codes,
+        reason_details,
+        policy_snapshot_digest: r.get(9)?,
+        input_digest: r.get(10)?,
+        output_schema_digest: r.get(11)?,
+        policy_id: r.get(12)?,
+        task_type: r.get(13)?,
+        policy_params_digest: r.get(14)?,
+        deprecated_as_exact: r.get::<_, bool>(15)?,
+        finalized_at: r.get::<_, i64>(16)? as u64,
+        confidence_hint: 0.5,
+    })
 }

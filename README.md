@@ -97,8 +97,11 @@ The workspace now includes dedicated crates and a control-plane bridge for node-
   - serves scope-aware backfill requests from the local event log
   - applies backfill responses into the local node projection pipeline
   - auto-requests backfill for every configured scope when a peer connection is established
+  - runs periodic anti-entropy backfill on connected peers so missed messages and post-partition gaps are re-requested without requiring a reconnect
   - auto-publishes locally authored events into `global / region / local` topics based on task scope hints
   - auto-publishes knowledge summaries on finalized decisions and reputation summaries on verifier updates
+  - propagates append-only revoke/penalty events so malicious event effects can be rolled back without deleting the event log
+  - suppresses summary fanout while local publish backlog is high, keeping event catch-up ahead of summary traffic
   - can dial peer listen addresses discovered through LAN state (`discovered_peers.json`)
 - `crates/artifact-store`
   - owns the node-local filesystem layout for evidence, checkpoints, snapshots, and event batches
@@ -111,6 +114,8 @@ Current coverage in tests:
 - unit tests for bridge ingest and backfill helpers
 - integration tests for two-node global gossip sync and request-response backfill sync
 - integration tests for region/local scoped sync and summary import
+- integration tests for event revoke rollback and summary revoke cleanup across nodes
+- integration tests for periodic anti-entropy catch-up and reconnect recovery after a partition-like disconnect
 
 Runtime toggles:
 
@@ -128,6 +133,12 @@ Task scope hints:
 - set `inputs.swarm_scope = "region:<id>"` or `inputs.swarm_scope = "local:<id>"` to route a task into region/local sync
 - object form is also accepted: `{"kind":"region","id":"sol-1"}`
 - `task_type` prefixes `region:<id>:` and `local:<id>:` are supported as a fallback
+
+Malicious data rollback model:
+
+- event log stays append-only; bad data is invalidated with `EventRevoked`, `SummaryRevoked`, and `NodePenalized`
+- projection rebuild skips revoked events, so rollback does not require deleting history
+- imported knowledge/reputation summaries are stored separately from local projections and can be revoked or quarantined by source node
 
 ## CLI
 

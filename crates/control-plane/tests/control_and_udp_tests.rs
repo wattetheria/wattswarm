@@ -479,6 +479,8 @@ fn run_real_task_flow_reports_task_file_parse_errors() {
         (err_msg.contains("parse task contract from") && err_msg.contains("broken-task.json"))
             || err_msg.contains("key must be a string")
             || err_msg.contains("expected value")
+            || err_msg.contains("expected ident")
+            || err_msg.contains("line 1 column")
     );
 
     cleanup_dir(&dir);

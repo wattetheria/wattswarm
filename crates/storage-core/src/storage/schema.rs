@@ -374,6 +374,65 @@ impl PgStore {
                 author_node_id TEXT NOT NULL,
                 observed_at TIMESTAMPTZ NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS event_revocations (
+                event_id TEXT PRIMARY KEY,
+                reason TEXT NOT NULL,
+                revoked_by_node_id TEXT NOT NULL,
+                revoked_at TIMESTAMPTZ NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS summary_revocations (
+                summary_id TEXT PRIMARY KEY,
+                summary_kind TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                revoked_by_node_id TEXT NOT NULL,
+                revoked_at TIMESTAMPTZ NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS penalized_nodes (
+                node_id TEXT PRIMARY KEY,
+                reason TEXT NOT NULL,
+                block_summaries BOOLEAN NOT NULL DEFAULT TRUE,
+                penalized_by_node_id TEXT NOT NULL,
+                penalized_at TIMESTAMPTZ NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS imported_decision_memory (
+                summary_id TEXT NOT NULL,
+                source_node_id TEXT NOT NULL,
+                task_id TEXT NOT NULL,
+                epoch BIGINT NOT NULL,
+                final_commit_hash TEXT NOT NULL,
+                finalized_at TIMESTAMPTZ NOT NULL,
+                winning_candidate_hash TEXT NOT NULL,
+                output_digest TEXT NOT NULL,
+                result_summary TEXT NOT NULL,
+                quorum_result_json TEXT NOT NULL DEFAULT '{}',
+                reason_codes_json TEXT NOT NULL DEFAULT '[]',
+                reason_details TEXT NOT NULL DEFAULT '{}',
+                policy_snapshot_digest TEXT NOT NULL DEFAULT '',
+                task_type TEXT NOT NULL,
+                input_digest TEXT NOT NULL,
+                output_schema_digest TEXT NOT NULL,
+                policy_id TEXT NOT NULL,
+                policy_params_digest TEXT NOT NULL,
+                deprecated_as_exact BOOLEAN NOT NULL DEFAULT FALSE,
+                revoked BOOLEAN NOT NULL DEFAULT FALSE,
+                PRIMARY KEY(summary_id, task_id, epoch)
+            );
+
+            CREATE TABLE IF NOT EXISTS imported_reputation_state (
+                summary_id TEXT NOT NULL,
+                source_node_id TEXT NOT NULL,
+                runtime_id TEXT NOT NULL,
+                profile_id TEXT NOT NULL,
+                stability_reputation BIGINT NOT NULL,
+                quality_reputation BIGINT NOT NULL,
+                last_updated_at TIMESTAMPTZ NOT NULL,
+                revoked BOOLEAN NOT NULL DEFAULT FALSE,
+                PRIMARY KEY(summary_id, runtime_id, profile_id)
+            );
             ",
             )?;
 

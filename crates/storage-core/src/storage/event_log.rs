@@ -107,6 +107,118 @@ impl PgStore {
         self.load_events_from(0)
     }
 
+    pub fn put_event_revocation(
+        &self,
+        event_id: &str,
+        reason: &str,
+        revoked_by_node_id: &str,
+        revoked_at: u64,
+    ) -> Result<()> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
+        conn.execute(
+            "INSERT INTO event_revocations(event_id, reason, revoked_by_node_id, revoked_at)
+             VALUES ($1, $2, $3, TIMESTAMPTZ 'epoch' + ($4::bigint * INTERVAL '1 millisecond'))
+             ON CONFLICT(event_id) DO UPDATE SET
+               reason = excluded.reason,
+               revoked_by_node_id = excluded.revoked_by_node_id,
+               revoked_at = excluded.revoked_at",
+            params![event_id, reason, revoked_by_node_id, revoked_at as i64],
+        )?;
+        Ok(())
+    }
+
+    pub fn is_event_revoked(&self, event_id: &str) -> Result<bool> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
+        let exists = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM event_revocations WHERE event_id = $1)",
+            params![event_id],
+            |r| r.get::<_, bool>(0),
+        )?;
+        Ok(exists)
+    }
+
+    pub fn put_summary_revocation(
+        &self,
+        summary_id: &str,
+        summary_kind: &str,
+        reason: &str,
+        revoked_by_node_id: &str,
+        revoked_at: u64,
+    ) -> Result<()> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
+        conn.execute(
+            "INSERT INTO summary_revocations(summary_id, summary_kind, reason, revoked_by_node_id, revoked_at)
+             VALUES ($1, $2, $3, $4, TIMESTAMPTZ 'epoch' + ($5::bigint * INTERVAL '1 millisecond'))
+             ON CONFLICT(summary_id) DO UPDATE SET
+               summary_kind = excluded.summary_kind,
+               reason = excluded.reason,
+               revoked_by_node_id = excluded.revoked_by_node_id,
+               revoked_at = excluded.revoked_at",
+            params![summary_id, summary_kind, reason, revoked_by_node_id, revoked_at as i64],
+        )?;
+        Ok(())
+    }
+
+    pub fn is_summary_revoked(&self, summary_id: &str) -> Result<bool> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
+        let exists = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM summary_revocations WHERE summary_id = $1)",
+            params![summary_id],
+            |r| r.get::<_, bool>(0),
+        )?;
+        Ok(exists)
+    }
+
+    pub fn put_node_penalty(
+        &self,
+        node_id: &str,
+        reason: &str,
+        block_summaries: bool,
+        penalized_by_node_id: &str,
+        penalized_at: u64,
+    ) -> Result<()> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
+        conn.execute(
+            "INSERT INTO penalized_nodes(node_id, reason, block_summaries, penalized_by_node_id, penalized_at)
+             VALUES ($1, $2, $3, $4, TIMESTAMPTZ 'epoch' + ($5::bigint * INTERVAL '1 millisecond'))
+             ON CONFLICT(node_id) DO UPDATE SET
+               reason = excluded.reason,
+               block_summaries = excluded.block_summaries,
+               penalized_by_node_id = excluded.penalized_by_node_id,
+               penalized_at = excluded.penalized_at",
+            params![node_id, reason, block_summaries, penalized_by_node_id, penalized_at as i64],
+        )?;
+        Ok(())
+    }
+
+    pub fn is_node_penalized(&self, node_id: &str) -> Result<bool> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
+        let exists = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM penalized_nodes WHERE node_id = $1 AND block_summaries = TRUE)",
+            params![node_id],
+            |r| r.get::<_, bool>(0),
+        )?;
+        Ok(exists)
+    }
+
     pub fn clear_projection(&self) -> Result<()> {
         let conn = self
             .conn
@@ -136,6 +248,9 @@ impl PgStore {
             DELETE FROM reuse_blacklist;
             DELETE FROM advisory_state;
             DELETE FROM unknown_reason_observations;
+            DELETE FROM event_revocations;
+            DELETE FROM summary_revocations;
+            DELETE FROM penalized_nodes;
             ",
         )?;
         Ok(())

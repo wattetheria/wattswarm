@@ -173,6 +173,8 @@ pub struct CheckpointAnnouncement {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SummaryAnnouncement {
+    pub summary_id: String,
+    pub source_node_id: String,
     pub scope: SwarmScope,
     pub summary_kind: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -321,6 +323,9 @@ pub enum NetworkRuntimeEvent {
         address: Multiaddr,
     },
     ConnectionEstablished {
+        peer: PeerId,
+    },
+    ConnectionClosed {
         peer: PeerId,
     },
     Gossip {
@@ -571,6 +576,11 @@ impl NetworkRuntime {
                     peer: peer_id,
                 }))
             }
+            SwarmEvent::ConnectionClosed { peer_id, .. } => {
+                Ok(Some(NetworkRuntimeEvent::ConnectionClosed {
+                    peer: peer_id,
+                }))
+            }
             SwarmEvent::Behaviour(WattSwarmBehaviourEvent::Gossipsub(
                 GossipsubEvent::Message {
                     propagation_source,
@@ -721,6 +731,8 @@ mod tests {
     #[test]
     fn summary_messages_roundtrip_as_json() {
         let message = GossipMessage::Summary(SummaryAnnouncement {
+            summary_id: "summary-1".to_owned(),
+            source_node_id: "node-a".to_owned(),
             scope: SwarmScope::Region("sol-1".to_owned()),
             summary_kind: "knowledge_task_type_v1".to_owned(),
             artifact_path: Some("summaries/sol-1/knowledge.json".to_owned()),

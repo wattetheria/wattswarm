@@ -127,6 +127,9 @@ impl Node {
             EventPayload::ReuseRejectRecorded(payload) => {
                 self.validate_reuse_reject_recorded(payload)
             }
+            EventPayload::EventRevoked(payload) => self.validate_event_revoked(event, payload),
+            EventPayload::SummaryRevoked(payload) => self.validate_summary_revoked(payload),
+            EventPayload::NodePenalized(payload) => self.validate_node_penalized(payload),
         }
     }
 
@@ -170,6 +173,9 @@ impl Node {
             EventPayload::AdvisoryApplied(_) => (Some(Role::Committer), None),
             EventPayload::TaskFeedbackReported(_) => (None, None),
             EventPayload::ReuseRejectRecorded(_) => (Some(Role::Committer), None),
+            EventPayload::EventRevoked(_) => (Some(Role::Finalizer), None),
+            EventPayload::SummaryRevoked(_) => (Some(Role::Finalizer), None),
+            EventPayload::NodePenalized(_) => (Some(Role::Finalizer), None),
         };
 
         if let Some(expected_author) = check_author_match
@@ -329,6 +335,72 @@ impl Node {
 
         if self.store.task_projection(&contract.task_id)?.is_some() {
             return Err(SwarmError::Conflict("task already exists".into()).into());
+        }
+        Ok(())
+    }
+
+    pub(crate) fn validate_event_revoked(
+        &self,
+        event: &Event,
+        payload: &crate::types::EventRevokedPayload,
+    ) -> Result<()> {
+        if payload.target_event_id.trim().is_empty() {
+            return Err(SwarmError::InvalidEvent("target_event_id required".into()).into());
+        }
+        if payload.reason.trim().is_empty() || payload.reason.len() > MAX_INLINE_EVIDENCE_BYTES {
+            return Err(
+                SwarmError::InvalidEvent("event revoke reason must be 1..64KB".into()).into(),
+            );
+        }
+        if payload.target_event_id == event.event_id {
+            return Err(SwarmError::InvalidEvent("event cannot revoke itself".into()).into());
+        }
+        Ok(())
+    }
+
+    pub(crate) fn validate_summary_revoked(
+        &self,
+        payload: &crate::types::SummaryRevokedPayload,
+    ) -> Result<()> {
+        if payload.target_summary_id.trim().is_empty() {
+            return Err(SwarmError::InvalidEvent("target_summary_id required".into()).into());
+        }
+        if payload.summary_kind.trim().is_empty() {
+            return Err(SwarmError::InvalidEvent("summary_kind required".into()).into());
+        }
+        if payload.reason.trim().is_empty() || payload.reason.len() > MAX_INLINE_EVIDENCE_BYTES {
+            return Err(
+                SwarmError::InvalidEvent("summary revoke reason must be 1..64KB".into()).into(),
+            );
+        }
+        Ok(())
+    }
+
+    pub(crate) fn validate_node_penalized(
+        &self,
+        payload: &crate::types::NodePenalizedPayload,
+    ) -> Result<()> {
+        if payload.penalized_node_id.trim().is_empty() {
+            return Err(SwarmError::InvalidEvent("penalized_node_id required".into()).into());
+        }
+        if payload.reason.trim().is_empty() || payload.reason.len() > MAX_INLINE_EVIDENCE_BYTES {
+            return Err(SwarmError::InvalidEvent("penalty reason must be 1..64KB".into()).into());
+        }
+        let unique_event_ids = payload
+            .revoked_event_ids
+            .iter()
+            .collect::<std::collections::HashSet<_>>();
+        if unique_event_ids.len() != payload.revoked_event_ids.len() {
+            return Err(SwarmError::InvalidEvent("revoked_event_ids must be unique".into()).into());
+        }
+        let unique_summary_ids = payload
+            .revoked_summary_ids
+            .iter()
+            .collect::<std::collections::HashSet<_>>();
+        if unique_summary_ids.len() != payload.revoked_summary_ids.len() {
+            return Err(
+                SwarmError::InvalidEvent("revoked_summary_ids must be unique".into()).into(),
+            );
         }
         Ok(())
     }

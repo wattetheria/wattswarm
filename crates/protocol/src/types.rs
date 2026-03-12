@@ -521,6 +521,31 @@ pub struct ReuseRejectRecordedPayload {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EventRevokedPayload {
+    pub target_event_id: String,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SummaryRevokedPayload {
+    pub target_summary_id: String,
+    pub summary_kind: String,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NodePenalizedPayload {
+    pub penalized_node_id: String,
+    pub reason: String,
+    #[serde(default)]
+    pub revoked_event_ids: Vec<String>,
+    #[serde(default)]
+    pub revoked_summary_ids: Vec<String>,
+    #[serde(default = "default_true")]
+    pub block_summaries: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum KnowledgeHitType {
     Exact,
     Similar,
@@ -580,6 +605,9 @@ pub enum EventPayload {
     AdvisoryApplied(AdvisoryAppliedPayload),
     TaskFeedbackReported(TaskFeedbackReportedPayload),
     ReuseRejectRecorded(ReuseRejectRecordedPayload),
+    EventRevoked(EventRevokedPayload),
+    SummaryRevoked(SummaryRevokedPayload),
+    NodePenalized(NodePenalizedPayload),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -612,6 +640,9 @@ pub enum EventKind {
     AdvisoryApplied,
     TaskFeedbackReported,
     ReuseRejectRecorded,
+    EventRevoked,
+    SummaryRevoked,
+    NodePenalized,
 }
 
 impl EventPayload {
@@ -644,6 +675,9 @@ impl EventPayload {
             Self::AdvisoryApplied(_) => EventKind::AdvisoryApplied,
             Self::TaskFeedbackReported(_) => EventKind::TaskFeedbackReported,
             Self::ReuseRejectRecorded(_) => EventKind::ReuseRejectRecorded,
+            Self::EventRevoked(_) => EventKind::EventRevoked,
+            Self::SummaryRevoked(_) => EventKind::SummaryRevoked,
+            Self::NodePenalized(_) => EventKind::NodePenalized,
         }
     }
 
@@ -676,6 +710,9 @@ impl EventPayload {
             Self::AdvisoryApplied(_) => None,
             Self::TaskFeedbackReported(p) => Some(&p.task_id),
             Self::ReuseRejectRecorded(p) => Some(&p.task_id),
+            Self::EventRevoked(_) => None,
+            Self::SummaryRevoked(_) => None,
+            Self::NodePenalized(_) => None,
         }
     }
 }
@@ -745,6 +782,10 @@ pub struct TaskView {
 
 fn default_one() -> u32 {
     1
+}
+
+fn default_true() -> bool {
+    true
 }
 
 fn default_topk() -> u32 {
