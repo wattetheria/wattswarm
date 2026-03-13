@@ -894,6 +894,11 @@ fn anti_entropy_uses_scope_specific_cursor_for_recovery() {
         .submit_task(global_contract, 1, 101)
         .expect("submit local global task");
 
+    // The first empty backfill request on connect pushes the next anti-entropy
+    // retry out by the configured interval, so wait for that window before
+    // asserting region recovery.
+    std::thread::sleep(Duration::from_secs(16));
+
     let mut recovered = false;
     for _ in 0..4_096 {
         let _ = service_b
