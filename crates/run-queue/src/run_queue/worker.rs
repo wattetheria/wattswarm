@@ -421,8 +421,10 @@ mod tests {
             .unwrap_or_else(|_| "postgres://postgres:postgres@127.0.0.1:55432/wattswarm".to_owned())
     }
 
+    const TEST_ORG_ID: &str = "local:test-worker:bootstrap";
+
     fn queue_or_skip() -> Option<PgRunQueue> {
-        let queue = PgRunQueue::new(test_pg_url());
+        let queue = PgRunQueue::new(test_pg_url()).for_org(TEST_ORG_ID);
         if queue.connect().is_err() {
             eprintln!("skip run-queue worker tests: postgres not reachable");
             return None;

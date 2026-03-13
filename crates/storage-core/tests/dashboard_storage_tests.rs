@@ -7,6 +7,12 @@ use wattswarm_storage_core::types::{
     VerifierResult, VerifyAssignment, VotePolicy,
 };
 
+fn open_test_store() -> PgStore {
+    PgStore::open_in_memory()
+        .expect("open store")
+        .for_org("local:test-dashboard:bootstrap")
+}
+
 fn sample_contract(task_id: &str) -> TaskContract {
     TaskContract {
         protocol_version: "v0.1".to_owned(),
@@ -121,7 +127,7 @@ fn sample_verifier_result(candidate_id: &str, execution_id: &str, passed: bool) 
 
 #[test]
 fn list_task_ids_recent_orders_by_epoch_then_task_id_desc() {
-    let store = PgStore::open_in_memory().expect("open store");
+    let store = open_test_store();
     store
         .upsert_task_contract(&sample_contract("task-a"), 1)
         .expect("upsert task-a");
@@ -138,7 +144,7 @@ fn list_task_ids_recent_orders_by_epoch_then_task_id_desc() {
 
 #[test]
 fn latest_candidate_for_task_returns_latest_candidate_id() {
-    let store = PgStore::open_in_memory().expect("open store");
+    let store = open_test_store();
     let task_id = "task-latest-candidate";
     store
         .upsert_task_contract(&sample_contract(task_id), 1)
@@ -166,7 +172,7 @@ fn latest_candidate_for_task_returns_latest_candidate_id() {
 
 #[test]
 fn count_verifier_results_for_candidate_only_counts_target_candidate() {
-    let store = PgStore::open_in_memory().expect("open store");
+    let store = open_test_store();
     let task_id = "task-verifier-count";
     store
         .upsert_task_contract(&sample_contract(task_id), 1)
@@ -214,7 +220,7 @@ fn count_verifier_results_for_candidate_only_counts_target_candidate() {
 
 #[test]
 fn has_vote_commit_for_execution_matches_task_and_execution() {
-    let store = PgStore::open_in_memory().expect("open store");
+    let store = open_test_store();
     let task_id = "task-vote-commit";
     store
         .upsert_task_contract(&sample_contract(task_id), 1)

@@ -8,6 +8,12 @@ use wattswarm_storage_core::types::{
 };
 use wattswarm_storage_core::{AdvisoryStateRow, PgStore};
 
+fn open_test_store() -> PgStore {
+    PgStore::open_in_memory()
+        .expect("open store")
+        .for_org("local:test-storage:bootstrap")
+}
+
 fn sample_contract(task_id: &str, task_type: &str) -> TaskContract {
     TaskContract {
         protocol_version: "v0.1".to_owned(),
@@ -143,7 +149,7 @@ fn sample_verifier_result(candidate_id: &str, execution_id: &str, passed: bool) 
 
 #[test]
 fn event_log_round_trip_and_clear_projection_keeps_events() {
-    let store = PgStore::open_in_memory().expect("open store");
+    let store = open_test_store();
     let task_id = "task-event-log";
     let contract = sample_contract(task_id, "resume_review");
     store
@@ -217,7 +223,7 @@ fn event_log_round_trip_and_clear_projection_keeps_events() {
 
 #[test]
 fn export_and_vote_checkpoint_membership_paths_work() {
-    let store = PgStore::open_in_memory().expect("open store");
+    let store = open_test_store();
     let task_id = "task-export";
     let task_type = "resume_review";
     store
@@ -563,7 +569,7 @@ fn export_and_vote_checkpoint_membership_paths_work() {
 
 #[test]
 fn ensure_local_bootstrap_topology_scopes_default_org_and_rejects_duplicate_identity() {
-    let store = PgStore::open_in_memory().expect("open store");
+    let store = open_test_store();
     let org_id = store
         .ensure_local_bootstrap_topology("node-a", "pub-a", 1_700_000_000_000)
         .expect("bootstrap local topology");
@@ -582,7 +588,7 @@ fn ensure_local_bootstrap_topology_scopes_default_org_and_rejects_duplicate_iden
 
 #[test]
 fn membership_and_revocations_are_scoped_by_org() {
-    let store = PgStore::open_in_memory().expect("open store");
+    let store = open_test_store();
     let local_org = store
         .ensure_local_bootstrap_topology("node-a", "pub-a", 1_700_000_000_000)
         .expect("bootstrap local topology");

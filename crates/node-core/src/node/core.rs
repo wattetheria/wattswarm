@@ -6,6 +6,14 @@ impl Node {
         store: PgStore,
         genesis_membership: Membership,
     ) -> Result<Self> {
+        let store = if !store.is_org_configured() {
+            let org_id = crate::storage::bootstrap_org_id(&crate::storage::local_network_id(
+                &identity.node_id(),
+            ));
+            store.for_org(org_id)
+        } else {
+            store
+        };
         let policy_registry = PolicyRegistry::with_builtin();
         let this = Self {
             identity,

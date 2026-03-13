@@ -166,7 +166,7 @@ impl PgStore {
 
             CREATE TABLE IF NOT EXISTS events (
                 seq BIGSERIAL PRIMARY KEY,
-                org_id TEXT NOT NULL DEFAULT 'bootstrap',
+                org_id TEXT NOT NULL DEFAULT '__unset_org__',
                 event_id TEXT NOT NULL UNIQUE,
                 protocol_version TEXT NOT NULL DEFAULT '0.1.0',
                 task_id TEXT,
@@ -178,7 +178,7 @@ impl PgStore {
             );
 
             CREATE TABLE IF NOT EXISTS task_projection (
-                org_id TEXT NOT NULL DEFAULT 'bootstrap',
+                org_id TEXT NOT NULL DEFAULT '__unset_org__',
                 task_id TEXT NOT NULL,
                 epoch BIGINT NOT NULL,
                 contract_json TEXT NOT NULL,
@@ -190,7 +190,7 @@ impl PgStore {
             );
 
             CREATE TABLE IF NOT EXISTS leases (
-                org_id TEXT NOT NULL DEFAULT 'bootstrap',
+                org_id TEXT NOT NULL DEFAULT '__unset_org__',
                 task_id TEXT NOT NULL,
                 role TEXT NOT NULL,
                 claimer_node_id TEXT NOT NULL,
@@ -200,7 +200,7 @@ impl PgStore {
             );
 
             CREATE TABLE IF NOT EXISTS candidates (
-                org_id TEXT NOT NULL DEFAULT 'bootstrap',
+                org_id TEXT NOT NULL DEFAULT '__unset_org__',
                 task_id TEXT NOT NULL,
                 candidate_id TEXT NOT NULL,
                 candidate_hash TEXT NOT NULL,
@@ -211,7 +211,7 @@ impl PgStore {
             );
 
             CREATE TABLE IF NOT EXISTS verifier_results (
-                org_id TEXT NOT NULL DEFAULT 'bootstrap',
+                org_id TEXT NOT NULL DEFAULT '__unset_org__',
                 task_id TEXT NOT NULL,
                 candidate_id TEXT NOT NULL,
                 verifier_node_id TEXT NOT NULL,
@@ -221,7 +221,7 @@ impl PgStore {
             );
 
             CREATE TABLE IF NOT EXISTS evidence_added (
-                org_id TEXT NOT NULL DEFAULT 'bootstrap',
+                org_id TEXT NOT NULL DEFAULT '__unset_org__',
                 task_id TEXT NOT NULL,
                 candidate_id TEXT NOT NULL,
                 evidence_digest TEXT NOT NULL,
@@ -230,7 +230,7 @@ impl PgStore {
             );
 
             CREATE TABLE IF NOT EXISTS evidence_available (
-                org_id TEXT NOT NULL DEFAULT 'bootstrap',
+                org_id TEXT NOT NULL DEFAULT '__unset_org__',
                 task_id TEXT NOT NULL,
                 candidate_id TEXT NOT NULL,
                 verifier_node_id TEXT NOT NULL,
@@ -240,7 +240,7 @@ impl PgStore {
             );
 
             CREATE TABLE IF NOT EXISTS vote_commits (
-                org_id TEXT NOT NULL DEFAULT 'bootstrap',
+                org_id TEXT NOT NULL DEFAULT '__unset_org__',
                 task_id TEXT NOT NULL,
                 voter_node_id TEXT NOT NULL,
                 candidate_hash TEXT NOT NULL DEFAULT '',
@@ -252,7 +252,7 @@ impl PgStore {
             );
 
             CREATE TABLE IF NOT EXISTS vote_reveals (
-                org_id TEXT NOT NULL DEFAULT 'bootstrap',
+                org_id TEXT NOT NULL DEFAULT '__unset_org__',
                 task_id TEXT NOT NULL,
                 voter_node_id TEXT NOT NULL,
                 candidate_id TEXT NOT NULL,
@@ -266,7 +266,7 @@ impl PgStore {
             );
 
             CREATE TABLE IF NOT EXISTS finalizations (
-                org_id TEXT NOT NULL DEFAULT 'bootstrap',
+                org_id TEXT NOT NULL DEFAULT '__unset_org__',
                 task_id TEXT NOT NULL,
                 epoch BIGINT NOT NULL,
                 candidate_id TEXT NOT NULL,
@@ -276,7 +276,7 @@ impl PgStore {
             );
 
             CREATE TABLE IF NOT EXISTS checkpoints (
-                org_id TEXT NOT NULL DEFAULT 'bootstrap',
+                org_id TEXT NOT NULL DEFAULT '__unset_org__',
                 checkpoint_id TEXT NOT NULL,
                 up_to_seq BIGINT NOT NULL,
                 event_id TEXT NOT NULL,
@@ -284,13 +284,13 @@ impl PgStore {
             );
 
             CREATE TABLE IF NOT EXISTS membership_projection (
-                org_id TEXT NOT NULL DEFAULT 'bootstrap',
+                org_id TEXT NOT NULL DEFAULT '__unset_org__',
                 singleton BIGINT NOT NULL DEFAULT 1 CHECK (singleton = 1),
                 membership_json TEXT NOT NULL
             );
 
             CREATE TABLE IF NOT EXISTS decision_memory (
-                org_id TEXT NOT NULL DEFAULT 'bootstrap',
+                org_id TEXT NOT NULL DEFAULT '__unset_org__',
                 task_id TEXT NOT NULL,
                 epoch BIGINT NOT NULL,
                 final_commit_hash TEXT NOT NULL,
@@ -312,7 +312,7 @@ impl PgStore {
             );
 
             CREATE TABLE IF NOT EXISTS evidence_summary (
-                org_id TEXT NOT NULL DEFAULT 'bootstrap',
+                org_id TEXT NOT NULL DEFAULT '__unset_org__',
                 cid TEXT NOT NULL,
                 mime TEXT NOT NULL,
                 size_bytes BIGINT NOT NULL,
@@ -323,7 +323,7 @@ impl PgStore {
             );
 
             CREATE TABLE IF NOT EXISTS runtime_metrics (
-                org_id TEXT NOT NULL DEFAULT 'bootstrap',
+                org_id TEXT NOT NULL DEFAULT '__unset_org__',
                 runtime_id TEXT NOT NULL,
                 profile_id TEXT NOT NULL,
                 task_type TEXT NOT NULL,
@@ -358,7 +358,7 @@ impl PgStore {
             );
 
             CREATE TABLE IF NOT EXISTS task_settlement (
-                org_id TEXT NOT NULL DEFAULT 'bootstrap',
+                org_id TEXT NOT NULL DEFAULT '__unset_org__',
                 task_id TEXT NOT NULL,
                 epoch BIGINT NOT NULL,
                 finalized_at TIMESTAMPTZ NOT NULL,
@@ -371,7 +371,7 @@ impl PgStore {
             );
 
             CREATE TABLE IF NOT EXISTS task_stage_usage (
-                org_id TEXT NOT NULL DEFAULT 'bootstrap',
+                org_id TEXT NOT NULL DEFAULT '__unset_org__',
                 task_id TEXT NOT NULL,
                 epoch BIGINT NOT NULL,
                 explore_used BIGINT NOT NULL DEFAULT 0,
@@ -381,7 +381,7 @@ impl PgStore {
             );
 
             CREATE TABLE IF NOT EXISTS task_cost_reports (
-                org_id TEXT NOT NULL DEFAULT 'bootstrap',
+                org_id TEXT NOT NULL DEFAULT '__unset_org__',
                 task_id TEXT NOT NULL,
                 epoch BIGINT NOT NULL,
                 cost_units_by_stage_json TEXT NOT NULL,
@@ -393,7 +393,7 @@ impl PgStore {
             );
 
             CREATE TABLE IF NOT EXISTS reputation_state (
-                org_id TEXT NOT NULL DEFAULT 'bootstrap',
+                org_id TEXT NOT NULL DEFAULT '__unset_org__',
                 runtime_id TEXT NOT NULL,
                 profile_id TEXT NOT NULL,
                 stability_reputation BIGINT NOT NULL,
@@ -403,7 +403,7 @@ impl PgStore {
             );
 
             CREATE TABLE IF NOT EXISTS knowledge_lookups (
-                org_id TEXT NOT NULL DEFAULT 'bootstrap',
+                org_id TEXT NOT NULL DEFAULT '__unset_org__',
                 task_id TEXT NOT NULL,
                 task_type TEXT NOT NULL,
                 input_digest TEXT NOT NULL,
@@ -416,7 +416,7 @@ impl PgStore {
             );
 
             CREATE TABLE IF NOT EXISTS reuse_blacklist (
-                org_id TEXT NOT NULL DEFAULT 'bootstrap',
+                org_id TEXT NOT NULL DEFAULT '__unset_org__',
                 task_id TEXT NOT NULL,
                 epoch BIGINT NOT NULL,
                 candidate_hash TEXT NOT NULL,
@@ -437,7 +437,7 @@ impl PgStore {
 
             CREATE TABLE IF NOT EXISTS unknown_reason_observations (
                 id BIGSERIAL PRIMARY KEY,
-                org_id TEXT NOT NULL DEFAULT 'bootstrap',
+                org_id TEXT NOT NULL DEFAULT '__unset_org__',
                 task_id TEXT,
                 unknown_reason_code BIGINT NOT NULL,
                 peer_protocol_version TEXT NOT NULL,
@@ -447,7 +447,7 @@ impl PgStore {
             );
 
             CREATE TABLE IF NOT EXISTS event_revocations (
-                org_id TEXT NOT NULL DEFAULT 'bootstrap',
+                org_id TEXT NOT NULL DEFAULT '__unset_org__',
                 event_id TEXT NOT NULL,
                 reason TEXT NOT NULL,
                 revoked_by_node_id TEXT NOT NULL,
@@ -455,7 +455,7 @@ impl PgStore {
             );
 
             CREATE TABLE IF NOT EXISTS summary_revocations (
-                org_id TEXT NOT NULL DEFAULT 'bootstrap',
+                org_id TEXT NOT NULL DEFAULT '__unset_org__',
                 summary_id TEXT NOT NULL,
                 summary_kind TEXT NOT NULL,
                 reason TEXT NOT NULL,
@@ -472,7 +472,7 @@ impl PgStore {
             );
 
             CREATE TABLE IF NOT EXISTS imported_decision_memory (
-                org_id TEXT NOT NULL DEFAULT 'bootstrap',
+                org_id TEXT NOT NULL DEFAULT '__unset_org__',
                 summary_id TEXT NOT NULL,
                 source_node_id TEXT NOT NULL,
                 task_id TEXT NOT NULL,
@@ -497,7 +497,7 @@ impl PgStore {
             );
 
             CREATE TABLE IF NOT EXISTS imported_reputation_state (
-                org_id TEXT NOT NULL DEFAULT 'bootstrap',
+                org_id TEXT NOT NULL DEFAULT '__unset_org__',
                 summary_id TEXT NOT NULL,
                 source_node_id TEXT NOT NULL,
                 runtime_id TEXT NOT NULL,
@@ -517,132 +517,132 @@ impl PgStore {
                 (
                     "events",
                     "org_id",
-                    "ALTER TABLE events ADD COLUMN org_id TEXT NOT NULL DEFAULT 'bootstrap'",
+                    "ALTER TABLE events ADD COLUMN org_id TEXT NOT NULL DEFAULT '__unset_org__'",
                 ),
                 (
                     "task_projection",
                     "org_id",
-                    "ALTER TABLE task_projection ADD COLUMN org_id TEXT NOT NULL DEFAULT 'bootstrap'",
+                    "ALTER TABLE task_projection ADD COLUMN org_id TEXT NOT NULL DEFAULT '__unset_org__'",
                 ),
                 (
                     "leases",
                     "org_id",
-                    "ALTER TABLE leases ADD COLUMN org_id TEXT NOT NULL DEFAULT 'bootstrap'",
+                    "ALTER TABLE leases ADD COLUMN org_id TEXT NOT NULL DEFAULT '__unset_org__'",
                 ),
                 (
                     "candidates",
                     "org_id",
-                    "ALTER TABLE candidates ADD COLUMN org_id TEXT NOT NULL DEFAULT 'bootstrap'",
+                    "ALTER TABLE candidates ADD COLUMN org_id TEXT NOT NULL DEFAULT '__unset_org__'",
                 ),
                 (
                     "verifier_results",
                     "org_id",
-                    "ALTER TABLE verifier_results ADD COLUMN org_id TEXT NOT NULL DEFAULT 'bootstrap'",
+                    "ALTER TABLE verifier_results ADD COLUMN org_id TEXT NOT NULL DEFAULT '__unset_org__'",
                 ),
                 (
                     "evidence_added",
                     "org_id",
-                    "ALTER TABLE evidence_added ADD COLUMN org_id TEXT NOT NULL DEFAULT 'bootstrap'",
+                    "ALTER TABLE evidence_added ADD COLUMN org_id TEXT NOT NULL DEFAULT '__unset_org__'",
                 ),
                 (
                     "evidence_available",
                     "org_id",
-                    "ALTER TABLE evidence_available ADD COLUMN org_id TEXT NOT NULL DEFAULT 'bootstrap'",
+                    "ALTER TABLE evidence_available ADD COLUMN org_id TEXT NOT NULL DEFAULT '__unset_org__'",
                 ),
                 (
                     "vote_commits",
                     "org_id",
-                    "ALTER TABLE vote_commits ADD COLUMN org_id TEXT NOT NULL DEFAULT 'bootstrap'",
+                    "ALTER TABLE vote_commits ADD COLUMN org_id TEXT NOT NULL DEFAULT '__unset_org__'",
                 ),
                 (
                     "vote_reveals",
                     "org_id",
-                    "ALTER TABLE vote_reveals ADD COLUMN org_id TEXT NOT NULL DEFAULT 'bootstrap'",
+                    "ALTER TABLE vote_reveals ADD COLUMN org_id TEXT NOT NULL DEFAULT '__unset_org__'",
                 ),
                 (
                     "finalizations",
                     "org_id",
-                    "ALTER TABLE finalizations ADD COLUMN org_id TEXT NOT NULL DEFAULT 'bootstrap'",
+                    "ALTER TABLE finalizations ADD COLUMN org_id TEXT NOT NULL DEFAULT '__unset_org__'",
                 ),
                 (
                     "checkpoints",
                     "org_id",
-                    "ALTER TABLE checkpoints ADD COLUMN org_id TEXT NOT NULL DEFAULT 'bootstrap'",
+                    "ALTER TABLE checkpoints ADD COLUMN org_id TEXT NOT NULL DEFAULT '__unset_org__'",
                 ),
                 (
                     "decision_memory",
                     "org_id",
-                    "ALTER TABLE decision_memory ADD COLUMN org_id TEXT NOT NULL DEFAULT 'bootstrap'",
+                    "ALTER TABLE decision_memory ADD COLUMN org_id TEXT NOT NULL DEFAULT '__unset_org__'",
                 ),
                 (
                     "evidence_summary",
                     "org_id",
-                    "ALTER TABLE evidence_summary ADD COLUMN org_id TEXT NOT NULL DEFAULT 'bootstrap'",
+                    "ALTER TABLE evidence_summary ADD COLUMN org_id TEXT NOT NULL DEFAULT '__unset_org__'",
                 ),
                 (
                     "runtime_metrics",
                     "org_id",
-                    "ALTER TABLE runtime_metrics ADD COLUMN org_id TEXT NOT NULL DEFAULT 'bootstrap'",
+                    "ALTER TABLE runtime_metrics ADD COLUMN org_id TEXT NOT NULL DEFAULT '__unset_org__'",
                 ),
                 (
                     "task_settlement",
                     "org_id",
-                    "ALTER TABLE task_settlement ADD COLUMN org_id TEXT NOT NULL DEFAULT 'bootstrap'",
+                    "ALTER TABLE task_settlement ADD COLUMN org_id TEXT NOT NULL DEFAULT '__unset_org__'",
                 ),
                 (
                     "task_stage_usage",
                     "org_id",
-                    "ALTER TABLE task_stage_usage ADD COLUMN org_id TEXT NOT NULL DEFAULT 'bootstrap'",
+                    "ALTER TABLE task_stage_usage ADD COLUMN org_id TEXT NOT NULL DEFAULT '__unset_org__'",
                 ),
                 (
                     "task_cost_reports",
                     "org_id",
-                    "ALTER TABLE task_cost_reports ADD COLUMN org_id TEXT NOT NULL DEFAULT 'bootstrap'",
+                    "ALTER TABLE task_cost_reports ADD COLUMN org_id TEXT NOT NULL DEFAULT '__unset_org__'",
                 ),
                 (
                     "reputation_state",
                     "org_id",
-                    "ALTER TABLE reputation_state ADD COLUMN org_id TEXT NOT NULL DEFAULT 'bootstrap'",
+                    "ALTER TABLE reputation_state ADD COLUMN org_id TEXT NOT NULL DEFAULT '__unset_org__'",
                 ),
                 (
                     "knowledge_lookups",
                     "org_id",
-                    "ALTER TABLE knowledge_lookups ADD COLUMN org_id TEXT NOT NULL DEFAULT 'bootstrap'",
+                    "ALTER TABLE knowledge_lookups ADD COLUMN org_id TEXT NOT NULL DEFAULT '__unset_org__'",
                 ),
                 (
                     "reuse_blacklist",
                     "org_id",
-                    "ALTER TABLE reuse_blacklist ADD COLUMN org_id TEXT NOT NULL DEFAULT 'bootstrap'",
+                    "ALTER TABLE reuse_blacklist ADD COLUMN org_id TEXT NOT NULL DEFAULT '__unset_org__'",
                 ),
                 (
                     "unknown_reason_observations",
                     "org_id",
-                    "ALTER TABLE unknown_reason_observations ADD COLUMN org_id TEXT NOT NULL DEFAULT 'bootstrap'",
+                    "ALTER TABLE unknown_reason_observations ADD COLUMN org_id TEXT NOT NULL DEFAULT '__unset_org__'",
                 ),
                 (
                     "membership_projection",
                     "org_id",
-                    "ALTER TABLE membership_projection ADD COLUMN org_id TEXT NOT NULL DEFAULT 'bootstrap'",
+                    "ALTER TABLE membership_projection ADD COLUMN org_id TEXT NOT NULL DEFAULT '__unset_org__'",
                 ),
                 (
                     "event_revocations",
                     "org_id",
-                    "ALTER TABLE event_revocations ADD COLUMN org_id TEXT NOT NULL DEFAULT 'bootstrap'",
+                    "ALTER TABLE event_revocations ADD COLUMN org_id TEXT NOT NULL DEFAULT '__unset_org__'",
                 ),
                 (
                     "summary_revocations",
                     "org_id",
-                    "ALTER TABLE summary_revocations ADD COLUMN org_id TEXT NOT NULL DEFAULT 'bootstrap'",
+                    "ALTER TABLE summary_revocations ADD COLUMN org_id TEXT NOT NULL DEFAULT '__unset_org__'",
                 ),
                 (
                     "imported_decision_memory",
                     "org_id",
-                    "ALTER TABLE imported_decision_memory ADD COLUMN org_id TEXT NOT NULL DEFAULT 'bootstrap'",
+                    "ALTER TABLE imported_decision_memory ADD COLUMN org_id TEXT NOT NULL DEFAULT '__unset_org__'",
                 ),
                 (
                     "imported_reputation_state",
                     "org_id",
-                    "ALTER TABLE imported_reputation_state ADD COLUMN org_id TEXT NOT NULL DEFAULT 'bootstrap'",
+                    "ALTER TABLE imported_reputation_state ADD COLUMN org_id TEXT NOT NULL DEFAULT '__unset_org__'",
                 ),
                 (
                     "task_projection",
@@ -877,6 +877,40 @@ impl PgStore {
                 ensure_timestamp_column(&conn, table, column)?;
             }
 
+            for table in [
+                "events",
+                "task_projection",
+                "leases",
+                "candidates",
+                "verifier_results",
+                "evidence_added",
+                "evidence_available",
+                "vote_commits",
+                "vote_reveals",
+                "finalizations",
+                "checkpoints",
+                "decision_memory",
+                "evidence_summary",
+                "runtime_metrics",
+                "task_settlement",
+                "task_stage_usage",
+                "task_cost_reports",
+                "reputation_state",
+                "knowledge_lookups",
+                "reuse_blacklist",
+                "unknown_reason_observations",
+                "membership_projection",
+                "event_revocations",
+                "summary_revocations",
+                "imported_decision_memory",
+                "imported_reputation_state",
+            ] {
+                conn.execute(
+                    &format!("ALTER TABLE {table} ALTER COLUMN org_id SET DEFAULT '__unset_org__'"),
+                    params![],
+                )?;
+            }
+
             conn.execute_batch(
                 "
                 ALTER TABLE task_projection DROP CONSTRAINT IF EXISTS task_projection_pkey;
@@ -980,7 +1014,7 @@ impl PgStore {
 
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
-            org_id: Arc::new(DEFAULT_BOOTSTRAP_ORG_ID.to_owned()),
+            org_id: Arc::new(UNSET_ORG_ID.to_owned()),
         })
     }
 }

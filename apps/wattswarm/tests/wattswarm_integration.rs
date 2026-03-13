@@ -2943,7 +2943,9 @@ fn knowledge_lookup_ignores_error_only_decision_memory_entries() {
 
 #[test]
 fn runtime_metrics_cost_units_accumulates_with_observations() {
-    let store = PgStore::open_in_memory().unwrap();
+    let store = PgStore::open_in_memory()
+        .unwrap()
+        .for_org("local:test-app:bootstrap");
     let obs_1 = RuntimeMetricObservation {
         runtime_id: "rt",
         profile_id: "p",

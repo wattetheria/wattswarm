@@ -17,7 +17,11 @@ pub struct PgStore {
     org_id: Arc<String>,
 }
 
-pub const DEFAULT_BOOTSTRAP_ORG_ID: &str = "bootstrap";
+pub const UNSET_ORG_ID: &str = "__unset_org__";
+
+pub fn is_unset_org_id(org_id: &str) -> bool {
+    org_id == UNSET_ORG_ID
+}
 
 #[derive(Debug, Clone)]
 pub struct LeaseRow {
@@ -158,7 +162,15 @@ impl PgStore {
         }
     }
 
+    pub fn is_org_configured(&self) -> bool {
+        !is_unset_org_id(self.org_id.as_str())
+    }
+
     pub fn org_id(&self) -> &str {
+        assert!(
+            !is_unset_org_id(self.org_id.as_str()),
+            "store org is not configured; bind the store to a concrete org before use"
+        );
         self.org_id.as_str()
     }
 
@@ -202,6 +214,8 @@ mod metrics;
 mod projection;
 mod registry;
 mod schema;
+
+pub use registry::{bootstrap_org_id, lan_network_id, local_network_id};
 
 fn query_table_json(
     conn: &Connection,

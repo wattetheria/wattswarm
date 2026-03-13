@@ -321,6 +321,7 @@ mod tests {
     use serde_json::json;
     use uuid::Uuid;
     const TEST_SCHEMA: &str = "test";
+    const TEST_ORG_ID: &str = "local:test-admin:bootstrap";
     const TEST_DB_LOCK_KEY: i64 = 1_987_654_321;
 
     struct DbTestLock {
@@ -365,7 +366,7 @@ mod tests {
     }
 
     fn queue_or_skip() -> Option<PgRunQueue> {
-        let queue = PgRunQueue::with_schema(test_pg_url(), TEST_SCHEMA);
+        let queue = PgRunQueue::with_schema(test_pg_url(), TEST_SCHEMA).for_org(TEST_ORG_ID);
         if queue.connect().is_err() {
             eprintln!("skip run-queue admin_api tests: postgres not reachable");
             return None;

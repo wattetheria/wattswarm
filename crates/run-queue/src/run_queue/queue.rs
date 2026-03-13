@@ -19,14 +19,14 @@ pub struct PgRunQueue {
     pub(crate) org_id: Arc<String>,
 }
 
-const DEFAULT_RUN_QUEUE_ORG_ID: &str = "bootstrap";
+const UNSET_RUN_QUEUE_ORG_ID: &str = "__unset_org__";
 
 impl PgRunQueue {
     pub fn new(database_url: impl Into<String>) -> Self {
         Self {
             database_url: database_url.into(),
             schema: None,
-            org_id: Arc::new(DEFAULT_RUN_QUEUE_ORG_ID.to_owned()),
+            org_id: Arc::new(UNSET_RUN_QUEUE_ORG_ID.to_owned()),
         }
     }
 
@@ -34,7 +34,7 @@ impl PgRunQueue {
         Self {
             database_url: database_url.into(),
             schema: Some(sanitize_ident(schema.as_ref())),
-            org_id: Arc::new(DEFAULT_RUN_QUEUE_ORG_ID.to_owned()),
+            org_id: Arc::new(UNSET_RUN_QUEUE_ORG_ID.to_owned()),
         }
     }
 
@@ -47,6 +47,10 @@ impl PgRunQueue {
     }
 
     pub fn org_id(&self) -> &str {
+        assert!(
+            self.org_id.as_str() != UNSET_RUN_QUEUE_ORG_ID,
+            "run queue org is not configured; call for_org() with the current node org"
+        );
         self.org_id.as_str()
     }
 
@@ -106,12 +110,12 @@ impl PgRunQueue {
             )?;
             tx.execute(
                 "UPDATE runs
-                 SET status = $2,
-                     shared_inputs_json = $3,
+                 SET status = $3,
+                     shared_inputs_json = $4,
                      result_json = NULL,
                      error_text = NULL,
                      finished_at = NULL,
-                     updated_at = TIMESTAMPTZ 'epoch' + ($4::bigint * INTERVAL '1 millisecond')
+                     updated_at = TIMESTAMPTZ 'epoch' + ($5::bigint * INTERVAL '1 millisecond')
                  WHERE org_id = $1 AND run_id = $2",
                 &[
                     &self.org_id(),
@@ -124,8 +128,8 @@ impl PgRunQueue {
             if counts.succeeded > 0 {
                 tx.execute(
                     "UPDATE run_steps
-                     SET status = $2,
-                         next_run_at = TIMESTAMPTZ 'epoch' + ($3::bigint * INTERVAL '1 millisecond'),
+                     SET status = $3,
+                         next_run_at = TIMESTAMPTZ 'epoch' + ($4::bigint * INTERVAL '1 millisecond'),
                          lease_id = NULL,
                          lease_owner = NULL,
                          lease_until = NULL,
@@ -133,10 +137,10 @@ impl PgRunQueue {
                          result_json = NULL,
                          error_text = NULL,
                          finished_at = NULL,
-                         updated_at = TIMESTAMPTZ 'epoch' + ($3::bigint * INTERVAL '1 millisecond')
+                         updated_at = TIMESTAMPTZ 'epoch' + ($4::bigint * INTERVAL '1 millisecond')
                      WHERE org_id = $1
                        AND run_id = $2
-                       AND status = $4",
+                       AND status = $5",
                     &[
                         &self.org_id(),
                         &run_id,
@@ -148,8 +152,8 @@ impl PgRunQueue {
             } else {
                 tx.execute(
                     "UPDATE run_steps
-                     SET status = $2,
-                         next_run_at = TIMESTAMPTZ 'epoch' + ($3::bigint * INTERVAL '1 millisecond'),
+                     SET status = $3,
+                         next_run_at = TIMESTAMPTZ 'epoch' + ($4::bigint * INTERVAL '1 millisecond'),
                          lease_id = NULL,
                          lease_owner = NULL,
                          lease_until = NULL,
@@ -157,10 +161,10 @@ impl PgRunQueue {
                          result_json = NULL,
                          error_text = NULL,
                          finished_at = NULL,
-                         updated_at = TIMESTAMPTZ 'epoch' + ($3::bigint * INTERVAL '1 millisecond')
+                         updated_at = TIMESTAMPTZ 'epoch' + ($4::bigint * INTERVAL '1 millisecond')
                      WHERE org_id = $1
                        AND run_id = $2
-                       AND status IN ($4, $5, $6)",
+                       AND status IN ($5, $6, $7)",
                     &[
                         &self.org_id(),
                         &run_id,

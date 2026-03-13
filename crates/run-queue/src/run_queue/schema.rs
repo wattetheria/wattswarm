@@ -9,7 +9,7 @@ impl PgRunQueue {
         client.batch_execute(
             r#"
 CREATE TABLE IF NOT EXISTS runs (
-  org_id TEXT NOT NULL DEFAULT 'bootstrap',
+  org_id TEXT NOT NULL DEFAULT '__unset_org__',
   run_id TEXT NOT NULL,
   status TEXT NOT NULL,
   task_type TEXT NOT NULL,
@@ -26,7 +26,7 @@ CREATE TABLE IF NOT EXISTS runs (
 );
 
 CREATE TABLE IF NOT EXISTS run_steps (
-  org_id TEXT NOT NULL DEFAULT 'bootstrap',
+  org_id TEXT NOT NULL DEFAULT '__unset_org__',
   step_id TEXT NOT NULL,
   run_id TEXT NOT NULL,
   agent_id TEXT NOT NULL,
@@ -56,7 +56,7 @@ CREATE TABLE IF NOT EXISTS run_steps (
 
 CREATE TABLE IF NOT EXISTS run_events (
   id BIGSERIAL PRIMARY KEY,
-  org_id TEXT NOT NULL DEFAULT 'bootstrap',
+  org_id TEXT NOT NULL DEFAULT '__unset_org__',
   run_id TEXT NOT NULL,
   event_type TEXT NOT NULL,
   payload_json TEXT NOT NULL,
@@ -73,19 +73,19 @@ BEGIN
     SELECT 1 FROM information_schema.columns
     WHERE table_schema = current_schema() AND table_name = 'runs' AND column_name = 'org_id'
   ) THEN
-    ALTER TABLE runs ADD COLUMN org_id TEXT NOT NULL DEFAULT 'bootstrap';
+    ALTER TABLE runs ADD COLUMN org_id TEXT NOT NULL DEFAULT '__unset_org__';
   END IF;
   IF NOT EXISTS (
     SELECT 1 FROM information_schema.columns
     WHERE table_schema = current_schema() AND table_name = 'run_steps' AND column_name = 'org_id'
   ) THEN
-    ALTER TABLE run_steps ADD COLUMN org_id TEXT NOT NULL DEFAULT 'bootstrap';
+    ALTER TABLE run_steps ADD COLUMN org_id TEXT NOT NULL DEFAULT '__unset_org__';
   END IF;
   IF NOT EXISTS (
     SELECT 1 FROM information_schema.columns
     WHERE table_schema = current_schema() AND table_name = 'run_events' AND column_name = 'org_id'
   ) THEN
-    ALTER TABLE run_events ADD COLUMN org_id TEXT NOT NULL DEFAULT 'bootstrap';
+    ALTER TABLE run_events ADD COLUMN org_id TEXT NOT NULL DEFAULT '__unset_org__';
   END IF;
 END $$;
 "#,
@@ -117,6 +117,13 @@ CREATE INDEX IF NOT EXISTS idx_run_steps_sched ON run_steps(org_id, status, next
 CREATE INDEX IF NOT EXISTS idx_run_steps_run_status ON run_steps(org_id, run_id, status);
 CREATE INDEX IF NOT EXISTS idx_run_steps_lease_until ON run_steps(org_id, lease_until);
 CREATE INDEX IF NOT EXISTS idx_run_events_run_id ON run_events(org_id, run_id, id DESC);
+"#,
+        )?;
+        client.batch_execute(
+            r#"
+ALTER TABLE runs ALTER COLUMN org_id SET DEFAULT '__unset_org__';
+ALTER TABLE run_steps ALTER COLUMN org_id SET DEFAULT '__unset_org__';
+ALTER TABLE run_events ALTER COLUMN org_id SET DEFAULT '__unset_org__';
 "#,
         )?;
         for column in ["created_at", "updated_at", "started_at", "finished_at"] {
