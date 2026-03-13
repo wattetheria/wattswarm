@@ -560,3 +560,82 @@ fn export_and_vote_checkpoint_membership_paths_work() {
         )
         .expect("put verifier result");
 }
+
+#[test]
+fn ensure_local_bootstrap_topology_scopes_default_org_and_rejects_duplicate_identity() {
+    let store = PgStore::open_in_memory().expect("open store");
+    let org_id = store
+        .ensure_local_bootstrap_topology("node-a", "pub-a", 1_700_000_000_000)
+        .expect("bootstrap local topology");
+    assert_eq!(org_id, "local:node-a:bootstrap");
+    assert_eq!(store.for_org(&org_id).org_id(), "local:node-a:bootstrap");
+
+    let err = store
+        .ensure_local_bootstrap_topology("node-b", "pub-a", 1_700_000_000_100)
+        .expect_err("duplicate public key should be rejected");
+    assert!(
+        err.to_string()
+            .contains("node identity conflict: node_id/public_key must be unique")
+    );
+    assert!(err.to_string().contains("node_seed.hex"));
+}
+
+#[test]
+fn membership_and_revocations_are_scoped_by_org() {
+    let store = PgStore::open_in_memory().expect("open store");
+    let local_org = store
+        .ensure_local_bootstrap_topology("node-a", "pub-a", 1_700_000_000_000)
+        .expect("bootstrap local topology");
+    let org_a = store.for_org(&local_org);
+    let org_b = store.for_org("local:node-a:other");
+
+    org_a
+        .put_membership("{\"members\":{\"node-a\":[\"FINALIZER\"]}}")
+        .expect("put membership org a");
+    assert_eq!(
+        org_a
+            .load_membership()
+            .expect("load membership org a")
+            .as_deref(),
+        Some("{\"members\":{\"node-a\":[\"FINALIZER\"]}}")
+    );
+    assert!(
+        org_b
+            .load_membership()
+            .expect("load membership org b")
+            .is_none(),
+        "membership should not bleed across orgs"
+    );
+
+    org_a
+        .put_event_revocation("evt-1", "bad event", "node-a", 1_700_000_000_100)
+        .expect("put event revocation org a");
+    assert!(org_a.is_event_revoked("evt-1").expect("revoked in org a"));
+    assert!(
+        !org_b
+            .is_event_revoked("evt-1")
+            .expect("not revoked in org b"),
+        "event revocation should be org-scoped"
+    );
+
+    org_a
+        .put_summary_revocation(
+            "summary-1",
+            "decision_memory",
+            "bad summary",
+            "node-a",
+            1_700_000_000_200,
+        )
+        .expect("put summary revocation org a");
+    assert!(
+        org_a
+            .is_summary_revoked("summary-1")
+            .expect("revoked in org a")
+    );
+    assert!(
+        !org_b
+            .is_summary_revoked("summary-1")
+            .expect("not revoked in org b"),
+        "summary revocation should be org-scoped"
+    );
+}

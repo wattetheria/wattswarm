@@ -9,10 +9,11 @@ impl PgStore {
             .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
         let seq: i64 = conn
             .query_row(
-                "INSERT INTO events(event_id, protocol_version, task_id, epoch, event_kind, author_node_id, created_at, event_json)
-                 VALUES ($1, $2, $3, $4, $5, $6, TIMESTAMPTZ 'epoch' + ($7::bigint * INTERVAL '1 millisecond'), $8)
+                "INSERT INTO events(org_id, event_id, protocol_version, task_id, epoch, event_kind, author_node_id, created_at, event_json)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, TIMESTAMPTZ 'epoch' + ($8::bigint * INTERVAL '1 millisecond'), $9)
                  RETURNING seq",
                 params![
+                    self.org_id(),
                     event.event_id,
                     event.protocol_version,
                     event.task_id,
@@ -33,9 +34,11 @@ impl PgStore {
             .conn
             .lock()
             .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
-        let seq = conn.query_row("SELECT COALESCE(MAX(seq), 0) FROM events", params![], |r| {
-            r.get::<_, i64>(0)
-        })?;
+        let seq = conn.query_row(
+            "SELECT COALESCE(MAX(seq), 0) FROM events WHERE org_id = $1",
+            params![self.org_id()],
+            |r| r.get::<_, i64>(0),
+        )?;
         Ok(seq as u64)
     }
 
@@ -50,11 +53,12 @@ impl PgStore {
         let mut stmt = conn.prepare(
             "SELECT protocol_version, COUNT(DISTINCT author_node_id) as node_count
              FROM events
-             WHERE author_node_id != $1
+             WHERE org_id = $1
+               AND author_node_id != $2
              GROUP BY protocol_version
              ORDER BY protocol_version ASC",
         )?;
-        let rows = stmt.query_map(params![local_node_id], |r| {
+        let rows = stmt.query_map(params![self.org_id(), local_node_id], |r| {
             Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as u32))
         })?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
@@ -66,9 +70,12 @@ impl PgStore {
             .conn
             .lock()
             .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
-        let mut stmt =
-            conn.prepare("SELECT seq, event_json FROM events WHERE seq > $1 ORDER BY seq ASC")?;
-        let rows = stmt.query_map(params![from_exclusive as i64], |row| {
+        let mut stmt = conn.prepare(
+            "SELECT seq, event_json FROM events
+             WHERE org_id = $1 AND seq > $2
+             ORDER BY seq ASC",
+        )?;
+        let rows = stmt.query_map(params![self.org_id(), from_exclusive as i64], |row| {
             let seq: i64 = row.get(0)?;
             let json: String = row.get(1)?;
             let event: Event = serde_json::from_str(&json).map_err(|e| {
@@ -87,18 +94,22 @@ impl PgStore {
             .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
         let mut stmt = conn.prepare(
             "SELECT seq, event_json FROM events
-             WHERE seq > $1
+             WHERE org_id = $1
+               AND seq > $2
              ORDER BY seq ASC
-             LIMIT $2",
+             LIMIT $3",
         )?;
-        let rows = stmt.query_map(params![from_exclusive as i64, limit as i64], |row| {
-            let seq: i64 = row.get(0)?;
-            let json: String = row.get(1)?;
-            let event: Event = serde_json::from_str(&json).map_err(|e| {
-                pg::Error::FromSqlConversionFailure(1, pg::types::Type::Text, Box::new(e))
-            })?;
-            Ok((seq as u64, event))
-        })?;
+        let rows = stmt.query_map(
+            params![self.org_id(), from_exclusive as i64, limit as i64],
+            |row| {
+                let seq: i64 = row.get(0)?;
+                let json: String = row.get(1)?;
+                let event: Event = serde_json::from_str(&json).map_err(|e| {
+                    pg::Error::FromSqlConversionFailure(1, pg::types::Type::Text, Box::new(e))
+                })?;
+                Ok((seq as u64, event))
+            },
+        )?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
             .map_err(Into::into)
     }
@@ -119,13 +130,19 @@ impl PgStore {
             .lock()
             .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
         conn.execute(
-            "INSERT INTO event_revocations(event_id, reason, revoked_by_node_id, revoked_at)
-             VALUES ($1, $2, $3, TIMESTAMPTZ 'epoch' + ($4::bigint * INTERVAL '1 millisecond'))
-             ON CONFLICT(event_id) DO UPDATE SET
+            "INSERT INTO event_revocations(org_id, event_id, reason, revoked_by_node_id, revoked_at)
+             VALUES ($1, $2, $3, $4, TIMESTAMPTZ 'epoch' + ($5::bigint * INTERVAL '1 millisecond'))
+             ON CONFLICT(org_id, event_id) DO UPDATE SET
                reason = excluded.reason,
                revoked_by_node_id = excluded.revoked_by_node_id,
                revoked_at = excluded.revoked_at",
-            params![event_id, reason, revoked_by_node_id, revoked_at as i64],
+            params![
+                self.org_id(),
+                event_id,
+                reason,
+                revoked_by_node_id,
+                revoked_at as i64
+            ],
         )?;
         Ok(())
     }
@@ -136,8 +153,8 @@ impl PgStore {
             .lock()
             .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
         let exists = conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM event_revocations WHERE event_id = $1)",
-            params![event_id],
+            "SELECT EXISTS(SELECT 1 FROM event_revocations WHERE org_id = $1 AND event_id = $2)",
+            params![self.org_id(), event_id],
             |r| r.get::<_, bool>(0),
         )?;
         Ok(exists)
@@ -156,14 +173,21 @@ impl PgStore {
             .lock()
             .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
         conn.execute(
-            "INSERT INTO summary_revocations(summary_id, summary_kind, reason, revoked_by_node_id, revoked_at)
-             VALUES ($1, $2, $3, $4, TIMESTAMPTZ 'epoch' + ($5::bigint * INTERVAL '1 millisecond'))
-             ON CONFLICT(summary_id) DO UPDATE SET
+            "INSERT INTO summary_revocations(org_id, summary_id, summary_kind, reason, revoked_by_node_id, revoked_at)
+             VALUES ($1, $2, $3, $4, $5, TIMESTAMPTZ 'epoch' + ($6::bigint * INTERVAL '1 millisecond'))
+             ON CONFLICT(org_id, summary_id) DO UPDATE SET
                summary_kind = excluded.summary_kind,
                reason = excluded.reason,
                revoked_by_node_id = excluded.revoked_by_node_id,
                revoked_at = excluded.revoked_at",
-            params![summary_id, summary_kind, reason, revoked_by_node_id, revoked_at as i64],
+            params![
+                self.org_id(),
+                summary_id,
+                summary_kind,
+                reason,
+                revoked_by_node_id,
+                revoked_at as i64
+            ],
         )?;
         Ok(())
     }
@@ -174,8 +198,8 @@ impl PgStore {
             .lock()
             .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
         let exists = conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM summary_revocations WHERE summary_id = $1)",
-            params![summary_id],
+            "SELECT EXISTS(SELECT 1 FROM summary_revocations WHERE org_id = $1 AND summary_id = $2)",
+            params![self.org_id(), summary_id],
             |r| r.get::<_, bool>(0),
         )?;
         Ok(exists)
@@ -224,35 +248,37 @@ impl PgStore {
             .conn
             .lock()
             .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
-        conn.execute_batch(
-            "
-            DELETE FROM task_projection;
-            DELETE FROM leases;
-            DELETE FROM candidates;
-            DELETE FROM verifier_results;
-            DELETE FROM evidence_added;
-            DELETE FROM evidence_available;
-            DELETE FROM vote_commits;
-            DELETE FROM vote_reveals;
-            DELETE FROM finalizations;
-            DELETE FROM checkpoints;
-            DELETE FROM membership_projection;
-            DELETE FROM decision_memory;
-            DELETE FROM evidence_summary;
-            DELETE FROM runtime_metrics;
-            DELETE FROM task_settlement;
-            DELETE FROM task_stage_usage;
-            DELETE FROM task_cost_reports;
-            DELETE FROM reputation_state;
-            DELETE FROM knowledge_lookups;
-            DELETE FROM reuse_blacklist;
-            DELETE FROM advisory_state;
-            DELETE FROM unknown_reason_observations;
-            DELETE FROM event_revocations;
-            DELETE FROM summary_revocations;
-            DELETE FROM penalized_nodes;
-            ",
-        )?;
+        let org_id = self.org_id().to_owned();
+        for table in [
+            "task_projection",
+            "leases",
+            "candidates",
+            "verifier_results",
+            "evidence_added",
+            "evidence_available",
+            "vote_commits",
+            "vote_reveals",
+            "finalizations",
+            "checkpoints",
+            "decision_memory",
+            "evidence_summary",
+            "runtime_metrics",
+            "task_settlement",
+            "task_stage_usage",
+            "task_cost_reports",
+            "reputation_state",
+            "knowledge_lookups",
+            "reuse_blacklist",
+            "unknown_reason_observations",
+            "imported_decision_memory",
+            "imported_reputation_state",
+            "membership_projection",
+            "event_revocations",
+            "summary_revocations",
+        ] {
+            let sql = format!("DELETE FROM {table} WHERE org_id = $1");
+            conn.execute(&sql, params![&org_id])?;
+        }
         Ok(())
     }
 }

@@ -43,13 +43,17 @@ pub(crate) fn ensure_run_queue_timestamp_column(
     Ok(())
 }
 
-pub(crate) fn step_counts_tx(tx: &mut Transaction<'_>, run_id: &str) -> Result<RunStepCounts> {
+pub(crate) fn step_counts_tx(
+    tx: &mut Transaction<'_>,
+    org_id: &str,
+    run_id: &str,
+) -> Result<RunStepCounts> {
     let rows = tx.query(
         "SELECT status, COUNT(1)
          FROM run_steps
-         WHERE run_id = $1
+         WHERE org_id = $1 AND run_id = $2
          GROUP BY status",
-        &[&run_id],
+        &[&org_id, &run_id],
     )?;
     Ok(accumulate_counts(rows))
 }

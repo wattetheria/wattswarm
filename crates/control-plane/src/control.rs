@@ -18,6 +18,47 @@ use uuid::Uuid;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeState {
     pub running: bool,
+    #[serde(default = "default_node_mode")]
+    pub mode: NodeMode,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum NodeMode {
+    Local,
+    Lan,
+    Network,
+}
+
+fn default_node_mode() -> NodeMode {
+    NodeMode::Local
+}
+
+impl Default for NodeMode {
+    fn default() -> Self {
+        Self::Local
+    }
+}
+
+impl NodeMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Local => "local",
+            Self::Lan => "lan",
+            Self::Network => "network",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "local" => Ok(Self::Local),
+            "lan" => Ok(Self::Lan),
+            "network" => Ok(Self::Network),
+            other => Err(anyhow!(
+                "unsupported node mode '{other}'; expected one of: local, lan, network"
+            )),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -56,6 +97,10 @@ pub fn executor_registry_path(state_dir: &Path) -> PathBuf {
     state_dir.join("executors.json")
 }
 
+pub fn node_state_path(state_dir: &Path) -> PathBuf {
+    state_dir.join("node_state.json")
+}
+
 pub fn discovered_peers_path(state_dir: &Path) -> PathBuf {
     state_dir.join("discovered_peers.json")
 }
@@ -64,9 +109,46 @@ pub fn local_node_id(state_dir: &Path) -> Result<String> {
     Ok(load_or_create_identity(&state_dir.join("node_seed.hex"))?.node_id())
 }
 
+pub fn resolve_node_mode(state_dir: &Path) -> Result<NodeMode> {
+    let state_path = node_state_path(state_dir);
+    if state_path.exists() {
+        let state: NodeState = serde_json::from_slice(&fs::read(&state_path)?)?;
+        return Ok(state.mode);
+    }
+    match env::var("WATTSWARM_NODE_MODE") {
+        Ok(value) => NodeMode::parse(&value),
+        Err(_) => Ok(NodeMode::Local),
+    }
+}
+
+pub fn write_node_state(state_dir: &Path, running: bool, mode: NodeMode) -> Result<()> {
+    fs::create_dir_all(state_dir)?;
+    fs::write(
+        node_state_path(state_dir),
+        serde_json::to_vec_pretty(&NodeState { running, mode })?,
+    )?;
+    Ok(())
+}
+
 pub fn open_node(state_dir: &Path, db_path: &Path) -> Result<Node> {
+    let mode = resolve_node_mode(state_dir)?;
+    open_node_in_mode(state_dir, db_path, mode)
+}
+
+pub fn open_node_in_mode(state_dir: &Path, db_path: &Path, mode: NodeMode) -> Result<Node> {
     let identity = load_or_create_identity(&state_dir.join("node_seed.hex"))?;
     let self_node_id = identity.node_id();
+    let now = chrono::Utc::now().timestamp_millis().max(0) as u64;
+    let store = PgStore::open(db_path)?;
+    let org_id = match mode {
+        NodeMode::Local => {
+            store.ensure_local_bootstrap_topology(&self_node_id, &self_node_id, now)?
+        }
+        NodeMode::Lan => store.ensure_lan_bootstrap_topology(&self_node_id, &self_node_id, now)?,
+        NodeMode::Network => {
+            store.resolve_network_bootstrap_topology(&self_node_id, &self_node_id, now)?
+        }
+    };
     let mut membership = Membership::new();
     for role in [
         Role::Proposer,
@@ -77,7 +159,7 @@ pub fn open_node(state_dir: &Path, db_path: &Path) -> Result<Node> {
         membership.grant(&identity.node_id(), role);
     }
 
-    let mut node = Node::new(identity, PgStore::open(db_path)?, membership)?;
+    let mut node = Node::new(identity, store.for_org(&org_id), membership)?;
     let replay_on_open = env::var("WATTSWARM_REPLAY_ON_OPEN").ok().is_some_and(|v| {
         let t = v.trim().to_ascii_lowercase();
         t == "1" || t == "true" || t == "yes"

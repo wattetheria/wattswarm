@@ -141,7 +141,9 @@ impl PgRunQueue {
                      ELSE s.error_text
                  END
              FROM runs r
-             WHERE s.run_id = r.run_id
+             WHERE s.org_id = $7
+               AND r.org_id = $7
+               AND s.run_id = r.run_id
                AND r.status IN ($3, $4, $5)
                AND s.status = $6
                AND s.lease_until IS NOT NULL
@@ -153,6 +155,7 @@ impl PgRunQueue {
                 &RUN_STATUS_RUNNING,
                 &RUN_STATUS_CANCELLING,
                 &STEP_STATUS_LEASED,
+                &self.org_id(),
             ],
         )?;
         Ok(recovered)
@@ -173,14 +176,16 @@ impl PgRunQueue {
             "SELECT s.step_id, s.run_id, s.agent_id, s.executor, s.profile, s.prompt, s.attempt, s.max_attempts,
                     r.task_type, r.shared_inputs_json, r.retry_policy_json, r.status
              FROM run_steps s
-             JOIN runs r ON r.run_id = s.run_id
-             WHERE r.status IN ($1, $2, $3)
-               AND s.status IN ($4, $5)
-               AND s.next_run_at <= TIMESTAMPTZ 'epoch' + ($6::bigint * INTERVAL '1 millisecond')
+             JOIN runs r ON r.org_id = s.org_id AND r.run_id = s.run_id
+             WHERE s.org_id = $1
+               AND r.status IN ($2, $3, $4)
+               AND s.status IN ($5, $6)
+               AND s.next_run_at <= TIMESTAMPTZ 'epoch' + ($7::bigint * INTERVAL '1 millisecond')
              ORDER BY s.priority DESC, s.next_run_at ASC, s.created_at ASC
-             LIMIT $7
+             LIMIT $8
              FOR UPDATE SKIP LOCKED",
             &[
+                &self.org_id(),
                 &RUN_STATUS_QUEUED,
                 &RUN_STATUS_RUNNING,
                 &RUN_STATUS_CANCELLING,
@@ -200,13 +205,14 @@ impl PgRunQueue {
             let lease_id = Uuid::new_v4().to_string();
             let updated = tx.execute(
                 "UPDATE run_steps
-                 SET status = $2,
-                     lease_id = $3,
-                     lease_owner = $4,
-                     lease_until = TIMESTAMPTZ 'epoch' + ($5::bigint * INTERVAL '1 millisecond'),
-                     attempt = attempt + 1, updated_at = TIMESTAMPTZ 'epoch' + ($6::bigint * INTERVAL '1 millisecond'), started_at = COALESCE(started_at, TIMESTAMPTZ 'epoch' + ($6::bigint * INTERVAL '1 millisecond'))
-                 WHERE step_id = $1",
+                 SET status = $3,
+                     lease_id = $4,
+                     lease_owner = $5,
+                     lease_until = TIMESTAMPTZ 'epoch' + ($6::bigint * INTERVAL '1 millisecond'),
+                     attempt = attempt + 1, updated_at = TIMESTAMPTZ 'epoch' + ($7::bigint * INTERVAL '1 millisecond'), started_at = COALESCE(started_at, TIMESTAMPTZ 'epoch' + ($7::bigint * INTERVAL '1 millisecond'))
+                 WHERE org_id = $1 AND step_id = $2",
                 &[
+                    &self.org_id(),
                     &step_id,
                     &STEP_STATUS_LEASED,
                     &lease_id,
@@ -220,9 +226,15 @@ impl PgRunQueue {
             }
             tx.execute(
                 "UPDATE runs
-                 SET status = $2, started_at = COALESCE(started_at, TIMESTAMPTZ 'epoch' + ($3::bigint * INTERVAL '1 millisecond')), updated_at = TIMESTAMPTZ 'epoch' + ($3::bigint * INTERVAL '1 millisecond')
-                 WHERE run_id = $1 AND status = $4",
-                &[&run_id, &RUN_STATUS_RUNNING, &now, &RUN_STATUS_QUEUED],
+                 SET status = $3, started_at = COALESCE(started_at, TIMESTAMPTZ 'epoch' + ($4::bigint * INTERVAL '1 millisecond')), updated_at = TIMESTAMPTZ 'epoch' + ($4::bigint * INTERVAL '1 millisecond')
+                 WHERE org_id = $1 AND run_id = $2 AND status = $5",
+                &[
+                    &self.org_id(),
+                    &run_id,
+                    &RUN_STATUS_RUNNING,
+                    &now,
+                    &RUN_STATUS_QUEUED,
+                ],
             )?;
 
             let shared_inputs_raw: String = row.get(9);
@@ -262,12 +274,13 @@ impl PgRunQueue {
         let mut tx = client.transaction()?;
         let updated = tx.execute(
             "UPDATE run_steps
-             SET status = $3, lease_id = NULL, lease_owner = NULL, lease_until = NULL,
-                 next_run_at = TIMESTAMPTZ 'epoch' + ($4::bigint * INTERVAL '1 millisecond'),
-                 error_text = $5,
-                 updated_at = TIMESTAMPTZ 'epoch' + ($6::bigint * INTERVAL '1 millisecond')
-             WHERE step_id = $1 AND lease_id = $2 AND status = $7",
+             SET status = $4, lease_id = NULL, lease_owner = NULL, lease_until = NULL,
+                 next_run_at = TIMESTAMPTZ 'epoch' + ($5::bigint * INTERVAL '1 millisecond'),
+                 error_text = $6,
+                 updated_at = TIMESTAMPTZ 'epoch' + ($7::bigint * INTERVAL '1 millisecond')
+             WHERE org_id = $1 AND step_id = $2 AND lease_id = $3 AND status = $8",
             &[
+                &self.org_id(),
                 &step.step_id,
                 &step.lease_id,
                 &STEP_STATUS_RETRY_WAIT,
@@ -307,11 +320,12 @@ impl PgRunQueue {
         let result_raw = result.map(serde_json::to_string).transpose()?;
         let updated = tx.execute(
             "UPDATE run_steps
-             SET status = $3, lease_id = NULL, lease_owner = NULL, lease_until = NULL,
-                 task_id = COALESCE($4, task_id), result_json = COALESCE($5, result_json),
-                 error_text = $6, updated_at = TIMESTAMPTZ 'epoch' + ($7::bigint * INTERVAL '1 millisecond'), finished_at = TIMESTAMPTZ 'epoch' + ($7::bigint * INTERVAL '1 millisecond')
-             WHERE step_id = $1 AND lease_id = $2 AND status = $8",
+             SET status = $4, lease_id = NULL, lease_owner = NULL, lease_until = NULL,
+                 task_id = COALESCE($5, task_id), result_json = COALESCE($6, result_json),
+                 error_text = $7, updated_at = TIMESTAMPTZ 'epoch' + ($8::bigint * INTERVAL '1 millisecond'), finished_at = TIMESTAMPTZ 'epoch' + ($8::bigint * INTERVAL '1 millisecond')
+             WHERE org_id = $1 AND step_id = $2 AND lease_id = $3 AND status = $9",
             &[
+                &self.org_id(),
                 &step.step_id,
                 &step.lease_id,
                 &status,
@@ -425,11 +439,12 @@ mod tests {
                 "SELECT EXISTS(
                     SELECT 1
                     FROM runs
-                    WHERE status IN ('QUEUED','RUNNING','CANCELLING')
+                    WHERE org_id = $1
+                      AND status IN ('QUEUED','RUNNING','CANCELLING')
                       AND run_id NOT LIKE 'worker-%'
                       AND run_id NOT LIKE 'admin-%'
                 )",
-                &[],
+                &[&queue.org_id()],
             )
             .ok();
         row.map(|r| r.get::<_, bool>(0)).unwrap_or(false)
@@ -491,13 +506,19 @@ mod tests {
 
     fn purge_worker_runs(queue: &PgRunQueue) {
         if let Ok(mut client) = queue.connect() {
-            let _ = client.execute("DELETE FROM runs WHERE run_id LIKE 'worker-%'", &[]);
+            let _ = client.execute(
+                "DELETE FROM runs WHERE org_id = $1 AND run_id LIKE 'worker-%'",
+                &[&queue.org_id()],
+            );
         }
     }
 
     fn cleanup_run(queue: &PgRunQueue, run_id: &str) {
         if let Ok(mut client) = queue.connect() {
-            let _ = client.execute("DELETE FROM runs WHERE run_id = $1", &[&run_id]);
+            let _ = client.execute(
+                "DELETE FROM runs WHERE org_id = $1 AND run_id = $2",
+                &[&queue.org_id(), &run_id],
+            );
         }
     }
 
@@ -585,8 +606,8 @@ mod tests {
         let mut client = queue.connect().expect("connect");
         let step_row = client
             .query_one(
-                "SELECT status, lease_owner, attempt FROM run_steps WHERE step_id = $1",
-                &[&first.step_id],
+                "SELECT status, lease_owner, attempt FROM run_steps WHERE org_id = $1 AND step_id = $2",
+                &[&queue.org_id(), &first.step_id],
             )
             .expect("step row");
         let step_status: String = step_row.get(0);
@@ -597,7 +618,10 @@ mod tests {
         assert_eq!(attempt, 1);
 
         let run_row = client
-            .query_one("SELECT status FROM runs WHERE run_id = $1", &[&run_id])
+            .query_one(
+                "SELECT status FROM runs WHERE org_id = $1 AND run_id = $2",
+                &[&queue.org_id(), &run_id],
+            )
             .expect("run row");
         let run_status: String = run_row.get(0);
         assert_eq!(run_status, RUN_STATUS_RUNNING);
@@ -632,9 +656,9 @@ mod tests {
         client
             .execute(
                 "UPDATE run_steps
-                 SET lease_until = TIMESTAMPTZ 'epoch' + ($2::bigint * INTERVAL '1 millisecond')
-                 WHERE step_id = $1",
-                &[&claimed.step_id, &0_i64],
+                 SET lease_until = TIMESTAMPTZ 'epoch' + ($3::bigint * INTERVAL '1 millisecond')
+                 WHERE org_id = $1 AND step_id = $2",
+                &[&queue.org_id(), &claimed.step_id, &0_i64],
             )
             .expect("expire lease");
 
@@ -648,8 +672,8 @@ mod tests {
 
         let row = client
             .query_one(
-                "SELECT status FROM run_steps WHERE step_id = $1",
-                &[&claimed.step_id],
+                "SELECT status FROM run_steps WHERE org_id = $1 AND step_id = $2",
+                &[&queue.org_id(), &claimed.step_id],
             )
             .expect("step row");
         let status: String = row.get(0);
@@ -683,8 +707,8 @@ mod tests {
         let mut client = queue.connect().expect("connect");
         client
             .execute(
-                "UPDATE runs SET status = $2 WHERE run_id = $1",
-                &[&run_id, &RUN_STATUS_CANCELLING],
+                "UPDATE runs SET status = $3 WHERE org_id = $1 AND run_id = $2",
+                &[&queue.org_id(), &run_id, &RUN_STATUS_CANCELLING],
             )
             .expect("set run cancelling");
         claimed.run_status = RUN_STATUS_CANCELLING.to_owned();
@@ -699,8 +723,8 @@ mod tests {
 
         let row = client
             .query_one(
-                "SELECT status FROM run_steps WHERE step_id = $1",
-                &[&claimed.step_id],
+                "SELECT status FROM run_steps WHERE org_id = $1 AND step_id = $2",
+                &[&queue.org_id(), &claimed.step_id],
             )
             .expect("step row");
         let status: String = row.get(0);
@@ -743,13 +767,14 @@ mod tests {
         client
             .execute(
                 "UPDATE run_steps
-                 SET status = $2,
-                     lease_id = $3,
+                 SET status = $3,
+                     lease_id = $4,
                      lease_owner = 'worker-b',
-                     lease_until = TIMESTAMPTZ 'epoch' + ($4::bigint * INTERVAL '1 millisecond'),
+                     lease_until = TIMESTAMPTZ 'epoch' + ($5::bigint * INTERVAL '1 millisecond'),
                      attempt = 2
-                 WHERE step_id = $1",
+                 WHERE org_id = $1 AND step_id = $2",
                 &[
+                    &queue.org_id(),
                     &claimed.step_id,
                     &STEP_STATUS_LEASED,
                     &lease_id,
@@ -775,8 +800,8 @@ mod tests {
 
         let step_row = client
             .query_one(
-                "SELECT status FROM run_steps WHERE step_id = $1",
-                &[&claimed_again.step_id],
+                "SELECT status FROM run_steps WHERE org_id = $1 AND step_id = $2",
+                &[&queue.org_id(), &claimed_again.step_id],
             )
             .expect("step row");
         let step_status: String = step_row.get(0);
@@ -827,23 +852,23 @@ mod tests {
         client
             .execute(
                 "UPDATE runs
-                 SET status = $2, updated_at = TIMESTAMPTZ 'epoch' + ($3::bigint * INTERVAL '1 millisecond')
-                 WHERE run_id = $1",
-                &[&run_id, &RUN_STATUS_RUNNING, &now],
+                 SET status = $3, updated_at = TIMESTAMPTZ 'epoch' + ($4::bigint * INTERVAL '1 millisecond')
+                 WHERE org_id = $1 AND run_id = $2",
+                &[&queue.org_id(), &run_id, &RUN_STATUS_RUNNING, &now],
             )
             .expect("mark running");
         client
             .execute(
                 "UPDATE run_steps
-                 SET status = $3,
+                 SET status = $4,
                      result_json = CASE
                        WHEN agent_id = 'agent-a' THEN '{\"candidate_output\":{\"decision\":\"approve\",\"answer\":\"x\"}}'
                        ELSE '{\"candidate_output\":{\"decision\":\"reject\",\"answer\":\"y\"}}'
                      END,
-                     updated_at = TIMESTAMPTZ 'epoch' + ($2::bigint * INTERVAL '1 millisecond'),
-                     finished_at = TIMESTAMPTZ 'epoch' + ($2::bigint * INTERVAL '1 millisecond')
-                 WHERE run_id = $1",
-                &[&run_id, &now, &STEP_STATUS_SUCCEEDED],
+                     updated_at = TIMESTAMPTZ 'epoch' + ($3::bigint * INTERVAL '1 millisecond'),
+                     finished_at = TIMESTAMPTZ 'epoch' + ($3::bigint * INTERVAL '1 millisecond')
+                 WHERE org_id = $1 AND run_id = $2",
+                &[&queue.org_id(), &run_id, &now, &STEP_STATUS_SUCCEEDED],
             )
             .expect("mark steps done");
 
@@ -912,23 +937,23 @@ mod tests {
         client
             .execute(
                 "UPDATE runs
-                 SET status = $2, updated_at = TIMESTAMPTZ 'epoch' + ($3::bigint * INTERVAL '1 millisecond')
-                 WHERE run_id = $1",
-                &[&run_id, &RUN_STATUS_RUNNING, &now],
+                 SET status = $3, updated_at = TIMESTAMPTZ 'epoch' + ($4::bigint * INTERVAL '1 millisecond')
+                 WHERE org_id = $1 AND run_id = $2",
+                &[&queue.org_id(), &run_id, &RUN_STATUS_RUNNING, &now],
             )
             .expect("mark running");
         client
             .execute(
                 "UPDATE run_steps
-                 SET status = $3,
+                 SET status = $4,
                      result_json = CASE
                        WHEN agent_id = 'agent-a' THEN '{\"candidate_output\":{\"decision\":\"approve\",\"answer\":\"x\"},\"evidence_digests\":[\"ev-a-1\"]}'
                        ELSE '{\"candidate_output\":{\"decision\":\"approve\",\"answer\":\"x\"},\"evidence_digests\":[\"ev-b-1\"]}'
                      END,
-                     updated_at = TIMESTAMPTZ 'epoch' + ($2::bigint * INTERVAL '1 millisecond'),
-                     finished_at = TIMESTAMPTZ 'epoch' + ($2::bigint * INTERVAL '1 millisecond')
-                 WHERE run_id = $1",
-                &[&run_id, &now, &STEP_STATUS_SUCCEEDED],
+                     updated_at = TIMESTAMPTZ 'epoch' + ($3::bigint * INTERVAL '1 millisecond'),
+                     finished_at = TIMESTAMPTZ 'epoch' + ($3::bigint * INTERVAL '1 millisecond')
+                 WHERE org_id = $1 AND run_id = $2",
+                &[&queue.org_id(), &run_id, &now, &STEP_STATUS_SUCCEEDED],
             )
             .expect("mark steps done");
 
@@ -949,8 +974,8 @@ mod tests {
 
         let signal_row = client
             .query_one(
-                "SELECT shared_inputs_json FROM runs WHERE run_id = $1",
-                &[&run_id],
+                "SELECT shared_inputs_json FROM runs WHERE org_id = $1 AND run_id = $2",
+                &[&queue.org_id(), &run_id],
             )
             .expect("shared inputs");
         let shared_inputs_raw: String = signal_row.get(0);

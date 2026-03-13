@@ -107,6 +107,7 @@ fn cli_node_lifecycle_and_log_head() {
         .assert()
         .success()
         .stdout(predicate::str::contains("\"running\":true"))
+        .stdout(predicate::str::contains("\"mode\":\"local\""))
         .stdout(predicate::str::contains("\"local_protocol_version\""));
 
     cmd(schema.as_str())
@@ -132,6 +133,41 @@ fn cli_node_lifecycle_and_log_head() {
         ])
         .assert()
         .success();
+}
+
+#[test]
+fn cli_node_up_accepts_lan_mode() {
+    let dir = tempdir().unwrap();
+    let state_dir = dir.path().join("state");
+    let store = "test.state";
+    let schema = CliSchemaGuard::new();
+
+    cmd(schema.as_str())
+        .args([
+            "--state-dir",
+            state_dir.to_str().unwrap(),
+            "--store",
+            store,
+            "node",
+            "up",
+            "--mode",
+            "lan",
+        ])
+        .assert()
+        .success();
+
+    cmd(schema.as_str())
+        .args([
+            "--state-dir",
+            state_dir.to_str().unwrap(),
+            "--store",
+            store,
+            "node",
+            "status",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"mode\":\"lan\""));
 }
 
 #[test]

@@ -2,6 +2,7 @@ use serde_json::json;
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 use uuid::Uuid;
 use wattswarm_control_plane::control::add_discovered_peer_endpoint;
 use wattswarm_control_plane::crypto::NodeIdentity;
@@ -833,6 +834,10 @@ fn anti_entropy_syncs_missed_event_without_live_publish() {
     let mut contract = sample_contract("task-anti-entropy", policy_hash);
     contract.inputs = json!({"prompt":"catch me via anti entropy"});
     node_a.submit_task(contract, 1, 100).expect("submit task");
+
+    // The bridge only re-requests anti-entropy after the configured interval
+    // elapses following the initial empty backfill on connect.
+    std::thread::sleep(Duration::from_secs(16));
 
     let mut synced = false;
     for _ in 0..4_096 {

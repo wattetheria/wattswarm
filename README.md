@@ -78,6 +78,37 @@ WattSwarm now treats node-local storage as layered storage:
 This split is local to one node. Nodes do not synchronize PostgreSQL databases with each other.
 Inter-node sync remains protocol-driven: signed events, checkpoint metadata, summaries, and artifact references are exchanged over the network, then re-applied into each node's local store.
 
+## Network And Org Context
+
+WattSwarm now separates:
+
+- `network`: the outer boundary (`local` or shared network)
+- `org`: the swarm/emergence container inside that network
+- `node`: the runtime host that stores local replicas and executes agents
+
+Registry tables now live in PostgreSQL:
+
+- `network_registry`
+- `network_params`
+- `node_registry`
+- `node_network_membership`
+- `org_registry`
+
+Core swarm projection tables now carry `org_id`. The org then resolves back to its network through `org_registry.network_id`.
+
+Local mode keeps backward-compatible behavior by auto-bootstrapping:
+
+- `network_id = local:<node_id>`
+- default org id = `local:<node_id>:bootstrap`
+
+So local runs still behave like a single self-contained swarm, but the storage model is now ready for multiple org contexts without mixing decision memory, reputation, or settlement data.
+
+Node identity reminder:
+
+- `node_id` is derived from the node Ed25519 public key
+- `node_registry.node_id` and `node_registry.public_key` are unique
+- if the same `node_seed.hex` is copied into multiple nodes, registry bootstrap now raises a clear conflict error instead of silently accepting a duplicate identity
+
 ## Network Layer
 
 The workspace now includes dedicated crates and a control-plane bridge for node-local storage plus live inter-node sync:

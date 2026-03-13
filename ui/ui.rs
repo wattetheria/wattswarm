@@ -1,6 +1,7 @@
 use crate::control::{
-    ExecutorRegistryEntry, NodeState, RealTaskRunRequest, executor_registry_path,
-    load_executor_registry, local_node_id, open_node, run_real_task_flow, save_executor_registry,
+    ExecutorRegistryEntry, NodeMode, NodeState, RealTaskRunRequest, executor_registry_path,
+    load_executor_registry, local_node_id, node_state_path, open_node, resolve_node_mode,
+    run_real_task_flow, save_executor_registry, write_node_state,
 };
 use crate::swarm_dashboard_engine::{SwarmDashboardState, build_dashboard_state, tick_real_swarm};
 use crate::swarm_dashboard_template::SWARM_DASHBOARD_HTML;
@@ -181,11 +182,8 @@ async fn node_up(State(state): State<UiServerState>) -> Result<Json<Value>, ApiE
     let state_clone = state.clone();
     run_blocking(move || -> Result<()> {
         let node = open_node(&state_clone.state_dir, &state_clone.db_path)?;
-        let state_path = state_clone.state_dir.join("node_state.json");
-        fs::write(
-            state_path,
-            serde_json::to_vec_pretty(&NodeState { running: true })?,
-        )?;
+        let mode = resolve_node_mode(&state_clone.state_dir)?;
+        write_node_state(&state_clone.state_dir, true, mode)?;
         if crate::network_bridge::network_enabled_from_env() {
             crate::udp_announce::announce_startup("node-up-api", None, Some(&node.node_id()));
         }
@@ -196,11 +194,8 @@ async fn node_up(State(state): State<UiServerState>) -> Result<Json<Value>, ApiE
 }
 
 async fn node_down(State(state): State<UiServerState>) -> Result<Json<Value>, ApiError> {
-    let state_path = state.state_dir.join("node_state.json");
-    fs::write(
-        state_path,
-        serde_json::to_vec_pretty(&NodeState { running: false })?,
-    )?;
+    let mode = resolve_node_mode(&state.state_dir)?;
+    write_node_state(&state.state_dir, false, mode)?;
     Ok(Json(json!({"ok": true})))
 }
 
@@ -208,11 +203,14 @@ async fn node_status(State(state): State<UiServerState>) -> Result<Json<Value>, 
     let state_clone = state.clone();
     let (running, dist) =
         run_blocking(move || -> Result<(bool, serde_json::Map<String, Value>)> {
-            let state_path = state_clone.state_dir.join("node_state.json");
+            let state_path = node_state_path(&state_clone.state_dir);
             let runtime_state: NodeState = if state_path.exists() {
                 serde_json::from_slice(&fs::read(state_path)?)?
             } else {
-                NodeState { running: false }
+                NodeState {
+                    running: false,
+                    mode: NodeMode::Local,
+                }
             };
             let node = open_node(&state_clone.state_dir, &state_clone.db_path)?;
             let peers = node
@@ -228,6 +226,7 @@ async fn node_status(State(state): State<UiServerState>) -> Result<Json<Value>, 
     Ok(Json(json!({
         "ok": true,
         "running": running,
+        "mode": resolve_node_mode(&state.state_dir)?.as_str(),
         "local_protocol_version": crate::constants::LOCAL_PROTOCOL_VERSION,
         "peer_protocol_distribution": dist
     })))

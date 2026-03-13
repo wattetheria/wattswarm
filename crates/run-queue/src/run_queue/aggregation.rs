@@ -123,20 +123,23 @@ impl NullReason {
 
 pub(crate) fn build_run_summary_tx(
     tx: &mut Transaction<'_>,
+    org_id: &str,
     run_id: &str,
     final_status: &str,
     counts: &super::types::RunStepCounts,
 ) -> Result<RunSummaryOutput> {
-    let aggregation_policy = load_aggregation_policy(tx, run_id)?;
-    let tie_reexplore_state = load_reexplore_state(tx, run_id, RUN_TIE_REEXPLORE_TRIGGERED)?;
-    let null_reexplore_state = load_reexplore_state(tx, run_id, RUN_NULL_REEXPLORE_TRIGGERED)?;
+    let aggregation_policy = load_aggregation_policy(tx, org_id, run_id)?;
+    let tie_reexplore_state =
+        load_reexplore_state(tx, org_id, run_id, RUN_TIE_REEXPLORE_TRIGGERED)?;
+    let null_reexplore_state =
+        load_reexplore_state(tx, org_id, run_id, RUN_NULL_REEXPLORE_TRIGGERED)?;
 
     let step_rows = tx.query(
         "SELECT step_id, agent_id, executor, profile, status, attempt, task_id, result_json, error_text
          FROM run_steps
-         WHERE run_id = $1
+         WHERE org_id = $1 AND run_id = $2
          ORDER BY priority DESC, step_id ASC",
-        &[&run_id],
+        &[&org_id, &run_id],
     )?;
 
     let mut entries = Vec::with_capacity(step_rows.len());
@@ -517,11 +520,15 @@ pub(crate) fn build_run_summary_tx(
     })
 }
 
-fn load_aggregation_policy(tx: &mut Transaction<'_>, run_id: &str) -> Result<AggregationPolicy> {
+fn load_aggregation_policy(
+    tx: &mut Transaction<'_>,
+    org_id: &str,
+    run_id: &str,
+) -> Result<AggregationPolicy> {
     let policy = tx
         .query_opt(
-            "SELECT aggregation_policy_json FROM runs WHERE run_id = $1",
-            &[&run_id],
+            "SELECT aggregation_policy_json FROM runs WHERE org_id = $1 AND run_id = $2",
+            &[&org_id, &run_id],
         )?
         .and_then(|row| {
             let raw: String = row.get(0);
@@ -543,14 +550,15 @@ fn load_aggregation_policy(tx: &mut Transaction<'_>, run_id: &str) -> Result<Agg
 
 fn load_reexplore_state(
     tx: &mut Transaction<'_>,
+    org_id: &str,
     run_id: &str,
     event_type: &str,
 ) -> Result<ReExploreState> {
     let iteration = tx.query_one(
         "SELECT COUNT(1)
          FROM run_events
-         WHERE run_id = $1 AND event_type = $2",
-        &[&run_id, &event_type],
+         WHERE org_id = $1 AND run_id = $2 AND event_type = $3",
+        &[&org_id, &run_id, &event_type],
     )?;
     let iteration = iteration.get::<_, i64>(0).max(0) as u32;
 
@@ -562,10 +570,10 @@ fn load_reexplore_state(
     let latest_payload = tx.query_opt(
         "SELECT payload_json
          FROM run_events
-         WHERE run_id = $1 AND event_type = $2
+         WHERE org_id = $1 AND run_id = $2 AND event_type = $3
          ORDER BY id DESC
          LIMIT 1",
-        &[&run_id, &event_type],
+        &[&org_id, &run_id, &event_type],
     )?;
     let Some(row) = latest_payload else {
         return Ok(state);

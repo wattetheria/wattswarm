@@ -14,8 +14,8 @@ impl PgStore {
             "SELECT runtime_id, profile_id, stability_reputation, quality_reputation,
                     (EXTRACT(EPOCH FROM last_updated_at) * 1000)::BIGINT AS last_updated_at
              FROM reputation_state
-             WHERE runtime_id = $1 AND profile_id = $2",
-            params![runtime_id, profile_id],
+             WHERE org_id = $1 AND runtime_id = $2 AND profile_id = $3",
+            params![self.org_id(), runtime_id, profile_id],
             |r| {
                 Ok(ReputationSnapshotRow {
                     runtime_id: r.get(0)?,
@@ -45,17 +45,19 @@ impl PgStore {
                 SELECT runtime_id, profile_id, stability_reputation, quality_reputation,
                        (EXTRACT(EPOCH FROM last_updated_at) * 1000)::BIGINT AS last_updated_at_ms
                   FROM reputation_state
-                 WHERE runtime_id = $1 AND profile_id = $2
+                 WHERE org_id = $1 AND runtime_id = $2 AND profile_id = $3
                 UNION ALL
                 SELECT runtime_id, profile_id, stability_reputation, quality_reputation,
                        (EXTRACT(EPOCH FROM last_updated_at) * 1000)::BIGINT AS last_updated_at_ms
                   FROM imported_reputation_state imported_rs
-                 WHERE runtime_id = $1
-                   AND profile_id = $2
+                 WHERE org_id = $1
+                   AND runtime_id = $2
+                   AND profile_id = $3
                    AND revoked = FALSE
                    AND NOT EXISTS (
                         SELECT 1 FROM summary_revocations revoked_summary
-                        WHERE revoked_summary.summary_id = imported_rs.summary_id
+                        WHERE revoked_summary.org_id = $1
+                          AND revoked_summary.summary_id = imported_rs.summary_id
                    )
                    AND NOT EXISTS (
                         SELECT 1 FROM penalized_nodes penalized
@@ -65,7 +67,7 @@ impl PgStore {
              ) merged
              ORDER BY last_updated_at_ms DESC
              LIMIT 1",
-            params![runtime_id, profile_id],
+            params![self.org_id(), runtime_id, profile_id],
             |r| {
             Ok(ReputationSnapshotRow {
                 runtime_id: r.get(0)?,
@@ -92,10 +94,11 @@ impl PgStore {
             "SELECT runtime_id, profile_id, stability_reputation, quality_reputation,
                     (EXTRACT(EPOCH FROM last_updated_at) * 1000)::BIGINT AS last_updated_at
              FROM reputation_state
+             WHERE org_id = $1
              ORDER BY last_updated_at DESC
-             LIMIT $1",
+             LIMIT $2",
         )?;
-        let rows = stmt.query_map(params![limit as i64], |r| {
+        let rows = stmt.query_map(params![self.org_id(), limit as i64], |r| {
             Ok(ReputationSnapshotRow {
                 runtime_id: r.get(0)?,
                 profile_id: r.get(1)?,
@@ -119,14 +122,17 @@ impl PgStore {
                 SELECT runtime_id, profile_id, stability_reputation, quality_reputation,
                        (EXTRACT(EPOCH FROM last_updated_at) * 1000)::BIGINT AS last_updated_at_ms
                   FROM reputation_state
+                 WHERE org_id = $1
                 UNION ALL
                 SELECT runtime_id, profile_id, stability_reputation, quality_reputation,
                        (EXTRACT(EPOCH FROM last_updated_at) * 1000)::BIGINT AS last_updated_at_ms
                   FROM imported_reputation_state imported_rs
-                 WHERE revoked = FALSE
+                 WHERE org_id = $1
+                   AND revoked = FALSE
                    AND NOT EXISTS (
                         SELECT 1 FROM summary_revocations revoked_summary
-                        WHERE revoked_summary.summary_id = imported_rs.summary_id
+                        WHERE revoked_summary.org_id = $1
+                          AND revoked_summary.summary_id = imported_rs.summary_id
                    )
                    AND NOT EXISTS (
                         SELECT 1 FROM penalized_nodes penalized
@@ -135,9 +141,9 @@ impl PgStore {
                    )
              ) merged
              ORDER BY last_updated_at_ms DESC
-             LIMIT $1",
+             LIMIT $2",
         )?;
-        let rows = stmt.query_map(params![limit as i64], |r| {
+        let rows = stmt.query_map(params![self.org_id(), limit as i64], |r| {
             Ok(ReputationSnapshotRow {
                 runtime_id: r.get(0)?,
                 profile_id: r.get(1)?,
@@ -163,14 +169,15 @@ impl PgStore {
             .lock()
             .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
         conn.execute(
-            "INSERT INTO reputation_state(runtime_id, profile_id, stability_reputation, quality_reputation, last_updated_at)
-             VALUES ($1, $2, $3, $4, TIMESTAMPTZ 'epoch' + ($5::bigint * INTERVAL '1 millisecond'))
-             ON CONFLICT(runtime_id, profile_id) DO UPDATE SET
+            "INSERT INTO reputation_state(org_id, runtime_id, profile_id, stability_reputation, quality_reputation, last_updated_at)
+             VALUES ($1, $2, $3, $4, $5, TIMESTAMPTZ 'epoch' + ($6::bigint * INTERVAL '1 millisecond'))
+             ON CONFLICT(org_id, runtime_id, profile_id) DO UPDATE SET
                stability_reputation = excluded.stability_reputation,
                quality_reputation = excluded.quality_reputation,
                last_updated_at = excluded.last_updated_at
              WHERE reputation_state.last_updated_at <= excluded.last_updated_at",
             params![
+                self.org_id(),
                 runtime_id,
                 profile_id,
                 stability_reputation,
@@ -192,15 +199,16 @@ impl PgStore {
             .lock()
             .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
         conn.execute(
-            "INSERT INTO imported_reputation_state(summary_id, source_node_id, runtime_id, profile_id, stability_reputation, quality_reputation, last_updated_at, revoked)
-             VALUES ($1, $2, $3, $4, $5, $6, TIMESTAMPTZ 'epoch' + ($7::bigint * INTERVAL '1 millisecond'), FALSE)
-             ON CONFLICT(summary_id, runtime_id, profile_id) DO UPDATE SET
+            "INSERT INTO imported_reputation_state(org_id, summary_id, source_node_id, runtime_id, profile_id, stability_reputation, quality_reputation, last_updated_at, revoked)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, TIMESTAMPTZ 'epoch' + ($8::bigint * INTERVAL '1 millisecond'), FALSE)
+             ON CONFLICT(org_id, summary_id, runtime_id, profile_id) DO UPDATE SET
                source_node_id = excluded.source_node_id,
                stability_reputation = excluded.stability_reputation,
                quality_reputation = excluded.quality_reputation,
                last_updated_at = excluded.last_updated_at,
                revoked = FALSE",
             params![
+                self.org_id(),
                 summary_id,
                 source_node_id,
                 entry.runtime_id,
@@ -219,8 +227,8 @@ impl PgStore {
             .lock()
             .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
         conn.execute(
-            "UPDATE imported_reputation_state SET revoked = TRUE WHERE summary_id = $1",
-            params![summary_id],
+            "UPDATE imported_reputation_state SET revoked = TRUE WHERE org_id = $1 AND summary_id = $2",
+            params![self.org_id(), summary_id],
         )?;
         Ok(())
     }
@@ -231,8 +239,8 @@ impl PgStore {
             .lock()
             .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
         conn.execute(
-            "UPDATE imported_reputation_state SET revoked = TRUE WHERE source_node_id = $1",
-            params![source_node_id],
+            "UPDATE imported_reputation_state SET revoked = TRUE WHERE org_id = $1 AND source_node_id = $2",
+            params![self.org_id(), source_node_id],
         )?;
         Ok(())
     }
@@ -349,9 +357,10 @@ impl PgStore {
             .lock()
             .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
         conn.execute(
-            "INSERT INTO unknown_reason_observations(task_id, unknown_reason_code, peer_protocol_version, local_protocol_version, author_node_id, observed_at)
-             VALUES ($1, $2, $3, $4, $5, TIMESTAMPTZ 'epoch' + ($6::bigint * INTERVAL '1 millisecond'))",
+            "INSERT INTO unknown_reason_observations(org_id, task_id, unknown_reason_code, peer_protocol_version, local_protocol_version, author_node_id, observed_at)
+             VALUES ($1, $2, $3, $4, $5, $6, TIMESTAMPTZ 'epoch' + ($7::bigint * INTERVAL '1 millisecond'))",
             params![
+                self.org_id(),
                 task_id,
                 unknown_reason_code as i64,
                 peer_protocol_version,
@@ -377,10 +386,12 @@ impl PgStore {
                         latency_samples_json, reject_reason_distribution, cost_units,
                         reuse_hit_rate_exact, reuse_hit_rate_similar, reuse_candidate_accept_rate
                  FROM runtime_metrics
-                 WHERE runtime_id = $1 AND profile_id = $2 AND task_type = $3
-                   AND window_start = TIMESTAMPTZ 'epoch' + ($4::bigint * INTERVAL '1 millisecond')
-                   AND window_end = TIMESTAMPTZ 'epoch' + ($5::bigint * INTERVAL '1 millisecond')",
+                 WHERE org_id = $1
+                   AND runtime_id = $2 AND profile_id = $3 AND task_type = $4
+                   AND window_start = TIMESTAMPTZ 'epoch' + ($5::bigint * INTERVAL '1 millisecond')
+                   AND window_end = TIMESTAMPTZ 'epoch' + ($6::bigint * INTERVAL '1 millisecond')",
                 params![
+                    self.org_id(),
                     obs.runtime_id,
                     obs.profile_id,
                     obs.task_type,
@@ -510,7 +521,7 @@ impl PgStore {
 
         conn.execute(
             "INSERT INTO runtime_metrics(
-                runtime_id, profile_id, task_type, window_start, window_end,
+                org_id, runtime_id, profile_id, task_type, window_start, window_end,
                 finalize_rate, timeout_rate, crash_rate, invalid_output_rate,
                 median_latency_ms, cost_units, reject_reason_distribution,
                 sample_count, finalize_count, timeout_count, crash_count, invalid_output_count,
@@ -520,13 +531,13 @@ impl PgStore {
                 cost_units_per_finalized_task_p50, cost_units_per_finalized_task_p95,
                 verify_cost_ratio, invalid_event_reject_count, fork_prevented_count, da_fetch_fail_rate
              ) VALUES (
-                $1, $2, $3,
-                TIMESTAMPTZ 'epoch' + ($4::bigint * INTERVAL '1 millisecond'),
+                $1, $2, $3, $4,
                 TIMESTAMPTZ 'epoch' + ($5::bigint * INTERVAL '1 millisecond'),
-                $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18,
-                $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30
+                TIMESTAMPTZ 'epoch' + ($6::bigint * INTERVAL '1 millisecond'),
+                $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19,
+                $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31
              )
-             ON CONFLICT(runtime_id, profile_id, task_type, window_start, window_end) DO UPDATE SET
+             ON CONFLICT(org_id, runtime_id, profile_id, task_type, window_start, window_end) DO UPDATE SET
                 finalize_rate = excluded.finalize_rate,
                 timeout_rate = excluded.timeout_rate,
                 crash_rate = excluded.crash_rate,
@@ -553,6 +564,7 @@ impl PgStore {
                 fork_prevented_count = excluded.fork_prevented_count,
                 da_fetch_fail_rate = excluded.da_fetch_fail_rate",
             params![
+                self.org_id(),
                 obs.runtime_id,
                 obs.profile_id,
                 obs.task_type,
@@ -603,8 +615,8 @@ impl PgStore {
         let existing = conn
             .query_row(
                 "SELECT stability_reputation, quality_reputation FROM reputation_state
-                 WHERE runtime_id = $1 AND profile_id = $2",
-                params![runtime_id, profile_id],
+                 WHERE org_id = $1 AND runtime_id = $2 AND profile_id = $3",
+                params![self.org_id(), runtime_id, profile_id],
                 |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)),
             )
             .optional()?;
@@ -613,13 +625,14 @@ impl PgStore {
             None => (0, 0),
         };
         conn.execute(
-            "INSERT INTO reputation_state(runtime_id, profile_id, stability_reputation, quality_reputation, last_updated_at)
-             VALUES ($1, $2, $3, $4, TIMESTAMPTZ 'epoch' + ($5::bigint * INTERVAL '1 millisecond'))
-             ON CONFLICT(runtime_id, profile_id) DO UPDATE SET
+            "INSERT INTO reputation_state(org_id, runtime_id, profile_id, stability_reputation, quality_reputation, last_updated_at)
+             VALUES ($1, $2, $3, $4, $5, TIMESTAMPTZ 'epoch' + ($6::bigint * INTERVAL '1 millisecond'))
+             ON CONFLICT(org_id, runtime_id, profile_id) DO UPDATE SET
                stability_reputation = excluded.stability_reputation,
                quality_reputation = excluded.quality_reputation,
                last_updated_at = excluded.last_updated_at",
             params![
+                self.org_id(),
                 runtime_id,
                 profile_id,
                 stability.saturating_add(stability_delta_units),

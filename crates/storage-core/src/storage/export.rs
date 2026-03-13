@@ -14,16 +14,16 @@ impl PgStore {
                     winning_candidate_hash, output_digest, result_summary, quorum_result_json,
                     reason_codes_json, reason_details, policy_snapshot_digest, task_type,
                     input_digest, output_schema_digest, policy_id, policy_params_digest
-             FROM decision_memory WHERE task_id = $1 ORDER BY epoch ASC",
-            params![task_id],
+             FROM decision_memory WHERE org_id = $1 AND task_id = $2 ORDER BY epoch ASC",
+            params![self.org_id(), task_id],
         )?;
         let evidence_summary = query_table_json(
             &conn,
             "SELECT cid, mime, size_bytes, source_hint_digest,
                     (EXTRACT(EPOCH FROM added_at) * 1000)::BIGINT AS added_at,
                     availability_confirmations_count
-             FROM evidence_summary ORDER BY added_at DESC LIMIT 200",
-            params![],
+             FROM evidence_summary WHERE org_id = $1 ORDER BY added_at DESC LIMIT 200",
+            params![self.org_id()],
         )?;
         let runtime_metrics = query_table_json(
             &conn,
@@ -31,8 +31,8 @@ impl PgStore {
                     (EXTRACT(EPOCH FROM window_start) * 1000)::BIGINT AS window_start,
                     (EXTRACT(EPOCH FROM window_end) * 1000)::BIGINT AS window_end,
                     finalize_rate, timeout_rate, crash_rate, invalid_output_rate, median_latency_ms, cost_units, reject_reason_distribution, sample_count, finalize_count, timeout_count, crash_count, invalid_output_count, reuse_hit_rate_exact, reuse_hit_rate_similar, reuse_candidate_accept_rate, time_to_finality_p50, time_to_finality_p95, expired_rate, cost_units_per_finalized_task_p50, cost_units_per_finalized_task_p95, verify_cost_ratio, invalid_event_reject_count, fork_prevented_count, da_fetch_fail_rate
-             FROM runtime_metrics ORDER BY window_end DESC LIMIT 200",
-            params![],
+             FROM runtime_metrics WHERE org_id = $1 ORDER BY window_end DESC LIMIT 200",
+            params![self.org_id()],
         )?;
         let task_settlement = query_table_json(
             &conn,
@@ -43,21 +43,21 @@ impl PgStore {
                     CASE WHEN bad_feedback_at IS NULL THEN NULL ELSE (EXTRACT(EPOCH FROM bad_feedback_at) * 1000)::BIGINT END AS bad_feedback_at,
                     implicit_settled,
                     CASE WHEN implicit_settled_at IS NULL THEN NULL ELSE (EXTRACT(EPOCH FROM implicit_settled_at) * 1000)::BIGINT END AS implicit_settled_at
-             FROM task_settlement WHERE task_id = $1 ORDER BY epoch ASC",
-            params![task_id],
+             FROM task_settlement WHERE org_id = $1 AND task_id = $2 ORDER BY epoch ASC",
+            params![self.org_id(), task_id],
         )?;
         let task_cost_reports = query_table_json(
             &conn,
             "SELECT task_id, epoch, cost_units_by_stage_json, latency_by_stage_json, evidence_fetch_bytes, events_emitted_count, cache_hit_rate
-             FROM task_cost_reports WHERE task_id = $1 ORDER BY epoch ASC",
-            params![task_id],
+             FROM task_cost_reports WHERE org_id = $1 AND task_id = $2 ORDER BY epoch ASC",
+            params![self.org_id(), task_id],
         )?;
         let reputation_state_raw = query_table_json(
             &conn,
             "SELECT runtime_id, profile_id, stability_reputation, quality_reputation,
                     (EXTRACT(EPOCH FROM last_updated_at) * 1000)::BIGINT AS last_updated_at
-             FROM reputation_state ORDER BY last_updated_at DESC LIMIT 200",
-            params![],
+             FROM reputation_state WHERE org_id = $1 ORDER BY last_updated_at DESC LIMIT 200",
+            params![self.org_id()],
         )?;
         let reputation_state = with_reputation_decimal(reputation_state_raw);
         let knowledge_lookups = query_table_json(
@@ -65,8 +65,8 @@ impl PgStore {
             "SELECT task_id, task_type, input_digest,
                     (EXTRACT(EPOCH FROM lookup_time) * 1000)::BIGINT AS lookup_time,
                     hit_count, exact_hit_count, similar_hit_count, hits_digest, reuse_applied
-             FROM knowledge_lookups WHERE task_id = $1 ORDER BY lookup_time DESC",
-            params![task_id],
+             FROM knowledge_lookups WHERE org_id = $1 AND task_id = $2 ORDER BY lookup_time DESC",
+            params![self.org_id(), task_id],
         )?;
         let advisory_state = query_table_json(
             &conn,
@@ -83,8 +83,8 @@ impl PgStore {
             &conn,
             "SELECT task_id, unknown_reason_code, peer_protocol_version, local_protocol_version, author_node_id,
                     (EXTRACT(EPOCH FROM observed_at) * 1000)::BIGINT AS observed_at
-             FROM unknown_reason_observations WHERE task_id = $1 ORDER BY observed_at DESC",
-            params![task_id],
+             FROM unknown_reason_observations WHERE org_id = $1 AND task_id = $2 ORDER BY observed_at DESC",
+            params![self.org_id(), task_id],
         )?;
 
         Ok(serde_json::json!({
@@ -110,8 +110,8 @@ impl PgStore {
             "SELECT task_id, task_type, input_digest,
                     (EXTRACT(EPOCH FROM lookup_time) * 1000)::BIGINT AS lookup_time,
                     hit_count, exact_hit_count, similar_hit_count, hits_digest, reuse_applied
-             FROM knowledge_lookups WHERE task_type = $1 ORDER BY lookup_time DESC",
-            params![task_type],
+             FROM knowledge_lookups WHERE org_id = $1 AND task_type = $2 ORDER BY lookup_time DESC",
+            params![self.org_id(), task_type],
         )?;
         let runtime_metrics = query_table_json(
             &conn,
@@ -119,21 +119,22 @@ impl PgStore {
                     (EXTRACT(EPOCH FROM window_start) * 1000)::BIGINT AS window_start,
                     (EXTRACT(EPOCH FROM window_end) * 1000)::BIGINT AS window_end,
                     finalize_rate, timeout_rate, crash_rate, invalid_output_rate, median_latency_ms, cost_units, reject_reason_distribution, sample_count, finalize_count, timeout_count, crash_count, invalid_output_count, reuse_hit_rate_exact, reuse_hit_rate_similar, reuse_candidate_accept_rate, time_to_finality_p50, time_to_finality_p95, expired_rate, cost_units_per_finalized_task_p50, cost_units_per_finalized_task_p95, verify_cost_ratio, invalid_event_reject_count, fork_prevented_count, da_fetch_fail_rate
-             FROM runtime_metrics WHERE task_type = $1 ORDER BY window_end DESC",
-            params![task_type],
+             FROM runtime_metrics WHERE org_id = $1 AND task_type = $2 ORDER BY window_end DESC",
+            params![self.org_id(), task_type],
         )?;
         let unknown_reason_observations = query_table_json(
             &conn,
             "SELECT task_id, unknown_reason_code, peer_protocol_version, local_protocol_version, author_node_id,
                     (EXTRACT(EPOCH FROM observed_at) * 1000)::BIGINT AS observed_at
              FROM unknown_reason_observations
-             WHERE task_id IN (
+             WHERE org_id = $1
+               AND task_id IN (
                     SELECT task_id
                     FROM task_projection
-                    WHERE (contract_json::jsonb ->> 'task_type') = $1
+                    WHERE org_id = $1 AND (contract_json::jsonb ->> 'task_type') = $2
              )
              ORDER BY observed_at DESC LIMIT 200",
-            params![task_type],
+            params![self.org_id(), task_type],
         )?;
         Ok(serde_json::json!({
             "task_type": task_type,
@@ -155,8 +156,8 @@ impl PgStore {
         conn.query_row(
             "SELECT commit_hash, candidate_hash, verifier_result_hash, execution_id,
                     (EXTRACT(EPOCH FROM created_at) * 1000)::BIGINT AS created_at
-             FROM vote_commits WHERE task_id = $1 AND voter_node_id = $2",
-            params![task_id, voter_node_id],
+             FROM vote_commits WHERE org_id = $1 AND task_id = $2 AND voter_node_id = $3",
+            params![self.org_id(), task_id, voter_node_id],
             |r| {
                 Ok(VoteCommitRow {
                     commit_hash: r.get(0)?,
@@ -181,9 +182,9 @@ impl PgStore {
             .lock()
             .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
         conn.execute(
-            "INSERT INTO vote_reveals(task_id, voter_node_id, candidate_id, candidate_hash, vote, salt, verifier_result_hash, valid, created_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, TIMESTAMPTZ 'epoch' + ($9::bigint * INTERVAL '1 millisecond'))
-             ON CONFLICT(task_id, voter_node_id) DO UPDATE SET
+            "INSERT INTO vote_reveals(org_id, task_id, voter_node_id, candidate_id, candidate_hash, vote, salt, verifier_result_hash, valid, created_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, TIMESTAMPTZ 'epoch' + ($10::bigint * INTERVAL '1 millisecond'))
+             ON CONFLICT(org_id, task_id, voter_node_id) DO UPDATE SET
                candidate_id = excluded.candidate_id,
                candidate_hash = excluded.candidate_hash,
                vote = excluded.vote,
@@ -192,6 +193,7 @@ impl PgStore {
                valid = excluded.valid,
                created_at = excluded.created_at",
             params![
+                self.org_id(),
                 row.task_id,
                 row.voter_node_id,
                 row.candidate_id,
@@ -222,8 +224,8 @@ impl PgStore {
             .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
         let count = conn.query_row(
             "SELECT COUNT(1) FROM vote_reveals
-             WHERE task_id = $1 AND candidate_id = $2 AND vote = $3 AND valid = TRUE",
-            params![task_id, candidate_id, vote_str],
+             WHERE org_id = $1 AND task_id = $2 AND candidate_id = $3 AND vote = $4 AND valid = TRUE",
+            params![self.org_id(), task_id, candidate_id, vote_str],
             |r| r.get::<_, i64>(0),
         )?;
         Ok(count as u32)
@@ -245,8 +247,8 @@ impl PgStore {
             .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
         let count = conn.query_row(
             "SELECT COUNT(1) FROM vote_reveals
-             WHERE task_id = $1 AND candidate_hash = $2 AND vote = $3 AND valid = TRUE",
-            params![task_id, candidate_hash, vote_str],
+             WHERE org_id = $1 AND task_id = $2 AND candidate_hash = $3 AND vote = $4 AND valid = TRUE",
+            params![self.org_id(), task_id, candidate_hash, vote_str],
             |r| r.get::<_, i64>(0),
         )?;
         Ok(count as u32)
@@ -265,13 +267,14 @@ impl PgStore {
             .lock()
             .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
         conn.execute(
-            "INSERT INTO finalizations(task_id, epoch, candidate_id, finality_proof_json, event_id)
-             VALUES ($1, $2, $3, $4, $5)
-             ON CONFLICT(task_id, epoch) DO UPDATE SET
+            "INSERT INTO finalizations(org_id, task_id, epoch, candidate_id, finality_proof_json, event_id)
+             VALUES ($1, $2, $3, $4, $5, $6)
+             ON CONFLICT(org_id, task_id, epoch) DO UPDATE SET
                candidate_id = excluded.candidate_id,
                finality_proof_json = excluded.finality_proof_json,
                event_id = excluded.event_id",
             params![
+                self.org_id(),
                 task_id,
                 epoch as i64,
                 candidate_id,
@@ -288,8 +291,8 @@ impl PgStore {
             .lock()
             .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
         conn.query_row(
-            "SELECT candidate_id FROM finalizations WHERE task_id = $1 AND epoch = $2",
-            params![task_id, epoch as i64],
+            "SELECT candidate_id FROM finalizations WHERE org_id = $1 AND task_id = $2 AND epoch = $3",
+            params![self.org_id(), task_id, epoch as i64],
             |r| r.get(0),
         )
         .optional()
@@ -307,12 +310,12 @@ impl PgStore {
             .lock()
             .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
         conn.execute(
-            "INSERT INTO checkpoints(checkpoint_id, up_to_seq, event_id)
-             VALUES ($1, $2, $3)
-             ON CONFLICT(checkpoint_id) DO UPDATE SET
+            "INSERT INTO checkpoints(org_id, checkpoint_id, up_to_seq, event_id)
+             VALUES ($1, $2, $3, $4)
+             ON CONFLICT(org_id, checkpoint_id) DO UPDATE SET
                up_to_seq = excluded.up_to_seq,
                event_id = excluded.event_id",
-            params![checkpoint_id, up_to_seq as i64, event_id],
+            params![self.org_id(), checkpoint_id, up_to_seq as i64, event_id],
         )?;
         Ok(())
     }
@@ -323,8 +326,8 @@ impl PgStore {
             .lock()
             .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
         conn.query_row(
-            "SELECT up_to_seq FROM checkpoints ORDER BY up_to_seq DESC LIMIT 1",
-            params![],
+            "SELECT up_to_seq FROM checkpoints WHERE org_id = $1 ORDER BY up_to_seq DESC LIMIT 1",
+            params![self.org_id()],
             |r| r.get::<_, i64>(0),
         )
         .optional()
@@ -338,10 +341,10 @@ impl PgStore {
             .lock()
             .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
         conn.execute(
-            "INSERT INTO membership_projection(singleton, membership_json)
-             VALUES (1, $1)
-             ON CONFLICT(singleton) DO UPDATE SET membership_json = excluded.membership_json",
-            params![membership_json],
+            "INSERT INTO membership_projection(org_id, singleton, membership_json)
+             VALUES ($1, 1, $2)
+             ON CONFLICT(org_id, singleton) DO UPDATE SET membership_json = excluded.membership_json",
+            params![self.org_id(), membership_json],
         )?;
         Ok(())
     }
@@ -352,8 +355,8 @@ impl PgStore {
             .lock()
             .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
         conn.query_row(
-            "SELECT membership_json FROM membership_projection WHERE singleton = 1",
-            params![],
+            "SELECT membership_json FROM membership_projection WHERE org_id = $1 AND singleton = 1",
+            params![self.org_id()],
             |r| r.get(0),
         )
         .optional()

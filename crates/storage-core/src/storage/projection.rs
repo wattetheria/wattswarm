@@ -8,10 +8,10 @@ impl PgStore {
             .lock()
             .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
         conn.execute(
-            "INSERT INTO task_projection(task_id, epoch, contract_json, terminal_state, committed_candidate_id, finalized_candidate_id)
-             VALUES ($1, $2, $3, 'open', NULL, NULL)
-             ON CONFLICT(task_id) DO UPDATE SET epoch=excluded.epoch, contract_json=excluded.contract_json",
-            params![contract.task_id, epoch as i64, contract_json],
+            "INSERT INTO task_projection(org_id, task_id, epoch, contract_json, terminal_state, committed_candidate_id, finalized_candidate_id)
+             VALUES ($1, $2, $3, $4, 'open', NULL, NULL)
+             ON CONFLICT(org_id, task_id) DO UPDATE SET epoch=excluded.epoch, contract_json=excluded.contract_json",
+            params![self.org_id(), contract.task_id, epoch as i64, contract_json],
         )?;
         Ok(())
     }
@@ -23,8 +23,8 @@ impl PgStore {
             .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
         conn.query_row(
             "SELECT epoch, contract_json, terminal_state, committed_candidate_id, finalized_candidate_id, retry_attempt
-             FROM task_projection WHERE task_id = $1",
-            params![task_id],
+             FROM task_projection WHERE org_id = $1 AND task_id = $2",
+            params![self.org_id(), task_id],
             |r| {
                 let epoch: i64 = r.get(0)?;
                 let contract_json: String = r.get(1)?;
@@ -75,8 +75,8 @@ impl PgStore {
             .lock()
             .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
         conn.execute(
-            "UPDATE task_projection SET terminal_state = $2 WHERE task_id = $1",
-            params![task_id, state_str],
+            "UPDATE task_projection SET terminal_state = $3 WHERE org_id = $1 AND task_id = $2",
+            params![self.org_id(), task_id, state_str],
         )?;
         Ok(())
     }
@@ -87,8 +87,8 @@ impl PgStore {
             .lock()
             .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
         conn.execute(
-            "UPDATE task_projection SET committed_candidate_id = $2 WHERE task_id = $1",
-            params![task_id, candidate_id],
+            "UPDATE task_projection SET committed_candidate_id = $3 WHERE org_id = $1 AND task_id = $2",
+            params![self.org_id(), task_id, candidate_id],
         )?;
         Ok(())
     }
@@ -100,9 +100,9 @@ impl PgStore {
             .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
         conn.execute(
             "UPDATE task_projection
-             SET finalized_candidate_id = $2, terminal_state = 'finalized'
-             WHERE task_id = $1",
-            params![task_id, candidate_id],
+             SET finalized_candidate_id = $3, terminal_state = 'finalized'
+             WHERE org_id = $1 AND task_id = $2",
+            params![self.org_id(), task_id, candidate_id],
         )?;
         Ok(())
     }
@@ -119,8 +119,8 @@ impl PgStore {
             .lock()
             .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
         conn.execute(
-            "UPDATE task_projection SET finalized_candidate_id = $2 WHERE task_id = $1",
-            params![task_id, candidate_id],
+            "UPDATE task_projection SET finalized_candidate_id = $3 WHERE org_id = $1 AND task_id = $2",
+            params![self.org_id(), task_id, candidate_id],
         )?;
         Ok(())
     }
@@ -132,9 +132,9 @@ impl PgStore {
             .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
         conn.execute(
             "UPDATE task_projection
-             SET retry_attempt = CASE WHEN retry_attempt < $2 THEN $2 ELSE retry_attempt END
-             WHERE task_id = $1",
-            params![task_id, attempt as i64],
+             SET retry_attempt = CASE WHEN retry_attempt < $3 THEN $3 ELSE retry_attempt END
+             WHERE org_id = $1 AND task_id = $2",
+            params![self.org_id(), task_id, attempt as i64],
         )?;
         Ok(())
     }
@@ -146,22 +146,25 @@ impl PgStore {
             .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
         conn.execute(
             "UPDATE task_projection
-             SET epoch = $2,
+             SET epoch = $3,
                  terminal_state = 'open',
                  committed_candidate_id = NULL,
                  finalized_candidate_id = NULL,
                  retry_attempt = 0
-             WHERE task_id = $1",
-            params![task_id, next_epoch as i64],
-        )?;
-        conn.execute("DELETE FROM leases WHERE task_id = $1", params![task_id])?;
-        conn.execute(
-            "DELETE FROM vote_commits WHERE task_id = $1",
-            params![task_id],
+             WHERE org_id = $1 AND task_id = $2",
+            params![self.org_id(), task_id, next_epoch as i64],
         )?;
         conn.execute(
-            "DELETE FROM vote_reveals WHERE task_id = $1",
-            params![task_id],
+            "DELETE FROM leases WHERE org_id = $1 AND task_id = $2",
+            params![self.org_id(), task_id],
+        )?;
+        conn.execute(
+            "DELETE FROM vote_commits WHERE org_id = $1 AND task_id = $2",
+            params![self.org_id(), task_id],
+        )?;
+        conn.execute(
+            "DELETE FROM vote_reveals WHERE org_id = $1 AND task_id = $2",
+            params![self.org_id(), task_id],
         )?;
         Ok(())
     }
@@ -177,11 +180,12 @@ impl PgStore {
             .lock()
             .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
         conn.execute(
-            "INSERT INTO evidence_added(task_id, candidate_id, evidence_digest, evidence_json)
-             VALUES ($1, $2, $3, $4)
-             ON CONFLICT(task_id, candidate_id, evidence_digest)
+            "INSERT INTO evidence_added(org_id, task_id, candidate_id, evidence_digest, evidence_json)
+             VALUES ($1, $2, $3, $4, $5)
+             ON CONFLICT(org_id, task_id, candidate_id, evidence_digest)
              DO UPDATE SET evidence_json = excluded.evidence_json",
             params![
+                self.org_id(),
                 task_id,
                 candidate_id,
                 evidence.digest,
@@ -204,11 +208,12 @@ impl PgStore {
             .lock()
             .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
         conn.execute(
-            "INSERT INTO evidence_available(task_id, candidate_id, verifier_node_id, evidence_digest, created_at)
-             VALUES ($1, $2, $3, $4, TIMESTAMPTZ 'epoch' + ($5::bigint * INTERVAL '1 millisecond'))
-             ON CONFLICT(task_id, candidate_id, verifier_node_id, evidence_digest)
+            "INSERT INTO evidence_available(org_id, task_id, candidate_id, verifier_node_id, evidence_digest, created_at)
+             VALUES ($1, $2, $3, $4, $5, TIMESTAMPTZ 'epoch' + ($6::bigint * INTERVAL '1 millisecond'))
+             ON CONFLICT(org_id, task_id, candidate_id, verifier_node_id, evidence_digest)
              DO UPDATE SET created_at = excluded.created_at",
             params![
+                self.org_id(),
                 task_id,
                 candidate_id,
                 verifier_node_id,
@@ -231,8 +236,8 @@ impl PgStore {
             .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
         let count = conn.query_row(
             "SELECT COUNT(1) FROM evidence_available
-             WHERE task_id = $1 AND candidate_id = $2 AND evidence_digest = $3",
-            params![task_id, candidate_id, evidence_digest],
+             WHERE org_id = $1 AND task_id = $2 AND candidate_id = $3 AND evidence_digest = $4",
+            params![self.org_id(), task_id, candidate_id, evidence_digest],
             |r| r.get::<_, i64>(0),
         )?;
         Ok(count as u32)
@@ -250,10 +255,10 @@ impl PgStore {
             .lock()
             .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
         conn.execute(
-            "INSERT INTO task_stage_usage(task_id, epoch, explore_used, verify_used, finalize_used)
-             VALUES ($1, $2, 0, 0, 0)
-             ON CONFLICT(task_id, epoch) DO NOTHING",
-            params![task_id, epoch as i64],
+            "INSERT INTO task_stage_usage(org_id, task_id, epoch, explore_used, verify_used, finalize_used)
+             VALUES ($1, $2, $3, 0, 0, 0)
+             ON CONFLICT(org_id, task_id, epoch) DO NOTHING",
+            params![self.org_id(), task_id, epoch as i64],
         )?;
         let (column, value) = match stage {
             "explore" => ("explore_used", delta as i64),
@@ -262,9 +267,9 @@ impl PgStore {
             _ => return Ok(()),
         };
         let sql = format!(
-            "UPDATE task_stage_usage SET {column} = {column} + $3 WHERE task_id = $1 AND epoch = $2"
+            "UPDATE task_stage_usage SET {column} = {column} + $4 WHERE org_id = $1 AND task_id = $2 AND epoch = $3"
         );
-        conn.execute(&sql, params![task_id, epoch as i64, value])?;
+        conn.execute(&sql, params![self.org_id(), task_id, epoch as i64, value])?;
         Ok(())
     }
 
@@ -275,8 +280,8 @@ impl PgStore {
             .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
         conn.query_row(
             "SELECT task_id, epoch, explore_used, verify_used, finalize_used
-             FROM task_stage_usage WHERE task_id = $1 AND epoch = $2",
-            params![task_id, epoch as i64],
+             FROM task_stage_usage WHERE org_id = $1 AND task_id = $2 AND epoch = $3",
+            params![self.org_id(), task_id, epoch as i64],
             |r| {
                 Ok(TaskStageUsageRow {
                     task_id: r.get(0)?,
@@ -307,15 +312,16 @@ impl PgStore {
             .lock()
             .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
         conn.execute(
-            "INSERT INTO task_cost_reports(task_id, epoch, cost_units_by_stage_json, latency_by_stage_json, evidence_fetch_bytes, events_emitted_count, cache_hit_rate)
-             VALUES ($1, $2, $3, $4, $5, $6, $7)
-             ON CONFLICT(task_id, epoch) DO UPDATE SET
+            "INSERT INTO task_cost_reports(org_id, task_id, epoch, cost_units_by_stage_json, latency_by_stage_json, evidence_fetch_bytes, events_emitted_count, cache_hit_rate)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+             ON CONFLICT(org_id, task_id, epoch) DO UPDATE SET
                cost_units_by_stage_json = excluded.cost_units_by_stage_json,
                latency_by_stage_json = excluded.latency_by_stage_json,
                evidence_fetch_bytes = excluded.evidence_fetch_bytes,
                events_emitted_count = excluded.events_emitted_count,
                cache_hit_rate = excluded.cache_hit_rate",
             params![
+                self.org_id(),
                 task_id,
                 epoch as i64,
                 serde_json::to_string(cost_units_by_stage)?,
@@ -341,13 +347,14 @@ impl PgStore {
             .lock()
             .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
         conn.execute(
-            "INSERT INTO leases(task_id, role, claimer_node_id, execution_id, lease_until)
-             VALUES ($1, $2, $3, $4, TIMESTAMPTZ 'epoch' + ($5::bigint * INTERVAL '1 millisecond'))
-             ON CONFLICT(task_id, role) DO UPDATE SET
+            "INSERT INTO leases(org_id, task_id, role, claimer_node_id, execution_id, lease_until)
+             VALUES ($1, $2, $3, $4, $5, TIMESTAMPTZ 'epoch' + ($6::bigint * INTERVAL '1 millisecond'))
+             ON CONFLICT(org_id, task_id, role) DO UPDATE SET
               claimer_node_id = excluded.claimer_node_id,
               execution_id = excluded.execution_id,
               lease_until = excluded.lease_until",
             params![
+                self.org_id(),
                 task_id,
                 role,
                 claimer_node_id,
@@ -366,8 +373,8 @@ impl PgStore {
         conn.query_row(
             "SELECT task_id, role, claimer_node_id, execution_id,
                     (EXTRACT(EPOCH FROM lease_until) * 1000)::BIGINT AS lease_until
-             FROM leases WHERE task_id = $1 AND role = $2",
-            params![task_id, role],
+             FROM leases WHERE org_id = $1 AND task_id = $2 AND role = $3",
+            params![self.org_id(), task_id, role],
             |r| {
                 Ok(LeaseRow {
                     task_id: r.get(0)?,
@@ -394,8 +401,8 @@ impl PgStore {
             .lock()
             .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
         conn.execute(
-            "DELETE FROM leases WHERE task_id = $1 AND role = $2 AND claimer_node_id = $3 AND execution_id = $4",
-            params![task_id, role, claimer_node_id, execution_id],
+            "DELETE FROM leases WHERE org_id = $1 AND task_id = $2 AND role = $3 AND claimer_node_id = $4 AND execution_id = $5",
+            params![self.org_id(), task_id, role, claimer_node_id, execution_id],
         )?;
         Ok(())
     }
@@ -413,14 +420,15 @@ impl PgStore {
             .lock()
             .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
         conn.execute(
-            "INSERT INTO candidates(task_id, candidate_id, candidate_hash, execution_id, proposer_node_id, candidate_json)
-             VALUES ($1, $2, $3, $4, $5, $6)
-             ON CONFLICT(task_id, candidate_id) DO UPDATE SET
+            "INSERT INTO candidates(org_id, task_id, candidate_id, candidate_hash, execution_id, proposer_node_id, candidate_json)
+             VALUES ($1, $2, $3, $4, $5, $6, $7)
+             ON CONFLICT(org_id, task_id, candidate_id) DO UPDATE SET
                candidate_hash = excluded.candidate_hash,
                execution_id = excluded.execution_id,
                proposer_node_id = excluded.proposer_node_id,
                candidate_json = excluded.candidate_json",
             params![
+                self.org_id(),
                 task_id,
                 candidate.candidate_id,
                 hash,
@@ -442,8 +450,8 @@ impl PgStore {
             .lock()
             .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
         conn.query_row(
-            "SELECT candidate_json FROM candidates WHERE task_id = $1 AND candidate_id = $2",
-            params![task_id, candidate_id],
+            "SELECT candidate_json FROM candidates WHERE org_id = $1 AND task_id = $2 AND candidate_id = $3",
+            params![self.org_id(), task_id, candidate_id],
             |r| {
                 let json: String = r.get(0)?;
                 let c: Candidate = serde_json::from_str(&json).map_err(|e| {
@@ -466,8 +474,8 @@ impl PgStore {
             .lock()
             .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
         conn.query_row(
-            "SELECT candidate_json FROM candidates WHERE task_id = $1 AND execution_id = $2",
-            params![task_id, execution_id],
+            "SELECT candidate_json FROM candidates WHERE org_id = $1 AND task_id = $2 AND execution_id = $3",
+            params![self.org_id(), task_id, execution_id],
             |r| {
                 let json: String = r.get(0)?;
                 let c: Candidate = serde_json::from_str(&json).map_err(|e| {
@@ -486,8 +494,8 @@ impl PgStore {
             .lock()
             .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
         let count = conn.query_row(
-            "SELECT COUNT(1) FROM candidates WHERE task_id = $1",
-            params![task_id],
+            "SELECT COUNT(1) FROM candidates WHERE org_id = $1 AND task_id = $2",
+            params![self.org_id(), task_id],
             |r| r.get::<_, i64>(0),
         )?;
         Ok(count as u32)
@@ -499,8 +507,8 @@ impl PgStore {
             .lock()
             .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
         let count: i64 = conn.query_row(
-            "SELECT COUNT(1) FROM verifier_results WHERE task_id = $1 AND passed = TRUE",
-            params![task_id],
+            "SELECT COUNT(1) FROM verifier_results WHERE org_id = $1 AND task_id = $2 AND passed = TRUE",
+            params![self.org_id(), task_id],
             |r| r.get(0),
         )?;
         Ok(count as u32)
@@ -511,8 +519,9 @@ impl PgStore {
             .conn
             .lock()
             .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
-        let mut stmt = conn.prepare("SELECT candidate_json FROM candidates WHERE task_id = $1")?;
-        let rows = stmt.query_map(params![task_id], |r| r.get::<_, String>(0))?;
+        let mut stmt = conn
+            .prepare("SELECT candidate_json FROM candidates WHERE org_id = $1 AND task_id = $2")?;
+        let rows = stmt.query_map(params![self.org_id(), task_id], |r| r.get::<_, String>(0))?;
         let mut set = std::collections::HashSet::new();
         for row in rows {
             let raw = row?;
@@ -539,12 +548,13 @@ impl PgStore {
             .lock()
             .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
         conn.execute(
-            "INSERT INTO verifier_results(task_id, candidate_id, verifier_node_id, result_json, passed)
-             VALUES ($1, $2, $3, $4, $5)
-             ON CONFLICT(task_id, candidate_id, verifier_node_id) DO UPDATE SET
+            "INSERT INTO verifier_results(org_id, task_id, candidate_id, verifier_node_id, result_json, passed)
+             VALUES ($1, $2, $3, $4, $5, $6)
+             ON CONFLICT(org_id, task_id, candidate_id, verifier_node_id) DO UPDATE SET
                result_json = excluded.result_json,
                passed = excluded.passed",
             params![
+                self.org_id(),
                 task_id,
                 result.candidate_id,
                 verifier_node_id,
@@ -565,9 +575,9 @@ impl PgStore {
             .lock()
             .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
         let mut stmt = conn.prepare(
-            "SELECT result_json FROM verifier_results WHERE task_id = $1 AND candidate_id = $2",
+            "SELECT result_json FROM verifier_results WHERE org_id = $1 AND task_id = $2 AND candidate_id = $3",
         )?;
-        let rows = stmt.query_map(params![task_id, candidate_id], |r| {
+        let rows = stmt.query_map(params![self.org_id(), task_id, candidate_id], |r| {
             let json: String = r.get(0)?;
             let parsed: VerifierResult = serde_json::from_str(&json).map_err(|e| {
                 pg::Error::FromSqlConversionFailure(0, pg::types::Type::Text, Box::new(e))
@@ -594,15 +604,16 @@ impl PgStore {
             .lock()
             .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
         conn.execute(
-            "INSERT INTO vote_commits(task_id, voter_node_id, candidate_hash, commit_hash, verifier_result_hash, execution_id, created_at)
-             VALUES ($1, $2, $3, $4, $5, $6, TIMESTAMPTZ 'epoch' + ($7::bigint * INTERVAL '1 millisecond'))
-             ON CONFLICT(task_id, voter_node_id) DO UPDATE SET
+            "INSERT INTO vote_commits(org_id, task_id, voter_node_id, candidate_hash, commit_hash, verifier_result_hash, execution_id, created_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, TIMESTAMPTZ 'epoch' + ($8::bigint * INTERVAL '1 millisecond'))
+             ON CONFLICT(org_id, task_id, voter_node_id) DO UPDATE SET
                candidate_hash = excluded.candidate_hash,
                commit_hash = excluded.commit_hash,
                verifier_result_hash = excluded.verifier_result_hash,
                execution_id = excluded.execution_id,
                created_at = excluded.created_at",
             params![
+                self.org_id(),
                 task_id,
                 voter_node_id,
                 candidate_hash,
@@ -622,9 +633,9 @@ impl PgStore {
             .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
         let mut stmt = conn.prepare(
             "SELECT voter_node_id, (EXTRACT(EPOCH FROM created_at) * 1000)::BIGINT AS created_at
-             FROM vote_commits WHERE task_id = $1",
+             FROM vote_commits WHERE org_id = $1 AND task_id = $2",
         )?;
-        let rows = stmt.query_map(params![task_id], |r| {
+        let rows = stmt.query_map(params![self.org_id(), task_id], |r| {
             Ok(VoteCommitMetaRow {
                 voter_node_id: r.get(0)?,
                 created_at: r.get::<_, i64>(1)? as u64,
@@ -640,9 +651,9 @@ impl PgStore {
             .lock()
             .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
         let mut stmt = conn.prepare(
-            "SELECT voter_node_id FROM vote_reveals WHERE task_id = $1 AND valid = TRUE",
+            "SELECT voter_node_id FROM vote_reveals WHERE org_id = $1 AND task_id = $2 AND valid = TRUE",
         )?;
-        let rows = stmt.query_map(params![task_id], |r| r.get(0))?;
+        let rows = stmt.query_map(params![self.org_id(), task_id], |r| r.get(0))?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
             .map_err(Into::into)
     }
@@ -656,10 +667,10 @@ impl PgStore {
             "SELECT COALESCE(MAX(cnt), 0) FROM (
                 SELECT COUNT(1) AS cnt
                 FROM vote_reveals
-                WHERE task_id = $1 AND vote = 'approve' AND valid = TRUE
+                WHERE org_id = $1 AND task_id = $2 AND vote = 'approve' AND valid = TRUE
                 GROUP BY candidate_hash
             ) AS reveal_counts",
-            params![task_id],
+            params![self.org_id(), task_id],
             |r| r.get(0),
         )?;
         Ok(max_count as u32)
@@ -671,12 +682,12 @@ impl PgStore {
             .lock()
             .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
         conn.execute(
-            "DELETE FROM vote_commits WHERE task_id = $1",
-            params![task_id],
+            "DELETE FROM vote_commits WHERE org_id = $1 AND task_id = $2",
+            params![self.org_id(), task_id],
         )?;
         conn.execute(
-            "DELETE FROM vote_reveals WHERE task_id = $1",
-            params![task_id],
+            "DELETE FROM vote_reveals WHERE org_id = $1 AND task_id = $2",
+            params![self.org_id(), task_id],
         )?;
         Ok(())
     }
@@ -686,9 +697,10 @@ impl PgStore {
             .conn
             .lock()
             .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
-        let mut stmt =
-            conn.prepare("SELECT task_id FROM task_projection WHERE terminal_state = 'open'")?;
-        let rows = stmt.query_map(params![], |r| r.get(0))?;
+        let mut stmt = conn.prepare(
+            "SELECT task_id FROM task_projection WHERE org_id = $1 AND terminal_state = 'open'",
+        )?;
+        let rows = stmt.query_map(params![self.org_id()], |r| r.get(0))?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
             .map_err(Into::into)
     }
@@ -700,8 +712,8 @@ impl PgStore {
             .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
         conn.query_row(
             "SELECT CASE WHEN MIN(created_at) IS NULL THEN NULL ELSE (EXTRACT(EPOCH FROM MIN(created_at)) * 1000)::BIGINT END
-             FROM events WHERE task_id = $1 AND event_kind = 'TaskCreated'",
-            params![task_id],
+             FROM events WHERE org_id = $1 AND task_id = $2 AND event_kind = 'TaskCreated'",
+            params![self.org_id(), task_id],
             |r| r.get::<_, Option<i64>>(0),
         )
         .optional()
@@ -722,27 +734,34 @@ impl PgStore {
             .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
         conn.execute(
             "INSERT INTO task_settlement(
-                task_id, epoch, finalized_at, window_end_at, bad_feedback_exists, bad_feedback_at,
+                org_id, task_id, epoch, finalized_at, window_end_at, bad_feedback_exists, bad_feedback_at,
                 implicit_settled, implicit_settled_at
              )
              VALUES (
                $1,
                $2,
-               TIMESTAMPTZ 'epoch' + ($3::bigint * INTERVAL '1 millisecond'),
+               $3,
                TIMESTAMPTZ 'epoch' + ($4::bigint * INTERVAL '1 millisecond'),
-               COALESCE((SELECT bad_feedback_exists FROM task_settlement WHERE task_id = $1 AND epoch = $2), FALSE),
-               COALESCE((SELECT bad_feedback_at FROM task_settlement WHERE task_id = $1 AND epoch = $2), NULL),
-               COALESCE((SELECT implicit_settled FROM task_settlement WHERE task_id = $1 AND epoch = $2), FALSE),
-               COALESCE((SELECT implicit_settled_at FROM task_settlement WHERE task_id = $1 AND epoch = $2), NULL)
+               TIMESTAMPTZ 'epoch' + ($5::bigint * INTERVAL '1 millisecond'),
+               COALESCE((SELECT bad_feedback_exists FROM task_settlement WHERE org_id = $1 AND task_id = $2 AND epoch = $3), FALSE),
+               COALESCE((SELECT bad_feedback_at FROM task_settlement WHERE org_id = $1 AND task_id = $2 AND epoch = $3), NULL),
+               COALESCE((SELECT implicit_settled FROM task_settlement WHERE org_id = $1 AND task_id = $2 AND epoch = $3), FALSE),
+               COALESCE((SELECT implicit_settled_at FROM task_settlement WHERE org_id = $1 AND task_id = $2 AND epoch = $3), NULL)
              )
-             ON CONFLICT(task_id, epoch) DO UPDATE SET
+             ON CONFLICT(org_id, task_id, epoch) DO UPDATE SET
                finalized_at = excluded.finalized_at,
                window_end_at = excluded.window_end_at,
                bad_feedback_exists = excluded.bad_feedback_exists,
                bad_feedback_at = excluded.bad_feedback_at,
                implicit_settled = excluded.implicit_settled,
                implicit_settled_at = excluded.implicit_settled_at",
-            params![task_id, epoch as i64, finalized_at as i64, window_end_at as i64],
+            params![
+                self.org_id(),
+                task_id,
+                epoch as i64,
+                finalized_at as i64,
+                window_end_at as i64
+            ],
         )?;
         Ok(())
     }
@@ -760,9 +779,9 @@ impl PgStore {
         conn.execute(
             "UPDATE task_settlement
              SET bad_feedback_exists = TRUE,
-                 bad_feedback_at = TIMESTAMPTZ 'epoch' + ($3::bigint * INTERVAL '1 millisecond')
-             WHERE task_id = $1 AND epoch = $2 AND bad_feedback_exists = FALSE",
-            params![task_id, epoch as i64, bad_feedback_at as i64],
+                 bad_feedback_at = TIMESTAMPTZ 'epoch' + ($4::bigint * INTERVAL '1 millisecond')
+             WHERE org_id = $1 AND task_id = $2 AND epoch = $3 AND bad_feedback_exists = FALSE",
+            params![self.org_id(), task_id, epoch as i64, bad_feedback_at as i64],
         )?;
         Ok(())
     }
@@ -781,10 +800,10 @@ impl PgStore {
                     implicit_settled,
                     CASE WHEN implicit_settled_at IS NULL THEN NULL ELSE (EXTRACT(EPOCH FROM implicit_settled_at) * 1000)::BIGINT END AS implicit_settled_at
              FROM task_settlement
-             WHERE task_id = $1
+             WHERE org_id = $1 AND task_id = $2
              ORDER BY epoch DESC
              LIMIT 1",
-            params![task_id],
+            params![self.org_id(), task_id],
             |r| {
                 Ok(TaskSettlementRow {
                     task_id: r.get(0)?,
@@ -814,13 +833,14 @@ impl PgStore {
         let mut stmt = conn.prepare(
             "SELECT task_id, epoch
              FROM task_settlement
-             WHERE bad_feedback_exists = FALSE
+             WHERE org_id = $1
+               AND bad_feedback_exists = FALSE
                AND implicit_settled = FALSE
-               AND window_end_at <= TIMESTAMPTZ 'epoch' + ($1::bigint * INTERVAL '1 millisecond')
+               AND window_end_at <= TIMESTAMPTZ 'epoch' + ($2::bigint * INTERVAL '1 millisecond')
              ORDER BY window_end_at ASC
-             LIMIT $2",
+             LIMIT $3",
         )?;
-        let rows = stmt.query_map(params![now as i64, limit as i64], |r| {
+        let rows = stmt.query_map(params![self.org_id(), now as i64, limit as i64], |r| {
             Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as u64))
         })?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
@@ -840,9 +860,9 @@ impl PgStore {
         let changed = conn.execute(
             "UPDATE task_settlement
              SET implicit_settled = TRUE,
-                 implicit_settled_at = TIMESTAMPTZ 'epoch' + ($3::bigint * INTERVAL '1 millisecond')
-             WHERE task_id = $1 AND epoch = $2 AND implicit_settled = FALSE",
-            params![task_id, epoch as i64, settled_at as i64],
+                 implicit_settled_at = TIMESTAMPTZ 'epoch' + ($4::bigint * INTERVAL '1 millisecond')
+             WHERE org_id = $1 AND task_id = $2 AND epoch = $3 AND implicit_settled = FALSE",
+            params![self.org_id(), task_id, epoch as i64, settled_at as i64],
         )?;
         Ok(changed > 0)
     }
@@ -857,8 +877,8 @@ impl PgStore {
             .lock()
             .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
         conn.query_row(
-            "SELECT candidate_id FROM finalizations WHERE task_id = $1 AND epoch = $2",
-            params![task_id, epoch as i64],
+            "SELECT candidate_id FROM finalizations WHERE org_id = $1 AND task_id = $2 AND epoch = $3",
+            params![self.org_id(), task_id, epoch as i64],
             |r| r.get(0),
         )
         .optional()
@@ -871,8 +891,8 @@ impl PgStore {
             .lock()
             .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
         let count = conn.query_row(
-            "SELECT COUNT(1) FROM knowledge_lookups WHERE task_id = $1 AND reuse_applied = TRUE",
-            params![task_id],
+            "SELECT COUNT(1) FROM knowledge_lookups WHERE org_id = $1 AND task_id = $2 AND reuse_applied = TRUE",
+            params![self.org_id(), task_id],
             |r| r.get::<_, i64>(0),
         )?;
         Ok(count as u32)
@@ -890,8 +910,8 @@ impl PgStore {
                       ELSE (EXTRACT(EPOCH FROM MIN(lookup_time)) * 1000)::BIGINT
                     END AS first_lookup_at
              FROM knowledge_lookups
-             WHERE task_id = $1 AND reuse_applied = TRUE",
-            params![task_id],
+             WHERE org_id = $1 AND task_id = $2 AND reuse_applied = TRUE",
+            params![self.org_id(), task_id],
             |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Option<i64>>(1)?)),
         )?;
         Ok((count as u32, first_at.map(|v| v as u64)))
@@ -908,8 +928,8 @@ impl PgStore {
                 COALESCE(SUM(similar_hit_count), 0)::BIGINT,
                 COALESCE(SUM(CASE WHEN reuse_applied THEN 1 ELSE 0 END), 0)::BIGINT
              FROM knowledge_lookups
-             WHERE task_id = $1",
-            params![task_id],
+             WHERE org_id = $1 AND task_id = $2",
+            params![self.org_id(), task_id],
             |r| {
                 Ok((
                     r.get::<_, i64>(0)?,
@@ -933,13 +953,14 @@ impl PgStore {
         let mut stmt = conn.prepare(
             "SELECT candidate_hash, COUNT(1) AS cnt
              FROM vote_reveals
-             WHERE task_id = $1
+             WHERE org_id = $1
+               AND task_id = $2
                AND vote = 'reject'
                AND valid = TRUE
                AND candidate_hash <> ''
              GROUP BY candidate_hash",
         )?;
-        let rows = stmt.query_map(params![task_id], |r| {
+        let rows = stmt.query_map(params![self.org_id(), task_id], |r| {
             Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as u32))
         })?;
         let pairs = rows.collect::<std::result::Result<Vec<_>, _>>()?;
@@ -973,13 +994,16 @@ impl PgStore {
         let mut stmt = conn.prepare(
             "SELECT voter_node_id
              FROM vote_reveals
-             WHERE task_id = $1
-               AND candidate_hash = $2
+             WHERE org_id = $1
+               AND task_id = $2
+               AND candidate_hash = $3
                AND vote = 'reject'
                AND valid = TRUE
              ORDER BY voter_node_id ASC",
         )?;
-        let rows = stmt.query_map(params![task_id, candidate_hash], |r| r.get::<_, String>(0))?;
+        let rows = stmt.query_map(params![self.org_id(), task_id, candidate_hash], |r| {
+            r.get::<_, String>(0)
+        })?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
             .map_err(Into::into)
     }
@@ -997,12 +1021,16 @@ impl PgStore {
             "SELECT vr.result_json
              FROM verifier_results vr
              JOIN candidates c
-               ON c.task_id = vr.task_id
+               ON c.org_id = vr.org_id
+              AND c.task_id = vr.task_id
               AND c.candidate_id = vr.candidate_id
-             WHERE vr.task_id = $1
-               AND c.candidate_hash = $2",
+             WHERE vr.org_id = $1
+               AND vr.task_id = $2
+               AND c.candidate_hash = $3",
         )?;
-        let rows = stmt.query_map(params![task_id, candidate_hash], |r| r.get::<_, String>(0))?;
+        let rows = stmt.query_map(params![self.org_id(), task_id, candidate_hash], |r| {
+            r.get::<_, String>(0)
+        })?;
         let mut set = std::collections::BTreeSet::new();
         for row in rows {
             let raw = row?;
@@ -1026,10 +1054,10 @@ impl PgStore {
             .lock()
             .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
         conn.execute(
-            "INSERT INTO reuse_blacklist(task_id, epoch, candidate_hash)
-             VALUES ($1, $2, $3)
-             ON CONFLICT(task_id, epoch, candidate_hash) DO NOTHING",
-            params![task_id, epoch as i64, candidate_hash],
+            "INSERT INTO reuse_blacklist(org_id, task_id, epoch, candidate_hash)
+             VALUES ($1, $2, $3, $4)
+             ON CONFLICT(org_id, task_id, epoch, candidate_hash) DO NOTHING",
+            params![self.org_id(), task_id, epoch as i64, candidate_hash],
         )?;
         Ok(())
     }
@@ -1047,12 +1075,12 @@ impl PgStore {
         let exists = conn.query_row(
             "SELECT EXISTS(
                 SELECT 1 FROM reuse_blacklist
-                WHERE task_id = $1 AND epoch = $2 AND candidate_hash = $3
+                WHERE org_id = $1 AND task_id = $2 AND epoch = $3 AND candidate_hash = $4
             )",
-            params![task_id, epoch as i64, candidate_hash],
-            |r| r.get::<_, i64>(0),
+            params![self.org_id(), task_id, epoch as i64, candidate_hash],
+            |r| r.get::<_, bool>(0),
         )?;
-        Ok(exists != 0)
+        Ok(exists)
     }
 
     pub fn list_reuse_blacklist(&self, task_id: &str, epoch: u64) -> Result<Vec<String>> {
@@ -1062,10 +1090,12 @@ impl PgStore {
             .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
         let mut stmt = conn.prepare(
             "SELECT candidate_hash FROM reuse_blacklist
-             WHERE task_id = $1 AND epoch = $2
+             WHERE org_id = $1 AND task_id = $2 AND epoch = $3
              ORDER BY candidate_hash ASC",
         )?;
-        let rows = stmt.query_map(params![task_id, epoch as i64], |r| r.get::<_, String>(0))?;
+        let rows = stmt.query_map(params![self.org_id(), task_id, epoch as i64], |r| {
+            r.get::<_, String>(0)
+        })?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
             .map_err(Into::into)
     }
@@ -1088,9 +1118,10 @@ impl PgStore {
             .lock()
             .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
         conn.execute(
-            "INSERT INTO knowledge_lookups(task_id, task_type, input_digest, lookup_time, hit_count, exact_hit_count, similar_hit_count, hits_digest, reuse_applied)
-             VALUES ($1, $2, $3, TIMESTAMPTZ 'epoch' + ($4::bigint * INTERVAL '1 millisecond'), $5, $6, $7, $8, $9)",
+            "INSERT INTO knowledge_lookups(org_id, task_id, task_type, input_digest, lookup_time, hit_count, exact_hit_count, similar_hit_count, hits_digest, reuse_applied)
+             VALUES ($1, $2, $3, $4, TIMESTAMPTZ 'epoch' + ($5::bigint * INTERVAL '1 millisecond'), $6, $7, $8, $9, $10)",
             params![
+                self.org_id(),
                 task_id,
                 task_type,
                 input_digest,
@@ -1118,15 +1149,22 @@ impl PgStore {
             .lock()
             .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
         conn.execute(
-            "INSERT INTO evidence_summary(cid, mime, size_bytes, source_hint_digest, added_at, availability_confirmations_count)
-             VALUES ($1, $2, $3, $4, TIMESTAMPTZ 'epoch' + ($5::bigint * INTERVAL '1 millisecond'), 1)
-             ON CONFLICT(cid) DO UPDATE SET
+            "INSERT INTO evidence_summary(org_id, cid, mime, size_bytes, source_hint_digest, added_at, availability_confirmations_count)
+             VALUES ($1, $2, $3, $4, $5, TIMESTAMPTZ 'epoch' + ($6::bigint * INTERVAL '1 millisecond'), 1)
+             ON CONFLICT(org_id, cid) DO UPDATE SET
                mime = excluded.mime,
                size_bytes = excluded.size_bytes,
                source_hint_digest = excluded.source_hint_digest,
                added_at = excluded.added_at,
                availability_confirmations_count = evidence_summary.availability_confirmations_count + 1",
-            params![cid, mime, size_bytes as i64, source_hint_digest, added_at as i64],
+            params![
+                self.org_id(),
+                cid,
+                mime,
+                size_bytes as i64,
+                source_hint_digest,
+                added_at as i64
+            ],
         )?;
         Ok(())
     }
@@ -1156,9 +1194,9 @@ impl PgStore {
             .lock()
             .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
         conn.execute(
-            "INSERT INTO decision_memory(task_id, epoch, final_commit_hash, finalized_at, winning_candidate_hash, output_digest, result_summary, quorum_result_json, reason_codes_json, reason_details, policy_snapshot_digest, task_type, input_digest, output_schema_digest, policy_id, policy_params_digest, deprecated_as_exact)
-             VALUES ($1, $2, $3, TIMESTAMPTZ 'epoch' + ($4::bigint * INTERVAL '1 millisecond'), $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, COALESCE((SELECT deprecated_as_exact FROM decision_memory WHERE task_id = $1 AND epoch = $2), FALSE))
-             ON CONFLICT(task_id, epoch) DO UPDATE SET
+            "INSERT INTO decision_memory(org_id, task_id, epoch, final_commit_hash, finalized_at, winning_candidate_hash, output_digest, result_summary, quorum_result_json, reason_codes_json, reason_details, policy_snapshot_digest, task_type, input_digest, output_schema_digest, policy_id, policy_params_digest, deprecated_as_exact)
+             VALUES ($1, $2, $3, $4, TIMESTAMPTZ 'epoch' + ($5::bigint * INTERVAL '1 millisecond'), $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, COALESCE((SELECT deprecated_as_exact FROM decision_memory WHERE org_id = $1 AND task_id = $2 AND epoch = $3), FALSE))
+             ON CONFLICT(org_id, task_id, epoch) DO UPDATE SET
                final_commit_hash = excluded.final_commit_hash,
                finalized_at = excluded.finalized_at,
                winning_candidate_hash = excluded.winning_candidate_hash,
@@ -1175,6 +1213,7 @@ impl PgStore {
                policy_params_digest = excluded.policy_params_digest,
                deprecated_as_exact = excluded.deprecated_as_exact",
             params![
+                self.org_id(),
                 task_id,
                 epoch as i64,
                 final_commit_hash,
@@ -1202,8 +1241,8 @@ impl PgStore {
             .lock()
             .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
         conn.execute(
-            "UPDATE decision_memory SET deprecated_as_exact = TRUE WHERE final_commit_hash = $1",
-            params![final_commit_hash],
+            "UPDATE decision_memory SET deprecated_as_exact = TRUE WHERE org_id = $1 AND final_commit_hash = $2",
+            params![self.org_id(), final_commit_hash],
         )?;
         Ok(())
     }
@@ -1219,14 +1258,14 @@ impl PgStore {
             .lock()
             .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
         conn.execute(
-            "INSERT INTO imported_decision_memory(summary_id, source_node_id, task_id, epoch, final_commit_hash, finalized_at,
+            "INSERT INTO imported_decision_memory(org_id, summary_id, source_node_id, task_id, epoch, final_commit_hash, finalized_at,
                                                   winning_candidate_hash, output_digest, result_summary, quorum_result_json,
                                                   reason_codes_json, reason_details, policy_snapshot_digest, task_type,
                                                   input_digest, output_schema_digest, policy_id, policy_params_digest,
                                                   deprecated_as_exact, revoked)
-             VALUES ($1, $2, $3, $4, $5, TIMESTAMPTZ 'epoch' + ($6::bigint * INTERVAL '1 millisecond'),
-                     $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, FALSE)
-             ON CONFLICT(summary_id, task_id, epoch) DO UPDATE SET
+             VALUES ($1, $2, $3, $4, $5, $6, TIMESTAMPTZ 'epoch' + ($7::bigint * INTERVAL '1 millisecond'),
+                     $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, FALSE)
+             ON CONFLICT(org_id, summary_id, task_id, epoch) DO UPDATE SET
                source_node_id = excluded.source_node_id,
                final_commit_hash = excluded.final_commit_hash,
                finalized_at = excluded.finalized_at,
@@ -1245,6 +1284,7 @@ impl PgStore {
                deprecated_as_exact = excluded.deprecated_as_exact,
                revoked = FALSE",
             params![
+                self.org_id(),
                 summary_id,
                 source_node_id,
                 decision.task_id,
@@ -1275,8 +1315,8 @@ impl PgStore {
             .lock()
             .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
         conn.execute(
-            "UPDATE imported_decision_memory SET revoked = TRUE WHERE summary_id = $1",
-            params![summary_id],
+            "UPDATE imported_decision_memory SET revoked = TRUE WHERE org_id = $1 AND summary_id = $2",
+            params![self.org_id(), summary_id],
         )?;
         Ok(())
     }
@@ -1287,8 +1327,8 @@ impl PgStore {
             .lock()
             .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
         conn.execute(
-            "UPDATE imported_decision_memory SET revoked = TRUE WHERE source_node_id = $1",
-            params![source_node_id],
+            "UPDATE imported_decision_memory SET revoked = TRUE WHERE org_id = $1 AND source_node_id = $2",
+            params![self.org_id(), source_node_id],
         )?;
         Ok(())
     }
@@ -1299,11 +1339,11 @@ impl PgStore {
             .lock()
             .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
         let exists = conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM decision_memory WHERE final_commit_hash = $1)",
-            params![final_commit_hash],
-            |r| r.get::<_, i64>(0),
+            "SELECT EXISTS(SELECT 1 FROM decision_memory WHERE org_id = $1 AND final_commit_hash = $2)",
+            params![self.org_id(), final_commit_hash],
+            |r| r.get::<_, bool>(0),
         )?;
-        Ok(exists != 0)
+        Ok(exists)
     }
 
     pub fn has_decision_reference(
@@ -1319,12 +1359,12 @@ impl PgStore {
         let exists = conn.query_row(
             "SELECT EXISTS(
                 SELECT 1 FROM decision_memory
-                WHERE task_id = $1 AND epoch = $2 AND final_commit_hash = $3
+                WHERE org_id = $1 AND task_id = $2 AND epoch = $3 AND final_commit_hash = $4
             )",
-            params![task_id, epoch as i64, final_commit_hash],
-            |r| r.get::<_, i64>(0),
+            params![self.org_id(), task_id, epoch as i64, final_commit_hash],
+            |r| r.get::<_, bool>(0),
         )?;
-        Ok(exists != 0)
+        Ok(exists)
     }
 
     pub fn list_local_decision_memory_hits_by_task_type(
@@ -1343,16 +1383,21 @@ impl PgStore {
                     policy_params_digest, deprecated_as_exact,
                     (EXTRACT(EPOCH FROM finalized_at) * 1000)::BIGINT AS finalized_at
              FROM decision_memory
-             WHERE task_type = $1
+             WHERE org_id = $1
+               AND task_type = $2
                AND winning_candidate_hash <> ''
-               AND NOT EXISTS (
-                    SELECT 1 FROM event_revocations revoked
-                    WHERE revoked.event_id = decision_memory.final_commit_hash
-               )
+                   AND NOT EXISTS (
+                        SELECT 1 FROM event_revocations revoked
+                        WHERE revoked.org_id = $1
+                          AND revoked.event_id = decision_memory.final_commit_hash
+                   )
              ORDER BY finalized_at DESC
-             LIMIT $2",
+             LIMIT $3",
         )?;
-        let rows = stmt.query_map(params![task_type, limit as i64], parse_decision_memory_row)?;
+        let rows = stmt.query_map(
+            params![self.org_id(), task_type, limit as i64],
+            parse_decision_memory_row,
+        )?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
             .map_err(Into::into)
     }
@@ -1377,12 +1422,14 @@ impl PgStore {
                        quorum_result_json, reason_codes_json, reason_details, policy_snapshot_digest,
                        input_digest, output_schema_digest, policy_id, task_type,
                        policy_params_digest, deprecated_as_exact, finalized_at
-                  FROM decision_memory local_dm
-                 WHERE task_type = $1
+                 FROM decision_memory local_dm
+                 WHERE org_id = $1
+                   AND task_type = $2
                    AND winning_candidate_hash <> ''
                    AND NOT EXISTS (
                         SELECT 1 FROM event_revocations revoked
-                        WHERE revoked.event_id = local_dm.final_commit_hash
+                        WHERE revoked.org_id = $1
+                          AND revoked.event_id = local_dm.final_commit_hash
                    )
                 UNION ALL
                 SELECT task_id, epoch, final_commit_hash, winning_candidate_hash, output_digest, result_summary,
@@ -1390,12 +1437,14 @@ impl PgStore {
                        input_digest, output_schema_digest, policy_id, task_type,
                        policy_params_digest, deprecated_as_exact, finalized_at
                   FROM imported_decision_memory imported_dm
-                 WHERE task_type = $1
+                 WHERE org_id = $1
+                   AND task_type = $2
                    AND winning_candidate_hash <> ''
                    AND revoked = FALSE
                    AND NOT EXISTS (
                         SELECT 1 FROM summary_revocations revoked_summary
-                        WHERE revoked_summary.summary_id = imported_dm.summary_id
+                        WHERE revoked_summary.org_id = $1
+                          AND revoked_summary.summary_id = imported_dm.summary_id
                    )
                    AND NOT EXISTS (
                         SELECT 1 FROM penalized_nodes penalized
@@ -1404,9 +1453,9 @@ impl PgStore {
                    )
              ) merged
              ORDER BY finalized_at DESC
-             LIMIT $2",
+             LIMIT $3",
         )?;
-        let rows = stmt.query_map(params![task_type, limit as i64], |r| {
+        let rows = stmt.query_map(params![self.org_id(), task_type, limit as i64], |r| {
             parse_decision_memory_row(r)
         })?;
         rows.collect::<std::result::Result<Vec<_>, _>>()

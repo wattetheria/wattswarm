@@ -14,7 +14,10 @@ pub mod pg;
 #[derive(Clone)]
 pub struct PgStore {
     conn: Arc<Mutex<Connection>>,
+    org_id: Arc<String>,
 }
+
+pub const DEFAULT_BOOTSTRAP_ORG_ID: &str = "bootstrap";
 
 #[derive(Debug, Clone)]
 pub struct LeaseRow {
@@ -148,6 +151,17 @@ pub struct TaskStageUsageRow {
 }
 
 impl PgStore {
+    pub fn for_org(&self, org_id: impl Into<String>) -> Self {
+        Self {
+            conn: self.conn.clone(),
+            org_id: Arc::new(org_id.into()),
+        }
+    }
+
+    pub fn org_id(&self) -> &str {
+        self.org_id.as_str()
+    }
+
     /// Begin an IMMEDIATE transaction on the underlying connection.
     ///
     /// # Safety contract
@@ -186,6 +200,7 @@ mod event_log;
 mod export;
 mod metrics;
 mod projection;
+mod registry;
 mod schema;
 
 fn query_table_json(

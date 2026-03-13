@@ -370,6 +370,175 @@ fn local_node_id_is_stable_for_same_state_dir() {
 }
 
 #[test]
+fn open_node_bootstraps_local_network_and_default_org() {
+    let _guard = env_lock();
+    let _db_lock = DbTestLock::acquire();
+    reset_test_schema("test");
+    let _schema_guard = EnvVarGuard::set("WATTSWARM_PG_SCHEMA", "test");
+    let dir = temp_test_dir("open-node-bootstrap");
+    let state_dir = dir.join("state");
+    fs::create_dir_all(&state_dir).expect("create state dir");
+    let db_path = state_dir.join("test.state");
+
+    let _node = open_node(&state_dir, &db_path).expect("open node");
+    let node_id = local_node_id(&state_dir).expect("local node id");
+    let network_id = format!("local:{node_id}");
+    let org_id = format!("{network_id}:bootstrap");
+
+    let conn = Connection::open("bootstrap-verify").expect("open verification connection");
+    let network_row = conn
+        .query_row(
+            "SELECT network_kind, genesis_node_id FROM network_registry WHERE network_id = $1",
+            wattswarm_storage_core::params![&network_id],
+            |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+        )
+        .expect("network registry row");
+    assert_eq!(network_row.0, "local");
+    assert_eq!(network_row.1, node_id);
+
+    let org_row = conn
+        .query_row(
+            "SELECT network_id, org_kind, is_default FROM org_registry WHERE org_id = $1",
+            wattswarm_storage_core::params![&org_id],
+            |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, bool>(2)?,
+                ))
+            },
+        )
+        .expect("org registry row");
+    assert_eq!(org_row.0, format!("local:{node_id}"));
+    assert_eq!(org_row.1, "bootstrap");
+    assert!(org_row.2);
+
+    let node_row = conn
+        .query_row(
+            "SELECT public_key, home_network_id FROM node_registry WHERE node_id = $1",
+            wattswarm_storage_core::params![&node_id],
+            |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+        )
+        .expect("node registry row");
+    assert_eq!(node_row.0, node_id);
+    assert_eq!(node_row.1, format!("local:{node_id}"));
+
+    cleanup_dir(&dir);
+}
+
+#[test]
+fn open_node_bootstraps_lan_network_and_default_org() {
+    let _guard = env_lock();
+    let _db_lock = DbTestLock::acquire();
+    reset_test_schema("test");
+    let _schema_guard = EnvVarGuard::set("WATTSWARM_PG_SCHEMA", "test");
+    let _mode_guard = EnvVarGuard::set("WATTSWARM_NODE_MODE", "lan");
+    let dir = temp_test_dir("open-node-lan-bootstrap");
+    let state_dir = dir.join("state");
+    fs::create_dir_all(&state_dir).expect("create state dir");
+    let db_path = state_dir.join("test.state");
+
+    let _node = open_node(&state_dir, &db_path).expect("open node");
+    let node_id = local_node_id(&state_dir).expect("local node id");
+    let network_id = format!("lan:{node_id}");
+    let org_id = format!("{network_id}:bootstrap");
+
+    let conn = Connection::open("lan-bootstrap-verify").expect("open verification connection");
+    let network_row = conn
+        .query_row(
+            "SELECT network_kind, genesis_node_id FROM network_registry WHERE network_id = $1",
+            wattswarm_storage_core::params![&network_id],
+            |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+        )
+        .expect("network registry row");
+    assert_eq!(network_row.0, "lan");
+    assert_eq!(network_row.1, node_id);
+
+    let org_row = conn
+        .query_row(
+            "SELECT network_id, org_kind, is_default FROM org_registry WHERE org_id = $1",
+            wattswarm_storage_core::params![&org_id],
+            |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, bool>(2)?,
+                ))
+            },
+        )
+        .expect("org registry row");
+    assert_eq!(org_row.0, network_id);
+    assert_eq!(org_row.1, "bootstrap");
+    assert!(org_row.2);
+
+    cleanup_dir(&dir);
+}
+
+#[test]
+fn open_node_network_mode_uses_existing_network_topology_only() {
+    let _guard = env_lock();
+    let _db_lock = DbTestLock::acquire();
+    reset_test_schema("test");
+    let _schema_guard = EnvVarGuard::set("WATTSWARM_PG_SCHEMA", "test");
+    let _mode_guard = EnvVarGuard::set("WATTSWARM_NODE_MODE", "network");
+    let dir = temp_test_dir("open-node-network-mode");
+    let state_dir = dir.join("state");
+    fs::create_dir_all(&state_dir).expect("create state dir");
+    let db_path = state_dir.join("test.state");
+    let node_id = local_node_id(&state_dir).expect("local node id");
+    let network_id = "mainnet:watt-galaxy";
+    let org_id = "mainnet:watt-galaxy:bootstrap";
+
+    let bootstrap_store = wattswarm_control_plane::storage::PgStore::open(&db_path)
+        .expect("open store for bootstrap network setup");
+    let conn = Connection::open("network-bootstrap-setup").expect("open setup connection");
+    conn.execute(
+        "INSERT INTO network_registry(network_id, network_kind, parent_network_id, name, status, genesis_node_id, created_at)
+         VALUES ($1, 'mainnet', NULL, 'Watt Galaxy', 'active', $2, TIMESTAMPTZ 'epoch' + ($3::bigint * INTERVAL '1 millisecond'))",
+        wattswarm_storage_core::params![network_id, &node_id, 1_700_000_000_000_i64],
+    )
+    .expect("insert network registry");
+    conn.execute(
+        "INSERT INTO network_params(network_id, control_mode, membership_version, policy_version, params_json, created_at, updated_at)
+         VALUES ($1, 'manual_owner', 1, 1, '{}', TIMESTAMPTZ 'epoch' + ($2::bigint * INTERVAL '1 millisecond'), TIMESTAMPTZ 'epoch' + ($2::bigint * INTERVAL '1 millisecond'))",
+        wattswarm_storage_core::params![network_id, 1_700_000_000_000_i64],
+    )
+    .expect("insert network params");
+    conn.execute(
+        "INSERT INTO org_registry(org_id, network_id, org_kind, name, status, is_default, created_at)
+         VALUES ($1, $2, 'bootstrap', 'Watt Galaxy Bootstrap', 'active', TRUE, TIMESTAMPTZ 'epoch' + ($3::bigint * INTERVAL '1 millisecond'))",
+        wattswarm_storage_core::params![org_id, network_id, 1_700_000_000_000_i64],
+    )
+    .expect("insert org registry");
+    drop(conn);
+    drop(bootstrap_store);
+
+    let node = open_node(&state_dir, &db_path).expect("open node in network mode");
+    assert_eq!(node.store.org_id(), org_id);
+
+    let conn = Connection::open("network-bootstrap-verify").expect("open verification connection");
+    let local_network_count = conn
+        .query_row(
+            "SELECT COUNT(*) FROM network_registry WHERE network_id = $1",
+            wattswarm_storage_core::params![format!("local:{node_id}")],
+            |r| r.get::<_, i64>(0),
+        )
+        .expect("count local network row");
+    assert_eq!(local_network_count, 0);
+
+    let home_network = conn
+        .query_row(
+            "SELECT home_network_id FROM node_registry WHERE node_id = $1",
+            wattswarm_storage_core::params![&node_id],
+            |r| r.get::<_, String>(0),
+        )
+        .expect("node registry row");
+    assert_eq!(home_network, network_id);
+
+    cleanup_dir(&dir);
+}
+
+#[test]
 fn run_real_task_flow_returns_clear_error_when_executor_missing() {
     let _guard = env_lock();
     let _db_lock = DbTestLock::acquire();

@@ -2,6 +2,7 @@ use anyhow::{Result, anyhow};
 use postgres::{Client, NoTls, Transaction};
 use serde_json::{Value, json};
 use std::collections::HashSet;
+use std::sync::Arc;
 
 use super::aggregation::{AggregationNextAction, build_run_summary_tx};
 use super::status::{
@@ -15,13 +16,17 @@ use super::utils::{accumulate_counts, step_counts_tx};
 pub struct PgRunQueue {
     pub(crate) database_url: String,
     pub(crate) schema: Option<String>,
+    pub(crate) org_id: Arc<String>,
 }
+
+const DEFAULT_RUN_QUEUE_ORG_ID: &str = "bootstrap";
 
 impl PgRunQueue {
     pub fn new(database_url: impl Into<String>) -> Self {
         Self {
             database_url: database_url.into(),
             schema: None,
+            org_id: Arc::new(DEFAULT_RUN_QUEUE_ORG_ID.to_owned()),
         }
     }
 
@@ -29,7 +34,20 @@ impl PgRunQueue {
         Self {
             database_url: database_url.into(),
             schema: Some(sanitize_ident(schema.as_ref())),
+            org_id: Arc::new(DEFAULT_RUN_QUEUE_ORG_ID.to_owned()),
         }
+    }
+
+    pub fn for_org(&self, org_id: impl Into<String>) -> Self {
+        Self {
+            database_url: self.database_url.clone(),
+            schema: self.schema.clone(),
+            org_id: Arc::new(org_id.into()),
+        }
+    }
+
+    pub fn org_id(&self) -> &str {
+        self.org_id.as_str()
     }
 
     pub(crate) fn connect(&self) -> Result<Client> {
@@ -53,7 +71,7 @@ impl PgRunQueue {
         let status = self
             .run_status_tx(tx, run_id)?
             .ok_or_else(|| anyhow!("run not found: {run_id}"))?;
-        let counts = step_counts_tx(tx, run_id)?;
+        let counts = step_counts_tx(tx, self.org_id(), run_id)?;
         let active = counts.created + counts.queued + counts.leased + counts.retry_wait;
         if active > 0 {
             return Ok(());
@@ -66,14 +84,14 @@ impl PgRunQueue {
         } else {
             RUN_STATUS_FAILED
         };
-        let summary = build_run_summary_tx(tx, run_id, final_status, &counts)?;
+        let summary = build_run_summary_tx(tx, self.org_id(), run_id, final_status, &counts)?;
         if status != RUN_STATUS_CANCELLING
             && let AggregationNextAction::ReExplore(directive) = &summary.action
         {
             let shared_inputs_raw: String = tx
                 .query_one(
-                    "SELECT shared_inputs_json FROM runs WHERE run_id = $1",
-                    &[&run_id],
+                    "SELECT shared_inputs_json FROM runs WHERE org_id = $1 AND run_id = $2",
+                    &[&self.org_id(), &run_id],
                 )?
                 .get(0);
             let merged_shared_inputs = merge_reexplore_signal(
@@ -94,8 +112,14 @@ impl PgRunQueue {
                      error_text = NULL,
                      finished_at = NULL,
                      updated_at = TIMESTAMPTZ 'epoch' + ($4::bigint * INTERVAL '1 millisecond')
-                 WHERE run_id = $1",
-                &[&run_id, &RUN_STATUS_QUEUED, &merged_shared_inputs, &now],
+                 WHERE org_id = $1 AND run_id = $2",
+                &[
+                    &self.org_id(),
+                    &run_id,
+                    &RUN_STATUS_QUEUED,
+                    &merged_shared_inputs,
+                    &now,
+                ],
             )?;
             if counts.succeeded > 0 {
                 tx.execute(
@@ -110,9 +134,11 @@ impl PgRunQueue {
                          error_text = NULL,
                          finished_at = NULL,
                          updated_at = TIMESTAMPTZ 'epoch' + ($3::bigint * INTERVAL '1 millisecond')
-                     WHERE run_id = $1
+                     WHERE org_id = $1
+                       AND run_id = $2
                        AND status = $4",
                     &[
+                        &self.org_id(),
                         &run_id,
                         &super::status::STEP_STATUS_QUEUED,
                         &now,
@@ -132,9 +158,11 @@ impl PgRunQueue {
                          error_text = NULL,
                          finished_at = NULL,
                          updated_at = TIMESTAMPTZ 'epoch' + ($3::bigint * INTERVAL '1 millisecond')
-                     WHERE run_id = $1
+                     WHERE org_id = $1
+                       AND run_id = $2
                        AND status IN ($4, $5, $6)",
                     &[
+                        &self.org_id(),
                         &run_id,
                         &super::status::STEP_STATUS_QUEUED,
                         &now,
@@ -155,9 +183,15 @@ impl PgRunQueue {
         }
         tx.execute(
             "UPDATE runs
-             SET status = $2, result_json = $3, finished_at = TIMESTAMPTZ 'epoch' + ($4::bigint * INTERVAL '1 millisecond'), updated_at = TIMESTAMPTZ 'epoch' + ($4::bigint * INTERVAL '1 millisecond')
-             WHERE run_id = $1",
-            &[&run_id, &final_status, &summary.result_payload.to_string(), &now],
+             SET status = $3, result_json = $4, finished_at = TIMESTAMPTZ 'epoch' + ($5::bigint * INTERVAL '1 millisecond'), updated_at = TIMESTAMPTZ 'epoch' + ($5::bigint * INTERVAL '1 millisecond')
+             WHERE org_id = $1 AND run_id = $2",
+            &[
+                &self.org_id(),
+                &run_id,
+                &final_status,
+                &summary.result_payload.to_string(),
+                &now,
+            ],
         )?;
         self.insert_event_tx(tx, run_id, "RUN_FINALIZED", &summary.event_payload, now)?;
         Ok(())
@@ -169,7 +203,10 @@ impl PgRunQueue {
         run_id: &str,
     ) -> Result<Option<String>> {
         Ok(tx
-            .query_opt("SELECT status FROM runs WHERE run_id = $1", &[&run_id])?
+            .query_opt(
+                "SELECT status FROM runs WHERE org_id = $1 AND run_id = $2",
+                &[&self.org_id(), &run_id],
+            )?
             .map(|row| row.get::<_, String>(0)))
     }
 
@@ -182,9 +219,15 @@ impl PgRunQueue {
         now: i64,
     ) -> Result<()> {
         tx.execute(
-            "INSERT INTO run_events(run_id, event_type, payload_json, created_at)
-             VALUES ($1,$2,$3,TIMESTAMPTZ 'epoch' + ($4::bigint * INTERVAL '1 millisecond'))",
-            &[&run_id, &event_type, &payload.to_string(), &now],
+            "INSERT INTO run_events(org_id, run_id, event_type, payload_json, created_at)
+             VALUES ($1,$2,$3,$4,TIMESTAMPTZ 'epoch' + ($5::bigint * INTERVAL '1 millisecond'))",
+            &[
+                &self.org_id(),
+                &run_id,
+                &event_type,
+                &payload.to_string(),
+                &now,
+            ],
         )?;
         Ok(())
     }
@@ -193,9 +236,9 @@ impl PgRunQueue {
         let rows = client.query(
             "SELECT status, COUNT(1)
              FROM run_steps
-             WHERE run_id = $1
+             WHERE org_id = $1 AND run_id = $2
              GROUP BY status",
-            &[&run_id],
+            &[&self.org_id(), &run_id],
         )?;
         Ok(accumulate_counts(rows))
     }

@@ -1,6 +1,7 @@
 use crate::control::{
-    ExecutorRegistryEntry, NodeState, RealTaskRunRequest, executor_registry_path,
-    load_executor_registry, open_node, run_real_task_flow, save_executor_registry,
+    ExecutorRegistryEntry, NodeMode, NodeState, RealTaskRunRequest, executor_registry_path,
+    load_executor_registry, node_state_path, open_node, open_node_in_mode, resolve_node_mode,
+    run_real_task_flow, save_executor_registry, write_node_state,
 };
 use crate::run_queue::{PgRunQueue, RunSubmitSpec, WorkerOptions};
 pub use crate::task_template::{sample_artifact_ref, sample_contract};
@@ -41,7 +42,10 @@ enum RootCommand {
 
 #[derive(Subcommand, Debug)]
 enum NodeAction {
-    Up,
+    Up {
+        #[arg(long, default_value = "local")]
+        mode: String,
+    },
     Down,
     Status,
 }
@@ -215,27 +219,30 @@ pub fn run() -> Result<()> {
 }
 
 fn handle_node(cmd: NodeCommand, state_dir: &Path, db_path: &Path) -> Result<()> {
-    let state_path = state_dir.join("node_state.json");
+    let state_path = node_state_path(state_dir);
     match cmd.action {
-        NodeAction::Up => {
-            let node = open_node(state_dir, db_path)?;
-            let state = NodeState { running: true };
-            fs::write(&state_path, serde_json::to_vec_pretty(&state)?)?;
+        NodeAction::Up { mode } => {
+            let mode = NodeMode::parse(&mode)?;
+            let node = open_node_in_mode(state_dir, db_path, mode)?;
+            write_node_state(state_dir, true, mode)?;
             if crate::network_bridge::network_enabled_from_env() {
                 crate::udp_announce::announce_startup("node-up", None, Some(&node.node_id()));
             }
             println!("node is up");
         }
         NodeAction::Down => {
-            let state = NodeState { running: false };
-            fs::write(&state_path, serde_json::to_vec_pretty(&state)?)?;
+            let mode = resolve_node_mode(state_dir)?;
+            write_node_state(state_dir, false, mode)?;
             println!("node is down");
         }
         NodeAction::Status => {
             let state: NodeState = if state_path.exists() {
                 serde_json::from_slice(&fs::read(&state_path)?)?
             } else {
-                NodeState { running: false }
+                NodeState {
+                    running: false,
+                    mode: NodeMode::Local,
+                }
             };
             let node = open_node(state_dir, db_path)?;
             let peers = node
@@ -249,6 +256,7 @@ fn handle_node(cmd: NodeCommand, state_dir: &Path, db_path: &Path) -> Result<()>
                 "{}",
                 serde_json::to_string(&serde_json::json!({
                     "running": state.running,
+                    "mode": state.mode.as_str(),
                     "local_protocol_version": crate::constants::LOCAL_PROTOCOL_VERSION,
                     "peer_protocol_distribution": dist
                 }))?
@@ -378,14 +386,15 @@ fn handle_task(cmd: TaskCommand, state_dir: &Path, db_path: &Path) -> Result<()>
 
 fn handle_run(cmd: RunCommand, state_dir: &Path, db_path: &Path) -> Result<()> {
     let pg_url = resolve_pg_url(cmd.pg_url);
-    let queue = PgRunQueue::new(pg_url);
-
     match cmd.action {
         RunAction::Init => {
+            let queue = PgRunQueue::new(pg_url);
             queue.init_schema()?;
             println!("run queue schema initialized");
         }
         RunAction::Submit { file, kickoff } => {
+            let node = open_node(state_dir, db_path)?;
+            let queue = PgRunQueue::new(pg_url).for_org(node.store.org_id().to_owned());
             let raw = fs::read(&file)?;
             let spec: RunSubmitSpec = serde_json::from_slice(&raw)
                 .with_context(|| format!("parse run submit spec from {}", file.display()))?;
@@ -404,26 +413,38 @@ fn handle_run(cmd: RunCommand, state_dir: &Path, db_path: &Path) -> Result<()> {
             );
         }
         RunAction::Kickoff { run_id } => {
+            let node = open_node(state_dir, db_path)?;
+            let queue = PgRunQueue::new(pg_url).for_org(node.store.org_id().to_owned());
             queue.kickoff_run(&run_id)?;
             println!("kicked off {}", run_id);
         }
         RunAction::Watch { run_id } => {
+            let node = open_node(state_dir, db_path)?;
+            let queue = PgRunQueue::new(pg_url).for_org(node.store.org_id().to_owned());
             let view = queue.run_view(&run_id)?;
             println!("{}", serde_json::to_string_pretty(&view)?);
         }
         RunAction::Result { run_id } => {
+            let node = open_node(state_dir, db_path)?;
+            let queue = PgRunQueue::new(pg_url).for_org(node.store.org_id().to_owned());
             let result = queue.run_result(&run_id)?;
             println!("{}", serde_json::to_string_pretty(&result)?);
         }
         RunAction::Events { run_id, limit } => {
+            let node = open_node(state_dir, db_path)?;
+            let queue = PgRunQueue::new(pg_url).for_org(node.store.org_id().to_owned());
             let events = queue.run_events(&run_id, limit.max(1))?;
             println!("{}", serde_json::to_string_pretty(&events)?);
         }
         RunAction::Cancel { run_id } => {
+            let node = open_node(state_dir, db_path)?;
+            let queue = PgRunQueue::new(pg_url).for_org(node.store.org_id().to_owned());
             queue.cancel_run(&run_id)?;
             println!("cancel requested {}", run_id);
         }
         RunAction::Retry { run_id } => {
+            let node = open_node(state_dir, db_path)?;
+            let queue = PgRunQueue::new(pg_url).for_org(node.store.org_id().to_owned());
             queue.retry_run(&run_id)?;
             println!("retry requested {}", run_id);
         }
@@ -434,6 +455,8 @@ fn handle_run(cmd: RunCommand, state_dir: &Path, db_path: &Path) -> Result<()> {
             lease_ms,
             once,
         } => {
+            let node = open_node(state_dir, db_path)?;
+            let queue = PgRunQueue::new(pg_url).for_org(node.store.org_id().to_owned());
             let worker_id = worker_id.unwrap_or_else(|| format!("worker-{}", Uuid::new_v4()));
             queue.run_worker(
                 WorkerOptions {

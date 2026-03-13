@@ -20,9 +20,10 @@ impl PgRunQueue {
         let agg_json = serde_json::to_string(&spec.aggregation)?;
         let shared_inputs_json = serde_json::to_string(&spec.shared_inputs)?;
         tx.execute(
-            "INSERT INTO runs(run_id, status, task_type, shared_inputs_json, retry_policy_json, aggregation_policy_json, created_at, updated_at)
-             VALUES ($1,$2,$3,$4,$5,$6,TIMESTAMPTZ 'epoch' + ($7::bigint * INTERVAL '1 millisecond'),TIMESTAMPTZ 'epoch' + ($7::bigint * INTERVAL '1 millisecond'))",
+            "INSERT INTO runs(org_id, run_id, status, task_type, shared_inputs_json, retry_policy_json, aggregation_policy_json, created_at, updated_at)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,TIMESTAMPTZ 'epoch' + ($8::bigint * INTERVAL '1 millisecond'),TIMESTAMPTZ 'epoch' + ($8::bigint * INTERVAL '1 millisecond'))",
             &[
+                &self.org_id(),
                 &spec.run_id,
                 &RUN_STATUS_CREATED,
                 &spec.task_type,
@@ -38,11 +39,12 @@ impl PgRunQueue {
             let step_id = format!("{}:{}", spec.run_id, agent.agent_id);
             tx.execute(
                 "INSERT INTO run_steps(
-                    step_id, run_id, agent_id, executor, profile, prompt, weight, priority,
+                    org_id, step_id, run_id, agent_id, executor, profile, prompt, weight, priority,
                     status, attempt, max_attempts, next_run_at, created_at, updated_at
                  )
-                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,0,$10,TIMESTAMPTZ 'epoch' + ($11::bigint * INTERVAL '1 millisecond'),TIMESTAMPTZ 'epoch' + ($11::bigint * INTERVAL '1 millisecond'),TIMESTAMPTZ 'epoch' + ($11::bigint * INTERVAL '1 millisecond'))",
+                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,0,$11,TIMESTAMPTZ 'epoch' + ($12::bigint * INTERVAL '1 millisecond'),TIMESTAMPTZ 'epoch' + ($12::bigint * INTERVAL '1 millisecond'),TIMESTAMPTZ 'epoch' + ($12::bigint * INTERVAL '1 millisecond'))",
                 &[
+                    &self.org_id(),
                     &step_id,
                     &spec.run_id,
                     &agent.agent_id,
@@ -86,21 +88,28 @@ impl PgRunQueue {
         tx.execute(
             "UPDATE runs
              SET status = CASE
-                WHEN status = $2 THEN $3
+                WHEN status = $3 THEN $4
                 ELSE status
              END,
-             started_at = COALESCE(started_at, TIMESTAMPTZ 'epoch' + ($4::bigint * INTERVAL '1 millisecond')),
-             updated_at = TIMESTAMPTZ 'epoch' + ($4::bigint * INTERVAL '1 millisecond')
-             WHERE run_id = $1",
-            &[&run_id, &RUN_STATUS_CREATED, &RUN_STATUS_QUEUED, &now],
+             started_at = COALESCE(started_at, TIMESTAMPTZ 'epoch' + ($5::bigint * INTERVAL '1 millisecond')),
+             updated_at = TIMESTAMPTZ 'epoch' + ($5::bigint * INTERVAL '1 millisecond')
+             WHERE org_id = $1 AND run_id = $2",
+            &[
+                &self.org_id(),
+                &run_id,
+                &RUN_STATUS_CREATED,
+                &RUN_STATUS_QUEUED,
+                &now,
+            ],
         )?;
         tx.execute(
             "UPDATE run_steps
-             SET status = $2,
-                 next_run_at = TIMESTAMPTZ 'epoch' + ($3::bigint * INTERVAL '1 millisecond'),
-                 updated_at = TIMESTAMPTZ 'epoch' + ($3::bigint * INTERVAL '1 millisecond')
-             WHERE run_id = $1 AND status IN ($4, $5)",
+             SET status = $3,
+                 next_run_at = TIMESTAMPTZ 'epoch' + ($4::bigint * INTERVAL '1 millisecond'),
+                 updated_at = TIMESTAMPTZ 'epoch' + ($4::bigint * INTERVAL '1 millisecond')
+             WHERE org_id = $1 AND run_id = $2 AND status IN ($5, $6)",
             &[
+                &self.org_id(),
                 &run_id,
                 &STEP_STATUS_QUEUED,
                 &now,
@@ -126,12 +135,13 @@ impl PgRunQueue {
         let updated = tx.execute(
             "UPDATE runs
              SET status = CASE
-                WHEN status IN ($2,$3,$4) THEN $5
+                WHEN status IN ($3,$4,$5) THEN $6
                 ELSE status
              END,
-             updated_at = TIMESTAMPTZ 'epoch' + ($6::bigint * INTERVAL '1 millisecond')
-             WHERE run_id = $1",
+             updated_at = TIMESTAMPTZ 'epoch' + ($7::bigint * INTERVAL '1 millisecond')
+             WHERE org_id = $1 AND run_id = $2",
             &[
+                &self.org_id(),
                 &run_id,
                 &RUN_STATUS_CREATED,
                 &RUN_STATUS_QUEUED,
@@ -145,10 +155,11 @@ impl PgRunQueue {
         }
         tx.execute(
             "UPDATE run_steps
-             SET status = $2, lease_id = NULL, lease_owner = NULL, lease_until = NULL,
-                 updated_at = TIMESTAMPTZ 'epoch' + ($3::bigint * INTERVAL '1 millisecond'), finished_at = TIMESTAMPTZ 'epoch' + ($3::bigint * INTERVAL '1 millisecond')
-             WHERE run_id = $1 AND status IN ($4, $5, $6)",
+             SET status = $3, lease_id = NULL, lease_owner = NULL, lease_until = NULL,
+                 updated_at = TIMESTAMPTZ 'epoch' + ($4::bigint * INTERVAL '1 millisecond'), finished_at = TIMESTAMPTZ 'epoch' + ($4::bigint * INTERVAL '1 millisecond')
+             WHERE org_id = $1 AND run_id = $2 AND status IN ($5, $6, $7)",
             &[
+                &self.org_id(),
                 &run_id,
                 &STEP_STATUS_CANCELLED,
                 &now,
@@ -182,16 +193,17 @@ impl PgRunQueue {
 
         let moved = tx.execute(
             "UPDATE run_steps
-             SET status = $2,
-                 next_run_at = TIMESTAMPTZ 'epoch' + ($3::bigint * INTERVAL '1 millisecond'),
+             SET status = $3,
+                 next_run_at = TIMESTAMPTZ 'epoch' + ($4::bigint * INTERVAL '1 millisecond'),
                  lease_id = NULL,
                  lease_owner = NULL,
                  lease_until = NULL,
                  error_text = NULL,
-                 updated_at = TIMESTAMPTZ 'epoch' + ($3::bigint * INTERVAL '1 millisecond'),
+                 updated_at = TIMESTAMPTZ 'epoch' + ($4::bigint * INTERVAL '1 millisecond'),
                  finished_at = NULL
-             WHERE run_id = $1 AND status IN ($4, $5)",
+             WHERE org_id = $1 AND run_id = $2 AND status IN ($5, $6)",
             &[
+                &self.org_id(),
                 &run_id,
                 &STEP_STATUS_QUEUED,
                 &now,
@@ -202,9 +214,9 @@ impl PgRunQueue {
         if moved > 0 {
             tx.execute(
                 "UPDATE runs
-                 SET status = $2, error_text = NULL, result_json = NULL, finished_at = NULL, updated_at = TIMESTAMPTZ 'epoch' + ($3::bigint * INTERVAL '1 millisecond')
-                 WHERE run_id = $1",
-                &[&run_id, &RUN_STATUS_QUEUED, &now],
+                 SET status = $3, error_text = NULL, result_json = NULL, finished_at = NULL, updated_at = TIMESTAMPTZ 'epoch' + ($4::bigint * INTERVAL '1 millisecond')
+                 WHERE org_id = $1 AND run_id = $2",
+                &[&self.org_id(), &run_id, &RUN_STATUS_QUEUED, &now],
             )?;
         }
         self.insert_event_tx(
@@ -227,8 +239,8 @@ impl PgRunQueue {
                         (EXTRACT(EPOCH FROM updated_at) * 1000)::BIGINT,
                         CASE WHEN started_at IS NULL THEN NULL ELSE (EXTRACT(EPOCH FROM started_at) * 1000)::BIGINT END,
                         CASE WHEN finished_at IS NULL THEN NULL ELSE (EXTRACT(EPOCH FROM finished_at) * 1000)::BIGINT END
-                 FROM runs WHERE run_id = $1",
-                &[&run_id],
+                 FROM runs WHERE org_id = $1 AND run_id = $2",
+                &[&self.org_id(), &run_id],
             )?
             .ok_or_else(|| anyhow!("run not found: {run_id}"))?;
         let counts = self.step_counts(&mut client, run_id)?;
@@ -250,8 +262,8 @@ impl PgRunQueue {
             .query_opt(
                 "SELECT status, result_json, error_text,
                         CASE WHEN finished_at IS NULL THEN NULL ELSE (EXTRACT(EPOCH FROM finished_at) * 1000)::BIGINT END
-                 FROM runs WHERE run_id = $1",
-                &[&run_id],
+                 FROM runs WHERE org_id = $1 AND run_id = $2",
+                &[&self.org_id(), &run_id],
             )?
             .ok_or_else(|| anyhow!("run not found: {run_id}"))?;
         let status: String = row.get(0);
@@ -278,10 +290,10 @@ impl PgRunQueue {
             "SELECT id, run_id, event_type, payload_json,
                     (EXTRACT(EPOCH FROM created_at) * 1000)::BIGINT
              FROM run_events
-             WHERE run_id = $1
+             WHERE org_id = $1 AND run_id = $2
              ORDER BY id DESC
-             LIMIT $2",
-            &[&run_id, &limit],
+             LIMIT $3",
+            &[&self.org_id(), &run_id, &limit],
         )?;
         let mut events = Vec::with_capacity(rows.len());
         for row in rows {
@@ -381,7 +393,10 @@ mod tests {
 
     fn cleanup_run(queue: &PgRunQueue, run_id: &str) {
         if let Ok(mut client) = queue.connect() {
-            let _ = client.execute("DELETE FROM runs WHERE run_id = $1", &[&run_id]);
+            let _ = client.execute(
+                "DELETE FROM runs WHERE org_id = $1 AND run_id = $2",
+                &[&queue.org_id(), &run_id],
+            );
         }
     }
 
@@ -441,23 +456,23 @@ mod tests {
         client
             .execute(
                 "UPDATE run_steps
-                 SET status = $2,
+                 SET status = $3,
                      error_text = 'failed',
-                     finished_at = TIMESTAMPTZ 'epoch' + ($3::bigint * INTERVAL '1 millisecond'),
-                     updated_at = TIMESTAMPTZ 'epoch' + ($3::bigint * INTERVAL '1 millisecond')
-                 WHERE run_id = $1",
-                &[&run_id, &STEP_STATUS_FAILED, &now],
+                     finished_at = TIMESTAMPTZ 'epoch' + ($4::bigint * INTERVAL '1 millisecond'),
+                     updated_at = TIMESTAMPTZ 'epoch' + ($4::bigint * INTERVAL '1 millisecond')
+                 WHERE org_id = $1 AND run_id = $2",
+                &[&queue.org_id(), &run_id, &STEP_STATUS_FAILED, &now],
             )
             .expect("mark step failed");
         client
             .execute(
                 "UPDATE runs
-                 SET status = $2,
+                 SET status = $3,
                      error_text = 'failed',
-                     finished_at = TIMESTAMPTZ 'epoch' + ($3::bigint * INTERVAL '1 millisecond'),
-                     updated_at = TIMESTAMPTZ 'epoch' + ($3::bigint * INTERVAL '1 millisecond')
-                 WHERE run_id = $1",
-                &[&run_id, &RUN_STATUS_FAILED, &now],
+                     finished_at = TIMESTAMPTZ 'epoch' + ($4::bigint * INTERVAL '1 millisecond'),
+                     updated_at = TIMESTAMPTZ 'epoch' + ($4::bigint * INTERVAL '1 millisecond')
+                 WHERE org_id = $1 AND run_id = $2",
+                &[&queue.org_id(), &run_id, &RUN_STATUS_FAILED, &now],
             )
             .expect("mark run failed");
 
@@ -469,8 +484,8 @@ mod tests {
 
         let step_row = client
             .query_one(
-                "SELECT status, error_text FROM run_steps WHERE run_id = $1",
-                &[&run_id],
+                "SELECT status, error_text FROM run_steps WHERE org_id = $1 AND run_id = $2",
+                &[&queue.org_id(), &run_id],
             )
             .expect("step row");
         let step_status: String = step_row.get(0);
@@ -506,9 +521,9 @@ mod tests {
         let now = now_ms();
         client
             .execute(
-                "INSERT INTO run_events(run_id, event_type, payload_json, created_at)
-                 VALUES ($1, $2, 'not-json', TIMESTAMPTZ 'epoch' + ($3::bigint * INTERVAL '1 millisecond'))",
-                &[&run_id, &"BROKEN_EVENT", &now],
+                "INSERT INTO run_events(org_id, run_id, event_type, payload_json, created_at)
+                 VALUES ($1, $2, $3, 'not-json', TIMESTAMPTZ 'epoch' + ($4::bigint * INTERVAL '1 millisecond'))",
+                &[&queue.org_id(), &run_id, &"BROKEN_EVENT", &now],
             )
             .expect("insert broken event");
 
