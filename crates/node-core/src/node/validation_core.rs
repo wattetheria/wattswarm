@@ -234,12 +234,15 @@ impl Node {
             );
         }
         if payload.subscriber_node_id != event.author_node_id {
-            return Err(
-                SwarmError::InvalidEvent("subscription author must match subscriber".into()).into(),
-            );
+            return Err(SwarmError::InvalidEvent(
+                "subscription author must match subscriber".into(),
+            )
+            .into());
         }
         if !is_valid_scope_hint(&payload.scope_hint) {
-            return Err(SwarmError::InvalidEvent("feed subscription scope_hint invalid".into()).into());
+            return Err(
+                SwarmError::InvalidEvent("feed subscription scope_hint invalid".into()).into(),
+            );
         }
         Ok(())
     }
@@ -250,18 +253,22 @@ impl Node {
             || payload.feed_key.trim().is_empty()
             || payload.scope_hint.trim().is_empty()
         {
-            return Err(SwarmError::InvalidEvent("task announcement fields required".into()).into());
+            return Err(
+                SwarmError::InvalidEvent("task announcement fields required".into()).into(),
+            );
         }
         if let Some(detail_ref) = &payload.detail_ref
             && (detail_ref.uri.trim().is_empty() || detail_ref.digest.trim().is_empty())
         {
-            return Err(
-                SwarmError::InvalidEvent("task announcement detail_ref must be complete".into())
-                    .into(),
-            );
+            return Err(SwarmError::InvalidEvent(
+                "task announcement detail_ref must be complete".into(),
+            )
+            .into());
         }
         if !is_valid_scope_hint(&payload.scope_hint) {
-            return Err(SwarmError::InvalidEvent("task announcement scope_hint invalid".into()).into());
+            return Err(
+                SwarmError::InvalidEvent("task announcement scope_hint invalid".into()).into(),
+            );
         }
         Ok(())
     }
@@ -281,13 +288,15 @@ impl Node {
             return Err(SwarmError::InvalidEvent("execution intent fields required".into()).into());
         }
         if payload.participant_node_id != event.author_node_id {
-            return Err(
-                SwarmError::InvalidEvent("execution intent author must match participant".into())
-                    .into(),
-            );
+            return Err(SwarmError::InvalidEvent(
+                "execution intent author must match participant".into(),
+            )
+            .into());
         }
         if !is_valid_scope_hint(&payload.scope_hint) {
-            return Err(SwarmError::InvalidEvent("execution intent scope_hint invalid".into()).into());
+            return Err(
+                SwarmError::InvalidEvent("execution intent scope_hint invalid".into()).into(),
+            );
         }
         Ok(())
     }
@@ -302,10 +311,10 @@ impl Node {
             || payload.confirmed_by_node_id.trim().is_empty()
             || payload.scope_hint.trim().is_empty()
         {
-            return Err(
-                SwarmError::InvalidEvent("execution set confirmation fields required".into())
-                    .into(),
-            );
+            return Err(SwarmError::InvalidEvent(
+                "execution set confirmation fields required".into(),
+            )
+            .into());
         }
         if payload.confirmed_by_node_id != event.author_node_id {
             return Err(
@@ -313,28 +322,30 @@ impl Node {
             );
         }
         if !is_valid_scope_hint(&payload.scope_hint) {
-            return Err(
-                SwarmError::InvalidEvent("execution set confirmation scope_hint invalid".into())
-                    .into(),
-            );
+            return Err(SwarmError::InvalidEvent(
+                "execution set confirmation scope_hint invalid".into(),
+            )
+            .into());
         }
         if payload.members.is_empty() {
-            return Err(
-                SwarmError::InvalidEvent("execution set confirmation requires members".into())
-                    .into(),
-            );
+            return Err(SwarmError::InvalidEvent(
+                "execution set confirmation requires members".into(),
+            )
+            .into());
         }
         let mut unique = HashSet::new();
         for member in &payload.members {
             if member.participant_node_id.trim().is_empty() || member.role_hint.trim().is_empty() {
-                return Err(
-                    SwarmError::InvalidEvent("execution set member fields required".into()).into(),
-                );
+                return Err(SwarmError::InvalidEvent(
+                    "execution set member fields required".into(),
+                )
+                .into());
             }
             if !unique.insert(member.participant_node_id.clone()) {
-                return Err(
-                    SwarmError::InvalidEvent("execution set members must be unique".into()).into(),
-                );
+                return Err(SwarmError::InvalidEvent(
+                    "execution set members must be unique".into(),
+                )
+                .into());
             }
         }
         Ok(())
@@ -997,5 +1008,9 @@ fn is_valid_scope_hint(raw: &str) -> bool {
         return false;
     };
     let id = rest.trim();
-    !id.is_empty() && matches!(kind.trim().to_ascii_lowercase().as_str(), "region" | "local" | "node")
+    !id.is_empty()
+        && matches!(
+            kind.trim().to_ascii_lowercase().as_str(),
+            "region" | "local" | "node"
+        )
 }

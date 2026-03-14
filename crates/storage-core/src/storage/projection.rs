@@ -296,7 +296,10 @@ impl PgStore {
         Ok(())
     }
 
-    pub fn get_task_announcement(&self, announcement_id: &str) -> Result<Option<TaskAnnouncementRow>> {
+    pub fn get_task_announcement(
+        &self,
+        announcement_id: &str,
+    ) -> Result<Option<TaskAnnouncementRow>> {
         let conn = self
             .conn
             .lock()
@@ -339,22 +342,25 @@ impl PgStore {
         .map_err(Into::into)
     }
 
-    pub fn get_task_announcement_for_task(&self, task_id: &str) -> Result<Option<TaskAnnouncementRow>> {
+    pub fn get_task_announcement_for_task(
+        &self,
+        task_id: &str,
+    ) -> Result<Option<TaskAnnouncementRow>> {
         let conn = self
             .conn
             .lock()
             .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
         let announcement_id = conn
             .query_row(
-            "SELECT announcement_id
+                "SELECT announcement_id
              FROM task_announcements
              WHERE org_id = $1 AND task_id = $2
              ORDER BY created_at DESC, announcement_id DESC
              LIMIT 1",
-            params![self.org_id(), task_id],
-            |r| r.get::<_, String>(0),
-        )
-        .optional()?;
+                params![self.org_id(), task_id],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()?;
         match announcement_id {
             Some(announcement_id) => self.get_task_announcement(&announcement_id),
             None => Ok(None),

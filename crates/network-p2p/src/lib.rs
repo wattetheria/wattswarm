@@ -1,4 +1,5 @@
 use anyhow::{Result, anyhow, bail};
+use libp2p::connection_limits;
 use libp2p::futures::{FutureExt, StreamExt};
 use libp2p::gossipsub::{
     Behaviour as Gossipsub, ConfigBuilder as GossipsubConfigBuilder, Event as GossipsubEvent,
@@ -11,8 +12,9 @@ use libp2p::multiaddr::Protocol;
 use libp2p::request_response::{self, Message as RequestResponseMessage, ProtocolSupport};
 use libp2p::swarm::{NetworkBehaviour, SwarmEvent, behaviour::toggle::Toggle};
 pub use libp2p::{Multiaddr, PeerId};
-use libp2p::connection_limits;
-use libp2p::{StreamProtocol, Swarm, SwarmBuilder, autonat, dcutr, identity, noise, relay, tcp, yamux};
+use libp2p::{
+    StreamProtocol, Swarm, SwarmBuilder, autonat, dcutr, identity, noise, relay, tcp, yamux,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
@@ -519,11 +521,8 @@ impl NetworkP2pNode {
         .map_err(|err| anyhow!(err))?;
 
         let identify = identify::Behaviour::new(
-            identify::Config::new(
-                config.protocol_version.clone(),
-                local_key.public(),
-            )
-            .with_agent_version("wattswarm-network-p2p".to_owned()),
+            identify::Config::new(config.protocol_version.clone(), local_key.public())
+                .with_agent_version("wattswarm-network-p2p".to_owned()),
         );
 
         let request_response = request_response::cbor::Behaviour::new(
@@ -793,10 +792,7 @@ impl NetworkRuntime {
             if !self.subscribed_topics.contains(&topic_name) {
                 continue;
             }
-            let _ = self.swarm
-                .behaviour_mut()
-                .gossipsub
-                .unsubscribe(&topic);
+            let _ = self.swarm.behaviour_mut().gossipsub.unsubscribe(&topic);
             self.subscribed_topics.remove(&topic_name);
         }
         Ok(())
@@ -900,7 +896,7 @@ impl NetworkRuntime {
             .behaviour_mut()
             .gossipsub
             .add_explicit_peer(&peer);
-            self.swarm
+        self.swarm
             .behaviour_mut()
             .kademlia
             .add_address(&peer, addr.clone());
@@ -910,7 +906,11 @@ impl NetworkRuntime {
             .add_server(peer, Some(addr));
     }
 
-    fn ensure_relay_reservation(&mut self, relay_peer: PeerId, relay_addr: Multiaddr) -> Result<()> {
+    fn ensure_relay_reservation(
+        &mut self,
+        relay_peer: PeerId,
+        relay_addr: Multiaddr,
+    ) -> Result<()> {
         let listen_addr = relay_reservation_addr(relay_peer, &relay_addr);
         let key = listen_addr.to_string();
         if self.relay_reservations.contains(&key) {
@@ -1053,11 +1053,9 @@ impl NetworkRuntime {
                 }
                 Ok(None)
             }
-            SwarmEvent::Behaviour(WattSwarmBehaviourEvent::Identify(identify::Event::Received {
-                peer_id,
-                info,
-                ..
-            })) => {
+            SwarmEvent::Behaviour(WattSwarmBehaviourEvent::Identify(
+                identify::Event::Received { peer_id, info, .. },
+            )) => {
                 for addr in info.listen_addrs {
                     self.register_peer_address(peer_id, addr);
                 }
@@ -1104,11 +1102,11 @@ impl NetworkRuntime {
                     error: err.to_string(),
                 })),
             },
-            SwarmEvent::Behaviour(WattSwarmBehaviourEvent::Kademlia(kad::Event::RoutingUpdated {
-                peer,
-                addresses,
-                ..
-            })) => {
+            SwarmEvent::Behaviour(WattSwarmBehaviourEvent::Kademlia(
+                kad::Event::RoutingUpdated {
+                    peer, addresses, ..
+                },
+            )) => {
                 for addr in addresses.into_vec() {
                     self.maybe_dial_peer(peer, addr);
                 }
