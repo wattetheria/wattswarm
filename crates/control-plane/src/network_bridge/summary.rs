@@ -34,9 +34,23 @@ pub fn build_knowledge_summary_for_task_type(
     scope: &SwarmScope,
     task_type: &str,
 ) -> Result<Option<SummaryAnnouncement>> {
+    build_knowledge_summary_for_task_type_with_limit(
+        node,
+        scope,
+        task_type,
+        wattswarm_protocol::types::NetworkProtocolParams::default().summary_decision_memory_limit,
+    )
+}
+
+pub(super) fn build_knowledge_summary_for_task_type_with_limit(
+    node: &Node,
+    scope: &SwarmScope,
+    task_type: &str,
+    decision_memory_limit: u32,
+) -> Result<Option<SummaryAnnouncement>> {
     let decisions = node
         .store
-        .list_local_decision_memory_hits_by_task_type(task_type, SUMMARY_DECISION_MEMORY_LIMIT)?;
+        .list_local_decision_memory_hits_by_task_type(task_type, decision_memory_limit)?;
     if decisions.is_empty() {
         return Ok(None);
     }
@@ -60,6 +74,7 @@ pub(super) fn knowledge_summary_for_event(
     node: &Node,
     event: &crate::types::Event,
     scope: &SwarmScope,
+    decision_memory_limit: u32,
 ) -> Result<Option<SummaryAnnouncement>> {
     let Some(task_id) = event.task_id.as_deref() else {
         return Ok(None);
@@ -73,7 +88,12 @@ pub(super) fn knowledge_summary_for_event(
     let Some(task) = node.task_view(task_id)? else {
         return Ok(None);
     };
-    build_knowledge_summary_for_task_type(node, scope, &task.contract.task_type)
+    build_knowledge_summary_for_task_type_with_limit(
+        node,
+        scope,
+        &task.contract.task_type,
+        decision_memory_limit,
+    )
 }
 
 pub fn build_reputation_summary_for_runtime(

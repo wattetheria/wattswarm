@@ -7,13 +7,12 @@ mod summary;
 #[cfg(test)]
 mod tests;
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{Result, anyhow, bail};
 
 use crate::constants::BACKFILL_BATCH_EVENTS;
 use crate::network_p2p::{
-    BackfillRequest, BackfillRequestId, EventEnvelope, GossipMessage, Multiaddr,
-    NetworkP2pConfig, NetworkP2pNode, NetworkRuntime, NetworkRuntimeEvent, PeerId,
-    SummaryAnnouncement, SwarmScope,
+    BackfillRequest, BackfillRequestId, EventEnvelope, GossipMessage, Multiaddr, NetworkP2pConfig,
+    NetworkP2pNode, NetworkRuntime, NetworkRuntimeEvent, PeerId, SummaryAnnouncement, SwarmScope,
 };
 use crate::node::Node;
 use std::collections::{HashMap, HashSet};
@@ -22,6 +21,7 @@ use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::runtime::Runtime;
+use wattswarm_protocol::types::NetworkProtocolParams;
 
 pub use announcements::{apply_checkpoint_announcement, apply_rule_announcement};
 pub use backfill::{
@@ -47,10 +47,6 @@ const ENV_P2P_LOCAL_IDS: &str = "WATTSWARM_P2P_LOCAL_IDS";
 const ENV_P2P_NODE_IDS: &str = "WATTSWARM_P2P_NODE_IDS";
 const KNOWLEDGE_SUMMARY_KIND: &str = "knowledge_task_type_v1";
 const REPUTATION_SUMMARY_KIND: &str = "reputation_runtime_profile_v1";
-const SUMMARY_REPUTATION_LIMIT: usize = 64;
-const SUMMARY_DECISION_MEMORY_LIMIT: u32 = 16;
-const ANTI_ENTROPY_INTERVAL: Duration = Duration::from_secs(15);
-const BACKFILL_RETRY_AFTER: Duration = Duration::from_secs(5);
 const MAX_INFLIGHT_BACKFILLS_PER_PEER: usize = 1;
 const SUMMARY_BACKPRESSURE_HIGH_WATERMARK: u64 = 256;
 const IDLE_NETWORK_SLEEP: Duration = Duration::from_millis(50);
@@ -234,8 +230,11 @@ fn run_background_network_service(
             .into_iter()
             .chain(dynamic_subscription_scopes_for_node(&node, &node_id)?),
     );
+    let protocol_params = node.store.load_network_protocol_params()?;
+    let config = config.apply_protocol_params(&protocol_params);
+    config.validate()?;
     let mut service =
-        NetworkBridgeService::new_with_scopes(NetworkP2pNode::generate(config)?, &scopes)?;
+        NetworkBridgeService::new(NetworkP2pNode::generate(config)?, &scopes, &protocol_params)?;
     let mut announced_listen = false;
     let mut last_published_seq = node.head_seq()?;
     let mut next_dial_attempt_at = HashMap::new();
@@ -297,20 +296,43 @@ fn run_background_network_service(
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NetworkBridgeTick {
-    Listening { address: Multiaddr },
-    TransportNotice { detail: String },
-    Connected { peer: PeerId },
-    Disconnected { peer: PeerId },
-    EventIngested { peer: PeerId, event_id: String },
-    SummaryApplied { peer: PeerId, summary_kind: String },
+    Listening {
+        address: Multiaddr,
+    },
+    TransportNotice {
+        detail: String,
+    },
+    Connected {
+        peer: PeerId,
+    },
+    Disconnected {
+        peer: PeerId,
+    },
+    EventIngested {
+        peer: PeerId,
+        event_id: String,
+    },
+    SummaryApplied {
+        peer: PeerId,
+        summary_kind: String,
+    },
     RuleApplied {
         peer: PeerId,
         rule_set: String,
         rule_version: u64,
     },
-    CheckpointApplied { peer: PeerId, checkpoint_id: String },
-    GossipIgnored { peer: PeerId, message_kind: String },
-    BackfillServed { peer: PeerId, events: usize },
+    CheckpointApplied {
+        peer: PeerId,
+        checkpoint_id: String,
+    },
+    GossipIgnored {
+        peer: PeerId,
+        message_kind: String,
+    },
+    BackfillServed {
+        peer: PeerId,
+        events: usize,
+    },
     BackfillApplied {
         peer: PeerId,
         request_id: BackfillRequestId,
@@ -331,14 +353,18 @@ pub struct NetworkBridgeService {
     peer_sync_state: HashMap<PeerId, PeerSyncState>,
     connected_peers: HashSet<PeerId>,
     global_publish_rate_guard: GlobalPublishRateGuard,
+    anti_entropy_interval: Duration,
+    backfill_retry_after: Duration,
+    summary_reputation_limit: usize,
+    summary_decision_memory_limit: u32,
 }
 
 impl NetworkBridgeService {
-    pub fn new(node: NetworkP2pNode) -> Result<Self> {
-        Self::new_with_scopes(node, &[SwarmScope::Global])
-    }
-
-    pub fn new_with_scopes(node: NetworkP2pNode, scopes: &[SwarmScope]) -> Result<Self> {
+    pub fn new(
+        node: NetworkP2pNode,
+        scopes: &[SwarmScope],
+        protocol_params: &NetworkProtocolParams,
+    ) -> Result<Self> {
         let tokio_runtime = Runtime::new()?;
         let mut runtime = tokio_runtime.block_on(async { NetworkRuntime::new(node) })?;
         let mut subscribed_scopes = Vec::new();
@@ -360,6 +386,10 @@ impl NetworkBridgeService {
             peer_sync_state: HashMap::new(),
             connected_peers: HashSet::new(),
             global_publish_rate_guard: GlobalPublishRateGuard::new(Instant::now()),
+            anti_entropy_interval: Duration::from_secs(protocol_params.anti_entropy_interval_secs),
+            backfill_retry_after: Duration::from_secs(protocol_params.backfill_retry_after_secs),
+            summary_reputation_limit: protocol_params.summary_reputation_limit,
+            summary_decision_memory_limit: protocol_params.summary_decision_memory_limit,
         })
     }
 
@@ -421,7 +451,8 @@ impl NetworkBridgeService {
     }
 
     pub fn publish_summary(&mut self, summary: SummaryAnnouncement) -> Result<()> {
-        self.runtime.publish_gossip(&GossipMessage::Summary(summary))
+        self.runtime
+            .publish_gossip(&GossipMessage::Summary(summary))
     }
 
     pub fn request_global_backfill(
@@ -485,7 +516,7 @@ impl NetworkBridgeService {
         }
         state.inflight_backfills += requests_sent;
         state.last_backfill_request_at = Some(now);
-        state.next_retry_at = now + BACKFILL_RETRY_AFTER;
+        state.next_retry_at = now + self.backfill_retry_after;
         Ok(requests_sent > 0)
     }
 
@@ -529,11 +560,13 @@ impl NetworkBridgeService {
         now: Instant,
     ) -> Option<PeerId> {
         let peers = self.connected_peers.iter().copied().collect::<Vec<_>>();
-        peers.iter()
+        peers
+            .iter()
             .copied()
             .find(|peer| self.peer_is_eligible_for_scope(peer, scope, now, true))
             .or_else(|| {
-                peers.into_iter()
+                peers
+                    .into_iter()
                     .find(|peer| self.peer_is_eligible_for_scope(peer, scope, now, false))
             })
     }
@@ -553,7 +586,7 @@ impl NetworkBridgeService {
                 state.inflight_backfills < MAX_INFLIGHT_BACKFILLS_PER_PEER
                     && state.next_retry_at <= now
                     && state.last_backfill_request_at.map_or(true, |last| {
-                        now.duration_since(last) >= ANTI_ENTROPY_INTERVAL
+                        now.duration_since(last) >= self.anti_entropy_interval
                     })
             }
             None => !require_known_scope,
@@ -583,14 +616,14 @@ impl NetworkBridgeService {
     fn mark_backfill_completed(&mut self, peer: PeerId) {
         if let Some(state) = self.peer_sync_state.get_mut(&peer) {
             state.inflight_backfills = state.inflight_backfills.saturating_sub(1);
-            state.next_retry_at = Instant::now() + ANTI_ENTROPY_INTERVAL;
+            state.next_retry_at = Instant::now() + self.anti_entropy_interval;
         }
     }
 
     fn mark_backfill_failed(&mut self, peer: PeerId) {
         if let Some(state) = self.peer_sync_state.get_mut(&peer) {
             state.inflight_backfills = state.inflight_backfills.saturating_sub(1);
-            state.next_retry_at = Instant::now() + BACKFILL_RETRY_AFTER;
+            state.next_retry_at = Instant::now() + self.backfill_retry_after;
         }
     }
 
@@ -660,9 +693,7 @@ impl NetworkBridgeService {
             }
             NetworkRuntimeEvent::DcutrConnectionUpgradeFailed { remote_peer, error } => {
                 Ok(NetworkBridgeTick::TransportNotice {
-                    detail: format!(
-                        "dcutr_upgrade_failed remote_peer={remote_peer} error={error}"
-                    ),
+                    detail: format!("dcutr_upgrade_failed remote_peer={remote_peer} error={error}"),
                 })
             }
             NetworkRuntimeEvent::ConnectionEstablished { peer } => {
@@ -671,7 +702,7 @@ impl NetworkBridgeService {
                 if !node.store.is_node_penalized(&node.node_id())? {
                     for entry in node
                         .store
-                        .list_local_reputation_snapshots(SUMMARY_REPUTATION_LIMIT)?
+                        .list_local_reputation_snapshots(self.summary_reputation_limit)?
                     {
                         if let Some(summary) = build_reputation_summary_for_runtime(
                             node,
@@ -735,6 +766,7 @@ impl NetworkBridgeService {
                     node,
                     &request,
                     self.runtime.config().max_backfill_events,
+                    self.runtime.config().max_backfill_events_hard_limit,
                 )?;
                 let events = response.events.len();
                 self.runtime.send_backfill_response(channel, response)?;

@@ -24,8 +24,10 @@ use wattswarm_protocol::types::Event;
 
 const DEFAULT_NAMESPACE: &str = "wattswarm";
 const DEFAULT_PROTOCOL_VERSION: &str = "/wattswarm/0.1.0";
-const DEFAULT_MAX_BACKFILL_EVENTS: usize = 512;
-const MAX_BACKFILL_EVENTS_HARD_LIMIT: usize = 8_192;
+// Backfill defaults are governance-controlled via NetworkProtocolParams;
+// kept here only as fallbacks for NetworkP2pConfig::default().
+const DEFAULT_MAX_BACKFILL_EVENTS_FALLBACK: usize = 512;
+const MAX_BACKFILL_EVENTS_HARD_LIMIT_FALLBACK: usize = 8_192;
 const BACKFILL_PROTOCOL: StreamProtocol = StreamProtocol::new("/wattswarm/backfill/1");
 const KADEMLIA_PROTOCOL: StreamProtocol = StreamProtocol::new("/wattswarm/kad/1");
 
@@ -36,15 +38,13 @@ const MAX_ESTABLISHED_PER_PEER: u32 = 2;
 const MAX_PENDING_INCOMING: u32 = 64;
 const MAX_PENDING_OUTGOING: u32 = 64;
 
-// Gossipsub mesh parameters tuned for large-scale deployment.
-// D=6/D_low=4/D_high=12 gives stable mesh fanout while limiting bandwidth.
-// Heartbeat at 1s keeps convergence fast without flooding peers.
-// 512 KiB max transmit prevents large blobs from saturating links.
-const GOSSIPSUB_D: usize = 6;
-const GOSSIPSUB_D_LOW: usize = 4;
-const GOSSIPSUB_D_HIGH: usize = 12;
-const GOSSIPSUB_HEARTBEAT: Duration = Duration::from_secs(1);
-const GOSSIPSUB_MAX_TRANSMIT_SIZE: usize = 512 * 1024; // 512 KiB
+// Gossipsub mesh defaults — governance-controlled via NetworkProtocolParams;
+// kept here only as fallbacks for NetworkP2pConfig::default().
+const GOSSIPSUB_D_FALLBACK: usize = 6;
+const GOSSIPSUB_D_LOW_FALLBACK: usize = 4;
+const GOSSIPSUB_D_HIGH_FALLBACK: usize = 12;
+const GOSSIPSUB_HEARTBEAT_MS_FALLBACK: u64 = 1_000;
+const GOSSIPSUB_MAX_TRANSMIT_SIZE_FALLBACK: usize = 512 * 1024;
 const TRAFFIC_WINDOW: Duration = Duration::from_secs(60);
 const TRAFFIC_DEDUPE_TTL: Duration = Duration::from_secs(120);
 const PER_PEER_MSGS_PER_WINDOW: usize = 1_200;
@@ -151,14 +151,14 @@ pub struct BackfillRequest {
 }
 
 impl BackfillRequest {
-    pub fn validate(&self, max_limit: usize) -> Result<()> {
+    pub fn validate(&self, max_limit: usize, hard_limit: usize) -> Result<()> {
         if self.limit == 0 {
             bail!("backfill limit must be > 0");
         }
         if self.limit > max_limit {
             bail!("backfill limit exceeds configured max");
         }
-        if self.limit > MAX_BACKFILL_EVENTS_HARD_LIMIT {
+        if self.limit > hard_limit {
             bail!("backfill limit exceeds hard safety limit");
         }
         Ok(())
@@ -254,12 +254,21 @@ impl GossipMessage {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NetworkP2pConfig {
+    // ── Node-local settings ──────────────────────────────────────────
     pub namespace: TopicNamespace,
     pub protocol_version: String,
     pub listen_addrs: Vec<String>,
     pub bootstrap_peers: Vec<String>,
-    pub max_backfill_events: usize,
     pub enable_mdns: bool,
+
+    // ── Governance-controlled (populated from NetworkProtocolParams) ─
+    pub gossipsub_d: usize,
+    pub gossipsub_d_low: usize,
+    pub gossipsub_d_high: usize,
+    pub gossipsub_heartbeat_ms: u64,
+    pub gossipsub_max_transmit_size: usize,
+    pub max_backfill_events: usize,
+    pub max_backfill_events_hard_limit: usize,
 }
 
 impl Default for NetworkP2pConfig {
@@ -269,13 +278,34 @@ impl Default for NetworkP2pConfig {
             protocol_version: DEFAULT_PROTOCOL_VERSION.to_owned(),
             listen_addrs: vec!["/ip4/0.0.0.0/tcp/0".to_owned()],
             bootstrap_peers: Vec::new(),
-            max_backfill_events: DEFAULT_MAX_BACKFILL_EVENTS,
             enable_mdns: true,
+            gossipsub_d: GOSSIPSUB_D_FALLBACK,
+            gossipsub_d_low: GOSSIPSUB_D_LOW_FALLBACK,
+            gossipsub_d_high: GOSSIPSUB_D_HIGH_FALLBACK,
+            gossipsub_heartbeat_ms: GOSSIPSUB_HEARTBEAT_MS_FALLBACK,
+            gossipsub_max_transmit_size: GOSSIPSUB_MAX_TRANSMIT_SIZE_FALLBACK,
+            max_backfill_events: DEFAULT_MAX_BACKFILL_EVENTS_FALLBACK,
+            max_backfill_events_hard_limit: MAX_BACKFILL_EVENTS_HARD_LIMIT_FALLBACK,
         }
     }
 }
 
 impl NetworkP2pConfig {
+    /// Populate governance-controlled fields from `NetworkProtocolParams`.
+    pub fn apply_protocol_params(
+        mut self,
+        params: &wattswarm_protocol::types::NetworkProtocolParams,
+    ) -> Self {
+        self.gossipsub_d = params.gossipsub_d;
+        self.gossipsub_d_low = params.gossipsub_d_low;
+        self.gossipsub_d_high = params.gossipsub_d_high;
+        self.gossipsub_heartbeat_ms = params.gossipsub_heartbeat_ms;
+        self.gossipsub_max_transmit_size = params.gossipsub_max_transmit_size;
+        self.max_backfill_events = params.default_max_backfill_events;
+        self.max_backfill_events_hard_limit = params.max_backfill_events_hard_limit;
+        self
+    }
+
     pub fn validate(&self) -> Result<()> {
         if self.listen_addrs.is_empty() {
             bail!("at least one listen address is required");
@@ -283,10 +313,25 @@ impl NetworkP2pConfig {
         if self.protocol_version.trim().is_empty() {
             bail!("protocol_version is required");
         }
+        if self.gossipsub_d == 0 || self.gossipsub_d_low == 0 || self.gossipsub_d_high == 0 {
+            bail!("gossipsub mesh parameters must be > 0");
+        }
+        if self.gossipsub_d_low > self.gossipsub_d || self.gossipsub_d > self.gossipsub_d_high {
+            bail!("gossipsub mesh parameters must satisfy d_low <= d <= d_high");
+        }
+        if self.gossipsub_heartbeat_ms == 0 {
+            bail!("gossipsub heartbeat must be > 0");
+        }
+        if self.gossipsub_max_transmit_size == 0 {
+            bail!("gossipsub max transmit size must be > 0");
+        }
         if self.max_backfill_events == 0 {
             bail!("max_backfill_events must be > 0");
         }
-        if self.max_backfill_events > MAX_BACKFILL_EVENTS_HARD_LIMIT {
+        if self.max_backfill_events_hard_limit == 0 {
+            bail!("max_backfill_events_hard_limit must be > 0");
+        }
+        if self.max_backfill_events > self.max_backfill_events_hard_limit {
             bail!("max_backfill_events exceeds hard safety limit");
         }
         Ok(())
@@ -507,11 +552,11 @@ impl NetworkP2pNode {
     ) -> Result<BehaviourSeedParts> {
         let gossipsub_config = GossipsubConfigBuilder::default()
             .validation_mode(ValidationMode::Strict)
-            .mesh_n(GOSSIPSUB_D)
-            .mesh_n_low(GOSSIPSUB_D_LOW)
-            .mesh_n_high(GOSSIPSUB_D_HIGH)
-            .heartbeat_interval(GOSSIPSUB_HEARTBEAT)
-            .max_transmit_size(GOSSIPSUB_MAX_TRANSMIT_SIZE)
+            .mesh_n(config.gossipsub_d)
+            .mesh_n_low(config.gossipsub_d_low)
+            .mesh_n_high(config.gossipsub_d_high)
+            .heartbeat_interval(Duration::from_millis(config.gossipsub_heartbeat_ms))
+            .max_transmit_size(config.gossipsub_max_transmit_size)
             .build()
             .map_err(|err| anyhow!(err))?;
         let gossipsub = Gossipsub::new(
@@ -828,7 +873,10 @@ impl NetworkRuntime {
         peer: &PeerId,
         request: BackfillRequest,
     ) -> Result<BackfillRequestId> {
-        request.validate(self.config.max_backfill_events)?;
+        request.validate(
+            self.config.max_backfill_events,
+            self.config.max_backfill_events_hard_limit,
+        )?;
         Ok(self
             .swarm
             .behaviour_mut()
@@ -1223,8 +1271,9 @@ mod tests {
             from_event_seq: 42,
             limit: 128,
         };
-        req.validate(256).expect("valid");
-        assert!(req.validate(64).is_err());
+        req.validate(256, 512).expect("valid");
+        assert!(req.validate(64, 512).is_err());
+        assert!(req.validate(256, 96).is_err());
     }
 
     #[test]
@@ -1264,6 +1313,48 @@ mod tests {
         assert_eq!(json["namespace"]["network"], "wattswarm");
         assert_eq!(json["max_backfill_events"], 512);
         assert_eq!(json["protocol_version"], "/wattswarm/0.1.0");
+    }
+
+    #[test]
+    fn apply_protocol_params_overrides_governed_runtime_fields() {
+        let params = wattswarm_protocol::types::NetworkProtocolParams {
+            gossipsub_d: 9,
+            gossipsub_d_low: 7,
+            gossipsub_d_high: 15,
+            gossipsub_heartbeat_ms: 2_500,
+            gossipsub_max_transmit_size: 1024 * 1024,
+            default_max_backfill_events: 1024,
+            max_backfill_events_hard_limit: 16_384,
+            ..wattswarm_protocol::types::NetworkProtocolParams::default()
+        };
+
+        let config = NetworkP2pConfig::default().apply_protocol_params(&params);
+
+        assert_eq!(config.gossipsub_d, 9);
+        assert_eq!(config.gossipsub_d_low, 7);
+        assert_eq!(config.gossipsub_d_high, 15);
+        assert_eq!(config.gossipsub_heartbeat_ms, 2_500);
+        assert_eq!(config.gossipsub_max_transmit_size, 1024 * 1024);
+        assert_eq!(config.max_backfill_events, 1024);
+        assert_eq!(config.max_backfill_events_hard_limit, 16_384);
+    }
+
+    #[test]
+    fn config_validation_rejects_invalid_governed_mesh_and_backfill_limits() {
+        let invalid_mesh = NetworkP2pConfig {
+            gossipsub_d: 4,
+            gossipsub_d_low: 5,
+            gossipsub_d_high: 8,
+            ..NetworkP2pConfig::default()
+        };
+        assert!(invalid_mesh.validate().is_err());
+
+        let invalid_backfill = NetworkP2pConfig {
+            max_backfill_events: 1024,
+            max_backfill_events_hard_limit: 512,
+            ..NetworkP2pConfig::default()
+        };
+        assert!(invalid_backfill.validate().is_err());
     }
 
     #[test]

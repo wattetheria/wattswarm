@@ -8,8 +8,9 @@ pub fn backfill_response_for_request(
     node: &Node,
     request: &BackfillRequest,
     max_limit: usize,
+    hard_limit: usize,
 ) -> Result<BackfillResponse> {
-    request.validate(max_limit)?;
+    request.validate(max_limit, hard_limit)?;
     let mut next_from_event_seq = request.from_event_seq;
     let mut from_event_seq = request.from_event_seq;
     let mut envelopes = Vec::new();

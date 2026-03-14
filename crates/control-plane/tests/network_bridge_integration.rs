@@ -16,6 +16,7 @@ use wattswarm_control_plane::node::Node;
 use wattswarm_control_plane::storage::PgStore;
 use wattswarm_control_plane::task_template::sample_contract;
 use wattswarm_control_plane::types::{Membership, Role};
+use wattswarm_protocol::types::NetworkProtocolParams;
 
 fn membership_with_roles(node_ids: &[String]) -> Membership {
     let mut membership = Membership::new();
@@ -41,19 +42,46 @@ fn make_node(identity: NodeIdentity, membership: Membership) -> Node {
     .expect("node")
 }
 
+/// Short protocol params for tests — the genesis node of this test network
+/// sets a 1-second anti-entropy interval instead of the production 15 seconds.
+fn test_protocol_params() -> NetworkProtocolParams {
+    NetworkProtocolParams {
+        anti_entropy_interval_secs: 1,
+        backfill_retry_after_secs: 1,
+        ..NetworkProtocolParams::default()
+    }
+}
+
 fn make_service() -> NetworkBridgeService {
     make_service_with_scopes(&[SwarmScope::Global])
 }
 
 fn make_service_with_scopes(scopes: &[SwarmScope]) -> NetworkBridgeService {
+    make_service_with_params(scopes, &NetworkProtocolParams::default())
+}
+
+fn make_fast_service() -> NetworkBridgeService {
+    make_service_with_params(&[SwarmScope::Global], &test_protocol_params())
+}
+
+fn make_fast_service_with_scopes(scopes: &[SwarmScope]) -> NetworkBridgeService {
+    make_service_with_params(scopes, &test_protocol_params())
+}
+
+fn make_service_with_params(
+    scopes: &[SwarmScope],
+    params: &NetworkProtocolParams,
+) -> NetworkBridgeService {
     let config = NetworkP2pConfig {
         listen_addrs: vec!["/ip4/127.0.0.1/tcp/0".to_owned()],
         enable_mdns: false,
         ..NetworkP2pConfig::default()
-    };
-    NetworkBridgeService::new_with_scopes(
+    }
+    .apply_protocol_params(params);
+    NetworkBridgeService::new(
         NetworkP2pNode::generate(config).expect("network node"),
         scopes,
+        params,
     )
     .expect("network service")
 }
@@ -83,14 +111,6 @@ fn slow_env_multiplier() -> u32 {
 
 fn scaled_timeout(base: Duration) -> Duration {
     base.saturating_mul(slow_env_multiplier())
-}
-
-fn anti_entropy_recovery_window() -> Duration {
-    scaled_timeout(Duration::from_secs(20))
-}
-
-fn anti_entropy_retry_delay() -> Duration {
-    scaled_timeout(Duration::from_secs(16))
 }
 
 fn reconnect_quiet_period() -> Duration {
@@ -871,8 +891,8 @@ fn anti_entropy_syncs_missed_event_without_live_publish() {
     let membership = membership_with_roles(&[identity_a.node_id(), identity_b.node_id()]);
     let mut node_a = make_node(identity_a, membership.clone());
     let mut node_b = make_node(identity_b, membership);
-    let mut service_a = make_service();
-    let mut service_b = make_service();
+    let mut service_a = make_fast_service();
+    let mut service_b = make_fast_service();
 
     connect_services(&mut service_a, &mut node_a, &mut service_b, &mut node_b);
 
@@ -885,11 +905,11 @@ fn anti_entropy_syncs_missed_event_without_live_publish() {
     contract.inputs = json!({"prompt":"catch me via anti entropy"});
     node_a.submit_task(contract, 1, 100).expect("submit task");
 
-    // The bridge only re-requests anti-entropy after the configured interval
-    // elapses following the initial empty backfill on connect.
-    std::thread::sleep(anti_entropy_retry_delay());
+    // Wait for the governance-configured anti-entropy interval (1s in test
+    // network) to elapse after the initial empty backfill on connect.
+    std::thread::sleep(Duration::from_secs(2));
 
-    let synced = wait_until(anti_entropy_recovery_window(), || {
+    let synced = wait_until(scaled_timeout(Duration::from_secs(10)), || {
         let _ = service_b
             .run_anti_entropy(&node_b)
             .expect("run anti entropy");
@@ -913,10 +933,14 @@ fn anti_entropy_uses_scope_specific_cursor_for_recovery() {
     let membership = membership_with_roles(&[identity_a.node_id(), identity_b.node_id()]);
     let mut node_a = make_node(identity_a, membership.clone());
     let mut node_b = make_node(identity_b, membership);
-    let mut service_a =
-        make_service_with_scopes(&[SwarmScope::Global, SwarmScope::Region("sol-1".to_owned())]);
-    let mut service_b =
-        make_service_with_scopes(&[SwarmScope::Global, SwarmScope::Region("sol-1".to_owned())]);
+    let mut service_a = make_fast_service_with_scopes(&[
+        SwarmScope::Global,
+        SwarmScope::Region("sol-1".to_owned()),
+    ]);
+    let mut service_b = make_fast_service_with_scopes(&[
+        SwarmScope::Global,
+        SwarmScope::Region("sol-1".to_owned()),
+    ]);
 
     connect_services(&mut service_a, &mut node_a, &mut service_b, &mut node_b);
 
@@ -938,12 +962,11 @@ fn anti_entropy_uses_scope_specific_cursor_for_recovery() {
         .submit_task(global_contract, 1, 101)
         .expect("submit local global task");
 
-    // The first empty backfill request on connect pushes the next anti-entropy
-    // retry out by the configured interval, so wait for that window before
-    // asserting region recovery.
-    std::thread::sleep(anti_entropy_retry_delay());
+    // Wait for the governance-configured anti-entropy interval (1s in test
+    // network) to elapse after the initial empty backfill on connect.
+    std::thread::sleep(Duration::from_secs(2));
 
-    let recovered = wait_until(anti_entropy_recovery_window(), || {
+    let recovered = wait_until(scaled_timeout(Duration::from_secs(10)), || {
         let _ = service_b
             .run_anti_entropy(&node_b)
             .expect("run anti entropy");
@@ -967,8 +990,8 @@ fn reconnect_recovers_missing_events_after_partition_like_disconnect() {
     let membership = membership_with_roles(&[identity_a.node_id(), identity_b.node_id()]);
     let mut node_a = make_node(identity_a, membership.clone());
     let mut node_b = make_node(identity_b, membership);
-    let mut service_a = make_service();
-    let mut service_b = make_service();
+    let mut service_a = make_fast_service();
+    let mut service_b = make_fast_service();
 
     connect_services(&mut service_a, &mut node_a, &mut service_b, &mut node_b);
 
@@ -1010,6 +1033,8 @@ fn reconnect_recovers_missing_events_after_partition_like_disconnect() {
             .is_some()
     );
 
+    // Drain inflight messages before disconnect to avoid libp2p
+    // request-response assertion on stale connection state.
     pump_services_for(
         &mut service_a,
         &mut node_a,
@@ -1017,10 +1042,14 @@ fn reconnect_recovers_missing_events_after_partition_like_disconnect() {
         &mut node_b,
         reconnect_quiet_period(),
     );
+    let peer_b_old = service_b.local_peer_id();
     drop(service_b);
-    let _ = wait_until(reconnect_quiet_period(), || {
-        let _ = pump_once(&mut service_a, &mut node_a);
-        false
+    // Pump service_a until it observes the disconnect event.
+    let _ = wait_until(scaled_timeout(Duration::from_secs(5)), || {
+        matches!(
+            pump_once(&mut service_a, &mut node_a),
+            Some(NetworkBridgeTick::Disconnected { peer }) if peer == peer_b_old
+        )
     });
 
     let mut second_contract = sample_contract("task-partition-second", policy_hash);
@@ -1029,7 +1058,7 @@ fn reconnect_recovers_missing_events_after_partition_like_disconnect() {
         .submit_task(second_contract, 1, 101)
         .expect("submit second task");
 
-    let mut service_b = make_service();
+    let mut service_b = make_fast_service();
     connect_services(&mut service_a, &mut node_a, &mut service_b, &mut node_b);
 
     let recovered = wait_until(scaled_timeout(Duration::from_secs(20)), || {

@@ -159,6 +159,7 @@ fn backfill_response_for_request_wraps_global_events() {
             limit: 8,
         },
         32,
+        64,
     )
     .expect("backfill response");
 
@@ -294,6 +295,8 @@ fn publish_pending_updates_subscribes_runtime_for_local_feed_subscription() {
             ..NetworkP2pConfig::default()
         })
         .expect("network node"),
+        &[SwarmScope::Global],
+        &NetworkProtocolParams::default(),
     )
     .expect("service");
 
@@ -345,6 +348,8 @@ fn publish_pending_updates_unsubscribes_scope_when_local_subscription_is_disable
             ..NetworkP2pConfig::default()
         })
         .expect("network node"),
+        &[SwarmScope::Global],
+        &NetworkProtocolParams::default(),
     )
     .expect("service");
 
@@ -566,9 +571,10 @@ fn smarter_backfill_prefers_peer_with_known_scope_activity() {
     let other_scope = SwarmScope::Node("lab-2".to_owned());
     let now = Instant::now();
 
-    let mut service = NetworkBridgeService::new_with_scopes(
+    let mut service = NetworkBridgeService::new(
         NetworkP2pNode::generate(NetworkP2pConfig::default()).expect("node"),
         &[SwarmScope::Global, target_scope.clone()],
+        &NetworkProtocolParams::default(),
     )
     .expect("service");
     service.connected_peers.insert(node_a);
@@ -591,9 +597,10 @@ fn smarter_backfill_prefers_peer_with_known_scope_activity() {
 fn scopes_to_request_for_peer_falls_back_to_all_scopes_until_peer_is_profiled() {
     let peer = PeerId::random();
     let target_scope = SwarmScope::Region("sol-1".to_owned());
-    let service = NetworkBridgeService::new_with_scopes(
+    let service = NetworkBridgeService::new(
         NetworkP2pNode::generate(NetworkP2pConfig::default()).expect("node"),
         &[SwarmScope::Global, target_scope.clone()],
+        &NetworkProtocolParams::default(),
     )
     .expect("service");
 
@@ -654,6 +661,7 @@ fn backfill_response_filters_by_scope() {
             limit: 8,
         },
         32,
+        64,
     )
     .expect("backfill response");
 
@@ -758,6 +766,82 @@ fn apply_summary_announcement_imports_knowledge_and_reputation() {
         .expect("reputation row");
     assert_eq!(reputation.stability_reputation, 10);
     assert_eq!(reputation.quality_reputation, 20);
+}
+
+#[test]
+fn knowledge_summary_builder_respects_protocol_limit() {
+    let node = Node::open_in_memory_with_roles(&[Role::Proposer]).expect("node");
+    for task_id in ["task-dm-1", "task-dm-2"] {
+        node.store
+            .put_decision_memory(
+                task_id,
+                1,
+                &format!("commit-{task_id}"),
+                100,
+                &format!("candidate-{task_id}"),
+                &format!("digest-{task_id}"),
+                &json!({"quorum":"ok"}),
+                &json!({"answer": task_id}),
+                &[100],
+                &json!({"detail":"ok"}),
+                "policy-snap",
+                "limit-type",
+                "input-digest",
+                "schema-digest",
+                "vp.schema_only.v1",
+                "params-digest",
+            )
+            .expect("put decision memory");
+    }
+
+    let summary = summary::build_knowledge_summary_for_task_type_with_limit(
+        &node,
+        &SwarmScope::Global,
+        "limit-type",
+        1,
+    )
+    .expect("build summary")
+    .expect("summary exists");
+    let payload: summary::KnowledgeSummaryBundle =
+        serde_json::from_value(summary.payload).expect("decode payload");
+
+    assert_eq!(payload.decisions.len(), 1);
+    assert!(matches!(
+        payload.decisions[0].task_id.as_str(),
+        "task-dm-1" | "task-dm-2"
+    ));
+}
+
+#[test]
+fn service_initializes_summary_limits_from_protocol_params() {
+    let params = NetworkProtocolParams {
+        summary_reputation_limit: 1,
+        summary_decision_memory_limit: 2,
+        ..NetworkProtocolParams::default()
+    };
+    let service = NetworkBridgeService::new(
+        NetworkP2pNode::generate(NetworkP2pConfig::default()).expect("node"),
+        &[SwarmScope::Global],
+        &params,
+    )
+    .expect("service");
+    let node = Node::open_in_memory_with_roles(&[Role::Proposer]).expect("node");
+    node.store
+        .put_reputation_snapshot("runtime-a", "model-a", 10, 20, 100)
+        .expect("put reputation a");
+    node.store
+        .put_reputation_snapshot("runtime-b", "model-b", 30, 40, 200)
+        .expect("put reputation b");
+
+    assert_eq!(service.summary_reputation_limit, 1);
+    assert_eq!(service.summary_decision_memory_limit, 2);
+    assert_eq!(
+        node.store
+            .list_local_reputation_snapshots(service.summary_reputation_limit)
+            .expect("list local reputation")
+            .len(),
+        1
+    );
 }
 
 #[test]
@@ -978,6 +1062,8 @@ fn publish_pending_global_events_publishes_local_rows_and_skips_remote_rows() {
             ..NetworkP2pConfig::default()
         })
         .expect("network node"),
+        &[SwarmScope::Global],
+        &NetworkProtocolParams::default(),
     )
     .expect("network service");
     let mut peer_node = Node::open_in_memory_with_roles(&[Role::Proposer]).expect("peer node");
@@ -988,6 +1074,8 @@ fn publish_pending_global_events_publishes_local_rows_and_skips_remote_rows() {
             ..NetworkP2pConfig::default()
         })
         .expect("peer network node"),
+        &[SwarmScope::Global],
+        &NetworkProtocolParams::default(),
     )
     .expect("peer network service");
 
@@ -1070,6 +1158,8 @@ fn dial_discovered_peer_endpoints_skips_invalid_self_and_missing_addrs() {
             ..NetworkP2pConfig::default()
         })
         .expect("network node"),
+        &[SwarmScope::Global],
+        &NetworkProtocolParams::default(),
     )
     .expect("network service");
 

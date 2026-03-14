@@ -1,4 +1,5 @@
 use super::*;
+use wattswarm_protocol::types::NetworkProtocolParams;
 
 pub const DEFAULT_LOCAL_ORG_NAME: &str = "Local Bootstrap";
 pub const DEFAULT_LAN_ORG_NAME: &str = "LAN Bootstrap";
@@ -74,13 +75,15 @@ impl PgStore {
             ],
         )?;
 
+        let default_params_json = serde_json::to_string(&NetworkProtocolParams::default())
+            .unwrap_or_else(|_| "{}".into());
         conn.execute(
             "INSERT INTO network_params(network_id, control_mode, membership_version, policy_version, params_json, created_at, updated_at)
-             VALUES ($1, $2, 1, 1, '{}', TIMESTAMPTZ 'epoch' + ($3::bigint * INTERVAL '1 millisecond'), TIMESTAMPTZ 'epoch' + ($3::bigint * INTERVAL '1 millisecond'))
+             VALUES ($1, $2, 1, 1, $4, TIMESTAMPTZ 'epoch' + ($3::bigint * INTERVAL '1 millisecond'), TIMESTAMPTZ 'epoch' + ($3::bigint * INTERVAL '1 millisecond'))
              ON CONFLICT(network_id) DO UPDATE SET
                control_mode = excluded.control_mode,
                updated_at = excluded.updated_at",
-            params![network_id, control_mode, now as i64],
+            params![network_id, control_mode, now as i64, default_params_json],
         )?;
 
         conn.execute(
@@ -215,5 +218,53 @@ impl PgStore {
         )?;
 
         Ok(org_id)
+    }
+
+    /// Read `NetworkProtocolParams` from the `network_params` table for the
+    /// network that owns this store's org. Returns `Default` when the store
+    /// has no org bound or no matching row exists (e.g. in-memory test stores
+    /// that skip bootstrap topology).
+    pub fn load_network_protocol_params(&self) -> Result<NetworkProtocolParams> {
+        if !self.is_org_configured() {
+            return Ok(NetworkProtocolParams::default());
+        }
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
+        let row: Option<String> = conn
+            .query_row(
+                "SELECT np.params_json
+                 FROM network_params np
+                 JOIN org_registry org ON org.network_id = np.network_id
+                 WHERE org.org_id = $1",
+                params![self.org_id()],
+                |r| r.get(0),
+            )
+            .optional()?;
+        match row {
+            Some(json) if !json.is_empty() && json != "{}" => Ok(serde_json::from_str(&json)?),
+            _ => Ok(NetworkProtocolParams::default()),
+        }
+    }
+
+    /// Write `NetworkProtocolParams` into the `network_params.params_json`
+    /// column for the given network. Only the genesis node or governance
+    /// proposals should call this.
+    pub fn put_network_protocol_params(
+        &self,
+        network_id: &str,
+        params: &NetworkProtocolParams,
+    ) -> Result<()> {
+        let json = serde_json::to_string(params)?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
+        conn.execute(
+            "UPDATE network_params SET params_json = $1, updated_at = NOW() WHERE network_id = $2",
+            params![json, network_id],
+        )?;
+        Ok(())
     }
 }

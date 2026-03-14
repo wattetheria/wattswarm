@@ -897,3 +897,112 @@ impl Default for FinalizeAssignment {
         }
     }
 }
+
+/// Network-wide protocol parameters set by the genesis node.
+///
+/// These values are persisted in `network_params.params_json` and govern
+/// P2P behaviour for every node in the network. Individual nodes MUST NOT
+/// override them; only governance proposals can change them.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct NetworkProtocolParams {
+    // ── Anti-entropy timing ──────────────────────────────────────────
+    /// Minimum seconds between successful anti-entropy backfill requests
+    /// to the same peer.
+    #[serde(default = "default_anti_entropy_interval_secs")]
+    pub anti_entropy_interval_secs: u64,
+
+    /// Seconds to wait before retrying a failed backfill request.
+    #[serde(default = "default_backfill_retry_after_secs")]
+    pub backfill_retry_after_secs: u64,
+
+    // ── Gossipsub mesh ───────────────────────────────────────────────
+    /// Target number of mesh peers per topic.
+    #[serde(default = "default_gossipsub_d")]
+    pub gossipsub_d: usize,
+
+    /// Minimum mesh peers before attempting to graft more.
+    #[serde(default = "default_gossipsub_d_low")]
+    pub gossipsub_d_low: usize,
+
+    /// Maximum mesh peers before pruning excess.
+    #[serde(default = "default_gossipsub_d_high")]
+    pub gossipsub_d_high: usize,
+
+    /// Gossipsub heartbeat interval in milliseconds.
+    #[serde(default = "default_gossipsub_heartbeat_ms")]
+    pub gossipsub_heartbeat_ms: u64,
+
+    /// Maximum single gossip message size in bytes.
+    #[serde(default = "default_gossipsub_max_transmit_size")]
+    pub gossipsub_max_transmit_size: usize,
+
+    // ── Backfill protocol ────────────────────────────────────────────
+    /// Default number of events returned per backfill response.
+    #[serde(default = "default_max_backfill_events")]
+    pub default_max_backfill_events: usize,
+
+    /// Hard upper limit on events per backfill response.
+    #[serde(default = "default_max_backfill_events_hard_limit")]
+    pub max_backfill_events_hard_limit: usize,
+
+    // ── Summary propagation ──────────────────────────────────────────
+    /// Maximum reputation snapshot entries per summary announcement.
+    #[serde(default = "default_summary_reputation_limit")]
+    pub summary_reputation_limit: usize,
+
+    /// Maximum decision-memory hits per knowledge summary.
+    #[serde(default = "default_summary_decision_memory_limit")]
+    pub summary_decision_memory_limit: u32,
+}
+
+fn default_anti_entropy_interval_secs() -> u64 {
+    15
+}
+fn default_backfill_retry_after_secs() -> u64 {
+    5
+}
+fn default_gossipsub_d() -> usize {
+    6
+}
+fn default_gossipsub_d_low() -> usize {
+    4
+}
+fn default_gossipsub_d_high() -> usize {
+    12
+}
+fn default_gossipsub_heartbeat_ms() -> u64 {
+    1_000
+}
+fn default_gossipsub_max_transmit_size() -> usize {
+    512 * 1024
+}
+fn default_max_backfill_events() -> usize {
+    512
+}
+fn default_max_backfill_events_hard_limit() -> usize {
+    8_192
+}
+fn default_summary_reputation_limit() -> usize {
+    64
+}
+fn default_summary_decision_memory_limit() -> u32 {
+    16
+}
+
+impl Default for NetworkProtocolParams {
+    fn default() -> Self {
+        Self {
+            anti_entropy_interval_secs: default_anti_entropy_interval_secs(),
+            backfill_retry_after_secs: default_backfill_retry_after_secs(),
+            gossipsub_d: default_gossipsub_d(),
+            gossipsub_d_low: default_gossipsub_d_low(),
+            gossipsub_d_high: default_gossipsub_d_high(),
+            gossipsub_heartbeat_ms: default_gossipsub_heartbeat_ms(),
+            gossipsub_max_transmit_size: default_gossipsub_max_transmit_size(),
+            default_max_backfill_events: default_max_backfill_events(),
+            max_backfill_events_hard_limit: default_max_backfill_events_hard_limit(),
+            summary_reputation_limit: default_summary_reputation_limit(),
+            summary_decision_memory_limit: default_summary_decision_memory_limit(),
+        }
+    }
+}

@@ -100,7 +100,12 @@ pub fn publish_pending_scoped_updates(
         }
         if publish_summaries
             && !local_node_penalized
-            && let Some(summary) = super::knowledge_summary_for_event(node, &event, &scope)?
+            && let Some(summary) = super::knowledge_summary_for_event(
+                node,
+                &event,
+                &scope,
+                service.summary_decision_memory_limit,
+            )?
         {
             let _ = service.publish_summary(summary);
         }
