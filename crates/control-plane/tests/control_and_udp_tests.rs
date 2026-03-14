@@ -158,12 +158,11 @@ impl RuntimeStub {
             while !stop_flag.load(Ordering::Relaxed) {
                 match listener.accept() {
                     Ok((mut stream, _)) => {
-                        let mut buf = [0_u8; 8192];
-                        let n = stream.read(&mut buf).unwrap_or(0);
-                        if n == 0 {
+                        let request = read_http_request(&mut stream);
+                        if request.is_empty() {
                             continue;
                         }
-                        let req = String::from_utf8_lossy(&buf[..n]);
+                        let req = String::from_utf8_lossy(&request);
                         let line = req.lines().next().unwrap_or_default();
 
                         let (status, body) = if line.starts_with("GET /health ") {
@@ -252,6 +251,41 @@ impl Drop for RuntimeStub {
             let _ = handle.join();
         }
     }
+}
+
+fn read_http_request(stream: &mut TcpStream) -> Vec<u8> {
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(250)));
+    let mut buf = [0_u8; 4096];
+    let mut request = Vec::with_capacity(4096);
+
+    loop {
+        match stream.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                request.extend_from_slice(&buf[..n]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+                if request.len() >= 64 * 1024 {
+                    break;
+                }
+            }
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                break;
+            }
+            Err(_) => {
+                request.clear();
+                break;
+            }
+        }
+    }
+
+    request
 }
 
 #[test]

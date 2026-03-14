@@ -2,7 +2,7 @@ use serde_json::json;
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use uuid::Uuid;
 use wattswarm_control_plane::control::add_discovered_peer_endpoint;
 use wattswarm_control_plane::crypto::NodeIdentity;
@@ -60,6 +60,32 @@ fn make_service_with_scopes(scopes: &[SwarmScope]) -> NetworkBridgeService {
 
 fn pump_once(service: &mut NetworkBridgeService, node: &mut Node) -> Option<NetworkBridgeTick> {
     service.try_tick(node).expect("tick")
+}
+
+fn wait_until(timeout: Duration, mut step: impl FnMut() -> bool) -> bool {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if step() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    step()
+}
+
+fn pump_services_for(
+    service_a: &mut NetworkBridgeService,
+    node_a: &mut Node,
+    service_b: &mut NetworkBridgeService,
+    node_b: &mut Node,
+    duration: Duration,
+) {
+    let deadline = Instant::now() + duration;
+    while Instant::now() < deadline {
+        let _ = pump_once(service_a, node_a);
+        let _ = pump_once(service_b, node_b);
+        std::thread::sleep(Duration::from_millis(1));
+    }
 }
 
 fn temp_test_dir(prefix: &str) -> PathBuf {
@@ -839,8 +865,7 @@ fn anti_entropy_syncs_missed_event_without_live_publish() {
     // elapses following the initial empty backfill on connect.
     std::thread::sleep(Duration::from_secs(16));
 
-    let mut synced = false;
-    for _ in 0..4_096 {
+    let synced = wait_until(Duration::from_secs(20), || {
         let _ = service_b
             .run_anti_entropy(&node_b)
             .expect("run anti entropy");
@@ -848,16 +873,11 @@ fn anti_entropy_syncs_missed_event_without_live_publish() {
         let _ = pump_once(&mut service_a, &mut node_a);
         let _ = pump_once(&mut service_b, &mut node_b);
         let _ = pump_once(&mut service_a, &mut node_a);
-        if node_b
+        node_b
             .task_view("task-anti-entropy")
             .expect("task view")
             .is_some()
-        {
-            synced = true;
-            break;
-        }
-        std::thread::yield_now();
-    }
+    });
 
     assert!(synced);
 }
@@ -899,8 +919,7 @@ fn anti_entropy_uses_scope_specific_cursor_for_recovery() {
     // asserting region recovery.
     std::thread::sleep(Duration::from_secs(16));
 
-    let mut recovered = false;
-    for _ in 0..4_096 {
+    let recovered = wait_until(Duration::from_secs(20), || {
         let _ = service_b
             .run_anti_entropy(&node_b)
             .expect("run anti entropy");
@@ -908,16 +927,11 @@ fn anti_entropy_uses_scope_specific_cursor_for_recovery() {
         let _ = pump_once(&mut service_a, &mut node_a);
         let _ = pump_once(&mut service_b, &mut node_b);
         let _ = pump_once(&mut service_a, &mut node_a);
-        if node_b
+        node_b
             .task_view("task-region-cursor")
             .expect("task view")
             .is_some()
-        {
-            recovered = true;
-            break;
-        }
-        std::thread::yield_now();
-    }
+    });
 
     assert!(recovered);
 }
@@ -972,7 +986,18 @@ fn reconnect_recovers_missing_events_after_partition_like_disconnect() {
             .is_some()
     );
 
+    pump_services_for(
+        &mut service_a,
+        &mut node_a,
+        &mut service_b,
+        &mut node_b,
+        Duration::from_millis(250),
+    );
     drop(service_b);
+    let _ = wait_until(Duration::from_millis(250), || {
+        let _ = pump_once(&mut service_a, &mut node_a);
+        false
+    });
 
     let mut second_contract = sample_contract("task-partition-second", policy_hash);
     second_contract.inputs = json!({"prompt":"after reconnect"});
@@ -983,20 +1008,14 @@ fn reconnect_recovers_missing_events_after_partition_like_disconnect() {
     let mut service_b = make_service();
     connect_services(&mut service_a, &mut node_a, &mut service_b, &mut node_b);
 
-    let mut recovered = false;
-    for _ in 0..4_096 {
+    let recovered = wait_until(Duration::from_secs(10), || {
         let _ = pump_once(&mut service_a, &mut node_a);
         let _ = pump_once(&mut service_b, &mut node_b);
-        if node_b
+        node_b
             .task_view("task-partition-second")
             .expect("task view second")
             .is_some()
-        {
-            recovered = true;
-            break;
-        }
-        std::thread::yield_now();
-    }
+    });
 
     assert!(recovered);
 }
