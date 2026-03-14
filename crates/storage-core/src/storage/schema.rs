@@ -283,6 +283,61 @@ impl PgStore {
                 PRIMARY KEY(org_id, checkpoint_id)
             );
 
+            CREATE TABLE IF NOT EXISTS feed_subscriptions (
+                org_id TEXT NOT NULL DEFAULT '__unset_org__',
+                subscriber_node_id TEXT NOT NULL,
+                feed_key TEXT NOT NULL,
+                scope_hint TEXT NOT NULL,
+                active BOOLEAN NOT NULL DEFAULT TRUE,
+                updated_at TIMESTAMPTZ NOT NULL,
+                PRIMARY KEY(org_id, subscriber_node_id, feed_key)
+            );
+
+            CREATE TABLE IF NOT EXISTS task_announcements (
+                org_id TEXT NOT NULL DEFAULT '__unset_org__',
+                task_id TEXT NOT NULL,
+                announcement_id TEXT NOT NULL,
+                feed_key TEXT NOT NULL,
+                scope_hint TEXT NOT NULL,
+                summary_json TEXT NOT NULL,
+                detail_ref_json TEXT,
+                announced_by_node_id TEXT NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL,
+                PRIMARY KEY(org_id, announcement_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS execution_set_projection (
+                org_id TEXT NOT NULL DEFAULT '__unset_org__',
+                task_id TEXT NOT NULL,
+                execution_set_id TEXT NOT NULL,
+                participant_node_id TEXT NOT NULL,
+                role_hint TEXT NOT NULL,
+                scope_hint TEXT NOT NULL,
+                status TEXT NOT NULL,
+                confirmed_by_node_id TEXT,
+                updated_at TIMESTAMPTZ NOT NULL,
+                PRIMARY KEY(org_id, task_id, execution_set_id, participant_node_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS network_rule_announcements (
+                org_id TEXT NOT NULL DEFAULT '__unset_org__',
+                scope_key TEXT NOT NULL,
+                rule_set TEXT NOT NULL,
+                rule_version BIGINT NOT NULL,
+                activation_epoch BIGINT,
+                observed_at TIMESTAMPTZ NOT NULL,
+                PRIMARY KEY(org_id, scope_key, rule_set, rule_version)
+            );
+
+            CREATE TABLE IF NOT EXISTS network_checkpoint_announcements (
+                org_id TEXT NOT NULL DEFAULT '__unset_org__',
+                scope_key TEXT NOT NULL,
+                checkpoint_id TEXT NOT NULL,
+                artifact_path TEXT NOT NULL,
+                observed_at TIMESTAMPTZ NOT NULL,
+                PRIMARY KEY(org_id, scope_key, checkpoint_id)
+            );
+
             CREATE TABLE IF NOT EXISTS membership_projection (
                 org_id TEXT NOT NULL DEFAULT '__unset_org__',
                 singleton BIGINT NOT NULL DEFAULT 1 CHECK (singleton = 1),

@@ -12,11 +12,12 @@ use std::collections::{HashMap, HashSet};
 use std::env;
 use std::path::{Path, PathBuf};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::runtime::Runtime;
 
 const ENV_P2P_REGION_IDS: &str = "WATTSWARM_P2P_REGION_IDS";
 const ENV_P2P_LOCAL_IDS: &str = "WATTSWARM_P2P_LOCAL_IDS";
+const ENV_P2P_NODE_IDS: &str = "WATTSWARM_P2P_NODE_IDS";
 const KNOWLEDGE_SUMMARY_KIND: &str = "knowledge_task_type_v1";
 const REPUTATION_SUMMARY_KIND: &str = "reputation_runtime_profile_v1";
 const SUMMARY_REPUTATION_LIMIT: usize = 64;
@@ -27,11 +28,19 @@ const MAX_INFLIGHT_BACKFILLS_PER_PEER: usize = 1;
 const SUMMARY_BACKPRESSURE_HIGH_WATERMARK: u64 = 256;
 const IDLE_NETWORK_SLEEP: Duration = Duration::from_millis(50);
 
+fn observed_at_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
 #[derive(Debug, Clone)]
 struct PeerSyncState {
     inflight_backfills: usize,
     last_backfill_request_at: Option<Instant>,
     next_retry_at: Instant,
+    known_scopes: HashSet<SwarmScope>,
 }
 
 impl PeerSyncState {
@@ -40,6 +49,7 @@ impl PeerSyncState {
             inflight_backfills: 0,
             last_backfill_request_at: None,
             next_retry_at: now,
+            known_scopes: HashSet::new(),
         }
     }
 }
@@ -90,7 +100,10 @@ const ENV_P2P_ENABLED: &str = "WATTSWARM_P2P_ENABLED";
 const ENV_P2P_MDNS: &str = "WATTSWARM_P2P_MDNS";
 const ENV_P2P_PORT: &str = "WATTSWARM_P2P_PORT";
 const ENV_P2P_LISTEN_ADDRS: &str = "WATTSWARM_P2P_LISTEN_ADDRS";
+const ENV_P2P_BOOTSTRAP_PEERS: &str = "WATTSWARM_P2P_BOOTSTRAP_PEERS";
 const DEFAULT_P2P_PORT: u16 = 4001;
+const GLOBAL_HIGH_FREQUENCY_WINDOW: Duration = Duration::from_secs(5);
+const GLOBAL_HIGH_FREQUENCY_LIMIT: usize = 32;
 
 fn parse_bool_env_with_default(key: &str, default: bool) -> bool {
     env::var(key)
@@ -128,14 +141,52 @@ pub fn configured_network_scopes_from_env() -> Vec<SwarmScope> {
             }
         }
     }
+    if let Ok(raw) = env::var(ENV_P2P_NODE_IDS) {
+        for scope in parse_scope_id_env(&raw, SwarmScope::Node) {
+            if !scopes.contains(&scope) {
+                scopes.push(scope);
+            }
+        }
+    }
     if let Ok(raw) = env::var(ENV_P2P_LOCAL_IDS) {
-        for scope in parse_scope_id_env(&raw, SwarmScope::Local) {
+        for scope in parse_scope_id_env(&raw, SwarmScope::Node) {
             if !scopes.contains(&scope) {
                 scopes.push(scope);
             }
         }
     }
     scopes
+}
+
+fn merge_scopes(scopes: impl IntoIterator<Item = SwarmScope>) -> Vec<SwarmScope> {
+    let mut merged = Vec::new();
+    for scope in scopes {
+        if !merged.contains(&scope) {
+            merged.push(scope);
+        }
+    }
+    if !merged.contains(&SwarmScope::Global) {
+        merged.insert(0, SwarmScope::Global);
+    }
+    merged
+}
+
+fn dynamic_subscription_scopes_for_node(node: &Node, node_id: &str) -> Result<Vec<SwarmScope>> {
+    let mut scopes = Vec::new();
+    for hint in node.store.list_active_feed_subscription_scope_hints(node_id)? {
+        if let Some(scope) = parse_scope_hint_string(&hint)
+            && !scopes.contains(&scope)
+        {
+            scopes.push(scope);
+        }
+    }
+    Ok(scopes)
+}
+
+fn node_has_active_subscription_scope(node: &Node, node_id: &str, scope: &SwarmScope) -> Result<bool> {
+    Ok(dynamic_subscription_scopes_for_node(node, node_id)?
+        .into_iter()
+        .any(|candidate| candidate == *scope))
 }
 
 pub fn network_enabled_from_env() -> bool {
@@ -154,9 +205,14 @@ pub fn network_config_from_env() -> NetworkP2pConfig {
                 .unwrap_or(DEFAULT_P2P_PORT);
             vec![format!("/ip4/0.0.0.0/tcp/{port}")]
         });
+    let bootstrap_peers = env::var(ENV_P2P_BOOTSTRAP_PEERS)
+        .ok()
+        .map(|raw| parse_listen_addrs_env(&raw))
+        .unwrap_or_default();
 
     NetworkP2pConfig {
         listen_addrs,
+        bootstrap_peers,
         enable_mdns: parse_bool_env_with_default(ENV_P2P_MDNS, true),
         ..NetworkP2pConfig::default()
     }
@@ -185,10 +241,16 @@ fn run_background_network_service(
     state_dir: &Path,
     db_path: &Path,
     config: NetworkP2pConfig,
-    scopes: Vec<SwarmScope>,
+    configured_scopes: Vec<SwarmScope>,
 ) -> Result<()> {
+    let bootstrap_peers = config.bootstrap_peers.clone();
     let mut node = crate::control::open_node(state_dir, db_path)?;
     let node_id = node.node_id();
+    let scopes = merge_scopes(
+        configured_scopes
+            .into_iter()
+            .chain(dynamic_subscription_scopes_for_node(&node, &node_id)?),
+    );
     let mut service =
         NetworkBridgeService::new_with_scopes(NetworkP2pNode::generate(config)?, &scopes)?;
     let mut announced_listen = false;
@@ -227,6 +289,10 @@ fn run_background_network_service(
             &node_id,
             &mut next_dial_attempt_at,
         )? > 0
+        {
+            did_work = true;
+        }
+        if dial_bootstrap_peer_endpoints(&mut service, &bootstrap_peers, &mut next_dial_attempt_at)? > 0
         {
             did_work = true;
         }
@@ -338,7 +404,7 @@ fn parse_scope_hint_string(raw: &str) -> Option<SwarmScope> {
     }
     match kind.trim().to_ascii_lowercase().as_str() {
         "region" => Some(SwarmScope::Region(id.to_owned())),
-        "local" => Some(SwarmScope::Local(id.to_owned())),
+        "local" | "node" => Some(SwarmScope::Node(id.to_owned())),
         _ => None,
     }
 }
@@ -366,8 +432,10 @@ fn contract_scope(contract: &crate::types::TaskContract) -> SwarmScope {
             (Some(kind), Some(id)) if !id.is_empty() && kind == "region" => {
                 return SwarmScope::Region(id.to_owned());
             }
-            (Some(kind), Some(id)) if !id.is_empty() && kind == "local" => {
-                return SwarmScope::Local(id.to_owned());
+            (Some(kind), Some(id))
+                if !id.is_empty() && matches!(kind.as_str(), "local" | "node") =>
+            {
+                return SwarmScope::Node(id.to_owned());
             }
             (Some(kind), _) if kind == "global" => return SwarmScope::Global,
             _ => {}
@@ -376,9 +444,25 @@ fn contract_scope(contract: &crate::types::TaskContract) -> SwarmScope {
     parse_scope_hint_string(&contract.task_type).unwrap_or(SwarmScope::Global)
 }
 
+fn scope_from_hint_or_global(raw: &str) -> SwarmScope {
+    parse_scope_hint_string(raw).unwrap_or(SwarmScope::Global)
+}
+
 fn event_scope(node: &Node, event: &crate::types::Event) -> Result<SwarmScope> {
     match &event.payload {
         crate::types::EventPayload::TaskCreated(contract) => Ok(contract_scope(contract)),
+        crate::types::EventPayload::FeedSubscriptionUpdated(payload) => {
+            Ok(scope_from_hint_or_global(&payload.scope_hint))
+        }
+        crate::types::EventPayload::TaskAnnounced(payload) => {
+            Ok(scope_from_hint_or_global(&payload.scope_hint))
+        }
+        crate::types::EventPayload::ExecutionIntentDeclared(payload) => {
+            Ok(scope_from_hint_or_global(&payload.scope_hint))
+        }
+        crate::types::EventPayload::ExecutionSetConfirmed(payload) => {
+            Ok(scope_from_hint_or_global(&payload.scope_hint))
+        }
         crate::types::EventPayload::MembershipUpdated(_)
         | crate::types::EventPayload::PolicyTuned(_)
         | crate::types::EventPayload::CheckpointCreated(_)
@@ -409,6 +493,28 @@ fn should_sync_event(node: &Node, event: &crate::types::Event) -> Result<bool> {
         return Ok(true);
     }
     Ok(!node.store.is_event_revoked(&event.event_id)?)
+}
+
+pub fn apply_rule_announcement(node: &mut Node, rule: &crate::network_p2p::RuleAnnouncement) -> Result<()> {
+    node.store.put_rule_announcement(
+        &rule.scope.label()?,
+        &rule.rule_set,
+        rule.rule_version,
+        rule.activation_epoch,
+        observed_at_ms(),
+    )
+}
+
+pub fn apply_checkpoint_announcement(
+    node: &mut Node,
+    checkpoint: &crate::network_p2p::CheckpointAnnouncement,
+) -> Result<()> {
+    node.store.put_checkpoint_announcement(
+        &checkpoint.scope.label()?,
+        &checkpoint.checkpoint_id,
+        &checkpoint.artifact_path,
+        observed_at_ms(),
+    )
 }
 
 fn build_summary_id(
@@ -551,6 +657,22 @@ pub fn apply_summary_announcement(node: &mut Node, summary: &SummaryAnnouncement
     Ok(())
 }
 
+fn is_high_frequency_global_event(payload: &crate::types::EventPayload) -> bool {
+    matches!(
+        payload,
+        crate::types::EventPayload::TaskClaimed(_)
+            | crate::types::EventPayload::TaskClaimRenewed(_)
+            | crate::types::EventPayload::TaskClaimReleased(_)
+            | crate::types::EventPayload::CandidateProposed(_)
+            | crate::types::EventPayload::EvidenceAdded(_)
+            | crate::types::EventPayload::EvidenceAvailable(_)
+            | crate::types::EventPayload::VerifierResultSubmitted(_)
+            | crate::types::EventPayload::VoteCommit(_)
+            | crate::types::EventPayload::VoteReveal(_)
+            | crate::types::EventPayload::DecisionCommitted(_)
+    )
+}
+
 pub fn publish_pending_scoped_updates(
     service: &mut NetworkBridgeService,
     node: &Node,
@@ -573,9 +695,31 @@ pub fn publish_pending_scoped_updates(
             continue;
         }
         let scope = event_scope(node, &event)?;
+        if let crate::types::EventPayload::FeedSubscriptionUpdated(payload) = &event.payload
+            && payload.subscriber_node_id == local_node_id
+        {
+            if payload.active {
+                service.subscribe_scope(&scope)?;
+            } else if !node_has_active_subscription_scope(node, local_node_id, &scope)? {
+                service.unsubscribe_scope(&scope)?;
+            }
+        }
+        let is_local_subscription_control_event = matches!(
+            &event.payload,
+            crate::types::EventPayload::FeedSubscriptionUpdated(_)
+        );
         match service.publish_event_for_scope(&scope, event.clone()) {
             Ok(()) => last_published_seq = seq,
+            Err(err)
+                if err.to_string().contains("NoPeersSubscribedToTopic")
+                    && is_local_subscription_control_event =>
+            {
+                last_published_seq = seq;
+                continue;
+            }
             Err(err) if err.to_string().contains("NoPeersSubscribedToTopic") => break,
+            Err(err) if err.to_string().contains("GlobalTopicRateLimited") => break,
+            Err(err) if err.to_string().contains("LocalTopicRateLimited") => break,
             Err(err) => return Err(err),
         }
         if publish_summaries
@@ -643,10 +787,45 @@ pub fn dial_discovered_peer_endpoints(
     Ok(dialed)
 }
 
+pub fn dial_bootstrap_peer_endpoints(
+    service: &mut NetworkBridgeService,
+    bootstrap_peers: &[String],
+    next_attempt_at: &mut HashMap<String, std::time::Instant>,
+) -> Result<usize> {
+    let now = std::time::Instant::now();
+    let mut dialed = 0usize;
+    for raw_addr in bootstrap_peers {
+        if next_attempt_at
+            .get(raw_addr)
+            .is_some_and(|deadline| *deadline > now)
+        {
+            continue;
+        }
+        let addr = match raw_addr.parse::<Multiaddr>() {
+            Ok(addr) => addr,
+            Err(_) => continue,
+        };
+        next_attempt_at.insert(raw_addr.clone(), now + DISCOVERY_DIAL_RETRY_AFTER);
+        match service.dial(addr) {
+            Ok(()) => dialed += 1,
+            Err(err)
+                if err
+                    .to_string()
+                    .to_ascii_lowercase()
+                    .contains("duplicate connection") => {}
+            Err(err) => eprintln!("bootstrap dial failed for {raw_addr}: {err}"),
+        }
+    }
+    Ok(dialed)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NetworkBridgeTick {
     Listening {
         address: Multiaddr,
+    },
+    TransportNotice {
+        detail: String,
     },
     Connected {
         peer: PeerId,
@@ -661,6 +840,15 @@ pub enum NetworkBridgeTick {
     SummaryApplied {
         peer: PeerId,
         summary_kind: String,
+    },
+    RuleApplied {
+        peer: PeerId,
+        rule_set: String,
+        rule_version: u64,
+    },
+    CheckpointApplied {
+        peer: PeerId,
+        checkpoint_id: String,
     },
     GossipIgnored {
         peer: PeerId,
@@ -682,12 +870,45 @@ pub enum NetworkBridgeTick {
     },
 }
 
+#[derive(Debug, Clone)]
+struct GlobalPublishRateGuard {
+    window_started_at: Instant,
+    high_frequency_events_in_window: usize,
+}
+
+impl GlobalPublishRateGuard {
+    fn new(now: Instant) -> Self {
+        Self {
+            window_started_at: now,
+            high_frequency_events_in_window: 0,
+        }
+    }
+
+    fn allow(&mut self, scope: &SwarmScope, event: &crate::types::Event) -> bool {
+        if *scope != SwarmScope::Global || !is_high_frequency_global_event(&event.payload) {
+            return true;
+        }
+        let now = Instant::now();
+        if now.duration_since(self.window_started_at) >= GLOBAL_HIGH_FREQUENCY_WINDOW {
+            self.window_started_at = now;
+            self.high_frequency_events_in_window = 0;
+        }
+        if self.high_frequency_events_in_window >= GLOBAL_HIGH_FREQUENCY_LIMIT {
+            return false;
+        }
+        self.high_frequency_events_in_window += 1;
+        true
+    }
+}
+
 pub struct NetworkBridgeService {
     runtime: NetworkRuntime,
     tokio_runtime: Runtime,
     subscribed_scopes: Vec<SwarmScope>,
+    pinned_scopes: Vec<SwarmScope>,
     peer_sync_state: HashMap<PeerId, PeerSyncState>,
     connected_peers: HashSet<PeerId>,
+    global_publish_rate_guard: GlobalPublishRateGuard,
 }
 
 impl NetworkBridgeService {
@@ -712,9 +933,11 @@ impl NetworkBridgeService {
         Ok(Self {
             runtime,
             tokio_runtime,
+            pinned_scopes: subscribed_scopes.clone(),
             subscribed_scopes,
             peer_sync_state: HashMap::new(),
             connected_peers: HashSet::new(),
+            global_publish_rate_guard: GlobalPublishRateGuard::new(Instant::now()),
         })
     }
 
@@ -739,6 +962,19 @@ impl NetworkBridgeService {
         Ok(())
     }
 
+    pub fn unsubscribe_scope(&mut self, scope: &SwarmScope) -> Result<()> {
+        if *scope == SwarmScope::Global
+            || self.pinned_scopes.contains(scope)
+            || !self.subscribed_scopes.contains(scope)
+        {
+            return Ok(());
+        }
+        let _guard = self.tokio_runtime.enter();
+        self.runtime.unsubscribe_scope(scope)?;
+        self.subscribed_scopes.retain(|existing| existing != scope);
+        Ok(())
+    }
+
     pub fn dial(&mut self, addr: Multiaddr) -> Result<()> {
         let _guard = self.tokio_runtime.enter();
         self.runtime.dial(addr)
@@ -749,6 +985,9 @@ impl NetworkBridgeService {
         scope: &SwarmScope,
         event: crate::types::Event,
     ) -> Result<()> {
+        if !self.global_publish_rate_guard.allow(scope, &event) {
+            bail!("GlobalTopicRateLimited");
+        }
         self.runtime.publish_gossip(&event_gossip(EventEnvelope {
             scope: scope.clone(),
             event,
@@ -787,6 +1026,16 @@ impl NetworkBridgeService {
     }
 
     fn request_backfill_for_peer(&mut self, peer: &PeerId, node: &Node) -> Result<bool> {
+        let scopes = self.scopes_to_request_for_peer(peer);
+        self.request_backfill_scopes_for_peer(peer, node, &scopes)
+    }
+
+    fn request_backfill_scopes_for_peer(
+        &mut self,
+        peer: &PeerId,
+        node: &Node,
+        scopes: &[SwarmScope],
+    ) -> Result<bool> {
         let now = Instant::now();
         let state = self
             .peer_sync_state
@@ -796,8 +1045,11 @@ impl NetworkBridgeService {
         {
             return Ok(false);
         }
+        if scopes.is_empty() {
+            return Ok(false);
+        }
         let mut requests_sent = 0usize;
-        for scope in self.subscribed_scopes.clone() {
+        for scope in scopes.iter().cloned() {
             let from_event_seq = latest_scoped_event_seq(node, &scope)?;
             let _guard = self.tokio_runtime.enter();
             let _ = self.runtime.send_backfill_request(
@@ -819,26 +1071,77 @@ impl NetworkBridgeService {
     pub fn run_anti_entropy(&mut self, node: &Node) -> Result<usize> {
         let now = Instant::now();
         let mut requested = 0usize;
-        let peers = self.connected_peers.iter().copied().collect::<Vec<_>>();
-        for peer in peers {
-            let should_request = match self.peer_sync_state.get(&peer) {
-                Some(state) => {
-                    state.inflight_backfills < MAX_INFLIGHT_BACKFILLS_PER_PEER
-                        && state.next_retry_at <= now
-                        && state.last_backfill_request_at.map_or(true, |last| {
-                            now.duration_since(last) >= ANTI_ENTROPY_INTERVAL
-                        })
-                }
-                None => true,
-            };
-            if !should_request {
+        let mut scopes = self.subscribed_scopes.clone();
+        scopes.sort_by_key(|scope| matches!(scope, SwarmScope::Global));
+        let mut requests_by_peer: HashMap<PeerId, Vec<SwarmScope>> = HashMap::new();
+        for scope in scopes {
+            let Some(peer) = self.preferred_backfill_peer_for_scope(&scope, now) else {
                 continue;
-            }
-            if self.request_backfill_for_peer(&peer, node)? {
+            };
+            requests_by_peer.entry(peer).or_default().push(scope);
+        }
+        for (peer, scopes) in requests_by_peer {
+            if self.request_backfill_scopes_for_peer(&peer, node, &scopes)? {
                 requested += 1;
             }
         }
         Ok(requested)
+    }
+
+    fn scopes_to_request_for_peer(&self, peer: &PeerId) -> Vec<SwarmScope> {
+        let Some(state) = self.peer_sync_state.get(peer) else {
+            return self.subscribed_scopes.clone();
+        };
+        if state.known_scopes.is_empty() {
+            return self.subscribed_scopes.clone();
+        }
+        self.subscribed_scopes
+            .iter()
+            .filter(|scope| state.known_scopes.contains(*scope))
+            .cloned()
+            .collect()
+    }
+
+    fn preferred_backfill_peer_for_scope(&self, scope: &SwarmScope, now: Instant) -> Option<PeerId> {
+        let peers = self.connected_peers.iter().copied().collect::<Vec<_>>();
+        peers
+            .iter()
+            .copied()
+            .find(|peer| self.peer_is_eligible_for_scope(peer, scope, now, true))
+            .or_else(|| {
+                peers.into_iter()
+                    .find(|peer| self.peer_is_eligible_for_scope(peer, scope, now, false))
+            })
+    }
+
+    fn peer_is_eligible_for_scope(
+        &self,
+        peer: &PeerId,
+        scope: &SwarmScope,
+        now: Instant,
+        require_known_scope: bool,
+    ) -> bool {
+        match self.peer_sync_state.get(peer) {
+            Some(state) => {
+                if require_known_scope && !state.known_scopes.contains(scope) {
+                    return false;
+                }
+                state.inflight_backfills < MAX_INFLIGHT_BACKFILLS_PER_PEER
+                    && state.next_retry_at <= now
+                    && state.last_backfill_request_at.map_or(true, |last| {
+                        now.duration_since(last) >= ANTI_ENTROPY_INTERVAL
+                    })
+            }
+            None => !require_known_scope,
+        }
+    }
+
+    fn record_peer_scope_activity(&mut self, peer: PeerId, scope: &SwarmScope) {
+        self.peer_sync_state
+            .entry(peer)
+            .or_insert_with(|| PeerSyncState::new(Instant::now()))
+            .known_scopes
+            .insert(scope.clone());
     }
 
     fn mark_peer_connected(&mut self, peer: PeerId) {
@@ -895,6 +1198,49 @@ impl NetworkBridgeService {
             NetworkRuntimeEvent::NewListenAddr { address } => {
                 Ok(NetworkBridgeTick::Listening { address })
             }
+            NetworkRuntimeEvent::NatStatusChanged {
+                old,
+                new,
+                public_address,
+                confidence,
+            } => Ok(NetworkBridgeTick::TransportNotice {
+                detail: format!(
+                    "nat_status_changed old={old} new={new} public_address={} confidence={confidence}",
+                    public_address
+                        .map(|addr| addr.to_string())
+                        .unwrap_or_else(|| "none".to_owned())
+                ),
+            }),
+            NetworkRuntimeEvent::RelayReservationAccepted {
+                relay_peer,
+                renewal,
+            } => Ok(NetworkBridgeTick::TransportNotice {
+                detail: format!(
+                    "relay_reservation_accepted relay_peer={relay_peer} renewal={renewal}"
+                ),
+            }),
+            NetworkRuntimeEvent::RelayCircuitEstablished { relay_peer } => {
+                Ok(NetworkBridgeTick::TransportNotice {
+                    detail: format!("relay_circuit_established relay_peer={relay_peer}"),
+                })
+            }
+            NetworkRuntimeEvent::RelayInboundCircuitEstablished { source_peer } => {
+                Ok(NetworkBridgeTick::TransportNotice {
+                    detail: format!("relay_inbound_circuit_established source_peer={source_peer}"),
+                })
+            }
+            NetworkRuntimeEvent::DcutrConnectionUpgradeSucceeded { remote_peer } => {
+                Ok(NetworkBridgeTick::TransportNotice {
+                    detail: format!("dcutr_upgrade_succeeded remote_peer={remote_peer}"),
+                })
+            }
+            NetworkRuntimeEvent::DcutrConnectionUpgradeFailed { remote_peer, error } => {
+                Ok(NetworkBridgeTick::TransportNotice {
+                    detail: format!(
+                        "dcutr_upgrade_failed remote_peer={remote_peer} error={error}"
+                    ),
+                })
+            }
             NetworkRuntimeEvent::ConnectionEstablished { peer } => {
                 self.mark_peer_connected(peer);
                 let _ = self.request_backfill_for_peer(&peer, node)?;
@@ -923,6 +1269,7 @@ impl NetworkBridgeService {
                 message,
             } => match message {
                 GossipMessage::Event(envelope) => {
+                    self.record_peer_scope_activity(propagation_source, &envelope.scope);
                     ingest_event_envelope(node, &envelope)?;
                     Ok(NetworkBridgeTick::EventIngested {
                         peer: propagation_source,
@@ -930,20 +1277,30 @@ impl NetworkBridgeService {
                     })
                 }
                 GossipMessage::Summary(summary) => {
+                    self.record_peer_scope_activity(propagation_source, &summary.scope);
                     apply_summary_announcement(node, &summary)?;
                     Ok(NetworkBridgeTick::SummaryApplied {
                         peer: propagation_source,
                         summary_kind: summary.summary_kind,
                     })
                 }
-                GossipMessage::Rule(_) => Ok(NetworkBridgeTick::GossipIgnored {
-                    peer: propagation_source,
-                    message_kind: "rule".to_owned(),
-                }),
-                GossipMessage::Checkpoint(_) => Ok(NetworkBridgeTick::GossipIgnored {
-                    peer: propagation_source,
-                    message_kind: "checkpoint".to_owned(),
-                }),
+                GossipMessage::Rule(rule) => {
+                    self.record_peer_scope_activity(propagation_source, &rule.scope);
+                    apply_rule_announcement(node, &rule)?;
+                    Ok(NetworkBridgeTick::RuleApplied {
+                        peer: propagation_source,
+                        rule_set: rule.rule_set,
+                        rule_version: rule.rule_version,
+                    })
+                }
+                GossipMessage::Checkpoint(checkpoint) => {
+                    self.record_peer_scope_activity(propagation_source, &checkpoint.scope);
+                    apply_checkpoint_announcement(node, &checkpoint)?;
+                    Ok(NetworkBridgeTick::CheckpointApplied {
+                        peer: propagation_source,
+                        checkpoint_id: checkpoint.checkpoint_id,
+                    })
+                }
             },
             NetworkRuntimeEvent::BackfillRequest {
                 peer,
@@ -964,6 +1321,7 @@ impl NetworkBridgeService {
                 request_id,
                 response,
             } => {
+                self.record_peer_scope_activity(peer, &response.scope);
                 self.mark_backfill_completed(peer);
                 Ok(NetworkBridgeTick::BackfillApplied {
                     peer,
@@ -1006,6 +1364,12 @@ mod tests {
     fn env_test_lock() -> &'static Mutex<()> {
         static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         ENV_LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    fn lock_env_test_mutex() -> std::sync::MutexGuard<'static, ()> {
+        env_test_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     fn membership_with_roles(node_ids: &[String]) -> Membership {
@@ -1185,38 +1549,422 @@ mod tests {
 
     #[test]
     fn network_config_defaults_to_enabled_with_fixed_tcp_port() {
-        let _lock = env_test_lock().lock().expect("env test lock");
+        let _lock = lock_env_test_mutex();
         let _enabled = EnvVarGuard::set(ENV_P2P_ENABLED, None);
         let _mdns = EnvVarGuard::set(ENV_P2P_MDNS, None);
         let _port = EnvVarGuard::set(ENV_P2P_PORT, None);
         let _listen = EnvVarGuard::set(ENV_P2P_LISTEN_ADDRS, None);
+        let _bootstrap = EnvVarGuard::set(ENV_P2P_BOOTSTRAP_PEERS, None);
         assert!(network_enabled_from_env());
         let config = network_config_from_env();
         assert!(config.enable_mdns);
         assert_eq!(config.listen_addrs, vec!["/ip4/0.0.0.0/tcp/4001"]);
+        assert!(config.bootstrap_peers.is_empty());
     }
 
     #[test]
     fn network_enabled_can_be_explicitly_disabled() {
-        let _lock = env_test_lock().lock().expect("env test lock");
+        let _lock = lock_env_test_mutex();
         let _enabled = EnvVarGuard::set(ENV_P2P_ENABLED, Some("false"));
         assert!(!network_enabled_from_env());
     }
 
     #[test]
-    fn configured_network_scopes_include_region_and_local_from_env() {
-        let _lock = env_test_lock().lock().expect("env test lock");
+    fn configured_network_scopes_include_global_by_default() {
+        let _lock = lock_env_test_mutex();
+        let _regions = EnvVarGuard::set(ENV_P2P_REGION_IDS, None);
+        let _locals = EnvVarGuard::set(ENV_P2P_LOCAL_IDS, None);
+        let _nodes = EnvVarGuard::set(ENV_P2P_NODE_IDS, None);
+        assert_eq!(configured_network_scopes_from_env(), vec![SwarmScope::Global]);
+    }
+
+    #[test]
+    fn configured_network_scopes_include_region_and_node_aliases() {
+        let _lock = lock_env_test_mutex();
         let _regions = EnvVarGuard::set(ENV_P2P_REGION_IDS, Some("sol-1,sol-2"));
         let _locals = EnvVarGuard::set(ENV_P2P_LOCAL_IDS, Some("lab-a"));
-        assert_eq!(
-            configured_network_scopes_from_env(),
-            vec![
-                SwarmScope::Global,
-                SwarmScope::Region("sol-1".to_owned()),
-                SwarmScope::Region("sol-2".to_owned()),
-                SwarmScope::Local("lab-a".to_owned()),
-            ]
+        let _nodes = EnvVarGuard::set(ENV_P2P_NODE_IDS, Some("lab-b"));
+        let scopes = configured_network_scopes_from_env();
+        assert_eq!(scopes.len(), 5);
+        assert_eq!(scopes[0], SwarmScope::Global);
+        assert!(scopes.contains(&SwarmScope::Region("sol-1".to_owned())));
+        assert!(scopes.contains(&SwarmScope::Region("sol-2".to_owned())));
+        assert!(scopes.contains(&SwarmScope::Node("lab-a".to_owned())));
+        assert!(scopes.contains(&SwarmScope::Node("lab-b".to_owned())));
+    }
+
+    #[test]
+    fn dynamic_subscription_scopes_merge_with_configured_scopes() {
+        let mut node = Node::open_in_memory_with_roles(&[]).expect("node");
+        let node_id = node.node_id();
+        node.emit_at(
+            1,
+            crate::types::EventPayload::FeedSubscriptionUpdated(
+                crate::types::FeedSubscriptionUpdatedPayload {
+                    subscriber_node_id: node_id.clone(),
+                    feed_key: "market.alpha".to_owned(),
+                    scope_hint: "region:sol-1".to_owned(),
+                    active: true,
+                },
+            ),
+            100,
+        )
+        .expect("subscription event");
+
+        let scopes = merge_scopes(
+            configured_network_scopes_from_env()
+                .into_iter()
+                .chain(dynamic_subscription_scopes_for_node(&node, &node_id).expect("scopes")),
         );
+        assert!(scopes.contains(&SwarmScope::Global));
+        assert!(scopes.contains(&SwarmScope::Region("sol-1".to_owned())));
+    }
+
+    #[test]
+    fn publish_pending_updates_subscribes_runtime_for_local_feed_subscription() {
+        let mut node = Node::open_in_memory_with_roles(&[]).expect("node");
+        let local_node_id = node.node_id();
+        node.emit_at(
+            1,
+            crate::types::EventPayload::FeedSubscriptionUpdated(
+                crate::types::FeedSubscriptionUpdatedPayload {
+                    subscriber_node_id: local_node_id.clone(),
+                    feed_key: "market.beta".to_owned(),
+                    scope_hint: "node:lab-9".to_owned(),
+                    active: true,
+                },
+            ),
+            100,
+        )
+        .expect("subscription event");
+
+        let mut service = NetworkBridgeService::new(
+            NetworkP2pNode::generate(NetworkP2pConfig {
+                listen_addrs: vec!["/ip4/127.0.0.1/tcp/0".to_owned()],
+                enable_mdns: false,
+                ..NetworkP2pConfig::default()
+            })
+            .expect("network node"),
+        )
+        .expect("service");
+
+        publish_pending_scoped_updates(&mut service, &node, &local_node_id, 0)
+            .expect("publish pending updates");
+
+        assert!(
+            service
+                .subscribed_scopes()
+                .contains(&SwarmScope::Node("lab-9".to_owned()))
+        );
+    }
+
+    #[test]
+    fn publish_pending_updates_unsubscribes_scope_when_local_subscription_is_disabled() {
+        let mut node = Node::open_in_memory_with_roles(&[]).expect("node");
+        let local_node_id = node.node_id();
+        node.emit_at(
+            1,
+            crate::types::EventPayload::FeedSubscriptionUpdated(
+                crate::types::FeedSubscriptionUpdatedPayload {
+                    subscriber_node_id: local_node_id.clone(),
+                    feed_key: "market.gamma".to_owned(),
+                    scope_hint: "region:sol-8".to_owned(),
+                    active: true,
+                },
+            ),
+            100,
+        )
+        .expect("subscription on");
+        node.emit_at(
+            1,
+            crate::types::EventPayload::FeedSubscriptionUpdated(
+                crate::types::FeedSubscriptionUpdatedPayload {
+                    subscriber_node_id: local_node_id.clone(),
+                    feed_key: "market.gamma".to_owned(),
+                    scope_hint: "region:sol-8".to_owned(),
+                    active: false,
+                },
+            ),
+            101,
+        )
+        .expect("subscription off");
+
+        let mut service = NetworkBridgeService::new(
+            NetworkP2pNode::generate(NetworkP2pConfig {
+                listen_addrs: vec!["/ip4/127.0.0.1/tcp/0".to_owned()],
+                enable_mdns: false,
+                ..NetworkP2pConfig::default()
+            })
+            .expect("network node"),
+        )
+        .expect("service");
+
+        publish_pending_scoped_updates(&mut service, &node, &local_node_id, 0)
+            .expect("publish pending updates");
+
+        assert!(
+            !service
+                .subscribed_scopes()
+                .contains(&SwarmScope::Region("sol-8".to_owned()))
+        );
+    }
+
+    #[test]
+    fn invalid_scope_hints_are_rejected_for_network_substrate_events() {
+        let mut node = Node::open_in_memory_with_roles(&[]).expect("node");
+        let subscriber_node_id = node.node_id();
+
+        let result = node.emit_at(
+            1,
+            crate::types::EventPayload::FeedSubscriptionUpdated(
+                crate::types::FeedSubscriptionUpdatedPayload {
+                    subscriber_node_id,
+                    feed_key: "market.invalid".to_owned(),
+                    scope_hint: "bad-scope".to_owned(),
+                    active: true,
+                },
+            ),
+            100,
+        );
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn task_announcement_event_persists_summary_and_detail_reference() {
+        let mut node = Node::open_in_memory_with_roles(&[Role::Proposer]).expect("node");
+        node.emit_at(
+            1,
+            crate::types::EventPayload::TaskAnnounced(crate::types::TaskAnnouncedPayload {
+                task_id: "task-announced-1".to_owned(),
+                announcement_id: "announce-1".to_owned(),
+                feed_key: "venue.market".to_owned(),
+                scope_hint: "region:sol-2".to_owned(),
+                summary: json!({"reward": 42, "headline": "Explore relay beacon"}),
+                detail_ref: Some(crate::types::ArtifactRef {
+                    uri: "ipfs://task-detail-1".to_owned(),
+                    digest: "digest-task-detail-1".to_owned(),
+                    size_bytes: 128,
+                    mime: "application/json".to_owned(),
+                    created_at: 100,
+                    producer: node.node_id(),
+                }),
+            }),
+            100,
+        )
+        .expect("announce task");
+
+        let announcement = node
+            .store
+            .get_task_announcement("announce-1")
+            .expect("load announcement")
+            .expect("announcement exists");
+        assert_eq!(announcement.task_id, "task-announced-1");
+        assert_eq!(announcement.feed_key, "venue.market");
+        assert_eq!(announcement.scope_hint, "region:sol-2");
+        assert_eq!(announcement.summary["reward"], json!(42));
+        assert_eq!(
+            announcement.detail_ref.expect("detail ref").uri,
+            "ipfs://task-detail-1"
+        );
+    }
+
+    #[test]
+    fn execution_set_events_persist_intent_and_confirmation() {
+        let mut intent_node = Node::open_in_memory_with_roles(&[]).expect("intent node");
+        let participant_node_id = intent_node.node_id();
+        intent_node
+            .emit_at(
+                1,
+                crate::types::EventPayload::ExecutionIntentDeclared(
+                    crate::types::ExecutionIntentDeclaredPayload {
+                        task_id: "task-execution-1".to_owned(),
+                        execution_set_id: "exec-set-1".to_owned(),
+                        participant_node_id: participant_node_id.clone(),
+                        role_hint: "writer".to_owned(),
+                        scope_hint: "region:sol-3".to_owned(),
+                        intent: "interested".to_owned(),
+                    },
+                ),
+                100,
+            )
+            .expect("intent event");
+
+        let members = intent_node
+            .store
+            .list_execution_set_members("task-execution-1", "exec-set-1")
+            .expect("members after intent");
+        assert_eq!(members.len(), 1);
+        assert_eq!(members[0].status, "interested");
+
+        let mut confirmer = Node::open_in_memory_with_roles(&[Role::Committer]).expect("confirmer");
+        let confirmed_by_node_id = confirmer.node_id();
+        confirmer
+            .emit_at(
+                1,
+                crate::types::EventPayload::ExecutionSetConfirmed(
+                    crate::types::ExecutionSetConfirmedPayload {
+                        task_id: "task-execution-1".to_owned(),
+                        execution_set_id: "exec-set-1".to_owned(),
+                        confirmed_by_node_id: confirmed_by_node_id.clone(),
+                        scope_hint: "region:sol-3".to_owned(),
+                        members: vec![crate::types::ExecutionSetMember {
+                            participant_node_id: "peer-a".to_owned(),
+                            role_hint: "writer".to_owned(),
+                        }],
+                    },
+                ),
+                101,
+            )
+            .expect("confirmation event");
+
+        let members = confirmer
+            .store
+            .list_execution_set_members("task-execution-1", "exec-set-1")
+            .expect("members after confirmation");
+        assert_eq!(members.len(), 1);
+        assert_eq!(members[0].status, "confirmed");
+        assert_eq!(members[0].confirmed_by_node_id.as_deref(), Some(confirmed_by_node_id.as_str()));
+    }
+
+    #[test]
+    fn rule_and_checkpoint_gossip_are_applied_to_projection_store() {
+        let mut node = Node::open_in_memory_with_roles(&[]).expect("node");
+
+        apply_rule_announcement(
+            &mut node,
+            &crate::network_p2p::RuleAnnouncement {
+                scope: SwarmScope::Region("sol-4".to_owned()),
+                rule_set: "market-routing".to_owned(),
+                rule_version: 3,
+                activation_epoch: Some(9),
+            },
+        )
+        .expect("apply rule");
+        apply_checkpoint_announcement(
+            &mut node,
+            &crate::network_p2p::CheckpointAnnouncement {
+                scope: SwarmScope::Region("sol-4".to_owned()),
+                checkpoint_id: "cp-sol-4".to_owned(),
+                artifact_path: "ipfs://checkpoint-sol-4".to_owned(),
+            },
+        )
+        .expect("apply checkpoint");
+
+        let rule = node
+            .store
+            .latest_rule_announcement("region.sol-4", "market-routing")
+            .expect("load rule")
+            .expect("rule exists");
+        assert_eq!(rule.rule_version, 3);
+        assert_eq!(rule.activation_epoch, Some(9));
+
+        let checkpoint = node
+            .store
+            .get_checkpoint_announcement("region.sol-4", "cp-sol-4")
+            .expect("load checkpoint")
+            .expect("checkpoint exists");
+        assert_eq!(checkpoint.artifact_path, "ipfs://checkpoint-sol-4");
+    }
+
+    #[test]
+    fn network_config_reads_bootstrap_peers_from_env() {
+        let _lock = lock_env_test_mutex();
+        let _bootstrap = EnvVarGuard::set(
+            ENV_P2P_BOOTSTRAP_PEERS,
+            Some("/ip4/127.0.0.1/tcp/4001/p2p/12D3KooWJ5r1D8N8QYp8JDs7u9mM4rY2kQ6xXK7Z6A6V4t7N3sQX"),
+        );
+        let config = network_config_from_env();
+        assert_eq!(config.bootstrap_peers.len(), 1);
+        assert_eq!(
+            config.bootstrap_peers[0],
+            "/ip4/127.0.0.1/tcp/4001/p2p/12D3KooWJ5r1D8N8QYp8JDs7u9mM4rY2kQ6xXK7Z6A6V4t7N3sQX"
+        );
+    }
+
+    #[test]
+    fn global_publish_rate_guard_limits_only_high_frequency_global_events() {
+        let mut guard = GlobalPublishRateGuard::new(Instant::now());
+        let event = build_event_for_external(
+            &NodeIdentity::random(),
+            1,
+            10,
+            crate::types::EventPayload::TaskClaimed(crate::types::ClaimPayload {
+                task_id: "task-rate-limit".to_owned(),
+                role: crate::types::ClaimRole::Propose,
+                claimer_node_id: "node-a".to_owned(),
+                execution_id: "exec-1".to_owned(),
+                lease_until: 20,
+            }),
+        )
+        .expect("event");
+
+        for _ in 0..GLOBAL_HIGH_FREQUENCY_LIMIT {
+            assert!(guard.allow(&SwarmScope::Global, &event));
+        }
+        assert!(!guard.allow(&SwarmScope::Global, &event));
+        assert!(guard.allow(&SwarmScope::Node("lab-1".to_owned()), &event));
+    }
+
+    #[test]
+    fn smarter_backfill_prefers_peer_with_known_scope_activity() {
+        let node_a = PeerId::random();
+        let node_b = PeerId::random();
+        let target_scope = SwarmScope::Region("sol-1".to_owned());
+        let other_scope = SwarmScope::Node("lab-2".to_owned());
+        let now = Instant::now();
+
+        let mut service = NetworkBridgeService::new_with_scopes(
+            NetworkP2pNode::generate(NetworkP2pConfig::default()).expect("node"),
+            &[SwarmScope::Global, target_scope.clone()],
+        )
+        .expect("service");
+        service.connected_peers.insert(node_a);
+        service.connected_peers.insert(node_b);
+
+        let mut state_a = PeerSyncState::new(now - Duration::from_secs(30));
+        state_a.known_scopes.insert(other_scope);
+        let mut state_b = PeerSyncState::new(now - Duration::from_secs(30));
+        state_b.known_scopes.insert(target_scope.clone());
+        service.peer_sync_state.insert(node_a, state_a);
+        service.peer_sync_state.insert(node_b, state_b);
+
+        assert_eq!(
+            service.preferred_backfill_peer_for_scope(&target_scope, now),
+            Some(node_b)
+        );
+    }
+
+    #[test]
+    fn scopes_to_request_for_peer_falls_back_to_all_scopes_until_peer_is_profiled() {
+        let peer = PeerId::random();
+        let target_scope = SwarmScope::Region("sol-1".to_owned());
+        let service = NetworkBridgeService::new_with_scopes(
+            NetworkP2pNode::generate(NetworkP2pConfig::default()).expect("node"),
+            &[SwarmScope::Global, target_scope.clone()],
+        )
+        .expect("service");
+
+        assert_eq!(
+            service.scopes_to_request_for_peer(&peer),
+            vec![SwarmScope::Global, target_scope]
+        );
+    }
+
+    #[test]
+    fn local_scope_aliases_map_to_node_scope() {
+        let policy_hash =
+            "policy-hash-alias".to_owned();
+        let mut contract = sample_contract("task-local-alias", policy_hash);
+        contract.inputs = json!({"swarm_scope":"local:lab-1"});
+        assert_eq!(contract_scope(&contract), SwarmScope::Node("lab-1".to_owned()));
+
+        contract.inputs = json!({"swarm_scope":{"kind":"local","id":"lab-2"}});
+        assert_eq!(contract_scope(&contract), SwarmScope::Node("lab-2".to_owned()));
+
+        contract.inputs = json!({});
+        contract.task_type = "local:lab-3:swarm".to_owned();
+        assert_eq!(contract_scope(&contract), SwarmScope::Node("lab-3".to_owned()));
     }
 
     #[test]

@@ -169,6 +169,391 @@ impl PgStore {
         Ok(())
     }
 
+    pub fn upsert_feed_subscription(
+        &self,
+        subscriber_node_id: &str,
+        feed_key: &str,
+        scope_hint: &str,
+        active: bool,
+        updated_at: u64,
+    ) -> Result<()> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
+        conn.execute(
+            "INSERT INTO feed_subscriptions(org_id, subscriber_node_id, feed_key, scope_hint, active, updated_at)
+             VALUES ($1, $2, $3, $4, $5, TIMESTAMPTZ 'epoch' + ($6::bigint * INTERVAL '1 millisecond'))
+             ON CONFLICT(org_id, subscriber_node_id, feed_key) DO UPDATE SET
+               scope_hint = excluded.scope_hint,
+               active = excluded.active,
+               updated_at = excluded.updated_at",
+            params![
+                self.org_id(),
+                subscriber_node_id,
+                feed_key,
+                scope_hint,
+                active,
+                updated_at as i64
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_active_feed_subscription_scope_hints(
+        &self,
+        subscriber_node_id: &str,
+    ) -> Result<Vec<String>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
+        let mut stmt = conn.prepare(
+            "SELECT scope_hint
+             FROM feed_subscriptions
+             WHERE org_id = $1 AND subscriber_node_id = $2 AND active = TRUE
+             ORDER BY updated_at DESC, feed_key ASC",
+        )?;
+        let rows = stmt.query_map(params![self.org_id(), subscriber_node_id], |r| r.get(0))?;
+        let mut hints = Vec::new();
+        for row in rows {
+            let hint: String = row?;
+            if !hints.contains(&hint) {
+                hints.push(hint);
+            }
+        }
+        Ok(hints)
+    }
+
+    pub fn get_feed_subscription(
+        &self,
+        subscriber_node_id: &str,
+        feed_key: &str,
+    ) -> Result<Option<FeedSubscriptionRow>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
+        conn.query_row(
+            "SELECT scope_hint, active, CAST(EXTRACT(EPOCH FROM updated_at) * 1000 AS BIGINT)
+             FROM feed_subscriptions
+             WHERE org_id = $1 AND subscriber_node_id = $2 AND feed_key = $3",
+            params![self.org_id(), subscriber_node_id, feed_key],
+            |r| {
+                let updated_at_ms: i64 = r.get(2)?;
+                Ok(FeedSubscriptionRow {
+                    subscriber_node_id: subscriber_node_id.to_owned(),
+                    feed_key: feed_key.to_owned(),
+                    scope_hint: r.get(0)?,
+                    active: r.get(1)?,
+                    updated_at: updated_at_ms as u64,
+                })
+            },
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    pub fn put_task_announcement(
+        &self,
+        task_id: &str,
+        announcement_id: &str,
+        feed_key: &str,
+        scope_hint: &str,
+        summary: &serde_json::Value,
+        detail_ref: Option<&crate::types::ArtifactRef>,
+        announced_by_node_id: &str,
+        created_at: u64,
+    ) -> Result<()> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
+        let detail_ref_json = detail_ref.map(serde_json::to_string).transpose()?;
+        conn.execute(
+            "INSERT INTO task_announcements(org_id, task_id, announcement_id, feed_key, scope_hint, summary_json, detail_ref_json, announced_by_node_id, created_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, TIMESTAMPTZ 'epoch' + ($9::bigint * INTERVAL '1 millisecond'))
+             ON CONFLICT(org_id, announcement_id) DO UPDATE SET
+               task_id = excluded.task_id,
+               feed_key = excluded.feed_key,
+               scope_hint = excluded.scope_hint,
+               summary_json = excluded.summary_json,
+               detail_ref_json = excluded.detail_ref_json,
+               announced_by_node_id = excluded.announced_by_node_id,
+               created_at = excluded.created_at",
+            params![
+                self.org_id(),
+                task_id,
+                announcement_id,
+                feed_key,
+                scope_hint,
+                serde_json::to_string(summary)?,
+                detail_ref_json,
+                announced_by_node_id,
+                created_at as i64
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_task_announcement(&self, announcement_id: &str) -> Result<Option<TaskAnnouncementRow>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
+        conn.query_row(
+            "SELECT task_id, feed_key, scope_hint, summary_json, detail_ref_json, announced_by_node_id,
+                    CAST(EXTRACT(EPOCH FROM created_at) * 1000 AS BIGINT)
+             FROM task_announcements
+             WHERE org_id = $1 AND announcement_id = $2",
+            params![self.org_id(), announcement_id],
+            |r| {
+                let summary_json: String = r.get(3)?;
+                let detail_ref_json: Option<String> = r.get(4)?;
+                let created_at_ms: i64 = r.get(6)?;
+                Ok(TaskAnnouncementRow {
+                    task_id: r.get(0)?,
+                    announcement_id: announcement_id.to_owned(),
+                    feed_key: r.get(1)?,
+                    scope_hint: r.get(2)?,
+                    summary: serde_json::from_str(&summary_json).map_err(|e| {
+                        pg::Error::FromSqlConversionFailure(0, pg::types::Type::Text, Box::new(e))
+                    })?,
+                    detail_ref: detail_ref_json
+                        .map(|raw| {
+                            serde_json::from_str(&raw).map_err(|e| {
+                                pg::Error::FromSqlConversionFailure(
+                                    0,
+                                    pg::types::Type::Text,
+                                    Box::new(e),
+                                )
+                            })
+                        })
+                        .transpose()?,
+                    announced_by_node_id: r.get(5)?,
+                    created_at: created_at_ms as u64,
+                })
+            },
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    pub fn get_task_announcement_for_task(&self, task_id: &str) -> Result<Option<TaskAnnouncementRow>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
+        let announcement_id = conn
+            .query_row(
+            "SELECT announcement_id
+             FROM task_announcements
+             WHERE org_id = $1 AND task_id = $2
+             ORDER BY created_at DESC, announcement_id DESC
+             LIMIT 1",
+            params![self.org_id(), task_id],
+            |r| r.get::<_, String>(0),
+        )
+        .optional()?;
+        match announcement_id {
+            Some(announcement_id) => self.get_task_announcement(&announcement_id),
+            None => Ok(None),
+        }
+    }
+
+    pub fn upsert_execution_set_member(
+        &self,
+        task_id: &str,
+        execution_set_id: &str,
+        participant_node_id: &str,
+        role_hint: &str,
+        scope_hint: &str,
+        status: &str,
+        confirmed_by_node_id: Option<&str>,
+        updated_at: u64,
+    ) -> Result<()> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
+        conn.execute(
+            "INSERT INTO execution_set_projection(org_id, task_id, execution_set_id, participant_node_id, role_hint, scope_hint, status, confirmed_by_node_id, updated_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, TIMESTAMPTZ 'epoch' + ($9::bigint * INTERVAL '1 millisecond'))
+             ON CONFLICT(org_id, task_id, execution_set_id, participant_node_id) DO UPDATE SET
+               role_hint = excluded.role_hint,
+               scope_hint = excluded.scope_hint,
+               status = excluded.status,
+               confirmed_by_node_id = excluded.confirmed_by_node_id,
+               updated_at = excluded.updated_at",
+            params![
+                self.org_id(),
+                task_id,
+                execution_set_id,
+                participant_node_id,
+                role_hint,
+                scope_hint,
+                status,
+                confirmed_by_node_id,
+                updated_at as i64
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_execution_set_members(
+        &self,
+        task_id: &str,
+        execution_set_id: &str,
+    ) -> Result<Vec<ExecutionSetMemberRow>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
+        let mut stmt = conn.prepare(
+            "SELECT participant_node_id, role_hint, scope_hint, status, confirmed_by_node_id,
+                    CAST(EXTRACT(EPOCH FROM updated_at) * 1000 AS BIGINT)
+             FROM execution_set_projection
+             WHERE org_id = $1 AND task_id = $2 AND execution_set_id = $3
+             ORDER BY participant_node_id ASC",
+        )?;
+        let rows = stmt.query_map(params![self.org_id(), task_id, execution_set_id], |r| {
+            let updated_at_ms: i64 = r.get(5)?;
+            Ok(ExecutionSetMemberRow {
+                task_id: task_id.to_owned(),
+                execution_set_id: execution_set_id.to_owned(),
+                participant_node_id: r.get(0)?,
+                role_hint: r.get(1)?,
+                scope_hint: r.get(2)?,
+                status: r.get(3)?,
+                confirmed_by_node_id: r.get(4)?,
+                updated_at: updated_at_ms as u64,
+            })
+        })?;
+        let mut members = Vec::new();
+        for row in rows {
+            members.push(row?);
+        }
+        Ok(members)
+    }
+
+    pub fn put_rule_announcement(
+        &self,
+        scope_key: &str,
+        rule_set: &str,
+        rule_version: u64,
+        activation_epoch: Option<u64>,
+        observed_at: u64,
+    ) -> Result<()> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
+        conn.execute(
+            "INSERT INTO network_rule_announcements(org_id, scope_key, rule_set, rule_version, activation_epoch, observed_at)
+             VALUES ($1, $2, $3, $4, $5, TIMESTAMPTZ 'epoch' + ($6::bigint * INTERVAL '1 millisecond'))
+             ON CONFLICT(org_id, scope_key, rule_set, rule_version) DO UPDATE SET
+               activation_epoch = excluded.activation_epoch,
+               observed_at = excluded.observed_at",
+            params![
+                self.org_id(),
+                scope_key,
+                rule_set,
+                rule_version as i64,
+                activation_epoch.map(|value| value as i64),
+                observed_at as i64
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn latest_rule_announcement(
+        &self,
+        scope_key: &str,
+        rule_set: &str,
+    ) -> Result<Option<RuleAnnouncementRow>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
+        conn.query_row(
+            "SELECT rule_version, activation_epoch, CAST(EXTRACT(EPOCH FROM observed_at) * 1000 AS BIGINT)
+             FROM network_rule_announcements
+             WHERE org_id = $1 AND scope_key = $2 AND rule_set = $3
+             ORDER BY rule_version DESC
+             LIMIT 1",
+            params![self.org_id(), scope_key, rule_set],
+            |r| {
+                let observed_at_ms: i64 = r.get(2)?;
+                let activation_epoch: Option<i64> = r.get(1)?;
+                Ok(RuleAnnouncementRow {
+                    scope_key: scope_key.to_owned(),
+                    rule_set: rule_set.to_owned(),
+                    rule_version: r.get::<_, i64>(0)? as u64,
+                    activation_epoch: activation_epoch.map(|value| value as u64),
+                    observed_at: observed_at_ms as u64,
+                })
+            },
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    pub fn put_checkpoint_announcement(
+        &self,
+        scope_key: &str,
+        checkpoint_id: &str,
+        artifact_path: &str,
+        observed_at: u64,
+    ) -> Result<()> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
+        conn.execute(
+            "INSERT INTO network_checkpoint_announcements(org_id, scope_key, checkpoint_id, artifact_path, observed_at)
+             VALUES ($1, $2, $3, $4, TIMESTAMPTZ 'epoch' + ($5::bigint * INTERVAL '1 millisecond'))
+             ON CONFLICT(org_id, scope_key, checkpoint_id) DO UPDATE SET
+               artifact_path = excluded.artifact_path,
+               observed_at = excluded.observed_at",
+            params![
+                self.org_id(),
+                scope_key,
+                checkpoint_id,
+                artifact_path,
+                observed_at as i64
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_checkpoint_announcement(
+        &self,
+        scope_key: &str,
+        checkpoint_id: &str,
+    ) -> Result<Option<CheckpointAnnouncementRow>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
+        conn.query_row(
+            "SELECT artifact_path, CAST(EXTRACT(EPOCH FROM observed_at) * 1000 AS BIGINT)
+             FROM network_checkpoint_announcements
+             WHERE org_id = $1 AND scope_key = $2 AND checkpoint_id = $3",
+            params![self.org_id(), scope_key, checkpoint_id],
+            |r| {
+                let observed_at_ms: i64 = r.get(1)?;
+                Ok(CheckpointAnnouncementRow {
+                    scope_key: scope_key.to_owned(),
+                    checkpoint_id: checkpoint_id.to_owned(),
+                    artifact_path: r.get(0)?,
+                    observed_at: observed_at_ms as u64,
+                })
+            },
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
     pub fn put_evidence_added(
         &self,
         task_id: &str,

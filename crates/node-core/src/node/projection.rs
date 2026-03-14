@@ -329,6 +329,53 @@ impl Node {
                     &event.event_id,
                 )?;
             }
+            EventPayload::FeedSubscriptionUpdated(payload) => {
+                self.store.upsert_feed_subscription(
+                    &payload.subscriber_node_id,
+                    &payload.feed_key,
+                    &payload.scope_hint,
+                    payload.active,
+                    event.created_at,
+                )?;
+            }
+            EventPayload::TaskAnnounced(payload) => {
+                self.store.put_task_announcement(
+                    &payload.task_id,
+                    &payload.announcement_id,
+                    &payload.feed_key,
+                    &payload.scope_hint,
+                    &payload.summary,
+                    payload.detail_ref.as_ref(),
+                    &event.author_node_id,
+                    event.created_at,
+                )?;
+            }
+            EventPayload::ExecutionIntentDeclared(payload) => {
+                self.store.upsert_execution_set_member(
+                    &payload.task_id,
+                    &payload.execution_set_id,
+                    &payload.participant_node_id,
+                    &payload.role_hint,
+                    &payload.scope_hint,
+                    &payload.intent,
+                    None,
+                    event.created_at,
+                )?;
+            }
+            EventPayload::ExecutionSetConfirmed(payload) => {
+                for member in &payload.members {
+                    self.store.upsert_execution_set_member(
+                        &payload.task_id,
+                        &payload.execution_set_id,
+                        &member.participant_node_id,
+                        &member.role_hint,
+                        &payload.scope_hint,
+                        "confirmed",
+                        Some(&payload.confirmed_by_node_id),
+                        event.created_at,
+                    )?;
+                }
+            }
             EventPayload::MembershipUpdated(payload) => {
                 self.store
                     .put_membership(&serde_json::to_string(&payload.new_membership)?)?;

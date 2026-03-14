@@ -114,12 +114,16 @@ Node identity reminder:
 The workspace now includes dedicated crates and a control-plane bridge for node-local storage plus live inter-node sync:
 
 - `crates/network-p2p`
-  - owns scope-aware topic naming (`global` / `region.*` / `local.*`)
+  - owns scope-aware topic naming (`global` / `region.*` / `node.*`)
   - defines network envelopes for events, rule broadcasts, checkpoint announcements, and summaries
   - defines typed backfill request/response messages
   - builds the minimal libp2p behaviour set used by WattSwarm networking:
     - gossipsub
     - identify
+    - Kademlia
+    - relay client
+    - AutoNAT
+    - DCUtR
     - request-response (CBOR backfill)
     - mDNS
   - exposes a pollable network runtime for listen/dial/publish/backfill flows
@@ -129,7 +133,7 @@ The workspace now includes dedicated crates and a control-plane bridge for node-
   - applies backfill responses into the local node projection pipeline
   - auto-requests backfill for every configured scope when a peer connection is established
   - runs periodic anti-entropy backfill on connected peers so missed messages and post-partition gaps are re-requested without requiring a reconnect
-  - auto-publishes locally authored events into `global / region / local` topics based on task scope hints
+  - auto-publishes locally authored events into `global / region / node` topics based on task scope hints
   - auto-publishes knowledge summaries on finalized decisions and reputation summaries on verifier updates
   - propagates append-only revoke/penalty events so malicious event effects can be rolled back without deleting the event log
   - suppresses summary fanout while local publish backlog is high, keeping event catch-up ahead of summary traffic
@@ -144,7 +148,7 @@ Current coverage in tests:
 - unit tests for network topic/backfill/runtime primitives
 - unit tests for bridge ingest and backfill helpers
 - integration tests for two-node global gossip sync and request-response backfill sync
-- integration tests for region/local scoped sync and summary import
+- integration tests for region/node scoped sync and summary import
 - integration tests for event revoke rollback and summary revoke cleanup across nodes
 - integration tests for periodic anti-entropy catch-up and reconnect recovery after a partition-like disconnect
 
@@ -155,15 +159,160 @@ Runtime toggles:
 - `WATTSWARM_P2P_MDNS=true` by default
 - `WATTSWARM_P2P_PORT=4001` by default
 - `WATTSWARM_P2P_LISTEN_ADDRS` can override the default listen multiaddr list
+- `WATTSWARM_P2P_BOOTSTRAP_PEERS=/ip4/203.0.113.10/tcp/4001/p2p/<peer-id>` seeds WAN bootstrap dialing and Kademlia discovery
 - `WATTSWARM_P2P_REGION_IDS=sol-1,sol-2` subscribes the node to those region scopes
-- `WATTSWARM_P2P_LOCAL_IDS=lab-a` subscribes the node to matching local scopes
+- `WATTSWARM_P2P_NODE_IDS=lab-a` subscribes the node to matching node scopes
+- `WATTSWARM_P2P_LOCAL_IDS=lab-a` is still accepted as a legacy alias for node scopes
+
+### Current Network Propagation Architecture
+
+WattSwarm's current decentralized networking model is:
+
+- topic-based publish/subscribe
+- gossip-style peer-to-peer dissemination
+- bootstrap-peer and Kademlia-assisted peer discovery
+- relay-assisted WAN reachability with DCUtR upgrade attempts
+- AutoNAT reachability probing against known peers
+- inbound dedupe and per-peer/topic traffic guards
+- request/response backfill for missed data
+- eventual consistency by replaying events into each node's local store
+
+This means nodes do not replicate PostgreSQL state directly. Instead, they exchange selected network messages, then each node re-applies those messages into its own local event log and projections.
+
+```mermaid
+flowchart TD
+    A["Node joins network"] --> B["Peer discovery<br/>mDNS / UDP announce / bootstrap peers / Kademlia"]
+    B --> C["P2P connections established<br/>direct, or via relay when needed"]
+    C --> D["Node subscribes to configured scopes"]
+    D --> E["Local topic set is derived<br/>namespace + scope + kind"]
+    C --> C1["AutoNAT probes reachability<br/>DCUtR attempts direct upgrade on relayed links"]
+
+    F["Local task/event/summary is produced"] --> G["Network bridge resolves scope"]
+    G --> H["Publish to topic over gossip"]
+    H --> I["Connected peers that subscribed to that topic receive it"]
+    I --> J["Event: ingest into local event log"]
+    I --> K["Summary: import supported summary payloads"]
+    J --> L["Projection/state rebuild on local node"]
+    K --> L
+
+    M["Peer missed messages or joined late"] --> N["Backfill request to connected peer"]
+    N --> O["Backfill response with missing events"]
+    O --> P["Local node applies missing events"]
+    P --> L
+```
+
+#### What propagates today
+
+- `Event` messages:
+  - task lifecycle events
+  - claim / candidate / evidence metadata events
+  - verifier, vote, finalize, revoke, and penalty events
+- `Summary` messages:
+  - imported decision-memory summaries
+  - imported reputation summaries
+- `BackfillRequest` / `BackfillResponse` messages:
+  - missing event pages for catch-up
+- peer discovery payloads:
+  - `node_id`
+  - listen address hints for LAN dialing
+- bootstrap peer multiaddrs:
+  - static `/p2p/<peer-id>` addresses supplied at startup for WAN bootstrapping
+- transport reachability signals:
+  - AutoNAT public/private status transitions
+  - relay reservation acceptance
+  - relay circuit establishment
+  - DCUtR upgrade success/failure notices
+
+#### What does not propagate today
+
+- PostgreSQL databases or table replicas
+- local run-queue state as a distributed scheduler
+- artifact file contents by default:
+  - evidence blobs
+  - checkpoint files
+  - snapshot files
+- agent intermediate reasoning traces
+- capability-tag or interest-tag registries for semantic routing
+
+#### Broadcast vs pull
+
+- Broadcast today:
+  - `Event` gossip on the resolved scope topic
+  - `Summary` gossip on the resolved scope topic
+  - LAN peer discovery via mDNS / UDP announce
+- Pull today:
+  - missing historical events through request/response backfill
+- WAN discovery today:
+  - direct dialing of configured bootstrap peers
+  - identify and mDNS addresses are inserted into Kademlia
+  - Kademlia bootstrap and closest-peer queries are used to widen discovery
+  - bootstrap peers are also used as initial AutoNAT probe servers
+  - relay reservations are attempted through configured bootstrap peers so relayed paths exist before direct punch-through
+- Traffic protection today:
+  - duplicate gossip payloads are dropped
+  - per-peer gossip and per-peer backfill request windows are rate-limited
+  - local per-topic publish windows are rate-limited
+- Not yet fully active end-to-end:
+  - `RuleAnnouncement`
+  - `CheckpointAnnouncement`
+
+`RuleAnnouncement` and `CheckpointAnnouncement` exist in the protocol model, but the current bridge logic does not yet apply them as first-class synchronized state transitions.
+
+#### How nodes subscribe
+
+Nodes do not discover a global topic catalog dynamically.
+
+Each node derives its own topic subscriptions from local configuration:
+
+- always `global`
+- optional region scopes from `WATTSWARM_P2P_REGION_IDS`
+- optional node scopes from `WATTSWARM_P2P_NODE_IDS`
+- legacy node-scope alias from `WATTSWARM_P2P_LOCAL_IDS`
+
+For each subscribed scope, the node derives four topic kinds:
+
+- `events`
+- `rules`
+- `checkpoints`
+- `summaries`
+
+This means the current model is scope-based routing, not semantic capability routing. A node cannot yet declare "I only want writing tasks" or "I only want stock-analysis tasks" and have the network route tasks that way automatically.
+
+#### How propagation actually spreads
+
+Propagation is neighbor-to-neighbor over the active connection graph:
+
+- a node publishes to a topic
+- directly connected peers subscribed to that topic receive it
+- the message continues spreading through the overlay network
+- nodes that missed it later request the missing event pages by backfill
+
+In practical terms, WattSwarm currently uses "connected-neighbor dissemination plus repair," not central broadcast and not database replication.
+
+#### How synchronization works
+
+Synchronization is event-driven and eventually consistent:
+
+1. discover peers
+2. establish connections
+3. subscribe to configured scope topics
+4. receive new `Event` and `Summary` gossip
+5. backfill missing event history after connect and during periodic anti-entropy
+6. rebuild local projections from the resulting event stream
+
+The local source of truth remains local. The shared network layer is the exchanged event and summary traffic, not a shared central database.
+
+To keep `global` from becoming a high-frequency firehose, the bridge now rate-limits high-frequency task-lifecycle traffic on the global scope. Fast-moving task coordination should use region or node scopes.
+
+Anti-entropy is also scope-aware now: once a peer is observed carrying a given scope, recovery prefers routing that scope's backfill through that peer instead of blindly asking every connected peer for every scope on every round.
 
 Task scope hints:
 
 - default task scope is `global`
-- set `inputs.swarm_scope = "region:<id>"` or `inputs.swarm_scope = "local:<id>"` to route a task into region/local sync
-- object form is also accepted: `{"kind":"region","id":"sol-1"}`
-- `task_type` prefixes `region:<id>:` and `local:<id>:` are supported as a fallback
+- set `inputs.swarm_scope = "region:<id>"` or `inputs.swarm_scope = "node:<id>"` to route a task into region/node sync
+- legacy `local:<id>` task hints are still accepted as aliases for `node:<id>`
+- object form is also accepted: `{"kind":"region","id":"sol-1"}` or `{"kind":"node","id":"lab-a"}`
+- `task_type` prefixes `region:<id>:`, `node:<id>:`, and legacy `local:<id>:` are supported as fallbacks
 
 Malicious data rollback model:
 
@@ -298,8 +447,10 @@ P2P env vars:
 - `WATTSWARM_P2P_MDNS=true` by default
 - `WATTSWARM_P2P_PORT=4001`
 - `WATTSWARM_P2P_LISTEN_ADDRS` optional comma-separated multiaddr override
+- `WATTSWARM_P2P_BOOTSTRAP_PEERS` optional comma-separated `/p2p/<peer-id>` bootstrap multiaddr list
 - `WATTSWARM_P2P_REGION_IDS` optional comma-separated region scope subscription list
-- `WATTSWARM_P2P_LOCAL_IDS` optional comma-separated local scope subscription list
+- `WATTSWARM_P2P_NODE_IDS` optional comma-separated node scope subscription list
+- `WATTSWARM_P2P_LOCAL_IDS` optional legacy alias for node scope subscription list
 
 Optional UDP announce switch (default off):
 

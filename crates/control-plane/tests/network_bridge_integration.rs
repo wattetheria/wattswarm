@@ -481,7 +481,7 @@ fn region_scoped_backfill_only_reaches_region_subscribers() {
 }
 
 #[test]
-fn local_scoped_live_sync_only_reaches_matching_local_scope() {
+fn node_scoped_live_sync_only_reaches_matching_node_scope() {
     let identity_a = NodeIdentity::random();
     let identity_b = NodeIdentity::random();
     let identity_c = NodeIdentity::random();
@@ -494,11 +494,11 @@ fn local_scoped_live_sync_only_reaches_matching_local_scope() {
     let mut node_b = make_node(identity_b, membership.clone());
     let mut node_c = make_node(identity_c, membership);
     let mut service_a =
-        make_service_with_scopes(&[SwarmScope::Global, SwarmScope::Local("lab-1".to_owned())]);
+        make_service_with_scopes(&[SwarmScope::Global, SwarmScope::Node("lab-1".to_owned())]);
     let mut service_b =
-        make_service_with_scopes(&[SwarmScope::Global, SwarmScope::Local("lab-1".to_owned())]);
+        make_service_with_scopes(&[SwarmScope::Global, SwarmScope::Node("lab-1".to_owned())]);
     let mut service_c =
-        make_service_with_scopes(&[SwarmScope::Global, SwarmScope::Local("lab-2".to_owned())]);
+        make_service_with_scopes(&[SwarmScope::Global, SwarmScope::Node("lab-2".to_owned())]);
 
     connect_services(&mut service_a, &mut node_a, &mut service_b, &mut node_b);
     connect_services(&mut service_a, &mut node_a, &mut service_c, &mut node_c);
@@ -509,8 +509,8 @@ fn local_scoped_live_sync_only_reaches_matching_local_scope() {
         .expect("policy binding")
         .policy_hash;
     let mut contract = sample_contract("task-local-live", policy_hash);
-    contract.task_type = "local:lab-1:swarm".to_owned();
-    contract.inputs = json!({"prompt":"local sync", "swarm_scope":"local:lab-1"});
+    contract.task_type = "node:lab-1:swarm".to_owned();
+    contract.inputs = json!({"prompt":"node-scoped sync", "swarm_scope":"node:lab-1"});
     node_a.submit_task(contract, 1, 100).expect("submit task");
 
     let mut last_published_seq = 0;

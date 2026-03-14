@@ -2,7 +2,9 @@ use crate::crypto::candidate_hash;
 use crate::error::SwarmError;
 use crate::params;
 use crate::storage::pg::{Connection, OptionalExtension, types::ValueRef};
-use crate::types::{Candidate, Event, TaskContract, TaskTerminalState, VerifierResult, VoteChoice};
+use crate::types::{
+    ArtifactRef, Candidate, Event, TaskContract, TaskTerminalState, VerifierResult, VoteChoice,
+};
 use anyhow::{Context, Result};
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -152,6 +154,56 @@ pub struct TaskStageUsageRow {
     pub explore_used: u64,
     pub verify_used: u64,
     pub finalize_used: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct FeedSubscriptionRow {
+    pub subscriber_node_id: String,
+    pub feed_key: String,
+    pub scope_hint: String,
+    pub active: bool,
+    pub updated_at: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct TaskAnnouncementRow {
+    pub task_id: String,
+    pub announcement_id: String,
+    pub feed_key: String,
+    pub scope_hint: String,
+    pub summary: Value,
+    pub detail_ref: Option<ArtifactRef>,
+    pub announced_by_node_id: String,
+    pub created_at: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExecutionSetMemberRow {
+    pub task_id: String,
+    pub execution_set_id: String,
+    pub participant_node_id: String,
+    pub role_hint: String,
+    pub scope_hint: String,
+    pub status: String,
+    pub confirmed_by_node_id: Option<String>,
+    pub updated_at: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuleAnnouncementRow {
+    pub scope_key: String,
+    pub rule_set: String,
+    pub rule_version: u64,
+    pub activation_epoch: Option<u64>,
+    pub observed_at: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CheckpointAnnouncementRow {
+    pub scope_key: String,
+    pub checkpoint_id: String,
+    pub artifact_path: String,
+    pub observed_at: u64,
 }
 
 impl PgStore {

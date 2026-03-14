@@ -459,6 +459,50 @@ pub struct CheckpointCreatedPayload {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FeedSubscriptionUpdatedPayload {
+    pub subscriber_node_id: String,
+    pub feed_key: String,
+    pub scope_hint: String,
+    pub active: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TaskAnnouncedPayload {
+    pub task_id: String,
+    pub announcement_id: String,
+    pub feed_key: String,
+    pub scope_hint: String,
+    pub summary: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail_ref: Option<ArtifactRef>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExecutionIntentDeclaredPayload {
+    pub task_id: String,
+    pub execution_set_id: String,
+    pub participant_node_id: String,
+    pub role_hint: String,
+    pub scope_hint: String,
+    pub intent: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExecutionSetMember {
+    pub participant_node_id: String,
+    pub role_hint: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExecutionSetConfirmedPayload {
+    pub task_id: String,
+    pub execution_set_id: String,
+    pub confirmed_by_node_id: String,
+    pub scope_hint: String,
+    pub members: Vec<ExecutionSetMember>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MembershipUpdatedPayload {
     pub new_membership: Membership,
     pub quorum_threshold: u32,
@@ -598,6 +642,10 @@ pub enum EventPayload {
     TaskSuspended(TaskSuspendedPayload),
     TaskKilled(TaskKilledPayload),
     CheckpointCreated(CheckpointCreatedPayload),
+    FeedSubscriptionUpdated(FeedSubscriptionUpdatedPayload),
+    TaskAnnounced(TaskAnnouncedPayload),
+    ExecutionIntentDeclared(ExecutionIntentDeclaredPayload),
+    ExecutionSetConfirmed(ExecutionSetConfirmedPayload),
     MembershipUpdated(MembershipUpdatedPayload),
     PolicyTuned(PolicyTunedPayload),
     AdvisoryCreated(AdvisoryCreatedPayload),
@@ -633,6 +681,10 @@ pub enum EventKind {
     TaskSuspended,
     TaskKilled,
     CheckpointCreated,
+    FeedSubscriptionUpdated,
+    TaskAnnounced,
+    ExecutionIntentDeclared,
+    ExecutionSetConfirmed,
     MembershipUpdated,
     PolicyTuned,
     AdvisoryCreated,
@@ -668,6 +720,10 @@ impl EventPayload {
             Self::TaskSuspended(_) => EventKind::TaskSuspended,
             Self::TaskKilled(_) => EventKind::TaskKilled,
             Self::CheckpointCreated(_) => EventKind::CheckpointCreated,
+            Self::FeedSubscriptionUpdated(_) => EventKind::FeedSubscriptionUpdated,
+            Self::TaskAnnounced(_) => EventKind::TaskAnnounced,
+            Self::ExecutionIntentDeclared(_) => EventKind::ExecutionIntentDeclared,
+            Self::ExecutionSetConfirmed(_) => EventKind::ExecutionSetConfirmed,
             Self::MembershipUpdated(_) => EventKind::MembershipUpdated,
             Self::PolicyTuned(_) => EventKind::PolicyTuned,
             Self::AdvisoryCreated(_) => EventKind::AdvisoryCreated,
@@ -703,6 +759,10 @@ impl EventPayload {
             Self::TaskSuspended(p) => Some(&p.task_id),
             Self::TaskKilled(p) => Some(&p.task_id),
             Self::CheckpointCreated(_) => None,
+            Self::FeedSubscriptionUpdated(_) => None,
+            Self::TaskAnnounced(p) => Some(&p.task_id),
+            Self::ExecutionIntentDeclared(p) => Some(&p.task_id),
+            Self::ExecutionSetConfirmed(p) => Some(&p.task_id),
             Self::MembershipUpdated(_) => None,
             Self::PolicyTuned(_) => None,
             Self::AdvisoryCreated(_) => None,

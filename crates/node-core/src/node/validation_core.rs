@@ -114,6 +114,16 @@ impl Node {
                 }
                 Ok(())
             }
+            EventPayload::FeedSubscriptionUpdated(payload) => {
+                self.validate_feed_subscription_updated(event, payload)
+            }
+            EventPayload::TaskAnnounced(payload) => self.validate_task_announced(payload),
+            EventPayload::ExecutionIntentDeclared(payload) => {
+                self.validate_execution_intent_declared(event, payload)
+            }
+            EventPayload::ExecutionSetConfirmed(payload) => {
+                self.validate_execution_set_confirmed(event, payload)
+            }
             EventPayload::MembershipUpdated(payload) => self.validate_membership_update(payload),
             EventPayload::PolicyTuned(payload) => self.validate_policy_tuned(payload),
             EventPayload::AdvisoryCreated(payload) => self.validate_advisory_created(payload),
@@ -166,6 +176,12 @@ impl Node {
             EventPayload::TaskSuspended(_) => (Some(Role::Finalizer), None),
             EventPayload::TaskKilled(_) => (Some(Role::Finalizer), None),
             EventPayload::CheckpointCreated(_) => (Some(Role::Committer), None),
+            EventPayload::FeedSubscriptionUpdated(p) => (None, Some(&p.subscriber_node_id)),
+            EventPayload::TaskAnnounced(_) => (Some(Role::Proposer), None),
+            EventPayload::ExecutionIntentDeclared(p) => (None, Some(&p.participant_node_id)),
+            EventPayload::ExecutionSetConfirmed(p) => {
+                (Some(Role::Committer), Some(&p.confirmed_by_node_id))
+            }
             EventPayload::MembershipUpdated(_) => (Some(Role::Finalizer), None),
             EventPayload::PolicyTuned(_) => (Some(Role::Finalizer), None),
             EventPayload::AdvisoryCreated(_) => (Some(Role::Committer), None),
@@ -200,6 +216,126 @@ impl Node {
                 "task_error author lacks proposer/verifier/committer role".into(),
             )
             .into());
+        }
+        Ok(())
+    }
+
+    fn validate_feed_subscription_updated(
+        &self,
+        event: &Event,
+        payload: &crate::types::FeedSubscriptionUpdatedPayload,
+    ) -> Result<()> {
+        if payload.subscriber_node_id.trim().is_empty()
+            || payload.feed_key.trim().is_empty()
+            || payload.scope_hint.trim().is_empty()
+        {
+            return Err(
+                SwarmError::InvalidEvent("feed subscription fields required".into()).into(),
+            );
+        }
+        if payload.subscriber_node_id != event.author_node_id {
+            return Err(
+                SwarmError::InvalidEvent("subscription author must match subscriber".into()).into(),
+            );
+        }
+        if !is_valid_scope_hint(&payload.scope_hint) {
+            return Err(SwarmError::InvalidEvent("feed subscription scope_hint invalid".into()).into());
+        }
+        Ok(())
+    }
+
+    fn validate_task_announced(&self, payload: &crate::types::TaskAnnouncedPayload) -> Result<()> {
+        if payload.task_id.trim().is_empty()
+            || payload.announcement_id.trim().is_empty()
+            || payload.feed_key.trim().is_empty()
+            || payload.scope_hint.trim().is_empty()
+        {
+            return Err(SwarmError::InvalidEvent("task announcement fields required".into()).into());
+        }
+        if let Some(detail_ref) = &payload.detail_ref
+            && (detail_ref.uri.trim().is_empty() || detail_ref.digest.trim().is_empty())
+        {
+            return Err(
+                SwarmError::InvalidEvent("task announcement detail_ref must be complete".into())
+                    .into(),
+            );
+        }
+        if !is_valid_scope_hint(&payload.scope_hint) {
+            return Err(SwarmError::InvalidEvent("task announcement scope_hint invalid".into()).into());
+        }
+        Ok(())
+    }
+
+    fn validate_execution_intent_declared(
+        &self,
+        event: &Event,
+        payload: &crate::types::ExecutionIntentDeclaredPayload,
+    ) -> Result<()> {
+        if payload.task_id.trim().is_empty()
+            || payload.execution_set_id.trim().is_empty()
+            || payload.participant_node_id.trim().is_empty()
+            || payload.role_hint.trim().is_empty()
+            || payload.scope_hint.trim().is_empty()
+            || payload.intent.trim().is_empty()
+        {
+            return Err(SwarmError::InvalidEvent("execution intent fields required".into()).into());
+        }
+        if payload.participant_node_id != event.author_node_id {
+            return Err(
+                SwarmError::InvalidEvent("execution intent author must match participant".into())
+                    .into(),
+            );
+        }
+        if !is_valid_scope_hint(&payload.scope_hint) {
+            return Err(SwarmError::InvalidEvent("execution intent scope_hint invalid".into()).into());
+        }
+        Ok(())
+    }
+
+    fn validate_execution_set_confirmed(
+        &self,
+        event: &Event,
+        payload: &crate::types::ExecutionSetConfirmedPayload,
+    ) -> Result<()> {
+        if payload.task_id.trim().is_empty()
+            || payload.execution_set_id.trim().is_empty()
+            || payload.confirmed_by_node_id.trim().is_empty()
+            || payload.scope_hint.trim().is_empty()
+        {
+            return Err(
+                SwarmError::InvalidEvent("execution set confirmation fields required".into())
+                    .into(),
+            );
+        }
+        if payload.confirmed_by_node_id != event.author_node_id {
+            return Err(
+                SwarmError::InvalidEvent("confirmed_by_node_id must equal author".into()).into(),
+            );
+        }
+        if !is_valid_scope_hint(&payload.scope_hint) {
+            return Err(
+                SwarmError::InvalidEvent("execution set confirmation scope_hint invalid".into())
+                    .into(),
+            );
+        }
+        if payload.members.is_empty() {
+            return Err(
+                SwarmError::InvalidEvent("execution set confirmation requires members".into())
+                    .into(),
+            );
+        }
+        let mut unique = HashSet::new();
+        for member in &payload.members {
+            if member.participant_node_id.trim().is_empty() || member.role_hint.trim().is_empty() {
+                return Err(
+                    SwarmError::InvalidEvent("execution set member fields required".into()).into(),
+                );
+            }
+            if !unique.insert(member.participant_node_id.clone()) {
+                return Err(
+                    SwarmError::InvalidEvent("execution set members must be unique".into()).into(),
+                );
+            }
         }
         Ok(())
     }
@@ -850,4 +986,16 @@ impl Node {
 
         Ok(())
     }
+}
+
+fn is_valid_scope_hint(raw: &str) -> bool {
+    let trimmed = raw.trim();
+    if trimmed.eq_ignore_ascii_case("global") {
+        return true;
+    }
+    let Some((kind, rest)) = trimmed.split_once(':') else {
+        return false;
+    };
+    let id = rest.trim();
+    !id.is_empty() && matches!(kind.trim().to_ascii_lowercase().as_str(), "region" | "local" | "node")
 }
