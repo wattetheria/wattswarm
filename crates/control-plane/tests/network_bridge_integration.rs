@@ -114,7 +114,7 @@ fn scaled_timeout(base: Duration) -> Duration {
 }
 
 fn reconnect_quiet_period() -> Duration {
-    scaled_timeout(Duration::from_millis(750))
+    scaled_timeout(Duration::from_millis(2_000))
 }
 
 fn pump_services_for(
@@ -907,7 +907,7 @@ fn anti_entropy_syncs_missed_event_without_live_publish() {
 
     // Wait for the governance-configured anti-entropy interval (1s in test
     // network) to elapse after the initial empty backfill on connect.
-    std::thread::sleep(Duration::from_secs(2));
+    std::thread::sleep(scaled_timeout(Duration::from_secs(2)));
 
     let synced = wait_until(scaled_timeout(Duration::from_secs(10)), || {
         let _ = service_b
@@ -964,7 +964,7 @@ fn anti_entropy_uses_scope_specific_cursor_for_recovery() {
 
     // Wait for the governance-configured anti-entropy interval (1s in test
     // network) to elapse after the initial empty backfill on connect.
-    std::thread::sleep(Duration::from_secs(2));
+    std::thread::sleep(scaled_timeout(Duration::from_secs(2)));
 
     let recovered = wait_until(scaled_timeout(Duration::from_secs(10)), || {
         let _ = service_b
