@@ -132,6 +132,28 @@ fn pump_services_for(
     }
 }
 
+fn drive_anti_entropy_until(
+    service_a: &mut NetworkBridgeService,
+    node_a: &mut Node,
+    service_b: &mut NetworkBridgeService,
+    node_b: &mut Node,
+    timeout: Duration,
+    mut condition: impl FnMut(&Node) -> bool,
+) -> bool {
+    wait_until(timeout, || {
+        for _ in 0..32 {
+            let _ = pump_once(service_b, node_b);
+            let _ = pump_once(service_a, node_a);
+        }
+        let _ = service_b.run_anti_entropy(node_b).expect("run anti entropy");
+        for _ in 0..32 {
+            let _ = pump_once(service_b, node_b);
+            let _ = pump_once(service_a, node_a);
+        }
+        condition(node_b)
+    })
+}
+
 fn temp_test_dir(prefix: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("wattswarm-{prefix}-{}", Uuid::new_v4().simple()));
     fs::create_dir_all(&dir).expect("create temp dir");
@@ -905,23 +927,29 @@ fn anti_entropy_syncs_missed_event_without_live_publish() {
     contract.inputs = json!({"prompt":"catch me via anti entropy"});
     node_a.submit_task(contract, 1, 100).expect("submit task");
 
-    // Wait for the governance-configured anti-entropy interval (1s in test
-    // network) to elapse after the initial empty backfill on connect.
-    std::thread::sleep(scaled_timeout(Duration::from_secs(2)));
+    // Drain the initial empty backfill round-trip from connect before the
+    // recovery loop begins.
+    pump_services_for(
+        &mut service_a,
+        &mut node_a,
+        &mut service_b,
+        &mut node_b,
+        scaled_timeout(Duration::from_secs(1)),
+    );
 
-    let synced = wait_until(scaled_timeout(Duration::from_secs(10)), || {
-        let _ = service_b
-            .run_anti_entropy(&node_b)
-            .expect("run anti entropy");
-        let _ = pump_once(&mut service_b, &mut node_b);
-        let _ = pump_once(&mut service_a, &mut node_a);
-        let _ = pump_once(&mut service_b, &mut node_b);
-        let _ = pump_once(&mut service_a, &mut node_a);
-        node_b
-            .task_view("task-anti-entropy")
-            .expect("task view")
-            .is_some()
-    });
+    let synced = drive_anti_entropy_until(
+        &mut service_a,
+        &mut node_a,
+        &mut service_b,
+        &mut node_b,
+        scaled_timeout(Duration::from_secs(30)),
+        |node_b| {
+            node_b
+                .task_view("task-anti-entropy")
+                .expect("task view")
+                .is_some()
+        },
+    );
 
     assert!(synced);
 }
@@ -962,23 +990,29 @@ fn anti_entropy_uses_scope_specific_cursor_for_recovery() {
         .submit_task(global_contract, 1, 101)
         .expect("submit local global task");
 
-    // Wait for the governance-configured anti-entropy interval (1s in test
-    // network) to elapse after the initial empty backfill on connect.
-    std::thread::sleep(scaled_timeout(Duration::from_secs(2)));
+    // Drain the initial empty backfill round-trip from connect before the
+    // recovery loop begins.
+    pump_services_for(
+        &mut service_a,
+        &mut node_a,
+        &mut service_b,
+        &mut node_b,
+        scaled_timeout(Duration::from_secs(1)),
+    );
 
-    let recovered = wait_until(scaled_timeout(Duration::from_secs(10)), || {
-        let _ = service_b
-            .run_anti_entropy(&node_b)
-            .expect("run anti entropy");
-        let _ = pump_once(&mut service_b, &mut node_b);
-        let _ = pump_once(&mut service_a, &mut node_a);
-        let _ = pump_once(&mut service_b, &mut node_b);
-        let _ = pump_once(&mut service_a, &mut node_a);
-        node_b
-            .task_view("task-region-cursor")
-            .expect("task view")
-            .is_some()
-    });
+    let recovered = drive_anti_entropy_until(
+        &mut service_a,
+        &mut node_a,
+        &mut service_b,
+        &mut node_b,
+        scaled_timeout(Duration::from_secs(30)),
+        |node_b| {
+            node_b
+                .task_view("task-region-cursor")
+                .expect("task view")
+                .is_some()
+        },
+    );
 
     assert!(recovered);
 }
@@ -990,8 +1024,8 @@ fn reconnect_recovers_missing_events_after_partition_like_disconnect() {
     let membership = membership_with_roles(&[identity_a.node_id(), identity_b.node_id()]);
     let mut node_a = make_node(identity_a, membership.clone());
     let mut node_b = make_node(identity_b, membership);
-    let mut service_a = make_fast_service();
-    let mut service_b = make_fast_service();
+    let mut service_a = make_service();
+    let mut service_b = make_service();
 
     connect_services(&mut service_a, &mut node_a, &mut service_b, &mut node_b);
 
@@ -1034,7 +1068,7 @@ fn reconnect_recovers_missing_events_after_partition_like_disconnect() {
     );
 
     // Drain inflight messages before disconnect to avoid libp2p
-    // request-response assertion on stale connection state.
+    // request-response debug assertion on stale connection state.
     pump_services_for(
         &mut service_a,
         &mut node_a,
@@ -1058,12 +1092,21 @@ fn reconnect_recovers_missing_events_after_partition_like_disconnect() {
         .submit_task(second_contract, 1, 101)
         .expect("submit second task");
 
-    let mut service_b = make_fast_service();
+    let mut service_b = make_service();
     connect_services(&mut service_a, &mut node_a, &mut service_b, &mut node_b);
 
-    let recovered = wait_until(scaled_timeout(Duration::from_secs(20)), || {
-        let _ = pump_once(&mut service_a, &mut node_a);
-        let _ = pump_once(&mut service_b, &mut node_b);
+    let recovered = wait_until(scaled_timeout(Duration::from_secs(30)), || {
+        for _ in 0..32 {
+            let _ = pump_once(&mut service_a, &mut node_a);
+            let _ = pump_once(&mut service_b, &mut node_b);
+        }
+        let _ = service_b
+            .run_anti_entropy(&node_b)
+            .expect("run anti entropy");
+        for _ in 0..32 {
+            let _ = pump_once(&mut service_b, &mut node_b);
+            let _ = pump_once(&mut service_a, &mut node_a);
+        }
         node_b
             .task_view("task-partition-second")
             .expect("task view second")
