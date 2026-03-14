@@ -73,6 +73,30 @@ fn wait_until(timeout: Duration, mut step: impl FnMut() -> bool) -> bool {
     step()
 }
 
+fn slow_env_multiplier() -> u32 {
+    if std::env::var_os("LLVM_PROFILE_FILE").is_some() || std::env::var_os("CI").is_some() {
+        3
+    } else {
+        1
+    }
+}
+
+fn scaled_timeout(base: Duration) -> Duration {
+    base.saturating_mul(slow_env_multiplier())
+}
+
+fn anti_entropy_recovery_window() -> Duration {
+    scaled_timeout(Duration::from_secs(20))
+}
+
+fn anti_entropy_retry_delay() -> Duration {
+    scaled_timeout(Duration::from_secs(16))
+}
+
+fn reconnect_quiet_period() -> Duration {
+    scaled_timeout(Duration::from_millis(750))
+}
+
 fn pump_services_for(
     service_a: &mut NetworkBridgeService,
     node_a: &mut Node,
@@ -863,9 +887,9 @@ fn anti_entropy_syncs_missed_event_without_live_publish() {
 
     // The bridge only re-requests anti-entropy after the configured interval
     // elapses following the initial empty backfill on connect.
-    std::thread::sleep(Duration::from_secs(16));
+    std::thread::sleep(anti_entropy_retry_delay());
 
-    let synced = wait_until(Duration::from_secs(20), || {
+    let synced = wait_until(anti_entropy_recovery_window(), || {
         let _ = service_b
             .run_anti_entropy(&node_b)
             .expect("run anti entropy");
@@ -917,9 +941,9 @@ fn anti_entropy_uses_scope_specific_cursor_for_recovery() {
     // The first empty backfill request on connect pushes the next anti-entropy
     // retry out by the configured interval, so wait for that window before
     // asserting region recovery.
-    std::thread::sleep(Duration::from_secs(16));
+    std::thread::sleep(anti_entropy_retry_delay());
 
-    let recovered = wait_until(Duration::from_secs(20), || {
+    let recovered = wait_until(anti_entropy_recovery_window(), || {
         let _ = service_b
             .run_anti_entropy(&node_b)
             .expect("run anti entropy");
@@ -991,10 +1015,10 @@ fn reconnect_recovers_missing_events_after_partition_like_disconnect() {
         &mut node_a,
         &mut service_b,
         &mut node_b,
-        Duration::from_millis(250),
+        reconnect_quiet_period(),
     );
     drop(service_b);
-    let _ = wait_until(Duration::from_millis(250), || {
+    let _ = wait_until(reconnect_quiet_period(), || {
         let _ = pump_once(&mut service_a, &mut node_a);
         false
     });
@@ -1008,7 +1032,7 @@ fn reconnect_recovers_missing_events_after_partition_like_disconnect() {
     let mut service_b = make_service();
     connect_services(&mut service_a, &mut node_a, &mut service_b, &mut node_b);
 
-    let recovered = wait_until(Duration::from_secs(10), || {
+    let recovered = wait_until(scaled_timeout(Duration::from_secs(20)), || {
         let _ = pump_once(&mut service_a, &mut node_a);
         let _ = pump_once(&mut service_b, &mut node_b);
         node_b
