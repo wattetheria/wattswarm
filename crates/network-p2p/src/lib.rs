@@ -1500,8 +1500,8 @@ mod tests {
         assert_eq!(decoded, handshake);
     }
 
-    #[test]
-    fn validate_identify_info_rejects_mismatched_params_hash() {
+    #[tokio::test]
+    async fn validate_identify_info_rejects_mismatched_params_hash() {
         let local_key = identity::Keypair::generate_ed25519();
         let remote_key = identity::Keypair::generate_ed25519();
         let expected = PeerHandshakeMetadata {
