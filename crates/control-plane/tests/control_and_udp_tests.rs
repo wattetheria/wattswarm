@@ -15,8 +15,10 @@ use wattswarm_control_plane::control::{
     load_executor_registry, local_node_id, open_node, run_real_task_flow, save_discovered_peers,
     save_executor_registry,
 };
+use wattswarm_control_plane::crypto::NodeIdentity;
 use wattswarm_control_plane::storage::storage::pg::Connection;
 use wattswarm_control_plane::task_template::sample_contract;
+use wattswarm_control_plane::types::SignedNetworkProtocolParamsEnvelope;
 use wattswarm_control_plane::udp_announce::{announce_startup, maybe_start_listener};
 
 static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -457,6 +459,18 @@ fn open_node_bootstraps_local_network_and_default_org() {
     assert_eq!(node_row.0, node_id);
     assert_eq!(node_row.1, format!("local:{node_id}"));
 
+    let signed_params: SignedNetworkProtocolParamsEnvelope = conn
+        .query_row(
+            "SELECT params_json FROM network_params WHERE network_id = $1",
+            wattswarm_storage_core::params![&network_id],
+            |r| r.get::<_, String>(0),
+        )
+        .map(|json| serde_json::from_str(&json).expect("signed network params"))
+        .expect("network params row");
+    assert_eq!(signed_params.network_id, network_id);
+    assert_eq!(signed_params.version, 1);
+    assert_eq!(signed_params.signed_by, node_id);
+
     cleanup_dir(&dir);
 }
 
@@ -505,6 +519,18 @@ fn open_node_bootstraps_lan_network_and_default_org() {
     assert_eq!(org_row.1, "bootstrap");
     assert!(org_row.2);
 
+    let signed_params: SignedNetworkProtocolParamsEnvelope = conn
+        .query_row(
+            "SELECT params_json FROM network_params WHERE network_id = $1",
+            wattswarm_storage_core::params![&network_id],
+            |r| r.get::<_, String>(0),
+        )
+        .map(|json| serde_json::from_str(&json).expect("signed network params"))
+        .expect("network params row");
+    assert_eq!(signed_params.network_id, network_id);
+    assert_eq!(signed_params.version, 1);
+    assert_eq!(signed_params.signed_by, node_id);
+
     cleanup_dir(&dir);
 }
 
@@ -523,7 +549,7 @@ fn open_node_network_mode_uses_existing_network_topology_only() {
     let network_id = "mainnet:watt-galaxy";
     let org_id = "mainnet:watt-galaxy:bootstrap";
 
-    let bootstrap_store = wattswarm_control_plane::storage::PgStore::open(&db_path)
+    let _bootstrap_store = wattswarm_control_plane::storage::PgStore::open(&db_path)
         .expect("open store for bootstrap network setup");
     let conn = Connection::open("network-bootstrap-setup").expect("open setup connection");
     conn.execute(
@@ -544,8 +570,6 @@ fn open_node_network_mode_uses_existing_network_topology_only() {
         wattswarm_storage_core::params![org_id, network_id, 1_700_000_000_000_i64],
     )
     .expect("insert org registry");
-    drop(conn);
-    drop(bootstrap_store);
 
     let node = open_node(&state_dir, &db_path).expect("open node in network mode");
     assert_eq!(node.store.org_id(), org_id);
@@ -568,6 +592,66 @@ fn open_node_network_mode_uses_existing_network_topology_only() {
         )
         .expect("node registry row");
     assert_eq!(home_network, network_id);
+
+    let signed_params: SignedNetworkProtocolParamsEnvelope = conn
+        .query_row(
+            "SELECT params_json FROM network_params WHERE network_id = $1",
+            wattswarm_storage_core::params![network_id],
+            |r| r.get::<_, String>(0),
+        )
+        .map(|json| serde_json::from_str(&json).expect("signed network params"))
+        .expect("network params row");
+    assert_eq!(signed_params.network_id, network_id);
+    assert_eq!(signed_params.version, 1);
+    assert_eq!(signed_params.signed_by, node_id);
+
+    cleanup_dir(&dir);
+}
+
+#[test]
+fn open_node_network_mode_rejects_unsigned_network_params() {
+    let _guard = env_lock();
+    let _db_lock = DbTestLock::acquire();
+    let schema = format!("test_{}", Uuid::new_v4().simple());
+    reset_test_schema(&schema);
+    let _schema_guard = EnvVarGuard::set("WATTSWARM_PG_SCHEMA", &schema);
+    let _mode_guard = EnvVarGuard::set("WATTSWARM_NODE_MODE", "network");
+    let dir = temp_test_dir("open-node-network-mode-unsigned-params");
+    let state_dir = dir.join("state");
+    fs::create_dir_all(&state_dir).expect("create state dir");
+    let db_path = state_dir.join("test.state");
+    let _node_id = local_node_id(&state_dir).expect("local node id");
+    let genesis_identity = NodeIdentity::random();
+    let network_id = "mainnet:watt-galaxy-unsigned";
+    let org_id = "mainnet:watt-galaxy-unsigned:bootstrap";
+
+    let _bootstrap_store = wattswarm_control_plane::storage::PgStore::open(&db_path)
+        .expect("open store for unsigned bootstrap setup");
+    let conn = Connection::open("network-bootstrap-unsigned-setup").expect("open setup connection");
+    conn.execute(
+        "INSERT INTO network_registry(network_id, network_kind, parent_network_id, name, status, genesis_node_id, created_at)
+         VALUES ($1, 'mainnet', NULL, 'Watt Galaxy', 'active', $2, TIMESTAMPTZ 'epoch' + ($3::bigint * INTERVAL '1 millisecond'))",
+        wattswarm_storage_core::params![network_id, &genesis_identity.node_id(), 1_700_000_000_000_i64],
+    )
+    .expect("insert network registry");
+    conn.execute(
+        "INSERT INTO network_params(network_id, control_mode, membership_version, policy_version, params_json, created_at, updated_at)
+         VALUES ($1, 'manual_owner', 1, 1, '{}', TIMESTAMPTZ 'epoch' + ($2::bigint * INTERVAL '1 millisecond'), TIMESTAMPTZ 'epoch' + ($2::bigint * INTERVAL '1 millisecond'))",
+        wattswarm_storage_core::params![network_id, 1_700_000_000_000_i64],
+    )
+    .expect("insert unsigned network params");
+    conn.execute(
+        "INSERT INTO org_registry(org_id, network_id, org_kind, name, status, is_default, created_at)
+         VALUES ($1, $2, 'bootstrap', 'Watt Galaxy Bootstrap', 'active', TRUE, TIMESTAMPTZ 'epoch' + ($3::bigint * INTERVAL '1 millisecond'))",
+        wattswarm_storage_core::params![org_id, network_id, 1_700_000_000_000_i64],
+    )
+    .expect("insert org registry");
+
+    let err = match open_node(&state_dir, &db_path) {
+        Ok(_) => panic!("unsigned network params must fail"),
+        Err(err) => err,
+    };
+    assert!(!err.to_string().trim().is_empty());
 
     cleanup_dir(&dir);
 }

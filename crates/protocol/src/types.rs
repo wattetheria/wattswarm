@@ -903,8 +903,22 @@ impl Default for FinalizeAssignment {
 /// These values are persisted in `network_params.params_json` and govern
 /// P2P behaviour for every node in the network. Individual nodes MUST NOT
 /// override them; only governance proposals can change them.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NetworkProtocolParams {
+    // ── Network identity / compatibility ────────────────────────────
+    /// Shared topic namespace prefix for this network.
+    #[serde(default = "default_namespace_network")]
+    pub namespace_network: String,
+
+    /// Shared libp2p identify protocol version for this network.
+    #[serde(default = "default_network_protocol_version")]
+    pub protocol_version: String,
+
+    /// Maximum number of simultaneously established connections allowed
+    /// to the same peer.
+    #[serde(default = "default_max_established_per_peer")]
+    pub max_established_per_peer: u32,
+
     // ── Anti-entropy timing ──────────────────────────────────────────
     /// Minimum seconds between successful anti-entropy backfill requests
     /// to the same peer.
@@ -955,6 +969,15 @@ pub struct NetworkProtocolParams {
     pub summary_decision_memory_limit: u32,
 }
 
+fn default_namespace_network() -> String {
+    "wattswarm".to_owned()
+}
+fn default_network_protocol_version() -> String {
+    "/wattswarm/0.1.0".to_owned()
+}
+fn default_max_established_per_peer() -> u32 {
+    2
+}
 fn default_anti_entropy_interval_secs() -> u64 {
     15
 }
@@ -992,6 +1015,9 @@ fn default_summary_decision_memory_limit() -> u32 {
 impl Default for NetworkProtocolParams {
     fn default() -> Self {
         Self {
+            namespace_network: default_namespace_network(),
+            protocol_version: default_network_protocol_version(),
+            max_established_per_peer: default_max_established_per_peer(),
             anti_entropy_interval_secs: default_anti_entropy_interval_secs(),
             backfill_retry_after_secs: default_backfill_retry_after_secs(),
             gossipsub_d: default_gossipsub_d(),
@@ -1003,6 +1029,38 @@ impl Default for NetworkProtocolParams {
             max_backfill_events_hard_limit: default_max_backfill_events_hard_limit(),
             summary_reputation_limit: default_summary_reputation_limit(),
             summary_decision_memory_limit: default_summary_decision_memory_limit(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UnsignedNetworkProtocolParamsEnvelope {
+    pub network_id: String,
+    pub version: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prev_hash: Option<String>,
+    pub params: NetworkProtocolParams,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SignedNetworkProtocolParamsEnvelope {
+    pub network_id: String,
+    pub version: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prev_hash: Option<String>,
+    pub params_hash: String,
+    pub params: NetworkProtocolParams,
+    pub signed_by: String,
+    pub signature: String,
+}
+
+impl SignedNetworkProtocolParamsEnvelope {
+    pub fn unsigned_payload(&self) -> UnsignedNetworkProtocolParamsEnvelope {
+        UnsignedNetworkProtocolParamsEnvelope {
+            network_id: self.network_id.clone(),
+            version: self.version,
+            prev_hash: self.prev_hash.clone(),
+            params: self.params.clone(),
         }
     }
 }

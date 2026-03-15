@@ -594,6 +594,66 @@ fn smarter_backfill_prefers_peer_with_known_scope_activity() {
 }
 
 #[test]
+fn connection_closed_with_remaining_established_keeps_peer_state() {
+    let peer = PeerId::random();
+    let mut node = Node::open_in_memory_with_roles(&[Role::Proposer]).expect("node");
+    let mut service = NetworkBridgeService::new(
+        NetworkP2pNode::generate(NetworkP2pConfig::default()).expect("node"),
+        &[SwarmScope::Global],
+        &NetworkProtocolParams::default(),
+    )
+    .expect("service");
+    service.connected_peers.insert(peer);
+    service
+        .peer_sync_state
+        .insert(peer, PeerSyncState::new(Instant::now()));
+
+    let tick = service
+        .process_runtime_event(
+            &mut node,
+            NetworkRuntimeEvent::ConnectionClosed {
+                peer,
+                remaining_established: 1,
+            },
+        )
+        .expect("process event");
+
+    assert!(matches!(tick, NetworkBridgeTick::TransportNotice { .. }));
+    assert!(service.connected_peers.contains(&peer));
+    assert!(service.peer_sync_state.contains_key(&peer));
+}
+
+#[test]
+fn connection_closed_with_zero_remaining_removes_peer_state() {
+    let peer = PeerId::random();
+    let mut node = Node::open_in_memory_with_roles(&[Role::Proposer]).expect("node");
+    let mut service = NetworkBridgeService::new(
+        NetworkP2pNode::generate(NetworkP2pConfig::default()).expect("node"),
+        &[SwarmScope::Global],
+        &NetworkProtocolParams::default(),
+    )
+    .expect("service");
+    service.connected_peers.insert(peer);
+    service
+        .peer_sync_state
+        .insert(peer, PeerSyncState::new(Instant::now()));
+
+    let tick = service
+        .process_runtime_event(
+            &mut node,
+            NetworkRuntimeEvent::ConnectionClosed {
+                peer,
+                remaining_established: 0,
+            },
+        )
+        .expect("process event");
+
+    assert!(matches!(tick, NetworkBridgeTick::Disconnected { peer: seen } if seen == peer));
+    assert!(!service.connected_peers.contains(&peer));
+    assert!(!service.peer_sync_state.contains_key(&peer));
+}
+
+#[test]
 fn scopes_to_request_for_peer_falls_back_to_all_scopes_until_peer_is_profiled() {
     let peer = PeerId::random();
     let target_scope = SwarmScope::Region("sol-1".to_owned());

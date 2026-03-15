@@ -24,6 +24,7 @@ use wattswarm_protocol::types::Event;
 
 const DEFAULT_NAMESPACE: &str = "wattswarm";
 const DEFAULT_PROTOCOL_VERSION: &str = "/wattswarm/0.1.0";
+const DEFAULT_IDENTIFY_AGENT_NAME: &str = "wattswarm-network-p2p";
 // Backfill defaults are governance-controlled via NetworkProtocolParams;
 // kept here only as fallbacks for NetworkP2pConfig::default().
 const DEFAULT_MAX_BACKFILL_EVENTS_FALLBACK: usize = 512;
@@ -34,7 +35,7 @@ const KADEMLIA_PROTOCOL: StreamProtocol = StreamProtocol::new("/wattswarm/kad/1"
 // Connection limits guard against resource exhaustion from too many peers.
 const MAX_ESTABLISHED_INCOMING: u32 = 512;
 const MAX_ESTABLISHED_OUTGOING: u32 = 256;
-const MAX_ESTABLISHED_PER_PEER: u32 = 2;
+const MAX_ESTABLISHED_PER_PEER_FALLBACK: u32 = 2;
 const MAX_PENDING_INCOMING: u32 = 64;
 const MAX_PENDING_OUTGOING: u32 = 64;
 
@@ -140,6 +141,58 @@ impl TopicCatalog {
             IdentTopic::new(self.checkpoints.clone()),
             IdentTopic::new(self.summaries.clone()),
         ]
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PeerHandshakeMetadata {
+    pub network_id: String,
+    pub params_version: u64,
+    pub params_hash: String,
+}
+
+impl Default for PeerHandshakeMetadata {
+    fn default() -> Self {
+        Self {
+            network_id: "default".to_owned(),
+            params_version: 0,
+            params_hash: "default".to_owned(),
+        }
+    }
+}
+
+impl PeerHandshakeMetadata {
+    pub fn encode_agent_version(&self) -> String {
+        format!(
+            "{DEFAULT_IDENTIFY_AGENT_NAME}|{}|{}|{}",
+            self.network_id, self.params_version, self.params_hash
+        )
+    }
+
+    pub fn decode_agent_version(raw: &str) -> Result<Self> {
+        let mut parts = raw.splitn(4, '|');
+        let Some(prefix) = parts.next() else {
+            bail!("identify agent version is empty");
+        };
+        if prefix != DEFAULT_IDENTIFY_AGENT_NAME {
+            bail!("unexpected identify agent prefix");
+        }
+        let Some(network_id) = parts.next() else {
+            bail!("identify agent version missing network_id");
+        };
+        let Some(params_version) = parts.next() else {
+            bail!("identify agent version missing params_version");
+        };
+        let Some(params_hash) = parts.next() else {
+            bail!("identify agent version missing params_hash");
+        };
+        Ok(Self {
+            network_id: network_id.to_owned(),
+            params_version: params_version
+                .parse::<u64>()
+                .map_err(|err| anyhow!("invalid params_version: {err}"))?,
+            params_hash: params_hash.to_owned(),
+        })
     }
 }
 
@@ -257,11 +310,13 @@ pub struct NetworkP2pConfig {
     // ── Node-local settings ──────────────────────────────────────────
     pub namespace: TopicNamespace,
     pub protocol_version: String,
+    pub identify_agent_version: String,
     pub listen_addrs: Vec<String>,
     pub bootstrap_peers: Vec<String>,
     pub enable_mdns: bool,
 
     // ── Governance-controlled (populated from NetworkProtocolParams) ─
+    pub max_established_per_peer: u32,
     pub gossipsub_d: usize,
     pub gossipsub_d_low: usize,
     pub gossipsub_d_high: usize,
@@ -276,9 +331,11 @@ impl Default for NetworkP2pConfig {
         Self {
             namespace: TopicNamespace::default(),
             protocol_version: DEFAULT_PROTOCOL_VERSION.to_owned(),
+            identify_agent_version: PeerHandshakeMetadata::default().encode_agent_version(),
             listen_addrs: vec!["/ip4/0.0.0.0/tcp/0".to_owned()],
             bootstrap_peers: Vec::new(),
             enable_mdns: true,
+            max_established_per_peer: MAX_ESTABLISHED_PER_PEER_FALLBACK,
             gossipsub_d: GOSSIPSUB_D_FALLBACK,
             gossipsub_d_low: GOSSIPSUB_D_LOW_FALLBACK,
             gossipsub_d_high: GOSSIPSUB_D_HIGH_FALLBACK,
@@ -296,6 +353,11 @@ impl NetworkP2pConfig {
         mut self,
         params: &wattswarm_protocol::types::NetworkProtocolParams,
     ) -> Self {
+        self.namespace = TopicNamespace {
+            network: params.namespace_network.clone(),
+        };
+        self.protocol_version = params.protocol_version.clone();
+        self.max_established_per_peer = params.max_established_per_peer;
         self.gossipsub_d = params.gossipsub_d;
         self.gossipsub_d_low = params.gossipsub_d_low;
         self.gossipsub_d_high = params.gossipsub_d_high;
@@ -310,8 +372,17 @@ impl NetworkP2pConfig {
         if self.listen_addrs.is_empty() {
             bail!("at least one listen address is required");
         }
+        if self.namespace.network.trim().is_empty() {
+            bail!("namespace network is required");
+        }
         if self.protocol_version.trim().is_empty() {
             bail!("protocol_version is required");
+        }
+        if self.identify_agent_version.trim().is_empty() {
+            bail!("identify_agent_version is required");
+        }
+        if self.max_established_per_peer == 0 {
+            bail!("max_established_per_peer must be > 0");
         }
         if self.gossipsub_d == 0 || self.gossipsub_d_low == 0 || self.gossipsub_d_high == 0 {
             bail!("gossipsub mesh parameters must be > 0");
@@ -453,6 +524,11 @@ pub enum NetworkRuntimeEvent {
     },
     ConnectionClosed {
         peer: PeerId,
+        remaining_established: u32,
+    },
+    PeerHandshakeRejected {
+        peer: PeerId,
+        detail: String,
     },
     Gossip {
         propagation_source: PeerId,
@@ -567,7 +643,7 @@ impl NetworkP2pNode {
 
         let identify = identify::Behaviour::new(
             identify::Config::new(config.protocol_version.clone(), local_key.public())
-                .with_agent_version("wattswarm-network-p2p".to_owned()),
+                .with_agent_version(config.identify_agent_version.clone()),
         );
 
         let request_response = request_response::cbor::Behaviour::new(
@@ -598,7 +674,7 @@ impl NetworkP2pNode {
             connection_limits::ConnectionLimits::default()
                 .with_max_established_incoming(Some(MAX_ESTABLISHED_INCOMING))
                 .with_max_established_outgoing(Some(MAX_ESTABLISHED_OUTGOING))
-                .with_max_established_per_peer(Some(MAX_ESTABLISHED_PER_PEER))
+                .with_max_established_per_peer(Some(config.max_established_per_peer))
                 .with_max_pending_incoming(Some(MAX_PENDING_INCOMING))
                 .with_max_pending_outgoing(Some(MAX_PENDING_OUTGOING)),
         );
@@ -666,6 +742,7 @@ pub struct NetworkRuntime {
     subscribed_topics: HashSet<String>,
     traffic_guard: TrafficGuard,
     relay_reservations: HashSet<String>,
+    expected_peer_handshake: PeerHandshakeMetadata,
 }
 
 #[derive(Debug)]
@@ -788,6 +865,8 @@ impl NetworkRuntime {
     pub fn new(node: NetworkP2pNode) -> Result<Self> {
         let local_peer_id = node.local_peer_id();
         let config = node.config.clone();
+        let expected_peer_handshake =
+            PeerHandshakeMetadata::decode_agent_version(&config.identify_agent_version)?;
         let swarm = node.build_swarm()?;
         let mut this = Self {
             config,
@@ -797,6 +876,7 @@ impl NetworkRuntime {
             subscribed_topics: HashSet::new(),
             traffic_guard: TrafficGuard::new(),
             relay_reservations: HashSet::new(),
+            expected_peer_handshake,
         };
         this.listen_on_configured_addrs()?;
         this.seed_bootstrap_peers()?;
@@ -813,6 +893,39 @@ impl NetworkRuntime {
 
     pub fn listen_addrs(&self) -> &[Multiaddr] {
         &self.listen_addrs
+    }
+
+    fn validate_identify_info(&self, info: &identify::Info) -> Result<Vec<Multiaddr>> {
+        if info.protocol_version != self.config.protocol_version {
+            bail!(
+                "identify protocol_version mismatch expected={} got={}",
+                self.config.protocol_version,
+                info.protocol_version
+            );
+        }
+        let remote = PeerHandshakeMetadata::decode_agent_version(&info.agent_version)?;
+        if remote.network_id != self.expected_peer_handshake.network_id {
+            bail!(
+                "identify network_id mismatch expected={} got={}",
+                self.expected_peer_handshake.network_id,
+                remote.network_id
+            );
+        }
+        if remote.params_version != self.expected_peer_handshake.params_version {
+            bail!(
+                "identify params_version mismatch expected={} got={}",
+                self.expected_peer_handshake.params_version,
+                remote.params_version
+            );
+        }
+        if remote.params_hash != self.expected_peer_handshake.params_hash {
+            bail!(
+                "identify params_hash mismatch expected={} got={}",
+                self.expected_peer_handshake.params_hash,
+                remote.params_hash
+            );
+        }
+        Ok(info.listen_addrs.clone())
     }
 
     pub fn subscribe_scope(&mut self, scope: &SwarmScope) -> Result<()> {
@@ -982,6 +1095,10 @@ impl NetworkRuntime {
         if peer == self.local_peer_id {
             return;
         }
+        if self.swarm.is_connected(&peer) {
+            self.register_peer_address(peer, addr);
+            return;
+        }
         self.register_peer_address(peer, addr.clone());
         match self.swarm.dial(addr) {
             Ok(()) => {}
@@ -1020,11 +1137,14 @@ impl NetworkRuntime {
                     peer: peer_id,
                 }))
             }
-            SwarmEvent::ConnectionClosed { peer_id, .. } => {
-                Ok(Some(NetworkRuntimeEvent::ConnectionClosed {
-                    peer: peer_id,
-                }))
-            }
+            SwarmEvent::ConnectionClosed {
+                peer_id,
+                num_established,
+                ..
+            } => Ok(Some(NetworkRuntimeEvent::ConnectionClosed {
+                peer: peer_id,
+                remaining_established: num_established,
+            })),
             SwarmEvent::Behaviour(WattSwarmBehaviourEvent::Gossipsub(
                 GossipsubEvent::Message {
                     propagation_source,
@@ -1110,13 +1230,23 @@ impl NetworkRuntime {
             }
             SwarmEvent::Behaviour(WattSwarmBehaviourEvent::Identify(
                 identify::Event::Received { peer_id, info, .. },
-            )) => {
-                for addr in info.listen_addrs {
-                    self.register_peer_address(peer_id, addr);
+            )) => match self.validate_identify_info(&info) {
+                Ok(listen_addrs) => {
+                    for addr in listen_addrs {
+                        self.register_peer_address(peer_id, addr);
+                    }
+                    self.trigger_kademlia_refresh();
+                    Ok(None)
                 }
-                self.trigger_kademlia_refresh();
-                Ok(None)
-            }
+                Err(err) => {
+                    let detail = err.to_string();
+                    let _ = self.swarm.disconnect_peer_id(peer_id);
+                    Ok(Some(NetworkRuntimeEvent::PeerHandshakeRejected {
+                        peer: peer_id,
+                        detail,
+                    }))
+                }
+            },
             SwarmEvent::Behaviour(WattSwarmBehaviourEvent::Relay(
                 relay::client::Event::ReservationReqAccepted {
                     relay_peer_id,
@@ -1319,12 +1449,16 @@ mod tests {
         let json = serde_json::to_value(&config).expect("serialize config");
         assert_eq!(json["namespace"]["network"], "wattswarm");
         assert_eq!(json["max_backfill_events"], 512);
+        assert_eq!(json["max_established_per_peer"], 2);
         assert_eq!(json["protocol_version"], "/wattswarm/0.1.0");
     }
 
     #[test]
     fn apply_protocol_params_overrides_governed_runtime_fields() {
         let params = wattswarm_protocol::types::NetworkProtocolParams {
+            namespace_network: "watt-galaxy".to_owned(),
+            protocol_version: "/wattswarm/9.9.9".to_owned(),
+            max_established_per_peer: 4,
             gossipsub_d: 9,
             gossipsub_d_low: 7,
             gossipsub_d_high: 15,
@@ -1337,6 +1471,9 @@ mod tests {
 
         let config = NetworkP2pConfig::default().apply_protocol_params(&params);
 
+        assert_eq!(config.namespace.network, "watt-galaxy");
+        assert_eq!(config.protocol_version, "/wattswarm/9.9.9");
+        assert_eq!(config.max_established_per_peer, 4);
         assert_eq!(config.gossipsub_d, 9);
         assert_eq!(config.gossipsub_d_low, 7);
         assert_eq!(config.gossipsub_d_high, 15);
@@ -1344,6 +1481,61 @@ mod tests {
         assert_eq!(config.gossipsub_max_transmit_size, 1024 * 1024);
         assert_eq!(config.max_backfill_events, 1024);
         assert_eq!(config.max_backfill_events_hard_limit, 16_384);
+    }
+
+    #[test]
+    fn peer_handshake_metadata_roundtrips_agent_version() {
+        let handshake = PeerHandshakeMetadata {
+            network_id: "mainnet:watt-galaxy".to_owned(),
+            params_version: 7,
+            params_hash: "abc123".to_owned(),
+        };
+        let encoded = handshake.encode_agent_version();
+        let decoded = PeerHandshakeMetadata::decode_agent_version(&encoded).expect("decode");
+        assert_eq!(decoded, handshake);
+    }
+
+    #[test]
+    fn validate_identify_info_rejects_mismatched_params_hash() {
+        let local_key = identity::Keypair::generate_ed25519();
+        let remote_key = identity::Keypair::generate_ed25519();
+        let expected = PeerHandshakeMetadata {
+            network_id: "mainnet:watt-galaxy".to_owned(),
+            params_version: 2,
+            params_hash: "good-hash".to_owned(),
+        };
+        let info = identify::Info {
+            public_key: remote_key.public(),
+            protocol_version: "/wattswarm/0.1.0".to_owned(),
+            agent_version: PeerHandshakeMetadata {
+                network_id: "mainnet:watt-galaxy".to_owned(),
+                params_version: 2,
+                params_hash: "bad-hash".to_owned(),
+            }
+            .encode_agent_version(),
+            listen_addrs: vec!["/ip4/127.0.0.1/tcp/4001".parse().expect("addr")],
+            protocols: Vec::new(),
+            observed_addr: "/ip4/127.0.0.1/tcp/4001".parse().expect("observed"),
+            signed_peer_record: None,
+        };
+        let runtime = NetworkRuntime {
+            config: NetworkP2pConfig {
+                protocol_version: "/wattswarm/0.1.0".to_owned(),
+                identify_agent_version: expected.encode_agent_version(),
+                ..NetworkP2pConfig::default()
+            },
+            local_peer_id: local_key.public().to_peer_id(),
+            swarm: NetworkP2pNode::new(NetworkP2pConfig::default(), local_key)
+                .expect("node")
+                .build_swarm()
+                .expect("swarm"),
+            listen_addrs: Vec::new(),
+            subscribed_topics: HashSet::new(),
+            traffic_guard: TrafficGuard::new(),
+            relay_reservations: HashSet::new(),
+            expected_peer_handshake: expected,
+        };
+        assert!(runtime.validate_identify_info(&info).is_err());
     }
 
     #[test]

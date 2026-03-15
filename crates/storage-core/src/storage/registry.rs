@@ -1,5 +1,9 @@
 use super::*;
-use wattswarm_protocol::types::NetworkProtocolParams;
+use crate::crypto::{NodeIdentity, sha256_hex, verify_signature};
+use wattswarm_protocol::types::{
+    NetworkProtocolParams, SignedNetworkProtocolParamsEnvelope,
+    UnsignedNetworkProtocolParamsEnvelope,
+};
 
 pub const DEFAULT_LOCAL_ORG_NAME: &str = "Local Bootstrap";
 pub const DEFAULT_LAN_ORG_NAME: &str = "LAN Bootstrap";
@@ -14,6 +18,92 @@ pub fn lan_network_id(node_id: &str) -> String {
 
 pub fn bootstrap_org_id(network_id: &str) -> String {
     format!("{network_id}:bootstrap")
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedNetworkProtocolParams {
+    pub network_id: String,
+    pub genesis_node_id: String,
+    pub signed: SignedNetworkProtocolParamsEnvelope,
+}
+
+impl VerifiedNetworkProtocolParams {
+    pub fn params(&self) -> &NetworkProtocolParams {
+        &self.signed.params
+    }
+
+    pub fn params_hash(&self) -> &str {
+        &self.signed.params_hash
+    }
+}
+
+fn network_params_payload_hash(payload: &UnsignedNetworkProtocolParamsEnvelope) -> Result<String> {
+    Ok(sha256_hex(&serde_json::to_vec(payload)?))
+}
+
+fn sign_network_protocol_params(
+    network_id: &str,
+    version: u64,
+    prev_hash: Option<String>,
+    params: &NetworkProtocolParams,
+    signer: &NodeIdentity,
+) -> Result<SignedNetworkProtocolParamsEnvelope> {
+    let payload = UnsignedNetworkProtocolParamsEnvelope {
+        network_id: network_id.to_owned(),
+        version,
+        prev_hash,
+        params: params.clone(),
+    };
+    let params_hash = network_params_payload_hash(&payload)?;
+    Ok(SignedNetworkProtocolParamsEnvelope {
+        network_id: payload.network_id,
+        version: payload.version,
+        prev_hash: payload.prev_hash,
+        params_hash: params_hash.clone(),
+        params: payload.params,
+        signed_by: signer.node_id(),
+        signature: signer.sign_bytes(params_hash.as_bytes()),
+    })
+}
+
+fn verify_network_protocol_params(
+    expected_network_id: &str,
+    expected_genesis_node_id: &str,
+    signed: &SignedNetworkProtocolParamsEnvelope,
+) -> Result<()> {
+    if signed.network_id != expected_network_id {
+        anyhow::bail!(
+            "network params network_id mismatch expected={} got={}",
+            expected_network_id,
+            signed.network_id
+        );
+    }
+    if signed.signed_by != expected_genesis_node_id {
+        anyhow::bail!(
+            "network params signed_by mismatch expected={} got={}",
+            expected_genesis_node_id,
+            signed.signed_by
+        );
+    }
+    if signed.version == 0 {
+        anyhow::bail!("network params version must be >= 1");
+    }
+    if signed.version == 1 && signed.prev_hash.is_some() {
+        anyhow::bail!("network params version 1 must not include prev_hash");
+    }
+    if signed.version > 1 && signed.prev_hash.as_deref().unwrap_or("").trim().is_empty() {
+        anyhow::bail!("network params version > 1 requires prev_hash");
+    }
+    let expected_hash = network_params_payload_hash(&signed.unsigned_payload())?;
+    if signed.params_hash != expected_hash {
+        anyhow::bail!("network params hash mismatch");
+    }
+    verify_signature(
+        expected_genesis_node_id,
+        signed.params_hash.as_bytes(),
+        &signed.signature,
+    )?;
+    Ok(())
 }
 
 impl PgStore {
@@ -75,15 +165,13 @@ impl PgStore {
             ],
         )?;
 
-        let default_params_json = serde_json::to_string(&NetworkProtocolParams::default())
-            .unwrap_or_else(|_| "{}".into());
         conn.execute(
             "INSERT INTO network_params(network_id, control_mode, membership_version, policy_version, params_json, created_at, updated_at)
              VALUES ($1, $2, 1, 1, $4, TIMESTAMPTZ 'epoch' + ($3::bigint * INTERVAL '1 millisecond'), TIMESTAMPTZ 'epoch' + ($3::bigint * INTERVAL '1 millisecond'))
              ON CONFLICT(network_id) DO UPDATE SET
                control_mode = excluded.control_mode,
                updated_at = excluded.updated_at",
-            params![network_id, control_mode, now as i64, default_params_json],
+            params![network_id, control_mode, now as i64, "{}"],
         )?;
 
         conn.execute(
@@ -120,6 +208,72 @@ impl PgStore {
         )?;
 
         Ok(org_id)
+    }
+
+    pub fn network_id_for_org(&self, org_id: &str) -> Result<String> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
+        Ok(conn.query_row(
+            "SELECT network_id FROM org_registry WHERE org_id = $1",
+            params![org_id],
+            |r| r.get(0),
+        )?)
+    }
+
+    fn network_genesis_node_id(&self, network_id: &str) -> Result<String> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
+        Ok(conn.query_row(
+            "SELECT genesis_node_id FROM network_registry WHERE network_id = $1",
+            params![network_id],
+            |r| r.get(0),
+        )?)
+    }
+
+    pub fn ensure_bootstrap_signed_network_protocol_params(
+        &self,
+        network_id: &str,
+        signer: &NodeIdentity,
+    ) -> Result<SignedNetworkProtocolParamsEnvelope> {
+        let genesis_node_id = self.network_genesis_node_id(network_id)?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
+        let existing_json: Option<String> = conn
+            .query_row(
+                "SELECT params_json FROM network_params WHERE network_id = $1",
+                params![network_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let existing_json = existing_json.unwrap_or_default();
+        if !existing_json.trim().is_empty() && existing_json.trim() != "{}" {
+            if let Ok(signed) =
+                serde_json::from_str::<SignedNetworkProtocolParamsEnvelope>(&existing_json)
+            {
+                verify_network_protocol_params(network_id, &genesis_node_id, &signed)?;
+                return Ok(signed);
+            }
+        }
+        if signer.node_id() != genesis_node_id {
+            anyhow::bail!("only the genesis node can sign bootstrap network params");
+        }
+        let params = if !existing_json.trim().is_empty() && existing_json.trim() != "{}" {
+            serde_json::from_str::<NetworkProtocolParams>(&existing_json)?
+        } else {
+            NetworkProtocolParams::default()
+        };
+        let signed = sign_network_protocol_params(network_id, 1, None, &params, signer)?;
+        conn.execute(
+            "UPDATE network_params SET params_json = $1, updated_at = NOW() WHERE network_id = $2",
+            params![serde_json::to_string(&signed)?, network_id],
+        )?;
+        Ok(signed)
     }
 
     pub fn ensure_local_bootstrap_topology(
@@ -220,51 +374,88 @@ impl PgStore {
         Ok(org_id)
     }
 
-    /// Read `NetworkProtocolParams` from the `network_params` table for the
-    /// network that owns this store's org. Returns `Default` when the store
-    /// has no org bound or no matching row exists (e.g. in-memory test stores
-    /// that skip bootstrap topology).
-    pub fn load_network_protocol_params(&self) -> Result<NetworkProtocolParams> {
+    pub fn load_verified_network_protocol_params(&self) -> Result<VerifiedNetworkProtocolParams> {
         if !self.is_org_configured() {
-            return Ok(NetworkProtocolParams::default());
+            anyhow::bail!("store org is not configured");
         }
         let conn = self
             .conn
             .lock()
             .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
-        let row: Option<String> = conn
+        let row: Option<(String, String, String)> = conn
             .query_row(
-                "SELECT np.params_json
+                "SELECT np.network_id, net.genesis_node_id, np.params_json
                  FROM network_params np
                  JOIN org_registry org ON org.network_id = np.network_id
+                 JOIN network_registry net ON net.network_id = np.network_id
                  WHERE org.org_id = $1",
                 params![self.org_id()],
-                |r| r.get(0),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
             .optional()?;
-        match row {
-            Some(json) if !json.is_empty() && json != "{}" => Ok(serde_json::from_str(&json)?),
-            _ => Ok(NetworkProtocolParams::default()),
+        let Some((network_id, genesis_node_id, json)) = row else {
+            anyhow::bail!("missing network_params for org {}", self.org_id());
+        };
+        if json.trim().is_empty() || json.trim() == "{}" {
+            anyhow::bail!("missing signed network params envelope for network {network_id}");
         }
+        let signed: SignedNetworkProtocolParamsEnvelope = serde_json::from_str(&json)?;
+        verify_network_protocol_params(&network_id, &genesis_node_id, &signed)?;
+        Ok(VerifiedNetworkProtocolParams {
+            network_id,
+            genesis_node_id,
+            signed,
+        })
     }
 
-    /// Write `NetworkProtocolParams` into the `network_params.params_json`
-    /// column for the given network. Only the genesis node or governance
-    /// proposals should call this.
+    /// Read verified `NetworkProtocolParams` for the network that owns this store's org.
+    pub fn load_network_protocol_params(&self) -> Result<NetworkProtocolParams> {
+        Ok(self.load_verified_network_protocol_params()?.signed.params)
+    }
+
+    /// Write a new signed `NetworkProtocolParams` envelope into the
+    /// `network_params.params_json` cache for the given network.
     pub fn put_network_protocol_params(
         &self,
         network_id: &str,
+        signer: &NodeIdentity,
         params: &NetworkProtocolParams,
-    ) -> Result<()> {
-        let json = serde_json::to_string(params)?;
+    ) -> Result<SignedNetworkProtocolParamsEnvelope> {
+        let genesis_node_id = self.network_genesis_node_id(network_id)?;
+        if signer.node_id() != genesis_node_id {
+            anyhow::bail!("only the genesis node can update network params");
+        }
         let conn = self
             .conn
             .lock()
             .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
+        let current_json: Option<String> = conn
+            .query_row(
+                "SELECT params_json FROM network_params WHERE network_id = $1",
+                params![network_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let (version, prev_hash) = match current_json {
+            Some(json) if !json.trim().is_empty() && json.trim() != "{}" => {
+                if let Ok(signed) =
+                    serde_json::from_str::<SignedNetworkProtocolParamsEnvelope>(&json)
+                {
+                    verify_network_protocol_params(network_id, &genesis_node_id, &signed)?;
+                    (signed.version + 1, Some(signed.params_hash))
+                } else {
+                    let _: NetworkProtocolParams = serde_json::from_str(&json)?;
+                    (1, None)
+                }
+            }
+            _ => (1, None),
+        };
+        let signed = sign_network_protocol_params(network_id, version, prev_hash, params, signer)?;
+        let json = serde_json::to_string(&signed)?;
         conn.execute(
             "UPDATE network_params SET params_json = $1, updated_at = NOW() WHERE network_id = $2",
             params![json, network_id],
         )?;
-        Ok(())
+        Ok(signed)
     }
 }

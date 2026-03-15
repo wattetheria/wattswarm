@@ -12,7 +12,8 @@ use anyhow::{Result, anyhow, bail};
 use crate::constants::BACKFILL_BATCH_EVENTS;
 use crate::network_p2p::{
     BackfillRequest, BackfillRequestId, EventEnvelope, GossipMessage, Multiaddr, NetworkP2pConfig,
-    NetworkP2pNode, NetworkRuntime, NetworkRuntimeEvent, PeerId, SummaryAnnouncement, SwarmScope,
+    NetworkP2pNode, NetworkRuntime, NetworkRuntimeEvent, PeerHandshakeMetadata, PeerId,
+    SummaryAnnouncement, SwarmScope,
 };
 use crate::node::Node;
 use std::collections::{HashMap, HashSet};
@@ -230,8 +231,18 @@ fn run_background_network_service(
             .into_iter()
             .chain(dynamic_subscription_scopes_for_node(&node, &node_id)?),
     );
-    let protocol_params = node.store.load_network_protocol_params()?;
-    let config = config.apply_protocol_params(&protocol_params);
+    let verified_protocol_params = node.store.load_verified_network_protocol_params()?;
+    let protocol_params = verified_protocol_params.params().clone();
+    let mut config = config.apply_protocol_params(&protocol_params);
+    let handshake_network_id = verified_protocol_params.network_id.clone();
+    let handshake_params_version = verified_protocol_params.signed.version;
+    let handshake_params_hash = verified_protocol_params.params_hash().to_owned();
+    config.identify_agent_version = PeerHandshakeMetadata {
+        network_id: handshake_network_id,
+        params_version: handshake_params_version,
+        params_hash: handshake_params_hash,
+    }
+    .encode_agent_version();
     config.validate()?;
     let mut service =
         NetworkBridgeService::new(NetworkP2pNode::generate(config)?, &scopes, &protocol_params)?;
@@ -715,9 +726,26 @@ impl NetworkBridgeService {
                 }
                 Ok(NetworkBridgeTick::Connected { peer })
             }
-            NetworkRuntimeEvent::ConnectionClosed { peer } => {
+            NetworkRuntimeEvent::PeerHandshakeRejected { peer, detail } => {
                 self.mark_peer_disconnected(peer);
-                Ok(NetworkBridgeTick::Disconnected { peer })
+                Ok(NetworkBridgeTick::TransportNotice {
+                    detail: format!("peer_handshake_rejected peer={peer} {detail}"),
+                })
+            }
+            NetworkRuntimeEvent::ConnectionClosed {
+                peer,
+                remaining_established,
+            } => {
+                if remaining_established == 0 {
+                    self.mark_peer_disconnected(peer);
+                    Ok(NetworkBridgeTick::Disconnected { peer })
+                } else {
+                    Ok(NetworkBridgeTick::TransportNotice {
+                        detail: format!(
+                            "connection_closed peer={peer} remaining_established={remaining_established}"
+                        ),
+                    })
+                }
             }
             NetworkRuntimeEvent::Gossip {
                 propagation_source,

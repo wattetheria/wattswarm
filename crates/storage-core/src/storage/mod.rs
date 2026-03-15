@@ -267,7 +267,9 @@ mod projection;
 mod registry;
 mod schema;
 
-pub use registry::{bootstrap_org_id, lan_network_id, local_network_id};
+pub use registry::{
+    VerifiedNetworkProtocolParams, bootstrap_org_id, lan_network_id, local_network_id,
+};
 
 fn query_table_json(
     conn: &Connection,

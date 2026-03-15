@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use serde_json::json;
 use std::collections::HashMap;
 use std::fs;
@@ -72,12 +74,40 @@ fn make_service_with_params(
     scopes: &[SwarmScope],
     params: &NetworkProtocolParams,
 ) -> NetworkBridgeService {
-    let config = NetworkP2pConfig {
-        listen_addrs: vec!["/ip4/127.0.0.1/tcp/0".to_owned()],
-        enable_mdns: false,
-        ..NetworkP2pConfig::default()
-    }
-    .apply_protocol_params(params);
+    make_service_with_config(
+        scopes,
+        params,
+        NetworkP2pConfig {
+            listen_addrs: vec!["/ip4/127.0.0.1/tcp/0".to_owned()],
+            enable_mdns: false,
+            ..NetworkP2pConfig::default()
+        },
+    )
+}
+
+fn make_bootstrap_service_with_params(
+    scopes: &[SwarmScope],
+    params: &NetworkProtocolParams,
+    bootstrap_peers: &[String],
+) -> NetworkBridgeService {
+    make_service_with_config(
+        scopes,
+        params,
+        NetworkP2pConfig {
+            listen_addrs: vec!["/ip4/127.0.0.1/tcp/0".to_owned()],
+            enable_mdns: false,
+            bootstrap_peers: bootstrap_peers.to_vec(),
+            ..NetworkP2pConfig::default()
+        },
+    )
+}
+
+fn make_service_with_config(
+    scopes: &[SwarmScope],
+    params: &NetworkProtocolParams,
+    config: NetworkP2pConfig,
+) -> NetworkBridgeService {
+    let config = NetworkP2pConfig { ..config }.apply_protocol_params(params);
     NetworkBridgeService::new(
         NetworkP2pNode::generate(config).expect("network node"),
         scopes,
@@ -145,7 +175,9 @@ fn drive_anti_entropy_until(
             let _ = pump_once(service_b, node_b);
             let _ = pump_once(service_a, node_a);
         }
-        let _ = service_b.run_anti_entropy(node_b).expect("run anti entropy");
+        let _ = service_b
+            .run_anti_entropy(node_b)
+            .expect("run anti entropy");
         for _ in 0..32 {
             let _ = pump_once(service_b, node_b);
             let _ = pump_once(service_a, node_a);
@@ -164,32 +196,81 @@ fn cleanup_dir(path: &Path) {
     let _ = fs::remove_dir_all(path);
 }
 
+fn wait_for_listen_addrs(service: &mut NetworkBridgeService, node: &mut Node) {
+    let listening = wait_until(scaled_timeout(Duration::from_secs(5)), || {
+        let _ = pump_once(service, node);
+        !service.listen_addrs().is_empty()
+    });
+    assert!(listening, "service should expose a listen address");
+}
+
+fn wait_for_connected_pair(
+    service_a: &mut NetworkBridgeService,
+    node_a: &mut Node,
+    service_b: &mut NetworkBridgeService,
+    node_b: &mut Node,
+) {
+    let peer_a = service_a.local_peer_id();
+    let peer_b = service_b.local_peer_id();
+    let mut a_connected = false;
+    let mut b_connected = false;
+    let connected = wait_until(scaled_timeout(Duration::from_secs(10)), || {
+        let tick_a = pump_once(service_a, node_a);
+        let tick_b = pump_once(service_b, node_b);
+        if let Some(NetworkBridgeTick::BackfillFailed { error, .. }) = tick_a.as_ref() {
+            panic!("backfill failed on service A: {error}");
+        }
+        if let Some(NetworkBridgeTick::BackfillFailed { error, .. }) = tick_b.as_ref() {
+            panic!("backfill failed on service B: {error}");
+        }
+        if matches!(
+            tick_a.as_ref(),
+            Some(NetworkBridgeTick::Connected { peer }) if *peer == peer_b
+        ) {
+            a_connected = true;
+        }
+        if matches!(
+            tick_b.as_ref(),
+            Some(NetworkBridgeTick::Connected { peer }) if *peer == peer_a
+        ) {
+            b_connected = true;
+        }
+        a_connected && b_connected
+    });
+    assert!(connected, "services should connect to each other");
+    pump_services_for(
+        service_a,
+        node_a,
+        service_b,
+        node_b,
+        scaled_timeout(Duration::from_millis(250)),
+    );
+}
+
+fn bootstrap_peer_addr(service: &mut NetworkBridgeService, node: &mut Node) -> String {
+    wait_for_listen_addrs(service, node);
+    format!(
+        "{}/p2p/{}",
+        service.listen_addrs()[0],
+        service.local_peer_id()
+    )
+}
+
 fn connect_services(
     dialer: &mut NetworkBridgeService,
     dialer_node: &mut Node,
     receiver: &mut NetworkBridgeService,
     receiver_node: &mut Node,
 ) {
-    for _ in 0..4_096 {
-        let _ = pump_once(dialer, dialer_node);
-        let _ = pump_once(receiver, receiver_node);
-        if !dialer.listen_addrs().is_empty() && !receiver.listen_addrs().is_empty() {
-            break;
-        }
-        std::thread::yield_now();
-    }
+    wait_for_listen_addrs(dialer, dialer_node);
+    wait_for_listen_addrs(receiver, receiver_node);
     dialer
         .dial(receiver.listen_addrs()[0].clone())
         .expect("dial peer");
-    for _ in 0..4_096 {
-        let _ = pump_once(dialer, dialer_node);
-        let _ = pump_once(receiver, receiver_node);
-        std::thread::yield_now();
-    }
+    wait_for_connected_pair(dialer, dialer_node, receiver, receiver_node);
 }
 
-#[test]
-fn two_nodes_sync_global_event_over_libp2p() {
+pub fn two_nodes_sync_global_event_over_libp2p() {
     let identity_a = NodeIdentity::random();
     let identity_b = NodeIdentity::random();
     let membership = membership_with_roles(&[identity_a.node_id(), identity_b.node_id()]);
@@ -308,8 +389,7 @@ fn two_nodes_sync_global_event_over_libp2p() {
     );
 }
 
-#[test]
-fn two_nodes_backfill_missing_events_over_request_response() {
+pub fn two_nodes_backfill_missing_events_over_request_response() {
     let identity_a = NodeIdentity::random();
     let identity_b = NodeIdentity::random();
     let membership = membership_with_roles(&[identity_a.node_id(), identity_b.node_id()]);
@@ -406,8 +486,7 @@ fn two_nodes_backfill_missing_events_over_request_response() {
     );
 }
 
-#[test]
-fn discovered_peer_endpoint_helper_dials_and_syncs_over_lan_state() {
+pub fn discovered_peer_endpoint_helper_dials_and_syncs_over_lan_state() {
     let identity_a = NodeIdentity::random();
     let identity_b = NodeIdentity::random();
     let membership = membership_with_roles(&[identity_a.node_id(), identity_b.node_id()]);
@@ -515,8 +594,7 @@ fn discovered_peer_endpoint_helper_dials_and_syncs_over_lan_state() {
     );
 }
 
-#[test]
-fn region_scoped_backfill_only_reaches_region_subscribers() {
+pub fn region_scoped_backfill_only_reaches_region_subscribers() {
     let identity_a = NodeIdentity::random();
     let identity_b = NodeIdentity::random();
     let identity_c = NodeIdentity::random();
@@ -572,8 +650,7 @@ fn region_scoped_backfill_only_reaches_region_subscribers() {
     );
 }
 
-#[test]
-fn node_scoped_live_sync_only_reaches_matching_node_scope() {
+pub fn node_scoped_live_sync_only_reaches_matching_node_scope() {
     let identity_a = NodeIdentity::random();
     let identity_b = NodeIdentity::random();
     let identity_c = NodeIdentity::random();
@@ -638,8 +715,7 @@ fn node_scoped_live_sync_only_reaches_matching_node_scope() {
     );
 }
 
-#[test]
-fn summary_gossip_imports_knowledge_and_reputation_into_remote_store() {
+pub fn summary_gossip_imports_knowledge_and_reputation_into_remote_store() {
     let identity_a = NodeIdentity::random();
     let identity_b = NodeIdentity::random();
     let membership = membership_with_roles(&[identity_a.node_id(), identity_b.node_id()]);
@@ -734,8 +810,7 @@ fn summary_gossip_imports_knowledge_and_reputation_into_remote_store() {
     );
 }
 
-#[test]
-fn revoked_event_propagates_and_removes_remote_projection_state() {
+pub fn revoked_event_propagates_and_removes_remote_projection_state() {
     let identity_a = NodeIdentity::random();
     let identity_b = NodeIdentity::random();
     let membership = membership_with_roles(&[identity_a.node_id(), identity_b.node_id()]);
@@ -810,8 +885,7 @@ fn revoked_event_propagates_and_removes_remote_projection_state() {
     assert!(revoked);
 }
 
-#[test]
-fn revoked_summary_event_removes_remote_imported_state() {
+pub fn revoked_summary_event_removes_remote_imported_state() {
     let identity_a = NodeIdentity::random();
     let identity_b = NodeIdentity::random();
     let membership = membership_with_roles(&[identity_a.node_id(), identity_b.node_id()]);
@@ -906,17 +980,21 @@ fn revoked_summary_event_removes_remote_imported_state() {
     assert!(removed);
 }
 
-#[test]
-fn anti_entropy_syncs_missed_event_without_live_publish() {
+pub fn anti_entropy_syncs_missed_event_without_live_publish() {
     let identity_a = NodeIdentity::random();
     let identity_b = NodeIdentity::random();
     let membership = membership_with_roles(&[identity_a.node_id(), identity_b.node_id()]);
     let mut node_a = make_node(identity_a, membership.clone());
     let mut node_b = make_node(identity_b, membership);
     let mut service_a = make_fast_service();
-    let mut service_b = make_fast_service();
+    let bootstrap_peer = bootstrap_peer_addr(&mut service_a, &mut node_a);
+    let mut service_b = make_bootstrap_service_with_params(
+        &[SwarmScope::Global],
+        &test_protocol_params(),
+        &[bootstrap_peer],
+    );
 
-    connect_services(&mut service_a, &mut node_a, &mut service_b, &mut node_b);
+    wait_for_connected_pair(&mut service_a, &mut node_a, &mut service_b, &mut node_b);
 
     let policy_hash = node_a
         .policy_registry()
@@ -954,23 +1032,19 @@ fn anti_entropy_syncs_missed_event_without_live_publish() {
     assert!(synced);
 }
 
-#[test]
-fn anti_entropy_uses_scope_specific_cursor_for_recovery() {
+pub fn anti_entropy_uses_scope_specific_cursor_for_recovery() {
     let identity_a = NodeIdentity::random();
     let identity_b = NodeIdentity::random();
     let membership = membership_with_roles(&[identity_a.node_id(), identity_b.node_id()]);
     let mut node_a = make_node(identity_a, membership.clone());
     let mut node_b = make_node(identity_b, membership);
-    let mut service_a = make_fast_service_with_scopes(&[
-        SwarmScope::Global,
-        SwarmScope::Region("sol-1".to_owned()),
-    ]);
-    let mut service_b = make_fast_service_with_scopes(&[
-        SwarmScope::Global,
-        SwarmScope::Region("sol-1".to_owned()),
-    ]);
+    let scopes = [SwarmScope::Global, SwarmScope::Region("sol-1".to_owned())];
+    let mut service_a = make_fast_service_with_scopes(&scopes);
+    let bootstrap_peer = bootstrap_peer_addr(&mut service_a, &mut node_a);
+    let mut service_b =
+        make_bootstrap_service_with_params(&scopes, &test_protocol_params(), &[bootstrap_peer]);
 
-    connect_services(&mut service_a, &mut node_a, &mut service_b, &mut node_b);
+    wait_for_connected_pair(&mut service_a, &mut node_a, &mut service_b, &mut node_b);
 
     let policy_hash = node_a
         .policy_registry()
@@ -1017,17 +1091,21 @@ fn anti_entropy_uses_scope_specific_cursor_for_recovery() {
     assert!(recovered);
 }
 
-#[test]
-fn reconnect_recovers_missing_events_after_partition_like_disconnect() {
+pub fn reconnect_recovers_missing_events_after_partition_like_disconnect() {
     let identity_a = NodeIdentity::random();
     let identity_b = NodeIdentity::random();
     let membership = membership_with_roles(&[identity_a.node_id(), identity_b.node_id()]);
     let mut node_a = make_node(identity_a, membership.clone());
     let mut node_b = make_node(identity_b, membership);
     let mut service_a = make_service();
-    let mut service_b = make_service();
+    let bootstrap_peer = bootstrap_peer_addr(&mut service_a, &mut node_a);
+    let mut service_b = make_bootstrap_service_with_params(
+        &[SwarmScope::Global],
+        &NetworkProtocolParams::default(),
+        &[bootstrap_peer.clone()],
+    );
 
-    connect_services(&mut service_a, &mut node_a, &mut service_b, &mut node_b);
+    wait_for_connected_pair(&mut service_a, &mut node_a, &mut service_b, &mut node_b);
 
     let policy_hash = node_a
         .policy_registry()
@@ -1092,8 +1170,12 @@ fn reconnect_recovers_missing_events_after_partition_like_disconnect() {
         .submit_task(second_contract, 1, 101)
         .expect("submit second task");
 
-    let mut service_b = make_service();
-    connect_services(&mut service_a, &mut node_a, &mut service_b, &mut node_b);
+    let mut service_b = make_bootstrap_service_with_params(
+        &[SwarmScope::Global],
+        &NetworkProtocolParams::default(),
+        &[bootstrap_peer],
+    );
+    wait_for_connected_pair(&mut service_a, &mut node_a, &mut service_b, &mut node_b);
 
     // Recovery relies on the initial backfill triggered by ConnectionEstablished,
     // not on anti-entropy.  Just pump until the backfill round-trip completes.
