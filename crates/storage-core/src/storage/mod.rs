@@ -177,6 +177,12 @@ pub struct TaskAnnouncementRow {
     pub created_at: u64,
 }
 
+#[derive(Debug, Clone)]
+pub struct TaskAnnouncementDetailRow {
+    pub announcement: TaskAnnouncementRow,
+    pub contract: Option<TaskContract>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExecutionSetMemberRow {
     pub task_id: String,
@@ -200,6 +206,16 @@ impl FeedSubscriptionRow {
 impl TaskAnnouncementRow {
     pub fn scope(&self) -> Option<ProjectionScope> {
         ProjectionScope::parse(&self.scope_hint)
+    }
+}
+
+impl TaskAnnouncementDetailRow {
+    pub fn task_id(&self) -> &str {
+        &self.announcement.task_id
+    }
+
+    pub fn detail_ref(&self) -> Option<&ArtifactRef> {
+        self.announcement.detail_ref.as_ref()
     }
 }
 

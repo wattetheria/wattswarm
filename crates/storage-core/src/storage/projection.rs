@@ -365,25 +365,56 @@ impl PgStore {
         &self,
         task_id: &str,
     ) -> Result<Option<TaskAnnouncementRow>> {
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
-        let announcement_id = conn
-            .query_row(
+        let announcement_id = {
+            let conn = self
+                .conn
+                .lock()
+                .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
+            conn.query_row(
                 "SELECT announcement_id
-             FROM task_announcements
-             WHERE org_id = $1 AND task_id = $2
-             ORDER BY created_at DESC, announcement_id DESC
-             LIMIT 1",
+                 FROM task_announcements
+                 WHERE org_id = $1 AND task_id = $2
+                 ORDER BY created_at DESC, announcement_id DESC
+                 LIMIT 1",
                 params![self.org_id(), task_id],
                 |r| r.get::<_, String>(0),
             )
-            .optional()?;
+            .optional()?
+        };
         match announcement_id {
             Some(announcement_id) => self.get_task_announcement(&announcement_id),
             None => Ok(None),
         }
+    }
+
+    pub fn get_task_announcement_detail(
+        &self,
+        announcement_id: &str,
+    ) -> Result<Option<TaskAnnouncementDetailRow>> {
+        let Some(announcement) = self.get_task_announcement(announcement_id)? else {
+            return Ok(None);
+        };
+        let contract = self
+            .task_projection(&announcement.task_id)?
+            .map(|task| task.contract);
+        Ok(Some(TaskAnnouncementDetailRow {
+            announcement,
+            contract,
+        }))
+    }
+
+    pub fn get_task_announcement_detail_for_task(
+        &self,
+        task_id: &str,
+    ) -> Result<Option<TaskAnnouncementDetailRow>> {
+        let Some(announcement) = self.get_task_announcement_for_task(task_id)? else {
+            return Ok(None);
+        };
+        let contract = self.task_projection(task_id)?.map(|task| task.contract);
+        Ok(Some(TaskAnnouncementDetailRow {
+            announcement,
+            contract,
+        }))
     }
 
     pub fn upsert_execution_set_member(

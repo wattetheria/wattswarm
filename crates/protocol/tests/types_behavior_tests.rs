@@ -3,8 +3,8 @@ use wattswarm_protocol::types::{
     ExecutionIntentDeclaredPayload, ExecutionSetConfirmedPayload, FeedSubscriptionUpdatedPayload,
     Membership, NetworkDescriptor, NetworkKind, NetworkTopology, NodePenalizedPayload,
     OrgDescriptor, PolicyBinding, Role, ScopeHint, SummaryRevokedPayload, TaskAnnouncedPayload,
-    TaskContract, TaskExpiredPayload, TaskMode, UnsignedEvent, canonical_scope_hint,
-    normalized_scope_hint,
+    TaskContract, TaskDisseminationLayer, TaskExpiredPayload, TaskMode, UnsignedEvent,
+    canonical_scope_hint, normalized_scope_hint,
 };
 
 #[test]
@@ -288,4 +288,77 @@ fn network_kind_and_topology_types_capture_subnet_as_network_subtype() {
         Some("mainnet:watt-galaxy")
     );
     assert_eq!(topology.org.network_id, topology.network.network_id);
+}
+
+#[test]
+fn dissemination_layer_marks_only_low_frequency_layers_as_global_safe() {
+    let announcement = EventPayload::TaskAnnounced(TaskAnnouncedPayload {
+        network_id: "default".to_owned(),
+        task_id: "task-announce".to_owned(),
+        announcement_id: "announce-1".to_owned(),
+        feed_key: "feed".to_owned(),
+        scope_hint: "global".to_owned(),
+        summary: serde_json::json!({"headline":"discover"}),
+        detail_ref: Some(wattswarm_protocol::types::ArtifactRef {
+            uri: "ipfs://detail".to_owned(),
+            digest: "digest-1".to_owned(),
+            size_bytes: 128,
+            mime: "application/json".to_owned(),
+            created_at: 42,
+            producer: "node-a".to_owned(),
+        }),
+    });
+    assert_eq!(
+        announcement.dissemination_layer(),
+        TaskDisseminationLayer::Announcement
+    );
+    assert!(announcement.allows_global_dissemination());
+    assert!(announcement.carries_task_detail_reference());
+
+    let execution_coordination =
+        EventPayload::ExecutionIntentDeclared(ExecutionIntentDeclaredPayload {
+            network_id: "default".to_owned(),
+            task_id: "task-1".to_owned(),
+            execution_set_id: "set-1".to_owned(),
+            participant_node_id: "node-a".to_owned(),
+            role_hint: "worker".to_owned(),
+            scope_hint: "global".to_owned(),
+            intent: "interested".to_owned(),
+        });
+    assert_eq!(
+        execution_coordination.dissemination_layer(),
+        TaskDisseminationLayer::ExecutionCoordination
+    );
+    assert!(!execution_coordination.allows_global_dissemination());
+
+    let process = EventPayload::TaskError(wattswarm_protocol::types::TaskErrorPayload {
+        task_id: "task-1".to_owned(),
+        reason: wattswarm_protocol::types::TaskErrorReason::Timeout,
+        reason_codes: vec![1001],
+        custom_reason_namespace: None,
+        custom_reason_code: None,
+        custom_reason_message: None,
+        message: "timed out".to_owned(),
+    });
+    assert_eq!(
+        process.dissemination_layer(),
+        TaskDisseminationLayer::Process
+    );
+    assert!(!process.allows_global_dissemination());
+
+    let proof = EventPayload::TaskExpired(TaskExpiredPayload {
+        task_id: "task-1".to_owned(),
+    });
+    assert_eq!(proof.dissemination_layer(), TaskDisseminationLayer::Proof);
+    assert!(proof.allows_global_dissemination());
+
+    let checkpoint = EventPayload::CheckpointCreated(CheckpointCreatedPayload {
+        checkpoint_id: "cp-1".to_owned(),
+        up_to_seq: 42,
+    });
+    assert_eq!(
+        checkpoint.dissemination_layer(),
+        TaskDisseminationLayer::Checkpoint
+    );
+    assert!(checkpoint.allows_global_dissemination());
 }

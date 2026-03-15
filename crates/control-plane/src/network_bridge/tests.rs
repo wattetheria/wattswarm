@@ -465,6 +465,15 @@ fn network_substrate_projection_canonicalizes_scope_hints() {
 #[test]
 fn task_announcement_event_persists_summary_and_detail_reference() {
     let mut node = Node::open_in_memory_with_roles(&[Role::Proposer]).expect("node");
+    let policy_hash = node
+        .policy_registry()
+        .binding_for("vp.schema_only.v1", json!({}))
+        .expect("policy binding")
+        .policy_hash;
+    let mut contract = sample_contract("task-announced-1", policy_hash);
+    contract.inputs = json!({"prompt":"lightweight discovery"});
+    node.submit_task(contract.clone(), 1, 90)
+        .expect("submit task detail");
     node.emit_at(
         1,
         crate::types::EventPayload::TaskAnnounced(crate::types::TaskAnnouncedPayload {
@@ -503,6 +512,21 @@ fn task_announcement_event_persists_summary_and_detail_reference() {
     assert_eq!(
         announcement.detail_ref.expect("detail ref").uri,
         "ipfs://task-detail-1"
+    );
+
+    let detail = node
+        .store
+        .get_task_announcement_detail_for_task("task-announced-1")
+        .expect("load announcement detail")
+        .expect("announcement detail exists");
+    assert_eq!(detail.task_id(), "task-announced-1");
+    assert_eq!(
+        detail.contract.as_ref().expect("task contract").task_id,
+        contract.task_id
+    );
+    assert_eq!(
+        detail.detail_ref().expect("detail ref").digest,
+        "digest-task-detail-1"
     );
 }
 
@@ -898,6 +922,68 @@ fn backfill_response_skips_network_substrate_events_for_other_networks() {
 }
 
 #[test]
+fn global_backfill_skips_task_process_layer_events() {
+    let mut node = Node::open_in_memory_with_roles(&[Role::Proposer]).expect("node");
+    let policy_hash = node
+        .policy_registry()
+        .binding_for("vp.schema_only.v1", json!({}))
+        .expect("policy binding")
+        .policy_hash;
+    let mut contract = sample_contract("task-global-process-backfill", policy_hash);
+    contract.inputs = json!({"prompt":"backfill without process"});
+    node.submit_task(contract, 1, 100).expect("submit task");
+    node.claim_task(
+        "task-global-process-backfill",
+        crate::types::ClaimRole::Propose,
+        "exec-backfill-1",
+        500,
+        1,
+        101,
+    )
+    .expect("claim task");
+
+    let response = backfill_response_for_request(
+        &node,
+        &BackfillRequest {
+            scope: SwarmScope::Global,
+            from_event_seq: 0,
+            limit: 16,
+        },
+        32,
+        64,
+    )
+    .expect("backfill response");
+
+    assert!(
+        response.events.iter().any(|envelope| matches!(
+            envelope.event.payload,
+            crate::types::EventPayload::TaskCreated(_)
+        )),
+        "global backfill should still include task detail events"
+    );
+    assert!(
+        response.events.iter().all(|envelope| {
+            !matches!(
+                envelope.event.payload,
+                crate::types::EventPayload::TaskClaimed(_)
+                    | crate::types::EventPayload::TaskClaimRenewed(_)
+                    | crate::types::EventPayload::TaskClaimReleased(_)
+                    | crate::types::EventPayload::CandidateProposed(_)
+                    | crate::types::EventPayload::EvidenceAdded(_)
+                    | crate::types::EventPayload::EvidenceAvailable(_)
+                    | crate::types::EventPayload::VerifierResultSubmitted(_)
+                    | crate::types::EventPayload::VoteCommit(_)
+                    | crate::types::EventPayload::VoteReveal(_)
+                    | crate::types::EventPayload::DecisionCommitted(_)
+                    | crate::types::EventPayload::TaskError(_)
+                    | crate::types::EventPayload::TaskRetryScheduled(_)
+            )
+        }),
+        "global backfill should suppress task process traffic"
+    );
+}
+
+#[test]
 fn summary_publish_is_suppressed_when_backlog_is_high() {
     assert!(should_publish_summaries(
         SUMMARY_BACKPRESSURE_HIGH_WATERMARK,
@@ -1054,7 +1140,13 @@ fn subnet_summary_is_mirrored_into_parent_network_store() {
     assert_eq!(hits[0].result_summary["answer"], json!("compress-me"));
 
     let revoke_event = node
-        .revoke_summary(&summary.summary_id, KNOWLEDGE_SUMMARY_KIND, "bad subnet summary", 1, 200)
+        .revoke_summary(
+            &summary.summary_id,
+            KNOWLEDGE_SUMMARY_KIND,
+            "bad subnet summary",
+            1,
+            200,
+        )
         .expect("revoke summary");
     assert!(
         mirror_summary_controls_to_parent_network(&node, &revoke_event)

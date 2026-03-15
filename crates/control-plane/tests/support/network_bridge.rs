@@ -418,6 +418,63 @@ pub fn two_nodes_sync_global_event_over_libp2p() {
     );
 }
 
+pub fn global_task_detail_sync_excludes_process_firehose() {
+    let identity_a = NodeIdentity::random();
+    let identity_b = NodeIdentity::random();
+    let membership = membership_with_roles(&[identity_a.node_id(), identity_b.node_id()]);
+    let mut node_a = make_node(identity_a, membership.clone());
+    let mut node_b = make_node(identity_b, membership);
+    let mut service_a = make_service();
+    let mut service_b = make_service();
+
+    connect_services(&mut service_a, &mut node_a, &mut service_b, &mut node_b);
+
+    let policy_hash = node_a
+        .policy_registry()
+        .binding_for("vp.schema_only.v1", json!({}))
+        .expect("policy binding")
+        .policy_hash;
+    let mut contract = sample_contract("task-global-process-filter", policy_hash);
+    contract.inputs = json!({"prompt":"sync task without process firehose"});
+    node_a.submit_task(contract, 1, 100).expect("submit task");
+    node_a
+        .claim_task(
+            "task-global-process-filter",
+            wattswarm_control_plane::types::ClaimRole::Propose,
+            "exec-filter-1",
+            500,
+            1,
+            101,
+        )
+        .expect("claim task");
+
+    let mut last_published_seq = 0;
+    let synced = wait_until(scaled_timeout(Duration::from_secs(10)), || {
+        last_published_seq = publish_pending_global_events(
+            &mut service_a,
+            &node_a,
+            &node_a.node_id(),
+            last_published_seq,
+        )
+        .expect("publish pending");
+        let _ = pump_once(&mut service_a, &mut node_a);
+        let _ = pump_once(&mut service_b, &mut node_b);
+        node_b
+            .task_view("task-global-process-filter")
+            .expect("task view")
+            .is_some()
+    });
+    assert!(synced, "remote node should receive task detail layer");
+    assert!(
+        node_b
+            .store
+            .get_lease("task-global-process-filter", "propose")
+            .expect("load lease")
+            .is_none(),
+        "global dissemination should not replay task process traffic"
+    );
+}
+
 pub fn two_nodes_backfill_missing_events_over_request_response() {
     let identity_a = NodeIdentity::random();
     let identity_b = NodeIdentity::random();

@@ -44,6 +44,53 @@ fn network_substrate_reads_canonicalize_scope_hints() {
 }
 
 #[test]
+fn task_announcement_detail_fetch_returns_latest_announcement_and_task_contract() {
+    let store = open_test_store();
+    let contract = sample_contract("task-announced-detail", "region:sol-1:swarm");
+    store
+        .upsert_task_contract(&contract, 1)
+        .expect("upsert task contract");
+    store
+        .put_task_announcement(
+            &contract.task_id,
+            "announce-1",
+            "feed-market",
+            "region:sol-1",
+            &serde_json::json!({"headline":"discovery"}),
+            Some(&ArtifactRef {
+                uri: "ipfs://detail-ref".to_owned(),
+                digest: "digest-detail-ref".to_owned(),
+                size_bytes: 256,
+                mime: "application/json".to_owned(),
+                created_at: 100,
+                producer: "node-a".to_owned(),
+            }),
+            "node-a",
+            100,
+        )
+        .expect("put task announcement");
+
+    let detail = store
+        .get_task_announcement_detail_for_task(&contract.task_id)
+        .expect("load announcement detail")
+        .expect("announcement detail exists");
+
+    assert_eq!(detail.task_id(), contract.task_id);
+    assert_eq!(
+        detail.announcement.scope(),
+        Some(ProjectionScope::Region("sol-1".to_owned()))
+    );
+    assert_eq!(
+        detail.contract.as_ref().expect("task contract").task_type,
+        contract.task_type
+    );
+    assert_eq!(
+        detail.detail_ref().expect("detail ref").digest,
+        "digest-detail-ref"
+    );
+}
+
+#[test]
 fn bootstrap_topology_returns_typed_network_and_org_descriptors() {
     let store = PgStore::open_in_memory().expect("open store");
     let topology = store

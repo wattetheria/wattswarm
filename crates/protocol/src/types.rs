@@ -491,6 +491,10 @@ impl TaskAnnouncedPayload {
     pub fn scope(&self) -> Option<ScopeHint> {
         ScopeHint::parse(&self.scope_hint)
     }
+
+    pub fn carries_detail_reference(&self) -> bool {
+        self.detail_ref.is_some()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -791,6 +795,17 @@ pub enum EventKind {
     NodePenalized,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaskDisseminationLayer {
+    Announcement,
+    TaskDetail,
+    ExecutionCoordination,
+    Process,
+    Proof,
+    Checkpoint,
+    Governance,
+}
+
 impl EventPayload {
     pub fn kind(&self) -> EventKind {
         match self {
@@ -868,6 +883,58 @@ impl EventPayload {
             Self::SummaryRevoked(_) => None,
             Self::NodePenalized(_) => None,
         }
+    }
+
+    pub fn dissemination_layer(&self) -> TaskDisseminationLayer {
+        match self {
+            Self::TaskCreated(_) => TaskDisseminationLayer::TaskDetail,
+            Self::FeedSubscriptionUpdated(_) | Self::TaskAnnounced(_) => {
+                TaskDisseminationLayer::Announcement
+            }
+            Self::ExecutionIntentDeclared(_) | Self::ExecutionSetConfirmed(_) => {
+                TaskDisseminationLayer::ExecutionCoordination
+            }
+            Self::TaskClaimed(_)
+            | Self::TaskClaimRenewed(_)
+            | Self::TaskClaimReleased(_)
+            | Self::CandidateProposed(_)
+            | Self::EvidenceAdded(_)
+            | Self::EvidenceAvailable(_)
+            | Self::VerifierResultSubmitted(_)
+            | Self::VoteCommit(_)
+            | Self::VoteReveal(_)
+            | Self::DecisionCommitted(_)
+            | Self::TaskError(_)
+            | Self::TaskRetryScheduled(_) => TaskDisseminationLayer::Process,
+            Self::DecisionFinalized(_)
+            | Self::TaskExpired(_)
+            | Self::EpochEnded(_)
+            | Self::TaskStopped(_)
+            | Self::TaskSuspended(_)
+            | Self::TaskKilled(_) => TaskDisseminationLayer::Proof,
+            Self::CheckpointCreated(_) => TaskDisseminationLayer::Checkpoint,
+            Self::MembershipUpdated(_)
+            | Self::PolicyTuned(_)
+            | Self::AdvisoryCreated(_)
+            | Self::AdvisoryApproved(_)
+            | Self::AdvisoryApplied(_)
+            | Self::TaskFeedbackReported(_)
+            | Self::ReuseRejectRecorded(_)
+            | Self::EventRevoked(_)
+            | Self::SummaryRevoked(_)
+            | Self::NodePenalized(_) => TaskDisseminationLayer::Governance,
+        }
+    }
+
+    pub fn allows_global_dissemination(&self) -> bool {
+        !matches!(
+            self.dissemination_layer(),
+            TaskDisseminationLayer::ExecutionCoordination | TaskDisseminationLayer::Process
+        )
+    }
+
+    pub fn carries_task_detail_reference(&self) -> bool {
+        matches!(self, Self::TaskAnnounced(payload) if payload.carries_detail_reference())
     }
 }
 

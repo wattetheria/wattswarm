@@ -32,6 +32,9 @@ pub fn backfill_response_for_request(
             if event_scope(node, &event)? != request.scope {
                 continue;
             }
+            if request.scope == SwarmScope::Global && !event.payload.allows_global_dissemination() {
+                continue;
+            }
             envelopes.push(EventEnvelope {
                 scope: request.scope.clone(),
                 event,

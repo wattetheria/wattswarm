@@ -3,19 +3,7 @@ use super::*;
 const AUTO_PUBLISH_BATCH_LIMIT: usize = 64;
 
 fn is_high_frequency_global_event(payload: &crate::types::EventPayload) -> bool {
-    matches!(
-        payload,
-        crate::types::EventPayload::TaskClaimed(_)
-            | crate::types::EventPayload::TaskClaimRenewed(_)
-            | crate::types::EventPayload::TaskClaimReleased(_)
-            | crate::types::EventPayload::CandidateProposed(_)
-            | crate::types::EventPayload::EvidenceAdded(_)
-            | crate::types::EventPayload::EvidenceAvailable(_)
-            | crate::types::EventPayload::VerifierResultSubmitted(_)
-            | crate::types::EventPayload::VoteCommit(_)
-            | crate::types::EventPayload::VoteReveal(_)
-            | crate::types::EventPayload::DecisionCommitted(_)
-    )
+    payload.dissemination_layer() == crate::types::TaskDisseminationLayer::Process
 }
 
 #[derive(Debug, Clone)]
@@ -71,6 +59,10 @@ pub fn publish_pending_scoped_updates(
             continue;
         }
         let scope = super::event_scope(node, &event)?;
+        if scope == SwarmScope::Global && !event.payload.allows_global_dissemination() {
+            last_published_seq = seq;
+            continue;
+        }
         if let crate::types::EventPayload::FeedSubscriptionUpdated(payload) = &event.payload
             && payload.subscriber_node_id == local_node_id
         {
