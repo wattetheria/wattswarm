@@ -242,6 +242,23 @@ pub struct CheckpointAnnouncementRow {
     pub observed_at: u64,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct ImportedTaskOutcomeRow {
+    pub summary_id: String,
+    pub source_node_id: String,
+    pub scope_hint: String,
+    pub task_id: String,
+    pub task_type: String,
+    pub candidate_id: String,
+    pub output_digest: String,
+    pub result_summary: Value,
+    pub evidence_digest_count: u32,
+    pub checkpoint_id: String,
+    pub proof_artifact_path: String,
+    pub finalized_at: u64,
+    pub revoked: bool,
+}
+
 impl PgStore {
     pub fn for_org(&self, org_id: impl Into<String>) -> Self {
         Self {

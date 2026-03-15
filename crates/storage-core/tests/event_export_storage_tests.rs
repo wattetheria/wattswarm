@@ -7,7 +7,7 @@ use wattswarm_storage_core::types::{
     TaskExpiredPayload, TaskMode, VerificationStatus, VerifierResult, VerifyAssignment, VoteChoice,
     VotePolicy,
 };
-use wattswarm_storage_core::{AdvisoryStateRow, PgStore, ProjectionScope};
+use wattswarm_storage_core::{AdvisoryStateRow, ImportedTaskOutcomeRow, PgStore, ProjectionScope};
 
 fn open_test_store() -> PgStore {
     PgStore::open_in_memory()
@@ -832,5 +832,48 @@ fn membership_and_revocations_are_scoped_by_org() {
             .is_summary_revoked("summary-1")
             .expect("not revoked in org b"),
         "summary revocation should be org-scoped"
+    );
+}
+
+#[test]
+fn imported_task_outcomes_roundtrip_and_revoke() {
+    let store = open_test_store();
+    store
+        .put_imported_task_outcome(&ImportedTaskOutcomeRow {
+            summary_id: "summary-outcome-1".to_owned(),
+            source_node_id: "node-remote".to_owned(),
+            scope_hint: "region:sol-1".to_owned(),
+            task_id: "task-outcome-1".to_owned(),
+            task_type: "summary-type".to_owned(),
+            candidate_id: "cand-1".to_owned(),
+            output_digest: "sha256:abc".to_owned(),
+            result_summary: serde_json::json!({"answer":"compressed"}),
+            evidence_digest_count: 2,
+            checkpoint_id: "cp-1".to_owned(),
+            proof_artifact_path: "finality://summary-type/task-outcome-1/1/cand-1".to_owned(),
+            finalized_at: 1_700_000_000_300,
+            revoked: false,
+        })
+        .expect("put imported outcome");
+
+    let outcomes = store
+        .list_imported_task_outcomes_by_task_type("summary-type", 8)
+        .expect("list imported outcomes");
+    assert_eq!(outcomes.len(), 1);
+    assert_eq!(outcomes[0].task_id, "task-outcome-1");
+    assert_eq!(
+        outcomes[0].result_summary["answer"],
+        serde_json::json!("compressed")
+    );
+    assert_eq!(outcomes[0].checkpoint_id, "cp-1");
+
+    store
+        .revoke_imported_task_outcomes_by_summary("summary-outcome-1")
+        .expect("revoke imported outcome");
+    assert!(
+        store
+            .list_imported_task_outcomes_by_task_type("summary-type", 8)
+            .expect("list outcomes after revoke")
+            .is_empty()
     );
 }

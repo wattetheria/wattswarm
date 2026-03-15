@@ -1828,6 +1828,118 @@ impl PgStore {
         Ok(())
     }
 
+    pub fn put_imported_task_outcome(&self, outcome: &ImportedTaskOutcomeRow) -> Result<()> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
+        conn.execute(
+            "INSERT INTO imported_task_outcomes(org_id, summary_id, source_node_id, scope_hint, task_id, task_type,
+                                                candidate_id, output_digest, result_summary_json, evidence_digest_count,
+                                                checkpoint_id, proof_artifact_path, finalized_at, revoked)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
+                     TIMESTAMPTZ 'epoch' + ($13::bigint * INTERVAL '1 millisecond'), FALSE)
+             ON CONFLICT(org_id, summary_id, task_id) DO UPDATE SET
+               source_node_id = excluded.source_node_id,
+               scope_hint = excluded.scope_hint,
+               task_type = excluded.task_type,
+               candidate_id = excluded.candidate_id,
+               output_digest = excluded.output_digest,
+               result_summary_json = excluded.result_summary_json,
+               evidence_digest_count = excluded.evidence_digest_count,
+               checkpoint_id = excluded.checkpoint_id,
+               proof_artifact_path = excluded.proof_artifact_path,
+               finalized_at = excluded.finalized_at,
+               revoked = FALSE",
+            params![
+                self.org_id(),
+                outcome.summary_id,
+                outcome.source_node_id,
+                outcome.scope_hint,
+                outcome.task_id,
+                outcome.task_type,
+                outcome.candidate_id,
+                outcome.output_digest,
+                serde_json::to_string(&outcome.result_summary)?,
+                outcome.evidence_digest_count as i64,
+                outcome.checkpoint_id,
+                outcome.proof_artifact_path,
+                outcome.finalized_at as i64,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_imported_task_outcomes_by_task_type(
+        &self,
+        task_type: &str,
+        limit: usize,
+    ) -> Result<Vec<ImportedTaskOutcomeRow>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
+        let mut stmt = conn.prepare(
+            "SELECT summary_id, source_node_id, scope_hint, task_id, task_type, candidate_id, output_digest,
+                    result_summary_json, evidence_digest_count, checkpoint_id, proof_artifact_path,
+                    CAST(EXTRACT(EPOCH FROM finalized_at) * 1000 AS BIGINT), revoked
+             FROM imported_task_outcomes
+             WHERE org_id = $1 AND task_type = $2 AND revoked = FALSE
+             ORDER BY finalized_at DESC, task_id DESC
+             LIMIT $3",
+        )?;
+        let rows = stmt.query_map(params![self.org_id(), task_type, limit as i64], |r| {
+            let result_summary_json: String = r.get(7)?;
+            let finalized_at_ms: i64 = r.get(11)?;
+            Ok(ImportedTaskOutcomeRow {
+                summary_id: r.get(0)?,
+                source_node_id: r.get(1)?,
+                scope_hint: Self::canonical_scope_hint_or_original(r.get(2)?),
+                task_id: r.get(3)?,
+                task_type: r.get(4)?,
+                candidate_id: r.get(5)?,
+                output_digest: r.get(6)?,
+                result_summary: serde_json::from_str(&result_summary_json).map_err(|e| {
+                    pg::Error::FromSqlConversionFailure(0, pg::types::Type::Text, Box::new(e))
+                })?,
+                evidence_digest_count: r.get::<_, i64>(8)? as u32,
+                checkpoint_id: r.get(9)?,
+                proof_artifact_path: r.get(10)?,
+                finalized_at: finalized_at_ms as u64,
+                revoked: r.get(12)?,
+            })
+        })?;
+        let mut outcomes = Vec::new();
+        for row in rows {
+            outcomes.push(row?);
+        }
+        Ok(outcomes)
+    }
+
+    pub fn revoke_imported_task_outcomes_by_summary(&self, summary_id: &str) -> Result<()> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
+        conn.execute(
+            "UPDATE imported_task_outcomes SET revoked = TRUE WHERE org_id = $1 AND summary_id = $2",
+            params![self.org_id(), summary_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn revoke_imported_task_outcomes_by_source(&self, source_node_id: &str) -> Result<()> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
+        conn.execute(
+            "UPDATE imported_task_outcomes SET revoked = TRUE WHERE org_id = $1 AND source_node_id = $2",
+            params![self.org_id(), source_node_id],
+        )?;
+        Ok(())
+    }
+
     pub fn has_decision_by_final_commit_hash(&self, final_commit_hash: &str) -> Result<bool> {
         let conn = self
             .conn

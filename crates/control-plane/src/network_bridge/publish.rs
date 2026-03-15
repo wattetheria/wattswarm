@@ -91,6 +91,16 @@ pub fn publish_pending_scoped_updates(
             Err(err) => return Err(err),
         }
         let _ = super::mirror_summary_controls_to_parent_network(node, &event);
+        if let Some(checkpoint) =
+            super::announcements::checkpoint_announcement_for_event(node, &event, &scope)?
+        {
+            let _ = super::announcements::apply_checkpoint_announcement_to_store(
+                &node.store,
+                &checkpoint,
+            );
+            let _ = service.publish_checkpoint(checkpoint.clone());
+            let _ = super::announcements::mirror_checkpoint_to_parent_network(node, &checkpoint);
+        }
         if publish_summaries
             && !local_node_penalized
             && let Some(summary) = super::knowledge_summary_for_event(
@@ -99,6 +109,13 @@ pub fn publish_pending_scoped_updates(
                 &scope,
                 service.summary_decision_memory_limit,
             )?
+        {
+            let _ = service.publish_summary(summary.clone());
+            let _ = super::mirror_summary_to_parent_network(node, &summary);
+        }
+        if publish_summaries
+            && !local_node_penalized
+            && let Some(summary) = super::task_outcome_summary_for_event(node, &event, &scope)?
         {
             let _ = service.publish_summary(summary.clone());
             let _ = super::mirror_summary_to_parent_network(node, &summary);

@@ -460,6 +460,8 @@ impl Node {
                     .revoke_imported_decision_memory_by_summary(&payload.target_summary_id)?;
                 self.store
                     .revoke_imported_reputation_by_summary(&payload.target_summary_id)?;
+                self.store
+                    .revoke_imported_task_outcomes_by_summary(&payload.target_summary_id)?;
             }
             EventPayload::NodePenalized(payload) => {
                 self.store.put_node_penalty(
@@ -489,12 +491,16 @@ impl Node {
                         .revoke_imported_decision_memory_by_summary(summary_id)?;
                     self.store
                         .revoke_imported_reputation_by_summary(summary_id)?;
+                    self.store
+                        .revoke_imported_task_outcomes_by_summary(summary_id)?;
                 }
                 if payload.block_summaries {
                     self.store
                         .revoke_imported_decision_memory_by_source(&payload.penalized_node_id)?;
                     self.store
                         .revoke_imported_reputation_by_source(&payload.penalized_node_id)?;
+                    self.store
+                        .revoke_imported_task_outcomes_by_source(&payload.penalized_node_id)?;
                 }
             }
         }

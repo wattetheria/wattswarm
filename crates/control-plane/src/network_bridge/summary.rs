@@ -13,6 +13,21 @@ pub(super) struct ReputationSummaryBundle {
     pub(super) entries: Vec<crate::storage::ReputationSnapshotRow>,
 }
 
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub(super) struct TaskOutcomeSummaryBundle {
+    pub(super) source_node_id: String,
+    pub(super) scope_hint: String,
+    pub(super) task_id: String,
+    pub(super) task_type: String,
+    pub(super) candidate_id: String,
+    pub(super) output_digest: String,
+    pub(super) result_summary: serde_json::Value,
+    pub(super) evidence_digest_count: u32,
+    pub(super) checkpoint_id: String,
+    pub(super) proof_artifact_path: String,
+    pub(super) finalized_at: u64,
+}
+
 fn build_summary_id(
     source_node_id: &str,
     scope: &SwarmScope,
@@ -141,6 +156,81 @@ pub(super) fn reputation_summary_for_event(
     )
 }
 
+fn outcome_summary_excerpt(output: &serde_json::Value) -> serde_json::Value {
+    let Some(obj) = output.as_object() else {
+        return output.clone();
+    };
+    let mut excerpt = serde_json::Map::new();
+    for key in ["decision", "answer", "confidence", "check_summary"] {
+        if let Some(value) = obj.get(key) {
+            excerpt.insert(key.to_owned(), value.clone());
+        }
+    }
+    if excerpt.is_empty() {
+        output.clone()
+    } else {
+        serde_json::Value::Object(excerpt)
+    }
+}
+
+fn canonical_scope_hint(scope: &SwarmScope) -> String {
+    match scope {
+        SwarmScope::Global => "global".to_owned(),
+        SwarmScope::Region(id) => format!("region:{id}"),
+        SwarmScope::Node(id) => format!("node:{id}"),
+    }
+}
+
+pub(super) fn task_outcome_summary_for_event(
+    node: &Node,
+    event: &crate::types::Event,
+    scope: &SwarmScope,
+) -> Result<Option<SummaryAnnouncement>> {
+    let crate::types::EventPayload::DecisionFinalized(payload) = &event.payload else {
+        return Ok(None);
+    };
+    let Some(task) = node.task_view(&payload.task_id)? else {
+        return Ok(None);
+    };
+    let Some(candidate) = node
+        .store
+        .get_candidate_by_id(&payload.task_id, &payload.candidate_id)?
+    else {
+        return Ok(None);
+    };
+    let checkpoint =
+        super::announcements::checkpoint_announcement_for_event(node, event, scope)?
+            .ok_or_else(|| anyhow::anyhow!("checkpoint announcement missing for finalized task"))?;
+    let output_digest = crate::crypto::sha256_hex(&serde_json::to_vec(&candidate.output)?);
+    let evidence_digest_count = candidate
+        .evidence_refs
+        .iter()
+        .filter(|reference| !reference.digest.trim().is_empty())
+        .count() as u32;
+    let bundle = TaskOutcomeSummaryBundle {
+        source_node_id: node.node_id(),
+        scope_hint: canonical_scope_hint(scope),
+        task_id: payload.task_id.clone(),
+        task_type: task.contract.task_type,
+        candidate_id: payload.candidate_id.clone(),
+        output_digest,
+        result_summary: outcome_summary_excerpt(&candidate.output),
+        evidence_digest_count,
+        checkpoint_id: checkpoint.checkpoint_id,
+        proof_artifact_path: checkpoint.artifact_path,
+        finalized_at: event.created_at,
+    };
+    let payload = serde_json::to_value(&bundle)?;
+    Ok(Some(SummaryAnnouncement {
+        summary_id: build_summary_id(&node.node_id(), scope, TASK_OUTCOME_SUMMARY_KIND, &payload)?,
+        source_node_id: node.node_id(),
+        scope: scope.clone(),
+        summary_kind: TASK_OUTCOME_SUMMARY_KIND.to_owned(),
+        artifact_path: Some(bundle.proof_artifact_path.clone()),
+        payload,
+    }))
+}
+
 fn apply_summary_announcement_to_store(
     store: &crate::storage::PgStore,
     summary: &SummaryAnnouncement,
@@ -171,41 +261,35 @@ fn apply_summary_announcement_to_store(
                 )?;
             }
         }
+        TASK_OUTCOME_SUMMARY_KIND => {
+            let payload: TaskOutcomeSummaryBundle =
+                serde_json::from_value(summary.payload.clone())?;
+            store.put_imported_task_outcome(&crate::storage::ImportedTaskOutcomeRow {
+                summary_id: summary.summary_id.clone(),
+                source_node_id: summary.source_node_id.clone(),
+                scope_hint: payload.scope_hint,
+                task_id: payload.task_id,
+                task_type: payload.task_type,
+                candidate_id: payload.candidate_id,
+                output_digest: payload.output_digest,
+                result_summary: payload.result_summary,
+                evidence_digest_count: payload.evidence_digest_count,
+                checkpoint_id: payload.checkpoint_id,
+                proof_artifact_path: payload.proof_artifact_path,
+                finalized_at: payload.finalized_at,
+                revoked: false,
+            })?;
+        }
         _ => {}
     }
     Ok(())
-}
-
-fn parent_uplink_store(node: &Node) -> Result<Option<crate::storage::PgStore>> {
-    if !node.store.is_org_configured() {
-        return Ok(None);
-    }
-    let topology = node
-        .store
-        .load_network_topology_for_org(node.store.org_id())?;
-    if !topology.network.is_subnet() {
-        return Ok(None);
-    }
-    let Some(parent_topology) = node
-        .store
-        .load_parent_network_topology_for_org(node.store.org_id())?
-    else {
-        return Ok(None);
-    };
-    if !node
-        .store
-        .node_has_network_membership(&node.node_id(), &parent_topology.network.network_id)?
-    {
-        return Ok(None);
-    }
-    Ok(Some(node.store.for_org(parent_topology.org.org_id)))
 }
 
 pub(super) fn mirror_summary_to_parent_network(
     node: &Node,
     summary: &SummaryAnnouncement,
 ) -> Result<bool> {
-    let Some(parent_store) = parent_uplink_store(node)? else {
+    let Some(parent_store) = super::parent_uplink_store(node)? else {
         return Ok(false);
     };
     apply_summary_announcement_to_store(&parent_store, summary)?;
@@ -216,7 +300,7 @@ pub(super) fn mirror_summary_controls_to_parent_network(
     node: &Node,
     event: &crate::types::Event,
 ) -> Result<bool> {
-    let Some(parent_store) = parent_uplink_store(node)? else {
+    let Some(parent_store) = super::parent_uplink_store(node)? else {
         return Ok(false);
     };
     match &event.payload {
@@ -230,6 +314,7 @@ pub(super) fn mirror_summary_controls_to_parent_network(
             )?;
             parent_store.revoke_imported_decision_memory_by_summary(&payload.target_summary_id)?;
             parent_store.revoke_imported_reputation_by_summary(&payload.target_summary_id)?;
+            parent_store.revoke_imported_task_outcomes_by_summary(&payload.target_summary_id)?;
             Ok(true)
         }
         crate::types::EventPayload::NodePenalized(payload) => {
@@ -250,11 +335,13 @@ pub(super) fn mirror_summary_controls_to_parent_network(
                 )?;
                 parent_store.revoke_imported_decision_memory_by_summary(summary_id)?;
                 parent_store.revoke_imported_reputation_by_summary(summary_id)?;
+                parent_store.revoke_imported_task_outcomes_by_summary(summary_id)?;
             }
             if payload.block_summaries {
                 parent_store
                     .revoke_imported_decision_memory_by_source(&payload.penalized_node_id)?;
                 parent_store.revoke_imported_reputation_by_source(&payload.penalized_node_id)?;
+                parent_store.revoke_imported_task_outcomes_by_source(&payload.penalized_node_id)?;
             }
             Ok(true)
         }

@@ -1,11 +1,12 @@
 use crate::crypto::{NodeIdentity, candidate_hash, vote_commit_hash};
 use crate::node::{Node, finality_sign};
-use crate::runtime::{HttpRuntimeClient, RuntimeClient};
+use crate::runtime::{HttpRuntimeClient, RuntimeCapabilities, RuntimeClient};
 use crate::storage::PgStore;
 use crate::task_template::sample_contract;
 use crate::types::{
-    ClaimRole, FinalityProof, Membership, Role, TaskContract, VoteChoice, VoteCommitPayload,
-    VoteRevealPayload,
+    ClaimRole, EventPayload, ExecutionIntentDeclaredPayload, ExecutionSetConfirmedPayload,
+    ExecutionSetMember, FinalityProof, Membership, Role, TaskContract, VoteChoice,
+    VoteCommitPayload, VoteRevealPayload,
 };
 use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -96,6 +97,40 @@ pub struct RealTaskRunRequest {
     pub task_contract: Option<TaskContract>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RemoteTaskBridgeRequest {
+    pub executor: String,
+    pub profile: String,
+    pub task_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct RemoteTaskBridgeRegistry {
+    pub entries: Vec<RemoteTaskBridgeRecord>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RemoteTaskBridgeRecord {
+    pub task_id: String,
+    pub announcement_id: String,
+    pub network_id: String,
+    pub source_node_id: String,
+    pub source_scope_hint: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail_ref_digest: Option<String>,
+    pub executor: String,
+    pub profile: String,
+    pub candidate_id: String,
+    pub terminal_state: String,
+    pub bridged_at: u64,
+}
+
+#[derive(Clone)]
+struct PreparedRuntime {
+    runtime: HttpRuntimeClient,
+    capabilities: RuntimeCapabilities,
+}
+
 pub fn executor_registry_path(state_dir: &Path) -> PathBuf {
     state_dir.join("executors.json")
 }
@@ -112,14 +147,90 @@ pub fn artifact_store_path(state_dir: &Path) -> PathBuf {
     state_dir.join("artifacts")
 }
 
+pub fn remote_task_bridge_registry_path(state_dir: &Path) -> PathBuf {
+    state_dir.join("remote_task_bridge_registry.json")
+}
+
 fn open_local_artifact_store(state_dir: &Path) -> Result<ArtifactStore> {
     let store = ArtifactStore::new(artifact_store_path(state_dir));
     store.ensure_layout()?;
     Ok(store)
 }
 
+fn load_remote_task_bridge_registry(path: &Path) -> Result<RemoteTaskBridgeRegistry> {
+    if !path.exists() {
+        return Ok(RemoteTaskBridgeRegistry::default());
+    }
+    Ok(serde_json::from_slice(&fs::read(path)?)?)
+}
+
+fn save_remote_task_bridge_registry(path: &Path, reg: &RemoteTaskBridgeRegistry) -> Result<()> {
+    fs::write(path, serde_json::to_vec_pretty(reg)?)?;
+    Ok(())
+}
+
+fn prepare_runtime_for_executor(
+    state_dir: &Path,
+    executor: &str,
+    profile: &str,
+) -> Result<PreparedRuntime> {
+    let reg = load_executor_registry(&executor_registry_path(state_dir))?;
+    let entry = reg
+        .entries
+        .iter()
+        .find(|e| e.name == executor)
+        .ok_or_else(|| anyhow!("executor not found: {executor}"))?;
+
+    let runtime = HttpRuntimeClient::new(entry.base_url.clone());
+    runtime.health().with_context(|| {
+        format!(
+            "runtime /health failed (executor='{}', base_url='{}')",
+            executor, entry.base_url
+        )
+    })?;
+    let capabilities = runtime.capabilities().with_context(|| {
+        format!(
+            "runtime /capabilities failed (executor='{}', base_url='{}')",
+            executor, entry.base_url
+        )
+    })?;
+    if !capabilities
+        .profiles
+        .iter()
+        .any(|candidate| candidate == profile)
+    {
+        return Err(anyhow!(
+            "profile '{}' not supported by executor '{}'",
+            profile,
+            executor
+        ));
+    }
+    Ok(PreparedRuntime {
+        runtime,
+        capabilities,
+    })
+}
+
 fn default_artifact_retry_after_ms() -> u64 {
     30_000
+}
+
+fn observed_at_ms() -> u64 {
+    chrono::Utc::now().timestamp_millis().max(0) as u64
+}
+
+fn current_network_context_id(node: &Node) -> String {
+    if node.store.is_org_configured()
+        && let Ok(topology) = node
+            .store
+            .load_network_topology_for_org(node.store.org_id())
+    {
+        return topology.network.network_id;
+    }
+    node.store
+        .load_verified_network_protocol_params()
+        .map(|verified| verified.network_id)
+        .unwrap_or_else(|_| "default".to_owned())
 }
 
 fn availability_manifest(
@@ -600,6 +711,380 @@ pub fn list_artifacts_needing_repair(
     artifact_store.list_manifests_needing_repair(now_ms)
 }
 
+fn run_existing_task_with_runtime(
+    node: &mut Node,
+    runtime: &dyn RuntimeClient,
+    capabilities: &RuntimeCapabilities,
+    executor: &str,
+    profile: &str,
+    task_id: &str,
+    now: u64,
+) -> Result<Value> {
+    let task = node
+        .task_view(task_id)?
+        .ok_or_else(|| anyhow!("task view missing for {task_id}"))?;
+    let propose_execution_id = format!("exec-p-{}", Uuid::new_v4());
+    let verify_execution_id = format!("exec-v-{}", Uuid::new_v4());
+    let lease_until = now.saturating_add(task.contract.assignment.claim.lease_ms);
+
+    node.claim_task(
+        task_id,
+        ClaimRole::Propose,
+        &propose_execution_id,
+        lease_until,
+        1,
+        now.saturating_add(1),
+    )?;
+    node.auto_execute_with_runtime(
+        runtime,
+        task_id,
+        profile,
+        &propose_execution_id,
+        1,
+        now.saturating_add(2),
+    )?;
+
+    let candidate_id = format!("cand-{propose_execution_id}");
+    node.claim_task(
+        task_id,
+        ClaimRole::Verify,
+        &verify_execution_id,
+        lease_until,
+        1,
+        now.saturating_add(3),
+    )?;
+    node.auto_verify_candidate_with_runtime(
+        runtime,
+        task_id,
+        &candidate_id,
+        &verify_execution_id,
+        1,
+        now.saturating_add(4),
+    )?;
+
+    let verifier_result = node
+        .store
+        .list_verifier_results_for_candidate(task_id, &candidate_id)?
+        .into_iter()
+        .find(|row| row.execution_id == verify_execution_id)
+        .ok_or_else(|| {
+            anyhow!(
+                "missing verifier result for execution {}",
+                verify_execution_id
+            )
+        })?;
+    if !verifier_result.passed {
+        return Err(anyhow!(
+            "verifier did not pass candidate; reason_codes={:?}",
+            verifier_result.reason_codes
+        ));
+    }
+    let candidate = node
+        .store
+        .get_candidate_by_id(task_id, &candidate_id)?
+        .ok_or_else(|| anyhow!("candidate not found after execute: {candidate_id}"))?;
+    let candidate_hash = candidate_hash(&candidate)?;
+
+    let salt = Uuid::new_v4().to_string();
+    let commit_hash = vote_commit_hash(
+        VoteChoice::Approve,
+        &salt,
+        &verifier_result.verifier_result_hash,
+    );
+    node.submit_vote_commit(
+        VoteCommitPayload {
+            task_id: task_id.to_owned(),
+            candidate_id: candidate_id.clone(),
+            candidate_hash: candidate_hash.clone(),
+            execution_id: verify_execution_id.clone(),
+            verifier_result_hash: verifier_result.verifier_result_hash.clone(),
+            commit_hash,
+        },
+        1,
+        now.saturating_add(5),
+    )?;
+    node.submit_vote_reveal(
+        VoteRevealPayload {
+            task_id: task_id.to_owned(),
+            candidate_id: candidate_id.clone(),
+            candidate_hash,
+            execution_id: verify_execution_id,
+            verifier_result_hash: verifier_result.verifier_result_hash.clone(),
+            vote: VoteChoice::Approve,
+            salt,
+        },
+        1,
+        now.saturating_add(6),
+    )?;
+    node.commit_decision(task_id, 1, &candidate_id, now.saturating_add(7))?;
+    node.finalize_decision(
+        task_id,
+        1,
+        &candidate_id,
+        FinalityProof {
+            threshold: 1,
+            signatures: vec![finality_sign(&node.identity, task_id, 1, &candidate_id)],
+        },
+        now.saturating_add(8),
+    )?;
+
+    let view = node
+        .task_view(task_id)?
+        .ok_or_else(|| anyhow!("task view not found after run"))?;
+    let final_decision = candidate
+        .output
+        .get("decision")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let final_answer = candidate
+        .output
+        .get("answer")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let evidence_digests = candidate
+        .evidence_refs
+        .iter()
+        .map(|r| r.digest.clone())
+        .collect::<Vec<_>>();
+    Ok(json!({
+        "task_id": task_id,
+        "candidate_id": candidate_id,
+        "executor": executor,
+        "profile": profile,
+        "provider_family": capabilities.provider_family,
+        "model_id": capabilities.model_id,
+        "candidate_output": candidate.output,
+        "evidence_digests": evidence_digests,
+        "final_decision": final_decision,
+        "final_answer": final_answer,
+        "terminal_state": format!("{:?}", view.terminal_state),
+        "committed_candidate_id": view.committed_candidate_id,
+        "finalized_candidate_id": view.finalized_candidate_id
+    }))
+}
+
+fn remote_bridge_scope_hint(raw: &str) -> String {
+    crate::types::normalized_scope_hint(raw)
+}
+
+fn remote_task_bridge_allowed_for_scope(node_id: &str, scope_hint: &str) -> bool {
+    match crate::types::ScopeHint::parse_with_prefix_fallback(scope_hint) {
+        Some(crate::types::ScopeHint::Node(target)) => target == node_id,
+        Some(crate::types::ScopeHint::Global | crate::types::ScopeHint::Region(_)) => true,
+        None => scope_hint.trim().is_empty(),
+    }
+}
+
+fn remote_bridge_execution_set_id(task_id: &str) -> String {
+    format!("remote-bridge:{task_id}")
+}
+
+fn ensure_remote_execution_participation(
+    node: &mut Node,
+    task_id: &str,
+    network_id: &str,
+    scope_hint: &str,
+    created_at: u64,
+) -> Result<()> {
+    let execution_set_id = remote_bridge_execution_set_id(task_id);
+    let local_node_id = node.node_id();
+    let existing = node
+        .store
+        .list_execution_set_members(task_id, &execution_set_id)?
+        .into_iter()
+        .any(|member| member.participant_node_id == local_node_id);
+    if existing {
+        return Ok(());
+    }
+
+    node.emit_at(
+        1,
+        EventPayload::ExecutionIntentDeclared(ExecutionIntentDeclaredPayload {
+            network_id: network_id.to_owned(),
+            task_id: task_id.to_owned(),
+            execution_set_id: execution_set_id.clone(),
+            participant_node_id: local_node_id.clone(),
+            role_hint: "executor".to_owned(),
+            scope_hint: scope_hint.to_owned(),
+            intent: "accepted".to_owned(),
+        }),
+        created_at,
+    )?;
+    node.emit_at(
+        1,
+        EventPayload::ExecutionSetConfirmed(ExecutionSetConfirmedPayload {
+            network_id: network_id.to_owned(),
+            task_id: task_id.to_owned(),
+            execution_set_id,
+            confirmed_by_node_id: local_node_id.clone(),
+            scope_hint: scope_hint.to_owned(),
+            members: vec![ExecutionSetMember {
+                participant_node_id: local_node_id,
+                role_hint: "executor".to_owned(),
+            }],
+        }),
+        created_at.saturating_add(1),
+    )?;
+    Ok(())
+}
+
+fn bridged_task_contract(node: &Node, state_dir: &Path, task_id: &str) -> Result<TaskContract> {
+    if let Some(task) = node.task_view(task_id)? {
+        return Ok(task.contract);
+    }
+    let detail = node
+        .store
+        .get_task_announcement_detail_for_task(task_id)?
+        .ok_or_else(|| anyhow!("task announcement missing for task {task_id}"))?;
+    if let Some(contract) = detail.contract {
+        return Ok(contract);
+    }
+    let bytes = fetch_task_detail_artifact(state_dir, node, task_id, observed_at_ms())?;
+    let contract = serde_json::from_slice::<TaskContract>(&bytes)
+        .with_context(|| format!("parse bridged task detail for {task_id}"))?;
+    if contract.task_id != task_id {
+        return Err(anyhow!(
+            "bridged task detail task_id mismatch: expected {}, got {}",
+            task_id,
+            contract.task_id
+        ));
+    }
+    Ok(contract)
+}
+
+fn bridge_origin_payload(
+    task_id: &str,
+    deduped: bool,
+    record: &RemoteTaskBridgeRecord,
+    run: Value,
+) -> Value {
+    let mut value = run;
+    let bridge = json!({
+        "deduped": deduped,
+        "announcement_id": record.announcement_id,
+        "network_id": record.network_id,
+        "source_node_id": record.source_node_id,
+        "source_scope_hint": record.source_scope_hint,
+        "detail_ref_digest": record.detail_ref_digest,
+        "bridged_at": record.bridged_at
+    });
+    if let Some(obj) = value.as_object_mut() {
+        obj.insert("task_id".to_owned(), json!(task_id));
+        obj.insert("bridge".to_owned(), bridge);
+    }
+    value
+}
+
+pub fn bridge_remote_task_into_local_execution(
+    node: &mut Node,
+    state_dir: &Path,
+    req: RemoteTaskBridgeRequest,
+) -> Result<Value> {
+    let RemoteTaskBridgeRequest {
+        executor,
+        profile,
+        task_id,
+    } = req;
+    let detail = node
+        .store
+        .get_task_announcement_detail_for_task(&task_id)?
+        .ok_or_else(|| anyhow!("remote task announcement missing for task {}", task_id))?;
+    let announcement = detail.announcement.clone();
+    let network_id = current_network_context_id(node);
+    let scope_hint = remote_bridge_scope_hint(&announcement.scope_hint);
+    if !remote_task_bridge_allowed_for_scope(&node.node_id(), &scope_hint) {
+        return Err(anyhow!(
+            "remote task {} is not eligible for local node {} under scope {}",
+            task_id,
+            node.node_id(),
+            scope_hint
+        ));
+    }
+    let reg_path = remote_task_bridge_registry_path(state_dir);
+    let mut registry = load_remote_task_bridge_registry(&reg_path)?;
+
+    if let Some(existing) = registry.entries.iter().find(|entry| {
+        entry.task_id == task_id
+            && entry.announcement_id == announcement.announcement_id
+            && entry.executor == executor
+            && entry.profile == profile
+    }) {
+        return Ok(bridge_origin_payload(
+            &task_id,
+            true,
+            existing,
+            json!({
+                "task_id": task_id,
+                "candidate_id": existing.candidate_id,
+                "executor": existing.executor,
+                "profile": existing.profile,
+                "terminal_state": existing.terminal_state
+            }),
+        ));
+    }
+
+    let prepared = prepare_runtime_for_executor(state_dir, &executor, &profile)?;
+    let contract = bridged_task_contract(node, state_dir, &task_id)?;
+    if node.task_view(&task_id)?.is_none() {
+        node.submit_task(contract, 1, observed_at_ms())?;
+    }
+    ensure_remote_execution_participation(
+        node,
+        &task_id,
+        &network_id,
+        &scope_hint,
+        observed_at_ms().saturating_add(1),
+    )?;
+    let run = run_existing_task_with_runtime(
+        node,
+        &prepared.runtime,
+        &prepared.capabilities,
+        &executor,
+        &profile,
+        &task_id,
+        observed_at_ms().saturating_add(2),
+    )?;
+    let candidate_id = run
+        .get("candidate_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("missing candidate_id after bridged run"))?
+        .to_owned();
+    let terminal_state = run
+        .get("terminal_state")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("missing terminal_state after bridged run"))?
+        .to_owned();
+
+    let record = RemoteTaskBridgeRecord {
+        task_id: task_id.clone(),
+        announcement_id: announcement.announcement_id,
+        network_id,
+        source_node_id: announcement.announced_by_node_id,
+        source_scope_hint: scope_hint,
+        detail_ref_digest: announcement.detail_ref.map(|reference| reference.digest),
+        executor: executor.clone(),
+        profile: profile.clone(),
+        candidate_id,
+        terminal_state,
+        bridged_at: observed_at_ms(),
+    };
+    registry.entries.retain(|entry| {
+        !(entry.task_id == record.task_id
+            && entry.executor == record.executor
+            && entry.profile == record.profile)
+    });
+    registry.entries.push(record.clone());
+    registry.entries.sort_by(|left, right| {
+        left.task_id
+            .cmp(&right.task_id)
+            .then_with(|| left.executor.cmp(&right.executor))
+            .then_with(|| left.profile.cmp(&right.profile))
+    });
+    save_remote_task_bridge_registry(&reg_path, &registry)?;
+
+    Ok(bridge_origin_payload(&task_id, false, &record, run))
+}
+
 pub fn local_node_id(state_dir: &Path) -> Result<String> {
     Ok(load_or_create_identity(&state_dir.join("node_seed.hex"))?.node_id())
 }
@@ -822,34 +1307,7 @@ pub fn run_real_task_flow(
         task_file,
         task_contract,
     } = req;
-
-    let reg = load_executor_registry(&executor_registry_path(state_dir))?;
-    let entry = reg
-        .entries
-        .iter()
-        .find(|e| e.name == executor)
-        .ok_or_else(|| anyhow!("executor not found: {executor}"))?;
-
-    let runtime = HttpRuntimeClient::new(entry.base_url.clone());
-    runtime.health().with_context(|| {
-        format!(
-            "runtime /health failed (executor='{}', base_url='{}')",
-            executor, entry.base_url
-        )
-    })?;
-    let capabilities = runtime.capabilities().with_context(|| {
-        format!(
-            "runtime /capabilities failed (executor='{}', base_url='{}')",
-            executor, entry.base_url
-        )
-    })?;
-    if !capabilities.profiles.iter().any(|p| p == &profile) {
-        return Err(anyhow!(
-            "profile '{}' not supported by executor '{}'",
-            profile,
-            executor
-        ));
-    }
+    let prepared = prepare_runtime_for_executor(state_dir, &executor, &profile)?;
 
     let mut contract = if let Some(contract) = task_contract {
         contract
@@ -874,149 +1332,15 @@ pub fn run_real_task_flow(
 
     let now = chrono::Utc::now().timestamp_millis().max(0) as u64;
     node.submit_task(contract.clone(), 1, now)?;
-
-    let propose_execution_id = format!("exec-p-{}", Uuid::new_v4());
-    let verify_execution_id = format!("exec-v-{}", Uuid::new_v4());
-    let lease_until = now.saturating_add(contract.assignment.claim.lease_ms);
-    node.claim_task(
-        &contract.task_id,
-        ClaimRole::Propose,
-        &propose_execution_id,
-        lease_until,
-        1,
-        now.saturating_add(1),
-    )?;
-    node.auto_execute_with_runtime(
-        &runtime,
-        &contract.task_id,
+    run_existing_task_with_runtime(
+        node,
+        &prepared.runtime,
+        &prepared.capabilities,
+        &executor,
         &profile,
-        &propose_execution_id,
-        1,
-        now.saturating_add(2),
-    )?;
-
-    let candidate_id = format!("cand-{propose_execution_id}");
-    node.claim_task(
         &contract.task_id,
-        ClaimRole::Verify,
-        &verify_execution_id,
-        lease_until,
-        1,
-        now.saturating_add(3),
-    )?;
-    node.auto_verify_candidate_with_runtime(
-        &runtime,
-        &contract.task_id,
-        &candidate_id,
-        &verify_execution_id,
-        1,
-        now.saturating_add(4),
-    )?;
-
-    let verifier_result = node
-        .store
-        .list_verifier_results_for_candidate(&contract.task_id, &candidate_id)?
-        .into_iter()
-        .find(|row| row.execution_id == verify_execution_id)
-        .ok_or_else(|| {
-            anyhow!(
-                "missing verifier result for execution {}",
-                verify_execution_id
-            )
-        })?;
-    if !verifier_result.passed {
-        return Err(anyhow!(
-            "verifier did not pass candidate; reason_codes={:?}",
-            verifier_result.reason_codes
-        ));
-    }
-    let candidate = node
-        .store
-        .get_candidate_by_id(&contract.task_id, &candidate_id)?
-        .ok_or_else(|| anyhow!("candidate not found after execute: {candidate_id}"))?;
-    let candidate_hash = candidate_hash(&candidate)?;
-
-    let salt = Uuid::new_v4().to_string();
-    let commit_hash = vote_commit_hash(
-        VoteChoice::Approve,
-        &salt,
-        &verifier_result.verifier_result_hash,
-    );
-    node.submit_vote_commit(
-        VoteCommitPayload {
-            task_id: contract.task_id.clone(),
-            candidate_id: candidate_id.clone(),
-            candidate_hash: candidate_hash.clone(),
-            execution_id: verify_execution_id.clone(),
-            verifier_result_hash: verifier_result.verifier_result_hash.clone(),
-            commit_hash,
-        },
-        1,
-        now.saturating_add(5),
-    )?;
-    node.submit_vote_reveal(
-        VoteRevealPayload {
-            task_id: contract.task_id.clone(),
-            candidate_id: candidate_id.clone(),
-            candidate_hash,
-            execution_id: verify_execution_id,
-            verifier_result_hash: verifier_result.verifier_result_hash.clone(),
-            vote: VoteChoice::Approve,
-            salt,
-        },
-        1,
-        now.saturating_add(6),
-    )?;
-    node.commit_decision(&contract.task_id, 1, &candidate_id, now.saturating_add(7))?;
-    node.finalize_decision(
-        &contract.task_id,
-        1,
-        &candidate_id,
-        FinalityProof {
-            threshold: 1,
-            signatures: vec![finality_sign(
-                &node.identity,
-                &contract.task_id,
-                1,
-                &candidate_id,
-            )],
-        },
-        now.saturating_add(8),
-    )?;
-
-    let view = node
-        .task_view(&contract.task_id)?
-        .ok_or_else(|| anyhow!("task view not found after run"))?;
-    let final_decision = candidate
-        .output
-        .get("decision")
-        .and_then(Value::as_str)
-        .map(str::to_owned);
-    let final_answer = candidate
-        .output
-        .get("answer")
-        .and_then(Value::as_str)
-        .map(str::to_owned);
-    let evidence_digests = candidate
-        .evidence_refs
-        .iter()
-        .map(|r| r.digest.clone())
-        .collect::<Vec<_>>();
-    Ok(json!({
-        "task_id": contract.task_id,
-        "candidate_id": candidate_id,
-        "executor": executor,
-        "profile": profile,
-        "provider_family": capabilities.provider_family,
-        "model_id": capabilities.model_id,
-        "candidate_output": candidate.output,
-        "evidence_digests": evidence_digests,
-        "final_decision": final_decision,
-        "final_answer": final_answer,
-        "terminal_state": format!("{:?}", view.terminal_state),
-        "committed_candidate_id": view.committed_candidate_id,
-        "finalized_candidate_id": view.finalized_candidate_id
-    }))
+        now,
+    )
 }
 
 fn load_or_create_identity(seed_file: &Path) -> Result<NodeIdentity> {

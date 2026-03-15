@@ -272,6 +272,7 @@ impl PgStore {
             "unknown_reason_observations",
             "imported_decision_memory",
             "imported_reputation_state",
+            "imported_task_outcomes",
             "membership_projection",
             "event_revocations",
             "summary_revocations",

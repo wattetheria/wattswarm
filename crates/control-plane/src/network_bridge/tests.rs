@@ -1162,6 +1162,213 @@ fn subnet_summary_is_mirrored_into_parent_network_store() {
 }
 
 #[test]
+fn task_outcome_summary_imports_compressed_result_facts() {
+    let identity = NodeIdentity::random();
+    let node_id = identity.node_id();
+    let membership = membership_with_roles(std::slice::from_ref(&node_id));
+    let store = PgStore::open_in_memory().expect("store");
+    let mut node = Node::new(identity.clone(), store, membership).expect("node");
+    let policy_hash = node
+        .policy_registry()
+        .binding_for("vp.schema_only.v1", json!({}))
+        .expect("policy binding")
+        .policy_hash;
+    let mut contract = sample_contract("task-outcome-summary", policy_hash);
+    contract.task_type = "cross-layer-type".to_owned();
+    node.store
+        .upsert_task_contract(&contract, 1)
+        .expect("upsert task contract");
+    let candidate = crate::types::Candidate {
+        candidate_id: "cand-outcome".to_owned(),
+        execution_id: "exec-outcome".to_owned(),
+        output: json!({
+            "answer": "compressed answer",
+            "decision": "approve",
+            "confidence": 0.98,
+            "check_summary": "ok",
+            "raw": {"large":"payload"}
+        }),
+        evidence_inline: vec![],
+        evidence_refs: vec![crate::types::ArtifactRef {
+            uri: "ipfs://evidence-1".to_owned(),
+            digest: "sha256:evidence-1".to_owned(),
+            size_bytes: 32,
+            mime: "application/json".to_owned(),
+            created_at: 10,
+            producer: node_id.clone(),
+        }],
+    };
+    node.store
+        .put_candidate(&contract.task_id, &node_id, &candidate)
+        .expect("put candidate");
+    let winning_candidate_hash = crate::crypto::candidate_hash(&candidate).expect("candidate hash");
+    let finalized = build_event_for_external(
+        &identity,
+        1,
+        100,
+        crate::types::EventPayload::DecisionFinalized(crate::types::DecisionFinalizedPayload {
+            task_id: contract.task_id.clone(),
+            epoch: 1,
+            candidate_id: candidate.candidate_id.clone(),
+            winning_candidate_hash,
+            finality_proof: crate::types::FinalityProof {
+                threshold: 1,
+                signatures: vec![crate::types::SignatureEnvelope {
+                    signer_node_id: node_id.clone(),
+                    signature_hex: "sig-1".to_owned(),
+                }],
+            },
+        }),
+    )
+    .expect("finalized event");
+
+    let summary = summary::task_outcome_summary_for_event(
+        &node,
+        &finalized,
+        &SwarmScope::Region("sol-1".to_owned()),
+    )
+    .expect("build outcome summary")
+    .expect("outcome summary exists");
+    apply_summary_announcement(&mut node, &summary).expect("apply outcome summary");
+
+    let outcomes = node
+        .store
+        .list_imported_task_outcomes_by_task_type("cross-layer-type", 8)
+        .expect("list imported outcomes");
+    assert_eq!(outcomes.len(), 1);
+    assert_eq!(outcomes[0].task_id, "task-outcome-summary");
+    assert_eq!(outcomes[0].candidate_id, "cand-outcome");
+    assert_eq!(
+        outcomes[0].result_summary["answer"],
+        json!("compressed answer")
+    );
+    assert_eq!(outcomes[0].result_summary["check_summary"], json!("ok"));
+    assert_eq!(outcomes[0].evidence_digest_count, 1);
+    assert_eq!(outcomes[0].scope_hint, "region:sol-1");
+}
+
+#[test]
+fn subnet_outcome_summary_and_checkpoint_anchor_mirror_to_parent_network() {
+    let identity = NodeIdentity::random();
+    let node_id = identity.node_id();
+    let membership = membership_with_roles(std::slice::from_ref(&node_id));
+    let base_store = PgStore::open_in_memory().expect("store");
+    let mainnet = base_store
+        .ensure_mainnet_bootstrap_network_topology(
+            "mainnet:watt-galaxy",
+            "Watt Galaxy",
+            &node_id,
+            &node_id,
+            1_700_000_000_000,
+        )
+        .expect("mainnet topology");
+    let subnet = base_store
+        .ensure_subnet_bootstrap_network_topology(
+            &mainnet.network.network_id,
+            "subnet:alpha",
+            "Subnet Alpha",
+            &node_id,
+            &node_id,
+            1_700_000_000_100,
+        )
+        .expect("subnet topology");
+
+    let subnet_store = base_store.for_org(&subnet.org.org_id);
+    let mut node = Node::new(identity.clone(), subnet_store, membership).expect("subnet node");
+    let policy_hash = node
+        .policy_registry()
+        .binding_for("vp.schema_only.v1", json!({}))
+        .expect("policy binding")
+        .policy_hash;
+    let mut contract = sample_contract("task-parent-outcome", policy_hash);
+    contract.task_type = "parent-outcome-type".to_owned();
+    node.store
+        .upsert_task_contract(&contract, 1)
+        .expect("upsert task contract");
+    let candidate = crate::types::Candidate {
+        candidate_id: "cand-parent-outcome".to_owned(),
+        execution_id: "exec-parent-outcome".to_owned(),
+        output: json!({"answer":"uplinked","decision":"approve","check_summary":"compressed"}),
+        evidence_inline: vec![],
+        evidence_refs: vec![],
+    };
+    node.store
+        .put_candidate(&contract.task_id, &node_id, &candidate)
+        .expect("put candidate");
+    let winning_candidate_hash = crate::crypto::candidate_hash(&candidate).expect("candidate hash");
+    let finalized = build_event_for_external(
+        &identity,
+        1,
+        120,
+        crate::types::EventPayload::DecisionFinalized(crate::types::DecisionFinalizedPayload {
+            task_id: contract.task_id.clone(),
+            epoch: 1,
+            candidate_id: candidate.candidate_id.clone(),
+            winning_candidate_hash,
+            finality_proof: crate::types::FinalityProof {
+                threshold: 1,
+                signatures: vec![crate::types::SignatureEnvelope {
+                    signer_node_id: node_id.clone(),
+                    signature_hex: "sig-parent".to_owned(),
+                }],
+            },
+        }),
+    )
+    .expect("finalized event");
+    let scope = SwarmScope::Global;
+    let summary = summary::task_outcome_summary_for_event(&node, &finalized, &scope)
+        .expect("build outcome summary")
+        .expect("outcome summary exists");
+    let checkpoint = announcements::checkpoint_announcement_for_event(&node, &finalized, &scope)
+        .expect("build checkpoint announcement")
+        .expect("checkpoint announcement exists");
+
+    assert!(
+        mirror_summary_to_parent_network(&node, &summary).expect("mirror outcome summary"),
+        "subnet outcome summary should mirror to parent network"
+    );
+    assert!(
+        announcements::mirror_checkpoint_to_parent_network(&node, &checkpoint)
+            .expect("mirror checkpoint"),
+        "subnet checkpoint anchor should mirror to parent network"
+    );
+
+    let parent_store = base_store.for_org(&mainnet.org.org_id);
+    let outcomes = parent_store
+        .list_imported_task_outcomes_by_task_type("parent-outcome-type", 8)
+        .expect("list mirrored outcomes");
+    assert_eq!(outcomes.len(), 1);
+    assert_eq!(outcomes[0].result_summary["answer"], json!("uplinked"));
+    assert_eq!(outcomes[0].checkpoint_id, checkpoint.checkpoint_id);
+    let mirrored_checkpoint = parent_store
+        .get_checkpoint_announcement("global", &checkpoint.checkpoint_id)
+        .expect("load mirrored checkpoint")
+        .expect("mirrored checkpoint exists");
+    assert_eq!(mirrored_checkpoint.artifact_path, checkpoint.artifact_path);
+
+    let revoke_event = node
+        .revoke_summary(
+            &summary.summary_id,
+            TASK_OUTCOME_SUMMARY_KIND,
+            "bad outcome summary",
+            1,
+            200,
+        )
+        .expect("revoke outcome summary");
+    assert!(
+        mirror_summary_controls_to_parent_network(&node, &revoke_event)
+            .expect("mirror outcome revoke to parent"),
+        "outcome summary revoke should mirror to parent network"
+    );
+    assert!(
+        parent_store
+            .list_imported_task_outcomes_by_task_type("parent-outcome-type", 8)
+            .expect("list mirrored outcomes after revoke")
+            .is_empty()
+    );
+}
+
+#[test]
 fn knowledge_summary_builder_respects_protocol_limit() {
     let node = Node::open_in_memory_with_roles(&[Role::Proposer]).expect("node");
     for task_id in ["task-dm-1", "task-dm-2"] {

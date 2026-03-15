@@ -43,7 +43,7 @@ use scope::{
 };
 use summary::{
     knowledge_summary_for_event, mirror_summary_controls_to_parent_network,
-    mirror_summary_to_parent_network, reputation_summary_for_event,
+    mirror_summary_to_parent_network, reputation_summary_for_event, task_outcome_summary_for_event,
 };
 
 const ENV_P2P_REGION_IDS: &str = "WATTSWARM_P2P_REGION_IDS";
@@ -51,6 +51,7 @@ const ENV_P2P_LOCAL_IDS: &str = "WATTSWARM_P2P_LOCAL_IDS";
 const ENV_P2P_NODE_IDS: &str = "WATTSWARM_P2P_NODE_IDS";
 const KNOWLEDGE_SUMMARY_KIND: &str = "knowledge_task_type_v1";
 const REPUTATION_SUMMARY_KIND: &str = "reputation_runtime_profile_v1";
+const TASK_OUTCOME_SUMMARY_KIND: &str = "task_outcome_v1";
 const MAX_INFLIGHT_BACKFILLS_PER_PEER: usize = 1;
 const SUMMARY_BACKPRESSURE_HIGH_WATERMARK: u64 = 256;
 const IDLE_NETWORK_SLEEP: Duration = Duration::from_millis(50);
@@ -94,6 +95,31 @@ fn observed_at_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
+}
+
+pub(super) fn parent_uplink_store(node: &Node) -> Result<Option<crate::storage::PgStore>> {
+    if !node.store.is_org_configured() {
+        return Ok(None);
+    }
+    let topology = node
+        .store
+        .load_network_topology_for_org(node.store.org_id())?;
+    if !topology.network.is_subnet() {
+        return Ok(None);
+    }
+    let Some(parent_topology) = node
+        .store
+        .load_parent_network_topology_for_org(node.store.org_id())?
+    else {
+        return Ok(None);
+    };
+    if !node
+        .store
+        .node_has_network_membership(&node.node_id(), &parent_topology.network.network_id)?
+    {
+        return Ok(None);
+    }
+    Ok(Some(node.store.for_org(parent_topology.org.org_id)))
 }
 
 #[derive(Debug, Clone)]
@@ -493,6 +519,14 @@ impl NetworkBridgeService {
     pub fn publish_summary(&mut self, summary: SummaryAnnouncement) -> Result<()> {
         self.runtime
             .publish_gossip(&GossipMessage::Summary(summary))
+    }
+
+    pub fn publish_checkpoint(
+        &mut self,
+        checkpoint: crate::network_p2p::CheckpointAnnouncement,
+    ) -> Result<()> {
+        self.runtime
+            .publish_gossip(&GossipMessage::Checkpoint(checkpoint))
     }
 
     pub fn request_global_backfill(

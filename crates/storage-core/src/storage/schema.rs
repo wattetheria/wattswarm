@@ -563,6 +563,24 @@ impl PgStore {
                 revoked BOOLEAN NOT NULL DEFAULT FALSE,
                 PRIMARY KEY(org_id, summary_id, runtime_id, profile_id)
             );
+
+            CREATE TABLE IF NOT EXISTS imported_task_outcomes (
+                org_id TEXT NOT NULL DEFAULT '__unset_org__',
+                summary_id TEXT NOT NULL,
+                source_node_id TEXT NOT NULL,
+                scope_hint TEXT NOT NULL,
+                task_id TEXT NOT NULL,
+                task_type TEXT NOT NULL,
+                candidate_id TEXT NOT NULL,
+                output_digest TEXT NOT NULL,
+                result_summary_json TEXT NOT NULL,
+                evidence_digest_count BIGINT NOT NULL DEFAULT 0,
+                checkpoint_id TEXT NOT NULL,
+                proof_artifact_path TEXT NOT NULL,
+                finalized_at TIMESTAMPTZ NOT NULL,
+                revoked BOOLEAN NOT NULL DEFAULT FALSE,
+                PRIMARY KEY(org_id, summary_id, task_id)
+            );
             ",
             )?;
 
@@ -698,6 +716,11 @@ impl PgStore {
                     "imported_reputation_state",
                     "org_id",
                     "ALTER TABLE imported_reputation_state ADD COLUMN org_id TEXT NOT NULL DEFAULT '__unset_org__'",
+                ),
+                (
+                    "imported_task_outcomes",
+                    "org_id",
+                    "ALTER TABLE imported_task_outcomes ADD COLUMN org_id TEXT NOT NULL DEFAULT '__unset_org__'",
                 ),
                 (
                     "task_projection",
@@ -927,6 +950,7 @@ impl PgStore {
                 ("summary_revocations", "revoked_at"),
                 ("imported_decision_memory", "finalized_at"),
                 ("imported_reputation_state", "last_updated_at"),
+                ("imported_task_outcomes", "finalized_at"),
             ];
             for (table, column) in timestamp_columns {
                 ensure_timestamp_column(&conn, table, column)?;
@@ -959,6 +983,7 @@ impl PgStore {
                 "summary_revocations",
                 "imported_decision_memory",
                 "imported_reputation_state",
+                "imported_task_outcomes",
             ] {
                 conn.execute(
                     &format!("ALTER TABLE {table} ALTER COLUMN org_id SET DEFAULT '__unset_org__'"),
@@ -1036,6 +1061,9 @@ impl PgStore {
 
                 ALTER TABLE imported_reputation_state DROP CONSTRAINT IF EXISTS imported_reputation_state_pkey;
                 ALTER TABLE imported_reputation_state ADD CONSTRAINT imported_reputation_state_pkey PRIMARY KEY (org_id, summary_id, runtime_id, profile_id);
+
+                ALTER TABLE imported_task_outcomes DROP CONSTRAINT IF EXISTS imported_task_outcomes_pkey;
+                ALTER TABLE imported_task_outcomes ADD CONSTRAINT imported_task_outcomes_pkey PRIMARY KEY (org_id, summary_id, task_id);
                 ",
             )?;
 
