@@ -1095,18 +1095,11 @@ fn reconnect_recovers_missing_events_after_partition_like_disconnect() {
     let mut service_b = make_service();
     connect_services(&mut service_a, &mut node_a, &mut service_b, &mut node_b);
 
+    // Recovery relies on the initial backfill triggered by ConnectionEstablished,
+    // not on anti-entropy.  Just pump until the backfill round-trip completes.
     let recovered = wait_until(scaled_timeout(Duration::from_secs(30)), || {
-        for _ in 0..32 {
-            let _ = pump_once(&mut service_a, &mut node_a);
-            let _ = pump_once(&mut service_b, &mut node_b);
-        }
-        let _ = service_b
-            .run_anti_entropy(&node_b)
-            .expect("run anti entropy");
-        for _ in 0..32 {
-            let _ = pump_once(&mut service_b, &mut node_b);
-            let _ = pump_once(&mut service_a, &mut node_a);
-        }
+        let _ = pump_once(&mut service_a, &mut node_a);
+        let _ = pump_once(&mut service_b, &mut node_b);
         node_b
             .task_view("task-partition-second")
             .expect("task view second")

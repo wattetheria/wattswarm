@@ -907,10 +907,17 @@ impl NetworkRuntime {
     }
 
     pub fn try_next_event(&mut self) -> Result<Option<NetworkRuntimeEvent>> {
-        let Some(event) = self.swarm.select_next_some().now_or_never() else {
-            return Ok(None);
-        };
-        self.handle_swarm_event(event)
+        loop {
+            let Some(event) = self.swarm.select_next_some().now_or_never() else {
+                return Ok(None);
+            };
+            if let Some(runtime_event) = self.handle_swarm_event(event)? {
+                return Ok(Some(runtime_event));
+            }
+            // Swarm event was consumed but mapped to None (background protocol
+            // noise such as kademlia, identify, or gossipsub heartbeats).
+            // Continue draining so callers don't starve on meaningful events.
+        }
     }
 
     fn listen_on_configured_addrs(&mut self) -> Result<()> {
