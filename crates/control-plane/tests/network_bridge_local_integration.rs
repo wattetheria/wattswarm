@@ -26,6 +26,11 @@ fn node_scoped_live_sync_only_reaches_matching_node_scope() {
 }
 
 #[test]
+fn group_scoped_live_sync_only_reaches_matching_group_scope() {
+    support::network_bridge::group_scoped_live_sync_only_reaches_matching_group_scope();
+}
+
+#[test]
 fn subnet_nodes_sync_and_mainnet_overlay_stays_isolated() {
     support::network_bridge::subnet_nodes_sync_and_mainnet_overlay_stays_isolated();
 }

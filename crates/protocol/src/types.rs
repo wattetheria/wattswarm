@@ -2,6 +2,20 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 
+fn dedup_preserve_order<I>(values: I) -> Vec<String>
+where
+    I: IntoIterator<Item = String>,
+{
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for value in values {
+        if seen.insert(value.clone()) {
+            out.push(value);
+        }
+    }
+    out
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Role {
@@ -66,6 +80,78 @@ pub struct TaskContract {
     pub task_mode: TaskMode,
     pub expiry_ms: u64,
     pub evidence_policy: EvidencePolicy,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct TransportRoute {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub target_node_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub relation_tags: Vec<String>,
+    #[serde(default, skip_serializing_if = "is_zero_u8")]
+    pub forward_budget: u8,
+}
+
+fn is_zero_u8(value: &u8) -> bool {
+    *value == 0
+}
+
+impl TransportRoute {
+    pub fn from_value(value: &Value) -> Option<Self> {
+        serde_json::from_value::<Self>(value.clone())
+            .ok()
+            .map(|route| route.normalized())
+    }
+
+    pub fn normalized(mut self) -> Self {
+        self.group_id = self
+            .group_id
+            .map(|id| id.trim().to_owned())
+            .filter(|id| !id.is_empty());
+        self.target_node_ids = dedup_preserve_order(
+            self.target_node_ids
+                .into_iter()
+                .map(|id| id.trim().to_owned())
+                .filter(|id| !id.is_empty()),
+        );
+        self.relation_tags = dedup_preserve_order(
+            self.relation_tags
+                .into_iter()
+                .map(|tag| tag.trim().to_owned())
+                .filter(|tag| !tag.is_empty()),
+        );
+        self
+    }
+
+    pub fn allows_node(&self, node_id: &str) -> bool {
+        self.target_node_ids.is_empty() || self.target_node_ids.iter().any(|id| id == node_id)
+    }
+
+    pub fn matches_group(&self, group_id: &str) -> bool {
+        self.group_id
+            .as_deref()
+            .is_none_or(|configured| configured == group_id)
+    }
+
+    pub fn can_forward(&self) -> bool {
+        self.forward_budget > 0
+    }
+
+    pub fn decrement_forward_budget(&self) -> Self {
+        let mut next = self.clone();
+        next.forward_budget = next.forward_budget.saturating_sub(1);
+        next
+    }
+}
+
+impl TaskContract {
+    pub fn transport_route(&self) -> Option<TransportRoute> {
+        self.inputs
+            .get("swarm_route")
+            .and_then(TransportRoute::from_value)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1139,6 +1225,7 @@ pub enum ScopeHint {
     Global,
     Region(String),
     Node(String),
+    Group(String),
 }
 
 impl ScopeHint {
@@ -1167,6 +1254,7 @@ impl ScopeHint {
         match kind.trim().to_ascii_lowercase().as_str() {
             "region" => Some(Self::Region(id.to_owned())),
             "local" | "node" => Some(Self::Node(id.to_owned())),
+            "group" => Some(Self::Group(id.to_owned())),
             _ => None,
         }
     }
@@ -1176,6 +1264,7 @@ impl ScopeHint {
             Self::Global => "global".to_owned(),
             Self::Region(id) => format!("region:{id}"),
             Self::Node(id) => format!("node:{id}"),
+            Self::Group(id) => format!("group:{id}"),
         }
     }
 

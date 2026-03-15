@@ -41,6 +41,19 @@ fn network_substrate_reads_canonicalize_scope_hints() {
         .list_active_feed_subscription_scopes("node-a")
         .expect("load scopes");
     assert_eq!(scopes, vec![ProjectionScope::Node("lab-9".to_owned())]);
+
+    store
+        .upsert_feed_subscription("node-a", "feed-group", " group:crew-7 ", true, 101)
+        .expect("upsert group subscription");
+    let group_subscription = store
+        .get_feed_subscription("node-a", "feed-group")
+        .expect("load group subscription")
+        .expect("group subscription exists");
+    assert_eq!(group_subscription.scope_hint, "group:crew-7");
+    assert_eq!(
+        group_subscription.scope(),
+        Some(ProjectionScope::Group("crew-7".to_owned()))
+    );
 }
 
 #[test]

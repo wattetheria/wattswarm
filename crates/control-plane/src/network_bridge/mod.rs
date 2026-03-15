@@ -102,6 +102,7 @@ fn scope_hint_label(scope: &SwarmScope) -> String {
         SwarmScope::Global => "global".to_owned(),
         SwarmScope::Region(id) => format!("region:{id}"),
         SwarmScope::Node(id) => format!("node:{id}"),
+        SwarmScope::Group(id) => format!("group:{id}"),
     }
 }
 
@@ -436,6 +437,11 @@ pub struct NetworkBridgePeerHealth {
     pub connected: bool,
     pub score: i64,
     pub blacklisted: bool,
+    pub reputation_tier: String,
+    pub quarantined: bool,
+    pub quarantine_remaining_ms: u64,
+    pub ban_remaining_ms: u64,
+    pub throttle_factor_percent: u32,
     pub known_scopes: Vec<String>,
     pub inflight_backfills: usize,
     pub next_retry_in_ms: u64,
@@ -673,6 +679,13 @@ impl NetworkBridgeService {
                     .any(|peer_id| peer_id.to_string() == peer),
                 score: traffic.map_or(0, |entry| entry.score),
                 blacklisted: traffic.is_some_and(|entry| entry.blacklisted),
+                reputation_tier: traffic
+                    .map(|entry| entry.reputation_tier.clone())
+                    .unwrap_or_else(|| "healthy".to_owned()),
+                quarantined: traffic.is_some_and(|entry| entry.quarantined),
+                quarantine_remaining_ms: traffic.map_or(0, |entry| entry.quarantine_remaining_ms),
+                ban_remaining_ms: traffic.map_or(0, |entry| entry.ban_remaining_ms),
+                throttle_factor_percent: traffic.map_or(100, |entry| entry.throttle_factor_percent),
                 known_scopes,
                 inflight_backfills: sync.map_or(0, |state| state.inflight_backfills),
                 next_retry_in_ms: sync.map_or(0, |state| {
@@ -839,14 +852,42 @@ impl NetworkBridgeService {
         now: Instant,
     ) -> Option<PeerId> {
         let peers = self.connected_peers.iter().copied().collect::<Vec<_>>();
+        self.best_peer_for_scope(peers.iter().copied(), scope, now, true)
+            .or_else(|| self.best_peer_for_scope(peers.into_iter(), scope, now, false))
+    }
+
+    fn best_peer_for_scope<I>(
+        &self,
+        peers: I,
+        scope: &SwarmScope,
+        now: Instant,
+        require_known_scope: bool,
+    ) -> Option<PeerId>
+    where
+        I: Iterator<Item = PeerId>,
+    {
+        let runtime = self.runtime.observability_snapshot();
+        let peer_scores = runtime
+            .peer_health
+            .into_iter()
+            .map(|entry| (entry.peer.clone(), entry))
+            .collect::<HashMap<_, _>>();
         peers
-            .iter()
-            .copied()
-            .find(|peer| self.peer_is_eligible_for_scope(peer, scope, now, true))
-            .or_else(|| {
-                peers
-                    .into_iter()
-                    .find(|peer| self.peer_is_eligible_for_scope(peer, scope, now, false))
+            .filter(|peer| self.peer_is_eligible_for_scope(peer, scope, now, require_known_scope))
+            .max_by(|left, right| {
+                let left_key = peer_scores
+                    .get(&left.to_string())
+                    .map_or((0_i64, 100_u32), |entry| {
+                        (entry.score, entry.throttle_factor_percent)
+                    });
+                let right_key = peer_scores
+                    .get(&right.to_string())
+                    .map_or((0_i64, 100_u32), |entry| {
+                        (entry.score, entry.throttle_factor_percent)
+                    });
+                left_key
+                    .cmp(&right_key)
+                    .then_with(|| left.to_string().cmp(&right.to_string()))
             })
     }
 
@@ -857,6 +898,9 @@ impl NetworkBridgeService {
         now: Instant,
         require_known_scope: bool,
     ) -> bool {
+        if !self.runtime.allows_outbound_backfill_to(peer) {
+            return false;
+        }
         match self.peer_sync_state.get(peer) {
             Some(state) => {
                 if require_known_scope && !state.known_scopes.contains(scope) {

@@ -827,6 +827,10 @@ fn parse_scope_hint_string_preserves_task_type_style_prefix_fallback() {
         scope::parse_scope_hint_string(" local:lab-7:worker "),
         Some(SwarmScope::Node("lab-7".to_owned()))
     );
+    assert_eq!(
+        scope::parse_scope_hint_string(" group:crew-7:worker "),
+        Some(SwarmScope::Group("crew-7".to_owned()))
+    );
 }
 
 #[test]
@@ -1625,6 +1629,11 @@ fn observability_snapshot_reports_network_and_sync_health() {
     assert!(snapshot.peer_health[0].connected);
     assert!(!snapshot.peer_health[0].blacklisted);
     assert_eq!(snapshot.peer_health[0].score, 0);
+    assert_eq!(snapshot.peer_health[0].reputation_tier, "healthy");
+    assert!(!snapshot.peer_health[0].quarantined);
+    assert_eq!(snapshot.peer_health[0].quarantine_remaining_ms, 0);
+    assert_eq!(snapshot.peer_health[0].ban_remaining_ms, 0);
+    assert_eq!(snapshot.peer_health[0].throttle_factor_percent, 100);
     assert_eq!(
         snapshot.peer_health[0].known_scopes,
         vec!["global".to_owned(), "region:sol-1".to_owned()]

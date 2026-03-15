@@ -994,10 +994,19 @@ fn remote_bridge_scope_hint(raw: &str) -> String {
     crate::types::normalized_scope_hint(raw)
 }
 
-fn remote_task_bridge_allowed_for_scope(node_id: &str, scope_hint: &str) -> bool {
+fn remote_task_bridge_allowed_for_scope(
+    node_id: &str,
+    scope_hint: &str,
+    route: Option<&crate::types::TransportRoute>,
+) -> bool {
     match crate::types::ScopeHint::parse_with_prefix_fallback(scope_hint) {
         Some(crate::types::ScopeHint::Node(target)) => target == node_id,
-        Some(crate::types::ScopeHint::Global | crate::types::ScopeHint::Region(_)) => true,
+        Some(crate::types::ScopeHint::Group(group_id)) => {
+            route.is_some_and(|route| route.matches_group(&group_id) && route.allows_node(node_id))
+        }
+        Some(crate::types::ScopeHint::Global | crate::types::ScopeHint::Region(_)) => {
+            route.is_none_or(|route| route.allows_node(node_id))
+        }
         None => scope_hint.trim().is_empty(),
     }
 }
@@ -1118,8 +1127,10 @@ pub fn bridge_remote_task_into_local_execution(
         .ok_or_else(|| anyhow!("remote task announcement missing for task {}", task_id))?;
     let announcement = detail.announcement.clone();
     let network_id = current_network_context_id(node);
+    let contract = bridged_task_contract(node, state_dir, &task_id)?;
+    let route = contract.transport_route();
     let scope_hint = remote_bridge_scope_hint(&announcement.scope_hint);
-    if !remote_task_bridge_allowed_for_scope(&node.node_id(), &scope_hint) {
+    if !remote_task_bridge_allowed_for_scope(&node.node_id(), &scope_hint, route.as_ref()) {
         return Err(anyhow!(
             "remote task {} is not eligible for local node {} under scope {}",
             task_id,
@@ -1151,7 +1162,6 @@ pub fn bridge_remote_task_into_local_execution(
     }
 
     let prepared = prepare_runtime_for_executor(state_dir, &executor, &profile)?;
-    let contract = bridged_task_contract(node, state_dir, &task_id)?;
     if node.task_view(&task_id)?.is_none() {
         node.submit_task(contract, 1, observed_at_ms())?;
     }

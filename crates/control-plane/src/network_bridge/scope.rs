@@ -6,6 +6,7 @@ fn scope_from_projection_scope(scope: ProjectionScope) -> SwarmScope {
         ProjectionScope::Global => SwarmScope::Global,
         ProjectionScope::Region(id) => SwarmScope::Region(id),
         ProjectionScope::Node(id) => SwarmScope::Node(id),
+        ProjectionScope::Group(id) => SwarmScope::Group(id),
     }
 }
 

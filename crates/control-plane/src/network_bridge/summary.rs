@@ -178,6 +178,7 @@ fn canonical_scope_hint(scope: &SwarmScope) -> String {
         SwarmScope::Global => "global".to_owned(),
         SwarmScope::Region(id) => format!("region:{id}"),
         SwarmScope::Node(id) => format!("node:{id}"),
+        SwarmScope::Group(id) => format!("group:{id}"),
     }
 }
 

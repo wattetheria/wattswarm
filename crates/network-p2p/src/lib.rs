@@ -52,7 +52,12 @@ const PER_PEER_MSGS_PER_WINDOW: usize = 1_200;
 const PER_PEER_TOPIC_MSGS_PER_WINDOW: usize = 600;
 const PER_TOPIC_PUBLISHES_PER_WINDOW: usize = 600;
 const PER_PEER_BACKFILL_REQUESTS_PER_WINDOW: usize = 60;
-const TRAFFIC_BLACKLIST_SCORE: i64 = -8;
+const TRAFFIC_THROTTLED_SCORE: i64 = -4;
+const TRAFFIC_QUARANTINE_SCORE: i64 = -8;
+const TRAFFIC_BAN_SCORE: i64 = -16;
+const TRAFFIC_QUARANTINE_DURATION: Duration = Duration::from_secs(90);
+const TRAFFIC_BAN_DURATION: Duration = Duration::from_secs(5 * 60);
+const TRAFFIC_FAILURE_PENALTY: i64 = 2;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -60,6 +65,7 @@ pub enum SwarmScope {
     Global,
     Region(String),
     Node(String),
+    Group(String),
 }
 
 impl SwarmScope {
@@ -68,6 +74,7 @@ impl SwarmScope {
             Self::Global => Ok("global".to_owned()),
             Self::Region(region_id) => Ok(format!("region.{}", sanitize_segment(region_id)?)),
             Self::Node(node_id) => Ok(format!("node.{}", sanitize_segment(node_id)?)),
+            Self::Group(group_id) => Ok(format!("group.{}", sanitize_segment(group_id)?)),
         }
     }
 }
@@ -767,6 +774,11 @@ pub struct TrafficGuardPeerHealth {
     pub peer: String,
     pub score: i64,
     pub blacklisted: bool,
+    pub reputation_tier: String,
+    pub quarantined: bool,
+    pub quarantine_remaining_ms: u64,
+    pub ban_remaining_ms: u64,
+    pub throttle_factor_percent: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -786,7 +798,36 @@ struct TrafficGuard {
     local_publish_windows: HashMap<String, Vec<Instant>>,
     backfill_request_windows: HashMap<PeerId, Vec<Instant>>,
     peer_scores: HashMap<PeerId, i64>,
-    blacklisted_peers: HashSet<PeerId>,
+    quarantined_peers: HashMap<PeerId, Instant>,
+    banned_peers: HashMap<PeerId, Instant>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TrafficPolicyTier {
+    Healthy,
+    Throttled,
+    Quarantined,
+    Banned,
+}
+
+impl TrafficPolicyTier {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Healthy => "healthy",
+            Self::Throttled => "throttled",
+            Self::Quarantined => "quarantined",
+            Self::Banned => "banned",
+        }
+    }
+
+    fn throttle_factor_percent(self) -> u32 {
+        match self {
+            Self::Healthy => 100,
+            Self::Throttled => 50,
+            Self::Quarantined => 0,
+            Self::Banned => 0,
+        }
+    }
 }
 
 impl TrafficGuard {
@@ -798,7 +839,8 @@ impl TrafficGuard {
             local_publish_windows: HashMap::new(),
             backfill_request_windows: HashMap::new(),
             peer_scores: HashMap::new(),
-            blacklisted_peers: HashSet::new(),
+            quarantined_peers: HashMap::new(),
+            banned_peers: HashMap::new(),
         }
     }
 
@@ -822,7 +864,12 @@ impl TrafficGuard {
         data: &[u8],
         now: Instant,
     ) -> bool {
-        if self.blacklisted_peers.contains(&source_peer) {
+        self.gc_peer_actions(now);
+        let policy = self.policy_for_peer(source_peer, now);
+        if matches!(
+            policy,
+            TrafficPolicyTier::Quarantined | TrafficPolicyTier::Banned
+        ) {
             return false;
         }
 
@@ -833,64 +880,144 @@ impl TrafficGuard {
             .get(&digest)
             .is_some_and(|seen_at| now.duration_since(*seen_at) <= TRAFFIC_DEDUPE_TTL)
         {
-            self.penalize(source_peer, 1);
+            self.penalize(source_peer, 1, now);
             return false;
         }
         self.seen_messages.insert(digest, now);
 
+        let peer_limit = throttled_limit(PER_PEER_MSGS_PER_WINDOW, policy);
         let peer_window = self.peer_windows.entry(source_peer).or_default();
         prune_window(peer_window, now, TRAFFIC_WINDOW);
-        if peer_window.len() >= PER_PEER_MSGS_PER_WINDOW {
-            self.penalize(source_peer, 3);
+        if peer_window.len() >= peer_limit {
+            self.penalize(source_peer, 3, now);
             return false;
         }
         peer_window.push(now);
 
+        let topic_limit = throttled_limit(PER_PEER_TOPIC_MSGS_PER_WINDOW, policy);
         let topic_window = self
             .peer_topic_windows
             .entry((source_peer, topic.to_owned()))
             .or_default();
         prune_window(topic_window, now, TRAFFIC_WINDOW);
-        if topic_window.len() >= PER_PEER_TOPIC_MSGS_PER_WINDOW {
-            self.penalize(source_peer, 2);
+        if topic_window.len() >= topic_limit {
+            self.penalize(source_peer, 2, now);
             return false;
         }
         topic_window.push(now);
 
-        self.reward(source_peer, 1);
+        self.reward(source_peer, 1, now);
         true
     }
 
     fn allow_backfill_request(&mut self, peer: PeerId, now: Instant) -> bool {
-        if self.blacklisted_peers.contains(&peer) {
+        self.gc_peer_actions(now);
+        let policy = self.policy_for_peer(peer, now);
+        if matches!(
+            policy,
+            TrafficPolicyTier::Quarantined | TrafficPolicyTier::Banned
+        ) {
             return false;
         }
+        let backfill_limit = throttled_limit(PER_PEER_BACKFILL_REQUESTS_PER_WINDOW, policy);
         let window = self.backfill_request_windows.entry(peer).or_default();
         prune_window(window, now, TRAFFIC_WINDOW);
-        if window.len() >= PER_PEER_BACKFILL_REQUESTS_PER_WINDOW {
-            self.penalize(peer, 2);
+        if window.len() >= backfill_limit {
+            self.penalize(peer, 2, now);
             return false;
         }
         window.push(now);
         true
     }
 
-    fn penalize(&mut self, peer: PeerId, amount: i64) {
+    fn penalize(&mut self, peer: PeerId, amount: i64, now: Instant) {
         let score = self.peer_scores.entry(peer).or_insert(0);
         *score -= amount;
-        if *score <= TRAFFIC_BLACKLIST_SCORE {
-            self.blacklisted_peers.insert(peer);
+        if *score <= TRAFFIC_BAN_SCORE {
+            self.banned_peers.insert(peer, now + TRAFFIC_BAN_DURATION);
+            self.quarantined_peers.remove(&peer);
+        } else if *score <= TRAFFIC_QUARANTINE_SCORE {
+            let until = now + TRAFFIC_QUARANTINE_DURATION;
+            self.quarantined_peers
+                .entry(peer)
+                .and_modify(|existing| {
+                    if *existing < until {
+                        *existing = until;
+                    }
+                })
+                .or_insert(until);
         }
     }
 
-    fn reward(&mut self, peer: PeerId, amount: i64) {
+    fn reward(&mut self, peer: PeerId, amount: i64, now: Instant) {
+        self.gc_peer_actions(now);
         let score = self.peer_scores.entry(peer).or_insert(0);
         *score = (*score + amount).min(100);
+        if *score > TRAFFIC_QUARANTINE_SCORE {
+            self.quarantined_peers.remove(&peer);
+        }
     }
 
     fn gc_seen(&mut self, now: Instant) {
         self.seen_messages
             .retain(|_, seen_at| now.duration_since(*seen_at) <= TRAFFIC_DEDUPE_TTL);
+    }
+
+    fn gc_peer_actions(&mut self, now: Instant) {
+        self.quarantined_peers.retain(|_, until| *until > now);
+        self.banned_peers.retain(|_, until| *until > now);
+    }
+
+    fn policy_for_peer(&self, peer: PeerId, now: Instant) -> TrafficPolicyTier {
+        if self
+            .banned_peers
+            .get(&peer)
+            .is_some_and(|until| *until > now)
+        {
+            return TrafficPolicyTier::Banned;
+        }
+        if self
+            .quarantined_peers
+            .get(&peer)
+            .is_some_and(|until| *until > now)
+        {
+            return TrafficPolicyTier::Quarantined;
+        }
+        let score = self.peer_scores.get(&peer).copied().unwrap_or(0);
+        if score <= TRAFFIC_THROTTLED_SCORE {
+            TrafficPolicyTier::Throttled
+        } else {
+            TrafficPolicyTier::Healthy
+        }
+    }
+
+    fn quarantine_remaining_ms(&self, peer: PeerId, now: Instant) -> u64 {
+        self.quarantined_peers
+            .get(&peer)
+            .map(|until| until.saturating_duration_since(now).as_millis() as u64)
+            .unwrap_or(0)
+    }
+
+    fn ban_remaining_ms(&self, peer: PeerId, now: Instant) -> u64 {
+        self.banned_peers
+            .get(&peer)
+            .map(|until| until.saturating_duration_since(now).as_millis() as u64)
+            .unwrap_or(0)
+    }
+
+    fn note_backfill_failure(&mut self, peer: PeerId, now: Instant) {
+        self.penalize(peer, TRAFFIC_FAILURE_PENALTY, now);
+    }
+
+    fn note_handshake_rejection(&mut self, peer: PeerId, now: Instant) {
+        self.penalize(peer, TRAFFIC_QUARANTINE_SCORE.abs(), now);
+    }
+
+    fn allows_outbound_backfill(&self, peer: PeerId, now: Instant) -> bool {
+        !matches!(
+            self.policy_for_peer(peer, now),
+            TrafficPolicyTier::Quarantined | TrafficPolicyTier::Banned
+        )
     }
 }
 
@@ -932,14 +1059,23 @@ impl NetworkRuntime {
     }
 
     pub fn observability_snapshot(&self) -> NetworkRuntimeObservabilitySnapshot {
+        let now = Instant::now();
         let mut peer_health = self
             .traffic_guard
             .peer_scores
             .iter()
-            .map(|(peer, score)| TrafficGuardPeerHealth {
-                peer: peer.to_string(),
-                score: *score,
-                blacklisted: self.traffic_guard.blacklisted_peers.contains(peer),
+            .map(|(peer, score)| {
+                let policy = self.traffic_guard.policy_for_peer(*peer, now);
+                TrafficGuardPeerHealth {
+                    peer: peer.to_string(),
+                    score: *score,
+                    blacklisted: matches!(policy, TrafficPolicyTier::Banned),
+                    reputation_tier: policy.as_str().to_owned(),
+                    quarantined: matches!(policy, TrafficPolicyTier::Quarantined),
+                    quarantine_remaining_ms: self.traffic_guard.quarantine_remaining_ms(*peer, now),
+                    ban_remaining_ms: self.traffic_guard.ban_remaining_ms(*peer, now),
+                    throttle_factor_percent: policy.throttle_factor_percent(),
+                }
             })
             .collect::<Vec<_>>();
         peer_health.sort_by(|left, right| left.peer.cmp(&right.peer));
@@ -954,6 +1090,11 @@ impl NetworkRuntime {
             relay_reservations,
             peer_health,
         }
+    }
+
+    pub fn allows_outbound_backfill_to(&self, peer: &PeerId) -> bool {
+        self.traffic_guard
+            .allows_outbound_backfill(*peer, Instant::now())
     }
 
     fn validate_identify_info(&self, info: &identify::Info) -> Result<Vec<Multiaddr>> {
@@ -1261,17 +1402,25 @@ impl NetworkRuntime {
                     error,
                     ..
                 },
-            )) => Ok(Some(NetworkRuntimeEvent::BackfillOutboundFailure {
-                peer,
-                request_id,
-                error: error.to_string(),
-            })),
+            )) => {
+                self.traffic_guard
+                    .note_backfill_failure(peer, Instant::now());
+                Ok(Some(NetworkRuntimeEvent::BackfillOutboundFailure {
+                    peer,
+                    request_id,
+                    error: error.to_string(),
+                }))
+            }
             SwarmEvent::Behaviour(WattSwarmBehaviourEvent::RequestResponse(
                 request_response::Event::InboundFailure { peer, error, .. },
-            )) => Ok(Some(NetworkRuntimeEvent::BackfillInboundFailure {
-                peer,
-                error: error.to_string(),
-            })),
+            )) => {
+                self.traffic_guard
+                    .note_backfill_failure(peer, Instant::now());
+                Ok(Some(NetworkRuntimeEvent::BackfillInboundFailure {
+                    peer,
+                    error: error.to_string(),
+                }))
+            }
             SwarmEvent::Behaviour(WattSwarmBehaviourEvent::Mdns(mdns::Event::Discovered(
                 discovered,
             ))) => {
@@ -1300,6 +1449,8 @@ impl NetworkRuntime {
                     Ok(None)
                 }
                 Err(err) => {
+                    self.traffic_guard
+                        .note_handshake_rejection(peer_id, Instant::now());
                     let detail = err.to_string();
                     let _ = self.swarm.disconnect_peer_id(peer_id);
                     Ok(Some(NetworkRuntimeEvent::PeerHandshakeRejected {
@@ -1405,6 +1556,11 @@ fn traffic_digest(data: &[u8]) -> u64 {
     hasher.finish()
 }
 
+fn throttled_limit(base: usize, policy: TrafficPolicyTier) -> usize {
+    let factor = policy.throttle_factor_percent() as usize;
+    ((base.saturating_mul(factor)).max(100)) / 100
+}
+
 fn nat_status_label(status: &autonat::NatStatus) -> String {
     match status {
         autonat::NatStatus::Public(_) => "public".to_owned(),
@@ -1479,6 +1635,13 @@ mod tests {
         assert_eq!(
             catalog.rules,
             "wattswarm-main.mainnet-watt-galaxy.region.sol-1-alpha.rules"
+        );
+
+        let group_catalog = TopicCatalog::new(&namespace, &SwarmScope::Group("crew/7".to_owned()))
+            .expect("group catalog");
+        assert_eq!(
+            group_catalog.events,
+            "wattswarm-main.mainnet-watt-galaxy.group.crew-7.events"
         );
     }
 
@@ -1707,6 +1870,70 @@ mod tests {
         }
         later += Duration::from_millis(1);
         assert!(!guard.allow_backfill_request(peer, later));
+        assert_eq!(
+            guard.policy_for_peer(peer, later),
+            TrafficPolicyTier::Healthy
+        );
+
+        for _ in 0..3 {
+            later += Duration::from_millis(1);
+            assert!(!guard.allow_backfill_request(peer, later));
+        }
+        assert_eq!(
+            guard.policy_for_peer(peer, later),
+            TrafficPolicyTier::Quarantined
+        );
+        assert!(!guard.allows_outbound_backfill(peer, later));
+
+        let after_quarantine = later + TRAFFIC_QUARANTINE_DURATION + Duration::from_millis(1);
+        assert_eq!(
+            guard.policy_for_peer(peer, after_quarantine),
+            TrafficPolicyTier::Throttled
+        );
+
+        guard.note_backfill_failure(peer, later);
+        guard.note_backfill_failure(peer, later);
+        guard.note_backfill_failure(peer, later);
+        guard.note_backfill_failure(peer, later);
+        assert_eq!(
+            guard.policy_for_peer(peer, later),
+            TrafficPolicyTier::Banned
+        );
+        assert!(!guard.allows_outbound_backfill(peer, later));
+    }
+
+    #[test]
+    fn traffic_guard_snapshot_reports_quarantine_and_ban_budget() {
+        let peer = identity::Keypair::generate_ed25519().public().to_peer_id();
+        let mut guard = TrafficGuard::new();
+        let now = Instant::now();
+
+        guard.note_handshake_rejection(peer, now);
+        let quarantine_snapshot = TrafficGuardPeerHealth {
+            peer: peer.to_string(),
+            score: guard.peer_scores.get(&peer).copied().unwrap_or_default(),
+            blacklisted: matches!(guard.policy_for_peer(peer, now), TrafficPolicyTier::Banned),
+            reputation_tier: guard.policy_for_peer(peer, now).as_str().to_owned(),
+            quarantined: matches!(
+                guard.policy_for_peer(peer, now),
+                TrafficPolicyTier::Quarantined
+            ),
+            quarantine_remaining_ms: guard.quarantine_remaining_ms(peer, now),
+            ban_remaining_ms: guard.ban_remaining_ms(peer, now),
+            throttle_factor_percent: guard.policy_for_peer(peer, now).throttle_factor_percent(),
+        };
+        assert_eq!(quarantine_snapshot.reputation_tier, "quarantined");
+        assert!(quarantine_snapshot.quarantined);
+        assert!(quarantine_snapshot.quarantine_remaining_ms > 0);
+        assert_eq!(quarantine_snapshot.throttle_factor_percent, 0);
+
+        guard.note_backfill_failure(peer, now);
+        guard.note_backfill_failure(peer, now);
+        guard.note_backfill_failure(peer, now);
+        guard.note_backfill_failure(peer, now);
+        let banned = guard.policy_for_peer(peer, now);
+        assert_eq!(banned, TrafficPolicyTier::Banned);
+        assert!(guard.ban_remaining_ms(peer, now) > 0);
     }
 
     #[test]

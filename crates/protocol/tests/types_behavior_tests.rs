@@ -3,8 +3,8 @@ use wattswarm_protocol::types::{
     ExecutionIntentDeclaredPayload, ExecutionSetConfirmedPayload, FeedSubscriptionUpdatedPayload,
     Membership, NetworkDescriptor, NetworkKind, NetworkTopology, NodePenalizedPayload,
     OrgDescriptor, PolicyBinding, Role, ScopeHint, SummaryRevokedPayload, TaskAnnouncedPayload,
-    TaskContract, TaskDisseminationLayer, TaskExpiredPayload, TaskMode, UnsignedEvent,
-    canonical_scope_hint, normalized_scope_hint,
+    TaskContract, TaskDisseminationLayer, TaskExpiredPayload, TaskMode, TransportRoute,
+    UnsignedEvent, canonical_scope_hint, normalized_scope_hint,
 };
 
 #[test]
@@ -174,6 +174,10 @@ fn scope_hint_parse_and_canonicalization_are_shared() {
         ScopeHint::parse(" local:lab-9 "),
         Some(ScopeHint::Node("lab-9".to_owned()))
     );
+    assert_eq!(
+        ScopeHint::parse(" group:crew-7 "),
+        Some(ScopeHint::Group("crew-7".to_owned()))
+    );
     assert_eq!(ScopeHint::parse("bad-scope"), None);
     assert_eq!(
         ScopeHint::from_kind_id(" region ", " sol-2 "),
@@ -243,6 +247,10 @@ fn scope_hint_parse_and_canonicalization_are_shared() {
         canonical_scope_hint(" local:lab-9 "),
         Some("node:lab-9".to_owned())
     );
+    assert_eq!(
+        canonical_scope_hint(" group:crew-7 "),
+        Some("group:crew-7".to_owned())
+    );
     assert_eq!(normalized_scope_hint(" local:lab-9 "), "node:lab-9");
     assert_eq!(normalized_scope_hint(" custom/raw "), "custom/raw");
 
@@ -254,6 +262,108 @@ fn scope_hint_parse_and_canonicalization_are_shared() {
         ScopeHint::parse_with_prefix_fallback(" local:lab-9:worker "),
         Some(ScopeHint::Node("lab-9".to_owned()))
     );
+    assert_eq!(
+        ScopeHint::parse_with_prefix_fallback(" group:crew-7:task "),
+        Some(ScopeHint::Group("crew-7".to_owned()))
+    );
+}
+
+#[test]
+fn transport_route_normalizes_targets_and_bounded_forwarding() {
+    let route = TransportRoute::from_value(&serde_json::json!({
+        "group_id": " crew-7 ",
+        "target_node_ids": [" node-a ", "node-b", "node-a"],
+        "relation_tags": [" trust ", "coop", "trust"],
+        "forward_budget": 2
+    }))
+    .expect("route");
+
+    assert_eq!(route.group_id.as_deref(), Some("crew-7"));
+    assert_eq!(
+        route.target_node_ids,
+        vec!["node-a".to_owned(), "node-b".to_owned()]
+    );
+    assert_eq!(
+        route.relation_tags,
+        vec!["trust".to_owned(), "coop".to_owned()]
+    );
+    assert!(route.matches_group("crew-7"));
+    assert!(route.allows_node("node-a"));
+    assert!(!route.allows_node("node-z"));
+    assert!(route.can_forward());
+    assert_eq!(route.decrement_forward_budget().forward_budget, 1);
+}
+
+#[test]
+fn task_contract_transport_route_reads_swarm_route_input() {
+    let contract: TaskContract = serde_json::from_value(serde_json::json!({
+        "protocol_version": "0.1.0",
+        "task_id": "task-route",
+        "task_type": "group:crew-7:analysis",
+        "inputs": {
+            "prompt": "route me",
+            "swarm_scope": "group:crew-7",
+            "swarm_route": {
+                "group_id": "crew-7",
+                "target_node_ids": ["node-a", "node-b"],
+                "relation_tags": ["trust"],
+                "forward_budget": 1
+            }
+        },
+        "output_schema": {"type":"object"},
+        "budget": {
+            "time_ms": 1000,
+            "max_steps": 4,
+            "cost_units": 10,
+            "mode": "LIFETIME",
+            "explore_cost_units": 0,
+            "verify_cost_units": 0,
+            "finalize_cost_units": 0,
+            "reuse_verify_time_ms": 100,
+            "reuse_verify_cost_units": 1,
+            "reuse_max_attempts": 1
+        },
+        "assignment": {
+            "mode": "solo",
+            "claim": {
+                "lease_ms": 1000,
+                "max_concurrency": {"propose": 1, "verify": 1}
+            },
+            "explore": {"max_proposers": 1, "topk": 1, "stop": {"no_new_evidence_rounds": 1}},
+            "verify": {"max_verifiers": 1},
+            "finalize": {"max_finalizers": 1}
+        },
+        "acceptance": {
+            "quorum_threshold": 1,
+            "verifier_policy": {
+                "policy_id": "vp.schema_only.v1",
+                "policy_version": "1",
+                "policy_hash": "policy-hash",
+                "policy_params": {}
+            },
+            "vote": {"commit_reveal": false, "reveal_deadline_ms": 1000},
+            "settlement": {
+                "window_ms": 1000,
+                "implicit_weight": 0.0,
+                "implicit_diminishing_returns": {"W": 1, "K": 1},
+                "bad_penalty": {"P": 100},
+                "feedback": {"mode": "open", "authority_pubkey": "pk"}
+            },
+            "da_quorum_threshold": 1
+        },
+        "task_mode": "ONE_SHOT",
+        "expiry_ms": 1000,
+        "evidence_policy": {
+            "max_inline_evidence_bytes": 1024,
+            "max_inline_media_bytes": 0,
+            "inline_mime_allowlist": ["text/plain"]
+        }
+    }))
+    .expect("contract");
+
+    let route = contract.transport_route().expect("contract route");
+    assert_eq!(route.group_id.as_deref(), Some("crew-7"));
+    assert_eq!(route.forward_budget, 1);
 }
 
 #[test]

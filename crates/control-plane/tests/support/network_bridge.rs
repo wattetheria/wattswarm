@@ -801,6 +801,80 @@ pub fn node_scoped_live_sync_only_reaches_matching_node_scope() {
     );
 }
 
+pub fn group_scoped_live_sync_only_reaches_matching_group_scope() {
+    let identity_a = NodeIdentity::random();
+    let identity_b = NodeIdentity::random();
+    let identity_c = NodeIdentity::random();
+    let membership = membership_with_roles(&[
+        identity_a.node_id(),
+        identity_b.node_id(),
+        identity_c.node_id(),
+    ]);
+    let mut node_a = make_node(identity_a, membership.clone());
+    let mut node_b = make_node(identity_b, membership.clone());
+    let mut node_c = make_node(identity_c, membership);
+    let mut service_a =
+        make_service_with_scopes(&[SwarmScope::Global, SwarmScope::Group("crew-7".to_owned())]);
+    let mut service_b =
+        make_service_with_scopes(&[SwarmScope::Global, SwarmScope::Group("crew-7".to_owned())]);
+    let mut service_c =
+        make_service_with_scopes(&[SwarmScope::Global, SwarmScope::Group("crew-8".to_owned())]);
+
+    connect_services(&mut service_a, &mut node_a, &mut service_b, &mut node_b);
+    connect_services(&mut service_a, &mut node_a, &mut service_c, &mut node_c);
+
+    let policy_hash = node_a
+        .policy_registry()
+        .binding_for("vp.schema_only.v1", json!({}))
+        .expect("policy binding")
+        .policy_hash;
+    let mut contract = sample_contract("task-group-live", policy_hash);
+    contract.task_type = "group:crew-7:swarm".to_owned();
+    contract.inputs = json!({
+        "prompt":"group-scoped sync",
+        "swarm_scope":"group:crew-7",
+        "swarm_route":{
+            "group_id":"crew-7",
+            "target_node_ids":[node_a.node_id(), node_b.node_id()],
+            "relation_tags":["crew"],
+            "forward_budget":1
+        }
+    });
+    node_a.submit_task(contract, 1, 100).expect("submit task");
+
+    let mut last_published_seq = 0;
+    let mut group_synced = false;
+    for _ in 0..4_096 {
+        last_published_seq = publish_pending_scoped_updates(
+            &mut service_a,
+            &node_a,
+            &node_a.node_id(),
+            last_published_seq,
+        )
+        .expect("publish pending scoped");
+        let _ = pump_once(&mut service_a, &mut node_a);
+        let _ = pump_once(&mut service_b, &mut node_b);
+        let _ = pump_once(&mut service_c, &mut node_c);
+        if node_b
+            .task_view("task-group-live")
+            .expect("task view")
+            .is_some()
+        {
+            group_synced = true;
+            break;
+        }
+        std::thread::yield_now();
+    }
+
+    assert!(group_synced);
+    assert!(
+        node_c
+            .task_view("task-group-live")
+            .expect("task view")
+            .is_none()
+    );
+}
+
 pub fn subnet_nodes_sync_and_mainnet_overlay_stays_isolated() {
     let identity_a = NodeIdentity::random();
     let identity_b = NodeIdentity::random();
