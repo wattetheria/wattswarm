@@ -235,7 +235,9 @@ impl PgStore {
     ) -> Result<Vec<ProjectionScope>> {
         let mut scopes = Vec::new();
         for hint in self.list_active_feed_subscription_scope_hints(subscriber_node_id)? {
-            if let Some(scope) = ProjectionScope::parse(&hint) && !scopes.contains(&scope) {
+            if let Some(scope) = ProjectionScope::parse(&hint)
+                && !scopes.contains(&scope)
+            {
                 scopes.push(scope);
             }
         }

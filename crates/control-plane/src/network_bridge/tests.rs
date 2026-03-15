@@ -990,6 +990,86 @@ fn apply_summary_announcement_imports_knowledge_and_reputation() {
 }
 
 #[test]
+fn subnet_summary_is_mirrored_into_parent_network_store() {
+    let identity = NodeIdentity::random();
+    let node_id = identity.node_id();
+    let membership = membership_with_roles(std::slice::from_ref(&node_id));
+    let base_store = PgStore::open_in_memory().expect("store");
+    let mainnet = base_store
+        .ensure_mainnet_bootstrap_network_topology(
+            "mainnet:watt-galaxy",
+            "Watt Galaxy",
+            &node_id,
+            &node_id,
+            1_700_000_000_000,
+        )
+        .expect("mainnet topology");
+    let subnet = base_store
+        .ensure_subnet_bootstrap_network_topology(
+            &mainnet.network.network_id,
+            "subnet:alpha",
+            "Subnet Alpha",
+            &node_id,
+            &node_id,
+            1_700_000_000_100,
+        )
+        .expect("subnet topology");
+
+    let subnet_store = base_store.for_org(&subnet.org.org_id);
+    let mut node = Node::new(identity, subnet_store, membership).expect("subnet node");
+    node.store
+        .put_decision_memory(
+            "task-parent-uplink",
+            1,
+            "commit-parent-uplink",
+            100,
+            "candidate-parent-uplink",
+            "digest-parent-uplink",
+            &json!({"answer":"compress-me"}),
+            &json!({"quorum":"ok"}),
+            &[100],
+            &json!({"detail":"ok"}),
+            "policy-snap",
+            "uplink-type",
+            "input-digest",
+            "schema-digest",
+            "vp.schema_only.v1",
+            "params-digest",
+        )
+        .expect("put decision memory");
+
+    let summary = build_knowledge_summary_for_task_type(&node, &SwarmScope::Global, "uplink-type")
+        .expect("build summary")
+        .expect("summary exists");
+    assert!(
+        mirror_summary_to_parent_network(&node, &summary).expect("mirror summary"),
+        "subnet summary should mirror to parent network"
+    );
+
+    let parent_store = base_store.for_org(&mainnet.org.org_id);
+    let hits = parent_store
+        .list_decision_memory_hits_by_task_type("uplink-type", 8)
+        .expect("list mirrored hits");
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].result_summary["answer"], json!("compress-me"));
+
+    let revoke_event = node
+        .revoke_summary(&summary.summary_id, KNOWLEDGE_SUMMARY_KIND, "bad subnet summary", 1, 200)
+        .expect("revoke summary");
+    assert!(
+        mirror_summary_controls_to_parent_network(&node, &revoke_event)
+            .expect("mirror revoke to parent"),
+        "summary revoke should mirror to parent network"
+    );
+    assert!(
+        parent_store
+            .list_decision_memory_hits_by_task_type("uplink-type", 8)
+            .expect("list mirrored hits after revoke")
+            .is_empty()
+    );
+}
+
+#[test]
 fn knowledge_summary_builder_respects_protocol_limit() {
     let node = Node::open_in_memory_with_roles(&[Role::Proposer]).expect("node");
     for task_id in ["task-dm-1", "task-dm-2"] {

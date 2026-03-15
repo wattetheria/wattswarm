@@ -10,7 +10,8 @@ fn scope_from_projection_scope(scope: ProjectionScope) -> SwarmScope {
 }
 
 fn scope_from_optional_hint(scope: Option<crate::types::ScopeHint>) -> SwarmScope {
-    scope.map(scope_from_projection_scope)
+    scope
+        .map(scope_from_projection_scope)
         .unwrap_or(SwarmScope::Global)
 }
 
@@ -92,7 +93,9 @@ pub(super) fn event_scope(node: &Node, event: &crate::types::Event) -> Result<Sw
         crate::types::EventPayload::FeedSubscriptionUpdated(payload) => {
             Ok(scope_from_optional_hint(payload.scope()))
         }
-        crate::types::EventPayload::TaskAnnounced(payload) => Ok(scope_from_optional_hint(payload.scope())),
+        crate::types::EventPayload::TaskAnnounced(payload) => {
+            Ok(scope_from_optional_hint(payload.scope()))
+        }
         crate::types::EventPayload::ExecutionIntentDeclared(payload) => {
             Ok(scope_from_optional_hint(payload.scope()))
         }

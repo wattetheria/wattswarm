@@ -7,6 +7,7 @@ use wattswarm_protocol::types::{
 
 pub const DEFAULT_LOCAL_ORG_NAME: &str = "Local Bootstrap";
 pub const DEFAULT_LAN_ORG_NAME: &str = "LAN Bootstrap";
+pub const DEFAULT_MAINNET_ORG_NAME: &str = "Mainnet Bootstrap";
 
 pub fn local_network_id(node_id: &str) -> String {
     format!("local:{node_id}")
@@ -108,8 +109,7 @@ fn verify_network_protocol_params(
 
 impl PgStore {
     fn parse_network_kind(raw: &str) -> Result<NetworkKind> {
-        NetworkKind::parse(raw)
-            .ok_or_else(|| anyhow::anyhow!("unsupported network_kind '{raw}'"))
+        NetworkKind::parse(raw).ok_or_else(|| anyhow::anyhow!("unsupported network_kind '{raw}'"))
     }
 
     fn ensure_node_identity_unique(
@@ -134,7 +134,10 @@ impl PgStore {
         Ok(())
     }
 
-    fn load_network_descriptor_tx(conn: &Connection, network_id: &str) -> Result<NetworkDescriptor> {
+    fn load_network_descriptor_tx(
+        conn: &Connection,
+        network_id: &str,
+    ) -> Result<NetworkDescriptor> {
         let row: Option<(String, String, Option<String>, String)> = conn
             .query_row(
                 "SELECT network_id, network_kind, parent_network_id, genesis_node_id
@@ -176,10 +179,70 @@ impl PgStore {
         })
     }
 
+    fn load_default_org_descriptor_tx(
+        conn: &Connection,
+        network_id: &str,
+    ) -> Result<OrgDescriptor> {
+        let rows = conn
+            .prepare(
+                "SELECT org_id, network_id, org_kind, is_default
+                 FROM org_registry
+                 WHERE network_id = $1
+                   AND is_default = TRUE
+                   AND status = 'active'
+                 ORDER BY created_at ASC
+                 LIMIT 2",
+            )?
+            .query_map(params![network_id], |r| {
+                Ok(OrgDescriptor {
+                    org_id: r.get(0)?,
+                    network_id: r.get(1)?,
+                    org_kind: r.get(2)?,
+                    is_default: r.get(3)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        match rows.as_slice() {
+            [] => anyhow::bail!("missing default org for network {network_id}"),
+            [org] => Ok(org.clone()),
+            _ => anyhow::bail!(
+                "multiple active default orgs found for network {network_id}; keep exactly one"
+            ),
+        }
+    }
+
+    fn upsert_node_registry_membership_tx(
+        conn: &Connection,
+        node_id: &str,
+        public_key: &str,
+        home_network_id: &str,
+        joined_network_ids: &[&str],
+        now: u64,
+    ) -> Result<()> {
+        conn.execute(
+            "INSERT INTO node_registry(node_id, public_key, home_network_id, status, created_at, last_seen_at)
+             VALUES ($1, $2, $3, 'active', TIMESTAMPTZ 'epoch' + ($4::bigint * INTERVAL '1 millisecond'), TIMESTAMPTZ 'epoch' + ($4::bigint * INTERVAL '1 millisecond'))
+             ON CONFLICT(node_id) DO UPDATE SET
+               status = excluded.status,
+               last_seen_at = excluded.last_seen_at",
+            params![node_id, public_key, home_network_id, now as i64],
+        )?;
+        for joined_network_id in joined_network_ids {
+            conn.execute(
+                "INSERT INTO node_network_membership(node_id, network_id, joined_at)
+                 VALUES ($1, $2, TIMESTAMPTZ 'epoch' + ($3::bigint * INTERVAL '1 millisecond'))
+                 ON CONFLICT(node_id, network_id) DO NOTHING",
+                params![node_id, joined_network_id, now as i64],
+            )?;
+        }
+        Ok(())
+    }
+
     fn ensure_bootstrap_topology(
         &self,
         network_id: &str,
         network_kind: &str,
+        parent_network_id: Option<&str>,
         network_name: &str,
         control_mode: &str,
         org_name: &str,
@@ -197,15 +260,17 @@ impl PgStore {
 
         conn.execute(
             "INSERT INTO network_registry(network_id, network_kind, parent_network_id, name, status, genesis_node_id, created_at)
-             VALUES ($1, $2, NULL, $3, 'active', $4, TIMESTAMPTZ 'epoch' + ($5::bigint * INTERVAL '1 millisecond'))
+             VALUES ($1, $2, $3, $4, 'active', $5, TIMESTAMPTZ 'epoch' + ($6::bigint * INTERVAL '1 millisecond'))
              ON CONFLICT(network_id) DO UPDATE SET
                network_kind = excluded.network_kind,
+               parent_network_id = excluded.parent_network_id,
                name = excluded.name,
                status = excluded.status,
                genesis_node_id = excluded.genesis_node_id",
             params![
                 network_id,
                 network_kind,
+                parent_network_id,
                 network_name,
                 node_id,
                 now as i64
@@ -221,21 +286,17 @@ impl PgStore {
             params![network_id, control_mode, now as i64, "{}"],
         )?;
 
-        conn.execute(
-            "INSERT INTO node_registry(node_id, public_key, home_network_id, status, created_at, last_seen_at)
-             VALUES ($1, $2, $3, 'active', TIMESTAMPTZ 'epoch' + ($4::bigint * INTERVAL '1 millisecond'), TIMESTAMPTZ 'epoch' + ($4::bigint * INTERVAL '1 millisecond'))
-             ON CONFLICT(node_id) DO UPDATE SET
-               home_network_id = excluded.home_network_id,
-               status = excluded.status,
-               last_seen_at = excluded.last_seen_at",
-            params![node_id, public_key, network_id, now as i64],
-        )?;
-
-        conn.execute(
-            "INSERT INTO node_network_membership(node_id, network_id, joined_at)
-             VALUES ($1, $2, TIMESTAMPTZ 'epoch' + ($3::bigint * INTERVAL '1 millisecond'))
-             ON CONFLICT(node_id, network_id) DO NOTHING",
-            params![node_id, network_id, now as i64],
+        let mut joined_network_ids = vec![network_id];
+        if let Some(parent_network_id) = parent_network_id {
+            joined_network_ids.push(parent_network_id);
+        }
+        Self::upsert_node_registry_membership_tx(
+            &conn,
+            node_id,
+            public_key,
+            network_id,
+            &joined_network_ids,
+            now,
         )?;
 
         conn.execute(
@@ -348,6 +409,7 @@ impl PgStore {
         self.ensure_bootstrap_topology(
             &network_id,
             "local",
+            None,
             &format!("Local Network {node_id}"),
             "local_owner",
             DEFAULT_LOCAL_ORG_NAME,
@@ -379,9 +441,65 @@ impl PgStore {
         self.ensure_bootstrap_topology(
             &network_id,
             "lan",
+            None,
             &format!("LAN Network {node_id}"),
             "lan_owner",
             DEFAULT_LAN_ORG_NAME,
+            node_id,
+            public_key,
+            now,
+        )
+    }
+
+    pub fn ensure_mainnet_bootstrap_network_topology(
+        &self,
+        network_id: &str,
+        network_name: &str,
+        node_id: &str,
+        public_key: &str,
+        now: u64,
+    ) -> Result<NetworkTopology> {
+        self.ensure_bootstrap_topology(
+            network_id,
+            "mainnet",
+            None,
+            network_name,
+            "manual_owner",
+            DEFAULT_MAINNET_ORG_NAME,
+            node_id,
+            public_key,
+            now,
+        )
+    }
+
+    pub fn ensure_subnet_bootstrap_network_topology(
+        &self,
+        parent_network_id: &str,
+        subnet_id: &str,
+        subnet_name: &str,
+        node_id: &str,
+        public_key: &str,
+        now: u64,
+    ) -> Result<NetworkTopology> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
+        let parent = Self::load_network_descriptor_tx(&conn, parent_network_id)?;
+        if !parent.network_kind.is_overlay() {
+            anyhow::bail!(
+                "subnet parent network must be an overlay; got {}",
+                parent.network_kind.as_str()
+            );
+        }
+        drop(conn);
+        self.ensure_bootstrap_topology(
+            subnet_id,
+            "subnet",
+            Some(parent_network_id),
+            subnet_name,
+            "subnet_owner",
+            "Subnet Bootstrap",
             node_id,
             public_key,
             now,
@@ -415,7 +533,7 @@ impl PgStore {
 
         let rows = conn
             .prepare(
-                "SELECT org.org_id, org.network_id
+                "SELECT org.network_id
                  FROM org_registry org
                  JOIN network_registry net ON net.network_id = org.network_id
                  WHERE org.is_default = TRUE
@@ -425,12 +543,10 @@ impl PgStore {
                  ORDER BY org.created_at ASC
                  LIMIT 2",
             )?
-            .query_map(params![], |r| {
-                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
-            })?
+            .query_map(params![], |r| r.get::<_, String>(0))?
             .collect::<std::result::Result<Vec<_>, _>>()?;
 
-        let (org_id, network_id) = match rows.as_slice() {
+        let network_id = match rows.as_slice() {
             [] => anyhow::bail!(
                 "network mode requires a preconfigured network_registry/org_registry default bootstrap org"
             ),
@@ -439,28 +555,8 @@ impl PgStore {
                 "network mode found multiple active default network orgs; keep exactly one default org in org_registry"
             ),
         };
-
-        conn.execute(
-            "INSERT INTO node_registry(node_id, public_key, home_network_id, status, created_at, last_seen_at)
-             VALUES ($1, $2, $3, 'active', TIMESTAMPTZ 'epoch' + ($4::bigint * INTERVAL '1 millisecond'), TIMESTAMPTZ 'epoch' + ($4::bigint * INTERVAL '1 millisecond'))
-             ON CONFLICT(node_id) DO UPDATE SET
-               home_network_id = excluded.home_network_id,
-               status = excluded.status,
-               last_seen_at = excluded.last_seen_at",
-            params![node_id, public_key, network_id, now as i64],
-        )?;
-
-        conn.execute(
-            "INSERT INTO node_network_membership(node_id, network_id, joined_at)
-             VALUES ($1, $2, TIMESTAMPTZ 'epoch' + ($3::bigint * INTERVAL '1 millisecond'))
-             ON CONFLICT(node_id, network_id) DO NOTHING",
-            params![node_id, network_id, now as i64],
-        )?;
-
-        Ok(NetworkTopology {
-            network: Self::load_network_descriptor_tx(&conn, &network_id)?,
-            org: Self::load_org_descriptor_tx(&conn, &org_id)?,
-        })
+        drop(conn);
+        self.join_node_to_network_topology(&network_id, node_id, public_key, now)
     }
 
     pub fn load_network_topology_for_org(&self, org_id: &str) -> Result<NetworkTopology> {
@@ -470,6 +566,73 @@ impl PgStore {
             .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
         let org = Self::load_org_descriptor_tx(&conn, org_id)?;
         let network = Self::load_network_descriptor_tx(&conn, &org.network_id)?;
+        Ok(NetworkTopology { network, org })
+    }
+
+    pub fn load_network_topology_for_network(&self, network_id: &str) -> Result<NetworkTopology> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
+        let network = Self::load_network_descriptor_tx(&conn, network_id)?;
+        let org = Self::load_default_org_descriptor_tx(&conn, network_id)?;
+        Ok(NetworkTopology { network, org })
+    }
+
+    pub fn load_parent_network_topology_for_org(
+        &self,
+        org_id: &str,
+    ) -> Result<Option<NetworkTopology>> {
+        let topology = self.load_network_topology_for_org(org_id)?;
+        let Some(parent_network_id) = topology.network.parent_network_id.as_deref() else {
+            return Ok(None);
+        };
+        self.load_network_topology_for_network(parent_network_id)
+            .map(Some)
+    }
+
+    pub fn node_has_network_membership(&self, node_id: &str, network_id: &str) -> Result<bool> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
+        let exists = conn.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM node_network_membership
+                WHERE node_id = $1 AND network_id = $2
+            )",
+            params![node_id, network_id],
+            |r| r.get::<_, bool>(0),
+        )?;
+        Ok(exists)
+    }
+
+    pub fn join_node_to_network_topology(
+        &self,
+        network_id: &str,
+        node_id: &str,
+        public_key: &str,
+        now: u64,
+    ) -> Result<NetworkTopology> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
+        Self::ensure_node_identity_unique(&conn, node_id, public_key)?;
+        let network = Self::load_network_descriptor_tx(&conn, network_id)?;
+        let org = Self::load_default_org_descriptor_tx(&conn, network_id)?;
+        let mut joined_network_ids = vec![network_id];
+        if let Some(parent_network_id) = network.parent_network_id.as_deref() {
+            joined_network_ids.push(parent_network_id);
+        }
+        Self::upsert_node_registry_membership_tx(
+            &conn,
+            node_id,
+            public_key,
+            network_id,
+            &joined_network_ids,
+            now,
+        )?;
         Ok(NetworkTopology { network, org })
     }
 

@@ -12,8 +12,8 @@ use wattswarm_control_plane::control::{
     DiscoveredPeerRecord, ExecutorRegistry, ExecutorRegistryEntry, RealTaskRunRequest,
     add_discovered_peer, add_discovered_peer_endpoint, discovered_peers_path,
     executor_registry_path, load_discovered_peer_records, load_discovered_peers,
-    load_executor_registry, local_node_id, open_node, run_real_task_flow, save_discovered_peers,
-    save_executor_registry,
+    load_executor_registry, local_node_id, open_node, open_node_on_network_id, run_real_task_flow,
+    save_discovered_peers, save_executor_registry,
 };
 use wattswarm_control_plane::crypto::NodeIdentity;
 use wattswarm_control_plane::storage::storage::pg::Connection;
@@ -705,6 +705,83 @@ fn network_mode_loads_subnet_topology_as_network_subtype() {
         Some(parent_network_id)
     );
     assert_eq!(topology.org.network_id, topology.network.network_id);
+
+    cleanup_dir(&dir);
+}
+
+#[test]
+fn open_node_on_network_id_joins_and_binds_subnet_overlay() {
+    let _guard = env_lock();
+    let _db_lock = DbTestLock::acquire();
+    let schema = format!("test_{}", Uuid::new_v4().simple());
+    reset_test_schema(&schema);
+    let _schema_guard = EnvVarGuard::set("WATTSWARM_PG_SCHEMA", &schema);
+    let dir = temp_test_dir("open-node-on-subnet");
+    let state_dir = dir.join("state");
+    fs::create_dir_all(&state_dir).expect("create state dir");
+    let db_path = state_dir.join("test.state");
+
+    let genesis_identity = NodeIdentity::random();
+    let genesis_node_id = genesis_identity.node_id();
+    let now = 1_700_000_000_000_u64;
+
+    let store = wattswarm_control_plane::storage::PgStore::open(&db_path).expect("open store");
+    let mainnet = store
+        .ensure_mainnet_bootstrap_network_topology(
+            "mainnet:watt-galaxy",
+            "Watt Galaxy",
+            &genesis_node_id,
+            &genesis_node_id,
+            now,
+        )
+        .expect("create mainnet topology");
+    store
+        .ensure_bootstrap_signed_network_protocol_params(
+            &mainnet.network.network_id,
+            &genesis_identity,
+        )
+        .expect("sign mainnet params");
+    let subnet = store
+        .ensure_subnet_bootstrap_network_topology(
+            &mainnet.network.network_id,
+            "subnet:alpha",
+            "Subnet Alpha",
+            &genesis_node_id,
+            &genesis_node_id,
+            now + 1,
+        )
+        .expect("create subnet topology");
+    store
+        .ensure_bootstrap_signed_network_protocol_params(
+            &subnet.network.network_id,
+            &genesis_identity,
+        )
+        .expect("sign subnet params");
+
+    let node = open_node_on_network_id(&state_dir, &db_path, &subnet.network.network_id)
+        .expect("open node on subnet");
+    assert_eq!(node.store.org_id(), subnet.org.org_id);
+
+    let opened_topology = store
+        .load_network_topology_for_org(node.store.org_id())
+        .expect("load opened topology");
+    assert_eq!(opened_topology.network.network_kind, NetworkKind::Subnet);
+    assert_eq!(
+        opened_topology.network.parent_network_id.as_deref(),
+        Some(mainnet.network.network_id.as_str())
+    );
+
+    let joined_node_id = local_node_id(&state_dir).expect("joined node id");
+    assert!(
+        store
+            .node_has_network_membership(&joined_node_id, &subnet.network.network_id)
+            .expect("subnet membership")
+    );
+    assert!(
+        store
+            .node_has_network_membership(&joined_node_id, &mainnet.network.network_id)
+            .expect("parent membership")
+    );
 
     cleanup_dir(&dir);
 }

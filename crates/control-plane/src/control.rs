@@ -135,23 +135,14 @@ pub fn open_node(state_dir: &Path, db_path: &Path) -> Result<Node> {
     open_node_in_mode(state_dir, db_path, mode)
 }
 
-pub fn open_node_in_mode(state_dir: &Path, db_path: &Path, mode: NodeMode) -> Result<Node> {
-    let identity = load_or_create_identity(&state_dir.join("node_seed.hex"))?;
-    let self_node_id = identity.node_id();
-    let now = chrono::Utc::now().timestamp_millis().max(0) as u64;
-    let store = PgStore::open(db_path)?;
-    let topology = match mode {
-        NodeMode::Local => {
-            store.ensure_local_bootstrap_network_topology(&self_node_id, &self_node_id, now)?
-        }
-        NodeMode::Lan => {
-            store.ensure_lan_bootstrap_network_topology(&self_node_id, &self_node_id, now)?
-        }
-        NodeMode::Network => {
-            store.resolve_network_bootstrap_topology_descriptor(&self_node_id, &self_node_id, now)?
-        }
-    };
-    store.ensure_bootstrap_signed_network_protocol_params(&topology.network.network_id, &identity)?;
+fn open_node_for_topology(
+    state_dir: &Path,
+    topology: crate::types::NetworkTopology,
+    identity: NodeIdentity,
+    store: PgStore,
+) -> Result<Node> {
+    store
+        .ensure_bootstrap_signed_network_protocol_params(&topology.network.network_id, &identity)?;
     let mut membership = Membership::new();
     for role in [
         Role::Proposer,
@@ -162,10 +153,16 @@ pub fn open_node_in_mode(state_dir: &Path, db_path: &Path, mode: NodeMode) -> Re
         membership.grant(&identity.node_id(), role);
     }
 
+    let self_node_id = identity.node_id();
     let bound_store = store.for_org(&topology.org.org_id);
     bound_store
         .load_verified_network_protocol_params()
-        .with_context(|| format!("load verified network params for org {}", topology.org.org_id))?;
+        .with_context(|| {
+            format!(
+                "load verified network params for org {}",
+                topology.org.org_id
+            )
+        })?;
     let mut node = Node::new(identity, bound_store, membership)?;
     let replay_on_open = env::var("WATTSWARM_REPLAY_ON_OPEN").ok().is_some_and(|v| {
         let t = v.trim().to_ascii_lowercase();
@@ -182,6 +179,37 @@ pub fn open_node_in_mode(state_dir: &Path, db_path: &Path, mode: NodeMode) -> Re
         }
     }
     Ok(node)
+}
+
+pub fn open_node_in_mode(state_dir: &Path, db_path: &Path, mode: NodeMode) -> Result<Node> {
+    let identity = load_or_create_identity(&state_dir.join("node_seed.hex"))?;
+    let self_node_id = identity.node_id();
+    let now = chrono::Utc::now().timestamp_millis().max(0) as u64;
+    let store = PgStore::open(db_path)?;
+    let topology = match mode {
+        NodeMode::Local => {
+            store.ensure_local_bootstrap_network_topology(&self_node_id, &self_node_id, now)?
+        }
+        NodeMode::Lan => {
+            store.ensure_lan_bootstrap_network_topology(&self_node_id, &self_node_id, now)?
+        }
+        NodeMode::Network => store.resolve_network_bootstrap_topology_descriptor(
+            &self_node_id,
+            &self_node_id,
+            now,
+        )?,
+    };
+    open_node_for_topology(state_dir, topology, identity, store)
+}
+
+pub fn open_node_on_network_id(state_dir: &Path, db_path: &Path, network_id: &str) -> Result<Node> {
+    let identity = load_or_create_identity(&state_dir.join("node_seed.hex"))?;
+    let self_node_id = identity.node_id();
+    let now = chrono::Utc::now().timestamp_millis().max(0) as u64;
+    let store = PgStore::open(db_path)?;
+    let topology =
+        store.join_node_to_network_topology(network_id, &self_node_id, &self_node_id, now)?;
+    open_node_for_topology(state_dir, topology, identity, store)
 }
 
 pub fn load_discovered_peers(path: &Path) -> Result<Vec<String>> {

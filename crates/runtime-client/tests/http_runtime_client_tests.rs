@@ -66,6 +66,16 @@ impl StubServer {
     }
 }
 
+fn wait_for_stub_listener(server: &StubServer) {
+    for _ in 0..50 {
+        if TcpStream::connect(server.addr).is_ok() {
+            return;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    panic!("stub listener did not become reachable in time");
+}
+
 impl Drop for StubServer {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
@@ -297,6 +307,7 @@ fn http_runtime_client_reports_status_and_decode_failures() {
         verify_status: 500,
         verify_body: "{}".to_owned(),
     });
+    wait_for_stub_listener(&status_server);
     let client = HttpRuntimeClient::new(status_server.base_url());
 
     assert!(

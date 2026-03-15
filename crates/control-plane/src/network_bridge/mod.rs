@@ -41,7 +41,10 @@ use scope::{
     dynamic_subscription_scopes_for_node, event_scope, merge_scopes,
     node_has_active_subscription_scope,
 };
-use summary::{knowledge_summary_for_event, reputation_summary_for_event};
+use summary::{
+    knowledge_summary_for_event, mirror_summary_controls_to_parent_network,
+    mirror_summary_to_parent_network, reputation_summary_for_event,
+};
 
 const ENV_P2P_REGION_IDS: &str = "WATTSWARM_P2P_REGION_IDS";
 const ENV_P2P_LOCAL_IDS: &str = "WATTSWARM_P2P_LOCAL_IDS";
@@ -64,7 +67,9 @@ const DEFAULT_NETWORK_CONTEXT_ID: &str = "default";
 
 fn current_network_context_id(node: &Node) -> String {
     if node.store.is_org_configured()
-        && let Ok(topology) = node.store.load_network_topology_for_org(node.store.org_id())
+        && let Ok(topology) = node
+            .store
+            .load_network_topology_for_org(node.store.org_id())
     {
         return topology.network.network_id;
     }

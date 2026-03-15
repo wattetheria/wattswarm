@@ -98,6 +98,7 @@ pub fn publish_pending_scoped_updates(
             Err(err) if err.to_string().contains("LocalTopicRateLimited") => break,
             Err(err) => return Err(err),
         }
+        let _ = super::mirror_summary_controls_to_parent_network(node, &event);
         if publish_summaries
             && !local_node_penalized
             && let Some(summary) = super::knowledge_summary_for_event(
@@ -107,13 +108,15 @@ pub fn publish_pending_scoped_updates(
                 service.summary_decision_memory_limit,
             )?
         {
-            let _ = service.publish_summary(summary);
+            let _ = service.publish_summary(summary.clone());
+            let _ = super::mirror_summary_to_parent_network(node, &summary);
         }
         if publish_summaries
             && !local_node_penalized
             && let Some(summary) = super::reputation_summary_for_event(node, &event)?
         {
-            let _ = service.publish_summary(summary);
+            let _ = service.publish_summary(summary.clone());
+            let _ = super::mirror_summary_to_parent_network(node, &summary);
         }
     }
     Ok(last_published_seq)

@@ -141,9 +141,12 @@ pub(super) fn reputation_summary_for_event(
     )
 }
 
-pub fn apply_summary_announcement(node: &mut Node, summary: &SummaryAnnouncement) -> Result<()> {
-    if node.store.is_summary_revoked(&summary.summary_id)?
-        || node.store.is_node_penalized(&summary.source_node_id)?
+fn apply_summary_announcement_to_store(
+    store: &crate::storage::PgStore,
+    summary: &SummaryAnnouncement,
+) -> Result<()> {
+    if store.is_summary_revoked(&summary.summary_id)?
+        || store.is_node_penalized(&summary.source_node_id)?
     {
         return Ok(());
     }
@@ -151,7 +154,7 @@ pub fn apply_summary_announcement(node: &mut Node, summary: &SummaryAnnouncement
         KNOWLEDGE_SUMMARY_KIND => {
             let payload: KnowledgeSummaryBundle = serde_json::from_value(summary.payload.clone())?;
             for decision in payload.decisions {
-                node.store.put_imported_decision_memory(
+                store.put_imported_decision_memory(
                     &summary.summary_id,
                     &summary.source_node_id,
                     &decision,
@@ -161,7 +164,7 @@ pub fn apply_summary_announcement(node: &mut Node, summary: &SummaryAnnouncement
         REPUTATION_SUMMARY_KIND => {
             let payload: ReputationSummaryBundle = serde_json::from_value(summary.payload.clone())?;
             for entry in payload.entries {
-                node.store.put_imported_reputation_snapshot(
+                store.put_imported_reputation_snapshot(
                     &summary.summary_id,
                     &summary.source_node_id,
                     &entry,
@@ -171,4 +174,93 @@ pub fn apply_summary_announcement(node: &mut Node, summary: &SummaryAnnouncement
         _ => {}
     }
     Ok(())
+}
+
+fn parent_uplink_store(node: &Node) -> Result<Option<crate::storage::PgStore>> {
+    if !node.store.is_org_configured() {
+        return Ok(None);
+    }
+    let topology = node
+        .store
+        .load_network_topology_for_org(node.store.org_id())?;
+    if !topology.network.is_subnet() {
+        return Ok(None);
+    }
+    let Some(parent_topology) = node
+        .store
+        .load_parent_network_topology_for_org(node.store.org_id())?
+    else {
+        return Ok(None);
+    };
+    if !node
+        .store
+        .node_has_network_membership(&node.node_id(), &parent_topology.network.network_id)?
+    {
+        return Ok(None);
+    }
+    Ok(Some(node.store.for_org(parent_topology.org.org_id)))
+}
+
+pub(super) fn mirror_summary_to_parent_network(
+    node: &Node,
+    summary: &SummaryAnnouncement,
+) -> Result<bool> {
+    let Some(parent_store) = parent_uplink_store(node)? else {
+        return Ok(false);
+    };
+    apply_summary_announcement_to_store(&parent_store, summary)?;
+    Ok(true)
+}
+
+pub(super) fn mirror_summary_controls_to_parent_network(
+    node: &Node,
+    event: &crate::types::Event,
+) -> Result<bool> {
+    let Some(parent_store) = parent_uplink_store(node)? else {
+        return Ok(false);
+    };
+    match &event.payload {
+        crate::types::EventPayload::SummaryRevoked(payload) => {
+            parent_store.put_summary_revocation(
+                &payload.target_summary_id,
+                &payload.summary_kind,
+                &payload.reason,
+                &event.author_node_id,
+                event.created_at,
+            )?;
+            parent_store.revoke_imported_decision_memory_by_summary(&payload.target_summary_id)?;
+            parent_store.revoke_imported_reputation_by_summary(&payload.target_summary_id)?;
+            Ok(true)
+        }
+        crate::types::EventPayload::NodePenalized(payload) => {
+            parent_store.put_node_penalty(
+                &payload.penalized_node_id,
+                &payload.reason,
+                payload.block_summaries,
+                &event.author_node_id,
+                event.created_at,
+            )?;
+            for summary_id in &payload.revoked_summary_ids {
+                parent_store.put_summary_revocation(
+                    summary_id,
+                    "penalty_cascade_v1",
+                    &payload.reason,
+                    &event.author_node_id,
+                    event.created_at,
+                )?;
+                parent_store.revoke_imported_decision_memory_by_summary(summary_id)?;
+                parent_store.revoke_imported_reputation_by_summary(summary_id)?;
+            }
+            if payload.block_summaries {
+                parent_store.revoke_imported_decision_memory_by_source(&payload.penalized_node_id)?;
+                parent_store.revoke_imported_reputation_by_source(&payload.penalized_node_id)?;
+            }
+            Ok(true)
+        }
+        _ => Ok(false),
+    }
+}
+
+pub fn apply_summary_announcement(node: &mut Node, summary: &SummaryAnnouncement) -> Result<()> {
+    apply_summary_announcement_to_store(&node.store, summary)
 }

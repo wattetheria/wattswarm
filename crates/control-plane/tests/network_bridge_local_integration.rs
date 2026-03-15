@@ -21,6 +21,11 @@ fn node_scoped_live_sync_only_reaches_matching_node_scope() {
 }
 
 #[test]
+fn subnet_nodes_sync_and_mainnet_overlay_stays_isolated() {
+    support::network_bridge::subnet_nodes_sync_and_mainnet_overlay_stays_isolated();
+}
+
+#[test]
 fn summary_gossip_imports_knowledge_and_reputation_into_remote_store() {
     support::network_bridge::summary_gossip_imports_knowledge_and_reputation_into_remote_store();
 }

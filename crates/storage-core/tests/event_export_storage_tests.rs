@@ -1,3 +1,4 @@
+use wattswarm_storage_core::types::NetworkKind;
 use wattswarm_storage_core::types::{
     Acceptance, ArtifactRef, Assignment, Budget, BudgetMode, Candidate, CheckpointCreatedPayload,
     ClaimPolicy, DecisionCommittedPayload, Event, EventPayload, EvidencePolicy, ExploreAssignment,
@@ -6,7 +7,6 @@ use wattswarm_storage_core::types::{
     TaskExpiredPayload, TaskMode, VerificationStatus, VerifierResult, VerifyAssignment, VoteChoice,
     VotePolicy,
 };
-use wattswarm_storage_core::types::NetworkKind;
 use wattswarm_storage_core::{AdvisoryStateRow, PgStore, ProjectionScope};
 
 fn open_test_store() -> PgStore {
@@ -63,6 +63,69 @@ fn bootstrap_topology_returns_typed_network_and_org_descriptors() {
         .load_network_topology_for_org(&topology.org.org_id)
         .expect("load topology");
     assert_eq!(loaded, topology);
+}
+
+#[test]
+fn subnet_topology_creation_and_joining_attach_parent_membership() {
+    let store = PgStore::open_in_memory().expect("open store");
+    let mainnet = store
+        .ensure_mainnet_bootstrap_network_topology(
+            "mainnet:watt-galaxy",
+            "Watt Galaxy",
+            "genesis-a",
+            "genesis-a",
+            1_700_000_000_000,
+        )
+        .expect("mainnet topology");
+    let subnet = store
+        .ensure_subnet_bootstrap_network_topology(
+            &mainnet.network.network_id,
+            "subnet:alpha",
+            "Subnet Alpha",
+            "genesis-a",
+            "genesis-a",
+            1_700_000_000_100,
+        )
+        .expect("subnet topology");
+
+    assert_eq!(subnet.network.network_kind, NetworkKind::Subnet);
+    assert_eq!(
+        subnet.network.parent_network_id.as_deref(),
+        Some(mainnet.network.network_id.as_str())
+    );
+    assert!(
+        store
+            .node_has_network_membership("genesis-a", &mainnet.network.network_id)
+            .expect("genesis parent membership")
+    );
+    assert!(
+        store
+            .node_has_network_membership("genesis-a", &subnet.network.network_id)
+            .expect("genesis subnet membership")
+    );
+
+    let joined = store
+        .join_node_to_network_topology("subnet:alpha", "node-b", "node-b", 1_700_000_000_200)
+        .expect("join subnet");
+    assert_eq!(joined.network.network_kind, NetworkKind::Subnet);
+    assert_eq!(joined.org.org_id, "subnet:alpha:bootstrap");
+    assert!(
+        store
+            .node_has_network_membership("node-b", "subnet:alpha")
+            .expect("joined subnet membership")
+    );
+    assert!(
+        store
+            .node_has_network_membership("node-b", "mainnet:watt-galaxy")
+            .expect("joined parent membership")
+    );
+
+    let parent = store
+        .load_parent_network_topology_for_org(&subnet.org.org_id)
+        .expect("load parent topology")
+        .expect("parent topology");
+    assert_eq!(parent.network.network_id, mainnet.network.network_id);
+    assert_eq!(parent.network.network_kind, NetworkKind::Mainnet);
 }
 
 fn sample_contract(task_id: &str, task_type: &str) -> TaskContract {

@@ -13,7 +13,9 @@ use wattswarm_control_plane::network_bridge::{
     build_reputation_summary_for_runtime, dial_discovered_peer_endpoints,
     publish_pending_global_events, publish_pending_scoped_updates,
 };
-use wattswarm_control_plane::network_p2p::{NetworkP2pConfig, NetworkP2pNode, SwarmScope};
+use wattswarm_control_plane::network_p2p::{
+    NetworkP2pConfig, NetworkP2pNode, PeerHandshakeMetadata, SwarmScope, TopicNamespace,
+};
 use wattswarm_control_plane::node::Node;
 use wattswarm_control_plane::storage::PgStore;
 use wattswarm_control_plane::task_template::sample_contract;
@@ -56,6 +58,33 @@ fn test_protocol_params() -> NetworkProtocolParams {
 
 fn make_service() -> NetworkBridgeService {
     make_service_with_scopes(&[SwarmScope::Global])
+}
+
+fn make_service_for_network(network_id: &str) -> NetworkBridgeService {
+    make_service_for_network_with_scopes(network_id, &[SwarmScope::Global])
+}
+
+fn make_service_for_network_with_scopes(
+    network_id: &str,
+    scopes: &[SwarmScope],
+) -> NetworkBridgeService {
+    let params = NetworkProtocolParams::default();
+    let config = NetworkP2pConfig {
+        namespace: TopicNamespace {
+            network: params.namespace_network.clone(),
+            network_id: network_id.to_owned(),
+        },
+        identify_agent_version: PeerHandshakeMetadata {
+            network_id: network_id.to_owned(),
+            params_version: 1,
+            params_hash: format!("params-{network_id}"),
+        }
+        .encode_agent_version(),
+        listen_addrs: vec!["/ip4/127.0.0.1/tcp/0".to_owned()],
+        enable_mdns: false,
+        ..NetworkP2pConfig::default()
+    };
+    make_service_with_config(scopes, &params, config)
 }
 
 fn make_service_with_scopes(scopes: &[SwarmScope]) -> NetworkBridgeService {
@@ -712,6 +741,82 @@ pub fn node_scoped_live_sync_only_reaches_matching_node_scope() {
             .task_view("task-local-live")
             .expect("task view")
             .is_none()
+    );
+}
+
+pub fn subnet_nodes_sync_and_mainnet_overlay_stays_isolated() {
+    let identity_a = NodeIdentity::random();
+    let identity_b = NodeIdentity::random();
+    let identity_c = NodeIdentity::random();
+    let membership = membership_with_roles(&[
+        identity_a.node_id(),
+        identity_b.node_id(),
+        identity_c.node_id(),
+    ]);
+    let mut node_a = make_node(identity_a, membership.clone());
+    let mut node_b = make_node(identity_b, membership.clone());
+    let mut node_c = make_node(identity_c, membership);
+    let mut subnet_a = make_service_for_network("subnet:alpha");
+    let mut subnet_b = make_service_for_network("subnet:alpha");
+    let mut mainnet_c = make_service_for_network("mainnet:watt-galaxy");
+
+    connect_services(&mut subnet_a, &mut node_a, &mut subnet_b, &mut node_b);
+    wait_for_listen_addrs(&mut mainnet_c, &mut node_c);
+    subnet_a
+        .dial(mainnet_c.listen_addrs()[0].clone())
+        .expect("dial mainnet overlay");
+
+    let handshake_rejected = wait_until(scaled_timeout(Duration::from_secs(5)), || {
+        let tick_a = pump_once(&mut subnet_a, &mut node_a);
+        let tick_c = pump_once(&mut mainnet_c, &mut node_c);
+        matches!(
+            tick_a.as_ref(),
+            Some(NetworkBridgeTick::TransportNotice { detail })
+                if detail.contains("peer_handshake_rejected")
+        ) || matches!(
+            tick_c.as_ref(),
+            Some(NetworkBridgeTick::TransportNotice { detail })
+                if detail.contains("peer_handshake_rejected")
+        )
+    });
+    assert!(
+        handshake_rejected,
+        "mainnet overlay should reject subnet handshake"
+    );
+
+    let policy_hash = node_a
+        .policy_registry()
+        .binding_for("vp.schema_only.v1", json!({}))
+        .expect("policy binding")
+        .policy_hash;
+    let mut contract = sample_contract("task-subnet-overlay", policy_hash);
+    contract.inputs = json!({"prompt":"subnet only"});
+    node_a.submit_task(contract, 1, 100).expect("submit task");
+
+    let mut last_published_seq = 0;
+    let subnet_synced = wait_until(scaled_timeout(Duration::from_secs(10)), || {
+        last_published_seq = publish_pending_global_events(
+            &mut subnet_a,
+            &node_a,
+            &node_a.node_id(),
+            last_published_seq,
+        )
+        .expect("publish pending subnet events");
+        let _ = pump_once(&mut subnet_a, &mut node_a);
+        let _ = pump_once(&mut subnet_b, &mut node_b);
+        let _ = pump_once(&mut mainnet_c, &mut node_c);
+        node_b
+            .task_view("task-subnet-overlay")
+            .expect("subnet task view")
+            .is_some()
+    });
+    assert!(subnet_synced, "subnet peer should receive subnet task");
+    assert!(
+        node_c
+            .task_view("task-subnet-overlay")
+            .expect("mainnet task view")
+            .is_none(),
+        "mainnet overlay must not receive subnet task"
     );
 }
 
