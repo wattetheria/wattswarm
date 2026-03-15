@@ -1,8 +1,8 @@
 use super::*;
 use crate::crypto::{NodeIdentity, sha256_hex, verify_signature};
 use wattswarm_protocol::types::{
-    NetworkProtocolParams, SignedNetworkProtocolParamsEnvelope,
-    UnsignedNetworkProtocolParamsEnvelope,
+    NetworkDescriptor, NetworkKind, NetworkProtocolParams, NetworkTopology, OrgDescriptor,
+    SignedNetworkProtocolParamsEnvelope, UnsignedNetworkProtocolParamsEnvelope,
 };
 
 pub const DEFAULT_LOCAL_ORG_NAME: &str = "Local Bootstrap";
@@ -107,6 +107,11 @@ fn verify_network_protocol_params(
 }
 
 impl PgStore {
+    fn parse_network_kind(raw: &str) -> Result<NetworkKind> {
+        NetworkKind::parse(raw)
+            .ok_or_else(|| anyhow::anyhow!("unsupported network_kind '{raw}'"))
+    }
+
     fn ensure_node_identity_unique(
         conn: &Connection,
         node_id: &str,
@@ -129,6 +134,48 @@ impl PgStore {
         Ok(())
     }
 
+    fn load_network_descriptor_tx(conn: &Connection, network_id: &str) -> Result<NetworkDescriptor> {
+        let row: Option<(String, String, Option<String>, String)> = conn
+            .query_row(
+                "SELECT network_id, network_kind, parent_network_id, genesis_node_id
+                 FROM network_registry
+                 WHERE network_id = $1",
+                params![network_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .optional()?;
+        let Some((network_id, network_kind, parent_network_id, genesis_node_id)) = row else {
+            anyhow::bail!("missing network_registry row for network {network_id}");
+        };
+        Ok(NetworkDescriptor {
+            network_id,
+            network_kind: Self::parse_network_kind(&network_kind)?,
+            parent_network_id,
+            genesis_node_id,
+        })
+    }
+
+    fn load_org_descriptor_tx(conn: &Connection, org_id: &str) -> Result<OrgDescriptor> {
+        let row: Option<(String, String, String, bool)> = conn
+            .query_row(
+                "SELECT org_id, network_id, org_kind, is_default
+                 FROM org_registry
+                 WHERE org_id = $1",
+                params![org_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .optional()?;
+        let Some((org_id, network_id, org_kind, is_default)) = row else {
+            anyhow::bail!("missing org_registry row for org {org_id}");
+        };
+        Ok(OrgDescriptor {
+            org_id,
+            network_id,
+            org_kind,
+            is_default,
+        })
+    }
+
     fn ensure_bootstrap_topology(
         &self,
         network_id: &str,
@@ -139,7 +186,7 @@ impl PgStore {
         node_id: &str,
         public_key: &str,
         now: u64,
-    ) -> Result<String> {
+    ) -> Result<NetworkTopology> {
         let org_id = bootstrap_org_id(network_id);
         let conn = self
             .conn
@@ -207,7 +254,10 @@ impl PgStore {
             ],
         )?;
 
-        Ok(org_id)
+        Ok(NetworkTopology {
+            network: Self::load_network_descriptor_tx(&conn, network_id)?,
+            org: Self::load_org_descriptor_tx(&conn, &org_id)?,
+        })
     }
 
     pub fn network_id_for_org(&self, org_id: &str) -> Result<String> {
@@ -282,6 +332,18 @@ impl PgStore {
         public_key: &str,
         now: u64,
     ) -> Result<String> {
+        Ok(self
+            .ensure_local_bootstrap_network_topology(node_id, public_key, now)?
+            .org
+            .org_id)
+    }
+
+    pub fn ensure_local_bootstrap_network_topology(
+        &self,
+        node_id: &str,
+        public_key: &str,
+        now: u64,
+    ) -> Result<NetworkTopology> {
         let network_id = local_network_id(node_id);
         self.ensure_bootstrap_topology(
             &network_id,
@@ -301,6 +363,18 @@ impl PgStore {
         public_key: &str,
         now: u64,
     ) -> Result<String> {
+        Ok(self
+            .ensure_lan_bootstrap_network_topology(node_id, public_key, now)?
+            .org
+            .org_id)
+    }
+
+    pub fn ensure_lan_bootstrap_network_topology(
+        &self,
+        node_id: &str,
+        public_key: &str,
+        now: u64,
+    ) -> Result<NetworkTopology> {
         let network_id = lan_network_id(node_id);
         self.ensure_bootstrap_topology(
             &network_id,
@@ -320,6 +394,18 @@ impl PgStore {
         public_key: &str,
         now: u64,
     ) -> Result<String> {
+        Ok(self
+            .resolve_network_bootstrap_topology_descriptor(node_id, public_key, now)?
+            .org
+            .org_id)
+    }
+
+    pub fn resolve_network_bootstrap_topology_descriptor(
+        &self,
+        node_id: &str,
+        public_key: &str,
+        now: u64,
+    ) -> Result<NetworkTopology> {
         let conn = self
             .conn
             .lock()
@@ -371,7 +457,20 @@ impl PgStore {
             params![node_id, network_id, now as i64],
         )?;
 
-        Ok(org_id)
+        Ok(NetworkTopology {
+            network: Self::load_network_descriptor_tx(&conn, &network_id)?,
+            org: Self::load_org_descriptor_tx(&conn, &org_id)?,
+        })
+    }
+
+    pub fn load_network_topology_for_org(&self, org_id: &str) -> Result<NetworkTopology> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
+        let org = Self::load_org_descriptor_tx(&conn, org_id)?;
+        let network = Self::load_network_descriptor_tx(&conn, &org.network_id)?;
+        Ok(NetworkTopology { network, org })
     }
 
     pub fn load_verified_network_protocol_params(&self) -> Result<VerifiedNetworkProtocolParams> {

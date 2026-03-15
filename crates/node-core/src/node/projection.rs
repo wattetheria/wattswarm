@@ -330,20 +330,22 @@ impl Node {
                 )?;
             }
             EventPayload::FeedSubscriptionUpdated(payload) => {
+                let scope_hint = crate::types::normalized_scope_hint(&payload.scope_hint);
                 self.store.upsert_feed_subscription(
                     &payload.subscriber_node_id,
                     &payload.feed_key,
-                    &payload.scope_hint,
+                    &scope_hint,
                     payload.active,
                     event.created_at,
                 )?;
             }
             EventPayload::TaskAnnounced(payload) => {
+                let scope_hint = crate::types::normalized_scope_hint(&payload.scope_hint);
                 self.store.put_task_announcement(
                     &payload.task_id,
                     &payload.announcement_id,
                     &payload.feed_key,
-                    &payload.scope_hint,
+                    &scope_hint,
                     &payload.summary,
                     payload.detail_ref.as_ref(),
                     &event.author_node_id,
@@ -351,25 +353,27 @@ impl Node {
                 )?;
             }
             EventPayload::ExecutionIntentDeclared(payload) => {
+                let scope_hint = crate::types::normalized_scope_hint(&payload.scope_hint);
                 self.store.upsert_execution_set_member(
                     &payload.task_id,
                     &payload.execution_set_id,
                     &payload.participant_node_id,
                     &payload.role_hint,
-                    &payload.scope_hint,
+                    &scope_hint,
                     &payload.intent,
                     None,
                     event.created_at,
                 )?;
             }
             EventPayload::ExecutionSetConfirmed(payload) => {
+                let scope_hint = crate::types::normalized_scope_hint(&payload.scope_hint);
                 for member in &payload.members {
                     self.store.upsert_execution_set_member(
                         &payload.task_id,
                         &payload.execution_set_id,
                         &member.participant_node_id,
                         &member.role_hint,
-                        &payload.scope_hint,
+                        &scope_hint,
                         "confirmed",
                         Some(&payload.confirmed_by_node_id),
                         event.created_at,

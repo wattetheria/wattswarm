@@ -80,6 +80,11 @@ pub(super) fn latest_scoped_event_seq(node: &Node, scope: &SwarmScope) -> Result
 }
 
 pub(super) fn should_sync_event(node: &Node, event: &crate::types::Event) -> Result<bool> {
+    if let Some(network_id) = super::network_id_for_network_substrate_event(event)
+        && network_id != super::current_network_context_id(node)
+    {
+        return Ok(false);
+    }
     if matches!(
         event.payload,
         crate::types::EventPayload::EventRevoked(_)

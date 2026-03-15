@@ -18,7 +18,7 @@ use wattswarm_control_plane::control::{
 use wattswarm_control_plane::crypto::NodeIdentity;
 use wattswarm_control_plane::storage::storage::pg::Connection;
 use wattswarm_control_plane::task_template::sample_contract;
-use wattswarm_control_plane::types::SignedNetworkProtocolParamsEnvelope;
+use wattswarm_control_plane::types::{NetworkKind, SignedNetworkProtocolParamsEnvelope};
 use wattswarm_control_plane::udp_announce::{announce_startup, maybe_start_listener};
 
 static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -652,6 +652,59 @@ fn open_node_network_mode_rejects_unsigned_network_params() {
         Err(err) => err,
     };
     assert!(!err.to_string().trim().is_empty());
+
+    cleanup_dir(&dir);
+}
+
+#[test]
+fn network_mode_loads_subnet_topology_as_network_subtype() {
+    let _guard = env_lock();
+    let _db_lock = DbTestLock::acquire();
+    reset_test_schema("test");
+    let _schema_guard = EnvVarGuard::set("WATTSWARM_PG_SCHEMA", "test");
+    let _mode_guard = EnvVarGuard::set("WATTSWARM_NODE_MODE", "network");
+    let dir = temp_test_dir("open-node-subnet-network-mode");
+    let state_dir = dir.join("state");
+    fs::create_dir_all(&state_dir).expect("create state dir");
+    let db_path = state_dir.join("test.state");
+    let node_id = local_node_id(&state_dir).expect("local node id");
+    let network_id = "subnet:alpha";
+    let parent_network_id = "mainnet:watt-galaxy";
+    let org_id = "subnet:alpha:bootstrap";
+
+    let store = wattswarm_control_plane::storage::PgStore::open(&db_path).expect("open store");
+    let conn = Connection::open("subnet-bootstrap-setup").expect("open setup connection");
+    conn.execute(
+        "INSERT INTO network_registry(network_id, network_kind, parent_network_id, name, status, genesis_node_id, created_at)
+         VALUES ($1, 'subnet', $2, 'Subnet Alpha', 'active', $3, TIMESTAMPTZ 'epoch' + ($4::bigint * INTERVAL '1 millisecond'))",
+        wattswarm_storage_core::params![network_id, parent_network_id, &node_id, 1_700_000_000_000_i64],
+    )
+    .expect("insert subnet network registry");
+    conn.execute(
+        "INSERT INTO network_params(network_id, control_mode, membership_version, policy_version, params_json, created_at, updated_at)
+         VALUES ($1, 'manual_owner', 1, 1, '{}', TIMESTAMPTZ 'epoch' + ($2::bigint * INTERVAL '1 millisecond'), TIMESTAMPTZ 'epoch' + ($2::bigint * INTERVAL '1 millisecond'))",
+        wattswarm_storage_core::params![network_id, 1_700_000_000_000_i64],
+    )
+    .expect("insert subnet network params");
+    conn.execute(
+        "INSERT INTO org_registry(org_id, network_id, org_kind, name, status, is_default, created_at)
+         VALUES ($1, $2, 'bootstrap', 'Subnet Alpha Bootstrap', 'active', TRUE, TIMESTAMPTZ 'epoch' + ($3::bigint * INTERVAL '1 millisecond'))",
+        wattswarm_storage_core::params![org_id, network_id, 1_700_000_000_000_i64],
+    )
+    .expect("insert subnet org registry");
+
+    let node = open_node(&state_dir, &db_path).expect("open node in subnet mode");
+    assert_eq!(node.store.org_id(), org_id);
+
+    let topology = store
+        .load_network_topology_for_org(org_id)
+        .expect("load subnet topology");
+    assert_eq!(topology.network.network_kind, NetworkKind::Subnet);
+    assert_eq!(
+        topology.network.parent_network_id.as_deref(),
+        Some(parent_network_id)
+    );
+    assert_eq!(topology.org.network_id, topology.network.network_id);
 
     cleanup_dir(&dir);
 }

@@ -460,14 +460,24 @@ pub struct CheckpointCreatedPayload {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FeedSubscriptionUpdatedPayload {
+    #[serde(default = "default_network_context_id")]
+    pub network_id: String,
     pub subscriber_node_id: String,
     pub feed_key: String,
     pub scope_hint: String,
     pub active: bool,
 }
 
+impl FeedSubscriptionUpdatedPayload {
+    pub fn scope(&self) -> Option<ScopeHint> {
+        ScopeHint::parse(&self.scope_hint)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TaskAnnouncedPayload {
+    #[serde(default = "default_network_context_id")]
+    pub network_id: String,
     pub task_id: String,
     pub announcement_id: String,
     pub feed_key: String,
@@ -477,14 +487,28 @@ pub struct TaskAnnouncedPayload {
     pub detail_ref: Option<ArtifactRef>,
 }
 
+impl TaskAnnouncedPayload {
+    pub fn scope(&self) -> Option<ScopeHint> {
+        ScopeHint::parse(&self.scope_hint)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExecutionIntentDeclaredPayload {
+    #[serde(default = "default_network_context_id")]
+    pub network_id: String,
     pub task_id: String,
     pub execution_set_id: String,
     pub participant_node_id: String,
     pub role_hint: String,
     pub scope_hint: String,
     pub intent: String,
+}
+
+impl ExecutionIntentDeclaredPayload {
+    pub fn scope(&self) -> Option<ScopeHint> {
+        ScopeHint::parse(&self.scope_hint)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -495,11 +519,81 @@ pub struct ExecutionSetMember {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExecutionSetConfirmedPayload {
+    #[serde(default = "default_network_context_id")]
+    pub network_id: String,
     pub task_id: String,
     pub execution_set_id: String,
     pub confirmed_by_node_id: String,
     pub scope_hint: String,
     pub members: Vec<ExecutionSetMember>,
+}
+
+impl ExecutionSetConfirmedPayload {
+    pub fn scope(&self) -> Option<ScopeHint> {
+        ScopeHint::parse(&self.scope_hint)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum NetworkKind {
+    Local,
+    Lan,
+    Mainnet,
+    Subnet,
+}
+
+impl NetworkKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Local => "local",
+            Self::Lan => "lan",
+            Self::Mainnet => "mainnet",
+            Self::Subnet => "subnet",
+        }
+    }
+
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "local" => Some(Self::Local),
+            "lan" => Some(Self::Lan),
+            "mainnet" => Some(Self::Mainnet),
+            "subnet" => Some(Self::Subnet),
+            _ => None,
+        }
+    }
+
+    pub fn is_overlay(self) -> bool {
+        matches!(self, Self::Mainnet | Self::Subnet)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NetworkDescriptor {
+    pub network_id: String,
+    pub network_kind: NetworkKind,
+    pub parent_network_id: Option<String>,
+    pub genesis_node_id: String,
+}
+
+impl NetworkDescriptor {
+    pub fn is_subnet(&self) -> bool {
+        self.network_kind == NetworkKind::Subnet
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OrgDescriptor {
+    pub org_id: String,
+    pub network_id: String,
+    pub org_kind: String,
+    pub is_default: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NetworkTopology {
+    pub network: NetworkDescriptor,
+    pub org: OrgDescriptor,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -972,8 +1066,87 @@ pub struct NetworkProtocolParams {
 fn default_namespace_network() -> String {
     "wattswarm".to_owned()
 }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ScopeHint {
+    Global,
+    Region(String),
+    Node(String),
+}
+
+impl ScopeHint {
+    pub fn from_kind_id(kind: &str, id: &str) -> Option<Self> {
+        let kind = kind.trim();
+        if kind.eq_ignore_ascii_case("global") {
+            return Some(Self::Global);
+        }
+        let id = id.trim();
+        if id.is_empty() {
+            return None;
+        }
+        Self::parse(&format!("{kind}:{id}"))
+    }
+
+    pub fn parse(raw: &str) -> Option<Self> {
+        let trimmed = raw.trim();
+        if trimmed.eq_ignore_ascii_case("global") {
+            return Some(Self::Global);
+        }
+        let (kind, rest) = trimmed.split_once(':')?;
+        let id = rest.trim();
+        if id.is_empty() {
+            return None;
+        }
+        match kind.trim().to_ascii_lowercase().as_str() {
+            "region" => Some(Self::Region(id.to_owned())),
+            "local" | "node" => Some(Self::Node(id.to_owned())),
+            _ => None,
+        }
+    }
+
+    pub fn canonical(&self) -> String {
+        match self {
+            Self::Global => "global".to_owned(),
+            Self::Region(id) => format!("region:{id}"),
+            Self::Node(id) => format!("node:{id}"),
+        }
+    }
+
+    pub fn parse_prefix(raw: &str) -> Option<Self> {
+        let trimmed = raw.trim();
+        if trimmed.eq_ignore_ascii_case("global") {
+            return Some(Self::Global);
+        }
+        let (kind, rest) = trimmed.split_once(':')?;
+        let id = rest
+            .split([':', '/'])
+            .next()
+            .map(str::trim)
+            .unwrap_or_default();
+        if id.is_empty() {
+            return None;
+        }
+        Self::parse(&format!("{}:{id}", kind.trim()))
+    }
+
+    pub fn parse_with_prefix_fallback(raw: &str) -> Option<Self> {
+        Self::parse_prefix(raw).or_else(|| Self::parse(raw))
+    }
+}
+
+pub fn canonical_scope_hint(raw: &str) -> Option<String> {
+    ScopeHint::parse(raw).map(|scope| scope.canonical())
+}
+
+pub fn normalized_scope_hint(raw: &str) -> String {
+    canonical_scope_hint(raw).unwrap_or_else(|| raw.trim().to_owned())
+}
+
 fn default_network_protocol_version() -> String {
     "/wattswarm/0.1.0".to_owned()
+}
+fn default_network_context_id() -> String {
+    "default".to_owned()
 }
 fn default_max_established_per_peer() -> u32 {
     2

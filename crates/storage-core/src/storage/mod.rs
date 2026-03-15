@@ -189,6 +189,26 @@ pub struct ExecutionSetMemberRow {
     pub updated_at: u64,
 }
 
+pub type ProjectionScope = wattswarm_protocol::types::ScopeHint;
+
+impl FeedSubscriptionRow {
+    pub fn scope(&self) -> Option<ProjectionScope> {
+        ProjectionScope::parse(&self.scope_hint)
+    }
+}
+
+impl TaskAnnouncementRow {
+    pub fn scope(&self) -> Option<ProjectionScope> {
+        ProjectionScope::parse(&self.scope_hint)
+    }
+}
+
+impl ExecutionSetMemberRow {
+    pub fn scope(&self) -> Option<ProjectionScope> {
+        ProjectionScope::parse(&self.scope_hint)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuleAnnouncementRow {
     pub scope_key: String,

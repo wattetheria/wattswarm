@@ -1,4 +1,18 @@
 use super::*;
+use crate::storage::ProjectionScope;
+
+fn scope_from_projection_scope(scope: ProjectionScope) -> SwarmScope {
+    match scope {
+        ProjectionScope::Global => SwarmScope::Global,
+        ProjectionScope::Region(id) => SwarmScope::Region(id),
+        ProjectionScope::Node(id) => SwarmScope::Node(id),
+    }
+}
+
+fn scope_from_optional_hint(scope: Option<crate::types::ScopeHint>) -> SwarmScope {
+    scope.map(scope_from_projection_scope)
+        .unwrap_or(SwarmScope::Global)
+}
 
 pub(super) fn merge_scopes(scopes: impl IntoIterator<Item = SwarmScope>) -> Vec<SwarmScope> {
     let mut merged = Vec::new();
@@ -18,13 +32,9 @@ pub(super) fn dynamic_subscription_scopes_for_node(
     node_id: &str,
 ) -> Result<Vec<SwarmScope>> {
     let mut scopes = Vec::new();
-    for hint in node
-        .store
-        .list_active_feed_subscription_scope_hints(node_id)?
-    {
-        if let Some(scope) = parse_scope_hint_string(&hint)
-            && !scopes.contains(&scope)
-        {
+    for scope in node.store.list_active_feed_subscription_scopes(node_id)? {
+        let scope = scope_from_projection_scope(scope);
+        if !scopes.contains(&scope) {
             scopes.push(scope);
         }
     }
@@ -42,24 +52,18 @@ pub(super) fn node_has_active_subscription_scope(
 }
 
 pub(super) fn parse_scope_hint_string(raw: &str) -> Option<SwarmScope> {
-    let trimmed = raw.trim();
-    if trimmed.eq_ignore_ascii_case("global") {
-        return Some(SwarmScope::Global);
-    }
-    let (kind, rest) = trimmed.split_once(':')?;
-    let id = rest
-        .split([':', '/'])
-        .next()
-        .map(str::trim)
+    crate::types::ScopeHint::parse_with_prefix_fallback(raw).map(scope_from_projection_scope)
+}
+
+fn contract_scope_from_object(
+    obj: &serde_json::Map<String, serde_json::Value>,
+) -> Option<SwarmScope> {
+    let kind = obj.get("kind").and_then(serde_json::Value::as_str)?;
+    let id = obj
+        .get("id")
+        .and_then(serde_json::Value::as_str)
         .unwrap_or_default();
-    if id.is_empty() {
-        return None;
-    }
-    match kind.trim().to_ascii_lowercase().as_str() {
-        "region" => Some(SwarmScope::Region(id.to_owned())),
-        "local" | "node" => Some(SwarmScope::Node(id.to_owned())),
-        _ => None,
-    }
+    crate::types::ScopeHint::from_kind_id(kind, id).map(scope_from_projection_scope)
 }
 
 pub(super) fn contract_scope(contract: &crate::types::TaskContract) -> SwarmScope {
@@ -75,46 +79,25 @@ pub(super) fn contract_scope(contract: &crate::types::TaskContract) -> SwarmScop
         .inputs
         .get("swarm_scope")
         .and_then(serde_json::Value::as_object)
+        .and_then(contract_scope_from_object)
     {
-        let kind = obj.get("kind").and_then(serde_json::Value::as_str);
-        let id = obj.get("id").and_then(serde_json::Value::as_str);
-        match (
-            kind.map(|v| v.trim().to_ascii_lowercase()),
-            id.map(str::trim),
-        ) {
-            (Some(kind), Some(id)) if !id.is_empty() && kind == "region" => {
-                return SwarmScope::Region(id.to_owned());
-            }
-            (Some(kind), Some(id))
-                if !id.is_empty() && matches!(kind.as_str(), "local" | "node") =>
-            {
-                return SwarmScope::Node(id.to_owned());
-            }
-            (Some(kind), _) if kind == "global" => return SwarmScope::Global,
-            _ => {}
-        }
+        return obj;
     }
     parse_scope_hint_string(&contract.task_type).unwrap_or(SwarmScope::Global)
-}
-
-pub(super) fn scope_from_hint_or_global(raw: &str) -> SwarmScope {
-    parse_scope_hint_string(raw).unwrap_or(SwarmScope::Global)
 }
 
 pub(super) fn event_scope(node: &Node, event: &crate::types::Event) -> Result<SwarmScope> {
     match &event.payload {
         crate::types::EventPayload::TaskCreated(contract) => Ok(contract_scope(contract)),
         crate::types::EventPayload::FeedSubscriptionUpdated(payload) => {
-            Ok(scope_from_hint_or_global(&payload.scope_hint))
+            Ok(scope_from_optional_hint(payload.scope()))
         }
-        crate::types::EventPayload::TaskAnnounced(payload) => {
-            Ok(scope_from_hint_or_global(&payload.scope_hint))
-        }
+        crate::types::EventPayload::TaskAnnounced(payload) => Ok(scope_from_optional_hint(payload.scope())),
         crate::types::EventPayload::ExecutionIntentDeclared(payload) => {
-            Ok(scope_from_hint_or_global(&payload.scope_hint))
+            Ok(scope_from_optional_hint(payload.scope()))
         }
         crate::types::EventPayload::ExecutionSetConfirmed(payload) => {
-            Ok(scope_from_hint_or_global(&payload.scope_hint))
+            Ok(scope_from_optional_hint(payload.scope()))
         }
         crate::types::EventPayload::MembershipUpdated(_)
         | crate::types::EventPayload::PolicyTuned(_)

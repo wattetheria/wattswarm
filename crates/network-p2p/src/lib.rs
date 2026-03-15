@@ -95,12 +95,15 @@ impl TopicKind {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TopicNamespace {
     pub network: String,
+    #[serde(default = "default_network_context_id")]
+    pub network_id: String,
 }
 
 impl Default for TopicNamespace {
     fn default() -> Self {
         Self {
             network: DEFAULT_NAMESPACE.to_owned(),
+            network_id: default_network_context_id(),
         }
     }
 }
@@ -108,8 +111,9 @@ impl Default for TopicNamespace {
 impl TopicNamespace {
     pub fn topic_name(&self, scope: &SwarmScope, kind: TopicKind) -> Result<String> {
         Ok(format!(
-            "{}.{}.{}",
+            "{}.{}.{}.{}",
             sanitize_segment(&self.network)?,
+            sanitize_segment(&self.network_id)?,
             scope.label()?,
             kind.as_str()
         ))
@@ -353,8 +357,10 @@ impl NetworkP2pConfig {
         mut self,
         params: &wattswarm_protocol::types::NetworkProtocolParams,
     ) -> Self {
+        let network_id = self.namespace.network_id.clone();
         self.namespace = TopicNamespace {
             network: params.namespace_network.clone(),
+            network_id,
         };
         self.protocol_version = params.protocol_version.clone();
         self.max_established_per_peer = params.max_established_per_peer;
@@ -374,6 +380,9 @@ impl NetworkP2pConfig {
         }
         if self.namespace.network.trim().is_empty() {
             bail!("namespace network is required");
+        }
+        if self.namespace.network_id.trim().is_empty() {
+            bail!("namespace network_id is required");
         }
         if self.protocol_version.trim().is_empty() {
             bail!("protocol_version is required");
@@ -1372,6 +1381,10 @@ fn sanitize_segment(raw: &str) -> Result<String> {
     Ok(out)
 }
 
+fn default_network_context_id() -> String {
+    "default".to_owned()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1399,11 +1412,39 @@ mod tests {
     fn topic_catalog_uses_namespace_scope_and_kind() {
         let namespace = TopicNamespace {
             network: "WattSwarm Main".to_owned(),
+            network_id: "mainnet:watt-galaxy".to_owned(),
         };
         let catalog = TopicCatalog::new(&namespace, &SwarmScope::Region("sol-1/alpha".to_owned()))
             .expect("catalog");
-        assert_eq!(catalog.events, "wattswarm-main.region.sol-1-alpha.events");
-        assert_eq!(catalog.rules, "wattswarm-main.region.sol-1-alpha.rules");
+        assert_eq!(
+            catalog.events,
+            "wattswarm-main.mainnet-watt-galaxy.region.sol-1-alpha.events"
+        );
+        assert_eq!(
+            catalog.rules,
+            "wattswarm-main.mainnet-watt-galaxy.region.sol-1-alpha.rules"
+        );
+    }
+
+    #[test]
+    fn topic_catalog_isolates_same_scope_across_network_contexts() {
+        let mainnet = TopicNamespace {
+            network: "watt-galaxy".to_owned(),
+            network_id: "mainnet:watt-galaxy".to_owned(),
+        };
+        let subnet = TopicNamespace {
+            network: "watt-galaxy".to_owned(),
+            network_id: "subnet:alpha".to_owned(),
+        };
+
+        let mainnet_topic = mainnet
+            .topic_name(&SwarmScope::Global, TopicKind::Events)
+            .expect("mainnet topic");
+        let subnet_topic = subnet
+            .topic_name(&SwarmScope::Global, TopicKind::Events)
+            .expect("subnet topic");
+
+        assert_ne!(mainnet_topic, subnet_topic);
     }
 
     #[test]
@@ -1453,6 +1494,7 @@ mod tests {
 
         let json = serde_json::to_value(&config).expect("serialize config");
         assert_eq!(json["namespace"]["network"], "wattswarm");
+        assert_eq!(json["namespace"]["network_id"], "default");
         assert_eq!(json["max_backfill_events"], 512);
         assert_eq!(json["max_established_per_peer"], 2);
         assert_eq!(json["protocol_version"], "/wattswarm/0.1.0");

@@ -1,7 +1,10 @@
 use wattswarm_protocol::types::{
-    BudgetMode, CheckpointCreatedPayload, EventKind, EventPayload, EventRevokedPayload, Membership,
-    NodePenalizedPayload, PolicyBinding, Role, SummaryRevokedPayload, TaskContract,
-    TaskExpiredPayload, TaskMode, UnsignedEvent,
+    BudgetMode, CheckpointCreatedPayload, EventKind, EventPayload, EventRevokedPayload,
+    ExecutionIntentDeclaredPayload, ExecutionSetConfirmedPayload, FeedSubscriptionUpdatedPayload,
+    Membership, NetworkDescriptor, NetworkKind, NetworkTopology, NodePenalizedPayload,
+    OrgDescriptor, PolicyBinding, Role, ScopeHint, SummaryRevokedPayload, TaskAnnouncedPayload,
+    TaskContract, TaskExpiredPayload, TaskMode, UnsignedEvent, canonical_scope_hint,
+    normalized_scope_hint,
 };
 
 #[test]
@@ -158,4 +161,131 @@ fn policy_binding_roundtrip_is_stable() {
     let encoded = serde_json::to_string(&binding).expect("encode policy binding");
     let decoded: PolicyBinding = serde_json::from_str(&encoded).expect("decode policy binding");
     assert_eq!(decoded, binding);
+}
+
+#[test]
+fn scope_hint_parse_and_canonicalization_are_shared() {
+    assert_eq!(ScopeHint::parse("global"), Some(ScopeHint::Global));
+    assert_eq!(
+        ScopeHint::parse(" region : sol-1 "),
+        Some(ScopeHint::Region("sol-1".to_owned()))
+    );
+    assert_eq!(
+        ScopeHint::parse(" local:lab-9 "),
+        Some(ScopeHint::Node("lab-9".to_owned()))
+    );
+    assert_eq!(ScopeHint::parse("bad-scope"), None);
+    assert_eq!(
+        ScopeHint::from_kind_id(" region ", " sol-2 "),
+        Some(ScopeHint::Region("sol-2".to_owned()))
+    );
+    assert_eq!(
+        ScopeHint::from_kind_id("global", ""),
+        Some(ScopeHint::Global)
+    );
+    assert_eq!(ScopeHint::from_kind_id("node", ""), None);
+    assert_eq!(
+        FeedSubscriptionUpdatedPayload {
+            network_id: "default".to_owned(),
+            subscriber_node_id: "node-a".to_owned(),
+            feed_key: "feed".to_owned(),
+            scope_hint: "region:sol-1".to_owned(),
+            active: true,
+        }
+        .scope(),
+        Some(ScopeHint::Region("sol-1".to_owned()))
+    );
+    assert_eq!(
+        TaskAnnouncedPayload {
+            network_id: "default".to_owned(),
+            task_id: "task-1".to_owned(),
+            announcement_id: "announce-1".to_owned(),
+            feed_key: "feed".to_owned(),
+            scope_hint: "node:lab-9".to_owned(),
+            summary: serde_json::json!({}),
+            detail_ref: None,
+        }
+        .scope(),
+        Some(ScopeHint::Node("lab-9".to_owned()))
+    );
+    assert_eq!(
+        ExecutionIntentDeclaredPayload {
+            network_id: "default".to_owned(),
+            task_id: "task-1".to_owned(),
+            execution_set_id: "set-1".to_owned(),
+            participant_node_id: "node-a".to_owned(),
+            role_hint: "worker".to_owned(),
+            scope_hint: "global".to_owned(),
+            intent: "propose".to_owned(),
+        }
+        .scope(),
+        Some(ScopeHint::Global)
+    );
+    assert_eq!(
+        ExecutionSetConfirmedPayload {
+            network_id: "default".to_owned(),
+            task_id: "task-1".to_owned(),
+            execution_set_id: "set-1".to_owned(),
+            confirmed_by_node_id: "node-b".to_owned(),
+            scope_hint: "region:sol-2".to_owned(),
+            members: vec![],
+        }
+        .scope(),
+        Some(ScopeHint::Region("sol-2".to_owned()))
+    );
+
+    assert_eq!(canonical_scope_hint("global"), Some("global".to_owned()));
+    assert_eq!(
+        canonical_scope_hint(" region : sol-1 "),
+        Some("region:sol-1".to_owned())
+    );
+    assert_eq!(
+        canonical_scope_hint(" local:lab-9 "),
+        Some("node:lab-9".to_owned())
+    );
+    assert_eq!(normalized_scope_hint(" local:lab-9 "), "node:lab-9");
+    assert_eq!(normalized_scope_hint(" custom/raw "), "custom/raw");
+
+    assert_eq!(
+        ScopeHint::parse_prefix("region:sol-1:swarm"),
+        Some(ScopeHint::Region("sol-1".to_owned()))
+    );
+    assert_eq!(
+        ScopeHint::parse_with_prefix_fallback(" local:lab-9:worker "),
+        Some(ScopeHint::Node("lab-9".to_owned()))
+    );
+}
+
+#[test]
+fn network_kind_and_topology_types_capture_subnet_as_network_subtype() {
+    assert_eq!(NetworkKind::parse("local"), Some(NetworkKind::Local));
+    assert_eq!(NetworkKind::parse("lan"), Some(NetworkKind::Lan));
+    assert_eq!(NetworkKind::parse("mainnet"), Some(NetworkKind::Mainnet));
+    assert_eq!(NetworkKind::parse("subnet"), Some(NetworkKind::Subnet));
+    assert_eq!(NetworkKind::Subnet.as_str(), "subnet");
+    assert!(NetworkKind::Subnet.is_overlay());
+    assert!(NetworkKind::Mainnet.is_overlay());
+    assert!(!NetworkKind::Lan.is_overlay());
+
+    let topology = NetworkTopology {
+        network: NetworkDescriptor {
+            network_id: "subnet:alpha".to_owned(),
+            network_kind: NetworkKind::Subnet,
+            parent_network_id: Some("mainnet:watt-galaxy".to_owned()),
+            genesis_node_id: "node-genesis".to_owned(),
+        },
+        org: OrgDescriptor {
+            org_id: "subnet:alpha:bootstrap".to_owned(),
+            network_id: "subnet:alpha".to_owned(),
+            org_kind: "bootstrap".to_owned(),
+            is_default: true,
+        },
+    };
+
+    assert!(topology.network.is_subnet());
+    assert_eq!(
+        topology.network.parent_network_id.as_deref(),
+        Some("mainnet:watt-galaxy")
+    );
+    assert_eq!(topology.org.network_id, topology.network.network_id);
 }

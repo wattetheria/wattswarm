@@ -1,7 +1,7 @@
 use crate::crypto::{NodeIdentity, candidate_hash, vote_commit_hash};
 use crate::node::{Node, finality_sign};
 use crate::runtime::{HttpRuntimeClient, RuntimeClient};
-use crate::storage::{PgStore, lan_network_id, local_network_id};
+use crate::storage::PgStore;
 use crate::task_template::sample_contract;
 use crate::types::{
     ClaimRole, FinalityProof, Membership, Role, TaskContract, VoteChoice, VoteCommitPayload,
@@ -140,21 +140,18 @@ pub fn open_node_in_mode(state_dir: &Path, db_path: &Path, mode: NodeMode) -> Re
     let self_node_id = identity.node_id();
     let now = chrono::Utc::now().timestamp_millis().max(0) as u64;
     let store = PgStore::open(db_path)?;
-    let org_id = match mode {
+    let topology = match mode {
         NodeMode::Local => {
-            store.ensure_local_bootstrap_topology(&self_node_id, &self_node_id, now)?
+            store.ensure_local_bootstrap_network_topology(&self_node_id, &self_node_id, now)?
         }
-        NodeMode::Lan => store.ensure_lan_bootstrap_topology(&self_node_id, &self_node_id, now)?,
+        NodeMode::Lan => {
+            store.ensure_lan_bootstrap_network_topology(&self_node_id, &self_node_id, now)?
+        }
         NodeMode::Network => {
-            store.resolve_network_bootstrap_topology(&self_node_id, &self_node_id, now)?
+            store.resolve_network_bootstrap_topology_descriptor(&self_node_id, &self_node_id, now)?
         }
     };
-    let network_id = match mode {
-        NodeMode::Local => local_network_id(&self_node_id),
-        NodeMode::Lan => lan_network_id(&self_node_id),
-        NodeMode::Network => store.network_id_for_org(&org_id)?,
-    };
-    store.ensure_bootstrap_signed_network_protocol_params(&network_id, &identity)?;
+    store.ensure_bootstrap_signed_network_protocol_params(&topology.network.network_id, &identity)?;
     let mut membership = Membership::new();
     for role in [
         Role::Proposer,
@@ -165,10 +162,10 @@ pub fn open_node_in_mode(state_dir: &Path, db_path: &Path, mode: NodeMode) -> Re
         membership.grant(&identity.node_id(), role);
     }
 
-    let bound_store = store.for_org(&org_id);
+    let bound_store = store.for_org(&topology.org.org_id);
     bound_store
         .load_verified_network_protocol_params()
-        .with_context(|| format!("load verified network params for org {org_id}"))?;
+        .with_context(|| format!("load verified network params for org {}", topology.org.org_id))?;
     let mut node = Node::new(identity, bound_store, membership)?;
     let replay_on_open = env::var("WATTSWARM_REPLAY_ON_OPEN").ok().is_some_and(|v| {
         let t = v.trim().to_ascii_lowercase();

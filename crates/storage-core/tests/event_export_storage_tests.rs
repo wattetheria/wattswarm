@@ -6,12 +6,63 @@ use wattswarm_storage_core::types::{
     TaskExpiredPayload, TaskMode, VerificationStatus, VerifierResult, VerifyAssignment, VoteChoice,
     VotePolicy,
 };
-use wattswarm_storage_core::{AdvisoryStateRow, PgStore};
+use wattswarm_storage_core::types::NetworkKind;
+use wattswarm_storage_core::{AdvisoryStateRow, PgStore, ProjectionScope};
 
 fn open_test_store() -> PgStore {
     PgStore::open_in_memory()
         .expect("open store")
         .for_org("local:test-storage:bootstrap")
+}
+
+#[test]
+fn network_substrate_reads_canonicalize_scope_hints() {
+    let store = open_test_store();
+    store
+        .upsert_feed_subscription("node-a", "feed-1", " local:lab-9 ", true, 100)
+        .expect("upsert subscription");
+
+    let subscription = store
+        .get_feed_subscription("node-a", "feed-1")
+        .expect("load subscription")
+        .expect("subscription exists");
+    assert_eq!(subscription.scope_hint, "node:lab-9");
+    assert_eq!(
+        subscription.scope(),
+        Some(ProjectionScope::Node("lab-9".to_owned()))
+    );
+
+    let hints = store
+        .list_active_feed_subscription_scope_hints("node-a")
+        .expect("load hints");
+    assert_eq!(hints, vec!["node:lab-9".to_owned()]);
+
+    let scopes = store
+        .list_active_feed_subscription_scopes("node-a")
+        .expect("load scopes");
+    assert_eq!(scopes, vec![ProjectionScope::Node("lab-9".to_owned())]);
+}
+
+#[test]
+fn bootstrap_topology_returns_typed_network_and_org_descriptors() {
+    let store = PgStore::open_in_memory().expect("open store");
+    let topology = store
+        .ensure_local_bootstrap_network_topology("node-a", "pub-a", 1_700_000_000_000)
+        .expect("bootstrap topology");
+
+    assert_eq!(topology.network.network_id, "local:node-a");
+    assert_eq!(topology.network.network_kind, NetworkKind::Local);
+    assert_eq!(topology.network.parent_network_id, None);
+    assert_eq!(topology.network.genesis_node_id, "node-a");
+    assert_eq!(topology.org.org_id, "local:node-a:bootstrap");
+    assert_eq!(topology.org.network_id, topology.network.network_id);
+    assert_eq!(topology.org.org_kind, "bootstrap");
+    assert!(topology.org.is_default);
+
+    let loaded = store
+        .load_network_topology_for_org(&topology.org.org_id)
+        .expect("load topology");
+    assert_eq!(loaded, topology);
 }
 
 fn sample_contract(task_id: &str, task_type: &str) -> TaskContract {

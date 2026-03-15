@@ -1,6 +1,13 @@
 use super::*;
 
 impl Node {
+    pub(crate) fn current_network_context_id(&self) -> String {
+        self.store
+            .load_verified_network_protocol_params()
+            .map(|verified| verified.network_id)
+            .unwrap_or_else(|_| "default".to_owned())
+    }
+
     pub fn new(
         identity: NodeIdentity,
         store: PgStore,

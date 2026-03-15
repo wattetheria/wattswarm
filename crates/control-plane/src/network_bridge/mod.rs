@@ -60,6 +60,29 @@ const ENV_P2P_BOOTSTRAP_PEERS: &str = "WATTSWARM_P2P_BOOTSTRAP_PEERS";
 const DEFAULT_P2P_PORT: u16 = 4001;
 const GLOBAL_HIGH_FREQUENCY_WINDOW: Duration = Duration::from_secs(5);
 const GLOBAL_HIGH_FREQUENCY_LIMIT: usize = 32;
+const DEFAULT_NETWORK_CONTEXT_ID: &str = "default";
+
+fn current_network_context_id(node: &Node) -> String {
+    if node.store.is_org_configured()
+        && let Ok(topology) = node.store.load_network_topology_for_org(node.store.org_id())
+    {
+        return topology.network.network_id;
+    }
+    node.store
+        .load_verified_network_protocol_params()
+        .map(|verified| verified.network_id)
+        .unwrap_or_else(|_| DEFAULT_NETWORK_CONTEXT_ID.to_owned())
+}
+
+fn network_id_for_network_substrate_event(event: &crate::types::Event) -> Option<&str> {
+    match &event.payload {
+        crate::types::EventPayload::FeedSubscriptionUpdated(payload) => Some(&payload.network_id),
+        crate::types::EventPayload::TaskAnnounced(payload) => Some(&payload.network_id),
+        crate::types::EventPayload::ExecutionIntentDeclared(payload) => Some(&payload.network_id),
+        crate::types::EventPayload::ExecutionSetConfirmed(payload) => Some(&payload.network_id),
+        _ => None,
+    }
+}
 
 fn observed_at_ms() -> u64 {
     SystemTime::now()
@@ -235,6 +258,7 @@ fn run_background_network_service(
     let protocol_params = verified_protocol_params.params().clone();
     let mut config = config.apply_protocol_params(&protocol_params);
     let handshake_network_id = verified_protocol_params.network_id.clone();
+    config.namespace.network_id = handshake_network_id.clone();
     let handshake_params_version = verified_protocol_params.signed.version;
     let handshake_params_hash = verified_protocol_params.params_hash().to_owned();
     config.identify_agent_version = PeerHandshakeMetadata {

@@ -1,6 +1,10 @@
 use super::*;
 
 impl PgStore {
+    fn canonical_scope_hint_or_original(raw: String) -> String {
+        wattswarm_protocol::types::normalized_scope_hint(&raw)
+    }
+
     pub fn upsert_task_contract(&self, contract: &TaskContract, epoch: u64) -> Result<()> {
         let contract_json = serde_json::to_string(contract)?;
         let conn = self
@@ -217,12 +221,25 @@ impl PgStore {
         let rows = stmt.query_map(params![self.org_id(), subscriber_node_id], |r| r.get(0))?;
         let mut hints = Vec::new();
         for row in rows {
-            let hint: String = row?;
+            let hint = Self::canonical_scope_hint_or_original(row?);
             if !hints.contains(&hint) {
                 hints.push(hint);
             }
         }
         Ok(hints)
+    }
+
+    pub fn list_active_feed_subscription_scopes(
+        &self,
+        subscriber_node_id: &str,
+    ) -> Result<Vec<ProjectionScope>> {
+        let mut scopes = Vec::new();
+        for hint in self.list_active_feed_subscription_scope_hints(subscriber_node_id)? {
+            if let Some(scope) = ProjectionScope::parse(&hint) && !scopes.contains(&scope) {
+                scopes.push(scope);
+            }
+        }
+        Ok(scopes)
     }
 
     pub fn get_feed_subscription(
@@ -244,7 +261,7 @@ impl PgStore {
                 Ok(FeedSubscriptionRow {
                     subscriber_node_id: subscriber_node_id.to_owned(),
                     feed_key: feed_key.to_owned(),
-                    scope_hint: r.get(0)?,
+                    scope_hint: Self::canonical_scope_hint_or_original(r.get(0)?),
                     active: r.get(1)?,
                     updated_at: updated_at_ms as u64,
                 })
@@ -318,7 +335,7 @@ impl PgStore {
                     task_id: r.get(0)?,
                     announcement_id: announcement_id.to_owned(),
                     feed_key: r.get(1)?,
-                    scope_hint: r.get(2)?,
+                    scope_hint: Self::canonical_scope_hint_or_original(r.get(2)?),
                     summary: serde_json::from_str(&summary_json).map_err(|e| {
                         pg::Error::FromSqlConversionFailure(0, pg::types::Type::Text, Box::new(e))
                     })?,
@@ -429,7 +446,7 @@ impl PgStore {
                 execution_set_id: execution_set_id.to_owned(),
                 participant_node_id: r.get(0)?,
                 role_hint: r.get(1)?,
-                scope_hint: r.get(2)?,
+                scope_hint: Self::canonical_scope_hint_or_original(r.get(2)?),
                 status: r.get(3)?,
                 confirmed_by_node_id: r.get(4)?,
                 updated_at: updated_at_ms as u64,

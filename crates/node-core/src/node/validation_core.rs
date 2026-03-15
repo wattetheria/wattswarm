@@ -1,6 +1,22 @@
 use super::*;
 
 impl Node {
+    fn validate_network_substrate_scope(
+        &self,
+        network_id: &str,
+        scope: Option<&crate::types::ScopeHint>,
+        network_error: &'static str,
+        scope_error: &'static str,
+    ) -> Result<()> {
+        if network_id != self.current_network_context_id() {
+            return Err(SwarmError::InvalidEvent(network_error.into()).into());
+        }
+        if scope.is_none() {
+            return Err(SwarmError::InvalidEvent(scope_error.into()).into());
+        }
+        Ok(())
+    }
+
     pub(crate) fn validate_event(&self, event: &Event) -> Result<()> {
         verify_event_signature(event).context("event signature verify")?;
 
@@ -225,7 +241,8 @@ impl Node {
         event: &Event,
         payload: &crate::types::FeedSubscriptionUpdatedPayload,
     ) -> Result<()> {
-        if payload.subscriber_node_id.trim().is_empty()
+        if payload.network_id.trim().is_empty()
+            || payload.subscriber_node_id.trim().is_empty()
             || payload.feed_key.trim().is_empty()
             || payload.scope_hint.trim().is_empty()
         {
@@ -239,16 +256,17 @@ impl Node {
             )
             .into());
         }
-        if !is_valid_scope_hint(&payload.scope_hint) {
-            return Err(
-                SwarmError::InvalidEvent("feed subscription scope_hint invalid".into()).into(),
-            );
-        }
-        Ok(())
+        self.validate_network_substrate_scope(
+            &payload.network_id,
+            payload.scope().as_ref(),
+            "feed subscription network_id mismatch",
+            "feed subscription scope_hint invalid",
+        )
     }
 
     fn validate_task_announced(&self, payload: &crate::types::TaskAnnouncedPayload) -> Result<()> {
-        if payload.task_id.trim().is_empty()
+        if payload.network_id.trim().is_empty()
+            || payload.task_id.trim().is_empty()
             || payload.announcement_id.trim().is_empty()
             || payload.feed_key.trim().is_empty()
             || payload.scope_hint.trim().is_empty()
@@ -265,12 +283,12 @@ impl Node {
             )
             .into());
         }
-        if !is_valid_scope_hint(&payload.scope_hint) {
-            return Err(
-                SwarmError::InvalidEvent("task announcement scope_hint invalid".into()).into(),
-            );
-        }
-        Ok(())
+        self.validate_network_substrate_scope(
+            &payload.network_id,
+            payload.scope().as_ref(),
+            "task announcement network_id mismatch",
+            "task announcement scope_hint invalid",
+        )
     }
 
     fn validate_execution_intent_declared(
@@ -278,7 +296,8 @@ impl Node {
         event: &Event,
         payload: &crate::types::ExecutionIntentDeclaredPayload,
     ) -> Result<()> {
-        if payload.task_id.trim().is_empty()
+        if payload.network_id.trim().is_empty()
+            || payload.task_id.trim().is_empty()
             || payload.execution_set_id.trim().is_empty()
             || payload.participant_node_id.trim().is_empty()
             || payload.role_hint.trim().is_empty()
@@ -293,12 +312,12 @@ impl Node {
             )
             .into());
         }
-        if !is_valid_scope_hint(&payload.scope_hint) {
-            return Err(
-                SwarmError::InvalidEvent("execution intent scope_hint invalid".into()).into(),
-            );
-        }
-        Ok(())
+        self.validate_network_substrate_scope(
+            &payload.network_id,
+            payload.scope().as_ref(),
+            "execution intent network_id mismatch",
+            "execution intent scope_hint invalid",
+        )
     }
 
     fn validate_execution_set_confirmed(
@@ -306,7 +325,8 @@ impl Node {
         event: &Event,
         payload: &crate::types::ExecutionSetConfirmedPayload,
     ) -> Result<()> {
-        if payload.task_id.trim().is_empty()
+        if payload.network_id.trim().is_empty()
+            || payload.task_id.trim().is_empty()
             || payload.execution_set_id.trim().is_empty()
             || payload.confirmed_by_node_id.trim().is_empty()
             || payload.scope_hint.trim().is_empty()
@@ -321,12 +341,12 @@ impl Node {
                 SwarmError::InvalidEvent("confirmed_by_node_id must equal author".into()).into(),
             );
         }
-        if !is_valid_scope_hint(&payload.scope_hint) {
-            return Err(SwarmError::InvalidEvent(
-                "execution set confirmation scope_hint invalid".into(),
-            )
-            .into());
-        }
+        self.validate_network_substrate_scope(
+            &payload.network_id,
+            payload.scope().as_ref(),
+            "execution set confirmation network_id mismatch",
+            "execution set confirmation scope_hint invalid",
+        )?;
         if payload.members.is_empty() {
             return Err(SwarmError::InvalidEvent(
                 "execution set confirmation requires members".into(),
@@ -997,20 +1017,4 @@ impl Node {
 
         Ok(())
     }
-}
-
-fn is_valid_scope_hint(raw: &str) -> bool {
-    let trimmed = raw.trim();
-    if trimmed.eq_ignore_ascii_case("global") {
-        return true;
-    }
-    let Some((kind, rest)) = trimmed.split_once(':') else {
-        return false;
-    };
-    let id = rest.trim();
-    !id.is_empty()
-        && matches!(
-            kind.trim().to_ascii_lowercase().as_str(),
-            "region" | "local" | "node"
-        )
 }

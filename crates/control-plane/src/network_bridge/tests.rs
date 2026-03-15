@@ -1,7 +1,7 @@
 use super::*;
 use crate::crypto::NodeIdentity;
 use crate::node::build_event_for_external;
-use crate::storage::PgStore;
+use crate::storage::{PgStore, ProjectionScope};
 use crate::types::{Membership, Role};
 use crate::{node::Node, task_template::sample_contract};
 use serde_json::json;
@@ -251,6 +251,7 @@ fn dynamic_subscription_scopes_merge_with_configured_scopes() {
         1,
         crate::types::EventPayload::FeedSubscriptionUpdated(
             crate::types::FeedSubscriptionUpdatedPayload {
+                network_id: "default".to_owned(),
                 subscriber_node_id: node_id.clone(),
                 feed_key: "market.alpha".to_owned(),
                 scope_hint: "region:sol-1".to_owned(),
@@ -278,6 +279,7 @@ fn publish_pending_updates_subscribes_runtime_for_local_feed_subscription() {
         1,
         crate::types::EventPayload::FeedSubscriptionUpdated(
             crate::types::FeedSubscriptionUpdatedPayload {
+                network_id: "default".to_owned(),
                 subscriber_node_id: local_node_id.clone(),
                 feed_key: "market.beta".to_owned(),
                 scope_hint: "node:lab-9".to_owned(),
@@ -318,6 +320,7 @@ fn publish_pending_updates_unsubscribes_scope_when_local_subscription_is_disable
         1,
         crate::types::EventPayload::FeedSubscriptionUpdated(
             crate::types::FeedSubscriptionUpdatedPayload {
+                network_id: "default".to_owned(),
                 subscriber_node_id: local_node_id.clone(),
                 feed_key: "market.gamma".to_owned(),
                 scope_hint: "region:sol-8".to_owned(),
@@ -331,6 +334,7 @@ fn publish_pending_updates_unsubscribes_scope_when_local_subscription_is_disable
         1,
         crate::types::EventPayload::FeedSubscriptionUpdated(
             crate::types::FeedSubscriptionUpdatedPayload {
+                network_id: "default".to_owned(),
                 subscriber_node_id: local_node_id.clone(),
                 feed_key: "market.gamma".to_owned(),
                 scope_hint: "region:sol-8".to_owned(),
@@ -372,6 +376,7 @@ fn invalid_scope_hints_are_rejected_for_network_substrate_events() {
         1,
         crate::types::EventPayload::FeedSubscriptionUpdated(
             crate::types::FeedSubscriptionUpdatedPayload {
+                network_id: "default".to_owned(),
                 subscriber_node_id,
                 feed_key: "market.invalid".to_owned(),
                 scope_hint: "bad-scope".to_owned(),
@@ -385,11 +390,85 @@ fn invalid_scope_hints_are_rejected_for_network_substrate_events() {
 }
 
 #[test]
+fn empty_network_id_is_rejected_for_network_substrate_events() {
+    let mut node = Node::open_in_memory_with_roles(&[]).expect("node");
+    let subscriber_node_id = node.node_id();
+
+    let result = node.emit_at(
+        1,
+        crate::types::EventPayload::FeedSubscriptionUpdated(
+            crate::types::FeedSubscriptionUpdatedPayload {
+                network_id: String::new(),
+                subscriber_node_id,
+                feed_key: "market.invalid".to_owned(),
+                scope_hint: "region:sol-1".to_owned(),
+                active: true,
+            },
+        ),
+        100,
+    );
+
+    assert!(result.is_err());
+}
+
+#[test]
+fn mismatched_network_id_is_rejected_for_network_substrate_events() {
+    let mut node = Node::open_in_memory_with_roles(&[]).expect("node");
+    let subscriber_node_id = node.node_id();
+
+    let result = node.emit_at(
+        1,
+        crate::types::EventPayload::FeedSubscriptionUpdated(
+            crate::types::FeedSubscriptionUpdatedPayload {
+                network_id: "mainnet:other".to_owned(),
+                subscriber_node_id,
+                feed_key: "market.invalid".to_owned(),
+                scope_hint: "region:sol-1".to_owned(),
+                active: true,
+            },
+        ),
+        100,
+    );
+
+    assert!(result.is_err());
+}
+
+#[test]
+fn network_substrate_projection_canonicalizes_scope_hints() {
+    let mut node = Node::open_in_memory_with_roles(&[]).expect("node");
+    let subscriber_node_id = node.node_id();
+
+    node.emit_at(
+        1,
+        crate::types::EventPayload::FeedSubscriptionUpdated(
+            crate::types::FeedSubscriptionUpdatedPayload {
+                network_id: "default".to_owned(),
+                subscriber_node_id: subscriber_node_id.clone(),
+                feed_key: "market.canonical".to_owned(),
+                scope_hint: " local:lab-9 ".to_owned(),
+                active: true,
+            },
+        ),
+        100,
+    )
+    .expect("subscription event");
+
+    let row = node
+        .store
+        .get_feed_subscription(&subscriber_node_id, "market.canonical")
+        .expect("load subscription")
+        .expect("subscription exists");
+    assert_eq!(row.scope_hint, "node:lab-9");
+    assert_eq!(row.scope(), Some(ProjectionScope::Node("lab-9".to_owned())));
+}
+
+#[test]
 fn task_announcement_event_persists_summary_and_detail_reference() {
     let mut node = Node::open_in_memory_with_roles(&[Role::Proposer]).expect("node");
     node.emit_at(
         1,
         crate::types::EventPayload::TaskAnnounced(crate::types::TaskAnnouncedPayload {
+            network_id: "default".to_owned(),
             task_id: "task-announced-1".to_owned(),
             announcement_id: "announce-1".to_owned(),
             feed_key: "venue.market".to_owned(),
@@ -416,6 +495,10 @@ fn task_announcement_event_persists_summary_and_detail_reference() {
     assert_eq!(announcement.task_id, "task-announced-1");
     assert_eq!(announcement.feed_key, "venue.market");
     assert_eq!(announcement.scope_hint, "region:sol-2");
+    assert_eq!(
+        announcement.scope(),
+        Some(ProjectionScope::Region("sol-2".to_owned()))
+    );
     assert_eq!(announcement.summary["reward"], json!(42));
     assert_eq!(
         announcement.detail_ref.expect("detail ref").uri,
@@ -432,6 +515,7 @@ fn execution_set_events_persist_intent_and_confirmation() {
             1,
             crate::types::EventPayload::ExecutionIntentDeclared(
                 crate::types::ExecutionIntentDeclaredPayload {
+                    network_id: "default".to_owned(),
                     task_id: "task-execution-1".to_owned(),
                     execution_set_id: "exec-set-1".to_owned(),
                     participant_node_id: participant_node_id.clone(),
@@ -450,6 +534,10 @@ fn execution_set_events_persist_intent_and_confirmation() {
         .expect("members after intent");
     assert_eq!(members.len(), 1);
     assert_eq!(members[0].status, "interested");
+    assert_eq!(
+        members[0].scope(),
+        Some(ProjectionScope::Region("sol-3".to_owned()))
+    );
 
     let mut confirmer = Node::open_in_memory_with_roles(&[Role::Committer]).expect("confirmer");
     let confirmed_by_node_id = confirmer.node_id();
@@ -458,6 +546,7 @@ fn execution_set_events_persist_intent_and_confirmation() {
             1,
             crate::types::EventPayload::ExecutionSetConfirmed(
                 crate::types::ExecutionSetConfirmedPayload {
+                    network_id: "default".to_owned(),
                     task_id: "task-execution-1".to_owned(),
                     execution_set_id: "exec-set-1".to_owned(),
                     confirmed_by_node_id: confirmed_by_node_id.clone(),
@@ -478,6 +567,10 @@ fn execution_set_events_persist_intent_and_confirmation() {
         .expect("members after confirmation");
     assert_eq!(members.len(), 1);
     assert_eq!(members[0].status, "confirmed");
+    assert_eq!(
+        members[0].scope(),
+        Some(ProjectionScope::Region("sol-3".to_owned()))
+    );
     assert_eq!(
         members[0].confirmed_by_node_id.as_deref(),
         Some(confirmed_by_node_id.as_str())
@@ -674,7 +767,7 @@ fn scopes_to_request_for_peer_falls_back_to_all_scopes_until_peer_is_profiled() 
 fn local_scope_aliases_map_to_node_scope() {
     let policy_hash = "policy-hash-alias".to_owned();
     let mut contract = sample_contract("task-local-alias", policy_hash);
-    contract.inputs = json!({"swarm_scope":"local:lab-1"});
+    contract.inputs = json!({"swarm_scope":" local:lab-1 "});
     assert_eq!(
         scope::contract_scope(&contract),
         SwarmScope::Node("lab-1".to_owned())
@@ -691,6 +784,28 @@ fn local_scope_aliases_map_to_node_scope() {
     assert_eq!(
         scope::contract_scope(&contract),
         SwarmScope::Node("lab-3".to_owned())
+    );
+}
+
+#[test]
+fn parse_scope_hint_string_preserves_task_type_style_prefix_fallback() {
+    assert_eq!(
+        scope::parse_scope_hint_string("region:sol-1:swarm"),
+        Some(SwarmScope::Region("sol-1".to_owned()))
+    );
+    assert_eq!(
+        scope::parse_scope_hint_string(" local:lab-7:worker "),
+        Some(SwarmScope::Node("lab-7".to_owned()))
+    );
+}
+
+#[test]
+fn contract_scope_object_uses_shared_canonical_scope_rules() {
+    let mut contract = sample_contract("task-object-scope", "policy-hash-object".to_owned());
+    contract.inputs = json!({"swarm_scope":{"kind":" local ","id":" lab-8 "}});
+    assert_eq!(
+        scope::contract_scope(&contract),
+        SwarmScope::Node("lab-8".to_owned())
     );
 }
 
@@ -734,6 +849,52 @@ fn backfill_response_filters_by_scope() {
         response.events[0].event.task_id.as_deref(),
         Some("task-region-backfill")
     );
+}
+
+#[test]
+fn backfill_response_skips_network_substrate_events_for_other_networks() {
+    let identity = NodeIdentity::random();
+    let node_id = identity.node_id();
+    let membership = membership_with_roles(std::slice::from_ref(&node_id));
+    let node = Node::new(
+        identity.clone(),
+        PgStore::open_in_memory().expect("store"),
+        membership,
+    )
+    .expect("node");
+
+    let mismatched_event = build_event_for_external(
+        &identity,
+        1,
+        100,
+        crate::types::EventPayload::FeedSubscriptionUpdated(
+            crate::types::FeedSubscriptionUpdatedPayload {
+                network_id: "mainnet:other".to_owned(),
+                subscriber_node_id: node_id,
+                feed_key: "market.alpha".to_owned(),
+                scope_hint: "region:sol-1".to_owned(),
+                active: true,
+            },
+        ),
+    )
+    .expect("event");
+    node.store
+        .append_event(&mismatched_event)
+        .expect("append event");
+
+    let response = backfill_response_for_request(
+        &node,
+        &BackfillRequest {
+            scope: SwarmScope::Region("sol-1".to_owned()),
+            from_event_seq: 0,
+            limit: 8,
+        },
+        32,
+        64,
+    )
+    .expect("backfill response");
+
+    assert!(response.events.is_empty());
 }
 
 #[test]
