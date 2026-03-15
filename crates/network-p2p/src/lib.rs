@@ -503,6 +503,12 @@ impl From<std::convert::Infallible> for WattSwarmBehaviourEvent {
 #[derive(NetworkBehaviour)]
 #[behaviour(to_swarm = "WattSwarmBehaviourEvent")]
 pub struct WattSwarmBehaviour {
+    // connection_limits MUST be declared before request_response so that
+    // over-limit connections are denied before request_response records
+    // them in its internal tracking map.  Reversing the order causes a
+    // phantom entry that triggers a debug_assert inside
+    // libp2p-request-response on ConnectionClosed.
+    pub connection_limits: connection_limits::Behaviour,
     pub gossipsub: Gossipsub,
     pub identify: identify::Behaviour,
     pub kademlia: kad::Behaviour<MemoryStore>,
@@ -511,7 +517,6 @@ pub struct WattSwarmBehaviour {
     pub dcutr: dcutr::Behaviour,
     pub request_response: request_response::cbor::Behaviour<BackfillRequest, BackfillResponse>,
     pub mdns: Toggle<mdns::tokio::Behaviour>,
-    pub connection_limits: connection_limits::Behaviour,
 }
 
 #[derive(Debug)]
@@ -720,6 +725,7 @@ impl NetworkP2pNode {
             )?
             .with_relay_client(noise::Config::new, yamux::Config::default)?
             .with_behaviour(move |_, relay_client| WattSwarmBehaviour {
+                connection_limits: parts.connection_limits,
                 gossipsub: parts.gossipsub,
                 identify: parts.identify,
                 kademlia: parts.kademlia,
@@ -728,7 +734,6 @@ impl NetworkP2pNode {
                 dcutr: dcutr::Behaviour::new(local_peer_id),
                 request_response: parts.request_response,
                 mdns: parts.mdns,
-                connection_limits: parts.connection_limits,
             })?
             .build())
     }
