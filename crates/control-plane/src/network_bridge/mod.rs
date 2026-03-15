@@ -97,6 +97,14 @@ fn observed_at_ms() -> u64 {
         .as_millis() as u64
 }
 
+fn scope_hint_label(scope: &SwarmScope) -> String {
+    match scope {
+        SwarmScope::Global => "global".to_owned(),
+        SwarmScope::Region(id) => format!("region:{id}"),
+        SwarmScope::Node(id) => format!("node:{id}"),
+    }
+}
+
 pub(super) fn parent_uplink_store(node: &Node) -> Result<Option<crate::storage::PgStore>> {
     if !node.store.is_org_configured() {
         return Ok(None);
@@ -411,6 +419,75 @@ pub enum NetworkBridgeTick {
     },
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ScopeTrafficStats {
+    pub published_events: u64,
+    pub ingested_events: u64,
+    pub summaries_applied: u64,
+    pub rules_applied: u64,
+    pub checkpoints_applied: u64,
+    pub backfills_applied: u64,
+    pub backfill_events_applied: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NetworkBridgePeerHealth {
+    pub peer: String,
+    pub connected: bool,
+    pub score: i64,
+    pub blacklisted: bool,
+    pub known_scopes: Vec<String>,
+    pub inflight_backfills: usize,
+    pub next_retry_in_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NetworkBridgeScopeTraffic {
+    pub scope: String,
+    pub stats: ScopeTrafficStats,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NetworkBridgeSummaryHealth {
+    pub imported_decision_memory_rows: u64,
+    pub imported_reputation_rows: u64,
+    pub imported_task_outcome_rows: u64,
+    pub checkpoint_rows: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NetworkBridgeSubnetSyncHealth {
+    pub network_id: String,
+    pub network_kind: String,
+    pub parent_network_id: Option<String>,
+    pub parent_uplink_available: bool,
+    pub parent_imported_task_outcome_rows: Option<u64>,
+    pub parent_checkpoint_rows: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NetworkBridgeExecutionSetHealth {
+    pub execution_set_count: u64,
+    pub execution_set_member_count: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NetworkBridgeObservabilitySnapshot {
+    pub local_peer_id: String,
+    pub listen_addrs: Vec<String>,
+    pub subscribed_scopes: Vec<String>,
+    pub connected_peer_count: usize,
+    pub nat_status: String,
+    pub nat_public_address: Option<String>,
+    pub nat_confidence: u32,
+    pub relay_reservations: Vec<String>,
+    pub peer_health: Vec<NetworkBridgePeerHealth>,
+    pub scope_traffic: Vec<NetworkBridgeScopeTraffic>,
+    pub summary_health: NetworkBridgeSummaryHealth,
+    pub subnet_sync_health: NetworkBridgeSubnetSyncHealth,
+    pub execution_set_health: NetworkBridgeExecutionSetHealth,
+}
+
 pub struct NetworkBridgeService {
     runtime: NetworkRuntime,
     tokio_runtime: Runtime,
@@ -423,6 +500,7 @@ pub struct NetworkBridgeService {
     backfill_retry_after: Duration,
     summary_reputation_limit: usize,
     summary_decision_memory_limit: u32,
+    scope_traffic: HashMap<SwarmScope, ScopeTrafficStats>,
 }
 
 impl NetworkBridgeService {
@@ -456,6 +534,7 @@ impl NetworkBridgeService {
             backfill_retry_after: Duration::from_secs(protocol_params.backfill_retry_after_secs),
             summary_reputation_limit: protocol_params.summary_reputation_limit,
             summary_decision_memory_limit: protocol_params.summary_decision_memory_limit,
+            scope_traffic: HashMap::new(),
         })
     }
 
@@ -527,6 +606,132 @@ impl NetworkBridgeService {
     ) -> Result<()> {
         self.runtime
             .publish_gossip(&GossipMessage::Checkpoint(checkpoint))
+    }
+
+    pub fn observability_snapshot(
+        &self,
+        node: &Node,
+    ) -> Result<NetworkBridgeObservabilitySnapshot> {
+        let runtime = self.runtime.observability_snapshot();
+        let topology = node
+            .store
+            .load_network_topology_for_org(node.store.org_id())?;
+        let parent_uplink = parent_uplink_store(node)?;
+        let parent_imported_task_outcome_rows = parent_uplink
+            .as_ref()
+            .map(|store| store.count_imported_task_outcomes())
+            .transpose()?;
+        let parent_checkpoint_rows = parent_uplink
+            .as_ref()
+            .map(|store| store.count_checkpoint_announcements())
+            .transpose()?;
+
+        let traffic_scores = runtime
+            .peer_health
+            .iter()
+            .map(|entry| (entry.peer.clone(), entry))
+            .collect::<HashMap<_, _>>();
+        let mut peer_ids = self
+            .peer_sync_state
+            .keys()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
+        for entry in &runtime.peer_health {
+            if !peer_ids.iter().any(|peer| peer == &entry.peer) {
+                peer_ids.push(entry.peer.clone());
+            }
+        }
+        peer_ids.sort();
+        peer_ids.dedup();
+
+        let now = Instant::now();
+        let mut peer_health = Vec::with_capacity(peer_ids.len());
+        for peer in peer_ids {
+            let traffic = traffic_scores.get(&peer);
+            let sync = self
+                .peer_sync_state
+                .iter()
+                .find(|(peer_id, _)| peer_id.to_string() == peer)
+                .map(|(_, state)| state);
+            let mut known_scopes = sync
+                .map(|state| {
+                    let mut scopes = state
+                        .known_scopes
+                        .iter()
+                        .map(scope_hint_label)
+                        .collect::<Vec<_>>();
+                    scopes.sort();
+                    scopes
+                })
+                .unwrap_or_default();
+            known_scopes.sort();
+            peer_health.push(NetworkBridgePeerHealth {
+                peer: peer.clone(),
+                connected: self
+                    .connected_peers
+                    .iter()
+                    .any(|peer_id| peer_id.to_string() == peer),
+                score: traffic.map_or(0, |entry| entry.score),
+                blacklisted: traffic.is_some_and(|entry| entry.blacklisted),
+                known_scopes,
+                inflight_backfills: sync.map_or(0, |state| state.inflight_backfills),
+                next_retry_in_ms: sync.map_or(0, |state| {
+                    state
+                        .next_retry_at
+                        .saturating_duration_since(now)
+                        .as_millis() as u64
+                }),
+            });
+        }
+
+        let mut scope_traffic = self
+            .scope_traffic
+            .iter()
+            .map(|(scope, stats)| NetworkBridgeScopeTraffic {
+                scope: scope_hint_label(scope),
+                stats: stats.clone(),
+            })
+            .collect::<Vec<_>>();
+        scope_traffic.sort_by(|left, right| left.scope.cmp(&right.scope));
+
+        Ok(NetworkBridgeObservabilitySnapshot {
+            local_peer_id: self.local_peer_id().to_string(),
+            listen_addrs: self
+                .listen_addrs()
+                .iter()
+                .map(ToString::to_string)
+                .collect(),
+            subscribed_scopes: self
+                .subscribed_scopes
+                .iter()
+                .map(scope_hint_label)
+                .collect(),
+            connected_peer_count: self.connected_peers.len(),
+            nat_status: runtime.nat_status,
+            nat_public_address: runtime.nat_public_address,
+            nat_confidence: runtime.nat_confidence,
+            relay_reservations: runtime.relay_reservations,
+            peer_health,
+            scope_traffic,
+            summary_health: NetworkBridgeSummaryHealth {
+                imported_decision_memory_rows: node.store.count_imported_decision_memory()?,
+                imported_reputation_rows: node.store.count_imported_reputation_snapshots()?,
+                imported_task_outcome_rows: node.store.count_imported_task_outcomes()?,
+                checkpoint_rows: node.store.count_checkpoint_announcements()?,
+            },
+            subnet_sync_health: NetworkBridgeSubnetSyncHealth {
+                network_id: topology.network.network_id,
+                network_kind: topology.network.network_kind.as_str().to_owned(),
+                parent_network_id: topology.network.parent_network_id,
+                parent_uplink_available: parent_uplink.is_some(),
+                parent_imported_task_outcome_rows,
+                parent_checkpoint_rows,
+            },
+            execution_set_health: NetworkBridgeExecutionSetHealth {
+                execution_set_count: node.store.count_distinct_execution_sets()?,
+                execution_set_member_count: node.store.count_execution_set_members()?,
+            },
+        })
     }
 
     pub fn request_global_backfill(
@@ -675,6 +880,36 @@ impl NetworkBridgeService {
             .insert(scope.clone());
     }
 
+    fn scope_traffic_mut(&mut self, scope: &SwarmScope) -> &mut ScopeTrafficStats {
+        self.scope_traffic.entry(scope.clone()).or_default()
+    }
+
+    pub(crate) fn record_scope_event_published(&mut self, scope: &SwarmScope) {
+        self.scope_traffic_mut(scope).published_events += 1;
+    }
+
+    fn record_scope_event_ingested(&mut self, scope: &SwarmScope) {
+        self.scope_traffic_mut(scope).ingested_events += 1;
+    }
+
+    fn record_scope_summary_applied(&mut self, scope: &SwarmScope) {
+        self.scope_traffic_mut(scope).summaries_applied += 1;
+    }
+
+    fn record_scope_rule_applied(&mut self, scope: &SwarmScope) {
+        self.scope_traffic_mut(scope).rules_applied += 1;
+    }
+
+    fn record_scope_checkpoint_applied(&mut self, scope: &SwarmScope) {
+        self.scope_traffic_mut(scope).checkpoints_applied += 1;
+    }
+
+    fn record_scope_backfill_applied(&mut self, scope: &SwarmScope, events: usize) {
+        let stats = self.scope_traffic_mut(scope);
+        stats.backfills_applied += 1;
+        stats.backfill_events_applied += events as u64;
+    }
+
     fn mark_peer_connected(&mut self, peer: PeerId) {
         self.connected_peers.insert(peer);
         self.peer_sync_state
@@ -817,6 +1052,7 @@ impl NetworkBridgeService {
                 GossipMessage::Event(envelope) => {
                     self.record_peer_scope_activity(propagation_source, &envelope.scope);
                     ingest_event_envelope(node, &envelope)?;
+                    self.record_scope_event_ingested(&envelope.scope);
                     Ok(NetworkBridgeTick::EventIngested {
                         peer: propagation_source,
                         event_id: envelope.event.event_id.clone(),
@@ -825,6 +1061,7 @@ impl NetworkBridgeService {
                 GossipMessage::Summary(summary) => {
                     self.record_peer_scope_activity(propagation_source, &summary.scope);
                     apply_summary_announcement(node, &summary)?;
+                    self.record_scope_summary_applied(&summary.scope);
                     Ok(NetworkBridgeTick::SummaryApplied {
                         peer: propagation_source,
                         summary_kind: summary.summary_kind,
@@ -833,6 +1070,7 @@ impl NetworkBridgeService {
                 GossipMessage::Rule(rule) => {
                     self.record_peer_scope_activity(propagation_source, &rule.scope);
                     apply_rule_announcement(node, &rule)?;
+                    self.record_scope_rule_applied(&rule.scope);
                     Ok(NetworkBridgeTick::RuleApplied {
                         peer: propagation_source,
                         rule_set: rule.rule_set,
@@ -842,6 +1080,7 @@ impl NetworkBridgeService {
                 GossipMessage::Checkpoint(checkpoint) => {
                     self.record_peer_scope_activity(propagation_source, &checkpoint.scope);
                     apply_checkpoint_announcement(node, &checkpoint)?;
+                    self.record_scope_checkpoint_applied(&checkpoint.scope);
                     Ok(NetworkBridgeTick::CheckpointApplied {
                         peer: propagation_source,
                         checkpoint_id: checkpoint.checkpoint_id,
@@ -870,10 +1109,12 @@ impl NetworkBridgeService {
             } => {
                 self.record_peer_scope_activity(peer, &response.scope);
                 self.mark_backfill_completed(peer);
+                let events = ingest_backfill_response(node, &response)?;
+                self.record_scope_backfill_applied(&response.scope, events);
                 Ok(NetworkBridgeTick::BackfillApplied {
                     peer,
                     request_id,
-                    events: ingest_backfill_response(node, &response)?,
+                    events,
                 })
             }
             NetworkRuntimeEvent::BackfillOutboundFailure {

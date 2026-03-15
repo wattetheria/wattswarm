@@ -757,6 +757,25 @@ pub struct NetworkRuntime {
     traffic_guard: TrafficGuard,
     relay_reservations: HashSet<String>,
     expected_peer_handshake: PeerHandshakeMetadata,
+    nat_status: String,
+    nat_public_address: Option<Multiaddr>,
+    nat_confidence: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrafficGuardPeerHealth {
+    pub peer: String,
+    pub score: i64,
+    pub blacklisted: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NetworkRuntimeObservabilitySnapshot {
+    pub nat_status: String,
+    pub nat_public_address: Option<String>,
+    pub nat_confidence: u32,
+    pub relay_reservations: Vec<String>,
+    pub peer_health: Vec<TrafficGuardPeerHealth>,
 }
 
 #[derive(Debug)]
@@ -891,6 +910,9 @@ impl NetworkRuntime {
             traffic_guard: TrafficGuard::new(),
             relay_reservations: HashSet::new(),
             expected_peer_handshake,
+            nat_status: "unknown".to_owned(),
+            nat_public_address: None,
+            nat_confidence: 0,
         };
         this.listen_on_configured_addrs()?;
         this.seed_bootstrap_peers()?;
@@ -907,6 +929,31 @@ impl NetworkRuntime {
 
     pub fn listen_addrs(&self) -> &[Multiaddr] {
         &self.listen_addrs
+    }
+
+    pub fn observability_snapshot(&self) -> NetworkRuntimeObservabilitySnapshot {
+        let mut peer_health = self
+            .traffic_guard
+            .peer_scores
+            .iter()
+            .map(|(peer, score)| TrafficGuardPeerHealth {
+                peer: peer.to_string(),
+                score: *score,
+                blacklisted: self.traffic_guard.blacklisted_peers.contains(peer),
+            })
+            .collect::<Vec<_>>();
+        peer_health.sort_by(|left, right| left.peer.cmp(&right.peer));
+
+        let mut relay_reservations = self.relay_reservations.iter().cloned().collect::<Vec<_>>();
+        relay_reservations.sort();
+
+        NetworkRuntimeObservabilitySnapshot {
+            nat_status: self.nat_status.clone(),
+            nat_public_address: self.nat_public_address.as_ref().map(ToString::to_string),
+            nat_confidence: self.nat_confidence,
+            relay_reservations,
+            peer_health,
+        }
     }
 
     fn validate_identify_info(&self, info: &identify::Info) -> Result<Vec<Multiaddr>> {
@@ -1283,12 +1330,21 @@ impl NetworkRuntime {
             })),
             SwarmEvent::Behaviour(WattSwarmBehaviourEvent::Autonat(
                 autonat::Event::StatusChanged { old, new },
-            )) => Ok(Some(NetworkRuntimeEvent::NatStatusChanged {
-                old: nat_status_label(&old),
-                new: nat_status_label(&new),
-                public_address: self.swarm.behaviour().autonat.public_address().cloned(),
-                confidence: self.swarm.behaviour().autonat.confidence(),
-            })),
+            )) => {
+                let old_label = nat_status_label(&old);
+                let new_label = nat_status_label(&new);
+                let public_address = self.swarm.behaviour().autonat.public_address().cloned();
+                let confidence = self.swarm.behaviour().autonat.confidence();
+                self.nat_status = new_label.clone();
+                self.nat_public_address = public_address.clone();
+                self.nat_confidence = confidence as u32;
+                Ok(Some(NetworkRuntimeEvent::NatStatusChanged {
+                    old: old_label,
+                    new: new_label,
+                    public_address,
+                    confidence,
+                }))
+            }
             SwarmEvent::Behaviour(WattSwarmBehaviourEvent::Dcutr(dcutr::Event {
                 remote_peer_id,
                 result,
@@ -1581,6 +1637,9 @@ mod tests {
             traffic_guard: TrafficGuard::new(),
             relay_reservations: HashSet::new(),
             expected_peer_handshake: expected,
+            nat_status: "unknown".to_owned(),
+            nat_public_address: None,
+            nat_confidence: 0,
         };
         assert!(runtime.validate_identify_info(&info).is_err());
     }

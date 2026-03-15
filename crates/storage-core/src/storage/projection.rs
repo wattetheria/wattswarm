@@ -417,6 +417,143 @@ impl PgStore {
         }))
     }
 
+    pub fn list_discoverable_feed_sources(&self, limit: usize) -> Result<Vec<DiscoverableFeedRow>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
+        let subscription_rows = conn
+            .prepare(
+                "SELECT subscriber_node_id, feed_key, scope_hint
+                 FROM feed_subscriptions
+                 WHERE org_id = $1 AND active = TRUE",
+            )?
+            .query_map(params![self.org_id()], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let announcement_rows = conn
+            .prepare(
+                "SELECT announcement_id, task_id, feed_key, scope_hint, announced_by_node_id,
+                        CAST(EXTRACT(EPOCH FROM created_at) * 1000 AS BIGINT)
+                 FROM task_announcements
+                 WHERE org_id = $1",
+            )?
+            .query_map(params![self.org_id()], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                    r.get::<_, String>(4)?,
+                    r.get::<_, i64>(5)? as u64,
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+
+        let mut subscribers_by_feed = std::collections::BTreeMap::<
+            (String, String),
+            std::collections::BTreeSet<String>,
+        >::new();
+        for (subscriber_node_id, feed_key, raw_scope_hint) in subscription_rows {
+            subscribers_by_feed
+                .entry((
+                    feed_key,
+                    Self::canonical_scope_hint_or_original(raw_scope_hint),
+                ))
+                .or_default()
+                .insert(subscriber_node_id);
+        }
+
+        let mut latest_by_feed =
+            std::collections::BTreeMap::<(String, String), (String, String, String, u64)>::new();
+        for (
+            announcement_id,
+            task_id,
+            feed_key,
+            raw_scope_hint,
+            announced_by_node_id,
+            created_at,
+        ) in announcement_rows
+        {
+            let key = (
+                feed_key,
+                Self::canonical_scope_hint_or_original(raw_scope_hint),
+            );
+            let replace = match latest_by_feed.get(&key) {
+                Some((existing_announcement_id, _, _, existing_created_at)) => {
+                    created_at > *existing_created_at
+                        || (created_at == *existing_created_at
+                            && announcement_id > *existing_announcement_id)
+                }
+                None => true,
+            };
+            if replace {
+                latest_by_feed.insert(
+                    key,
+                    (announcement_id, task_id, announced_by_node_id, created_at),
+                );
+            }
+        }
+
+        let mut feed_keys = subscribers_by_feed
+            .keys()
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>();
+        feed_keys.extend(latest_by_feed.keys().cloned());
+
+        let mut rows = Vec::with_capacity(feed_keys.len());
+        for (feed_key, scope_hint) in feed_keys {
+            let key = (feed_key.clone(), scope_hint.clone());
+            let latest = latest_by_feed.get(&key);
+            rows.push(DiscoverableFeedRow {
+                feed_key,
+                scope_hint,
+                subscriber_count: subscribers_by_feed
+                    .get(&key)
+                    .map(|subscribers| subscribers.len() as u32)
+                    .unwrap_or(0),
+                latest_announcement_id: latest.map(|row| row.0.clone()),
+                latest_task_id: latest.map(|row| row.1.clone()),
+                latest_source_node_id: latest.map(|row| row.2.clone()),
+                latest_announced_at: latest.map(|row| row.3),
+            });
+        }
+        rows.sort_by(|left, right| {
+            right
+                .latest_announced_at
+                .cmp(&left.latest_announced_at)
+                .then_with(|| left.feed_key.cmp(&right.feed_key))
+                .then_with(|| left.scope_hint.cmp(&right.scope_hint))
+        });
+        rows.truncate(limit);
+        Ok(rows)
+    }
+
+    pub fn list_active_dissemination_domains(&self, limit: usize) -> Result<Vec<String>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
+        let mut domains = std::collections::BTreeSet::new();
+        for sql in [
+            "SELECT scope_hint FROM feed_subscriptions WHERE org_id = $1 AND active = TRUE",
+            "SELECT scope_hint FROM task_announcements WHERE org_id = $1",
+            "SELECT scope_hint FROM execution_set_projection WHERE org_id = $1",
+        ] {
+            let mut stmt = conn.prepare(sql)?;
+            let rows = stmt.query_map(params![self.org_id()], |r| r.get::<_, String>(0))?;
+            for row in rows {
+                domains.insert(Self::canonical_scope_hint_or_original(row?));
+            }
+        }
+        Ok(domains.into_iter().take(limit).collect())
+    }
+
     pub fn upsert_execution_set_member(
         &self,
         task_id: &str,
@@ -490,6 +627,34 @@ impl PgStore {
             members.push(row?);
         }
         Ok(members)
+    }
+
+    pub fn count_execution_set_members(&self) -> Result<u64> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
+        let count = conn.query_row(
+            "SELECT COUNT(1) FROM execution_set_projection WHERE org_id = $1",
+            params![self.org_id()],
+            |r| r.get::<_, i64>(0),
+        )?;
+        Ok(count as u64)
+    }
+
+    pub fn count_distinct_execution_sets(&self) -> Result<u64> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
+        let count = conn.query_row(
+            "SELECT COUNT(DISTINCT task_id || ':' || execution_set_id)
+             FROM execution_set_projection
+             WHERE org_id = $1",
+            params![self.org_id()],
+            |r| r.get::<_, i64>(0),
+        )?;
+        Ok(count as u64)
     }
 
     pub fn put_rule_announcement(
@@ -608,6 +773,19 @@ impl PgStore {
         )
         .optional()
         .map_err(Into::into)
+    }
+
+    pub fn count_checkpoint_announcements(&self) -> Result<u64> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
+        let count = conn.query_row(
+            "SELECT COUNT(1) FROM network_checkpoint_announcements WHERE org_id = $1",
+            params![self.org_id()],
+            |r| r.get::<_, i64>(0),
+        )?;
+        Ok(count as u64)
     }
 
     pub fn put_evidence_added(
@@ -1938,6 +2116,51 @@ impl PgStore {
             params![self.org_id(), source_node_id],
         )?;
         Ok(())
+    }
+
+    pub fn count_imported_decision_memory(&self) -> Result<u64> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
+        let count = conn.query_row(
+            "SELECT COUNT(1)
+             FROM imported_decision_memory
+             WHERE org_id = $1 AND revoked = FALSE",
+            params![self.org_id()],
+            |r| r.get::<_, i64>(0),
+        )?;
+        Ok(count as u64)
+    }
+
+    pub fn count_imported_reputation_snapshots(&self) -> Result<u64> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
+        let count = conn.query_row(
+            "SELECT COUNT(1)
+             FROM imported_reputation_state
+             WHERE org_id = $1 AND revoked = FALSE",
+            params![self.org_id()],
+            |r| r.get::<_, i64>(0),
+        )?;
+        Ok(count as u64)
+    }
+
+    pub fn count_imported_task_outcomes(&self) -> Result<u64> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
+        let count = conn.query_row(
+            "SELECT COUNT(1)
+             FROM imported_task_outcomes
+             WHERE org_id = $1 AND revoked = FALSE",
+            params![self.org_id()],
+            |r| r.get::<_, i64>(0),
+        )?;
+        Ok(count as u64)
     }
 
     pub fn has_decision_by_final_commit_hash(&self, final_commit_hash: &str) -> Result<bool> {

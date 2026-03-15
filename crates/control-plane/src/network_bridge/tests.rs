@@ -1,8 +1,10 @@
 use super::*;
 use crate::crypto::NodeIdentity;
 use crate::node::build_event_for_external;
-use crate::storage::{PgStore, ProjectionScope};
-use crate::types::{Membership, Role};
+use crate::storage::{
+    DecisionMemoryHitRow, ImportedTaskOutcomeRow, PgStore, ProjectionScope, ReputationSnapshotRow,
+};
+use crate::types::{Membership, NetworkKind, Role};
 use crate::{node::Node, task_template::sample_contract};
 use serde_json::json;
 use std::collections::HashMap;
@@ -293,6 +295,10 @@ fn publish_pending_updates_subscribes_runtime_for_local_feed_subscription() {
     let mut service = NetworkBridgeService::new(
         NetworkP2pNode::generate(NetworkP2pConfig {
             listen_addrs: vec!["/ip4/127.0.0.1/tcp/0".to_owned()],
+            bootstrap_peers: vec![
+                "/ip4/127.0.0.1/tcp/4001/p2p/12D3KooWJ5r1D8N8QYp8JDs7u9mM4rY2kQ6xXK7Z6A6V4t7N3sQX"
+                    .to_owned(),
+            ],
             enable_mdns: false,
             ..NetworkP2pConfig::default()
         })
@@ -1442,6 +1448,212 @@ fn service_initializes_summary_limits_from_protocol_params() {
             .len(),
         1
     );
+}
+
+#[test]
+fn observability_snapshot_reports_network_and_sync_health() {
+    let identity = NodeIdentity::random();
+    let node_id = identity.node_id();
+    let store = PgStore::open_in_memory().expect("store");
+    let mainnet = store
+        .ensure_mainnet_bootstrap_network_topology(
+            "mainnet:watt-galaxy",
+            "Watt Galaxy",
+            &node_id,
+            &node_id,
+            1_700_000_000_000,
+        )
+        .expect("mainnet topology");
+    let subnet = store
+        .ensure_subnet_bootstrap_network_topology(
+            &mainnet.network.network_id,
+            "subnet:alpha",
+            "Subnet Alpha",
+            &node_id,
+            &node_id,
+            1_700_000_000_100,
+        )
+        .expect("subnet topology");
+
+    let membership = membership_with_roles(std::slice::from_ref(&node_id));
+    let node = Node::new(
+        identity,
+        store.for_org(subnet.org.org_id.clone()),
+        membership,
+    )
+    .expect("subnet node");
+
+    node.store
+        .put_imported_decision_memory(
+            "summary-knowledge",
+            "peer-a",
+            &DecisionMemoryHitRow {
+                task_id: "task-observe".to_owned(),
+                epoch: 1,
+                final_commit_hash: "commit-hash".to_owned(),
+                winning_candidate_hash: "candidate-hash".to_owned(),
+                output_digest: "output-digest".to_owned(),
+                result_summary: json!({"answer":"ok"}),
+                quorum_result: json!({"quorum":"pass"}),
+                reason_codes: vec![100],
+                reason_details: json!({"detail":"good"}),
+                policy_snapshot_digest: "policy-snapshot".to_owned(),
+                input_digest: "input-digest".to_owned(),
+                output_schema_digest: "schema-digest".to_owned(),
+                policy_id: "vp.schema_only.v1".to_owned(),
+                task_type: "resume_review".to_owned(),
+                policy_params_digest: "params-digest".to_owned(),
+                deprecated_as_exact: false,
+                finalized_at: 10,
+                confidence_hint: 0.9,
+            },
+        )
+        .expect("import decision memory");
+    node.store
+        .put_imported_reputation_snapshot(
+            "summary-reputation",
+            "peer-a",
+            &ReputationSnapshotRow {
+                runtime_id: "stub".to_owned(),
+                profile_id: "p1".to_owned(),
+                stability_reputation: 5,
+                quality_reputation: 7,
+                last_updated_at: 11,
+            },
+        )
+        .expect("import reputation");
+    node.store
+        .put_imported_task_outcome(&ImportedTaskOutcomeRow {
+            summary_id: "summary-outcome".to_owned(),
+            source_node_id: "peer-a".to_owned(),
+            scope_hint: "global".to_owned(),
+            task_id: "task-observe".to_owned(),
+            task_type: "resume_review".to_owned(),
+            candidate_id: "cand-1".to_owned(),
+            output_digest: "digest-1".to_owned(),
+            result_summary: json!({"answer":"ok"}),
+            evidence_digest_count: 1,
+            checkpoint_id: "cp-1".to_owned(),
+            proof_artifact_path: "ipfs://cp-1".to_owned(),
+            finalized_at: 12,
+            revoked: false,
+        })
+        .expect("import task outcome");
+    node.store
+        .put_checkpoint_announcement("global", "cp-local", "ipfs://cp-local", 13)
+        .expect("checkpoint");
+    node.store
+        .upsert_execution_set_member(
+            "task-observe",
+            "exec-1",
+            "peer-a",
+            "worker",
+            "region:sol-1",
+            "confirmed",
+            Some("peer-a"),
+            14,
+        )
+        .expect("execution set");
+
+    let parent_store = store.for_org(mainnet.org.org_id.clone());
+    parent_store
+        .put_imported_task_outcome(&ImportedTaskOutcomeRow {
+            summary_id: "summary-parent".to_owned(),
+            source_node_id: node.node_id(),
+            scope_hint: "global".to_owned(),
+            task_id: "task-parent".to_owned(),
+            task_type: "resume_review".to_owned(),
+            candidate_id: "cand-parent".to_owned(),
+            output_digest: "digest-parent".to_owned(),
+            result_summary: json!({"answer":"uplink"}),
+            evidence_digest_count: 0,
+            checkpoint_id: "cp-parent".to_owned(),
+            proof_artifact_path: "ipfs://cp-parent".to_owned(),
+            finalized_at: 15,
+            revoked: false,
+        })
+        .expect("parent outcome");
+    parent_store
+        .put_checkpoint_announcement("global", "cp-parent", "ipfs://cp-parent", 16)
+        .expect("parent checkpoint");
+
+    let mut service = NetworkBridgeService::new(
+        NetworkP2pNode::generate(NetworkP2pConfig {
+            listen_addrs: vec!["/ip4/127.0.0.1/tcp/0".to_owned()],
+            enable_mdns: false,
+            ..NetworkP2pConfig::default()
+        })
+        .expect("network node"),
+        &[SwarmScope::Global, SwarmScope::Region("sol-1".to_owned())],
+        &NetworkProtocolParams::default(),
+    )
+    .expect("service");
+
+    let peer = PeerId::random();
+    service.connected_peers.insert(peer);
+    let mut peer_state = PeerSyncState::new(Instant::now());
+    peer_state.known_scopes.insert(SwarmScope::Global);
+    peer_state
+        .known_scopes
+        .insert(SwarmScope::Region("sol-1".to_owned()));
+    peer_state.inflight_backfills = 1;
+    peer_state.next_retry_at = Instant::now() + Duration::from_secs(5);
+    service.peer_sync_state.insert(peer, peer_state);
+    service.scope_traffic.insert(
+        SwarmScope::Global,
+        ScopeTrafficStats {
+            published_events: 2,
+            ingested_events: 3,
+            summaries_applied: 1,
+            rules_applied: 0,
+            checkpoints_applied: 1,
+            backfills_applied: 1,
+            backfill_events_applied: 4,
+        },
+    );
+
+    let snapshot = service
+        .observability_snapshot(&node)
+        .expect("observability snapshot");
+
+    assert_eq!(snapshot.connected_peer_count, 1);
+    assert_eq!(snapshot.nat_status, "unknown");
+    assert_eq!(snapshot.nat_public_address, None);
+    assert_eq!(snapshot.nat_confidence, 0);
+    assert!(snapshot.relay_reservations.is_empty());
+    assert_eq!(snapshot.peer_health.len(), 1);
+    assert!(snapshot.peer_health[0].connected);
+    assert!(!snapshot.peer_health[0].blacklisted);
+    assert_eq!(snapshot.peer_health[0].score, 0);
+    assert_eq!(
+        snapshot.peer_health[0].known_scopes,
+        vec!["global".to_owned(), "region:sol-1".to_owned()]
+    );
+    assert_eq!(snapshot.scope_traffic.len(), 1);
+    assert_eq!(snapshot.scope_traffic[0].scope, "global");
+    assert_eq!(snapshot.scope_traffic[0].stats.published_events, 2);
+    assert_eq!(snapshot.summary_health.imported_decision_memory_rows, 1);
+    assert_eq!(snapshot.summary_health.imported_reputation_rows, 1);
+    assert_eq!(snapshot.summary_health.imported_task_outcome_rows, 1);
+    assert_eq!(snapshot.summary_health.checkpoint_rows, 1);
+    assert_eq!(
+        snapshot.subnet_sync_health.network_kind,
+        NetworkKind::Subnet.as_str()
+    );
+    assert_eq!(
+        snapshot.subnet_sync_health.parent_network_id.as_deref(),
+        Some(mainnet.network.network_id.as_str())
+    );
+    assert!(snapshot.subnet_sync_health.parent_uplink_available);
+    assert_eq!(
+        snapshot
+            .subnet_sync_health
+            .parent_imported_task_outcome_rows,
+        Some(1)
+    );
+    assert_eq!(snapshot.subnet_sync_health.parent_checkpoint_rows, Some(1));
+    assert_eq!(snapshot.execution_set_health.execution_set_count, 1);
+    assert_eq!(snapshot.execution_set_health.execution_set_member_count, 1);
 }
 
 #[test]

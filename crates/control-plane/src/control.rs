@@ -11,6 +11,7 @@ use crate::types::{
 use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
+use std::collections::BTreeMap;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -86,6 +87,40 @@ pub struct DiscoveredPeerRecord {
     pub node_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub listen_addr: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DirectoryNetworkInstance {
+    pub topology: crate::types::NetworkTopology,
+    pub is_current: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DirectoryFeedSource {
+    pub feed_key: String,
+    pub scope_hint: String,
+    pub subscriber_count: u32,
+    pub latest_announcement_id: Option<String>,
+    pub latest_task_id: Option<String>,
+    pub latest_source_node_id: Option<String>,
+    pub latest_announced_at: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+pub struct DirectorySyncEndpoint {
+    pub network_id: String,
+    pub node_id: String,
+    pub listen_addr: String,
+    pub source_kind: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NetworkDirectorySnapshot {
+    pub current_topology: crate::types::NetworkTopology,
+    pub networks: Vec<DirectoryNetworkInstance>,
+    pub active_dissemination_domains: Vec<String>,
+    pub feeds: Vec<DirectoryFeedSource>,
+    pub sync_endpoints: Vec<DirectorySyncEndpoint>,
 }
 
 #[derive(Debug, Clone)]
@@ -231,6 +266,98 @@ fn current_network_context_id(node: &Node) -> String {
         .load_verified_network_protocol_params()
         .map(|verified| verified.network_id)
         .unwrap_or_else(|_| "default".to_owned())
+}
+
+fn current_network_topology(node: &Node) -> Result<crate::types::NetworkTopology> {
+    node.store
+        .load_network_topology_for_org(node.store.org_id())
+}
+
+pub fn load_network_directory_snapshot(
+    node: &Node,
+    state_dir: &Path,
+    limit: usize,
+) -> Result<NetworkDirectorySnapshot> {
+    let current_topology = current_network_topology(node)?;
+    let current_network_id = current_topology.network.network_id.clone();
+
+    let mut networks = node
+        .store
+        .list_discoverable_network_topologies(limit)?
+        .into_iter()
+        .map(|topology| DirectoryNetworkInstance {
+            is_current: topology.network.network_id == current_network_id,
+            topology,
+        })
+        .collect::<Vec<_>>();
+    networks.sort_by(|left, right| {
+        right.is_current.cmp(&left.is_current).then_with(|| {
+            left.topology
+                .network
+                .network_id
+                .cmp(&right.topology.network.network_id)
+        })
+    });
+
+    let active_dissemination_domains = node.store.list_active_dissemination_domains(limit)?;
+    let feeds = node
+        .store
+        .list_discoverable_feed_sources(limit)?
+        .into_iter()
+        .map(|row| DirectoryFeedSource {
+            feed_key: row.feed_key,
+            scope_hint: row.scope_hint,
+            subscriber_count: row.subscriber_count,
+            latest_announcement_id: row.latest_announcement_id,
+            latest_task_id: row.latest_task_id,
+            latest_source_node_id: row.latest_source_node_id,
+            latest_announced_at: row.latest_announced_at,
+        })
+        .collect::<Vec<_>>();
+
+    let mut sync_endpoints = BTreeMap::<(String, String), DirectorySyncEndpoint>::new();
+    for record in load_discovered_peer_records(&discovered_peers_path(state_dir))? {
+        let Some(listen_addr) = record.listen_addr else {
+            continue;
+        };
+        sync_endpoints.insert(
+            (record.node_id.clone(), listen_addr.clone()),
+            DirectorySyncEndpoint {
+                network_id: current_network_id.clone(),
+                node_id: record.node_id,
+                listen_addr,
+                source_kind: "udp_discovery".to_owned(),
+            },
+        );
+    }
+    let config = crate::network_bridge::network_config_from_env();
+    for raw_addr in config.bootstrap_peers {
+        let Some((listen_addr, node_id)) = raw_addr.rsplit_once("/p2p/") else {
+            continue;
+        };
+        if listen_addr.trim().is_empty() || node_id.trim().is_empty() {
+            continue;
+        }
+        let node_id = node_id.trim().to_owned();
+        let key = (node_id.clone(), raw_addr.clone());
+        sync_endpoints
+            .entry(key)
+            .and_modify(|entry| entry.source_kind = "bootstrap".to_owned())
+            .or_insert_with(|| DirectorySyncEndpoint {
+                network_id: current_network_id.clone(),
+                node_id,
+                listen_addr: raw_addr,
+                source_kind: "bootstrap".to_owned(),
+            });
+    }
+
+    Ok(NetworkDirectorySnapshot {
+        current_topology,
+        networks,
+        active_dissemination_domains,
+        feeds,
+        sync_endpoints: sync_endpoints.into_values().take(limit).collect(),
+    })
 }
 
 fn availability_manifest(

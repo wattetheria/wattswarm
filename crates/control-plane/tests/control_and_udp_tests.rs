@@ -17,11 +17,11 @@ use wattswarm_control_plane::control::{
     discovered_peers_path, executor_registry_path, fetch_checkpoint_artifact_json,
     fetch_evidence_artifact, fetch_snapshot_artifact_json, fetch_task_detail_artifact,
     list_artifacts_needing_repair, load_discovered_peer_records, load_discovered_peers,
-    load_executor_registry, local_node_id, materialize_checkpoint_artifact_json,
-    materialize_evidence_artifact, materialize_snapshot_artifact_json,
-    materialize_task_detail_artifact, open_node, open_node_on_network_id,
-    remote_task_bridge_registry_path, run_real_task_flow, save_discovered_peers,
-    save_executor_registry,
+    load_executor_registry, load_network_directory_snapshot, local_node_id,
+    materialize_checkpoint_artifact_json, materialize_evidence_artifact,
+    materialize_snapshot_artifact_json, materialize_task_detail_artifact, open_node,
+    open_node_on_network_id, remote_task_bridge_registry_path, run_real_task_flow,
+    save_discovered_peers, save_executor_registry,
 };
 use wattswarm_control_plane::crypto::{NodeIdentity, sha256_hex};
 use wattswarm_control_plane::storage::storage::pg::Connection;
@@ -389,6 +389,91 @@ fn add_discovered_peer_dedups_and_sorts() {
                 listen_addr: None,
             }
         ]
+    );
+
+    cleanup_dir(&dir);
+}
+
+#[test]
+fn network_directory_snapshot_lists_networks_feeds_domains_and_sync_endpoints() {
+    let _guard = env_lock();
+    let _db_lock = DbTestLock::acquire();
+    let schema = format!("test_{}", Uuid::new_v4().simple());
+    reset_test_schema(&schema);
+    let _schema_guard = EnvVarGuard::set("WATTSWARM_PG_SCHEMA", &schema);
+    let _bootstrap_guard = EnvVarGuard::set(
+        "WATTSWARM_P2P_BOOTSTRAP_PEERS",
+        "/ip4/127.0.0.1/tcp/4001/p2p/12D3KooWJ5r1D8N8QYp8JDs7u9mM4rY2kQ6xXK7Z6A6V4t7N3sQX",
+    );
+    let dir = temp_test_dir("network-directory-snapshot");
+    let state_dir = dir.join("state");
+    fs::create_dir_all(&state_dir).expect("create state dir");
+    let db_path = state_dir.join("test.state");
+
+    let node = open_node(&state_dir, &db_path).expect("open node");
+    add_discovered_peer_endpoint(
+        &state_dir,
+        "peer-udp",
+        Some("/ip4/127.0.0.1/tcp/4999/p2p/12D3KooWJ5r1D8N8QYp8JDs7u9mM4rY2kQ6xXK7Z6A6V4t7N3sQX"),
+    )
+    .expect("save discovered peer");
+    node.store
+        .upsert_feed_subscription("node-a", "feed-market", "region:sol-1", true, 10)
+        .expect("feed subscription");
+    node.store
+        .put_task_announcement(
+            "task-dir-1",
+            "announce-dir-1",
+            "feed-market",
+            "region:sol-1",
+            &json!({"headline":"dir"}),
+            None,
+            "node-source",
+            11,
+        )
+        .expect("task announcement");
+    node.store
+        .upsert_execution_set_member(
+            "task-dir-1",
+            "exec-dir-1",
+            "node-worker",
+            "worker",
+            "node:lab-7",
+            "active",
+            Some("node-source"),
+            12,
+        )
+        .expect("execution set");
+
+    let snapshot =
+        load_network_directory_snapshot(&node, &state_dir, 16).expect("directory snapshot");
+
+    assert_eq!(
+        snapshot.current_topology.network.network_kind,
+        NetworkKind::Local
+    );
+    assert_eq!(snapshot.networks.len(), 1);
+    assert!(snapshot.networks[0].is_current);
+    assert_eq!(snapshot.feeds.len(), 1);
+    assert_eq!(snapshot.feeds[0].feed_key, "feed-market");
+    assert_eq!(snapshot.feeds[0].scope_hint, "region:sol-1");
+    assert_eq!(snapshot.feeds[0].subscriber_count, 1);
+    assert_eq!(
+        snapshot.active_dissemination_domains,
+        vec!["node:lab-7".to_owned(), "region:sol-1".to_owned()]
+    );
+    assert_eq!(snapshot.sync_endpoints.len(), 2);
+    assert!(
+        snapshot
+            .sync_endpoints
+            .iter()
+            .any(|entry| entry.source_kind == "udp_discovery" && entry.node_id == "peer-udp")
+    );
+    assert!(
+        snapshot
+            .sync_endpoints
+            .iter()
+            .any(|entry| entry.source_kind == "bootstrap")
     );
 
     cleanup_dir(&dir);

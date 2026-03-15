@@ -242,6 +242,17 @@ pub struct CheckpointAnnouncementRow {
     pub observed_at: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiscoverableFeedRow {
+    pub feed_key: String,
+    pub scope_hint: String,
+    pub subscriber_count: u32,
+    pub latest_announcement_id: Option<String>,
+    pub latest_task_id: Option<String>,
+    pub latest_source_node_id: Option<String>,
+    pub latest_announced_at: Option<u64>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct ImportedTaskOutcomeRow {
     pub summary_id: String,

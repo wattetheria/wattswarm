@@ -77,7 +77,10 @@ pub fn publish_pending_scoped_updates(
             crate::types::EventPayload::FeedSubscriptionUpdated(_)
         );
         match service.publish_event_for_scope(&scope, event.clone()) {
-            Ok(()) => last_published_seq = seq,
+            Ok(()) => {
+                service.record_scope_event_published(&scope);
+                last_published_seq = seq;
+            }
             Err(err)
                 if err.to_string().contains("NoPeersSubscribedToTopic")
                     && is_local_subscription_control_event =>

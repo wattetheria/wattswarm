@@ -203,6 +203,106 @@ fn subnet_topology_creation_and_joining_attach_parent_membership() {
     assert_eq!(parent.network.network_kind, NetworkKind::Mainnet);
 }
 
+#[test]
+fn discoverable_network_topologies_list_active_default_networks() {
+    let store = PgStore::open_in_memory().expect("open store");
+    let mainnet = store
+        .ensure_mainnet_bootstrap_network_topology(
+            "mainnet:watt-galaxy",
+            "Watt Galaxy",
+            "genesis-a",
+            "genesis-a",
+            1_700_000_000_000,
+        )
+        .expect("mainnet topology");
+    let subnet = store
+        .ensure_subnet_bootstrap_network_topology(
+            &mainnet.network.network_id,
+            "subnet:alpha",
+            "Subnet Alpha",
+            "genesis-a",
+            "genesis-a",
+            1_700_000_000_100,
+        )
+        .expect("subnet topology");
+
+    let discoverable = store
+        .list_discoverable_network_topologies(10)
+        .expect("list discoverable networks");
+
+    assert_eq!(discoverable.len(), 2);
+    assert_eq!(discoverable[0], mainnet);
+    assert_eq!(discoverable[1], subnet);
+}
+
+#[test]
+fn discoverable_feed_sources_and_domains_capture_active_network_surfaces() {
+    let store = open_test_store();
+    let contract = sample_contract("task-feed-directory", "resume_review");
+    store
+        .upsert_task_contract(&contract, 1)
+        .expect("upsert task contract");
+    store
+        .upsert_feed_subscription("node-a", "feed-market", " region:sol-1 ", true, 10)
+        .expect("active feed subscription");
+    store
+        .upsert_feed_subscription("node-b", "feed-market", "region:sol-1", true, 11)
+        .expect("second feed subscription");
+    store
+        .upsert_execution_set_member(
+            &contract.task_id,
+            "exec-1",
+            "node-a",
+            "worker",
+            "node:lab-7",
+            "active",
+            Some("node-a"),
+            12,
+        )
+        .expect("execution set member");
+    store
+        .put_task_announcement(
+            &contract.task_id,
+            "announce-directory",
+            "feed-market",
+            "region:sol-1",
+            &serde_json::json!({"headline":"directory"}),
+            None,
+            "node-source",
+            20,
+        )
+        .expect("task announcement");
+
+    let feeds = store
+        .list_discoverable_feed_sources(10)
+        .expect("list discoverable feeds");
+    assert_eq!(feeds.len(), 1);
+    assert_eq!(feeds[0].feed_key, "feed-market");
+    assert_eq!(feeds[0].scope_hint, "region:sol-1");
+    assert_eq!(feeds[0].subscriber_count, 2);
+    assert_eq!(
+        feeds[0].latest_announcement_id.as_deref(),
+        Some("announce-directory")
+    );
+    assert_eq!(
+        feeds[0].latest_task_id.as_deref(),
+        Some(contract.task_id.as_str())
+    );
+    assert_eq!(
+        feeds[0].latest_source_node_id.as_deref(),
+        Some("node-source")
+    );
+    assert_eq!(feeds[0].latest_announced_at, Some(20));
+
+    let domains = store
+        .list_active_dissemination_domains(10)
+        .expect("list domains");
+    assert_eq!(
+        domains,
+        vec!["node:lab-7".to_owned(), "region:sol-1".to_owned()]
+    );
+}
+
 fn sample_contract(task_id: &str, task_type: &str) -> TaskContract {
     TaskContract {
         protocol_version: "v0.1".to_owned(),

@@ -591,6 +591,36 @@ impl PgStore {
             .map(Some)
     }
 
+    pub fn list_discoverable_network_topologies(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<NetworkTopology>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
+        let network_ids = conn
+            .prepare(
+                "SELECT net.network_id
+                 FROM network_registry net
+                 JOIN org_registry org ON org.network_id = net.network_id
+                 WHERE net.status = 'active'
+                   AND org.status = 'active'
+                   AND org.is_default = TRUE
+                 ORDER BY net.created_at ASC, net.network_id ASC
+                 LIMIT $1",
+            )?
+            .query_map(params![limit as i64], |r| r.get::<_, String>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        drop(conn);
+
+        let mut topologies = Vec::with_capacity(network_ids.len());
+        for network_id in network_ids {
+            topologies.push(self.load_network_topology_for_network(&network_id)?);
+        }
+        Ok(topologies)
+    }
+
     pub fn node_has_network_membership(&self, node_id: &str, network_id: &str) -> Result<bool> {
         let conn = self
             .conn
