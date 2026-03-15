@@ -1,3 +1,4 @@
+use serde_json::json;
 use std::fs;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream, UdpSocket};
@@ -8,14 +9,18 @@ use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
+use wattswarm_control_plane::artifact_store::{ArtifactAvailabilityStatus, ArtifactKind};
 use wattswarm_control_plane::control::{
     DiscoveredPeerRecord, ExecutorRegistry, ExecutorRegistryEntry, RealTaskRunRequest,
-    add_discovered_peer, add_discovered_peer_endpoint, discovered_peers_path,
-    executor_registry_path, load_discovered_peer_records, load_discovered_peers,
-    load_executor_registry, local_node_id, open_node, open_node_on_network_id, run_real_task_flow,
-    save_discovered_peers, save_executor_registry,
+    add_discovered_peer, add_discovered_peer_endpoint, artifact_store_path, discovered_peers_path,
+    executor_registry_path, fetch_checkpoint_artifact_json, fetch_evidence_artifact,
+    fetch_snapshot_artifact_json, fetch_task_detail_artifact, list_artifacts_needing_repair,
+    load_discovered_peer_records, load_discovered_peers, load_executor_registry, local_node_id,
+    materialize_checkpoint_artifact_json, materialize_evidence_artifact,
+    materialize_snapshot_artifact_json, materialize_task_detail_artifact, open_node,
+    open_node_on_network_id, run_real_task_flow, save_discovered_peers, save_executor_registry,
 };
-use wattswarm_control_plane::crypto::NodeIdentity;
+use wattswarm_control_plane::crypto::{NodeIdentity, sha256_hex};
 use wattswarm_control_plane::storage::storage::pg::Connection;
 use wattswarm_control_plane::task_template::sample_contract;
 use wattswarm_control_plane::types::{NetworkKind, SignedNetworkProtocolParamsEnvelope};
@@ -255,6 +260,17 @@ impl Drop for RuntimeStub {
     }
 }
 
+fn wait_for_stub_listener(stub: &RuntimeStub) {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline {
+        match TcpStream::connect(stub.addr) {
+            Ok(_) => return,
+            Err(_) => thread::sleep(Duration::from_millis(10)),
+        }
+    }
+    panic!("runtime stub listener did not become ready in time");
+}
+
 fn read_http_request(stream: &mut TcpStream) -> Vec<u8> {
     let _ = stream.set_read_timeout(Some(Duration::from_millis(250)));
     let mut buf = [0_u8; 4096];
@@ -401,6 +417,28 @@ fn local_node_id_is_stable_for_same_state_dir() {
     let node_id_1 = local_node_id(&dir).expect("first node id");
     let node_id_2 = local_node_id(&dir).expect("second node id");
     assert_eq!(node_id_1, node_id_2);
+
+    cleanup_dir(&dir);
+}
+
+#[test]
+fn open_node_creates_local_artifact_store_layout() {
+    let dir = temp_test_dir("artifact-layout");
+    let state_dir = dir.join("state");
+    fs::create_dir_all(&state_dir).expect("create state dir");
+    let db_path = state_dir.join("test.state");
+
+    let _node = open_node(&state_dir, &db_path).expect("open node");
+
+    assert!(artifact_store_path(&state_dir).join("references").exists());
+    assert!(artifact_store_path(&state_dir).join("evidence").exists());
+    assert!(artifact_store_path(&state_dir).join("checkpoints").exists());
+    assert!(artifact_store_path(&state_dir).join("snapshots").exists());
+    assert!(
+        artifact_store_path(&state_dir)
+            .join("availability")
+            .exists()
+    );
 
     cleanup_dir(&dir);
 }
@@ -787,6 +825,223 @@ fn open_node_on_network_id_joins_and_binds_subnet_overlay() {
 }
 
 #[test]
+fn task_detail_and_evidence_artifacts_roundtrip_and_missing_refs_schedule_repair() {
+    let _guard = env_lock();
+    let _db_lock = DbTestLock::acquire();
+    let schema = format!("test_{}", Uuid::new_v4().simple());
+    reset_test_schema(&schema);
+    let _schema_guard = EnvVarGuard::set("WATTSWARM_PG_SCHEMA", &schema);
+    let dir = temp_test_dir("artifact-detail-evidence");
+    let state_dir = dir.join("state");
+    fs::create_dir_all(&state_dir).expect("create state dir");
+    let db_path = state_dir.join("test.state");
+    let mut node = open_node(&state_dir, &db_path).expect("open node");
+    let network_id = node
+        .store
+        .load_network_topology_for_org(node.store.org_id())
+        .expect("load topology")
+        .network
+        .network_id;
+
+    let policy_hash = node
+        .policy_registry()
+        .binding_for("vp.schema_only.v1", json!({}))
+        .expect("policy binding")
+        .policy_hash;
+    let mut contract = sample_contract("task-artifact-detail", policy_hash);
+    contract.inputs = json!({"prompt":"artifact detail"});
+    node.submit_task(contract, 1, 10).expect("submit task");
+
+    let detail_bytes = br#"{"task":"detail","v":1}"#;
+    let detail_digest = format!("sha256:{}", sha256_hex(detail_bytes));
+    node.emit_at(
+        1,
+        wattswarm_control_plane::types::EventPayload::TaskAnnounced(
+            wattswarm_control_plane::types::TaskAnnouncedPayload {
+                network_id,
+                task_id: "task-artifact-detail".to_owned(),
+                announcement_id: "announce-artifact-detail".to_owned(),
+                feed_key: "feed.detail".to_owned(),
+                scope_hint: "global".to_owned(),
+                summary: json!({"headline":"detail"}),
+                detail_ref: Some(wattswarm_control_plane::types::ArtifactRef {
+                    uri: "ipfs://task-artifact-detail".to_owned(),
+                    digest: detail_digest.clone(),
+                    size_bytes: detail_bytes.len() as u64,
+                    mime: "application/json".to_owned(),
+                    created_at: 11,
+                    producer: node.node_id(),
+                }),
+            },
+        ),
+        11,
+    )
+    .expect("announce detail");
+
+    let missing_detail = fetch_task_detail_artifact(&state_dir, &node, "task-artifact-detail", 20);
+    assert!(missing_detail.is_err());
+
+    let pending = list_artifacts_needing_repair(&state_dir, 20 + 30_000).expect("list repairs");
+    assert!(pending.iter().any(|manifest| {
+        manifest.artifact_kind == ArtifactKind::Reference
+            && manifest.artifact_id == detail_digest
+            && manifest.status == ArtifactAvailabilityStatus::Missing
+    }));
+
+    let detail_manifest = materialize_task_detail_artifact(
+        &state_dir,
+        &node,
+        "task-artifact-detail",
+        detail_bytes,
+        21,
+    )
+    .expect("materialize task detail");
+    assert_eq!(
+        detail_manifest.status,
+        ArtifactAvailabilityStatus::Available
+    );
+
+    let loaded_detail = fetch_task_detail_artifact(&state_dir, &node, "task-artifact-detail", 22)
+        .expect("fetch task detail");
+    assert_eq!(loaded_detail, detail_bytes);
+
+    node.claim_task(
+        "task-artifact-detail",
+        wattswarm_control_plane::types::ClaimRole::Propose,
+        "exec-artifact-detail",
+        500,
+        1,
+        23,
+    )
+    .expect("claim task");
+    let evidence_bytes = br#"{"evidence":"blob"}"#;
+    let evidence_digest = format!("sha256:{}", sha256_hex(evidence_bytes));
+    let candidate = wattswarm_control_plane::types::Candidate {
+        candidate_id: "cand-artifact-1".to_owned(),
+        execution_id: "exec-artifact-detail".to_owned(),
+        output: json!({"answer":"ok"}),
+        evidence_inline: vec![],
+        evidence_refs: vec![],
+    };
+    node.propose_candidate("task-artifact-detail", candidate, 1, 24)
+        .expect("propose candidate");
+    node.add_evidence(
+        "task-artifact-detail",
+        "cand-artifact-1",
+        "exec-artifact-detail",
+        vec![wattswarm_control_plane::types::ArtifactRef {
+            uri: "ipfs://evidence-artifact".to_owned(),
+            digest: evidence_digest.clone(),
+            size_bytes: evidence_bytes.len() as u64,
+            mime: "application/json".to_owned(),
+            created_at: 24,
+            producer: node.node_id(),
+        }],
+        1,
+        25,
+    )
+    .expect("add evidence");
+
+    materialize_evidence_artifact(
+        &state_dir,
+        &node,
+        "task-artifact-detail",
+        "cand-artifact-1",
+        &evidence_digest,
+        evidence_bytes,
+        26,
+    )
+    .expect("materialize evidence");
+    let loaded_evidence = fetch_evidence_artifact(
+        &state_dir,
+        &node,
+        "task-artifact-detail",
+        "cand-artifact-1",
+        &evidence_digest,
+        27,
+    )
+    .expect("fetch evidence");
+    assert_eq!(loaded_evidence, evidence_bytes);
+
+    cleanup_dir(&dir);
+}
+
+#[test]
+fn checkpoint_and_snapshot_artifacts_roundtrip_and_record_missing_retries() {
+    let _guard = env_lock();
+    let _db_lock = DbTestLock::acquire();
+    let schema = format!("test_{}", Uuid::new_v4().simple());
+    reset_test_schema(&schema);
+    let _schema_guard = EnvVarGuard::set("WATTSWARM_PG_SCHEMA", &schema);
+    let dir = temp_test_dir("artifact-checkpoint-snapshot");
+    let state_dir = dir.join("state");
+    fs::create_dir_all(&state_dir).expect("create state dir");
+    let db_path = state_dir.join("test.state");
+    let node = open_node(&state_dir, &db_path).expect("open node");
+
+    node.store
+        .put_checkpoint_announcement("global", "cp-artifact-1", "ipfs://checkpoint-1", 30)
+        .expect("put checkpoint announcement");
+
+    let missing_checkpoint = fetch_checkpoint_artifact_json::<serde_json::Value>(
+        &state_dir,
+        &node,
+        "global",
+        "cp-artifact-1",
+        31,
+    );
+    assert!(missing_checkpoint.is_err());
+
+    let checkpoint_manifest = materialize_checkpoint_artifact_json(
+        &state_dir,
+        &node,
+        "global",
+        "cp-artifact-1",
+        &json!({"checkpoint":"cp-artifact-1","up_to_seq":42}),
+        32,
+    )
+    .expect("materialize checkpoint");
+    assert_eq!(checkpoint_manifest.artifact_kind, ArtifactKind::Checkpoint);
+
+    let checkpoint = fetch_checkpoint_artifact_json::<serde_json::Value>(
+        &state_dir,
+        &node,
+        "global",
+        "cp-artifact-1",
+        33,
+    )
+    .expect("fetch checkpoint");
+    assert_eq!(checkpoint["up_to_seq"], json!(42));
+
+    let missing_snapshot =
+        fetch_snapshot_artifact_json::<serde_json::Value>(&state_dir, "region:sol-1", "snap-1", 34);
+    assert!(missing_snapshot.is_err());
+
+    let pending = list_artifacts_needing_repair(&state_dir, 34 + 30_000).expect("list repairs");
+    assert!(pending.iter().any(|manifest| {
+        manifest.artifact_kind == ArtifactKind::Snapshot
+            && manifest.artifact_id == "snap-1"
+            && manifest.status == ArtifactAvailabilityStatus::Missing
+    }));
+
+    materialize_snapshot_artifact_json(
+        &state_dir,
+        "region:sol-1",
+        "snap-1",
+        Some("ipfs://snapshot-1"),
+        &json!({"snapshot":"snap-1","epoch":7}),
+        35,
+    )
+    .expect("materialize snapshot");
+    let snapshot =
+        fetch_snapshot_artifact_json::<serde_json::Value>(&state_dir, "region:sol-1", "snap-1", 36)
+            .expect("fetch snapshot");
+    assert_eq!(snapshot["epoch"], json!(7));
+
+    cleanup_dir(&dir);
+}
+
+#[test]
 fn run_real_task_flow_returns_clear_error_when_executor_missing() {
     let _guard = env_lock();
     let _db_lock = DbTestLock::acquire();
@@ -827,6 +1082,7 @@ fn run_real_task_flow_rejects_unsupported_profile() {
     fs::create_dir_all(&state_dir).expect("create state dir");
     let db_path = state_dir.join("test.state");
     let stub = RuntimeStub::start(&["other-profile"]);
+    wait_for_stub_listener(&stub);
 
     save_executor_registry(
         &executor_registry_path(&state_dir),
@@ -866,6 +1122,7 @@ fn run_real_task_flow_reports_task_file_parse_errors() {
     fs::create_dir_all(&state_dir).expect("create state dir");
     let db_path = state_dir.join("test.state");
     let stub = RuntimeStub::start(&["default"]);
+    wait_for_stub_listener(&stub);
 
     save_executor_registry(
         &executor_registry_path(&state_dir),
@@ -914,6 +1171,7 @@ fn run_real_task_flow_completes_with_stub_runtime() {
     fs::create_dir_all(&state_dir).expect("create state dir");
     let db_path = state_dir.join("test.state");
     let stub = RuntimeStub::start(&["default"]);
+    wait_for_stub_listener(&stub);
 
     save_executor_registry(
         &executor_registry_path(&state_dir),

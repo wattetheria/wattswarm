@@ -6,6 +6,10 @@ pub mod crypto {
     pub use wattswarm_crypto::*;
 }
 
+pub mod artifact_store {
+    pub use wattswarm_artifact_store::*;
+}
+
 pub mod node {
     pub use wattswarm_node_core::*;
 }

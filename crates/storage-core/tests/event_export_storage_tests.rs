@@ -91,6 +91,34 @@ fn task_announcement_detail_fetch_returns_latest_announcement_and_task_contract(
 }
 
 #[test]
+fn evidence_reference_reads_return_added_artifacts() {
+    let store = open_test_store();
+    let reference = ArtifactRef {
+        uri: "ipfs://evidence-ref".to_owned(),
+        digest: "sha256:evidence-ref".to_owned(),
+        size_bytes: 512,
+        mime: "application/json".to_owned(),
+        created_at: 123,
+        producer: "node-a".to_owned(),
+    };
+    store
+        .put_evidence_added("task-evidence", "cand-1", &reference)
+        .expect("put evidence");
+
+    let loaded = store
+        .get_evidence_reference("task-evidence", "cand-1", &reference.digest)
+        .expect("load evidence")
+        .expect("evidence exists");
+    assert_eq!(loaded.digest, reference.digest);
+    assert_eq!(loaded.uri, reference.uri);
+
+    let listed = store
+        .list_evidence_references("task-evidence", "cand-1")
+        .expect("list evidence");
+    assert_eq!(listed, vec![reference]);
+}
+
+#[test]
 fn bootstrap_topology_returns_typed_network_and_org_descriptors() {
     let store = PgStore::open_in_memory().expect("open store");
     let topology = store

@@ -252,7 +252,8 @@ pub(super) fn mirror_summary_controls_to_parent_network(
                 parent_store.revoke_imported_reputation_by_summary(summary_id)?;
             }
             if payload.block_summaries {
-                parent_store.revoke_imported_decision_memory_by_source(&payload.penalized_node_id)?;
+                parent_store
+                    .revoke_imported_decision_memory_by_source(&payload.penalized_node_id)?;
                 parent_store.revoke_imported_reputation_by_source(&payload.penalized_node_id)?;
             }
             Ok(true)

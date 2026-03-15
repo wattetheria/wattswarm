@@ -8,12 +8,15 @@ use crate::types::{
     VoteRevealPayload,
 };
 use anyhow::{Context, Result, anyhow};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
+use wattswarm_artifact_store::{
+    ArtifactAvailabilityManifest, ArtifactAvailabilityStatus, ArtifactKind, ArtifactStore,
+};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeState {
@@ -105,6 +108,498 @@ pub fn discovered_peers_path(state_dir: &Path) -> PathBuf {
     state_dir.join("discovered_peers.json")
 }
 
+pub fn artifact_store_path(state_dir: &Path) -> PathBuf {
+    state_dir.join("artifacts")
+}
+
+fn open_local_artifact_store(state_dir: &Path) -> Result<ArtifactStore> {
+    let store = ArtifactStore::new(artifact_store_path(state_dir));
+    store.ensure_layout()?;
+    Ok(store)
+}
+
+fn default_artifact_retry_after_ms() -> u64 {
+    30_000
+}
+
+fn availability_manifest(
+    kind: ArtifactKind,
+    artifact_id: &str,
+    scope: Option<&str>,
+    source_uri: Option<&str>,
+    expected_digest: Option<&str>,
+    mime: Option<&str>,
+    size_bytes: Option<u64>,
+    local_path: Option<&Path>,
+    status: ArtifactAvailabilityStatus,
+    observed_at: u64,
+    repair_attempts: u32,
+    next_retry_at: Option<u64>,
+    last_error: Option<String>,
+) -> ArtifactAvailabilityManifest {
+    ArtifactAvailabilityManifest {
+        artifact_kind: kind,
+        artifact_id: artifact_id.to_owned(),
+        scope: scope.map(ToOwned::to_owned),
+        source_uri: source_uri.map(ToOwned::to_owned),
+        expected_digest: expected_digest.map(ToOwned::to_owned),
+        mime: mime.map(ToOwned::to_owned),
+        size_bytes,
+        local_path: local_path.map(|path| path.display().to_string()),
+        status,
+        observed_at,
+        last_checked_at: Some(observed_at),
+        missing_since: (status == ArtifactAvailabilityStatus::Missing).then_some(observed_at),
+        repair_attempts,
+        next_retry_at,
+        last_error,
+    }
+}
+
+fn load_task_detail_reference(node: &Node, task_id: &str) -> Result<crate::types::ArtifactRef> {
+    let detail = node
+        .store
+        .get_task_announcement_detail_for_task(task_id)?
+        .ok_or_else(|| anyhow!("task announcement missing for task {task_id}"))?;
+    detail
+        .detail_ref()
+        .cloned()
+        .ok_or_else(|| anyhow!("task announcement detail_ref missing for task {task_id}"))
+}
+
+fn load_evidence_reference(
+    node: &Node,
+    task_id: &str,
+    candidate_id: &str,
+    evidence_digest: &str,
+) -> Result<crate::types::ArtifactRef> {
+    if let Some(reference) =
+        node.store
+            .get_evidence_reference(task_id, candidate_id, evidence_digest)?
+    {
+        return Ok(reference);
+    }
+    let candidate = node
+        .store
+        .get_candidate_by_id(task_id, candidate_id)?
+        .ok_or_else(|| anyhow!("candidate missing for evidence {candidate_id}"))?;
+    candidate
+        .evidence_refs
+        .into_iter()
+        .find(|reference| reference.digest == evidence_digest)
+        .ok_or_else(|| {
+            anyhow!("evidence ref {evidence_digest} missing for candidate {candidate_id}")
+        })
+}
+
+fn write_missing_manifest(
+    artifact_store: &ArtifactStore,
+    kind: ArtifactKind,
+    artifact_id: &str,
+    scope: Option<&str>,
+    source_uri: Option<&str>,
+    expected_digest: Option<&str>,
+    mime: Option<&str>,
+    size_bytes: Option<u64>,
+    observed_at: u64,
+    error: anyhow::Error,
+) -> Result<()> {
+    let repair_attempts = artifact_store
+        .read_availability_manifest(kind, artifact_id, scope)?
+        .map(|manifest| manifest.repair_attempts.saturating_add(1))
+        .unwrap_or(1);
+    artifact_store.write_availability_manifest(&availability_manifest(
+        kind,
+        artifact_id,
+        scope,
+        source_uri,
+        expected_digest,
+        mime,
+        size_bytes,
+        None,
+        ArtifactAvailabilityStatus::Missing,
+        observed_at,
+        repair_attempts,
+        Some(observed_at.saturating_add(default_artifact_retry_after_ms())),
+        Some(error.to_string()),
+    ))?;
+    Ok(())
+}
+
+fn materialize_reference_artifact(
+    state_dir: &Path,
+    kind: ArtifactKind,
+    artifact_id: &str,
+    source_uri: &str,
+    expected_digest: &str,
+    mime: &str,
+    size_bytes: u64,
+    bytes: &[u8],
+    observed_at: u64,
+) -> Result<ArtifactAvailabilityManifest> {
+    let artifact_store = open_local_artifact_store(state_dir)?;
+    let path = artifact_store.write_validated_bytes(
+        kind,
+        artifact_id,
+        None,
+        bytes,
+        Some(expected_digest),
+        Some(size_bytes),
+    )?;
+    let manifest = availability_manifest(
+        kind,
+        artifact_id,
+        None,
+        Some(source_uri),
+        Some(expected_digest),
+        Some(mime),
+        Some(size_bytes),
+        Some(&path),
+        ArtifactAvailabilityStatus::Available,
+        observed_at,
+        0,
+        None,
+        None,
+    );
+    artifact_store.write_availability_manifest(&manifest)?;
+    Ok(manifest)
+}
+
+fn fetch_reference_artifact(
+    state_dir: &Path,
+    kind: ArtifactKind,
+    artifact_id: &str,
+    source_uri: &str,
+    expected_digest: &str,
+    mime: &str,
+    size_bytes: u64,
+    observed_at: u64,
+) -> Result<Vec<u8>> {
+    let artifact_store = open_local_artifact_store(state_dir)?;
+    match artifact_store.read_validated_bytes(
+        kind,
+        artifact_id,
+        None,
+        Some(expected_digest),
+        Some(size_bytes),
+    ) {
+        Ok(bytes) => {
+            let path = match kind {
+                ArtifactKind::Reference => artifact_store.reference_path(artifact_id)?,
+                ArtifactKind::Evidence => artifact_store.evidence_path(artifact_id)?,
+                _ => unreachable!("reference artifact kind"),
+            };
+            artifact_store.write_availability_manifest(&availability_manifest(
+                kind,
+                artifact_id,
+                None,
+                Some(source_uri),
+                Some(expected_digest),
+                Some(mime),
+                Some(size_bytes),
+                Some(&path),
+                ArtifactAvailabilityStatus::Available,
+                observed_at,
+                artifact_store
+                    .read_availability_manifest(kind, artifact_id, None)?
+                    .map(|manifest| manifest.repair_attempts)
+                    .unwrap_or(0),
+                None,
+                None,
+            ))?;
+            Ok(bytes)
+        }
+        Err(err) => {
+            write_missing_manifest(
+                &artifact_store,
+                kind,
+                artifact_id,
+                None,
+                Some(source_uri),
+                Some(expected_digest),
+                Some(mime),
+                Some(size_bytes),
+                observed_at,
+                err.context("fetch reference artifact"),
+            )?;
+            Err(anyhow!("artifact {} is not locally available", artifact_id))
+        }
+    }
+}
+
+pub fn materialize_task_detail_artifact(
+    state_dir: &Path,
+    node: &Node,
+    task_id: &str,
+    bytes: &[u8],
+    observed_at: u64,
+) -> Result<ArtifactAvailabilityManifest> {
+    let reference = load_task_detail_reference(node, task_id)?;
+    materialize_reference_artifact(
+        state_dir,
+        ArtifactKind::Reference,
+        &reference.digest,
+        &reference.uri,
+        &reference.digest,
+        &reference.mime,
+        reference.size_bytes,
+        bytes,
+        observed_at,
+    )
+}
+
+pub fn fetch_task_detail_artifact(
+    state_dir: &Path,
+    node: &Node,
+    task_id: &str,
+    observed_at: u64,
+) -> Result<Vec<u8>> {
+    let reference = load_task_detail_reference(node, task_id)?;
+    fetch_reference_artifact(
+        state_dir,
+        ArtifactKind::Reference,
+        &reference.digest,
+        &reference.uri,
+        &reference.digest,
+        &reference.mime,
+        reference.size_bytes,
+        observed_at,
+    )
+}
+
+pub fn materialize_evidence_artifact(
+    state_dir: &Path,
+    node: &Node,
+    task_id: &str,
+    candidate_id: &str,
+    evidence_digest: &str,
+    bytes: &[u8],
+    observed_at: u64,
+) -> Result<ArtifactAvailabilityManifest> {
+    let reference = load_evidence_reference(node, task_id, candidate_id, evidence_digest)?;
+    materialize_reference_artifact(
+        state_dir,
+        ArtifactKind::Evidence,
+        &reference.digest,
+        &reference.uri,
+        &reference.digest,
+        &reference.mime,
+        reference.size_bytes,
+        bytes,
+        observed_at,
+    )
+}
+
+pub fn fetch_evidence_artifact(
+    state_dir: &Path,
+    node: &Node,
+    task_id: &str,
+    candidate_id: &str,
+    evidence_digest: &str,
+    observed_at: u64,
+) -> Result<Vec<u8>> {
+    let reference = load_evidence_reference(node, task_id, candidate_id, evidence_digest)?;
+    fetch_reference_artifact(
+        state_dir,
+        ArtifactKind::Evidence,
+        &reference.digest,
+        &reference.uri,
+        &reference.digest,
+        &reference.mime,
+        reference.size_bytes,
+        observed_at,
+    )
+}
+
+pub fn materialize_checkpoint_artifact_json<T: Serialize>(
+    state_dir: &Path,
+    node: &Node,
+    scope_key: &str,
+    checkpoint_id: &str,
+    value: &T,
+    observed_at: u64,
+) -> Result<ArtifactAvailabilityManifest> {
+    let artifact_store = open_local_artifact_store(state_dir)?;
+    let checkpoint = node
+        .store
+        .get_checkpoint_announcement(scope_key, checkpoint_id)?
+        .ok_or_else(|| {
+            anyhow!("checkpoint announcement missing for {scope_key}/{checkpoint_id}")
+        })?;
+    let path = artifact_store.checkpoint_path(checkpoint_id)?;
+    artifact_store.write_json(&path, value)?;
+    let manifest = availability_manifest(
+        ArtifactKind::Checkpoint,
+        checkpoint_id,
+        Some(scope_key),
+        Some(&checkpoint.artifact_path),
+        None,
+        Some("application/json"),
+        None,
+        Some(&path),
+        ArtifactAvailabilityStatus::Available,
+        observed_at,
+        0,
+        None,
+        None,
+    );
+    artifact_store.write_availability_manifest(&manifest)?;
+    Ok(manifest)
+}
+
+pub fn fetch_checkpoint_artifact_json<T: DeserializeOwned>(
+    state_dir: &Path,
+    node: &Node,
+    scope_key: &str,
+    checkpoint_id: &str,
+    observed_at: u64,
+) -> Result<T> {
+    let artifact_store = open_local_artifact_store(state_dir)?;
+    let checkpoint = node
+        .store
+        .get_checkpoint_announcement(scope_key, checkpoint_id)?
+        .ok_or_else(|| {
+            anyhow!("checkpoint announcement missing for {scope_key}/{checkpoint_id}")
+        })?;
+    let path = artifact_store.checkpoint_path(checkpoint_id)?;
+    match artifact_store.read_json::<T>(&path) {
+        Ok(value) => {
+            artifact_store.write_availability_manifest(&availability_manifest(
+                ArtifactKind::Checkpoint,
+                checkpoint_id,
+                Some(scope_key),
+                Some(&checkpoint.artifact_path),
+                None,
+                Some("application/json"),
+                None,
+                Some(&path),
+                ArtifactAvailabilityStatus::Available,
+                observed_at,
+                artifact_store
+                    .read_availability_manifest(
+                        ArtifactKind::Checkpoint,
+                        checkpoint_id,
+                        Some(scope_key),
+                    )?
+                    .map(|manifest| manifest.repair_attempts)
+                    .unwrap_or(0),
+                None,
+                None,
+            ))?;
+            Ok(value)
+        }
+        Err(err) => {
+            write_missing_manifest(
+                &artifact_store,
+                ArtifactKind::Checkpoint,
+                checkpoint_id,
+                Some(scope_key),
+                Some(&checkpoint.artifact_path),
+                None,
+                Some("application/json"),
+                None,
+                observed_at,
+                err.context("fetch checkpoint artifact"),
+            )?;
+            Err(anyhow!(
+                "checkpoint artifact {checkpoint_id} is not locally available"
+            ))
+        }
+    }
+}
+
+pub fn materialize_snapshot_artifact_json<T: Serialize>(
+    state_dir: &Path,
+    scope_key: &str,
+    snapshot_id: &str,
+    source_uri: Option<&str>,
+    value: &T,
+    observed_at: u64,
+) -> Result<ArtifactAvailabilityManifest> {
+    let artifact_store = open_local_artifact_store(state_dir)?;
+    let path = artifact_store.snapshot_path(scope_key, snapshot_id)?;
+    artifact_store.write_json(&path, value)?;
+    let manifest = availability_manifest(
+        ArtifactKind::Snapshot,
+        snapshot_id,
+        Some(scope_key),
+        source_uri,
+        None,
+        Some("application/json"),
+        None,
+        Some(&path),
+        ArtifactAvailabilityStatus::Available,
+        observed_at,
+        0,
+        None,
+        None,
+    );
+    artifact_store.write_availability_manifest(&manifest)?;
+    Ok(manifest)
+}
+
+pub fn fetch_snapshot_artifact_json<T: DeserializeOwned>(
+    state_dir: &Path,
+    scope_key: &str,
+    snapshot_id: &str,
+    observed_at: u64,
+) -> Result<T> {
+    let artifact_store = open_local_artifact_store(state_dir)?;
+    let path = artifact_store.snapshot_path(scope_key, snapshot_id)?;
+    match artifact_store.read_json::<T>(&path) {
+        Ok(value) => {
+            artifact_store.write_availability_manifest(&availability_manifest(
+                ArtifactKind::Snapshot,
+                snapshot_id,
+                Some(scope_key),
+                None,
+                None,
+                Some("application/json"),
+                None,
+                Some(&path),
+                ArtifactAvailabilityStatus::Available,
+                observed_at,
+                artifact_store
+                    .read_availability_manifest(
+                        ArtifactKind::Snapshot,
+                        snapshot_id,
+                        Some(scope_key),
+                    )?
+                    .map(|manifest| manifest.repair_attempts)
+                    .unwrap_or(0),
+                None,
+                None,
+            ))?;
+            Ok(value)
+        }
+        Err(err) => {
+            write_missing_manifest(
+                &artifact_store,
+                ArtifactKind::Snapshot,
+                snapshot_id,
+                Some(scope_key),
+                None,
+                None,
+                Some("application/json"),
+                None,
+                observed_at,
+                err.context("fetch snapshot artifact"),
+            )?;
+            Err(anyhow!(
+                "snapshot artifact {snapshot_id} is not locally available"
+            ))
+        }
+    }
+}
+
+pub fn list_artifacts_needing_repair(
+    state_dir: &Path,
+    now_ms: u64,
+) -> Result<Vec<ArtifactAvailabilityManifest>> {
+    let artifact_store = open_local_artifact_store(state_dir)?;
+    artifact_store.list_manifests_needing_repair(now_ms)
+}
+
 pub fn local_node_id(state_dir: &Path) -> Result<String> {
     Ok(load_or_create_identity(&state_dir.join("node_seed.hex"))?.node_id())
 }
@@ -141,6 +636,7 @@ fn open_node_for_topology(
     identity: NodeIdentity,
     store: PgStore,
 ) -> Result<Node> {
+    let _ = open_local_artifact_store(state_dir)?;
     store
         .ensure_bootstrap_signed_network_protocol_params(&topology.network.network_id, &identity)?;
     let mut membership = Membership::new();

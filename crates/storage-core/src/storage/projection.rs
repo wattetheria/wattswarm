@@ -684,6 +684,60 @@ impl PgStore {
         Ok(count as u32)
     }
 
+    pub fn get_evidence_reference(
+        &self,
+        task_id: &str,
+        candidate_id: &str,
+        evidence_digest: &str,
+    ) -> Result<Option<crate::types::ArtifactRef>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
+        conn.query_row(
+            "SELECT evidence_json
+             FROM evidence_added
+             WHERE org_id = $1 AND task_id = $2 AND candidate_id = $3 AND evidence_digest = $4",
+            params![self.org_id(), task_id, candidate_id, evidence_digest],
+            |r| {
+                let raw: String = r.get(0)?;
+                serde_json::from_str(&raw).map_err(|e| {
+                    pg::Error::FromSqlConversionFailure(0, pg::types::Type::Text, Box::new(e))
+                })
+            },
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    pub fn list_evidence_references(
+        &self,
+        task_id: &str,
+        candidate_id: &str,
+    ) -> Result<Vec<crate::types::ArtifactRef>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
+        let mut stmt = conn.prepare(
+            "SELECT evidence_json
+             FROM evidence_added
+             WHERE org_id = $1 AND task_id = $2 AND candidate_id = $3
+             ORDER BY evidence_digest ASC",
+        )?;
+        let rows = stmt.query_map(params![self.org_id(), task_id, candidate_id], |r| {
+            let raw: String = r.get(0)?;
+            serde_json::from_str(&raw).map_err(|e| {
+                pg::Error::FromSqlConversionFailure(0, pg::types::Type::Text, Box::new(e))
+            })
+        })?;
+        let mut references = Vec::new();
+        for row in rows {
+            references.push(row?);
+        }
+        Ok(references)
+    }
+
     pub fn mark_stage_cost(
         &self,
         task_id: &str,
