@@ -3,8 +3,8 @@ use wattswarm_protocol::types::{
     ExecutionIntentDeclaredPayload, ExecutionSetConfirmedPayload, FeedSubscriptionUpdatedPayload,
     Membership, NetworkDescriptor, NetworkKind, NetworkTopology, NodePenalizedPayload,
     OrgDescriptor, PolicyBinding, Role, ScopeHint, SummaryRevokedPayload, TaskAnnouncedPayload,
-    TaskContract, TaskDisseminationLayer, TaskExpiredPayload, TaskMode, TransportRoute,
-    UnsignedEvent, canonical_scope_hint, normalized_scope_hint,
+    TaskContract, TaskDisseminationLayer, TaskExpiredPayload, TaskMode, TopicMessagePostedPayload,
+    TransportRoute, UnsignedEvent, canonical_scope_hint, normalized_scope_hint,
 };
 
 #[test]
@@ -62,6 +62,16 @@ fn event_payload_kind_and_task_id_cover_task_and_non_task_variants() {
     });
     assert_eq!(penalized_payload.kind(), EventKind::NodePenalized);
     assert_eq!(penalized_payload.task_id(), None);
+
+    let topic_message_payload = EventPayload::TopicMessagePosted(TopicMessagePostedPayload {
+        network_id: "default".to_owned(),
+        feed_key: "crew.chat".to_owned(),
+        scope_hint: "group:crew-7".to_owned(),
+        content: serde_json::json!({"text":"hello"}),
+        reply_to_message_id: None,
+    });
+    assert_eq!(topic_message_payload.kind(), EventKind::TopicMessagePosted);
+    assert_eq!(topic_message_payload.task_id(), None);
 }
 
 #[test]
@@ -236,6 +246,17 @@ fn scope_hint_parse_and_canonicalization_are_shared() {
         }
         .scope(),
         Some(ScopeHint::Region("sol-2".to_owned()))
+    );
+    assert_eq!(
+        TopicMessagePostedPayload {
+            network_id: "default".to_owned(),
+            feed_key: "crew.chat".to_owned(),
+            scope_hint: "group:crew-7".to_owned(),
+            content: serde_json::json!({"text":"hello"}),
+            reply_to_message_id: Some("message-1".to_owned()),
+        }
+        .scope(),
+        Some(ScopeHint::Group("crew-7".to_owned()))
     );
 
     assert_eq!(canonical_scope_hint("global"), Some("global".to_owned()));
@@ -455,6 +476,16 @@ fn dissemination_layer_marks_only_low_frequency_layers_as_global_safe() {
         TaskDisseminationLayer::Process
     );
     assert!(!process.allows_global_dissemination());
+
+    let chat = EventPayload::TopicMessagePosted(TopicMessagePostedPayload {
+        network_id: "default".to_owned(),
+        feed_key: "crew.chat".to_owned(),
+        scope_hint: "group:crew-7".to_owned(),
+        content: serde_json::json!({"text":"hello"}),
+        reply_to_message_id: None,
+    });
+    assert_eq!(chat.dissemination_layer(), TaskDisseminationLayer::Process);
+    assert!(!chat.allows_global_dissemination());
 
     let proof = EventPayload::TaskExpired(TaskExpiredPayload {
         task_id: "task-1".to_owned(),

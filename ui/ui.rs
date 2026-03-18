@@ -98,6 +98,21 @@ struct SwarmTickRequest {
     profile: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+struct TopicMessagesQuery {
+    feed_key: String,
+    scope_hint: String,
+    limit: Option<usize>,
+    before_created_at: Option<u64>,
+    before_message_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TopicCursorQuery {
+    feed_key: String,
+    subscriber_node_id: Option<String>,
+}
+
 pub fn run(state_dir: PathBuf, db_path: PathBuf, listen: String) -> Result<()> {
     fs::create_dir_all(&state_dir)?;
     let node_id = local_node_id(&state_dir).ok();
@@ -154,6 +169,8 @@ pub fn build_app(state: UiServerState) -> Router {
         .route("/api/task/decision/:task_id", get(task_decision))
         .route("/api/task/run-real", post(task_run_real))
         .route("/api/knowledge/export", post(knowledge_export))
+        .route("/api/topic/messages", get(topic_messages))
+        .route("/api/topic/cursor", get(topic_cursor))
         .route("/api/swarm/state", get(swarm_state))
         .route("/api/swarm/tick", post(swarm_tick))
         .with_state(state)
@@ -435,6 +452,110 @@ async fn knowledge_export(
     })
     .await?;
     Ok(Json(json!({"ok": true, "knowledge": payload})))
+}
+
+fn clamp_topic_page_limit(limit: Option<usize>) -> usize {
+    limit.unwrap_or(50).clamp(1, 200)
+}
+
+fn resolve_subscriber_node_id(
+    state_dir: &std::path::Path,
+    db_path: &std::path::Path,
+    explicit: Option<String>,
+) -> Result<String> {
+    if let Some(subscriber_node_id) = explicit {
+        let trimmed = subscriber_node_id.trim();
+        if trimmed.is_empty() {
+            return Err(anyhow!("subscriber_node_id cannot be empty"));
+        }
+        return Ok(trimmed.to_owned());
+    }
+    match local_node_id(state_dir) {
+        Ok(node_id) => Ok(node_id),
+        Err(_) => {
+            let node = open_node(state_dir, db_path)?;
+            Ok(node.node_id())
+        }
+    }
+}
+
+async fn topic_messages(
+    State(state): State<UiServerState>,
+    Query(query): Query<TopicMessagesQuery>,
+) -> Result<Json<Value>, ApiError> {
+    let state_clone = state.clone();
+    let limit = clamp_topic_page_limit(query.limit);
+    let feed_key = query.feed_key.trim().to_owned();
+    let scope_hint = query.scope_hint.trim().to_owned();
+    if feed_key.is_empty() {
+        return Err(anyhow!("feed_key is required").into());
+    }
+    if scope_hint.is_empty() {
+        return Err(anyhow!("scope_hint is required").into());
+    }
+    let before_created_at = query.before_created_at;
+    let before_message_id = query
+        .before_message_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned);
+    let payload = run_blocking(move || -> Result<Value> {
+        let node = open_node(&state_clone.state_dir, &state_clone.db_path)?;
+        let messages = node.store.list_topic_messages_page(
+            &feed_key,
+            &scope_hint,
+            before_created_at,
+            before_message_id.as_deref(),
+            limit,
+        )?;
+        let next_anchor = messages.last().map(|message| {
+            json!({
+                "before_created_at": message.created_at,
+                "before_message_id": message.message_id,
+            })
+        });
+        Ok(json!({
+            "ok": true,
+            "feed_key": feed_key,
+            "scope_hint": scope_hint,
+            "messages": messages,
+            "next_anchor": next_anchor,
+        }))
+    })
+    .await?;
+    Ok(Json(payload))
+}
+
+async fn topic_cursor(
+    State(state): State<UiServerState>,
+    Query(query): Query<TopicCursorQuery>,
+) -> Result<Json<Value>, ApiError> {
+    let state_clone = state.clone();
+    let feed_key = query.feed_key.trim().to_owned();
+    if feed_key.is_empty() {
+        return Err(anyhow!("feed_key is required").into());
+    }
+    let subscriber_node_id = query.subscriber_node_id;
+    let payload = run_blocking(move || -> Result<Value> {
+        let subscriber_node_id = resolve_subscriber_node_id(
+            &state_clone.state_dir,
+            &state_clone.db_path,
+            subscriber_node_id,
+        )?;
+        let node = open_node(&state_clone.state_dir, &state_clone.db_path)?;
+        let cursor = node
+            .store
+            .get_topic_cursor(&subscriber_node_id, &feed_key)?;
+        Ok(json!({
+            "ok": true,
+            "subscriber_node_id": subscriber_node_id,
+            "feed_key": feed_key,
+            "cursor": cursor,
+        }))
+    })
+    .await?;
+    Ok(Json(payload))
 }
 
 async fn swarm_state(State(state): State<UiServerState>) -> Result<Json<Value>, ApiError> {

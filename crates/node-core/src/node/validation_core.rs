@@ -140,6 +140,9 @@ impl Node {
             EventPayload::ExecutionSetConfirmed(payload) => {
                 self.validate_execution_set_confirmed(event, payload)
             }
+            EventPayload::TopicMessagePosted(payload) => {
+                self.validate_topic_message_posted(payload)
+            }
             EventPayload::MembershipUpdated(payload) => self.validate_membership_update(payload),
             EventPayload::PolicyTuned(payload) => self.validate_policy_tuned(payload),
             EventPayload::AdvisoryCreated(payload) => self.validate_advisory_created(payload),
@@ -198,6 +201,7 @@ impl Node {
             EventPayload::ExecutionSetConfirmed(p) => {
                 (Some(Role::Committer), Some(&p.confirmed_by_node_id))
             }
+            EventPayload::TopicMessagePosted(_) => (None, None),
             EventPayload::MembershipUpdated(_) => (Some(Role::Finalizer), None),
             EventPayload::PolicyTuned(_) => (Some(Role::Finalizer), None),
             EventPayload::AdvisoryCreated(_) => (Some(Role::Committer), None),
@@ -369,6 +373,38 @@ impl Node {
             }
         }
         Ok(())
+    }
+
+    fn validate_topic_message_posted(
+        &self,
+        payload: &crate::types::TopicMessagePostedPayload,
+    ) -> Result<()> {
+        if payload.network_id.trim().is_empty()
+            || payload.feed_key.trim().is_empty()
+            || payload.scope_hint.trim().is_empty()
+        {
+            return Err(SwarmError::InvalidEvent("topic message fields required".into()).into());
+        }
+        if let Some(reply_to_message_id) = &payload.reply_to_message_id
+            && reply_to_message_id.trim().is_empty()
+        {
+            return Err(
+                SwarmError::InvalidEvent("reply_to_message_id must not be empty".into()).into(),
+            );
+        }
+        let content_bytes = serde_json::to_vec(&payload.content)?;
+        if payload.content.is_null()
+            || content_bytes.is_empty()
+            || content_bytes.len() > MAX_INLINE_EVIDENCE_BYTES
+        {
+            return Err(SwarmError::InvalidEvent("topic message content invalid".into()).into());
+        }
+        self.validate_network_substrate_scope(
+            &payload.network_id,
+            payload.scope().as_ref(),
+            "topic message network_id mismatch",
+            "topic message scope_hint invalid",
+        )
     }
 
     pub(crate) fn validate_task_created(&self, contract: &TaskContract) -> Result<()> {

@@ -306,6 +306,33 @@ impl PgStore {
                 PRIMARY KEY(org_id, announcement_id)
             );
 
+            CREATE TABLE IF NOT EXISTS topic_messages (
+                org_id TEXT NOT NULL DEFAULT '__unset_org__',
+                message_id TEXT NOT NULL,
+                network_id TEXT NOT NULL,
+                feed_key TEXT NOT NULL,
+                scope_hint TEXT NOT NULL,
+                author_node_id TEXT NOT NULL,
+                content_json TEXT NOT NULL,
+                reply_to_message_id TEXT,
+                created_at TIMESTAMPTZ NOT NULL,
+                PRIMARY KEY(org_id, message_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_topic_messages_feed_scope_created
+                ON topic_messages(org_id, feed_key, scope_hint, created_at DESC, message_id DESC);
+
+            CREATE TABLE IF NOT EXISTS topic_cursors (
+                org_id TEXT NOT NULL DEFAULT '__unset_org__',
+                subscriber_node_id TEXT NOT NULL,
+                feed_key TEXT NOT NULL,
+                scope_hint TEXT NOT NULL,
+                last_event_seq BIGINT NOT NULL DEFAULT 0,
+                updated_at TIMESTAMPTZ NOT NULL,
+                PRIMARY KEY(org_id, subscriber_node_id, feed_key)
+            );
+            CREATE INDEX IF NOT EXISTS idx_topic_cursors_scope_updated
+                ON topic_cursors(org_id, scope_hint, updated_at DESC);
+
             CREATE TABLE IF NOT EXISTS execution_set_projection (
                 org_id TEXT NOT NULL DEFAULT '__unset_org__',
                 task_id TEXT NOT NULL,

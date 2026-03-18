@@ -72,11 +72,29 @@ pub fn publish_pending_scoped_updates(
                 service.unsubscribe_scope(&scope)?;
             }
         }
+        if let crate::types::EventPayload::TopicMessagePosted(payload) = &event.payload {
+            super::maybe_record_topic_cursor(
+                node,
+                local_node_id,
+                &payload.feed_key,
+                &scope,
+                seq,
+                event.created_at,
+            )?;
+        }
         let is_local_subscription_control_event = matches!(
             &event.payload,
             crate::types::EventPayload::FeedSubscriptionUpdated(_)
         );
-        match service.publish_event_for_scope(&scope, event.clone()) {
+        let publish_result = if matches!(
+            &event.payload,
+            crate::types::EventPayload::TopicMessagePosted(_)
+        ) {
+            service.publish_chat_for_scope(&scope, event.clone())
+        } else {
+            service.publish_event_for_scope(&scope, event.clone())
+        };
+        match publish_result {
             Ok(()) => {
                 service.record_scope_event_published(&scope);
                 last_published_seq = seq;

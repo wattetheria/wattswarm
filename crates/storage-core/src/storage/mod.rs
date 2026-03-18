@@ -177,6 +177,27 @@ pub struct TaskAnnouncementRow {
     pub created_at: u64,
 }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct TopicMessageRow {
+    pub message_id: String,
+    pub network_id: String,
+    pub feed_key: String,
+    pub scope_hint: String,
+    pub author_node_id: String,
+    pub content: Value,
+    pub reply_to_message_id: Option<String>,
+    pub created_at: u64,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct TopicCursorRow {
+    pub subscriber_node_id: String,
+    pub feed_key: String,
+    pub scope_hint: String,
+    pub last_event_seq: u64,
+    pub updated_at: u64,
+}
+
 #[derive(Debug, Clone)]
 pub struct TaskAnnouncementDetailRow {
     pub announcement: TaskAnnouncementRow,
@@ -204,6 +225,18 @@ impl FeedSubscriptionRow {
 }
 
 impl TaskAnnouncementRow {
+    pub fn scope(&self) -> Option<ProjectionScope> {
+        ProjectionScope::parse(&self.scope_hint)
+    }
+}
+
+impl TopicMessageRow {
+    pub fn scope(&self) -> Option<ProjectionScope> {
+        ProjectionScope::parse(&self.scope_hint)
+    }
+}
+
+impl TopicCursorRow {
     pub fn scope(&self) -> Option<ProjectionScope> {
         ProjectionScope::parse(&self.scope_hint)
     }

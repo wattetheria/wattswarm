@@ -11,9 +11,11 @@ use crate::types::{
     VerifierResult,
 };
 use anyhow::{Context, Result, anyhow};
-use reqwest::blocking::Client;
+use reqwest::blocking::{Client, Response};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::thread;
+use std::time::Duration;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuntimeCapabilities {
@@ -88,11 +90,37 @@ impl HttpRuntimeClient {
     }
 }
 
+fn retry_send<F>(mut op: F) -> Result<Response>
+where
+    F: FnMut() -> std::result::Result<Response, reqwest::Error>,
+{
+    const MAX_ATTEMPTS: usize = 5;
+    const BASE_BACKOFF_MS: u64 = 50;
+
+    let mut last_err = None;
+    for attempt in 0..MAX_ATTEMPTS {
+        match op() {
+            Ok(response) => return Ok(response),
+            Err(err) => {
+                last_err = Some(err);
+                if attempt + 1 < MAX_ATTEMPTS {
+                    thread::sleep(Duration::from_millis(
+                        BASE_BACKOFF_MS * (attempt as u64 + 1),
+                    ));
+                }
+            }
+        }
+    }
+
+    let err = last_err
+        .map(anyhow::Error::from)
+        .unwrap_or_else(|| anyhow!("runtime request failed without an error"));
+    Err(err)
+}
+
 impl RuntimeClient for HttpRuntimeClient {
     fn health(&self) -> Result<()> {
-        self.client
-            .get(self.url("/health"))
-            .send()
+        retry_send(|| self.client.get(self.url("/health")).send())
             .context("runtime /health request")?
             .error_for_status()
             .context("runtime /health status")?;
@@ -100,9 +128,7 @@ impl RuntimeClient for HttpRuntimeClient {
     }
 
     fn capabilities(&self) -> Result<RuntimeCapabilities> {
-        self.client
-            .get(self.url("/capabilities"))
-            .send()
+        retry_send(|| self.client.get(self.url("/capabilities")).send())
             .context("runtime /capabilities request")?
             .error_for_status()
             .context("runtime /capabilities status")?
@@ -111,11 +137,7 @@ impl RuntimeClient for HttpRuntimeClient {
     }
 
     fn execute(&self, req: &ExecuteRequest) -> Result<ExecuteResponse> {
-        let response = self
-            .client
-            .post(self.url("/execute"))
-            .json(req)
-            .send()
+        let response = retry_send(|| self.client.post(self.url("/execute")).json(req).send())
             .context("runtime /execute request")?;
 
         let status = response.status();
@@ -131,10 +153,7 @@ impl RuntimeClient for HttpRuntimeClient {
     }
 
     fn verify(&self, req: &VerifyRequest) -> Result<VerifyResponse> {
-        self.client
-            .post(self.url("/verify"))
-            .json(req)
-            .send()
+        retry_send(|| self.client.post(self.url("/verify")).json(req).send())
             .context("runtime /verify request")?
             .error_for_status()
             .context("runtime /verify status")?

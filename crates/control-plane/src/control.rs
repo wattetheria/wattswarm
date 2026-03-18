@@ -15,6 +15,8 @@ use std::collections::BTreeMap;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::thread;
+use std::time::Duration;
 use uuid::Uuid;
 use wattswarm_artifact_store::{
     ArtifactAvailabilityManifest, ArtifactAvailabilityStatus, ArtifactKind, ArtifactStore,
@@ -217,13 +219,13 @@ fn prepare_runtime_for_executor(
         .ok_or_else(|| anyhow!("executor not found: {executor}"))?;
 
     let runtime = HttpRuntimeClient::new(entry.base_url.clone());
-    runtime.health().with_context(|| {
+    retry_runtime_probe(|| runtime.health()).with_context(|| {
         format!(
             "runtime /health failed (executor='{}', base_url='{}')",
             executor, entry.base_url
         )
     })?;
-    let capabilities = runtime.capabilities().with_context(|| {
+    let capabilities = retry_runtime_probe(|| runtime.capabilities()).with_context(|| {
         format!(
             "runtime /capabilities failed (executor='{}', base_url='{}')",
             executor, entry.base_url
@@ -244,6 +246,31 @@ fn prepare_runtime_for_executor(
         runtime,
         capabilities,
     })
+}
+
+fn retry_runtime_probe<T, F>(mut op: F) -> Result<T>
+where
+    F: FnMut() -> Result<T>,
+{
+    const MAX_ATTEMPTS: usize = 5;
+    const BASE_BACKOFF_MS: u64 = 50;
+
+    let mut last_err = None;
+    for attempt in 0..MAX_ATTEMPTS {
+        match op() {
+            Ok(value) => return Ok(value),
+            Err(err) => {
+                last_err = Some(err);
+                if attempt + 1 < MAX_ATTEMPTS {
+                    thread::sleep(Duration::from_millis(
+                        BASE_BACKOFF_MS * (attempt as u64 + 1),
+                    ));
+                }
+            }
+        }
+    }
+
+    Err(last_err.unwrap_or_else(|| anyhow!("runtime probe failed without an error")))
 }
 
 fn default_artifact_retry_after_ms() -> u64 {

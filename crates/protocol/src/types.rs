@@ -624,6 +624,23 @@ impl ExecutionSetConfirmedPayload {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TopicMessagePostedPayload {
+    #[serde(default = "default_network_context_id")]
+    pub network_id: String,
+    pub feed_key: String,
+    pub scope_hint: String,
+    pub content: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reply_to_message_id: Option<String>,
+}
+
+impl TopicMessagePostedPayload {
+    pub fn scope(&self) -> Option<ScopeHint> {
+        ScopeHint::parse(&self.scope_hint)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum NetworkKind {
@@ -830,6 +847,7 @@ pub enum EventPayload {
     TaskAnnounced(TaskAnnouncedPayload),
     ExecutionIntentDeclared(ExecutionIntentDeclaredPayload),
     ExecutionSetConfirmed(ExecutionSetConfirmedPayload),
+    TopicMessagePosted(TopicMessagePostedPayload),
     MembershipUpdated(MembershipUpdatedPayload),
     PolicyTuned(PolicyTunedPayload),
     AdvisoryCreated(AdvisoryCreatedPayload),
@@ -869,6 +887,7 @@ pub enum EventKind {
     TaskAnnounced,
     ExecutionIntentDeclared,
     ExecutionSetConfirmed,
+    TopicMessagePosted,
     MembershipUpdated,
     PolicyTuned,
     AdvisoryCreated,
@@ -919,6 +938,7 @@ impl EventPayload {
             Self::TaskAnnounced(_) => EventKind::TaskAnnounced,
             Self::ExecutionIntentDeclared(_) => EventKind::ExecutionIntentDeclared,
             Self::ExecutionSetConfirmed(_) => EventKind::ExecutionSetConfirmed,
+            Self::TopicMessagePosted(_) => EventKind::TopicMessagePosted,
             Self::MembershipUpdated(_) => EventKind::MembershipUpdated,
             Self::PolicyTuned(_) => EventKind::PolicyTuned,
             Self::AdvisoryCreated(_) => EventKind::AdvisoryCreated,
@@ -958,6 +978,7 @@ impl EventPayload {
             Self::TaskAnnounced(p) => Some(&p.task_id),
             Self::ExecutionIntentDeclared(p) => Some(&p.task_id),
             Self::ExecutionSetConfirmed(p) => Some(&p.task_id),
+            Self::TopicMessagePosted(_) => None,
             Self::MembershipUpdated(_) => None,
             Self::PolicyTuned(_) => None,
             Self::AdvisoryCreated(_) => None,
@@ -980,6 +1001,7 @@ impl EventPayload {
             Self::ExecutionIntentDeclared(_) | Self::ExecutionSetConfirmed(_) => {
                 TaskDisseminationLayer::ExecutionCoordination
             }
+            Self::TopicMessagePosted(_) => TaskDisseminationLayer::Process,
             Self::TaskClaimed(_)
             | Self::TaskClaimRenewed(_)
             | Self::TaskClaimReleased(_)

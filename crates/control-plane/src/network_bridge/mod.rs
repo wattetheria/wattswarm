@@ -86,6 +86,7 @@ fn network_id_for_network_substrate_event(event: &crate::types::Event) -> Option
         crate::types::EventPayload::TaskAnnounced(payload) => Some(&payload.network_id),
         crate::types::EventPayload::ExecutionIntentDeclared(payload) => Some(&payload.network_id),
         crate::types::EventPayload::ExecutionSetConfirmed(payload) => Some(&payload.network_id),
+        crate::types::EventPayload::TopicMessagePosted(payload) => Some(&payload.network_id),
         _ => None,
     }
 }
@@ -104,6 +105,72 @@ fn scope_hint_label(scope: &SwarmScope) -> String {
         SwarmScope::Node(id) => format!("node:{id}"),
         SwarmScope::Group(id) => format!("group:{id}"),
     }
+}
+
+fn maybe_record_topic_cursor(
+    node: &Node,
+    subscriber_node_id: &str,
+    feed_key: &str,
+    scope: &SwarmScope,
+    last_event_seq: u64,
+    updated_at: u64,
+) -> Result<()> {
+    let Some(subscription) = node
+        .store
+        .get_feed_subscription(subscriber_node_id, feed_key)?
+    else {
+        return Ok(());
+    };
+    if !subscription.active || subscription.scope_hint != scope_hint_label(scope) {
+        return Ok(());
+    }
+    node.store.upsert_topic_cursor(
+        subscriber_node_id,
+        feed_key,
+        &subscription.scope_hint,
+        last_event_seq,
+        updated_at,
+    )
+}
+
+fn maybe_record_topic_cursor_for_event_id(
+    node: &Node,
+    subscriber_node_id: &str,
+    feed_key: &str,
+    scope: &SwarmScope,
+    event_id: &str,
+    updated_at: u64,
+) -> Result<()> {
+    let Some(last_event_seq) = node.store.event_seq_for_event_id(event_id)? else {
+        return Ok(());
+    };
+    maybe_record_topic_cursor(
+        node,
+        subscriber_node_id,
+        feed_key,
+        scope,
+        last_event_seq,
+        updated_at,
+    )
+}
+
+fn maybe_record_topic_cursor_for_response(
+    node: &Node,
+    subscriber_node_id: &str,
+    response: &crate::network_p2p::BackfillResponse,
+    updated_at: u64,
+) -> Result<()> {
+    let Some(feed_key) = &response.feed_key else {
+        return Ok(());
+    };
+    maybe_record_topic_cursor(
+        node,
+        subscriber_node_id,
+        feed_key,
+        &response.scope,
+        response.next_from_event_seq,
+        updated_at,
+    )
 }
 
 pub(super) fn parent_uplink_store(node: &Node) -> Result<Option<crate::storage::PgStore>> {
@@ -170,6 +237,10 @@ pub fn summary_announcement_from_gossip(message: &GossipMessage) -> Result<&Summ
 
 pub fn event_gossip(envelope: EventEnvelope) -> GossipMessage {
     GossipMessage::Event(envelope)
+}
+
+pub fn chat_gossip(envelope: EventEnvelope) -> GossipMessage {
+    GossipMessage::Chat(envelope)
 }
 
 pub fn global_event_gossip(envelope: EventEnvelope) -> Result<GossipMessage> {
@@ -597,6 +668,20 @@ impl NetworkBridgeService {
         }))
     }
 
+    pub fn publish_chat_for_scope(
+        &mut self,
+        scope: &SwarmScope,
+        event: crate::types::Event,
+    ) -> Result<()> {
+        if !self.global_publish_rate_guard.allow(scope, &event) {
+            bail!("GlobalTopicRateLimited");
+        }
+        self.runtime.publish_gossip(&chat_gossip(EventEnvelope {
+            scope: scope.clone(),
+            event,
+        }))
+    }
+
     pub fn publish_global_event(&mut self, event: crate::types::Event) -> Result<()> {
         self.publish_event_for_scope(&SwarmScope::Global, event)
     }
@@ -760,6 +845,7 @@ impl NetworkBridgeService {
                 scope: SwarmScope::Global,
                 from_event_seq,
                 limit,
+                feed_key: None,
             },
         )
     }
@@ -792,19 +878,42 @@ impl NetworkBridgeService {
         if scopes.is_empty() {
             return Ok(false);
         }
+        let local_node_id = node.node_id();
+        let active_subscriptions = node.store.list_active_feed_subscriptions(&local_node_id)?;
         let mut requests_sent = 0usize;
         for scope in scopes.iter().cloned() {
+            let scope_hint = scope_hint_label(&scope);
             let from_event_seq = latest_scoped_event_seq(node, &scope)?;
             let _guard = self.tokio_runtime.enter();
             let _ = self.runtime.send_backfill_request(
                 peer,
                 BackfillRequest {
-                    scope,
+                    scope: scope.clone(),
                     from_event_seq,
                     limit: BACKFILL_BATCH_EVENTS,
+                    feed_key: None,
                 },
             )?;
             requests_sent += 1;
+            for subscription in active_subscriptions
+                .iter()
+                .filter(|subscription| subscription.scope_hint == scope_hint)
+            {
+                let from_event_seq = node
+                    .store
+                    .get_topic_cursor(&local_node_id, &subscription.feed_key)?
+                    .map_or(0, |cursor| cursor.last_event_seq);
+                let _ = self.runtime.send_backfill_request(
+                    peer,
+                    BackfillRequest {
+                        scope: scope.clone(),
+                        from_event_seq,
+                        limit: BACKFILL_BATCH_EVENTS,
+                        feed_key: Some(subscription.feed_key.clone()),
+                    },
+                )?;
+                requests_sent += 1;
+            }
         }
         state.inflight_backfills += requests_sent;
         state.last_backfill_request_at = Some(now);
@@ -1102,6 +1211,27 @@ impl NetworkBridgeService {
                         event_id: envelope.event.event_id.clone(),
                     })
                 }
+                GossipMessage::Chat(envelope) => {
+                    self.record_peer_scope_activity(propagation_source, &envelope.scope);
+                    ingest_event_envelope(node, &envelope)?;
+                    if let crate::types::EventPayload::TopicMessagePosted(payload) =
+                        &envelope.event.payload
+                    {
+                        maybe_record_topic_cursor_for_event_id(
+                            node,
+                            &node.node_id(),
+                            &payload.feed_key,
+                            &envelope.scope,
+                            &envelope.event.event_id,
+                            envelope.event.created_at,
+                        )?;
+                    }
+                    self.record_scope_event_ingested(&envelope.scope);
+                    Ok(NetworkBridgeTick::EventIngested {
+                        peer: propagation_source,
+                        event_id: envelope.event.event_id.clone(),
+                    })
+                }
                 GossipMessage::Summary(summary) => {
                     self.record_peer_scope_activity(propagation_source, &summary.scope);
                     apply_summary_announcement(node, &summary)?;
@@ -1154,6 +1284,12 @@ impl NetworkBridgeService {
                 self.record_peer_scope_activity(peer, &response.scope);
                 self.mark_backfill_completed(peer);
                 let events = ingest_backfill_response(node, &response)?;
+                maybe_record_topic_cursor_for_response(
+                    node,
+                    &node.node_id(),
+                    &response,
+                    observed_at_ms(),
+                )?;
                 self.record_scope_backfill_applied(&response.scope, events);
                 Ok(NetworkBridgeTick::BackfillApplied {
                     peer,

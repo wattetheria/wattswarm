@@ -83,6 +83,7 @@ impl SwarmScope {
 #[serde(rename_all = "snake_case")]
 pub enum TopicKind {
     Events,
+    Messages,
     Rules,
     Checkpoints,
     Summaries,
@@ -92,6 +93,7 @@ impl TopicKind {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Events => "events",
+            Self::Messages => "messages",
             Self::Rules => "rules",
             Self::Checkpoints => "checkpoints",
             Self::Summaries => "summaries",
@@ -130,6 +132,7 @@ impl TopicNamespace {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TopicCatalog {
     pub events: String,
+    pub messages: String,
     pub rules: String,
     pub checkpoints: String,
     pub summaries: String,
@@ -139,15 +142,17 @@ impl TopicCatalog {
     pub fn new(namespace: &TopicNamespace, scope: &SwarmScope) -> Result<Self> {
         Ok(Self {
             events: namespace.topic_name(scope, TopicKind::Events)?,
+            messages: namespace.topic_name(scope, TopicKind::Messages)?,
             rules: namespace.topic_name(scope, TopicKind::Rules)?,
             checkpoints: namespace.topic_name(scope, TopicKind::Checkpoints)?,
             summaries: namespace.topic_name(scope, TopicKind::Summaries)?,
         })
     }
 
-    pub fn as_ident_topics(&self) -> [IdentTopic; 4] {
+    pub fn as_ident_topics(&self) -> [IdentTopic; 5] {
         [
             IdentTopic::new(self.events.clone()),
+            IdentTopic::new(self.messages.clone()),
             IdentTopic::new(self.rules.clone()),
             IdentTopic::new(self.checkpoints.clone()),
             IdentTopic::new(self.summaries.clone()),
@@ -212,6 +217,8 @@ pub struct BackfillRequest {
     pub scope: SwarmScope,
     pub from_event_seq: u64,
     pub limit: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub feed_key: Option<String>,
 }
 
 impl BackfillRequest {
@@ -224,6 +231,11 @@ impl BackfillRequest {
         }
         if self.limit > hard_limit {
             bail!("backfill limit exceeds hard safety limit");
+        }
+        if let Some(feed_key) = &self.feed_key
+            && feed_key.trim().is_empty()
+        {
+            bail!("backfill feed_key must not be empty");
         }
         Ok(())
     }
@@ -249,6 +261,8 @@ impl EventEnvelope {
 pub struct BackfillResponse {
     pub scope: SwarmScope,
     pub next_from_event_seq: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub feed_key: Option<String>,
     pub events: Vec<EventEnvelope>,
 }
 
@@ -283,6 +297,7 @@ pub struct SummaryAnnouncement {
 #[serde(tag = "type", content = "payload")]
 pub enum GossipMessage {
     Event(EventEnvelope),
+    Chat(EventEnvelope),
     Rule(RuleAnnouncement),
     Checkpoint(CheckpointAnnouncement),
     Summary(SummaryAnnouncement),
@@ -292,6 +307,7 @@ impl GossipMessage {
     pub fn kind(&self) -> TopicKind {
         match self {
             Self::Event(_) => TopicKind::Events,
+            Self::Chat(_) => TopicKind::Messages,
             Self::Rule(_) => TopicKind::Rules,
             Self::Checkpoint(_) => TopicKind::Checkpoints,
             Self::Summary(_) => TopicKind::Summaries,
@@ -301,6 +317,7 @@ impl GossipMessage {
     pub fn scope(&self) -> &SwarmScope {
         match self {
             Self::Event(payload) => &payload.scope,
+            Self::Chat(payload) => &payload.scope,
             Self::Rule(payload) => &payload.scope,
             Self::Checkpoint(payload) => &payload.scope,
             Self::Summary(payload) => &payload.scope,
@@ -1636,6 +1653,10 @@ mod tests {
             catalog.rules,
             "wattswarm-main.mainnet-watt-galaxy.region.sol-1-alpha.rules"
         );
+        assert_eq!(
+            catalog.messages,
+            "wattswarm-main.mainnet-watt-galaxy.region.sol-1-alpha.messages"
+        );
 
         let group_catalog = TopicCatalog::new(&namespace, &SwarmScope::Group("crew/7".to_owned()))
             .expect("group catalog");
@@ -1672,10 +1693,21 @@ mod tests {
             scope: SwarmScope::Global,
             from_event_seq: 42,
             limit: 128,
+            feed_key: None,
         };
         req.validate(256, 512).expect("valid");
         assert!(req.validate(64, 512).is_err());
         assert!(req.validate(256, 96).is_err());
+        assert!(
+            BackfillRequest {
+                scope: SwarmScope::Global,
+                from_event_seq: 0,
+                limit: 1,
+                feed_key: Some(" ".to_owned()),
+            }
+            .validate(256, 512)
+            .is_err()
+        );
     }
 
     #[test]
@@ -1688,6 +1720,18 @@ mod tests {
         let decoded = GossipMessage::decode_json(&bytes).expect("decode");
         assert_eq!(decoded, message);
         assert_eq!(decoded.kind(), TopicKind::Events);
+    }
+
+    #[test]
+    fn chat_gossip_messages_roundtrip_as_json() {
+        let message = GossipMessage::Chat(EventEnvelope {
+            scope: SwarmScope::Group("crew-7".to_owned()),
+            event: sample_event(),
+        });
+        let bytes = message.encode_json().expect("encode");
+        let decoded = GossipMessage::decode_json(&bytes).expect("decode");
+        assert_eq!(decoded, message);
+        assert_eq!(decoded.kind(), TopicKind::Messages);
     }
 
     #[test]

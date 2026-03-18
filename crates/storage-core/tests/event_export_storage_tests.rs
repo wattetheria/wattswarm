@@ -104,6 +104,122 @@ fn task_announcement_detail_fetch_returns_latest_announcement_and_task_contract(
 }
 
 #[test]
+fn topic_message_roundtrip_reads_scope_and_content() {
+    let store = open_test_store();
+    store
+        .put_topic_message(
+            "msg-1",
+            "default",
+            "crew.chat",
+            " group:crew-7 ",
+            "node-a",
+            &serde_json::json!({"text":"hello crew"}),
+            None,
+            123,
+        )
+        .expect("put topic message");
+    store
+        .put_topic_message(
+            "msg-2",
+            "default",
+            "crew.chat",
+            "group:crew-7",
+            "node-b",
+            &serde_json::json!({"text":"reply"}),
+            Some("msg-1"),
+            124,
+        )
+        .expect("put reply topic message");
+
+    let messages = store
+        .list_topic_messages("crew.chat", " group:crew-7 ", 10)
+        .expect("list topic messages");
+    assert_eq!(messages.len(), 2);
+    assert_eq!(messages[0].message_id, "msg-2");
+    assert_eq!(messages[0].reply_to_message_id.as_deref(), Some("msg-1"));
+    assert_eq!(
+        messages[0].scope(),
+        Some(ProjectionScope::Group("crew-7".to_owned()))
+    );
+    assert_eq!(messages[1].content["text"], serde_json::json!("hello crew"));
+}
+
+#[test]
+fn topic_cursor_roundtrip_advances_only_forward() {
+    let store = open_test_store();
+    store
+        .upsert_topic_cursor("node-a", "crew.chat", " group:crew-7 ", 11, 200)
+        .expect("put topic cursor");
+    store
+        .upsert_topic_cursor("node-a", "crew.chat", "group:crew-7", 7, 201)
+        .expect("attempt backwards cursor");
+
+    let cursor = store
+        .get_topic_cursor("node-a", "crew.chat")
+        .expect("get topic cursor")
+        .expect("cursor exists");
+    assert_eq!(cursor.last_event_seq, 11);
+    assert_eq!(
+        cursor.scope(),
+        Some(ProjectionScope::Group("crew-7".to_owned()))
+    );
+}
+
+#[test]
+fn topic_message_pagination_uses_created_at_and_message_id_anchor() {
+    let store = open_test_store();
+    store
+        .put_topic_message(
+            "msg-1",
+            "default",
+            "crew.chat",
+            "group:crew-7",
+            "node-a",
+            &serde_json::json!({"text":"first"}),
+            None,
+            124,
+        )
+        .expect("put first topic message");
+    store
+        .put_topic_message(
+            "msg-2",
+            "default",
+            "crew.chat",
+            "group:crew-7",
+            "node-b",
+            &serde_json::json!({"text":"second"}),
+            None,
+            124,
+        )
+        .expect("put second topic message");
+    store
+        .put_topic_message(
+            "msg-3",
+            "default",
+            "crew.chat",
+            "group:crew-7",
+            "node-c",
+            &serde_json::json!({"text":"third"}),
+            None,
+            125,
+        )
+        .expect("put third topic message");
+
+    let page = store
+        .list_topic_messages_page("crew.chat", "group:crew-7", Some(125), Some("msg-3"), 10)
+        .expect("load paged topic messages");
+    assert_eq!(page.len(), 2);
+    assert_eq!(page[0].message_id, "msg-2");
+    assert_eq!(page[1].message_id, "msg-1");
+
+    let tie_page = store
+        .list_topic_messages_page("crew.chat", "group:crew-7", Some(124), Some("msg-2"), 10)
+        .expect("load tie-broken topic messages");
+    assert_eq!(tie_page.len(), 1);
+    assert_eq!(tie_page[0].message_id, "msg-1");
+}
+
+#[test]
 fn evidence_reference_reads_return_added_artifacts() {
     let store = open_test_store();
     let reference = ArtifactRef {

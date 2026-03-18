@@ -273,6 +273,37 @@ impl PgStore {
         .map_err(Into::into)
     }
 
+    pub fn list_active_feed_subscriptions(
+        &self,
+        subscriber_node_id: &str,
+    ) -> Result<Vec<FeedSubscriptionRow>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
+        let mut stmt = conn.prepare(
+            "SELECT feed_key, scope_hint, active, CAST(EXTRACT(EPOCH FROM updated_at) * 1000 AS BIGINT)
+             FROM feed_subscriptions
+             WHERE org_id = $1 AND subscriber_node_id = $2 AND active = TRUE
+             ORDER BY updated_at DESC, feed_key ASC",
+        )?;
+        let rows = stmt.query_map(params![self.org_id(), subscriber_node_id], |r| {
+            let updated_at_ms: i64 = r.get(3)?;
+            Ok(FeedSubscriptionRow {
+                subscriber_node_id: subscriber_node_id.to_owned(),
+                feed_key: r.get(0)?,
+                scope_hint: Self::canonical_scope_hint_or_original(r.get(1)?),
+                active: r.get(2)?,
+                updated_at: updated_at_ms as u64,
+            })
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
     pub fn put_task_announcement(
         &self,
         task_id: &str,
@@ -415,6 +446,185 @@ impl PgStore {
             announcement,
             contract,
         }))
+    }
+
+    pub fn put_topic_message(
+        &self,
+        message_id: &str,
+        network_id: &str,
+        feed_key: &str,
+        scope_hint: &str,
+        author_node_id: &str,
+        content: &serde_json::Value,
+        reply_to_message_id: Option<&str>,
+        created_at: u64,
+    ) -> Result<()> {
+        let canonical_scope_hint = Self::canonical_scope_hint_or_original(scope_hint.to_owned());
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
+        conn.execute(
+            "INSERT INTO topic_messages(org_id, message_id, network_id, feed_key, scope_hint, author_node_id, content_json, reply_to_message_id, created_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, TIMESTAMPTZ 'epoch' + ($9::bigint * INTERVAL '1 millisecond'))
+             ON CONFLICT(org_id, message_id) DO UPDATE SET
+               network_id = excluded.network_id,
+               feed_key = excluded.feed_key,
+               scope_hint = excluded.scope_hint,
+               author_node_id = excluded.author_node_id,
+               content_json = excluded.content_json,
+               reply_to_message_id = excluded.reply_to_message_id,
+               created_at = excluded.created_at",
+            params![
+                self.org_id(),
+                message_id,
+                network_id,
+                feed_key,
+                canonical_scope_hint,
+                author_node_id,
+                serde_json::to_string(content)?,
+                reply_to_message_id,
+                created_at as i64
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_topic_messages_page(
+        &self,
+        feed_key: &str,
+        scope_hint: &str,
+        before_created_at: Option<u64>,
+        before_message_id: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<TopicMessageRow>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
+        let canonical_scope_hint = Self::canonical_scope_hint_or_original(scope_hint.to_owned());
+        let has_anchor = before_created_at.is_some();
+        let before_created_at = before_created_at.unwrap_or(u64::MAX) as i64;
+        let mut stmt = conn.prepare(
+            "SELECT message_id, network_id, author_node_id, content_json, reply_to_message_id,
+                    CAST(EXTRACT(EPOCH FROM created_at) * 1000 AS BIGINT)
+             FROM topic_messages
+             WHERE org_id = $1 AND feed_key = $2 AND scope_hint = $3
+               AND (
+                    $4 = FALSE
+                    OR CAST(EXTRACT(EPOCH FROM created_at) * 1000 AS BIGINT) < $5
+                    OR (
+                        CAST(EXTRACT(EPOCH FROM created_at) * 1000 AS BIGINT) = $5
+                        AND $6::text IS NOT NULL
+                        AND message_id < $6
+                    )
+               )
+             ORDER BY created_at DESC, message_id DESC
+             LIMIT $7",
+        )?;
+        let rows = stmt.query_map(
+            params![
+                self.org_id(),
+                feed_key,
+                canonical_scope_hint,
+                has_anchor,
+                before_created_at,
+                before_message_id,
+                limit as i64
+            ],
+            |r| {
+                let content_json: String = r.get(3)?;
+                let created_at_ms: i64 = r.get(5)?;
+                Ok(TopicMessageRow {
+                    message_id: r.get(0)?,
+                    network_id: r.get(1)?,
+                    feed_key: feed_key.to_owned(),
+                    scope_hint: canonical_scope_hint.clone(),
+                    author_node_id: r.get(2)?,
+                    content: serde_json::from_str(&content_json).map_err(|e| {
+                        pg::Error::FromSqlConversionFailure(0, pg::types::Type::Text, Box::new(e))
+                    })?,
+                    reply_to_message_id: r.get(4)?,
+                    created_at: created_at_ms as u64,
+                })
+            },
+        )?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    pub fn list_topic_messages(
+        &self,
+        feed_key: &str,
+        scope_hint: &str,
+        limit: usize,
+    ) -> Result<Vec<TopicMessageRow>> {
+        self.list_topic_messages_page(feed_key, scope_hint, None, None, limit)
+    }
+
+    pub fn upsert_topic_cursor(
+        &self,
+        subscriber_node_id: &str,
+        feed_key: &str,
+        scope_hint: &str,
+        last_event_seq: u64,
+        updated_at: u64,
+    ) -> Result<()> {
+        let canonical_scope_hint = Self::canonical_scope_hint_or_original(scope_hint.to_owned());
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
+        conn.execute(
+            "INSERT INTO topic_cursors(org_id, subscriber_node_id, feed_key, scope_hint, last_event_seq, updated_at)
+             VALUES ($1, $2, $3, $4, $5, TIMESTAMPTZ 'epoch' + ($6::bigint * INTERVAL '1 millisecond'))
+             ON CONFLICT(org_id, subscriber_node_id, feed_key) DO UPDATE SET
+               scope_hint = excluded.scope_hint,
+               last_event_seq = GREATEST(topic_cursors.last_event_seq, excluded.last_event_seq),
+               updated_at = excluded.updated_at",
+            params![
+                self.org_id(),
+                subscriber_node_id,
+                feed_key,
+                canonical_scope_hint,
+                last_event_seq as i64,
+                updated_at as i64
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_topic_cursor(
+        &self,
+        subscriber_node_id: &str,
+        feed_key: &str,
+    ) -> Result<Option<TopicCursorRow>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
+        conn.query_row(
+            "SELECT scope_hint, last_event_seq, CAST(EXTRACT(EPOCH FROM updated_at) * 1000 AS BIGINT)
+             FROM topic_cursors
+             WHERE org_id = $1 AND subscriber_node_id = $2 AND feed_key = $3",
+            params![self.org_id(), subscriber_node_id, feed_key],
+            |r| {
+                let updated_at_ms: i64 = r.get(2)?;
+                let last_event_seq: i64 = r.get(1)?;
+                Ok(TopicCursorRow {
+                    subscriber_node_id: subscriber_node_id.to_owned(),
+                    feed_key: feed_key.to_owned(),
+                    scope_hint: Self::canonical_scope_hint_or_original(r.get(0)?),
+                    last_event_seq: last_event_seq as u64,
+                    updated_at: updated_at_ms as u64,
+                })
+            },
+        )
+        .optional()
+        .map_err(Into::into)
     }
 
     pub fn list_discoverable_feed_sources(&self, limit: usize) -> Result<Vec<DiscoverableFeedRow>> {

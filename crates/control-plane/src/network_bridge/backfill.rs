@@ -29,6 +29,14 @@ pub fn backfill_response_for_request(
             if !should_sync_event(node, &event)? {
                 continue;
             }
+            if let Some(feed_key) = &request.feed_key {
+                let crate::types::EventPayload::TopicMessagePosted(payload) = &event.payload else {
+                    continue;
+                };
+                if payload.feed_key != *feed_key {
+                    continue;
+                }
+            }
             if event_scope(node, &event)? != request.scope {
                 continue;
             }
@@ -48,6 +56,7 @@ pub fn backfill_response_for_request(
     Ok(BackfillResponse {
         scope: request.scope.clone(),
         next_from_event_seq,
+        feed_key: request.feed_key.clone(),
         events: envelopes,
     })
 }
@@ -57,6 +66,15 @@ pub fn ingest_backfill_response(node: &mut Node, response: &BackfillResponse) ->
     for envelope in &response.events {
         if envelope.scope != response.scope {
             return Err(anyhow!("backfill response scope mismatch"));
+        }
+        if let Some(feed_key) = &response.feed_key {
+            let crate::types::EventPayload::TopicMessagePosted(payload) = &envelope.event.payload
+            else {
+                return Err(anyhow!("topic backfill response contains non-topic event"));
+            };
+            if payload.feed_key != *feed_key {
+                return Err(anyhow!("topic backfill response feed_key mismatch"));
+            }
         }
         if ingest_event_envelope(node, envelope).is_ok() {
             applied += 1;

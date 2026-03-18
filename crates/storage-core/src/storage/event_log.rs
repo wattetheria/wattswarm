@@ -118,6 +118,21 @@ impl PgStore {
         self.load_events_from(0)
     }
 
+    pub fn event_seq_for_event_id(&self, event_id: &str) -> Result<Option<u64>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
+        conn.query_row(
+            "SELECT seq FROM events WHERE org_id = $1 AND event_id = $2",
+            params![self.org_id(), event_id],
+            |r| r.get::<_, i64>(0),
+        )
+        .optional()
+        .map(|row| row.map(|seq| seq as u64))
+        .map_err(Into::into)
+    }
+
     pub fn put_event_revocation(
         &self,
         event_id: &str,
@@ -276,6 +291,8 @@ impl PgStore {
             "membership_projection",
             "event_revocations",
             "summary_revocations",
+            "topic_messages",
+            "topic_cursors",
         ] {
             let sql = format!("DELETE FROM {table} WHERE org_id = $1");
             conn.execute(&sql, params![&org_id])?;

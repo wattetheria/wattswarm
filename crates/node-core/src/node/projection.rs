@@ -380,6 +380,19 @@ impl Node {
                     )?;
                 }
             }
+            EventPayload::TopicMessagePosted(payload) => {
+                let scope_hint = crate::types::normalized_scope_hint(&payload.scope_hint);
+                self.store.put_topic_message(
+                    &event.event_id,
+                    &payload.network_id,
+                    &payload.feed_key,
+                    &scope_hint,
+                    &event.author_node_id,
+                    &payload.content,
+                    payload.reply_to_message_id.as_deref(),
+                    event.created_at,
+                )?;
+            }
             EventPayload::MembershipUpdated(payload) => {
                 self.store
                     .put_membership(&serde_json::to_string(&payload.new_membership)?)?;
