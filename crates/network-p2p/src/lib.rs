@@ -1,244 +1,29 @@
-use anyhow::{Result, anyhow, bail};
-use libp2p::connection_limits;
-use libp2p::futures::{FutureExt, StreamExt};
-use libp2p::gossipsub::{
-    Behaviour as Gossipsub, ConfigBuilder as GossipsubConfigBuilder, Event as GossipsubEvent,
-};
-use libp2p::gossipsub::{IdentTopic, MessageAuthenticity, ValidationMode};
+use anyhow::Result;
 use libp2p::identify;
-use libp2p::kad::{self, store::MemoryStore};
-use libp2p::mdns;
-use libp2p::multiaddr::Protocol;
-use libp2p::request_response::{self, Message as RequestResponseMessage, ProtocolSupport};
-use libp2p::swarm::{NetworkBehaviour, SwarmEvent, behaviour::toggle::Toggle};
-pub use libp2p::{Multiaddr, PeerId};
-use libp2p::{
-    StreamProtocol, Swarm, SwarmBuilder, autonat, dcutr, identity, noise, relay, tcp, yamux,
-};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::{HashMap, HashSet};
-use std::hash::{DefaultHasher, Hash, Hasher};
-use std::time::{Duration, Instant};
-use wattswarm_protocol::types::Event;
+use wattswarm_network_substrate::{
+    self as substrate, RawBackfillResponse, RawGossipMessage, SubstrateConfig, SubstrateNode,
+    SubstrateRuntime, SubstrateRuntimeEvent,
+};
+use wattswarm_protocol::types::{Event, NetworkProtocolParams};
+#[cfg(test)]
+use wattswarm_protocol::types::{EventKind, EventPayload};
 
-const DEFAULT_NAMESPACE: &str = "wattswarm";
-const DEFAULT_PROTOCOL_VERSION: &str = "/wattswarm/0.1.0";
-const DEFAULT_IDENTIFY_AGENT_NAME: &str = "wattswarm-network-p2p";
-// Backfill defaults are governance-controlled via NetworkProtocolParams;
-// kept here only as fallbacks for NetworkP2pConfig::default().
-const DEFAULT_MAX_BACKFILL_EVENTS_FALLBACK: usize = 512;
-const MAX_BACKFILL_EVENTS_HARD_LIMIT_FALLBACK: usize = 8_192;
-const BACKFILL_PROTOCOL: StreamProtocol = StreamProtocol::new("/wattswarm/backfill/1");
-const KADEMLIA_PROTOCOL: StreamProtocol = StreamProtocol::new("/wattswarm/kad/1");
+pub use substrate::{
+    BackfillRequestId, BackfillResponseChannel, Multiaddr, NetworkRuntimeObservabilitySnapshot,
+    PeerHandshakeMetadata, PeerId, SwarmScope, TopicCatalog, TopicKind, TopicNamespace,
+    TrafficGuardPeerHealth, relay_reservation_addr, sanitize_segment,
+};
 
-// Connection limits guard against resource exhaustion from too many peers.
-const MAX_ESTABLISHED_INCOMING: u32 = 512;
-const MAX_ESTABLISHED_OUTGOING: u32 = 256;
-const MAX_ESTABLISHED_PER_PEER_FALLBACK: u32 = 2;
-const MAX_PENDING_INCOMING: u32 = 64;
-const MAX_PENDING_OUTGOING: u32 = 64;
+pub type BackfillRequest = substrate::RawBackfillRequest;
+pub type WattSwarmBehaviour = substrate::SubstrateBehaviour;
+pub type WattSwarmBehaviourEvent = substrate::SubstrateBehaviourEvent;
 
-// Gossipsub mesh defaults — governance-controlled via NetworkProtocolParams;
-// kept here only as fallbacks for NetworkP2pConfig::default().
-const GOSSIPSUB_D_FALLBACK: usize = 6;
-const GOSSIPSUB_D_LOW_FALLBACK: usize = 4;
-const GOSSIPSUB_D_HIGH_FALLBACK: usize = 12;
-const GOSSIPSUB_HEARTBEAT_MS_FALLBACK: u64 = 1_000;
-const GOSSIPSUB_MAX_TRANSMIT_SIZE_FALLBACK: usize = 512 * 1024;
-const TRAFFIC_WINDOW: Duration = Duration::from_secs(60);
-const TRAFFIC_DEDUPE_TTL: Duration = Duration::from_secs(120);
-const PER_PEER_MSGS_PER_WINDOW: usize = 1_200;
-const PER_PEER_TOPIC_MSGS_PER_WINDOW: usize = 600;
-const PER_TOPIC_PUBLISHES_PER_WINDOW: usize = 600;
-const PER_PEER_BACKFILL_REQUESTS_PER_WINDOW: usize = 60;
-const TRAFFIC_THROTTLED_SCORE: i64 = -4;
-const TRAFFIC_QUARANTINE_SCORE: i64 = -8;
-const TRAFFIC_BAN_SCORE: i64 = -16;
-const TRAFFIC_QUARANTINE_DURATION: Duration = Duration::from_secs(90);
-const TRAFFIC_BAN_DURATION: Duration = Duration::from_secs(5 * 60);
-const TRAFFIC_FAILURE_PENALTY: i64 = 2;
+pub const WATTSWARM_IDENTIFY_AGENT_PREFIX: &str = "wattswarm-network-p2p";
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SwarmScope {
-    Global,
-    Region(String),
-    Node(String),
-    Group(String),
-}
-
-impl SwarmScope {
-    pub fn label(&self) -> Result<String> {
-        match self {
-            Self::Global => Ok("global".to_owned()),
-            Self::Region(region_id) => Ok(format!("region.{}", sanitize_segment(region_id)?)),
-            Self::Node(node_id) => Ok(format!("node.{}", sanitize_segment(node_id)?)),
-            Self::Group(group_id) => Ok(format!("group.{}", sanitize_segment(group_id)?)),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum TopicKind {
-    Events,
-    Messages,
-    Rules,
-    Checkpoints,
-    Summaries,
-}
-
-impl TopicKind {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Events => "events",
-            Self::Messages => "messages",
-            Self::Rules => "rules",
-            Self::Checkpoints => "checkpoints",
-            Self::Summaries => "summaries",
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TopicNamespace {
-    pub network: String,
-    #[serde(default = "default_network_context_id")]
-    pub network_id: String,
-}
-
-impl Default for TopicNamespace {
-    fn default() -> Self {
-        Self {
-            network: DEFAULT_NAMESPACE.to_owned(),
-            network_id: default_network_context_id(),
-        }
-    }
-}
-
-impl TopicNamespace {
-    pub fn topic_name(&self, scope: &SwarmScope, kind: TopicKind) -> Result<String> {
-        Ok(format!(
-            "{}.{}.{}.{}",
-            sanitize_segment(&self.network)?,
-            sanitize_segment(&self.network_id)?,
-            scope.label()?,
-            kind.as_str()
-        ))
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TopicCatalog {
-    pub events: String,
-    pub messages: String,
-    pub rules: String,
-    pub checkpoints: String,
-    pub summaries: String,
-}
-
-impl TopicCatalog {
-    pub fn new(namespace: &TopicNamespace, scope: &SwarmScope) -> Result<Self> {
-        Ok(Self {
-            events: namespace.topic_name(scope, TopicKind::Events)?,
-            messages: namespace.topic_name(scope, TopicKind::Messages)?,
-            rules: namespace.topic_name(scope, TopicKind::Rules)?,
-            checkpoints: namespace.topic_name(scope, TopicKind::Checkpoints)?,
-            summaries: namespace.topic_name(scope, TopicKind::Summaries)?,
-        })
-    }
-
-    pub fn as_ident_topics(&self) -> [IdentTopic; 5] {
-        [
-            IdentTopic::new(self.events.clone()),
-            IdentTopic::new(self.messages.clone()),
-            IdentTopic::new(self.rules.clone()),
-            IdentTopic::new(self.checkpoints.clone()),
-            IdentTopic::new(self.summaries.clone()),
-        ]
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PeerHandshakeMetadata {
-    pub network_id: String,
-    pub params_version: u64,
-    pub params_hash: String,
-}
-
-impl Default for PeerHandshakeMetadata {
-    fn default() -> Self {
-        Self {
-            network_id: "default".to_owned(),
-            params_version: 0,
-            params_hash: "default".to_owned(),
-        }
-    }
-}
-
-impl PeerHandshakeMetadata {
-    pub fn encode_agent_version(&self) -> String {
-        format!(
-            "{DEFAULT_IDENTIFY_AGENT_NAME}|{}|{}|{}",
-            self.network_id, self.params_version, self.params_hash
-        )
-    }
-
-    pub fn decode_agent_version(raw: &str) -> Result<Self> {
-        let mut parts = raw.splitn(4, '|');
-        let Some(prefix) = parts.next() else {
-            bail!("identify agent version is empty");
-        };
-        if prefix != DEFAULT_IDENTIFY_AGENT_NAME {
-            bail!("unexpected identify agent prefix");
-        }
-        let Some(network_id) = parts.next() else {
-            bail!("identify agent version missing network_id");
-        };
-        let Some(params_version) = parts.next() else {
-            bail!("identify agent version missing params_version");
-        };
-        let Some(params_hash) = parts.next() else {
-            bail!("identify agent version missing params_hash");
-        };
-        Ok(Self {
-            network_id: network_id.to_owned(),
-            params_version: params_version
-                .parse::<u64>()
-                .map_err(|err| anyhow!("invalid params_version: {err}"))?,
-            params_hash: params_hash.to_owned(),
-        })
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct BackfillRequest {
-    pub scope: SwarmScope,
-    pub from_event_seq: u64,
-    pub limit: usize,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub feed_key: Option<String>,
-}
-
-impl BackfillRequest {
-    pub fn validate(&self, max_limit: usize, hard_limit: usize) -> Result<()> {
-        if self.limit == 0 {
-            bail!("backfill limit must be > 0");
-        }
-        if self.limit > max_limit {
-            bail!("backfill limit exceeds configured max");
-        }
-        if self.limit > hard_limit {
-            bail!("backfill limit exceeds hard safety limit");
-        }
-        if let Some(feed_key) = &self.feed_key
-            && feed_key.trim().is_empty()
-        {
-            bail!("backfill feed_key must not be empty");
-        }
-        Ok(())
-    }
+pub fn encode_wattswarm_agent_version(metadata: &PeerHandshakeMetadata) -> String {
+    metadata.encode_agent_version_with_prefix(WATTSWARM_IDENTIFY_AGENT_PREFIX)
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -335,15 +120,12 @@ impl GossipMessage {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NetworkP2pConfig {
-    // ── Node-local settings ──────────────────────────────────────────
     pub namespace: TopicNamespace,
     pub protocol_version: String,
     pub identify_agent_version: String,
     pub listen_addrs: Vec<String>,
     pub bootstrap_peers: Vec<String>,
     pub enable_mdns: bool,
-
-    // ── Governance-controlled (populated from NetworkProtocolParams) ─
     pub max_established_per_peer: u32,
     pub gossipsub_d: usize,
     pub gossipsub_d_low: usize,
@@ -356,31 +138,53 @@ pub struct NetworkP2pConfig {
 
 impl Default for NetworkP2pConfig {
     fn default() -> Self {
-        Self {
-            namespace: TopicNamespace::default(),
-            protocol_version: DEFAULT_PROTOCOL_VERSION.to_owned(),
-            identify_agent_version: PeerHandshakeMetadata::default().encode_agent_version(),
-            listen_addrs: vec!["/ip4/0.0.0.0/tcp/0".to_owned()],
-            bootstrap_peers: Vec::new(),
-            enable_mdns: true,
-            max_established_per_peer: MAX_ESTABLISHED_PER_PEER_FALLBACK,
-            gossipsub_d: GOSSIPSUB_D_FALLBACK,
-            gossipsub_d_low: GOSSIPSUB_D_LOW_FALLBACK,
-            gossipsub_d_high: GOSSIPSUB_D_HIGH_FALLBACK,
-            gossipsub_heartbeat_ms: GOSSIPSUB_HEARTBEAT_MS_FALLBACK,
-            gossipsub_max_transmit_size: GOSSIPSUB_MAX_TRANSMIT_SIZE_FALLBACK,
-            max_backfill_events: DEFAULT_MAX_BACKFILL_EVENTS_FALLBACK,
-            max_backfill_events_hard_limit: MAX_BACKFILL_EVENTS_HARD_LIMIT_FALLBACK,
-        }
+        let mut config = Self::from_substrate(SubstrateConfig::default());
+        config.identify_agent_version =
+            encode_wattswarm_agent_version(&PeerHandshakeMetadata::default());
+        config
     }
 }
 
 impl NetworkP2pConfig {
-    /// Populate governance-controlled fields from `NetworkProtocolParams`.
-    pub fn apply_protocol_params(
-        mut self,
-        params: &wattswarm_protocol::types::NetworkProtocolParams,
-    ) -> Self {
+    fn from_substrate(config: SubstrateConfig) -> Self {
+        Self {
+            namespace: config.namespace,
+            protocol_version: config.protocol_version,
+            identify_agent_version: config.identify_agent_version,
+            listen_addrs: config.listen_addrs,
+            bootstrap_peers: config.bootstrap_peers,
+            enable_mdns: config.enable_mdns,
+            max_established_per_peer: config.max_established_per_peer,
+            gossipsub_d: config.gossipsub_d,
+            gossipsub_d_low: config.gossipsub_d_low,
+            gossipsub_d_high: config.gossipsub_d_high,
+            gossipsub_heartbeat_ms: config.gossipsub_heartbeat_ms,
+            gossipsub_max_transmit_size: config.gossipsub_max_transmit_size,
+            max_backfill_events: config.max_backfill_events,
+            max_backfill_events_hard_limit: config.max_backfill_events_hard_limit,
+        }
+    }
+
+    fn as_substrate(&self) -> SubstrateConfig {
+        SubstrateConfig {
+            namespace: self.namespace.clone(),
+            protocol_version: self.protocol_version.clone(),
+            identify_agent_version: self.identify_agent_version.clone(),
+            listen_addrs: self.listen_addrs.clone(),
+            bootstrap_peers: self.bootstrap_peers.clone(),
+            enable_mdns: self.enable_mdns,
+            max_established_per_peer: self.max_established_per_peer,
+            gossipsub_d: self.gossipsub_d,
+            gossipsub_d_low: self.gossipsub_d_low,
+            gossipsub_d_high: self.gossipsub_d_high,
+            gossipsub_heartbeat_ms: self.gossipsub_heartbeat_ms,
+            gossipsub_max_transmit_size: self.gossipsub_max_transmit_size,
+            max_backfill_events: self.max_backfill_events,
+            max_backfill_events_hard_limit: self.max_backfill_events_hard_limit,
+        }
+    }
+
+    pub fn apply_protocol_params(mut self, params: &NetworkProtocolParams) -> Self {
         let network_id = self.namespace.network_id.clone();
         self.namespace = TopicNamespace {
             network: params.namespace_network.clone(),
@@ -399,157 +203,57 @@ impl NetworkP2pConfig {
     }
 
     pub fn validate(&self) -> Result<()> {
-        if self.listen_addrs.is_empty() {
-            bail!("at least one listen address is required");
-        }
-        if self.namespace.network.trim().is_empty() {
-            bail!("namespace network is required");
-        }
-        if self.namespace.network_id.trim().is_empty() {
-            bail!("namespace network_id is required");
-        }
-        if self.protocol_version.trim().is_empty() {
-            bail!("protocol_version is required");
-        }
-        if self.identify_agent_version.trim().is_empty() {
-            bail!("identify_agent_version is required");
-        }
-        if self.max_established_per_peer == 0 {
-            bail!("max_established_per_peer must be > 0");
-        }
-        if self.gossipsub_d == 0 || self.gossipsub_d_low == 0 || self.gossipsub_d_high == 0 {
-            bail!("gossipsub mesh parameters must be > 0");
-        }
-        if self.gossipsub_d_low > self.gossipsub_d || self.gossipsub_d > self.gossipsub_d_high {
-            bail!("gossipsub mesh parameters must satisfy d_low <= d <= d_high");
-        }
-        if self.gossipsub_heartbeat_ms == 0 {
-            bail!("gossipsub heartbeat must be > 0");
-        }
-        if self.gossipsub_max_transmit_size == 0 {
-            bail!("gossipsub max transmit size must be > 0");
-        }
-        if self.max_backfill_events == 0 {
-            bail!("max_backfill_events must be > 0");
-        }
-        if self.max_backfill_events_hard_limit == 0 {
-            bail!("max_backfill_events_hard_limit must be > 0");
-        }
-        if self.max_backfill_events > self.max_backfill_events_hard_limit {
-            bail!("max_backfill_events exceeds hard safety limit");
-        }
-        Ok(())
+        self.as_substrate().validate()
     }
 
     pub fn parse_listen_addrs(&self) -> Result<Vec<Multiaddr>> {
-        self.listen_addrs
-            .iter()
-            .map(|addr| {
-                addr.parse::<Multiaddr>()
-                    .map_err(|err| anyhow!("invalid listen address '{}': {err}", addr))
-            })
-            .collect()
+        self.as_substrate().parse_listen_addrs()
     }
 
     pub fn parse_bootstrap_peers(&self) -> Result<Vec<(PeerId, Multiaddr)>> {
-        self.bootstrap_peers
-            .iter()
-            .map(|addr| parse_peer_multiaddr(addr))
-            .collect()
+        self.as_substrate().parse_bootstrap_peers()
     }
 
     pub fn topic_catalog(&self, scope: &SwarmScope) -> Result<TopicCatalog> {
-        TopicCatalog::new(&self.namespace, scope)
+        self.as_substrate().topic_catalog(scope)
     }
 }
 
-pub type BackfillRequestId = request_response::OutboundRequestId;
-pub type BackfillResponseChannel = request_response::ResponseChannel<BackfillResponse>;
-
-#[derive(Debug)]
-pub enum WattSwarmBehaviourEvent {
-    Gossipsub(GossipsubEvent),
-    Identify(identify::Event),
-    Kademlia(kad::Event),
-    Relay(relay::client::Event),
-    Autonat(autonat::Event),
-    Dcutr(dcutr::Event),
-    RequestResponse(request_response::Event<BackfillRequest, BackfillResponse>),
-    Mdns(mdns::Event),
+pub struct NetworkP2pNode {
+    config: NetworkP2pConfig,
+    inner: SubstrateNode,
 }
 
-impl From<GossipsubEvent> for WattSwarmBehaviourEvent {
-    fn from(value: GossipsubEvent) -> Self {
-        Self::Gossipsub(value)
+impl NetworkP2pNode {
+    pub fn new(config: NetworkP2pConfig, local_key: libp2p::identity::Keypair) -> Result<Self> {
+        let inner = SubstrateNode::new(config.as_substrate(), local_key)?;
+        Ok(Self { config, inner })
     }
-}
 
-impl From<identify::Event> for WattSwarmBehaviourEvent {
-    fn from(value: identify::Event) -> Self {
-        Self::Identify(value)
+    pub fn generate(config: NetworkP2pConfig) -> Result<Self> {
+        let inner = SubstrateNode::generate(config.as_substrate())?;
+        Ok(Self { config, inner })
     }
-}
 
-impl From<kad::Event> for WattSwarmBehaviourEvent {
-    fn from(value: kad::Event) -> Self {
-        Self::Kademlia(value)
+    pub fn config(&self) -> &NetworkP2pConfig {
+        &self.config
     }
-}
 
-impl From<relay::client::Event> for WattSwarmBehaviourEvent {
-    fn from(value: relay::client::Event) -> Self {
-        Self::Relay(value)
+    pub fn local_peer_id(&self) -> PeerId {
+        self.inner.local_peer_id()
     }
-}
 
-impl From<autonat::Event> for WattSwarmBehaviourEvent {
-    fn from(value: autonat::Event) -> Self {
-        Self::Autonat(value)
+    pub fn parse_listen_addrs(&self) -> Result<Vec<Multiaddr>> {
+        self.config.parse_listen_addrs()
     }
-}
 
-impl From<dcutr::Event> for WattSwarmBehaviourEvent {
-    fn from(value: dcutr::Event) -> Self {
-        Self::Dcutr(value)
+    pub fn build_behaviour(&self) -> Result<WattSwarmBehaviour> {
+        self.inner.build_behaviour()
     }
-}
 
-impl From<request_response::Event<BackfillRequest, BackfillResponse>> for WattSwarmBehaviourEvent {
-    fn from(value: request_response::Event<BackfillRequest, BackfillResponse>) -> Self {
-        Self::RequestResponse(value)
+    pub fn build_swarm(&self) -> Result<libp2p::Swarm<WattSwarmBehaviour>> {
+        self.inner.build_swarm()
     }
-}
-
-impl From<mdns::Event> for WattSwarmBehaviourEvent {
-    fn from(value: mdns::Event) -> Self {
-        Self::Mdns(value)
-    }
-}
-
-// connection_limits::Behaviour emits Infallible (never fires); required by derive macro.
-impl From<std::convert::Infallible> for WattSwarmBehaviourEvent {
-    fn from(v: std::convert::Infallible) -> Self {
-        match v {}
-    }
-}
-
-#[derive(NetworkBehaviour)]
-#[behaviour(to_swarm = "WattSwarmBehaviourEvent")]
-pub struct WattSwarmBehaviour {
-    // connection_limits MUST be declared before request_response so that
-    // over-limit connections are denied before request_response records
-    // them in its internal tracking map.  Reversing the order causes a
-    // phantom entry that triggers a debug_assert inside
-    // libp2p-request-response on ConnectionClosed.
-    pub connection_limits: connection_limits::Behaviour,
-    pub gossipsub: Gossipsub,
-    pub identify: identify::Behaviour,
-    pub kademlia: kad::Behaviour<MemoryStore>,
-    pub relay_client: relay::client::Behaviour,
-    pub autonat: autonat::Behaviour,
-    pub dcutr: dcutr::Behaviour,
-    pub request_response: request_response::cbor::Behaviour<BackfillRequest, BackfillResponse>,
-    pub mdns: Toggle<mdns::tokio::Behaviour>,
 }
 
 #[derive(Debug)]
@@ -616,455 +320,20 @@ pub enum NetworkRuntimeEvent {
     },
 }
 
-pub struct NetworkP2pNode {
-    config: NetworkP2pConfig,
-    local_key: identity::Keypair,
-    local_peer_id: PeerId,
-}
-
-struct BehaviourSeedParts {
-    gossipsub: Gossipsub,
-    identify: identify::Behaviour,
-    kademlia: kad::Behaviour<MemoryStore>,
-    autonat: autonat::Behaviour,
-    request_response: request_response::cbor::Behaviour<BackfillRequest, BackfillResponse>,
-    mdns: Toggle<mdns::tokio::Behaviour>,
-    connection_limits: connection_limits::Behaviour,
-}
-
-impl NetworkP2pNode {
-    pub fn new(config: NetworkP2pConfig, local_key: identity::Keypair) -> Result<Self> {
-        config.validate()?;
-        let local_peer_id = local_key.public().to_peer_id();
-        Ok(Self {
-            config,
-            local_key,
-            local_peer_id,
-        })
-    }
-
-    pub fn generate(config: NetworkP2pConfig) -> Result<Self> {
-        Self::new(config, identity::Keypair::generate_ed25519())
-    }
-
-    pub fn config(&self) -> &NetworkP2pConfig {
-        &self.config
-    }
-
-    pub fn local_peer_id(&self) -> PeerId {
-        self.local_peer_id
-    }
-
-    pub fn parse_listen_addrs(&self) -> Result<Vec<Multiaddr>> {
-        self.config.parse_listen_addrs()
-    }
-
-    fn build_behaviour_seed_parts(
-        config: &NetworkP2pConfig,
-        local_key: &identity::Keypair,
-        local_peer_id: PeerId,
-    ) -> Result<BehaviourSeedParts> {
-        let gossipsub_config = GossipsubConfigBuilder::default()
-            .validation_mode(ValidationMode::Strict)
-            .mesh_n(config.gossipsub_d)
-            .mesh_n_low(config.gossipsub_d_low)
-            .mesh_n_high(config.gossipsub_d_high)
-            .heartbeat_interval(Duration::from_millis(config.gossipsub_heartbeat_ms))
-            .max_transmit_size(config.gossipsub_max_transmit_size)
-            .build()
-            .map_err(|err| anyhow!(err))?;
-        let gossipsub = Gossipsub::new(
-            MessageAuthenticity::Signed(local_key.clone()),
-            gossipsub_config,
-        )
-        .map_err(|err| anyhow!(err))?;
-
-        let identify = identify::Behaviour::new(
-            identify::Config::new(config.protocol_version.clone(), local_key.public())
-                .with_agent_version(config.identify_agent_version.clone()),
-        );
-
-        let request_response = request_response::cbor::Behaviour::new(
-            [(BACKFILL_PROTOCOL, ProtocolSupport::Full)],
-            request_response::Config::default(),
-        );
-
-        let mut kad_config = kad::Config::new(KADEMLIA_PROTOCOL);
-        kad_config.set_periodic_bootstrap_interval(Some(Duration::from_secs(300)));
-        let mut kademlia =
-            kad::Behaviour::with_config(local_peer_id, MemoryStore::new(local_peer_id), kad_config);
-        let mut autonat = autonat::Behaviour::new(local_peer_id, autonat::Config::default());
-        for (peer, addr) in config.parse_bootstrap_peers()? {
-            kademlia.add_address(&peer, addr.clone());
-            autonat.add_server(peer, Some(addr));
-        }
-
-        let mdns = Toggle::from(if config.enable_mdns {
-            Some(mdns::tokio::Behaviour::new(
-                mdns::Config::default(),
-                local_peer_id,
-            )?)
-        } else {
-            None
-        });
-
-        let connection_limits = connection_limits::Behaviour::new(
-            connection_limits::ConnectionLimits::default()
-                .with_max_established_incoming(Some(MAX_ESTABLISHED_INCOMING))
-                .with_max_established_outgoing(Some(MAX_ESTABLISHED_OUTGOING))
-                .with_max_established_per_peer(Some(config.max_established_per_peer))
-                .with_max_pending_incoming(Some(MAX_PENDING_INCOMING))
-                .with_max_pending_outgoing(Some(MAX_PENDING_OUTGOING)),
-        );
-
-        Ok(BehaviourSeedParts {
-            gossipsub,
-            identify,
-            kademlia,
-            autonat,
-            request_response,
-            mdns,
-            connection_limits,
-        })
-    }
-
-    pub fn build_behaviour(&self) -> Result<WattSwarmBehaviour> {
-        let (_, relay_client) = relay::client::new(self.local_peer_id);
-        let parts =
-            Self::build_behaviour_seed_parts(&self.config, &self.local_key, self.local_peer_id)?;
-        Ok(WattSwarmBehaviour {
-            gossipsub: parts.gossipsub,
-            identify: parts.identify,
-            kademlia: parts.kademlia,
-            relay_client,
-            autonat: parts.autonat,
-            dcutr: dcutr::Behaviour::new(self.local_peer_id),
-            request_response: parts.request_response,
-            mdns: parts.mdns,
-            connection_limits: parts.connection_limits,
-        })
-    }
-
-    pub fn build_swarm(&self) -> Result<Swarm<WattSwarmBehaviour>> {
-        let config = self.config.clone();
-        let local_peer_id = self.local_peer_id;
-        let parts = Self::build_behaviour_seed_parts(&config, &self.local_key, local_peer_id)?;
-        Ok(SwarmBuilder::with_existing_identity(self.local_key.clone())
-            .with_tokio()
-            .with_tcp(
-                tcp::Config::default(),
-                noise::Config::new,
-                yamux::Config::default,
-            )?
-            .with_relay_client(noise::Config::new, yamux::Config::default)?
-            .with_behaviour(move |_, relay_client| WattSwarmBehaviour {
-                connection_limits: parts.connection_limits,
-                gossipsub: parts.gossipsub,
-                identify: parts.identify,
-                kademlia: parts.kademlia,
-                relay_client,
-                autonat: parts.autonat,
-                dcutr: dcutr::Behaviour::new(local_peer_id),
-                request_response: parts.request_response,
-                mdns: parts.mdns,
-            })?
-            .build())
-    }
-}
-
 pub struct NetworkRuntime {
     config: NetworkP2pConfig,
-    local_peer_id: PeerId,
-    swarm: Swarm<WattSwarmBehaviour>,
-    listen_addrs: Vec<Multiaddr>,
-    subscribed_topics: HashSet<String>,
-    traffic_guard: TrafficGuard,
-    relay_reservations: HashSet<String>,
-    expected_peer_handshake: PeerHandshakeMetadata,
-    nat_status: String,
-    nat_public_address: Option<Multiaddr>,
-    nat_confidence: u32,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TrafficGuardPeerHealth {
-    pub peer: String,
-    pub score: i64,
-    pub blacklisted: bool,
-    pub reputation_tier: String,
-    pub quarantined: bool,
-    pub quarantine_remaining_ms: u64,
-    pub ban_remaining_ms: u64,
-    pub throttle_factor_percent: u32,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct NetworkRuntimeObservabilitySnapshot {
-    pub nat_status: String,
-    pub nat_public_address: Option<String>,
-    pub nat_confidence: u32,
-    pub relay_reservations: Vec<String>,
-    pub peer_health: Vec<TrafficGuardPeerHealth>,
-}
-
-#[derive(Debug)]
-struct TrafficGuard {
-    seen_messages: HashMap<u64, Instant>,
-    peer_windows: HashMap<PeerId, Vec<Instant>>,
-    peer_topic_windows: HashMap<(PeerId, String), Vec<Instant>>,
-    local_publish_windows: HashMap<String, Vec<Instant>>,
-    backfill_request_windows: HashMap<PeerId, Vec<Instant>>,
-    peer_scores: HashMap<PeerId, i64>,
-    quarantined_peers: HashMap<PeerId, Instant>,
-    banned_peers: HashMap<PeerId, Instant>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TrafficPolicyTier {
-    Healthy,
-    Throttled,
-    Quarantined,
-    Banned,
-}
-
-impl TrafficPolicyTier {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Healthy => "healthy",
-            Self::Throttled => "throttled",
-            Self::Quarantined => "quarantined",
-            Self::Banned => "banned",
-        }
-    }
-
-    fn throttle_factor_percent(self) -> u32 {
-        match self {
-            Self::Healthy => 100,
-            Self::Throttled => 50,
-            Self::Quarantined => 0,
-            Self::Banned => 0,
-        }
-    }
-}
-
-impl TrafficGuard {
-    fn new() -> Self {
-        Self {
-            seen_messages: HashMap::new(),
-            peer_windows: HashMap::new(),
-            peer_topic_windows: HashMap::new(),
-            local_publish_windows: HashMap::new(),
-            backfill_request_windows: HashMap::new(),
-            peer_scores: HashMap::new(),
-            quarantined_peers: HashMap::new(),
-            banned_peers: HashMap::new(),
-        }
-    }
-
-    fn allow_local_publish(&mut self, topic: &str, now: Instant) -> bool {
-        let window = self
-            .local_publish_windows
-            .entry(topic.to_owned())
-            .or_default();
-        prune_window(window, now, TRAFFIC_WINDOW);
-        if window.len() >= PER_TOPIC_PUBLISHES_PER_WINDOW {
-            return false;
-        }
-        window.push(now);
-        true
-    }
-
-    fn allow_inbound_gossip(
-        &mut self,
-        source_peer: PeerId,
-        topic: &str,
-        data: &[u8],
-        now: Instant,
-    ) -> bool {
-        self.gc_peer_actions(now);
-        let policy = self.policy_for_peer(source_peer, now);
-        if matches!(
-            policy,
-            TrafficPolicyTier::Quarantined | TrafficPolicyTier::Banned
-        ) {
-            return false;
-        }
-
-        let digest = traffic_digest(data);
-        self.gc_seen(now);
-        if self
-            .seen_messages
-            .get(&digest)
-            .is_some_and(|seen_at| now.duration_since(*seen_at) <= TRAFFIC_DEDUPE_TTL)
-        {
-            self.penalize(source_peer, 1, now);
-            return false;
-        }
-        self.seen_messages.insert(digest, now);
-
-        let peer_limit = throttled_limit(PER_PEER_MSGS_PER_WINDOW, policy);
-        let peer_window = self.peer_windows.entry(source_peer).or_default();
-        prune_window(peer_window, now, TRAFFIC_WINDOW);
-        if peer_window.len() >= peer_limit {
-            self.penalize(source_peer, 3, now);
-            return false;
-        }
-        peer_window.push(now);
-
-        let topic_limit = throttled_limit(PER_PEER_TOPIC_MSGS_PER_WINDOW, policy);
-        let topic_window = self
-            .peer_topic_windows
-            .entry((source_peer, topic.to_owned()))
-            .or_default();
-        prune_window(topic_window, now, TRAFFIC_WINDOW);
-        if topic_window.len() >= topic_limit {
-            self.penalize(source_peer, 2, now);
-            return false;
-        }
-        topic_window.push(now);
-
-        self.reward(source_peer, 1, now);
-        true
-    }
-
-    fn allow_backfill_request(&mut self, peer: PeerId, now: Instant) -> bool {
-        self.gc_peer_actions(now);
-        let policy = self.policy_for_peer(peer, now);
-        if matches!(
-            policy,
-            TrafficPolicyTier::Quarantined | TrafficPolicyTier::Banned
-        ) {
-            return false;
-        }
-        let backfill_limit = throttled_limit(PER_PEER_BACKFILL_REQUESTS_PER_WINDOW, policy);
-        let window = self.backfill_request_windows.entry(peer).or_default();
-        prune_window(window, now, TRAFFIC_WINDOW);
-        if window.len() >= backfill_limit {
-            self.penalize(peer, 2, now);
-            return false;
-        }
-        window.push(now);
-        true
-    }
-
-    fn penalize(&mut self, peer: PeerId, amount: i64, now: Instant) {
-        let score = self.peer_scores.entry(peer).or_insert(0);
-        *score -= amount;
-        if *score <= TRAFFIC_BAN_SCORE {
-            self.banned_peers.insert(peer, now + TRAFFIC_BAN_DURATION);
-            self.quarantined_peers.remove(&peer);
-        } else if *score <= TRAFFIC_QUARANTINE_SCORE {
-            let until = now + TRAFFIC_QUARANTINE_DURATION;
-            self.quarantined_peers
-                .entry(peer)
-                .and_modify(|existing| {
-                    if *existing < until {
-                        *existing = until;
-                    }
-                })
-                .or_insert(until);
-        }
-    }
-
-    fn reward(&mut self, peer: PeerId, amount: i64, now: Instant) {
-        self.gc_peer_actions(now);
-        let score = self.peer_scores.entry(peer).or_insert(0);
-        *score = (*score + amount).min(100);
-        if *score > TRAFFIC_QUARANTINE_SCORE {
-            self.quarantined_peers.remove(&peer);
-        }
-    }
-
-    fn gc_seen(&mut self, now: Instant) {
-        self.seen_messages
-            .retain(|_, seen_at| now.duration_since(*seen_at) <= TRAFFIC_DEDUPE_TTL);
-    }
-
-    fn gc_peer_actions(&mut self, now: Instant) {
-        self.quarantined_peers.retain(|_, until| *until > now);
-        self.banned_peers.retain(|_, until| *until > now);
-    }
-
-    fn policy_for_peer(&self, peer: PeerId, now: Instant) -> TrafficPolicyTier {
-        if self
-            .banned_peers
-            .get(&peer)
-            .is_some_and(|until| *until > now)
-        {
-            return TrafficPolicyTier::Banned;
-        }
-        if self
-            .quarantined_peers
-            .get(&peer)
-            .is_some_and(|until| *until > now)
-        {
-            return TrafficPolicyTier::Quarantined;
-        }
-        let score = self.peer_scores.get(&peer).copied().unwrap_or(0);
-        if score <= TRAFFIC_THROTTLED_SCORE {
-            TrafficPolicyTier::Throttled
-        } else {
-            TrafficPolicyTier::Healthy
-        }
-    }
-
-    fn quarantine_remaining_ms(&self, peer: PeerId, now: Instant) -> u64 {
-        self.quarantined_peers
-            .get(&peer)
-            .map(|until| until.saturating_duration_since(now).as_millis() as u64)
-            .unwrap_or(0)
-    }
-
-    fn ban_remaining_ms(&self, peer: PeerId, now: Instant) -> u64 {
-        self.banned_peers
-            .get(&peer)
-            .map(|until| until.saturating_duration_since(now).as_millis() as u64)
-            .unwrap_or(0)
-    }
-
-    fn note_backfill_failure(&mut self, peer: PeerId, now: Instant) {
-        self.penalize(peer, TRAFFIC_FAILURE_PENALTY, now);
-    }
-
-    fn note_handshake_rejection(&mut self, peer: PeerId, now: Instant) {
-        self.penalize(peer, TRAFFIC_QUARANTINE_SCORE.abs(), now);
-    }
-
-    fn allows_outbound_backfill(&self, peer: PeerId, now: Instant) -> bool {
-        !matches!(
-            self.policy_for_peer(peer, now),
-            TrafficPolicyTier::Quarantined | TrafficPolicyTier::Banned
-        )
-    }
+    inner: SubstrateRuntime,
 }
 
 impl NetworkRuntime {
     pub fn new(node: NetworkP2pNode) -> Result<Self> {
-        let local_peer_id = node.local_peer_id();
         let config = node.config.clone();
-        let expected_peer_handshake =
-            PeerHandshakeMetadata::decode_agent_version(&config.identify_agent_version)?;
-        let swarm = node.build_swarm()?;
-        let mut this = Self {
-            config,
-            local_peer_id,
-            swarm,
-            listen_addrs: Vec::new(),
-            subscribed_topics: HashSet::new(),
-            traffic_guard: TrafficGuard::new(),
-            relay_reservations: HashSet::new(),
-            expected_peer_handshake,
-            nat_status: "unknown".to_owned(),
-            nat_public_address: None,
-            nat_confidence: 0,
-        };
-        this.listen_on_configured_addrs()?;
-        this.seed_bootstrap_peers()?;
-        Ok(this)
+        let inner = SubstrateRuntime::new(node.inner)?;
+        Ok(Self { config, inner })
     }
 
     pub fn local_peer_id(&self) -> PeerId {
-        self.local_peer_id
+        self.inner.local_peer_id()
     }
 
     pub fn config(&self) -> &NetworkP2pConfig {
@@ -1072,132 +341,39 @@ impl NetworkRuntime {
     }
 
     pub fn listen_addrs(&self) -> &[Multiaddr] {
-        &self.listen_addrs
+        self.inner.listen_addrs()
     }
 
     pub fn observability_snapshot(&self) -> NetworkRuntimeObservabilitySnapshot {
-        let now = Instant::now();
-        let mut peer_health = self
-            .traffic_guard
-            .peer_scores
-            .iter()
-            .map(|(peer, score)| {
-                let policy = self.traffic_guard.policy_for_peer(*peer, now);
-                TrafficGuardPeerHealth {
-                    peer: peer.to_string(),
-                    score: *score,
-                    blacklisted: matches!(policy, TrafficPolicyTier::Banned),
-                    reputation_tier: policy.as_str().to_owned(),
-                    quarantined: matches!(policy, TrafficPolicyTier::Quarantined),
-                    quarantine_remaining_ms: self.traffic_guard.quarantine_remaining_ms(*peer, now),
-                    ban_remaining_ms: self.traffic_guard.ban_remaining_ms(*peer, now),
-                    throttle_factor_percent: policy.throttle_factor_percent(),
-                }
-            })
-            .collect::<Vec<_>>();
-        peer_health.sort_by(|left, right| left.peer.cmp(&right.peer));
-
-        let mut relay_reservations = self.relay_reservations.iter().cloned().collect::<Vec<_>>();
-        relay_reservations.sort();
-
-        NetworkRuntimeObservabilitySnapshot {
-            nat_status: self.nat_status.clone(),
-            nat_public_address: self.nat_public_address.as_ref().map(ToString::to_string),
-            nat_confidence: self.nat_confidence,
-            relay_reservations,
-            peer_health,
-        }
+        self.inner.observability_snapshot()
     }
 
     pub fn allows_outbound_backfill_to(&self, peer: &PeerId) -> bool {
-        self.traffic_guard
-            .allows_outbound_backfill(*peer, Instant::now())
+        self.inner.allows_outbound_backfill_to(peer)
     }
 
-    fn validate_identify_info(&self, info: &identify::Info) -> Result<Vec<Multiaddr>> {
-        if info.protocol_version != self.config.protocol_version {
-            bail!(
-                "identify protocol_version mismatch expected={} got={}",
-                self.config.protocol_version,
-                info.protocol_version
-            );
-        }
-        let remote = PeerHandshakeMetadata::decode_agent_version(&info.agent_version)?;
-        if remote.network_id != self.expected_peer_handshake.network_id {
-            bail!(
-                "identify network_id mismatch expected={} got={}",
-                self.expected_peer_handshake.network_id,
-                remote.network_id
-            );
-        }
-        if remote.params_version != self.expected_peer_handshake.params_version {
-            bail!(
-                "identify params_version mismatch expected={} got={}",
-                self.expected_peer_handshake.params_version,
-                remote.params_version
-            );
-        }
-        if remote.params_hash != self.expected_peer_handshake.params_hash {
-            bail!(
-                "identify params_hash mismatch expected={} got={}",
-                self.expected_peer_handshake.params_hash,
-                remote.params_hash
-            );
-        }
-        Ok(info.listen_addrs.clone())
+    pub fn validate_identify_info(&self, info: &identify::Info) -> Result<Vec<Multiaddr>> {
+        self.inner.validate_identify_info(info)
     }
 
     pub fn subscribe_scope(&mut self, scope: &SwarmScope) -> Result<()> {
-        for topic in self.config.topic_catalog(scope)?.as_ident_topics() {
-            let topic_name = topic.to_string();
-            if self.subscribed_topics.contains(&topic_name) {
-                continue;
-            }
-            self.swarm
-                .behaviour_mut()
-                .gossipsub
-                .subscribe(&topic)
-                .map_err(|err| anyhow!(err))?;
-            self.subscribed_topics.insert(topic_name);
-        }
-        Ok(())
+        self.inner.subscribe_scope(scope)
     }
 
     pub fn unsubscribe_scope(&mut self, scope: &SwarmScope) -> Result<()> {
-        for topic in self.config.topic_catalog(scope)?.as_ident_topics() {
-            let topic_name = topic.to_string();
-            if !self.subscribed_topics.contains(&topic_name) {
-                continue;
-            }
-            let _ = self.swarm.behaviour_mut().gossipsub.unsubscribe(&topic);
-            self.subscribed_topics.remove(&topic_name);
-        }
-        Ok(())
+        self.inner.unsubscribe_scope(scope)
     }
 
     pub fn dial(&mut self, addr: Multiaddr) -> Result<()> {
-        self.swarm.dial(addr).map_err(|err| anyhow!(err))?;
-        Ok(())
+        self.inner.dial(addr)
     }
 
     pub fn publish_gossip(&mut self, message: &GossipMessage) -> Result<()> {
-        let topic_name = self
-            .config
-            .namespace
-            .topic_name(message.scope(), message.kind())?;
-        if !self
-            .traffic_guard
-            .allow_local_publish(&topic_name, Instant::now())
-        {
-            bail!("LocalTopicRateLimited");
-        }
-        let topic = IdentTopic::new(topic_name);
-        self.swarm
-            .behaviour_mut()
-            .gossipsub
-            .publish(topic, message.encode_json()?)
-            .map_err(|err| anyhow!(err))?;
-        Ok(())
+        self.inner.publish(
+            message.scope(),
+            message.kind(),
+            &encode_overlay_payload(message)?,
+        )
     }
 
     pub fn send_backfill_request(
@@ -1205,15 +381,7 @@ impl NetworkRuntime {
         peer: &PeerId,
         request: BackfillRequest,
     ) -> Result<BackfillRequestId> {
-        request.validate(
-            self.config.max_backfill_events,
-            self.config.max_backfill_events_hard_limit,
-        )?;
-        Ok(self
-            .swarm
-            .behaviour_mut()
-            .request_response
-            .send_request(peer, request))
+        self.inner.send_backfill_request(peer, request)
     }
 
     pub fn send_backfill_response(
@@ -1221,397 +389,154 @@ impl NetworkRuntime {
         channel: BackfillResponseChannel,
         response: BackfillResponse,
     ) -> Result<()> {
-        self.swarm
-            .behaviour_mut()
-            .request_response
-            .send_response(channel, response)
-            .map_err(|_| anyhow!("backfill response channel closed"))?;
-        Ok(())
+        let items = response
+            .events
+            .iter()
+            .map(EventEnvelope::encode_json)
+            .collect::<Result<Vec<_>>>()?;
+        self.inner.send_backfill_response(
+            channel,
+            RawBackfillResponse {
+                scope: response.scope,
+                next_from_event_seq: response.next_from_event_seq,
+                feed_key: response.feed_key,
+                items,
+            },
+        )
     }
 
     pub async fn next_event(&mut self) -> Result<NetworkRuntimeEvent> {
-        loop {
-            let swarm_event = self.swarm.select_next_some().await;
-            if let Some(event) = self.handle_swarm_event(swarm_event)? {
-                return Ok(event);
-            }
-        }
+        Self::map_runtime_event(self.inner.next_event().await?)
     }
 
     pub fn try_next_event(&mut self) -> Result<Option<NetworkRuntimeEvent>> {
-        loop {
-            let Some(event) = self.swarm.select_next_some().now_or_never() else {
-                return Ok(None);
-            };
-            if let Some(runtime_event) = self.handle_swarm_event(event)? {
-                return Ok(Some(runtime_event));
+        self.inner
+            .try_next_event()?
+            .map(Self::map_runtime_event)
+            .transpose()
+    }
+
+    fn map_runtime_event(event: SubstrateRuntimeEvent) -> Result<NetworkRuntimeEvent> {
+        Ok(match event {
+            SubstrateRuntimeEvent::NewListenAddr { address } => {
+                NetworkRuntimeEvent::NewListenAddr { address }
             }
-            // Swarm event was consumed but mapped to None (background protocol
-            // noise such as kademlia, identify, or gossipsub heartbeats).
-            // Continue draining so callers don't starve on meaningful events.
-        }
-    }
-
-    fn listen_on_configured_addrs(&mut self) -> Result<()> {
-        for addr in self.config.parse_listen_addrs()? {
-            self.swarm.listen_on(addr).map_err(|err| anyhow!(err))?;
-        }
-        Ok(())
-    }
-
-    fn seed_bootstrap_peers(&mut self) -> Result<()> {
-        for (peer, addr) in self.config.parse_bootstrap_peers()? {
-            self.register_peer_address(peer, addr.clone());
-            match self.swarm.dial(addr.clone()) {
-                Ok(()) => {}
-                Err(err)
-                    if err
-                        .to_string()
-                        .to_ascii_lowercase()
-                        .contains("duplicate connection") => {}
-                Err(err) => return Err(anyhow!(err)),
+            SubstrateRuntimeEvent::ConnectionEstablished { peer } => {
+                NetworkRuntimeEvent::ConnectionEstablished { peer }
             }
-            self.ensure_relay_reservation(peer, addr)?;
-        }
-        self.trigger_kademlia_refresh();
-        Ok(())
-    }
-
-    fn register_peer_address(&mut self, peer: PeerId, addr: Multiaddr) {
-        self.swarm.add_peer_address(peer, addr.clone());
-        self.swarm
-            .behaviour_mut()
-            .gossipsub
-            .add_explicit_peer(&peer);
-        self.swarm
-            .behaviour_mut()
-            .kademlia
-            .add_address(&peer, addr.clone());
-        self.swarm
-            .behaviour_mut()
-            .autonat
-            .add_server(peer, Some(addr));
-    }
-
-    fn ensure_relay_reservation(
-        &mut self,
-        relay_peer: PeerId,
-        relay_addr: Multiaddr,
-    ) -> Result<()> {
-        let listen_addr = relay_reservation_addr(relay_peer, &relay_addr);
-        let key = listen_addr.to_string();
-        if self.relay_reservations.contains(&key) {
-            return Ok(());
-        }
-        self.swarm
-            .listen_on(listen_addr)
-            .map_err(|err| anyhow!(err))?;
-        self.relay_reservations.insert(key);
-        Ok(())
-    }
-
-    fn maybe_dial_peer(&mut self, peer: PeerId, addr: Multiaddr) {
-        if peer == self.local_peer_id {
-            return;
-        }
-        if self.swarm.is_connected(&peer) {
-            self.register_peer_address(peer, addr);
-            return;
-        }
-        self.register_peer_address(peer, addr.clone());
-        match self.swarm.dial(addr) {
-            Ok(()) => {}
-            Err(err)
-                if err
-                    .to_string()
-                    .to_ascii_lowercase()
-                    .contains("duplicate connection") => {}
-            Err(_) => {}
-        }
-    }
-
-    fn trigger_kademlia_refresh(&mut self) {
-        let _ = self.swarm.behaviour_mut().kademlia.bootstrap();
-        let _ = self
-            .swarm
-            .behaviour_mut()
-            .kademlia
-            .get_closest_peers(self.local_peer_id);
-    }
-
-    fn handle_swarm_event(
-        &mut self,
-        event: SwarmEvent<WattSwarmBehaviourEvent>,
-    ) -> Result<Option<NetworkRuntimeEvent>> {
-        match event {
-            SwarmEvent::NewListenAddr { address, .. } => {
-                if !self.listen_addrs.iter().any(|seen| seen == &address) {
-                    self.listen_addrs.push(address.clone());
-                }
-                Ok(Some(NetworkRuntimeEvent::NewListenAddr { address }))
-            }
-            SwarmEvent::ConnectionEstablished { peer_id, .. } => {
-                self.trigger_kademlia_refresh();
-                Ok(Some(NetworkRuntimeEvent::ConnectionEstablished {
-                    peer: peer_id,
-                }))
-            }
-            SwarmEvent::ConnectionClosed {
-                peer_id,
-                num_established,
-                ..
-            } => Ok(Some(NetworkRuntimeEvent::ConnectionClosed {
-                peer: peer_id,
-                remaining_established: num_established,
-            })),
-            SwarmEvent::Behaviour(WattSwarmBehaviourEvent::Gossipsub(
-                GossipsubEvent::Message {
-                    propagation_source,
-                    message,
-                    ..
-                },
-            )) => {
-                let topic = message.topic.to_string();
-                if !self.traffic_guard.allow_inbound_gossip(
-                    propagation_source,
-                    &topic,
-                    &message.data,
-                    Instant::now(),
-                ) {
-                    return Ok(None);
-                }
-                Ok(Some(NetworkRuntimeEvent::Gossip {
-                    propagation_source,
-                    message: GossipMessage::decode_json(&message.data)?,
-                }))
-            }
-            SwarmEvent::Behaviour(WattSwarmBehaviourEvent::RequestResponse(
-                request_response::Event::Message { peer, message, .. },
-            )) => match message {
-                RequestResponseMessage::Request {
-                    request, channel, ..
-                } => {
-                    if !self
-                        .traffic_guard
-                        .allow_backfill_request(peer, Instant::now())
-                    {
-                        return Ok(None);
-                    }
-                    Ok(Some(NetworkRuntimeEvent::BackfillRequest {
-                        peer,
-                        request,
-                        channel,
-                    }))
-                }
-                RequestResponseMessage::Response {
-                    request_id,
-                    response,
-                } => Ok(Some(NetworkRuntimeEvent::BackfillResponse {
-                    peer,
-                    request_id,
-                    response,
-                })),
+            SubstrateRuntimeEvent::ConnectionClosed {
+                peer,
+                remaining_established,
+            } => NetworkRuntimeEvent::ConnectionClosed {
+                peer,
+                remaining_established,
             },
-            SwarmEvent::Behaviour(WattSwarmBehaviourEvent::RequestResponse(
-                request_response::Event::OutboundFailure {
-                    peer,
-                    request_id,
-                    error,
-                    ..
-                },
-            )) => {
-                self.traffic_guard
-                    .note_backfill_failure(peer, Instant::now());
-                Ok(Some(NetworkRuntimeEvent::BackfillOutboundFailure {
-                    peer,
-                    request_id,
-                    error: error.to_string(),
-                }))
+            SubstrateRuntimeEvent::PeerHandshakeRejected { peer, detail } => {
+                NetworkRuntimeEvent::PeerHandshakeRejected { peer, detail }
             }
-            SwarmEvent::Behaviour(WattSwarmBehaviourEvent::RequestResponse(
-                request_response::Event::InboundFailure { peer, error, .. },
-            )) => {
-                self.traffic_guard
-                    .note_backfill_failure(peer, Instant::now());
-                Ok(Some(NetworkRuntimeEvent::BackfillInboundFailure {
-                    peer,
-                    error: error.to_string(),
-                }))
-            }
-            SwarmEvent::Behaviour(WattSwarmBehaviourEvent::Mdns(mdns::Event::Discovered(
-                discovered,
-            ))) => {
-                for (peer, addr) in discovered {
-                    self.maybe_dial_peer(peer, addr);
-                }
-                Ok(None)
-            }
-            SwarmEvent::Behaviour(WattSwarmBehaviourEvent::Mdns(mdns::Event::Expired(expired))) => {
-                for (peer, _) in expired {
-                    self.swarm
-                        .behaviour_mut()
-                        .gossipsub
-                        .remove_explicit_peer(&peer);
-                }
-                Ok(None)
-            }
-            SwarmEvent::Behaviour(WattSwarmBehaviourEvent::Identify(
-                identify::Event::Received { peer_id, info, .. },
-            )) => match self.validate_identify_info(&info) {
-                Ok(listen_addrs) => {
-                    for addr in listen_addrs {
-                        self.register_peer_address(peer_id, addr);
-                    }
-                    self.trigger_kademlia_refresh();
-                    Ok(None)
-                }
-                Err(err) => {
-                    self.traffic_guard
-                        .note_handshake_rejection(peer_id, Instant::now());
-                    let detail = err.to_string();
-                    let _ = self.swarm.disconnect_peer_id(peer_id);
-                    Ok(Some(NetworkRuntimeEvent::PeerHandshakeRejected {
-                        peer: peer_id,
-                        detail,
-                    }))
-                }
+            SubstrateRuntimeEvent::Gossip {
+                propagation_source,
+                message,
+            } => NetworkRuntimeEvent::Gossip {
+                propagation_source,
+                message: decode_overlay_gossip(message)?,
             },
-            SwarmEvent::Behaviour(WattSwarmBehaviourEvent::Relay(
-                relay::client::Event::ReservationReqAccepted {
-                    relay_peer_id,
-                    renewal,
-                    ..
-                },
-            )) => Ok(Some(NetworkRuntimeEvent::RelayReservationAccepted {
-                relay_peer: relay_peer_id,
+            SubstrateRuntimeEvent::BackfillRequest {
+                peer,
+                request,
+                channel,
+            } => NetworkRuntimeEvent::BackfillRequest {
+                peer,
+                request,
+                channel,
+            },
+            SubstrateRuntimeEvent::BackfillResponse {
+                peer,
+                request_id,
+                response,
+            } => NetworkRuntimeEvent::BackfillResponse {
+                peer,
+                request_id,
+                response: decode_backfill_response(response)?,
+            },
+            SubstrateRuntimeEvent::BackfillOutboundFailure {
+                peer,
+                request_id,
+                error,
+            } => NetworkRuntimeEvent::BackfillOutboundFailure {
+                peer,
+                request_id,
+                error,
+            },
+            SubstrateRuntimeEvent::BackfillInboundFailure { peer, error } => {
+                NetworkRuntimeEvent::BackfillInboundFailure { peer, error }
+            }
+            SubstrateRuntimeEvent::NatStatusChanged {
+                old,
+                new,
+                public_address,
+                confidence,
+            } => NetworkRuntimeEvent::NatStatusChanged {
+                old,
+                new,
+                public_address,
+                confidence,
+            },
+            SubstrateRuntimeEvent::RelayReservationAccepted {
+                relay_peer,
                 renewal,
-            })),
-            SwarmEvent::Behaviour(WattSwarmBehaviourEvent::Relay(
-                relay::client::Event::OutboundCircuitEstablished { relay_peer_id, .. },
-            )) => Ok(Some(NetworkRuntimeEvent::RelayCircuitEstablished {
-                relay_peer: relay_peer_id,
-            })),
-            SwarmEvent::Behaviour(WattSwarmBehaviourEvent::Relay(
-                relay::client::Event::InboundCircuitEstablished { src_peer_id, .. },
-            )) => Ok(Some(NetworkRuntimeEvent::RelayInboundCircuitEstablished {
-                source_peer: src_peer_id,
-            })),
-            SwarmEvent::Behaviour(WattSwarmBehaviourEvent::Autonat(
-                autonat::Event::StatusChanged { old, new },
-            )) => {
-                let old_label = nat_status_label(&old);
-                let new_label = nat_status_label(&new);
-                let public_address = self.swarm.behaviour().autonat.public_address().cloned();
-                let confidence = self.swarm.behaviour().autonat.confidence();
-                self.nat_status = new_label.clone();
-                self.nat_public_address = public_address.clone();
-                self.nat_confidence = confidence as u32;
-                Ok(Some(NetworkRuntimeEvent::NatStatusChanged {
-                    old: old_label,
-                    new: new_label,
-                    public_address,
-                    confidence,
-                }))
-            }
-            SwarmEvent::Behaviour(WattSwarmBehaviourEvent::Dcutr(dcutr::Event {
-                remote_peer_id,
-                result,
-            })) => match result {
-                Ok(_) => Ok(Some(NetworkRuntimeEvent::DcutrConnectionUpgradeSucceeded {
-                    remote_peer: remote_peer_id,
-                })),
-                Err(err) => Ok(Some(NetworkRuntimeEvent::DcutrConnectionUpgradeFailed {
-                    remote_peer: remote_peer_id,
-                    error: err.to_string(),
-                })),
+            } => NetworkRuntimeEvent::RelayReservationAccepted {
+                relay_peer,
+                renewal,
             },
-            SwarmEvent::Behaviour(WattSwarmBehaviourEvent::Kademlia(
-                kad::Event::RoutingUpdated {
-                    peer, addresses, ..
-                },
-            )) => {
-                for addr in addresses.into_vec() {
-                    self.maybe_dial_peer(peer, addr);
-                }
-                Ok(None)
+            SubstrateRuntimeEvent::RelayCircuitEstablished { relay_peer } => {
+                NetworkRuntimeEvent::RelayCircuitEstablished { relay_peer }
             }
-            SwarmEvent::Behaviour(WattSwarmBehaviourEvent::Kademlia(
-                kad::Event::OutboundQueryProgressed {
-                    result: kad::QueryResult::GetClosestPeers(Ok(ok)),
-                    ..
-                },
-            )) => {
-                for peer in ok.peers {
-                    for addr in peer.addrs {
-                        self.maybe_dial_peer(peer.peer_id, addr);
-                    }
-                }
-                Ok(None)
+            SubstrateRuntimeEvent::RelayInboundCircuitEstablished { source_peer } => {
+                NetworkRuntimeEvent::RelayInboundCircuitEstablished { source_peer }
             }
-            _ => Ok(None),
-        }
+            SubstrateRuntimeEvent::DcutrConnectionUpgradeSucceeded { remote_peer } => {
+                NetworkRuntimeEvent::DcutrConnectionUpgradeSucceeded { remote_peer }
+            }
+            SubstrateRuntimeEvent::DcutrConnectionUpgradeFailed { remote_peer, error } => {
+                NetworkRuntimeEvent::DcutrConnectionUpgradeFailed { remote_peer, error }
+            }
+        })
     }
 }
 
-fn parse_peer_multiaddr(raw: &str) -> Result<(PeerId, Multiaddr)> {
-    let mut addr = raw
-        .parse::<Multiaddr>()
-        .map_err(|err| anyhow!("invalid bootstrap peer address '{}': {err}", raw))?;
-    let Some(Protocol::P2p(peer)) = addr.pop() else {
-        bail!("bootstrap peer address must end with /p2p/<peer_id>: {raw}");
-    };
-    Ok((peer, addr))
-}
-
-fn prune_window(entries: &mut Vec<Instant>, now: Instant, window: Duration) {
-    entries.retain(|ts| now.duration_since(*ts) <= window);
-}
-
-fn traffic_digest(data: &[u8]) -> u64 {
-    let mut hasher = DefaultHasher::new();
-    data.hash(&mut hasher);
-    hasher.finish()
-}
-
-fn throttled_limit(base: usize, policy: TrafficPolicyTier) -> usize {
-    let factor = policy.throttle_factor_percent() as usize;
-    ((base.saturating_mul(factor)).max(100)) / 100
-}
-
-fn nat_status_label(status: &autonat::NatStatus) -> String {
-    match status {
-        autonat::NatStatus::Public(_) => "public".to_owned(),
-        autonat::NatStatus::Private => "private".to_owned(),
-        autonat::NatStatus::Unknown => "unknown".to_owned(),
+fn decode_overlay_gossip(message: RawGossipMessage) -> Result<GossipMessage> {
+    let payload = &message.payload;
+    match message.kind {
+        TopicKind::Events => Ok(GossipMessage::Event(EventEnvelope::decode_json(payload)?)),
+        TopicKind::Messages => Ok(GossipMessage::Chat(EventEnvelope::decode_json(payload)?)),
+        TopicKind::Rules => Ok(GossipMessage::Rule(serde_json::from_slice(payload)?)),
+        TopicKind::Checkpoints => Ok(GossipMessage::Checkpoint(serde_json::from_slice(payload)?)),
+        TopicKind::Summaries => Ok(GossipMessage::Summary(serde_json::from_slice(payload)?)),
     }
 }
 
-fn relay_reservation_addr(relay_peer: PeerId, relay_addr: &Multiaddr) -> Multiaddr {
-    relay_addr
-        .clone()
-        .with(Protocol::P2p(relay_peer))
-        .with(Protocol::P2pCircuit)
+fn encode_overlay_payload(message: &GossipMessage) -> Result<Vec<u8>> {
+    match message {
+        GossipMessage::Event(envelope) | GossipMessage::Chat(envelope) => envelope.encode_json(),
+        GossipMessage::Rule(rule) => Ok(serde_json::to_vec(rule)?),
+        GossipMessage::Checkpoint(checkpoint) => Ok(serde_json::to_vec(checkpoint)?),
+        GossipMessage::Summary(summary) => Ok(serde_json::to_vec(summary)?),
+    }
 }
 
-fn sanitize_segment(raw: &str) -> Result<String> {
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        bail!("network segment cannot be empty");
-    }
-
-    let mut out = String::with_capacity(trimmed.len());
-    for ch in trimmed.chars() {
-        if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_') {
-            out.push(ch.to_ascii_lowercase());
-        } else {
-            out.push('-');
-        }
-    }
-    Ok(out)
-}
-
-fn default_network_context_id() -> String {
-    "default".to_owned()
+fn decode_backfill_response(response: RawBackfillResponse) -> Result<BackfillResponse> {
+    let events = response
+        .items
+        .iter()
+        .map(|raw| EventEnvelope::decode_json(raw))
+        .collect::<Result<Vec<_>>>()?;
+    Ok(BackfillResponse {
+        scope: response.scope,
+        next_from_event_seq: response.next_from_event_seq,
+        feed_key: response.feed_key,
+        events,
+    })
 }
 
 #[cfg(test)]
@@ -1621,16 +546,16 @@ mod tests {
     fn sample_event() -> Event {
         Event {
             event_id: "evt-1".to_owned(),
-            protocol_version: "0.1.0".to_owned(),
-            event_kind: wattswarm_protocol::types::EventKind::CheckpointCreated,
-            task_id: None,
-            epoch: 1,
+            protocol_version: "1".to_owned(),
+            event_kind: EventKind::CheckpointCreated,
+            task_id: Some("task-1".to_owned()),
+            epoch: 0,
             author_node_id: "node-1".to_owned(),
-            created_at: 42,
-            payload: wattswarm_protocol::types::EventPayload::CheckpointCreated(
+            created_at: 1,
+            payload: EventPayload::CheckpointCreated(
                 wattswarm_protocol::types::CheckpointCreatedPayload {
                     checkpoint_id: "cp-1".to_owned(),
-                    up_to_seq: 10,
+                    up_to_seq: 1,
                 },
             ),
             signature_hex: "sig".to_owned(),
@@ -1638,426 +563,68 @@ mod tests {
     }
 
     #[test]
-    fn topic_catalog_uses_namespace_scope_and_kind() {
-        let namespace = TopicNamespace {
-            network: "WattSwarm Main".to_owned(),
-            network_id: "mainnet:watt-galaxy".to_owned(),
-        };
-        let catalog = TopicCatalog::new(&namespace, &SwarmScope::Region("sol-1/alpha".to_owned()))
-            .expect("catalog");
-        assert_eq!(
-            catalog.events,
-            "wattswarm-main.mainnet-watt-galaxy.region.sol-1-alpha.events"
-        );
-        assert_eq!(
-            catalog.rules,
-            "wattswarm-main.mainnet-watt-galaxy.region.sol-1-alpha.rules"
-        );
-        assert_eq!(
-            catalog.messages,
-            "wattswarm-main.mainnet-watt-galaxy.region.sol-1-alpha.messages"
-        );
-
-        let group_catalog = TopicCatalog::new(&namespace, &SwarmScope::Group("crew/7".to_owned()))
-            .expect("group catalog");
-        assert_eq!(
-            group_catalog.events,
-            "wattswarm-main.mainnet-watt-galaxy.group.crew-7.events"
-        );
-    }
-
-    #[test]
-    fn topic_catalog_isolates_same_scope_across_network_contexts() {
-        let mainnet = TopicNamespace {
-            network: "watt-galaxy".to_owned(),
-            network_id: "mainnet:watt-galaxy".to_owned(),
-        };
-        let subnet = TopicNamespace {
-            network: "watt-galaxy".to_owned(),
-            network_id: "subnet:alpha".to_owned(),
-        };
-
-        let mainnet_topic = mainnet
-            .topic_name(&SwarmScope::Global, TopicKind::Events)
-            .expect("mainnet topic");
-        let subnet_topic = subnet
-            .topic_name(&SwarmScope::Global, TopicKind::Events)
-            .expect("subnet topic");
-
-        assert_ne!(mainnet_topic, subnet_topic);
-    }
-
-    #[test]
-    fn backfill_request_enforces_limits() {
-        let req = BackfillRequest {
-            scope: SwarmScope::Global,
-            from_event_seq: 42,
-            limit: 128,
-            feed_key: None,
-        };
-        req.validate(256, 512).expect("valid");
-        assert!(req.validate(64, 512).is_err());
-        assert!(req.validate(256, 96).is_err());
-        assert!(
-            BackfillRequest {
-                scope: SwarmScope::Global,
-                from_event_seq: 0,
-                limit: 1,
-                feed_key: Some(" ".to_owned()),
-            }
-            .validate(256, 512)
-            .is_err()
-        );
-    }
-
-    #[test]
-    fn event_and_gossip_messages_roundtrip_as_json() {
+    fn gossip_event_roundtrip() {
         let message = GossipMessage::Event(EventEnvelope {
             scope: SwarmScope::Global,
             event: sample_event(),
         });
-        let bytes = message.encode_json().expect("encode");
-        let decoded = GossipMessage::decode_json(&bytes).expect("decode");
+        let encoded = message.encode_json().unwrap();
+        let decoded = GossipMessage::decode_json(&encoded).unwrap();
         assert_eq!(decoded, message);
-        assert_eq!(decoded.kind(), TopicKind::Events);
     }
 
     #[test]
-    fn chat_gossip_messages_roundtrip_as_json() {
-        let message = GossipMessage::Chat(EventEnvelope {
-            scope: SwarmScope::Group("crew-7".to_owned()),
-            event: sample_event(),
-        });
-        let bytes = message.encode_json().expect("encode");
-        let decoded = GossipMessage::decode_json(&bytes).expect("decode");
-        assert_eq!(decoded, message);
-        assert_eq!(decoded.kind(), TopicKind::Messages);
-    }
-
-    #[test]
-    fn summary_messages_roundtrip_as_json() {
-        let message = GossipMessage::Summary(SummaryAnnouncement {
-            summary_id: "summary-1".to_owned(),
-            source_node_id: "node-a".to_owned(),
-            scope: SwarmScope::Region("sol-1".to_owned()),
-            summary_kind: "knowledge_task_type_v1".to_owned(),
-            artifact_path: Some("summaries/sol-1/knowledge.json".to_owned()),
-            payload: serde_json::json!({"task_type":"swarm","rows":[{"task_id":"task-1"}]}),
-        });
-        let bytes = message.encode_json().expect("encode");
-        let decoded = GossipMessage::decode_json(&bytes).expect("decode");
-        assert_eq!(decoded, message);
-        assert_eq!(decoded.kind(), TopicKind::Summaries);
-    }
-
-    #[test]
-    fn default_config_is_valid_and_serializable() {
-        let config = NetworkP2pConfig::default();
-        config.validate().expect("config valid");
-
-        let json = serde_json::to_value(&config).expect("serialize config");
-        assert_eq!(json["namespace"]["network"], "wattswarm");
-        assert_eq!(json["namespace"]["network_id"], "default");
-        assert_eq!(json["max_backfill_events"], 512);
-        assert_eq!(json["max_established_per_peer"], 2);
-        assert_eq!(json["protocol_version"], "/wattswarm/0.1.0");
-    }
-
-    #[test]
-    fn apply_protocol_params_overrides_governed_runtime_fields() {
-        let params = wattswarm_protocol::types::NetworkProtocolParams {
-            namespace_network: "watt-galaxy".to_owned(),
-            protocol_version: "/wattswarm/9.9.9".to_owned(),
+    fn config_apply_protocol_params_updates_governed_fields() {
+        let config = NetworkP2pConfig::default().apply_protocol_params(&NetworkProtocolParams {
+            namespace_network: "swarmnet".to_owned(),
+            protocol_version: "/swarmnet/1".to_owned(),
             max_established_per_peer: 4,
             gossipsub_d: 9,
             gossipsub_d_low: 7,
-            gossipsub_d_high: 15,
-            gossipsub_heartbeat_ms: 2_500,
+            gossipsub_d_high: 12,
+            gossipsub_heartbeat_ms: 2500,
             gossipsub_max_transmit_size: 1024 * 1024,
             default_max_backfill_events: 1024,
-            max_backfill_events_hard_limit: 16_384,
-            ..wattswarm_protocol::types::NetworkProtocolParams::default()
-        };
-
-        let config = NetworkP2pConfig::default().apply_protocol_params(&params);
-
-        assert_eq!(config.namespace.network, "watt-galaxy");
-        assert_eq!(config.protocol_version, "/wattswarm/9.9.9");
-        assert_eq!(config.max_established_per_peer, 4);
-        assert_eq!(config.gossipsub_d, 9);
-        assert_eq!(config.gossipsub_d_low, 7);
-        assert_eq!(config.gossipsub_d_high, 15);
-        assert_eq!(config.gossipsub_heartbeat_ms, 2_500);
-        assert_eq!(config.gossipsub_max_transmit_size, 1024 * 1024);
+            max_backfill_events_hard_limit: 4096,
+            ..NetworkProtocolParams::default()
+        });
+        assert_eq!(config.namespace.network, "swarmnet");
+        assert_eq!(config.protocol_version, "/swarmnet/1");
         assert_eq!(config.max_backfill_events, 1024);
-        assert_eq!(config.max_backfill_events_hard_limit, 16_384);
     }
 
     #[test]
-    fn peer_handshake_metadata_roundtrips_agent_version() {
-        let handshake = PeerHandshakeMetadata {
-            network_id: "mainnet:watt-galaxy".to_owned(),
-            params_version: 7,
-            params_hash: "abc123".to_owned(),
+    fn raw_gossip_maps_back_to_overlay_message() {
+        let overlay = GossipMessage::Summary(SummaryAnnouncement {
+            summary_id: "sum-1".to_owned(),
+            source_node_id: "node-1".to_owned(),
+            scope: SwarmScope::Global,
+            summary_kind: "knowledge".to_owned(),
+            artifact_path: None,
+            payload: serde_json::json!({"ok": true}),
+        });
+        let raw = RawGossipMessage {
+            scope: overlay.scope().clone(),
+            kind: overlay.kind(),
+            payload: encode_overlay_payload(&overlay).unwrap(),
         };
-        let encoded = handshake.encode_agent_version();
-        let decoded = PeerHandshakeMetadata::decode_agent_version(&encoded).expect("decode");
-        assert_eq!(decoded, handshake);
-    }
-
-    #[tokio::test]
-    async fn validate_identify_info_rejects_mismatched_params_hash() {
-        let local_key = identity::Keypair::generate_ed25519();
-        let remote_key = identity::Keypair::generate_ed25519();
-        let expected = PeerHandshakeMetadata {
-            network_id: "mainnet:watt-galaxy".to_owned(),
-            params_version: 2,
-            params_hash: "good-hash".to_owned(),
-        };
-        let info = identify::Info {
-            public_key: remote_key.public(),
-            protocol_version: "/wattswarm/0.1.0".to_owned(),
-            agent_version: PeerHandshakeMetadata {
-                network_id: "mainnet:watt-galaxy".to_owned(),
-                params_version: 2,
-                params_hash: "bad-hash".to_owned(),
-            }
-            .encode_agent_version(),
-            listen_addrs: vec!["/ip4/127.0.0.1/tcp/4001".parse().expect("addr")],
-            protocols: Vec::new(),
-            observed_addr: "/ip4/127.0.0.1/tcp/4001".parse().expect("observed"),
-            signed_peer_record: None,
-        };
-        let runtime = NetworkRuntime {
-            config: NetworkP2pConfig {
-                protocol_version: "/wattswarm/0.1.0".to_owned(),
-                identify_agent_version: expected.encode_agent_version(),
-                ..NetworkP2pConfig::default()
-            },
-            local_peer_id: local_key.public().to_peer_id(),
-            swarm: NetworkP2pNode::new(NetworkP2pConfig::default(), local_key)
-                .expect("node")
-                .build_swarm()
-                .expect("swarm"),
-            listen_addrs: Vec::new(),
-            subscribed_topics: HashSet::new(),
-            traffic_guard: TrafficGuard::new(),
-            relay_reservations: HashSet::new(),
-            expected_peer_handshake: expected,
-            nat_status: "unknown".to_owned(),
-            nat_public_address: None,
-            nat_confidence: 0,
-        };
-        assert!(runtime.validate_identify_info(&info).is_err());
+        let decoded = decode_overlay_gossip(raw).unwrap();
+        assert_eq!(decoded, overlay);
     }
 
     #[test]
-    fn config_validation_rejects_invalid_governed_mesh_and_backfill_limits() {
-        let invalid_mesh = NetworkP2pConfig {
-            gossipsub_d: 4,
-            gossipsub_d_low: 5,
-            gossipsub_d_high: 8,
-            ..NetworkP2pConfig::default()
+    fn raw_backfill_response_maps_back_to_overlay_events() {
+        let envelope = EventEnvelope {
+            scope: SwarmScope::Global,
+            event: sample_event(),
         };
-        assert!(invalid_mesh.validate().is_err());
-
-        let invalid_backfill = NetworkP2pConfig {
-            max_backfill_events: 1024,
-            max_backfill_events_hard_limit: 512,
-            ..NetworkP2pConfig::default()
-        };
-        assert!(invalid_backfill.validate().is_err());
-    }
-
-    #[test]
-    fn config_parses_multiaddrs() {
-        let config = NetworkP2pConfig {
-            listen_addrs: vec!["/ip4/127.0.0.1/tcp/4001".to_owned()],
-            ..NetworkP2pConfig::default()
-        };
-        let addrs = config.parse_listen_addrs().expect("multiaddr parse");
-        assert_eq!(addrs.len(), 1);
-    }
-
-    #[test]
-    fn config_parses_bootstrap_peers_with_peer_ids() {
-        let peer = identity::Keypair::generate_ed25519().public().to_peer_id();
-        let config = NetworkP2pConfig {
-            bootstrap_peers: vec![format!("/ip4/127.0.0.1/tcp/4001/p2p/{peer}")],
-            ..NetworkP2pConfig::default()
-        };
-        let peers = config.parse_bootstrap_peers().expect("bootstrap peers");
-        assert_eq!(peers.len(), 1);
-        assert_eq!(peers[0].0, peer);
-        assert_eq!(peers[0].1.to_string(), "/ip4/127.0.0.1/tcp/4001");
-    }
-
-    #[test]
-    fn traffic_guard_rejects_duplicate_gossip_and_backfill_spam() {
-        let peer = identity::Keypair::generate_ed25519().public().to_peer_id();
-        let mut guard = TrafficGuard::new();
-        let now = Instant::now();
-        let payload = br#"{"kind":"event","n":1}"#;
-
-        assert!(guard.allow_inbound_gossip(peer, "wattswarm.global.events", payload, now));
-        assert!(!guard.allow_inbound_gossip(
-            peer,
-            "wattswarm.global.events",
-            payload,
-            now + Duration::from_secs(1),
-        ));
-
-        let mut later = now;
-        for _ in 0..PER_PEER_BACKFILL_REQUESTS_PER_WINDOW {
-            later += Duration::from_millis(1);
-            assert!(guard.allow_backfill_request(peer, later));
-        }
-        later += Duration::from_millis(1);
-        assert!(!guard.allow_backfill_request(peer, later));
-        assert_eq!(
-            guard.policy_for_peer(peer, later),
-            TrafficPolicyTier::Healthy
-        );
-
-        for _ in 0..3 {
-            later += Duration::from_millis(1);
-            assert!(!guard.allow_backfill_request(peer, later));
-        }
-        assert_eq!(
-            guard.policy_for_peer(peer, later),
-            TrafficPolicyTier::Quarantined
-        );
-        assert!(!guard.allows_outbound_backfill(peer, later));
-
-        let after_quarantine = later + TRAFFIC_QUARANTINE_DURATION + Duration::from_millis(1);
-        assert_eq!(
-            guard.policy_for_peer(peer, after_quarantine),
-            TrafficPolicyTier::Throttled
-        );
-
-        guard.note_backfill_failure(peer, later);
-        guard.note_backfill_failure(peer, later);
-        guard.note_backfill_failure(peer, later);
-        guard.note_backfill_failure(peer, later);
-        assert_eq!(
-            guard.policy_for_peer(peer, later),
-            TrafficPolicyTier::Banned
-        );
-        assert!(!guard.allows_outbound_backfill(peer, later));
-    }
-
-    #[test]
-    fn traffic_guard_snapshot_reports_quarantine_and_ban_budget() {
-        let peer = identity::Keypair::generate_ed25519().public().to_peer_id();
-        let mut guard = TrafficGuard::new();
-        let now = Instant::now();
-
-        guard.note_handshake_rejection(peer, now);
-        let quarantine_snapshot = TrafficGuardPeerHealth {
-            peer: peer.to_string(),
-            score: guard.peer_scores.get(&peer).copied().unwrap_or_default(),
-            blacklisted: matches!(guard.policy_for_peer(peer, now), TrafficPolicyTier::Banned),
-            reputation_tier: guard.policy_for_peer(peer, now).as_str().to_owned(),
-            quarantined: matches!(
-                guard.policy_for_peer(peer, now),
-                TrafficPolicyTier::Quarantined
-            ),
-            quarantine_remaining_ms: guard.quarantine_remaining_ms(peer, now),
-            ban_remaining_ms: guard.ban_remaining_ms(peer, now),
-            throttle_factor_percent: guard.policy_for_peer(peer, now).throttle_factor_percent(),
-        };
-        assert_eq!(quarantine_snapshot.reputation_tier, "quarantined");
-        assert!(quarantine_snapshot.quarantined);
-        assert!(quarantine_snapshot.quarantine_remaining_ms > 0);
-        assert_eq!(quarantine_snapshot.throttle_factor_percent, 0);
-
-        guard.note_backfill_failure(peer, now);
-        guard.note_backfill_failure(peer, now);
-        guard.note_backfill_failure(peer, now);
-        guard.note_backfill_failure(peer, now);
-        let banned = guard.policy_for_peer(peer, now);
-        assert_eq!(banned, TrafficPolicyTier::Banned);
-        assert!(guard.ban_remaining_ms(peer, now) > 0);
-    }
-
-    #[test]
-    fn relay_reservation_addr_uses_peer_and_circuit_protocols() {
-        let relay_peer = identity::Keypair::generate_ed25519().public().to_peer_id();
-        let relay_addr = "/ip4/127.0.0.1/tcp/4001"
-            .parse::<Multiaddr>()
-            .expect("relay addr");
-        let reserved = relay_reservation_addr(relay_peer, &relay_addr);
-        assert_eq!(
-            reserved.to_string(),
-            format!("/ip4/127.0.0.1/tcp/4001/p2p/{relay_peer}/p2p-circuit")
-        );
-    }
-
-    #[tokio::test]
-    async fn runtime_seeds_relay_reservations_from_bootstrap_peers() {
-        let relay_peer = identity::Keypair::generate_ed25519().public().to_peer_id();
-        let node = NetworkP2pNode::generate(NetworkP2pConfig {
-            bootstrap_peers: vec![format!("/ip4/127.0.0.1/tcp/4001/p2p/{relay_peer}")],
-            enable_mdns: false,
-            ..NetworkP2pConfig::default()
+        let response = decode_backfill_response(RawBackfillResponse {
+            scope: SwarmScope::Global,
+            next_from_event_seq: 2,
+            feed_key: None,
+            items: vec![envelope.encode_json().unwrap()],
         })
-        .expect("node");
-        let runtime = NetworkRuntime::new(node).expect("runtime");
-        assert!(
-            runtime.relay_reservations.contains(&format!(
-                "/ip4/127.0.0.1/tcp/4001/p2p/{relay_peer}/p2p-circuit"
-            )),
-            "bootstrap peers should seed relay listen reservations"
-        );
-    }
-
-    #[tokio::test]
-    async fn node_builds_libp2p_behaviour() {
-        let node = NetworkP2pNode::generate(NetworkP2pConfig::default()).expect("node");
-        let behaviour = node.build_behaviour().expect("behaviour");
-        let topics = node
-            .config()
-            .topic_catalog(&SwarmScope::Global)
-            .expect("topic catalog")
-            .as_ident_topics();
-
-        let mut gossipsub = behaviour.gossipsub;
-        for topic in topics {
-            assert!(gossipsub.subscribe(&topic).expect("subscribe"));
-        }
-    }
-
-    #[tokio::test]
-    async fn runtime_tracks_listen_addresses_and_subscriptions() {
-        let node = NetworkP2pNode::generate(NetworkP2pConfig::default()).expect("node");
-        let mut runtime = NetworkRuntime::new(node).expect("runtime");
-        runtime
-            .subscribe_scope(&SwarmScope::Global)
-            .expect("subscribe scope");
-
-        let mut saw_addr = false;
-        for _ in 0..128 {
-            if let Some(NetworkRuntimeEvent::NewListenAddr { .. }) =
-                runtime.try_next_event().expect("poll event")
-            {
-                saw_addr = true;
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-
-        assert!(saw_addr);
-        assert!(!runtime.listen_addrs().is_empty());
-    }
-
-    #[test]
-    fn mdns_flag_controls_behaviour_construction() {
-        let node = NetworkP2pNode::generate(NetworkP2pConfig {
-            enable_mdns: false,
-            ..NetworkP2pConfig::default()
-        })
-        .expect("node");
-        let behaviour = node.build_behaviour().expect("behaviour");
-        assert!(!behaviour.mdns.is_enabled());
+        .unwrap();
+        assert_eq!(response.events, vec![envelope]);
     }
 }

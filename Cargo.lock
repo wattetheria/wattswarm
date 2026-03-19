@@ -4003,7 +4003,19 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+ "wattswarm-network-substrate",
  "wattswarm-protocol",
+]
+
+[[package]]
+name = "wattswarm-network-substrate"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "libp2p",
+ "serde",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]

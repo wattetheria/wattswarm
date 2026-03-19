@@ -372,12 +372,12 @@ fn run_background_network_service(
     config.namespace.network_id = handshake_network_id.clone();
     let handshake_params_version = verified_protocol_params.signed.version;
     let handshake_params_hash = verified_protocol_params.params_hash().to_owned();
-    config.identify_agent_version = PeerHandshakeMetadata {
-        network_id: handshake_network_id,
-        params_version: handshake_params_version,
-        params_hash: handshake_params_hash,
-    }
-    .encode_agent_version();
+    config.identify_agent_version =
+        crate::network_p2p::encode_wattswarm_agent_version(&PeerHandshakeMetadata {
+            network_id: handshake_network_id,
+            params_version: handshake_params_version,
+            params_hash: handshake_params_hash,
+        });
     config.validate()?;
     let mut service =
         NetworkBridgeService::new(NetworkP2pNode::generate(config)?, &scopes, &protocol_params)?;

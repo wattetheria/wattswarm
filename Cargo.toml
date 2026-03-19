@@ -4,6 +4,7 @@ members = [
   "crates/protocol",
   "crates/crypto",
   "crates/artifact-store",
+  "crates/network-substrate",
   "crates/network-p2p",
   "crates/policy-engine",
   "crates/runtime-client",
@@ -42,6 +43,7 @@ tower = "0.5"
 wattswarm-protocol = { path = "crates/protocol" }
 wattswarm-crypto = { path = "crates/crypto" }
 wattswarm-artifact-store = { path = "crates/artifact-store" }
+wattswarm-network-substrate = { path = "crates/network-substrate" }
 wattswarm-network-p2p = { path = "crates/network-p2p" }
 wattswarm-policy-engine = { path = "crates/policy-engine" }
 wattswarm-runtime-client = { path = "crates/runtime-client" }

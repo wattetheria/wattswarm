@@ -423,3 +423,96 @@ fn ui_exposes_topic_message_history_and_cursor_queries() {
         );
     });
 }
+
+#[test]
+fn ui_accepts_topic_subscription_and_message_writes() {
+    let _guard = env_lock();
+    let _db_lock = DbTestLock::acquire();
+    reset_test_schema("test");
+    let _schema_guard = EnvVarGuard::set("WATTSWARM_PG_SCHEMA", "test");
+    let dir = tempdir().unwrap();
+    let state_dir = dir.path().join("state");
+    std::fs::create_dir_all(&state_dir).unwrap();
+    let db_path = state_dir.join("ui.state");
+    let app = build_app(UiServerState::new(state_dir.clone(), db_path.clone()));
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let subscription_res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/topic/subscriptions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&serde_json::json!({
+                            "feed_key": "crew.chat",
+                            "scope_hint": "group:crew-7",
+                            "active": true
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(subscription_res.status(), StatusCode::OK);
+
+        let message_res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/topic/messages")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&serde_json::json!({
+                            "feed_key": "crew.chat",
+                            "scope_hint": "group:crew-7",
+                            "content": {"text": "hello from ui write api"}
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(message_res.status(), StatusCode::OK);
+
+        let messages_res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/topic/messages?feed_key=crew.chat&scope_hint=group:crew-7&limit=5")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let messages_json = json_from(messages_res).await;
+        assert_eq!(messages_json["ok"].as_bool(), Some(true));
+        assert_eq!(
+            messages_json["messages"][0]["content"]["text"].as_str(),
+            Some("hello from ui write api")
+        );
+
+        let cursor_res = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/topic/cursor?feed_key=crew.chat")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let cursor_json = json_from(cursor_res).await;
+        assert_eq!(cursor_json["ok"].as_bool(), Some(true));
+        assert!(cursor_json["subscriber_node_id"].as_str().is_some());
+    });
+}

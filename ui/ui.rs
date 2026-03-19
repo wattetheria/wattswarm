@@ -113,6 +113,24 @@ struct TopicCursorQuery {
     subscriber_node_id: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+struct TopicSubscriptionWriteRequest {
+    network_id: Option<String>,
+    subscriber_node_id: Option<String>,
+    feed_key: String,
+    scope_hint: String,
+    active: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct TopicMessageWriteRequest {
+    network_id: Option<String>,
+    feed_key: String,
+    scope_hint: String,
+    content: Value,
+    reply_to_message_id: Option<String>,
+}
+
 pub fn run(state_dir: PathBuf, db_path: PathBuf, listen: String) -> Result<()> {
     fs::create_dir_all(&state_dir)?;
     let node_id = local_node_id(&state_dir).ok();
@@ -170,7 +188,9 @@ pub fn build_app(state: UiServerState) -> Router {
         .route("/api/task/run-real", post(task_run_real))
         .route("/api/knowledge/export", post(knowledge_export))
         .route("/api/topic/messages", get(topic_messages))
+        .route("/api/topic/messages", post(topic_message_post))
         .route("/api/topic/cursor", get(topic_cursor))
+        .route("/api/topic/subscriptions", post(topic_subscription_post))
         .route("/api/swarm/state", get(swarm_state))
         .route("/api/swarm/tick", post(swarm_tick))
         .with_state(state)
@@ -479,6 +499,21 @@ fn resolve_subscriber_node_id(
     }
 }
 
+fn resolve_network_id(node: &crate::node::Node) -> String {
+    if node.store.is_org_configured()
+        && let Ok(topology) = node
+            .store
+            .load_network_topology_for_org(node.store.org_id())
+    {
+        return topology.network.network_id;
+    }
+
+    node.store
+        .load_verified_network_protocol_params()
+        .map(|verified| verified.network_id)
+        .unwrap_or_else(|_| format!("local:{}", node.node_id()))
+}
+
 async fn topic_messages(
     State(state): State<UiServerState>,
     Query(query): Query<TopicMessagesQuery>,
@@ -521,6 +556,110 @@ async fn topic_messages(
             "scope_hint": scope_hint,
             "messages": messages,
             "next_anchor": next_anchor,
+        }))
+    })
+    .await?;
+    Ok(Json(payload))
+}
+
+async fn topic_subscription_post(
+    State(state): State<UiServerState>,
+    Json(req): Json<TopicSubscriptionWriteRequest>,
+) -> Result<Json<Value>, ApiError> {
+    let state_clone = state.clone();
+    let feed_key = req.feed_key.trim().to_owned();
+    let scope_hint = req.scope_hint.trim().to_owned();
+    let network_id = req.network_id.as_deref().map(str::trim).map(str::to_owned);
+    let subscriber_node_id = req
+        .subscriber_node_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned);
+    let active = req.active;
+    if feed_key.is_empty() {
+        return Err(anyhow!("feed_key is required").into());
+    }
+    if scope_hint.is_empty() {
+        return Err(anyhow!("scope_hint is required").into());
+    }
+    let payload = run_blocking(move || -> Result<Value> {
+        let mut node = open_node(&state_clone.state_dir, &state_clone.db_path)?;
+        let subscriber_node_id = subscriber_node_id.unwrap_or_else(|| node.node_id());
+        let network_id = network_id.unwrap_or_else(|| resolve_network_id(&node));
+        let created_at = chrono::Utc::now().timestamp_millis().max(0) as u64;
+        let event = node.emit_at(
+            1,
+            crate::types::EventPayload::FeedSubscriptionUpdated(
+                crate::types::FeedSubscriptionUpdatedPayload {
+                    network_id: network_id.clone(),
+                    subscriber_node_id: subscriber_node_id.clone(),
+                    feed_key: feed_key.clone(),
+                    scope_hint: scope_hint.clone(),
+                    active,
+                },
+            ),
+            created_at,
+        )?;
+        Ok(json!({
+            "ok": true,
+            "event_id": event.event_id,
+            "network_id": network_id,
+            "subscriber_node_id": subscriber_node_id,
+            "feed_key": feed_key,
+            "scope_hint": scope_hint,
+            "active": active,
+        }))
+    })
+    .await?;
+    Ok(Json(payload))
+}
+
+async fn topic_message_post(
+    State(state): State<UiServerState>,
+    Json(req): Json<TopicMessageWriteRequest>,
+) -> Result<Json<Value>, ApiError> {
+    let state_clone = state.clone();
+    let feed_key = req.feed_key.trim().to_owned();
+    let scope_hint = req.scope_hint.trim().to_owned();
+    let network_id = req.network_id.as_deref().map(str::trim).map(str::to_owned);
+    let reply_to_message_id = req
+        .reply_to_message_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned);
+    let content = req.content;
+    if feed_key.is_empty() {
+        return Err(anyhow!("feed_key is required").into());
+    }
+    if scope_hint.is_empty() {
+        return Err(anyhow!("scope_hint is required").into());
+    }
+    let payload = run_blocking(move || -> Result<Value> {
+        let mut node = open_node(&state_clone.state_dir, &state_clone.db_path)?;
+        let network_id = network_id.unwrap_or_else(|| resolve_network_id(&node));
+        let created_at = chrono::Utc::now().timestamp_millis().max(0) as u64;
+        let event = node.emit_at(
+            1,
+            crate::types::EventPayload::TopicMessagePosted(
+                crate::types::TopicMessagePostedPayload {
+                    network_id: network_id.clone(),
+                    feed_key: feed_key.clone(),
+                    scope_hint: scope_hint.clone(),
+                    content,
+                    reply_to_message_id,
+                },
+            ),
+            created_at,
+        )?;
+        Ok(json!({
+            "ok": true,
+            "event_id": event.event_id,
+            "message_id": event.event_id,
+            "network_id": network_id,
+            "feed_key": feed_key,
+            "scope_hint": scope_hint,
         }))
     })
     .await?;

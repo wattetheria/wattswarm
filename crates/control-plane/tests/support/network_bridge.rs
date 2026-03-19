@@ -74,12 +74,14 @@ fn make_service_for_network_with_scopes(
             network: params.namespace_network.clone(),
             network_id: network_id.to_owned(),
         },
-        identify_agent_version: PeerHandshakeMetadata {
-            network_id: network_id.to_owned(),
-            params_version: 1,
-            params_hash: format!("params-{network_id}"),
-        }
-        .encode_agent_version(),
+        identify_agent_version:
+            wattswarm_control_plane::network_p2p::encode_wattswarm_agent_version(
+                &PeerHandshakeMetadata {
+                    network_id: network_id.to_owned(),
+                    params_version: 1,
+                    params_hash: format!("params-{network_id}"),
+                },
+            ),
         listen_addrs: vec!["/ip4/127.0.0.1/tcp/0".to_owned()],
         enable_mdns: false,
         ..NetworkP2pConfig::default()
