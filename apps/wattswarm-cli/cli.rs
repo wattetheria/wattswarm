@@ -3,7 +3,8 @@ use crate::control::{
     load_executor_registry, node_state_path, open_node, open_node_in_mode, resolve_node_mode,
     run_real_task_flow, save_executor_registry, write_node_state,
 };
-use crate::run_queue::{PgRunQueue, RunSubmitSpec, WorkerOptions};
+use crate::run_control;
+use crate::run_queue::{RunSubmitSpec, WorkerOptions};
 pub use crate::task_template::{sample_artifact_ref, sample_contract};
 use crate::types::TaskContract;
 use anyhow::{Context, Result, anyhow};
@@ -11,8 +12,6 @@ use clap::{Args, Parser, Subcommand};
 use std::fs;
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
-
-const DEFAULT_PG_URL: &str = "postgres://postgres:postgres@127.0.0.1:55432/wattswarm";
 
 #[derive(Parser, Debug)]
 #[command(name = "wattswarm")]
@@ -385,67 +384,45 @@ fn handle_task(cmd: TaskCommand, state_dir: &Path, db_path: &Path) -> Result<()>
 }
 
 fn handle_run(cmd: RunCommand, state_dir: &Path, db_path: &Path) -> Result<()> {
-    let pg_url = resolve_pg_url(cmd.pg_url);
+    let pg_url = run_control::resolve_run_queue_pg_url(cmd.pg_url);
     match cmd.action {
         RunAction::Init => {
-            let queue = PgRunQueue::new(pg_url);
-            queue.init_schema()?;
+            run_control::init_run_queue(&pg_url)?;
             println!("run queue schema initialized");
         }
         RunAction::Submit { file, kickoff } => {
-            let node = open_node(state_dir, db_path)?;
-            let queue = PgRunQueue::new(pg_url).for_org(node.store.org_id().to_owned());
             let raw = fs::read(&file)?;
             let spec: RunSubmitSpec = serde_json::from_slice(&raw)
                 .with_context(|| format!("parse run submit spec from {}", file.display()))?;
-            let run_id = spec.run_id.clone();
-            queue.submit_run(spec)?;
-            if kickoff {
-                queue.kickoff_run(&run_id)?;
-            }
             println!(
                 "{}",
-                serde_json::to_string_pretty(&serde_json::json!({
-                    "ok": true,
-                    "run_id": run_id,
-                    "kicked_off": kickoff
-                }))?
+                serde_json::to_string_pretty(&run_control::submit_run(
+                    state_dir, db_path, &pg_url, spec, kickoff,
+                )?)?
             );
         }
         RunAction::Kickoff { run_id } => {
-            let node = open_node(state_dir, db_path)?;
-            let queue = PgRunQueue::new(pg_url).for_org(node.store.org_id().to_owned());
-            queue.kickoff_run(&run_id)?;
+            run_control::kickoff_run(state_dir, db_path, &pg_url, &run_id)?;
             println!("kicked off {}", run_id);
         }
         RunAction::Watch { run_id } => {
-            let node = open_node(state_dir, db_path)?;
-            let queue = PgRunQueue::new(pg_url).for_org(node.store.org_id().to_owned());
-            let view = queue.run_view(&run_id)?;
+            let view = run_control::watch_run(state_dir, db_path, &pg_url, &run_id)?;
             println!("{}", serde_json::to_string_pretty(&view)?);
         }
         RunAction::Result { run_id } => {
-            let node = open_node(state_dir, db_path)?;
-            let queue = PgRunQueue::new(pg_url).for_org(node.store.org_id().to_owned());
-            let result = queue.run_result(&run_id)?;
+            let result = run_control::run_result(state_dir, db_path, &pg_url, &run_id)?;
             println!("{}", serde_json::to_string_pretty(&result)?);
         }
         RunAction::Events { run_id, limit } => {
-            let node = open_node(state_dir, db_path)?;
-            let queue = PgRunQueue::new(pg_url).for_org(node.store.org_id().to_owned());
-            let events = queue.run_events(&run_id, limit.max(1))?;
+            let events = run_control::run_events(state_dir, db_path, &pg_url, &run_id, limit)?;
             println!("{}", serde_json::to_string_pretty(&events)?);
         }
         RunAction::Cancel { run_id } => {
-            let node = open_node(state_dir, db_path)?;
-            let queue = PgRunQueue::new(pg_url).for_org(node.store.org_id().to_owned());
-            queue.cancel_run(&run_id)?;
+            run_control::cancel_run(state_dir, db_path, &pg_url, &run_id)?;
             println!("cancel requested {}", run_id);
         }
         RunAction::Retry { run_id } => {
-            let node = open_node(state_dir, db_path)?;
-            let queue = PgRunQueue::new(pg_url).for_org(node.store.org_id().to_owned());
-            queue.retry_run(&run_id)?;
+            run_control::retry_run(state_dir, db_path, &pg_url, &run_id)?;
             println!("retry requested {}", run_id);
         }
         RunAction::Worker {
@@ -455,10 +432,11 @@ fn handle_run(cmd: RunCommand, state_dir: &Path, db_path: &Path) -> Result<()> {
             lease_ms,
             once,
         } => {
-            let node = open_node(state_dir, db_path)?;
-            let queue = PgRunQueue::new(pg_url).for_org(node.store.org_id().to_owned());
             let worker_id = worker_id.unwrap_or_else(|| format!("worker-{}", Uuid::new_v4()));
-            queue.run_worker(
+            run_control::run_worker(
+                state_dir,
+                db_path,
+                &pg_url,
                 WorkerOptions {
                     worker_id,
                     concurrency: concurrency.max(1),
@@ -466,18 +444,10 @@ fn handle_run(cmd: RunCommand, state_dir: &Path, db_path: &Path) -> Result<()> {
                     lease_ms,
                     once,
                 },
-                state_dir,
-                db_path,
             )?;
         }
     }
     Ok(())
-}
-
-fn resolve_pg_url(flag_value: Option<String>) -> String {
-    flag_value
-        .or_else(|| std::env::var("WATTSWARM_PG_URL").ok())
-        .unwrap_or_else(|| DEFAULT_PG_URL.to_owned())
 }
 
 fn handle_knowledge(cmd: KnowledgeCommand, state_dir: &Path, db_path: &Path) -> Result<()> {

@@ -3,6 +3,8 @@ use crate::control::{
     load_executor_registry, local_node_id, node_state_path, open_node, resolve_node_mode,
     run_real_task_flow, save_executor_registry, write_node_state,
 };
+use crate::run_control;
+use crate::run_queue::RunSubmitSpec;
 use crate::swarm_dashboard_engine::{SwarmDashboardState, build_dashboard_state, tick_real_swarm};
 use crate::swarm_dashboard_template::SWARM_DASHBOARD_HTML;
 use crate::task_template::sample_contract;
@@ -84,6 +86,25 @@ struct RunRealRequest {
     profile: Option<String>,
     task_id: Option<String>,
     file_path: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RunSubmitEnvelope {
+    kickoff: Option<bool>,
+    spec: Option<RunSubmitSpec>,
+    run_spec: Option<RunSubmitSpec>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum RunSubmitPayload {
+    Spec(RunSubmitSpec),
+    Envelope(RunSubmitEnvelope),
+}
+
+#[derive(Debug, Deserialize)]
+struct RunEventsQuery {
+    limit: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -186,6 +207,13 @@ pub fn build_app(state: UiServerState) -> Router {
         .route("/api/task/watch/:task_id", get(task_watch))
         .route("/api/task/decision/:task_id", get(task_decision))
         .route("/api/task/run-real", post(task_run_real))
+        .route("/api/run/submit", post(run_submit))
+        .route("/api/run/kickoff/:run_id", post(run_kickoff))
+        .route("/api/run/watch/:run_id", get(run_watch))
+        .route("/api/run/result/:run_id", get(run_result))
+        .route("/api/run/events/:run_id", get(run_events))
+        .route("/api/run/cancel/:run_id", post(run_cancel))
+        .route("/api/run/retry/:run_id", post(run_retry))
         .route("/api/knowledge/export", post(knowledge_export))
         .route("/api/topic/messages", get(topic_messages))
         .route("/api/topic/messages", post(topic_message_post))
@@ -455,6 +483,156 @@ async fn task_run_real(
     .await
     .map_err(|err| anyhow!("task join error: {err}"))??;
     Ok(Json(json!({"ok": true, "result": output})))
+}
+
+fn unpack_run_submit_payload(payload: RunSubmitPayload) -> Result<(RunSubmitSpec, bool)> {
+    match payload {
+        RunSubmitPayload::Spec(spec) => Ok((spec, false)),
+        RunSubmitPayload::Envelope(envelope) => {
+            let spec = envelope
+                .spec
+                .or(envelope.run_spec)
+                .ok_or_else(|| anyhow!("spec or run_spec is required"))?;
+            Ok((spec, envelope.kickoff.unwrap_or(false)))
+        }
+    }
+}
+
+async fn run_submit(
+    State(state): State<UiServerState>,
+    Json(payload): Json<RunSubmitPayload>,
+) -> Result<Json<Value>, ApiError> {
+    let (spec, kickoff) = unpack_run_submit_payload(payload)?;
+    let state_clone = state.clone();
+    let pg_url = run_control::resolve_run_queue_pg_url(None);
+    let payload = run_blocking(move || {
+        run_control::submit_run(
+            &state_clone.state_dir,
+            &state_clone.db_path,
+            &pg_url,
+            spec,
+            kickoff,
+        )
+    })
+    .await?;
+    Ok(Json(payload))
+}
+
+async fn run_kickoff(
+    State(state): State<UiServerState>,
+    Path(run_id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let run_id_clone = run_id.clone();
+    let state_clone = state.clone();
+    let pg_url = run_control::resolve_run_queue_pg_url(None);
+    let payload = run_blocking(move || {
+        run_control::kickoff_run(
+            &state_clone.state_dir,
+            &state_clone.db_path,
+            &pg_url,
+            &run_id_clone,
+        )
+    })
+    .await?;
+    Ok(Json(payload))
+}
+
+async fn run_watch(
+    State(state): State<UiServerState>,
+    Path(run_id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let run_id_clone = run_id.clone();
+    let state_clone = state.clone();
+    let pg_url = run_control::resolve_run_queue_pg_url(None);
+    let watch = run_blocking(move || {
+        run_control::watch_run(
+            &state_clone.state_dir,
+            &state_clone.db_path,
+            &pg_url,
+            &run_id_clone,
+        )
+    })
+    .await?;
+    Ok(Json(json!({"ok": true, "watch": watch})))
+}
+
+async fn run_result(
+    State(state): State<UiServerState>,
+    Path(run_id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let run_id_clone = run_id.clone();
+    let state_clone = state.clone();
+    let pg_url = run_control::resolve_run_queue_pg_url(None);
+    let result = run_blocking(move || {
+        run_control::run_result(
+            &state_clone.state_dir,
+            &state_clone.db_path,
+            &pg_url,
+            &run_id_clone,
+        )
+    })
+    .await?;
+    Ok(Json(json!({"ok": true, "result": result})))
+}
+
+async fn run_events(
+    State(state): State<UiServerState>,
+    Path(run_id): Path<String>,
+    Query(query): Query<RunEventsQuery>,
+) -> Result<Json<Value>, ApiError> {
+    let run_id_clone = run_id.clone();
+    let limit = query.limit.unwrap_or(50).max(1);
+    let state_clone = state.clone();
+    let pg_url = run_control::resolve_run_queue_pg_url(None);
+    let events = run_blocking(move || {
+        run_control::run_events(
+            &state_clone.state_dir,
+            &state_clone.db_path,
+            &pg_url,
+            &run_id_clone,
+            limit,
+        )
+    })
+    .await?;
+    Ok(Json(json!({"ok": true, "events": events})))
+}
+
+async fn run_cancel(
+    State(state): State<UiServerState>,
+    Path(run_id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let run_id_clone = run_id.clone();
+    let state_clone = state.clone();
+    let pg_url = run_control::resolve_run_queue_pg_url(None);
+    let payload = run_blocking(move || {
+        run_control::cancel_run(
+            &state_clone.state_dir,
+            &state_clone.db_path,
+            &pg_url,
+            &run_id_clone,
+        )
+    })
+    .await?;
+    Ok(Json(payload))
+}
+
+async fn run_retry(
+    State(state): State<UiServerState>,
+    Path(run_id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let run_id_clone = run_id.clone();
+    let state_clone = state.clone();
+    let pg_url = run_control::resolve_run_queue_pg_url(None);
+    let payload = run_blocking(move || {
+        run_control::retry_run(
+            &state_clone.state_dir,
+            &state_clone.db_path,
+            &pg_url,
+            &run_id_clone,
+        )
+    })
+    .await?;
+    Ok(Json(payload))
 }
 
 async fn knowledge_export(

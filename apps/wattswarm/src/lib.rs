@@ -10,6 +10,8 @@ pub mod run_queue {
     pub use wattswarm_run_queue::*;
 }
 
+pub mod run_control;
+
 pub mod task_template {
     pub use wattswarm_control_plane::task_template::*;
 }
