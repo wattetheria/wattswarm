@@ -3,6 +3,9 @@ use crate::control::{
     load_executor_registry, local_node_id, node_state_path, open_node, resolve_node_mode,
     run_real_task_flow, save_executor_registry, write_node_state,
 };
+use crate::egress_agent::{
+    EgressAgentConfig, egress_agent_config_path, load_egress_agent_config, save_egress_agent_config,
+};
 use crate::run_control;
 use crate::run_queue::RunSubmitSpec;
 use crate::swarm_dashboard_engine::{SwarmDashboardState, build_dashboard_state, tick_real_swarm};
@@ -202,6 +205,13 @@ pub fn build_app(state: UiServerState) -> Router {
         .route("/api/executors/add", post(executors_add))
         .route("/api/executors/list", get(executors_list))
         .route("/api/executors/check", post(executors_check))
+        .route("/api/egress-agent", get(egress_agent_get))
+        .route("/api/egress-agent", post(egress_agent_save))
+        .route("/api/a2a/google/agent-card", get(google_a2a_agent_card))
+        .route(
+            "/api/a2a/google/message/send",
+            post(google_a2a_message_send),
+        )
         .route("/api/task/sample", get(task_sample))
         .route("/api/task/submit", post(task_submit))
         .route("/api/task/watch/:task_id", get(task_watch))
@@ -221,6 +231,7 @@ pub fn build_app(state: UiServerState) -> Router {
         .route("/api/topic/subscriptions", post(topic_subscription_post))
         .route("/api/swarm/state", get(swarm_state))
         .route("/api/swarm/tick", post(swarm_tick))
+        .route("/.well-known/agent.json", get(google_a2a_well_known))
         .with_state(state)
 }
 
@@ -376,6 +387,91 @@ async fn executors_check(
         .await?
         .error_for_status()?;
     Ok(Json(json!({"ok": true})))
+}
+
+async fn egress_agent_get(State(state): State<UiServerState>) -> Result<Json<Value>, ApiError> {
+    let state_clone = state.clone();
+    let config = run_blocking(move || {
+        load_egress_agent_config(&egress_agent_config_path(&state_clone.state_dir))
+    })
+    .await?;
+    Ok(Json(json!({"ok": true, "config": config})))
+}
+
+async fn egress_agent_save(
+    State(state): State<UiServerState>,
+    Json(config): Json<EgressAgentConfig>,
+) -> Result<Json<Value>, ApiError> {
+    let state_clone = state.clone();
+    let normalized = config.normalized();
+    let saved = normalized.clone();
+    run_blocking(move || {
+        save_egress_agent_config(
+            &egress_agent_config_path(&state_clone.state_dir),
+            &normalized,
+        )
+    })
+    .await?;
+    Ok(Json(json!({"ok": true, "config": saved})))
+}
+
+async fn google_a2a_agent_card(
+    State(state): State<UiServerState>,
+) -> Result<Json<Value>, ApiError> {
+    let card = load_google_a2a_agent_card(&state, false).await?;
+    Ok(Json(card))
+}
+
+async fn google_a2a_well_known(
+    State(state): State<UiServerState>,
+) -> Result<Json<Value>, ApiError> {
+    let card = load_google_a2a_agent_card(&state, true).await?;
+    Ok(Json(card))
+}
+
+async fn google_a2a_message_send(
+    State(state): State<UiServerState>,
+    Json(payload): Json<Value>,
+) -> Result<Json<Value>, ApiError> {
+    let state_clone = state.clone();
+    let request = serde_json::from_value::<crate::a2a::GoogleA2aSendRequest>(payload)
+        .map_err(|err| anyhow!("invalid google a2a message/send request: {err}"))?;
+    let response = run_blocking(move || {
+        let config = load_egress_agent_config(&egress_agent_config_path(&state_clone.state_dir))?;
+        if !config.enabled {
+            return Err(anyhow!("egress agent is disabled"));
+        }
+        if !matches!(config.protocol, crate::a2a::InvocationProtocol::GoogleA2a) {
+            return Err(anyhow!("egress agent protocol is not google_a2a"));
+        }
+        let pg_url = run_control::resolve_run_queue_pg_url(None);
+        crate::a2a::handle_google_message_send(
+            &state_clone.state_dir,
+            &state_clone.db_path,
+            &pg_url,
+            &config,
+            request,
+        )
+    })
+    .await?;
+    Ok(Json(response))
+}
+
+async fn load_google_a2a_agent_card(
+    state: &UiServerState,
+    require_enabled: bool,
+) -> Result<Value, ApiError> {
+    let state_clone = state.clone();
+    let card = run_blocking(move || {
+        let config = load_egress_agent_config(&egress_agent_config_path(&state_clone.state_dir))?;
+        if require_enabled && !config.enabled {
+            return Err(anyhow!("egress agent is disabled"));
+        }
+        let node_id = local_node_id(&state_clone.state_dir)?;
+        crate::a2a::build_agent_card(&config, &node_id)
+    })
+    .await?;
+    Ok(card)
 }
 
 async fn task_sample(

@@ -288,6 +288,42 @@ pub const INDEX_HTML: &str = r#"<!DOCTYPE html>
         </div>
 
         <div class="card">
+          <h2>Egress Agent</h2>
+          <div class="row">
+            <label><input id="egressEnabled" type="checkbox" /> enabled</label>
+            <label><input id="egressPublish" type="checkbox" /> publish</label>
+            <label><input id="egressInbound" type="checkbox" /> inbound</label>
+          </div>
+          <div class="row">
+            <input id="egressAgentId" placeholder="agent_id" value="egress-agent" />
+            <input id="egressDisplayName" placeholder="display name" value="WattSwarm Egress Agent" />
+          </div>
+          <div class="row">
+            <select id="egressMode">
+              <option value="group_representative">group_representative</option>
+              <option value="direct_gateway">direct_gateway</option>
+            </select>
+            <select id="egressProtocol">
+              <option value="google_a2a">google_a2a</option>
+            </select>
+          </div>
+          <div class="row">
+            <input id="egressExecutor" placeholder="target executor (optional)" />
+            <input id="egressProfile" placeholder="profile" value="default"/>
+          </div>
+          <div class="row">
+            <input id="egressPublicBaseUrl" placeholder="public base url (e.g. https://node.example.com)" />
+          </div>
+          <textarea id="egressDescription" placeholder="description">Node-facing gateway agent for external invocation and outbound result publishing.</textarea>
+          <textarea id="egressSkillsJson" placeholder='skills JSON'>[]</textarea>
+          <div class="row">
+            <button onclick="loadEgressAgent()">load</button>
+            <button onclick="saveEgressAgent()" class="alt">save</button>
+            <button onclick="previewGoogleAgentCard()" class="ghost">agent card</button>
+          </div>
+        </div>
+
+        <div class="card">
           <h2>Task</h2>
           <div class="row">
             <input id="sampleTaskId" placeholder="sample task_id" value="task-ui-1"/>
@@ -404,6 +440,7 @@ pub const INDEX_HTML: &str = r#"<!DOCTYPE html>
     }
     setStatus("", "js-ready");
     pushEvent("ready");
+    loadEgressAgent();
 
     async function api(method, url, body) {
       const controller = new AbortController();
@@ -439,6 +476,56 @@ pub const INDEX_HTML: &str = r#"<!DOCTYPE html>
       } finally {
         clearTimeout(timer);
       }
+    }
+    async function loadEgressAgent() {
+      try {
+        const res = await fetch("/api/egress-agent");
+        const data = await res.json();
+        if (!res.ok || !data.ok) throw new Error(data.error || `HTTP ${res.status}`);
+        const cfg = data.config || {};
+        document.getElementById("egressEnabled").checked = !!cfg.enabled;
+        document.getElementById("egressPublish").checked = !!cfg.publish_to_network;
+        document.getElementById("egressInbound").checked = !!cfg.accept_inbound_invocations;
+        document.getElementById("egressAgentId").value = cfg.agent_id || "egress-agent";
+        document.getElementById("egressDisplayName").value = cfg.display_name || "WattSwarm Egress Agent";
+        document.getElementById("egressMode").value = cfg.mode || "group_representative";
+        document.getElementById("egressProtocol").value = cfg.protocol || "google_a2a";
+        document.getElementById("egressExecutor").value = cfg.executor || "";
+        document.getElementById("egressProfile").value = cfg.profile || "default";
+        document.getElementById("egressPublicBaseUrl").value = cfg.public_base_url || "";
+        document.getElementById("egressDescription").value = cfg.description || "";
+        document.getElementById("egressSkillsJson").value = JSON.stringify(cfg.skills || [], null, 2);
+      } catch (err) {
+        pushEvent(`error -> ${String(err)}`);
+      }
+    }
+    function buildEgressPayload() {
+      return {
+        enabled: document.getElementById("egressEnabled").checked,
+        publish_to_network: document.getElementById("egressPublish").checked,
+        accept_inbound_invocations: document.getElementById("egressInbound").checked,
+        agent_id: document.getElementById("egressAgentId").value,
+        display_name: document.getElementById("egressDisplayName").value,
+        mode: document.getElementById("egressMode").value,
+        protocol: document.getElementById("egressProtocol").value,
+        executor: document.getElementById("egressExecutor").value || null,
+        profile: document.getElementById("egressProfile").value,
+        public_base_url: document.getElementById("egressPublicBaseUrl").value,
+        description: document.getElementById("egressDescription").value,
+        skills: JSON.parse(document.getElementById("egressSkillsJson").value || "[]")
+      };
+    }
+    function saveEgressAgent() {
+      try {
+        api("POST", "/api/egress-agent", buildEgressPayload());
+      } catch (err) {
+        showResponse({ ok: false, error: String(err) });
+        setStatus("err", "egress-save-failed");
+        pushEvent(`error -> ${String(err)}`);
+      }
+    }
+    function previewGoogleAgentCard() {
+      api("GET", "/api/a2a/google/agent-card");
     }
     async function loadSample() {
       try {

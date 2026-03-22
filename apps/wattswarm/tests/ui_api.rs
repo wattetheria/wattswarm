@@ -1,6 +1,10 @@
 use axum::body::{Body, to_bytes};
 use axum::http::{Request, StatusCode};
 use serde_json::{Value, json};
+use std::io::{Read, Write};
+use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 use tempfile::tempdir;
 use tower::ServiceExt;
@@ -50,6 +54,117 @@ impl Drop for EnvVarGuard {
 
 struct DbTestLock {
     conn: Connection,
+}
+
+#[derive(Clone)]
+struct UiStubRuntimeConfig {
+    health_body: String,
+    capabilities_body: String,
+    execute_body: String,
+}
+
+struct UiStubRuntimeServer {
+    addr: SocketAddr,
+    stop: Arc<AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl UiStubRuntimeServer {
+    fn start(cfg: UiStubRuntimeConfig) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind stub listener");
+        listener
+            .set_nonblocking(true)
+            .expect("set nonblocking listener");
+        let addr = listener.local_addr().expect("listener local addr");
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_flag = Arc::clone(&stop);
+        let handle = std::thread::spawn(move || {
+            while !stop_flag.load(Ordering::Relaxed) {
+                match listener.accept() {
+                    Ok((stream, _)) => handle_stub_conn(stream, &cfg),
+                    Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        Self {
+            addr,
+            stop,
+            handle: Some(handle),
+        }
+    }
+
+    fn base_url(&self) -> String {
+        format!("http://{}", self.addr)
+    }
+}
+
+impl Drop for UiStubRuntimeServer {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        let _ = TcpStream::connect(self.addr);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+fn wait_for_stub_listener(server: &UiStubRuntimeServer) {
+    for _ in 0..50 {
+        if TcpStream::connect(server.addr).is_ok() {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    panic!("stub listener did not become reachable in time");
+}
+
+fn write_stub_response(mut stream: TcpStream, status: u16, body: &str) {
+    let status_text = match status {
+        200 => "OK",
+        400 => "Bad Request",
+        404 => "Not Found",
+        500 => "Internal Server Error",
+        _ => "Status",
+    };
+    let response = format!(
+        "HTTP/1.1 {} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        status,
+        status_text,
+        body.len(),
+        body
+    );
+    let _ = stream.write_all(response.as_bytes());
+    let _ = stream.flush();
+}
+
+fn handle_stub_conn(mut stream: TcpStream, cfg: &UiStubRuntimeConfig) {
+    let mut buf = [0_u8; 8192];
+    let n = stream.read(&mut buf).unwrap_or(0);
+    if n == 0 {
+        return;
+    }
+    let req = String::from_utf8_lossy(&buf[..n]);
+    let line = req.lines().next().unwrap_or_default();
+    if line.starts_with("GET /health ") {
+        return write_stub_response(stream, 200, &cfg.health_body);
+    }
+    if line.starts_with("GET /capabilities ") {
+        return write_stub_response(stream, 200, &cfg.capabilities_body);
+    }
+    if line.starts_with("POST /execute ") {
+        return write_stub_response(stream, 200, &cfg.execute_body);
+    }
+    if line.starts_with("POST /verify ") {
+        return write_stub_response(
+            stream,
+            200,
+            "{\"passed\":true,\"score\":1.0,\"reason_codes\":[100],\"verifier_result_hash\":\"vr-stub\",\"provider_family\":\"stub\",\"model_id\":\"stub-1\"}",
+        );
+    }
+    write_stub_response(stream, 404, "{}")
 }
 
 impl DbTestLock {
@@ -739,5 +854,417 @@ fn ui_exposes_run_queue_http_apis() {
             .filter_map(|event| event["event_type"].as_str())
             .collect();
         assert!(retry_event_types.contains(&"RUN_RETRY_REQUESTED"));
+    });
+}
+
+#[test]
+fn ui_exposes_egress_agent_config_and_google_a2a_card() {
+    let _guard = env_lock();
+    let _db_lock = DbTestLock::acquire();
+    reset_test_schema("test");
+    let _schema_guard = EnvVarGuard::set("WATTSWARM_PG_SCHEMA", "test");
+    let dir = tempdir().unwrap();
+    let state_dir = dir.path().join("state");
+    std::fs::create_dir_all(&state_dir).unwrap();
+    let db_path = state_dir.join("ui.state");
+    let app = build_app(UiServerState::new(state_dir.clone(), db_path));
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let get_default_res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/egress-agent")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(get_default_res.status(), StatusCode::OK);
+        let get_default_json = json_from(get_default_res).await;
+        assert_eq!(
+            get_default_json["config"]["agent_id"].as_str(),
+            Some("egress-agent")
+        );
+        assert_eq!(get_default_json["config"]["enabled"].as_bool(), Some(false));
+
+        let disabled_well_known_res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/.well-known/agent.json")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(disabled_well_known_res.status(), StatusCode::BAD_REQUEST);
+
+        let save_res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/egress-agent")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({
+                            "enabled": true,
+                            "agent_id": "twilio-egress",
+                            "display_name": "Twilio Bridge",
+                            "description": "Bridges outbound SMS requests through a local Twilio adapter.",
+                            "protocol": "google_a2a",
+                            "mode": "direct_gateway",
+                            "executor": "twilio-http",
+                            "profile": "default",
+                            "public_base_url": "https://node.example.com",
+                            "publish_to_network": true,
+                            "accept_inbound_invocations": true,
+                            "skills": [
+                                {
+                                    "id": "send_sms",
+                                    "name": "Send SMS",
+                                    "description": "Sends outbound SMS via a local adapter.",
+                                    "tags": ["twilio", "sms"]
+                                }
+                            ]
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(save_res.status(), StatusCode::OK);
+        let save_json = json_from(save_res).await;
+        assert_eq!(save_json["config"]["enabled"].as_bool(), Some(true));
+        assert_eq!(
+            save_json["config"]["executor"].as_str(),
+            Some("twilio-http")
+        );
+
+        let get_saved_res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/egress-agent")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let get_saved_json = json_from(get_saved_res).await;
+        assert_eq!(
+            get_saved_json["config"]["agent_id"].as_str(),
+            Some("twilio-egress")
+        );
+        assert_eq!(
+            get_saved_json["config"]["skills"][0]["id"].as_str(),
+            Some("send_sms")
+        );
+
+        let card_res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/a2a/google/agent-card")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(card_res.status(), StatusCode::OK);
+        let card_json = json_from(card_res).await;
+        assert_eq!(card_json["protocol"].as_str(), Some("google_a2a"));
+        assert_eq!(card_json["name"].as_str(), Some("Twilio Bridge"));
+        assert_eq!(
+            card_json["url"].as_str(),
+            Some("https://node.example.com/a2a/google")
+        );
+        assert_eq!(
+            card_json["metadata"]["agent_id"].as_str(),
+            Some("twilio-egress")
+        );
+        assert_eq!(
+            card_json["skills"][0]["id"].as_str(),
+            Some("send_sms")
+        );
+
+        let well_known_res = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/.well-known/agent.json")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(well_known_res.status(), StatusCode::OK);
+        let well_known_json = json_from(well_known_res).await;
+        assert_eq!(well_known_json, card_json);
+    });
+}
+
+#[test]
+fn ui_google_a2a_message_send_supports_direct_and_group_modes() {
+    let _guard = env_lock();
+    let _db_lock = DbTestLock::acquire();
+    reset_test_schema("test");
+    let _schema_guard = EnvVarGuard::set("WATTSWARM_PG_SCHEMA", "test");
+    let dir = tempdir().unwrap();
+    let state_dir = dir.path().join("state");
+    std::fs::create_dir_all(&state_dir).unwrap();
+    let db_path = state_dir.join("ui.state");
+    let app = build_app(UiServerState::new(state_dir.clone(), db_path));
+    let runtime_server = UiStubRuntimeServer::start(UiStubRuntimeConfig {
+        health_body: "{}".to_owned(),
+        capabilities_body: json!({
+            "task_types": ["a2a_invoke"],
+            "profiles": ["default"],
+            "provider_family": "stub",
+            "model_id": "stub-1"
+        })
+        .to_string(),
+        execute_body: json!({
+            "candidate_output": {"decision":"SENT","answer":"sent"},
+            "evidence_inline": [],
+            "evidence_refs": []
+        })
+        .to_string(),
+    });
+    wait_for_stub_listener(&runtime_server);
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let disabled_res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/a2a/google/message/send")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({
+                            "jsonrpc": "2.0",
+                            "id": "req-disabled",
+                            "method": "message/send",
+                            "params": {
+                                "targetAgentId": "egress-agent",
+                                "capability": "send_sms",
+                                "message": {
+                                    "role": "user",
+                                    "parts": [{"type":"data","data":{"to":"+61","body":"hello"}}]
+                                }
+                            }
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(disabled_res.status(), StatusCode::BAD_REQUEST);
+
+        let save_direct_res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/egress-agent")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({
+                            "enabled": true,
+                            "agent_id": "twilio-egress",
+                            "display_name": "Twilio Bridge",
+                            "description": "Bridge agent",
+                            "protocol": "google_a2a",
+                            "mode": "direct_gateway",
+                            "executor": "twilio-http",
+                            "profile": "default",
+                            "public_base_url": "https://node.example.com",
+                            "publish_to_network": true,
+                            "accept_inbound_invocations": true,
+                            "skills": [{"id":"send_sms","name":"Send SMS"}]
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(save_direct_res.status(), StatusCode::OK);
+
+        let add_exec_res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/executors/add")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({
+                            "name": "twilio-http",
+                            "base_url": runtime_server.base_url()
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(add_exec_res.status(), StatusCode::OK);
+
+        let direct_res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/a2a/google/message/send")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({
+                            "jsonrpc": "2.0",
+                            "id": "req-direct",
+                            "method": "message/send",
+                            "params": {
+                                "targetAgentId": "twilio-egress",
+                                "capability": "send_sms",
+                                "message": {
+                                    "role": "user",
+                                    "parts": [{"type":"data","data":{"to":"+61400000000","body":"hello"}}]
+                                },
+                                "extensions": {
+                                    "auth_proof": {"kind":"did"},
+                                    "payment_proof": {"kind":"watt"},
+                                    "signature": "sig-1"
+                                }
+                            }
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let direct_status = direct_res.status();
+        let direct_bytes = to_bytes(direct_res.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(
+            direct_status,
+            StatusCode::OK,
+            "direct gateway body: {}",
+            String::from_utf8_lossy(&direct_bytes)
+        );
+        let direct_json: Value = serde_json::from_slice(&direct_bytes).unwrap();
+        assert_eq!(direct_json["jsonrpc"].as_str(), Some("2.0"));
+        assert_eq!(direct_json["id"].as_str(), Some("req-direct"));
+        assert_eq!(direct_json["result"]["status"].as_str(), Some("completed"));
+        assert_eq!(
+            direct_json["result"]["extensions"]["receipt"]["mode"].as_str(),
+            Some("direct_gateway")
+        );
+        assert_eq!(
+            direct_json["result"]["artifacts"][0]["candidate_output"]["decision"].as_str(),
+            Some("SENT")
+        );
+
+        let save_group_res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/egress-agent")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({
+                            "enabled": true,
+                            "agent_id": "team-egress",
+                            "display_name": "Team Bridge",
+                            "protocol": "google_a2a",
+                            "mode": "group_representative",
+                            "profile": "default",
+                            "public_base_url": "https://node.example.com"
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(save_group_res.status(), StatusCode::OK);
+
+        let group_run_id = "run-a2a-group";
+        let group_res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/a2a/google/message/send")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({
+                            "jsonrpc": "2.0",
+                            "id": "req-group",
+                            "method": "message/send",
+                            "params": {
+                                "targetAgentId": "team-egress",
+                                "capability": "resume_review",
+                                "message": {
+                                    "role": "user",
+                                    "parts": [{"type":"data","data":{"resume":"alex"}}]
+                                },
+                                "extensions": {
+                                    "kickoff": true,
+                                    "run_spec": sample_run_spec(group_run_id)
+                                }
+                            }
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(group_res.status(), StatusCode::OK);
+        let group_json = json_from(group_res).await;
+        assert_eq!(group_json["id"].as_str(), Some("req-group"));
+        assert_eq!(group_json["result"]["status"].as_str(), Some("accepted"));
+        assert_eq!(
+            group_json["result"]["extensions"]["receipt"]["mode"].as_str(),
+            Some("group_representative")
+        );
+        assert_eq!(
+            group_json["result"]["extensions"]["receipt"]["run_id"].as_str(),
+            Some(group_run_id)
+        );
+
+        let run_watch_res = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(format!("/api/run/watch/{group_run_id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(run_watch_res.status(), StatusCode::OK);
+        let run_watch_json = json_from(run_watch_res).await;
+        assert_eq!(
+            run_watch_json["watch"]["run_id"].as_str(),
+            Some(group_run_id)
+        );
     });
 }

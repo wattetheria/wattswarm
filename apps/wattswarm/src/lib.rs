@@ -10,6 +10,8 @@ pub mod run_queue {
     pub use wattswarm_run_queue::*;
 }
 
+pub mod a2a;
+pub mod egress_agent;
 pub mod run_control;
 
 pub mod task_template {
