@@ -1,0 +1,24 @@
+syntax = "proto3";
+
+package wattswarm.wattetheria.sync;
+
+message ProjectionStreamRequest {
+  uint64 poll_interval_ms = 1;
+  uint32 limit = 2;
+  string feed_key = 3;
+  string scope_hint = 4;
+  string subscriber_node_id = 5;
+}
+
+message ProjectionFrame {
+  string kind = 1;
+  string cursor = 2;
+  uint64 generated_at = 3;
+  string json_payload = 4;
+}
+
+service WattetheriaSyncService {
+  rpc StreamNetworkProjection(ProjectionStreamRequest) returns (stream ProjectionFrame);
+  rpc StreamTaskRunProjection(ProjectionStreamRequest) returns (stream ProjectionFrame);
+  rpc StreamTopicActivity(ProjectionStreamRequest) returns (stream ProjectionFrame);
+}

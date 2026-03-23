@@ -6,11 +6,16 @@ use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
+use std::time::Duration;
 use tempfile::tempdir;
+use tonic::Request as GrpcRequest;
 use tower::ServiceExt;
 use wattswarm::control::open_node;
 use wattswarm::types::{EventPayload, FeedSubscriptionUpdatedPayload, TopicMessagePostedPayload};
 use wattswarm::ui::{UiServerState, build_app};
+use wattswarm::wattetheria_sync;
+use wattswarm::wattetheria_sync::proto::ProjectionStreamRequest;
+use wattswarm::wattetheria_sync::proto::wattetheria_sync_service_client::WattetheriaSyncServiceClient;
 use wattswarm_storage_core::storage::pg::Connection;
 
 static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -119,6 +124,13 @@ fn wait_for_stub_listener(server: &UiStubRuntimeServer) {
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
     panic!("stub listener did not become reachable in time");
+}
+
+fn reserve_local_addr() -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind free local addr");
+    let addr = listener.local_addr().expect("local addr");
+    drop(listener);
+    addr
 }
 
 fn write_stub_response(mut stream: TcpStream, status: u16, body: &str) {
@@ -1266,5 +1278,536 @@ fn ui_google_a2a_message_send_supports_direct_and_group_modes() {
             run_watch_json["watch"]["run_id"].as_str(),
             Some(group_run_id)
         );
+    });
+}
+
+#[test]
+fn ui_exposes_wattetheria_sync_http_boundaries() {
+    let _guard = env_lock();
+    let _db_lock = DbTestLock::acquire();
+    reset_test_schema("test");
+    let _schema_guard = EnvVarGuard::set("WATTSWARM_PG_SCHEMA", "test");
+    let dir = tempdir().unwrap();
+    let state_dir = dir.path().join("state");
+    std::fs::create_dir_all(&state_dir).unwrap();
+    let db_path = state_dir.join("ui.state");
+    let app = build_app(UiServerState::new(state_dir.clone(), db_path.clone()));
+    let runtime_server = UiStubRuntimeServer::start(UiStubRuntimeConfig {
+        health_body: "{}".to_owned(),
+        capabilities_body: json!({
+            "task_types": ["a2a_invoke", "resume_review"],
+            "profiles": ["default"],
+            "provider_family": "stub",
+            "model_id": "stub-1"
+        })
+        .to_string(),
+        execute_body: json!({
+            "candidate_output": {"decision":"PASS","answer":"sync-ok"},
+            "evidence_inline": [],
+            "evidence_refs": []
+        })
+        .to_string(),
+    });
+    wait_for_stub_listener(&runtime_server);
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let node_up_res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/node/up")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(node_up_res.status(), StatusCode::OK);
+
+        let add_exec_res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/executors/add")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({
+                            "name": "rt-sync",
+                            "base_url": runtime_server.base_url()
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(add_exec_res.status(), StatusCode::OK);
+
+        let network_snapshot_res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/wattetheria/network/snapshot")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(network_snapshot_res.status(), StatusCode::OK);
+        let network_snapshot = json_from(network_snapshot_res).await;
+        assert_eq!(network_snapshot["running"].as_bool(), Some(true));
+        assert!(network_snapshot["node_id"].as_str().is_some());
+        assert!(network_snapshot["org_id"].as_str().is_some());
+
+        let subscribe_res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/topic/subscriptions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({
+                            "feed_key": "crew.chat",
+                            "scope_hint": "group:crew-7",
+                            "active": true
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(subscribe_res.status(), StatusCode::OK);
+
+        let publish_res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/wattetheria/brain/publish-topic")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({
+                            "feed_key": "crew.chat",
+                            "scope_hint": "group:crew-7",
+                            "content": {"text": "hello from wattetheria brain"}
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(publish_res.status(), StatusCode::OK);
+
+        let sample_res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/task/sample?task_id=task-wattetheria-grpc")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(sample_res.status(), StatusCode::OK);
+        let contract = json_from(sample_res).await["contract"].clone();
+        let submit_task_res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/task/submit")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({ "contract": contract })).unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(submit_task_res.status(), StatusCode::OK);
+        let publish_json = json_from(publish_res).await;
+        assert_eq!(publish_json["ok"].as_bool(), Some(true));
+        assert_eq!(publish_json["feed_key"].as_str(), Some("crew.chat"));
+
+        let topic_activity_res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/wattetheria/topic/activity?feed_key=crew.chat&scope_hint=group:crew-7&limit=5")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(topic_activity_res.status(), StatusCode::OK);
+        let topic_activity = json_from(topic_activity_res).await;
+        assert_eq!(
+            topic_activity["messages"][0]["content"]["text"].as_str(),
+            Some("hello from wattetheria brain")
+        );
+        assert_eq!(topic_activity["feed_key"].as_str(), Some("crew.chat"));
+
+        let run_id = "run-wattetheria-http";
+        let submit_run_res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/wattetheria/brain/submit-run")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({
+                            "kickoff": true,
+                            "spec": sample_run_spec(run_id)
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(submit_run_res.status(), StatusCode::OK);
+        let submit_run_json = json_from(submit_run_res).await;
+        assert_eq!(submit_run_json["run_id"].as_str(), Some(run_id));
+        assert_eq!(submit_run_json["kicked_off"].as_bool(), Some(true));
+
+        let sample_res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/task/sample?task_id=task-sync-http")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(sample_res.status(), StatusCode::OK);
+        let sample_json = json_from(sample_res).await;
+        let contract = sample_json["contract"].clone();
+
+        let submit_task_res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/task/submit")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({"contract": contract})).unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(submit_task_res.status(), StatusCode::OK);
+
+        let task_decision_res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/wattetheria/task/decision/task-sync-http")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(task_decision_res.status(), StatusCode::OK);
+        let task_decision_json = json_from(task_decision_res).await;
+        assert_eq!(
+            task_decision_json["task_id"].as_str(),
+            Some("task-sync-http")
+        );
+
+        let run_real_sample_res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/task/sample?task_id=task-sync-http-real")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(run_real_sample_res.status(), StatusCode::OK);
+        let run_real_contract = json_from(run_real_sample_res).await["contract"].clone();
+        let run_real_file = state_dir.join("task-sync-http-real.json");
+        std::fs::write(
+            &run_real_file,
+            serde_json::to_vec(&run_real_contract).expect("serialize run-real contract"),
+        )
+        .expect("write run-real contract");
+
+        let run_real_res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/wattetheria/brain/run-task-real")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({
+                            "executor": "rt-sync",
+                            "profile": "default",
+                            "file_path": run_real_file
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let run_real_status = run_real_res.status();
+        let run_real_bytes = to_bytes(run_real_res.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(
+            run_real_status,
+            StatusCode::OK,
+            "brain run-task-real body: {}",
+            String::from_utf8_lossy(&run_real_bytes)
+        );
+        let run_real_json: Value = serde_json::from_slice(&run_real_bytes).unwrap();
+        assert_eq!(
+            run_real_json["result"]["candidate_output"]["decision"].as_str(),
+            Some("PASS")
+        );
+
+        let run_result_res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(format!("/api/wattetheria/run/result/{run_id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(run_result_res.status(), StatusCode::OK);
+        let run_result_json = json_from(run_result_res).await;
+        assert_eq!(
+            run_result_json["result"]["run_id"].as_str(),
+            Some(run_id)
+        );
+
+        let run_events_res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(format!("/api/wattetheria/run/events/{run_id}?limit=10"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(run_events_res.status(), StatusCode::OK);
+        let run_events_json = json_from(run_events_res).await;
+        let run_event_types: Vec<_> = run_events_json["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|event| event["event_type"].as_str())
+            .collect();
+        assert!(run_event_types.contains(&"RUN_CREATED"));
+        assert!(run_event_types.contains(&"RUN_KICKOFF"));
+
+        let knowledge_export_res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/wattetheria/knowledge/export")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({
+                            "task_id": "task-sync-http"
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(knowledge_export_res.status(), StatusCode::OK);
+        let knowledge_export_json = json_from(knowledge_export_res).await;
+        assert_eq!(knowledge_export_json["ok"].as_bool(), Some(true));
+        assert!(knowledge_export_json["knowledge"].is_object());
+
+        let task_run_snapshot_res = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/wattetheria/task-run/snapshot?task_limit=10&run_limit=10")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(task_run_snapshot_res.status(), StatusCode::OK);
+        let task_run_snapshot = json_from(task_run_snapshot_res).await;
+        let recent_runs = task_run_snapshot["recent_runs"].as_array().unwrap();
+        assert!(recent_runs.iter().any(|run| run["run_id"].as_str() == Some(run_id)));
+        let recent_tasks = task_run_snapshot["recent_tasks"].as_array().unwrap();
+        assert!(recent_tasks
+            .iter()
+            .any(|task| task["task_id"].as_str() == Some("task-sync-http")));
+    });
+}
+
+#[test]
+fn ui_exposes_wattetheria_sync_grpc_streams() {
+    let _guard = env_lock();
+    let _db_lock = DbTestLock::acquire();
+    reset_test_schema("test");
+    let _schema_guard = EnvVarGuard::set("WATTSWARM_PG_SCHEMA", "test");
+    let dir = tempdir().unwrap();
+    let state_dir = dir.path().join("state");
+    std::fs::create_dir_all(&state_dir).unwrap();
+    let db_path = state_dir.join("ui.state");
+    let app = build_app(UiServerState::new(state_dir.clone(), db_path.clone()));
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let node_up_res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/node/up")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(node_up_res.status(), StatusCode::OK);
+
+        let publish_res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/wattetheria/brain/publish-topic")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({
+                            "feed_key": "crew.chat",
+                            "scope_hint": "group:crew-stream",
+                            "content": {"text": "stream me"}
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(publish_res.status(), StatusCode::OK);
+
+        let grpc_addr = reserve_local_addr();
+        let grpc_state = UiServerState::new(state_dir.clone(), db_path.clone());
+        let grpc_task = tokio::spawn(async move {
+            wattetheria_sync::serve_grpc(grpc_state, grpc_addr.to_string())
+                .await
+                .expect("serve grpc");
+        });
+
+        let endpoint = format!("http://{grpc_addr}");
+        let mut client = loop {
+            match WattetheriaSyncServiceClient::connect(endpoint.clone()).await {
+                Ok(client) => break client,
+                Err(_) => tokio::time::sleep(Duration::from_millis(50)).await,
+            }
+        };
+
+        let network_frame = tokio::time::timeout(Duration::from_secs(3), async {
+            client
+                .stream_network_projection(GrpcRequest::new(ProjectionStreamRequest {
+                    poll_interval_ms: 250,
+                    limit: 10,
+                    feed_key: String::new(),
+                    scope_hint: String::new(),
+                    subscriber_node_id: String::new(),
+                }))
+                .await
+                .unwrap()
+                .into_inner()
+                .message()
+                .await
+        })
+        .await
+        .expect("network stream timeout")
+        .expect("network stream response")
+        .expect("network frame");
+        assert_eq!(network_frame.kind, "network_projection");
+        let network_json: Value = serde_json::from_str(&network_frame.json_payload).unwrap();
+        assert_eq!(network_json["running"].as_bool(), Some(true));
+
+        let topic_frame = tokio::time::timeout(Duration::from_secs(10), async {
+            client
+                .stream_topic_activity(GrpcRequest::new(ProjectionStreamRequest {
+                    poll_interval_ms: 250,
+                    limit: 10,
+                    feed_key: "crew.chat".to_owned(),
+                    scope_hint: "group:crew-stream".to_owned(),
+                    subscriber_node_id: String::new(),
+                }))
+                .await
+                .unwrap()
+                .into_inner()
+                .message()
+                .await
+        })
+        .await
+        .expect("topic stream timeout")
+        .expect("topic stream response")
+        .expect("topic frame");
+        assert_eq!(topic_frame.kind, "topic_activity");
+        let topic_json: Value = serde_json::from_str(&topic_frame.json_payload).unwrap();
+        assert_eq!(
+            topic_json["messages"][0]["content"]["text"].as_str(),
+            Some("stream me")
+        );
+
+        let task_run_frame = tokio::time::timeout(Duration::from_secs(10), async {
+            client
+                .stream_task_run_projection(GrpcRequest::new(ProjectionStreamRequest {
+                    poll_interval_ms: 250,
+                    limit: 10,
+                    feed_key: String::new(),
+                    scope_hint: String::new(),
+                    subscriber_node_id: String::new(),
+                }))
+                .await
+                .unwrap()
+                .into_inner()
+                .message()
+                .await
+        })
+        .await
+        .expect("task/run stream timeout")
+        .expect("task/run stream response")
+        .expect("task/run frame");
+        assert_eq!(task_run_frame.kind, "task_run_projection");
+        let task_run_json: Value = serde_json::from_str(&task_run_frame.json_payload).unwrap();
+        assert!(task_run_json["recent_tasks"].is_array());
+        assert!(task_run_json["recent_runs"].is_array());
+
+        grpc_task.abort();
+        let _ = grpc_task.await;
     });
 }

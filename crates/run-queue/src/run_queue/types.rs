@@ -225,7 +225,7 @@ pub struct RunSubmitSpec {
     pub aggregation: AggregationPolicy,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct RunView {
     pub run_id: String,
     pub status: String,
@@ -237,7 +237,7 @@ pub struct RunView {
     pub counts: RunStepCounts,
 }
 
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct RunStepCounts {
     pub created: i64,
     pub queued: i64,

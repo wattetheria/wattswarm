@@ -13,6 +13,7 @@ use crate::swarm_dashboard_template::SWARM_DASHBOARD_HTML;
 use crate::task_template::sample_contract;
 use crate::types::TaskContract;
 use crate::ui_template::INDEX_HTML;
+use crate::wattetheria_sync;
 use anyhow::{Context, Result, anyhow};
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
@@ -26,8 +27,8 @@ use std::path::PathBuf;
 
 #[derive(Clone)]
 pub struct UiServerState {
-    state_dir: PathBuf,
-    db_path: PathBuf,
+    pub(crate) state_dir: PathBuf,
+    pub(crate) db_path: PathBuf,
 }
 
 impl UiServerState {
@@ -37,7 +38,7 @@ impl UiServerState {
 }
 
 #[derive(Debug)]
-struct ApiError(anyhow::Error);
+pub(crate) struct ApiError(anyhow::Error);
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
@@ -182,6 +183,20 @@ pub fn run(state_dir: PathBuf, db_path: PathBuf, listen: String) -> Result<()> {
         .context("build tokio runtime for UI")?;
 
     runtime.block_on(async move {
+        if let Some(grpc_listen) = wattetheria_sync::grpc_listen_addr_from_env() {
+            let grpc_state = state.clone();
+            let grpc_listen_task = grpc_listen.clone();
+            tokio::spawn(async move {
+                if let Err(error) =
+                    wattetheria_sync::serve_grpc(grpc_state, grpc_listen_task.clone()).await
+                {
+                    eprintln!(
+                        "wattswarm Wattetheria sync gRPC failed on {grpc_listen_task}: {error}"
+                    );
+                }
+            });
+            eprintln!("wattswarm Wattetheria sync gRPC listening on {grpc_listen}");
+        }
         let app = build_app(state);
         let listener = tokio::net::TcpListener::bind(&listen)
             .await
@@ -229,13 +244,53 @@ pub fn build_app(state: UiServerState) -> Router {
         .route("/api/topic/messages", post(topic_message_post))
         .route("/api/topic/cursor", get(topic_cursor))
         .route("/api/topic/subscriptions", post(topic_subscription_post))
+        .route(
+            "/api/wattetheria/network/snapshot",
+            get(wattetheria_sync::network_snapshot_http),
+        )
+        .route(
+            "/api/wattetheria/task-run/snapshot",
+            get(wattetheria_sync::task_run_snapshot_http),
+        )
+        .route(
+            "/api/wattetheria/task/decision/:task_id",
+            get(wattetheria_sync::task_decision_snapshot_http),
+        )
+        .route(
+            "/api/wattetheria/run/result/:run_id",
+            get(wattetheria_sync::run_result_snapshot_http),
+        )
+        .route(
+            "/api/wattetheria/run/events/:run_id",
+            get(wattetheria_sync::run_events_snapshot_http),
+        )
+        .route(
+            "/api/wattetheria/topic/activity",
+            get(wattetheria_sync::topic_activity_http),
+        )
+        .route(
+            "/api/wattetheria/knowledge/export",
+            post(wattetheria_sync::knowledge_export_snapshot_http),
+        )
+        .route(
+            "/api/wattetheria/brain/publish-topic",
+            post(wattetheria_sync::brain_publish_topic_http),
+        )
+        .route(
+            "/api/wattetheria/brain/submit-run",
+            post(wattetheria_sync::brain_submit_run_http),
+        )
+        .route(
+            "/api/wattetheria/brain/run-task-real",
+            post(wattetheria_sync::brain_run_task_real_http),
+        )
         .route("/api/swarm/state", get(swarm_state))
         .route("/api/swarm/tick", post(swarm_tick))
         .route("/.well-known/agent.json", get(google_a2a_well_known))
         .with_state(state)
 }
 
-async fn run_blocking<T, F>(f: F) -> Result<T, ApiError>
+pub(crate) async fn run_blocking<T, F>(f: F) -> Result<T, ApiError>
 where
     T: Send + 'static,
     F: FnOnce() -> Result<T> + Send + 'static,

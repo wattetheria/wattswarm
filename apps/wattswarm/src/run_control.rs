@@ -59,6 +59,15 @@ pub fn run_result(state_dir: &Path, db_path: &Path, pg_url: &str, run_id: &str) 
     current_org_queue(state_dir, db_path, pg_url)?.run_result(run_id)
 }
 
+pub fn list_runs(
+    state_dir: &Path,
+    db_path: &Path,
+    pg_url: &str,
+    limit: i64,
+) -> Result<Vec<RunView>> {
+    current_org_queue(state_dir, db_path, pg_url)?.list_runs(limit.max(1))
+}
+
 pub fn run_events(
     state_dir: &Path,
     db_path: &Path,

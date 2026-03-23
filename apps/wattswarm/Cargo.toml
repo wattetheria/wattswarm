@@ -27,13 +27,17 @@ test-utils = ["wattswarm-storage-core/test-utils"]
 
 [dependencies]
 anyhow = { workspace = true }
+async-stream = "0.3"
 axum = { workspace = true }
 chrono = { workspace = true }
 clap = { workspace = true }
+prost = "0.13"
 reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["time"] }
+tokio-stream = { version = "0.1", features = ["net"] }
+tonic = { version = "0.12", features = ["transport"] }
 uuid = { workspace = true }
 
 wattswarm-protocol = { workspace = true }
@@ -53,3 +57,7 @@ base64 = { workspace = true }
 predicates = { workspace = true }
 tempfile = { workspace = true }
 tower = { workspace = true }
+
+[build-dependencies]
+protoc-bin-vendored = "3"
+tonic-build = "0.12"

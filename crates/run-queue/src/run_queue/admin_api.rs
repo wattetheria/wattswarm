@@ -256,6 +256,38 @@ impl PgRunQueue {
         })
     }
 
+    pub fn list_runs(&self, limit: i64) -> Result<Vec<RunView>> {
+        let mut client = self.connect()?;
+        let rows = client.query(
+            "SELECT run_id, status, task_type,
+                    (EXTRACT(EPOCH FROM created_at) * 1000)::BIGINT,
+                    (EXTRACT(EPOCH FROM updated_at) * 1000)::BIGINT,
+                    CASE WHEN started_at IS NULL THEN NULL ELSE (EXTRACT(EPOCH FROM started_at) * 1000)::BIGINT END,
+                    CASE WHEN finished_at IS NULL THEN NULL ELSE (EXTRACT(EPOCH FROM finished_at) * 1000)::BIGINT END
+             FROM runs
+             WHERE org_id = $1
+             ORDER BY updated_at DESC, run_id DESC
+             LIMIT $2",
+            &[&self.org_id(), &limit.max(1)],
+        )?;
+        let mut views = Vec::with_capacity(rows.len());
+        for row in rows {
+            let run_id = row.get::<_, String>(0);
+            let counts = self.step_counts(&mut client, &run_id)?;
+            views.push(RunView {
+                run_id,
+                status: row.get::<_, String>(1),
+                task_type: row.get::<_, String>(2),
+                created_at: row.get::<_, i64>(3),
+                updated_at: row.get::<_, i64>(4),
+                started_at: row.get::<_, Option<i64>>(5),
+                finished_at: row.get::<_, Option<i64>>(6),
+                counts,
+            });
+        }
+        Ok(views)
+    }
+
     pub fn run_result(&self, run_id: &str) -> Result<Value> {
         let mut client = self.connect()?;
         let row = client

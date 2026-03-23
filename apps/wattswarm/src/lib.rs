@@ -13,6 +13,7 @@ pub mod run_queue {
 pub mod a2a;
 pub mod egress_agent;
 pub mod run_control;
+pub mod wattetheria_sync;
 
 pub mod task_template {
     pub use wattswarm_control_plane::task_template::*;
