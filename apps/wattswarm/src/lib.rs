@@ -13,6 +13,7 @@ pub mod run_queue {
 pub mod a2a;
 pub mod egress_agent;
 pub mod run_control;
+pub mod startup_config;
 pub mod wattetheria_sync;
 
 pub mod task_template {
@@ -78,6 +79,9 @@ pub mod ui;
 
 #[path = "../../../ui/ui_template.rs"]
 pub mod ui_template;
+
+#[path = "../../../ui/startup_template.rs"]
+pub mod startup_template;
 
 #[path = "../../wattswarm-cli/cli.rs"]
 pub mod cli;

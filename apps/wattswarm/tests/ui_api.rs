@@ -305,6 +305,7 @@ fn ui_supports_core_cli_operations() {
         assert_eq!(status_res.status(), StatusCode::OK);
         let status_json = json_from(status_res).await;
         assert_eq!(status_json["running"].as_bool(), Some(true));
+        assert!(status_json["node_id"].as_str().is_some());
 
         let add_exec_res = app
             .clone()
@@ -423,6 +424,169 @@ fn ui_supports_core_cli_operations() {
         assert_eq!(swarm_state_res.status(), StatusCode::OK);
         let swarm_state_json = json_from(swarm_state_res).await;
         assert!(swarm_state_json["state"]["signals"].is_array());
+    });
+}
+
+#[test]
+fn ui_root_page_serves_startup_view_and_console_route_keeps_legacy_console() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let dir = tempdir().unwrap();
+        let state_dir = dir.path().join("state");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        let db_path = state_dir.join("ui.state");
+        let app = build_app(UiServerState::new(state_dir, db_path));
+
+        let root_res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(root_res.status(), StatusCode::OK);
+        let root_body = to_bytes(root_res.into_body(), usize::MAX).await.unwrap();
+        let root_html = String::from_utf8(root_body.to_vec()).unwrap();
+        assert!(root_html.contains("WattSwarm Startup"));
+        assert!(root_html.contains("Open Developer Console"));
+
+        let console_res = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/console")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(console_res.status(), StatusCode::OK);
+        let console_body = to_bytes(console_res.into_body(), usize::MAX).await.unwrap();
+        let console_html = String::from_utf8(console_body.to_vec()).unwrap();
+        assert!(console_html.contains("WattSwarm Kernel Console"));
+        assert!(console_html.contains("Quick Start"));
+    });
+}
+
+#[test]
+fn ui_startup_config_roundtrips_and_registers_core_agent_executor() {
+    let _guard = env_lock();
+    let _db_lock = DbTestLock::acquire();
+    reset_test_schema("test");
+    let _schema_guard = EnvVarGuard::set("WATTSWARM_PG_SCHEMA", "test");
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let dir = tempdir().unwrap();
+        let state_dir = dir.path().join("state");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        let db_path = state_dir.join("ui.state");
+        let app = build_app(UiServerState::new(state_dir.clone(), db_path));
+
+        let default_res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/startup-config")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(default_res.status(), StatusCode::OK);
+        let default_json = json_from(default_res).await;
+        assert_eq!(
+            default_json["config"]["network_mode"].as_str(),
+            Some("local")
+        );
+        assert_eq!(
+            default_json["core_agent_executor"].as_str(),
+            Some("core-agent")
+        );
+
+        let save_res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/startup-config")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({
+                            "display_name": "Captain Aurora",
+                            "network_mode": "lan",
+                            "core_agent": {
+                                "mode": "remote_url",
+                                "base_url": "http://127.0.0.1:9999",
+                                "provider": "openclaw",
+                                "model": "",
+                                "api_key": ""
+                            }
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(save_res.status(), StatusCode::OK);
+        let save_json = json_from(save_res).await;
+        assert_eq!(save_json["executor_registered"].as_bool(), Some(true));
+
+        let get_saved_res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/startup-config")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(get_saved_res.status(), StatusCode::OK);
+        let get_saved_json = json_from(get_saved_res).await;
+        assert_eq!(
+            get_saved_json["config"]["display_name"].as_str(),
+            Some("Captain Aurora")
+        );
+        assert_eq!(
+            get_saved_json["config"]["core_agent"]["base_url"].as_str(),
+            Some("http://127.0.0.1:9999")
+        );
+
+        let executors_res = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/executors/list")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(executors_res.status(), StatusCode::OK);
+        let executors_json = json_from(executors_res).await;
+        assert!(
+            executors_json["executors"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|entry| {
+                    entry["name"].as_str() == Some("core-agent")
+                        && entry["base_url"].as_str() == Some("http://127.0.0.1:9999")
+                })
+        );
     });
 }
 

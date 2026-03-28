@@ -1,0 +1,34 @@
+# Overlay for joint deployment with Wattetheria.
+#
+# Usage:
+#   docker network create watt-net
+#   docker compose -f docker-compose.yml -f docker-compose.wattetheria.yml up -d
+#
+# This adds a shared external network and enables the gRPC sync service
+# that Wattetheria connects to. Does NOT modify the base compose file.
+
+services:
+  kernel:
+    environment:
+      WATTSWARM_WATTETHERIA_SYNC_GRPC_LISTEN: "0.0.0.0:7791"
+    ports:
+      - "${WATTSWARM_SYNC_GRPC_PORT:-7791}:7791"
+    networks:
+      - default
+      - watt-net
+
+  postgres:
+    networks:
+      - default
+
+  runtime:
+    networks:
+      - default
+
+  worker:
+    networks:
+      - default
+
+networks:
+  watt-net:
+    external: true

@@ -8,6 +8,11 @@ use crate::egress_agent::{
 };
 use crate::run_control;
 use crate::run_queue::RunSubmitSpec;
+use crate::startup_config::{
+    StartupConfig, core_agent_executor_name, load_startup_config, save_startup_config,
+    startup_config_path, sync_core_agent_executor,
+};
+use crate::startup_template::STARTUP_HTML;
 use crate::swarm_dashboard_engine::{SwarmDashboardState, build_dashboard_state, tick_real_swarm};
 use crate::swarm_dashboard_template::SWARM_DASHBOARD_HTML;
 use crate::task_template::sample_contract;
@@ -156,6 +161,13 @@ struct TopicMessageWriteRequest {
     reply_to_message_id: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+struct StartupConfigSaveRequest {
+    display_name: String,
+    network_mode: crate::startup_config::NetworkMode,
+    core_agent: crate::startup_config::CoreAgentConfig,
+}
+
 pub fn run(state_dir: PathBuf, db_path: PathBuf, listen: String) -> Result<()> {
     fs::create_dir_all(&state_dir)?;
     let node_id = local_node_id(&state_dir).ok();
@@ -209,10 +221,13 @@ pub fn run(state_dir: PathBuf, db_path: PathBuf, listen: String) -> Result<()> {
 pub fn build_app(state: UiServerState) -> Router {
     Router::new()
         .route("/", get(index))
+        .route("/console", get(console_page))
         .route("/swarm", get(swarm_page))
         .route("/api/node/up", post(node_up))
         .route("/api/node/down", post(node_down))
         .route("/api/node/status", get(node_status))
+        .route("/api/startup-config", get(startup_config_get))
+        .route("/api/startup-config", post(startup_config_save))
         .route("/api/peers/list", get(peers_list))
         .route("/api/log/head", get(log_head))
         .route("/api/log/replay", post(log_replay))
@@ -302,6 +317,10 @@ where
 }
 
 async fn index() -> Html<&'static str> {
+    Html(STARTUP_HTML)
+}
+
+async fn console_page() -> Html<&'static str> {
     Html(INDEX_HTML)
 }
 
@@ -332,8 +351,8 @@ async fn node_down(State(state): State<UiServerState>) -> Result<Json<Value>, Ap
 
 async fn node_status(State(state): State<UiServerState>) -> Result<Json<Value>, ApiError> {
     let state_clone = state.clone();
-    let (running, dist) =
-        run_blocking(move || -> Result<(bool, serde_json::Map<String, Value>)> {
+    let (running, node_id, dist) = run_blocking(
+        move || -> Result<(bool, String, serde_json::Map<String, Value>)> {
             let state_path = node_state_path(&state_clone.state_dir);
             let runtime_state: NodeState = if state_path.exists() {
                 serde_json::from_slice(&fs::read(state_path)?)?
@@ -351,15 +370,56 @@ async fn node_status(State(state): State<UiServerState>) -> Result<Json<Value>, 
             for (version, count) in peers {
                 dist.insert(version, Value::from(count));
             }
-            Ok((runtime_state.running, dist))
-        })
-        .await?;
+            Ok((runtime_state.running, node.node_id(), dist))
+        },
+    )
+    .await?;
     Ok(Json(json!({
         "ok": true,
         "running": running,
+        "node_id": node_id,
         "mode": resolve_node_mode(&state.state_dir)?.as_str(),
         "local_protocol_version": crate::constants::LOCAL_PROTOCOL_VERSION,
         "peer_protocol_distribution": dist
+    })))
+}
+
+async fn startup_config_get(State(state): State<UiServerState>) -> Result<Json<Value>, ApiError> {
+    let state_clone = state.clone();
+    let config =
+        run_blocking(move || load_startup_config(&startup_config_path(&state_clone.state_dir)))
+            .await?;
+    Ok(Json(json!({
+        "ok": true,
+        "config": config,
+        "core_agent_executor": core_agent_executor_name()
+    })))
+}
+
+async fn startup_config_save(
+    State(state): State<UiServerState>,
+    Json(req): Json<StartupConfigSaveRequest>,
+) -> Result<Json<Value>, ApiError> {
+    let state_clone = state.clone();
+    let payload = StartupConfig {
+        display_name: req.display_name,
+        network_mode: req.network_mode,
+        core_agent: req.core_agent,
+    }
+    .normalized();
+    payload.validate()?;
+    let saved = payload.clone();
+    let executor_registered = run_blocking(move || -> Result<bool> {
+        let path = startup_config_path(&state_clone.state_dir);
+        save_startup_config(&path, &saved)?;
+        sync_core_agent_executor(&state_clone.state_dir, &saved)
+    })
+    .await?;
+    Ok(Json(json!({
+        "ok": true,
+        "config": payload,
+        "core_agent_executor": core_agent_executor_name(),
+        "executor_registered": executor_registered
     })))
 }
 
