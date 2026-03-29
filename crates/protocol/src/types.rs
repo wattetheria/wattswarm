@@ -706,6 +706,15 @@ pub struct NetworkTopology {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NetworkBootstrapBundle {
+    pub topology: NetworkTopology,
+    pub control_mode: String,
+    pub membership_version: u64,
+    pub policy_version: u64,
+    pub signed_params: SignedNetworkProtocolParamsEnvelope,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MembershipUpdatedPayload {
     pub new_membership: Membership,
     pub quorum_threshold: u32,

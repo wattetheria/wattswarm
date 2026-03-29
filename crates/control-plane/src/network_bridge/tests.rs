@@ -9,7 +9,10 @@ use crate::{node::Node, task_template::sample_contract};
 use serde_json::json;
 use std::collections::HashMap;
 use std::env;
+use std::fs;
+use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
+use uuid::Uuid;
 
 fn env_test_lock() -> &'static Mutex<()> {
     static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -20,6 +23,15 @@ fn lock_env_test_mutex() -> std::sync::MutexGuard<'static, ()> {
     env_test_lock()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn temp_startup_dir(prefix: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!(
+        "wattswarm-network-bridge-{prefix}-{}",
+        Uuid::new_v4().simple()
+    ));
+    fs::create_dir_all(&dir).expect("create temp dir");
+    dir
 }
 
 fn membership_with_roles(node_ids: &[String]) -> Membership {
@@ -837,6 +849,32 @@ fn network_config_reads_bootstrap_peers_from_env() {
         config.bootstrap_peers[0],
         "/ip4/127.0.0.1/tcp/4001/p2p/12D3KooWJ5r1D8N8QYp8JDs7u9mM4rY2kQ6xXK7Z6A6V4t7N3sQX"
     );
+}
+
+#[test]
+fn network_config_reads_bootstrap_peers_from_startup_config_when_env_missing() {
+    let _lock = lock_env_test_mutex();
+    let _bootstrap = EnvVarGuard::set(ENV_P2P_BOOTSTRAP_PEERS, None);
+    let dir = temp_startup_dir("startup-bootstrap");
+    fs::write(
+        dir.join("startup_config.json"),
+        serde_json::to_vec(&json!({
+            "bootstrap_peers": [
+                "/ip4/127.0.0.1/tcp/4002/p2p/12D3KooWStartupBootstrap"
+            ]
+        }))
+        .expect("startup config json"),
+    )
+    .expect("write startup config");
+
+    let config = network_config_from_state_dir(&dir);
+    assert_eq!(config.bootstrap_peers.len(), 1);
+    assert_eq!(
+        config.bootstrap_peers[0],
+        "/ip4/127.0.0.1/tcp/4002/p2p/12D3KooWStartupBootstrap"
+    );
+
+    let _ = fs::remove_dir_all(dir);
 }
 
 #[test]

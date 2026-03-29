@@ -6,6 +6,7 @@ use crate::types::{
     ArtifactRef, Candidate, Event, TaskContract, TaskTerminalState, VerifierResult, VoteChoice,
 };
 use anyhow::{Context, Result};
+use serde::{Serialize, de::DeserializeOwned};
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -205,6 +206,36 @@ pub struct TaskAnnouncementDetailRow {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalExecutorEntryRow {
+    pub name: String,
+    pub base_url: String,
+    pub updated_at: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalDiscoveredPeerRow {
+    pub node_id: String,
+    pub listen_addr: Option<String>,
+    pub discovered_at: u64,
+    pub updated_at: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalRemoteTaskBridgeRow {
+    pub task_id: String,
+    pub announcement_id: String,
+    pub network_id: String,
+    pub source_node_id: String,
+    pub source_scope_hint: String,
+    pub detail_ref_digest: Option<String>,
+    pub executor: String,
+    pub profile: String,
+    pub candidate_id: String,
+    pub terminal_state: String,
+    pub bridged_at: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExecutionSetMemberRow {
     pub task_id: String,
     pub execution_set_id: String,
@@ -359,6 +390,8 @@ impl PgStore {
 mod dashboard;
 mod event_log;
 mod export;
+mod local_control;
+pub use local_control::{local_control_scope_id, local_control_store};
 mod metrics;
 mod projection;
 mod registry;

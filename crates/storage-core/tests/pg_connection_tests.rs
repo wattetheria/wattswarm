@@ -1,10 +1,10 @@
 use std::sync::{Mutex, OnceLock};
 
-use wattswarm_storage_core::storage::PgStore;
 use wattswarm_storage_core::storage::pg::ErrorCode;
 use wattswarm_storage_core::storage::pg::{
     Connection, Error, OptionalExtension, ParamValue, types::ValueRef,
 };
+use wattswarm_storage_core::storage::{PgStore, local_control_scope_id};
 
 const TEST_SCHEMA: &str = "test";
 const TEST_DB_LOCK_KEY: i64 = 1_987_654_321;
@@ -281,6 +281,131 @@ fn legacy_bigint_bool_columns_are_migrated_to_boolean() {
             )
             .expect("reuse_applied type");
         assert_eq!(reuse_type, "boolean");
+    });
+}
+
+#[test]
+fn legacy_discovered_peers_rows_are_migrated_to_scope_and_real_node_id() {
+    with_test_schema(|| {
+        let conn = open_test_connection();
+        conn.execute_batch(
+            "
+            DROP TABLE IF EXISTS discovered_peers_local;
+            CREATE TABLE discovered_peers_local (
+                node_id TEXT PRIMARY KEY,
+                listen_addr TEXT,
+                discovered_at TIMESTAMPTZ NOT NULL,
+                updated_at TIMESTAMPTZ NOT NULL
+            );
+            ",
+        )
+        .expect("create legacy discovered peers table");
+
+        let scope_id = local_control_scope_id(std::path::Path::new("/tmp/wattswarm-state"));
+        let legacy_node_id = format!("{scope_id}\u{1f}peer-a");
+        conn.execute(
+            "INSERT INTO discovered_peers_local(node_id, listen_addr, discovered_at, updated_at)
+             VALUES (
+                $1,
+                $2,
+                TIMESTAMPTZ 'epoch' + (1700000000000::bigint * INTERVAL '1 millisecond'),
+                TIMESTAMPTZ 'epoch' + (1700000000000::bigint * INTERVAL '1 millisecond')
+             )",
+            wattswarm_storage_core::params![legacy_node_id, "/ip4/127.0.0.1/tcp/4001"],
+        )
+        .expect("insert legacy discovered peer");
+
+        let store = PgStore::open("legacy-discovered-peers-migration.state").expect("open store");
+        drop(store);
+
+        let rows = conn
+            .prepare(
+                "SELECT scope_id, node_id, listen_addr
+                 FROM discovered_peers_local",
+            )
+            .expect("prepare migrated discovered peers query")
+            .query_map(wattswarm_storage_core::params![], |row| {
+                Ok((
+                    row.get::<usize, String>(0)?,
+                    row.get::<usize, String>(1)?,
+                    row.get::<usize, Option<String>>(2)?,
+                ))
+            })
+            .expect("query migrated discovered peers")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("collect migrated discovered peers");
+
+        assert_eq!(
+            rows,
+            vec![(
+                scope_id,
+                "peer-a".to_owned(),
+                Some("/ip4/127.0.0.1/tcp/4001".to_owned()),
+            )]
+        );
+    });
+}
+
+#[test]
+fn legacy_executor_registry_rows_are_migrated_to_scope_and_real_executor_name() {
+    with_test_schema(|| {
+        let conn = open_test_connection();
+        conn.execute_batch(
+            "
+            DROP TABLE IF EXISTS executor_registry_local;
+            CREATE TABLE executor_registry_local (
+                executor_name TEXT PRIMARY KEY,
+                base_url TEXT NOT NULL,
+                updated_at TIMESTAMPTZ NOT NULL
+            );
+            ",
+        )
+        .expect("create legacy executor registry table");
+
+        let scope_id = local_control_scope_id(std::path::Path::new("/tmp/wattswarm-state"));
+        let legacy_executor_name = format!("{scope_id}\u{1f}Boss");
+        conn.execute(
+            "INSERT INTO executor_registry_local(executor_name, base_url, updated_at)
+             VALUES (
+                $1,
+                $2,
+                TIMESTAMPTZ 'epoch' + (1700000000000::bigint * INTERVAL '1 millisecond')
+             )",
+            wattswarm_storage_core::params![
+                legacy_executor_name,
+                "http://host.docker.internal:9077/runtime/Boss"
+            ],
+        )
+        .expect("insert legacy executor row");
+
+        let store = PgStore::open("legacy-executor-migration.state").expect("open store");
+        drop(store);
+
+        let rows = conn
+            .prepare(
+                "SELECT scope_id, executor_name, base_url
+                 FROM executor_registry_local",
+            )
+            .expect("prepare migrated executor query")
+            .query_map(wattswarm_storage_core::params![], |row| {
+                Ok((
+                    row.get::<usize, String>(0)?,
+                    row.get::<usize, String>(1)?,
+                    row.get::<usize, String>(2)?,
+                ))
+            })
+            .expect("query migrated executors")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("collect migrated executors");
+
+        assert_eq!(
+            rows,
+            vec![(
+                scope_id,
+                "Boss".to_owned(),
+                "http://host.docker.internal:9077/runtime/Boss".to_owned(),
+            )]
+        );
     });
 }
 

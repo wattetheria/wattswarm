@@ -1,5 +1,5 @@
 use super::*;
-use crate::control::load_discovered_peer_records;
+use crate::control::load_discovered_peer_records_state;
 use crate::network_p2p::BackfillResponse;
 
 const DISCOVERY_DIAL_RETRY_AFTER: Duration = Duration::from_secs(3);
@@ -123,7 +123,7 @@ pub fn dial_discovered_peer_endpoints(
     local_node_id: &str,
     next_attempt_at: &mut HashMap<String, std::time::Instant>,
 ) -> Result<usize> {
-    let records = load_discovered_peer_records(&crate::control::discovered_peers_path(state_dir))?;
+    let records = load_discovered_peer_records_state(state_dir)?;
     let now = std::time::Instant::now();
     let mut dialed = 0usize;
     for record in records {

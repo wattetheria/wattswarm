@@ -137,7 +137,7 @@ The workspace now includes dedicated crates and a control-plane bridge for node-
   - auto-publishes knowledge summaries on finalized decisions and reputation summaries on verifier updates
   - propagates append-only revoke/penalty events so malicious event effects can be rolled back without deleting the event log
   - suppresses summary fanout while local publish backlog is high, keeping event catch-up ahead of summary traffic
-  - can dial peer listen addresses discovered through LAN state (`discovered_peers.json`)
+  - can dial peer listen addresses discovered through the local PostgreSQL peer cache (`discovered_peers_local`)
 - `crates/artifact-store`
   - owns the node-local filesystem layout for evidence, checkpoints, snapshots, and event batches
   - provides read/write helpers for byte and JSON payloads
@@ -163,6 +163,17 @@ Runtime toggles:
 - `WATTSWARM_P2P_REGION_IDS=sol-1,sol-2` subscribes the node to those region scopes
 - `WATTSWARM_P2P_NODE_IDS=lab-a` subscribes the node to matching node scopes
 - `WATTSWARM_P2P_LOCAL_IDS=lab-a` is still accepted as a legacy alias for node scopes
+
+Network-mode bootstrap behavior:
+
+- `WATTSWARM_NODE_MODE=network` tells the node to join an existing shared network instead of creating `local:` or `lan:` topology.
+- a joining node must know at least one bootstrap peer multiaddr; in product UI this is saved as `bootstrap_peers` inside `startup_config.json`
+- if local PostgreSQL is missing `network_registry / org_registry / network_params`, the node now attempts an automatic bootstrap sync:
+  - derives one or more bootstrap HTTP endpoints from configured peers (or explicit `WATTSWARM_NETWORK_BOOTSTRAP_HTTP_URLS`)
+  - fetches the remote signed `NetworkBootstrapBundle`
+  - verifies `network_id`, `genesis_node_id`, `params_hash`, and signature
+  - imports the bundle into the local PostgreSQL store before opening the node
+- normal joining nodes do not re-sign network params locally; they import the genesis-signed bundle and verify it
 
 ### Current Network Propagation Architecture
 
@@ -646,6 +657,16 @@ Worker container startup behavior:
 - continuously claims `run_steps` in `QUEUED/RETRY_WAIT` and executes them
 - updates step/run status until terminal state (`FINALIZED/FAILED/CANCELLED`)
 
+Node-local state in Docker:
+
+- default container state dir is `/var/lib/wattswarm`
+- with the default compose setup this path is backed by the named volume `wattswarm_state_data`
+- startup-page file config is stored in that state dir:
+  - `startup_config.json`
+  - `node_state.json`
+  - `node_seed.hex`
+- on macOS with Docker Desktop, inspect these files through the container or `docker cp`, not through the repo-local `.wattswarm/` directory
+
 Hot reload behavior in current compose:
 
 - `kernel`, `runtime`, `worker` use `cargo watch` in containers.
@@ -669,15 +690,22 @@ P2P env vars:
 - `WATTSWARM_P2P_NODE_IDS` optional comma-separated node scope subscription list
 - `WATTSWARM_P2P_LOCAL_IDS` optional legacy alias for node scope subscription list
 
+Startup UI behavior:
+
+- `Display Name`, `Network Mode`, `Bootstrap Peers`, and `Core Agent` are saved to `startup_config.json`
+- `Bootstrap Peers` is shown only for `LAN` / `WAN`
+- saving `Core Agent` also syncs the local executor route into PostgreSQL `executor_registry_local`
+- startup UI does not write network topology into PostgreSQL directly; topology and signed network params are still imported through bootstrap sync or regular node startup flows
+
 Optional UDP announce switch (default off):
 
 - `WATTSWARM_UDP_ANNOUNCE_ENABLED=true` to enable UDP announce + listener
 - `WATTSWARM_UDP_ANNOUNCE_MODE=multicast|broadcast` (default `multicast`)
 - `WATTSWARM_UDP_ANNOUNCE_ADDR=239.255.42.99` (multicast default) or `255.255.255.255` for broadcast
 - `WATTSWARM_UDP_ANNOUNCE_PORT=37931`
-- with switch enabled, startup emits announce payload and UI process listens on the same port and records discovered peer IDs into `--state-dir/discovered_peers.json`
+- with switch enabled, startup emits announce payload and UI process listens on the same port and records discovered peer IDs into PostgreSQL `discovered_peers_local`
 - when a peer advertise includes a libp2p listen address, that address is also recorded and used by the background network bridge for automatic LAN dialing
-- `peers list` and `/api/peers/list` include the discovered peers loaded from that file
+- `peers list` and `/api/peers/list` include the discovered peers loaded from that local PostgreSQL cache
 
 Examples:
 
@@ -742,7 +770,10 @@ cargo run --bin wattswarm -- --state-dir ./.ws-dev --store wattswarm.state task 
 ## Multi-Executor Configuration
 
 WattSwarm can register multiple runtime executors at the same time. Each executor is identified by
-`name -> base_url` in executor registry (`executors.json` under `--state-dir`).
+`name -> base_url` in the local PostgreSQL executor registry table `executor_registry_local`.
+
+Each executor row is scoped by the local node state dir internally, but the stored `executor_name`
+column remains the plain executor name (`core-agent`, `Boss`, `CTO`, etc.), not a path-prefixed key.
 
 Example:
 

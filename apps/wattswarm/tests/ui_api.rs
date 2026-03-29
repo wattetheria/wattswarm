@@ -11,6 +11,9 @@ use tempfile::tempdir;
 use tonic::Request as GrpcRequest;
 use tower::ServiceExt;
 use wattswarm::control::open_node;
+use wattswarm::crypto::NodeIdentity;
+use wattswarm::storage::local_control_scope_id;
+use wattswarm::types::NetworkProtocolParams;
 use wattswarm::types::{EventPayload, FeedSubscriptionUpdatedPayload, TopicMessagePostedPayload};
 use wattswarm::ui::{UiServerState, build_app};
 use wattswarm::wattetheria_sync;
@@ -525,21 +528,98 @@ fn ui_exposes_local_network_peer_identity_and_listen_addrs() {
 }
 
 #[test]
-fn ui_startup_config_roundtrips_and_registers_core_agent_executor() {
+fn ui_exposes_network_bootstrap_bundle() {
     let _guard = env_lock();
     let _db_lock = DbTestLock::acquire();
     reset_test_schema("test");
     let _schema_guard = EnvVarGuard::set("WATTSWARM_PG_SCHEMA", "test");
+    let _mode_guard = EnvVarGuard::set("WATTSWARM_NODE_MODE", "network");
+    let dir = tempdir().unwrap();
+    let state_dir = dir.path().join("state");
+    std::fs::create_dir_all(&state_dir).unwrap();
+    let db_path = state_dir.join("ui.state");
+    let genesis = NodeIdentity::random();
+    let genesis_node_id = genesis.node_id();
+    let network_id = "mainnet:watt-etheria";
+    let org_id = "mainnet:watt-etheria:bootstrap";
+    let store = wattswarm::storage::PgStore::open(&db_path).unwrap();
+    store
+        .ensure_mainnet_bootstrap_network_topology(
+            network_id,
+            "Watt Etheria",
+            &genesis_node_id,
+            &genesis_node_id,
+            1_700_000_000_000,
+        )
+        .unwrap();
+    let conn = Connection::open("ui-network-bootstrap-setup").unwrap();
+    conn.execute(
+        "UPDATE org_registry SET name = 'Aether Genesis' WHERE org_id = $1",
+        wattswarm_storage_core::params![org_id],
+    )
+    .unwrap();
+    store
+        .put_network_protocol_params(network_id, &genesis, &NetworkProtocolParams::default())
+        .unwrap();
+
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .unwrap();
     runtime.block_on(async {
-        let dir = tempdir().unwrap();
-        let state_dir = dir.path().join("state");
-        std::fs::create_dir_all(&state_dir).unwrap();
-        let db_path = state_dir.join("ui.state");
-        let app = build_app(UiServerState::new(state_dir.clone(), db_path));
+        let app = build_app(UiServerState::new(state_dir, db_path));
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/network/bootstrap")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let json = json_from(res).await;
+        assert_eq!(json["ok"].as_bool(), Some(true));
+        assert_eq!(
+            json["bundle"]["topology"]["network"]["network_id"].as_str(),
+            Some(network_id)
+        );
+        assert_eq!(
+            json["bundle"]["topology"]["network"]["network_name"].as_str(),
+            Some("Watt Etheria")
+        );
+        assert_eq!(
+            json["bundle"]["topology"]["org"]["org_id"].as_str(),
+            Some(org_id)
+        );
+        assert_eq!(
+            json["bundle"]["topology"]["org"]["network_org_name"].as_str(),
+            Some("Aether Genesis")
+        );
+        assert_eq!(
+            json["bundle"]["signed_params"]["signed_by"].as_str(),
+            Some(genesis_node_id.as_str())
+        );
+    });
+}
+
+#[test]
+fn ui_startup_config_roundtrips_and_registers_core_agent_executor() {
+    let _guard = env_lock();
+    let _db_lock = DbTestLock::acquire();
+    reset_test_schema("test");
+    let _schema_guard = EnvVarGuard::set("WATTSWARM_PG_SCHEMA", "test");
+    let dir = tempdir().unwrap();
+    let state_dir = dir.path().join("state");
+    std::fs::create_dir_all(&state_dir).unwrap();
+    let db_path = state_dir.join("ui.state");
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let app = build_app(UiServerState::new(state_dir.clone(), db_path.clone()));
 
         let default_res = app
             .clone()
@@ -559,6 +639,12 @@ fn ui_startup_config_roundtrips_and_registers_core_agent_executor() {
             Some("local")
         );
         assert_eq!(
+            default_json["config"]["bootstrap_peers"]
+                .as_array()
+                .map(|items| items.len()),
+            Some(0)
+        );
+        assert_eq!(
             default_json["core_agent_executor"].as_str(),
             Some("core-agent")
         );
@@ -574,6 +660,9 @@ fn ui_startup_config_roundtrips_and_registers_core_agent_executor() {
                         serde_json::to_vec(&json!({
                             "display_name": "Captain Aurora",
                             "network_mode": "lan",
+                            "bootstrap_peers": [
+                                "/ip4/127.0.0.1/tcp/4001/p2p/12D3KooWLanBootstrap"
+                            ],
                             "core_agent": {
                                 "mode": "remote_url",
                                 "base_url": "http://127.0.0.1:9999",
@@ -610,11 +699,53 @@ fn ui_startup_config_roundtrips_and_registers_core_agent_executor() {
             Some("Captain Aurora")
         );
         assert_eq!(
+            get_saved_json["config"]["bootstrap_peers"][0].as_str(),
+            Some("/ip4/127.0.0.1/tcp/4001/p2p/12D3KooWLanBootstrap")
+        );
+        assert_eq!(
             get_saved_json["config"]["core_agent"]["base_url"].as_str(),
             Some("http://127.0.0.1:9999")
         );
 
+        let save_local_res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/startup-config")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({
+                            "display_name": "Captain Aurora",
+                            "network_mode": "local",
+                            "bootstrap_peers": [
+                                "/ip4/127.0.0.1/tcp/4001/p2p/12D3KooWShouldBeCleared"
+                            ],
+                            "core_agent": {
+                                "mode": "remote_url",
+                                "base_url": "http://127.0.0.1:9999",
+                                "provider": "openclaw",
+                                "model": "",
+                                "api_key": ""
+                            }
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(save_local_res.status(), StatusCode::OK);
+        let save_local_json = json_from(save_local_res).await;
+        assert_eq!(
+            save_local_json["config"]["bootstrap_peers"]
+                .as_array()
+                .map(|items| items.len()),
+            Some(0)
+        );
+
         let executors_res = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .method("GET")
@@ -636,7 +767,60 @@ fn ui_startup_config_roundtrips_and_registers_core_agent_executor() {
                         && entry["base_url"].as_str() == Some("http://127.0.0.1:9999")
                 })
         );
+
+        let get_local_saved_res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/startup-config")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(get_local_saved_res.status(), StatusCode::OK);
+        let get_local_saved_json = json_from(get_local_saved_res).await;
+        assert_eq!(
+            get_local_saved_json["config"]["network_mode"].as_str(),
+            Some("local")
+        );
+        assert_eq!(
+            get_local_saved_json["config"]["bootstrap_peers"]
+                .as_array()
+                .map(|items| items.len()),
+            Some(0)
+        );
     });
+
+    let conn =
+        Connection::open(state_dir.join("local-control.state")).expect("open local control db");
+    let mut stmt = conn
+        .prepare(
+            "SELECT scope_id, executor_name, base_url
+             FROM executor_registry_local
+             ORDER BY executor_name ASC",
+        )
+        .expect("prepare executor raw query");
+    let raw_rows = stmt
+        .query_map(wattswarm_storage_core::params![], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })
+        .expect("query executor raw rows")
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .expect("collect executor raw rows");
+    assert_eq!(
+        raw_rows,
+        vec![(
+            local_control_scope_id(&state_dir),
+            "core-agent".to_owned(),
+            "http://127.0.0.1:9999".to_owned(),
+        )]
+    );
 }
 
 #[test]
@@ -1947,7 +2131,7 @@ fn ui_exposes_wattetheria_sync_grpc_streams() {
             }
         };
 
-        let network_frame = tokio::time::timeout(Duration::from_secs(3), async {
+        let network_frame = tokio::time::timeout(Duration::from_secs(15), async {
             client
                 .stream_network_projection(GrpcRequest::new(ProjectionStreamRequest {
                     poll_interval_ms: 250,

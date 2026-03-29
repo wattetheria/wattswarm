@@ -95,6 +95,127 @@ fn ensure_boolean_column(
     Ok(())
 }
 
+fn migrate_discovered_peers_local_scope_schema(conn: &Connection) -> Result<()> {
+    if column_exists(conn, "discovered_peers_local", "scope_id") {
+        return Ok(());
+    }
+
+    const LEGACY_SCOPE_SEP: char = '\u{1f}';
+
+    conn.execute_batch(
+        "
+        ALTER TABLE discovered_peers_local
+        ADD COLUMN scope_id TEXT NOT NULL DEFAULT '';
+        ALTER TABLE discovered_peers_local
+        RENAME COLUMN node_id TO legacy_node_id;
+        ALTER TABLE discovered_peers_local
+        ADD COLUMN node_id TEXT;
+        ",
+    )?;
+
+    let mut stmt = conn.prepare(
+        "SELECT legacy_node_id
+         FROM discovered_peers_local",
+    )?;
+    let rows = stmt.query_map(params![], |r| r.get::<_, String>(0))?;
+    let legacy_node_ids = rows.collect::<std::result::Result<Vec<_>, _>>()?;
+
+    for legacy_node_id in legacy_node_ids {
+        let (scope_id, node_id) = legacy_node_id
+            .split_once(LEGACY_SCOPE_SEP)
+            .map(|(scope, node)| (scope.to_owned(), node.to_owned()))
+            .unwrap_or_else(|| ("".to_owned(), legacy_node_id.clone()));
+        conn.execute(
+            "UPDATE discovered_peers_local
+             SET scope_id = $2,
+                 node_id = $3
+             WHERE legacy_node_id = $1",
+            params![legacy_node_id, scope_id, node_id],
+        )?;
+    }
+
+    conn.execute_batch(
+        "
+        ALTER TABLE discovered_peers_local
+        DROP CONSTRAINT IF EXISTS discovered_peers_local_pkey;
+        ALTER TABLE discovered_peers_local
+        ALTER COLUMN node_id SET NOT NULL;
+        ALTER TABLE discovered_peers_local
+        DROP COLUMN legacy_node_id;
+        ALTER TABLE discovered_peers_local
+        ADD CONSTRAINT discovered_peers_local_pkey PRIMARY KEY (scope_id, node_id);
+        DROP INDEX IF EXISTS idx_discovered_peers_local_updated;
+        CREATE INDEX IF NOT EXISTS idx_discovered_peers_local_updated
+            ON discovered_peers_local(scope_id, updated_at DESC, node_id ASC);
+        ",
+    )?;
+    Ok(())
+}
+
+fn migrate_executor_registry_local_scope_schema(conn: &Connection) -> Result<()> {
+    if column_exists(conn, "executor_registry_local", "scope_id") {
+        return Ok(());
+    }
+
+    const LEGACY_SCOPE_SEP: char = '\u{1f}';
+
+    conn.execute_batch(
+        "
+        ALTER TABLE executor_registry_local
+        ADD COLUMN scope_id TEXT NOT NULL DEFAULT '';
+        ALTER TABLE executor_registry_local
+        RENAME COLUMN executor_name TO legacy_executor_name;
+        ALTER TABLE executor_registry_local
+        ADD COLUMN executor_name TEXT;
+        ",
+    )?;
+
+    let mut stmt = conn.prepare(
+        "SELECT legacy_executor_name
+         FROM executor_registry_local",
+    )?;
+    let rows = stmt.query_map(params![], |r| r.get::<_, String>(0))?;
+    let legacy_names = rows.collect::<std::result::Result<Vec<_>, _>>()?;
+
+    for legacy_name in legacy_names {
+        let (scope_id, executor_name) = legacy_name
+            .split_once(LEGACY_SCOPE_SEP)
+            .map(|(scope, name)| (scope.to_owned(), name.to_owned()))
+            .unwrap_or_else(|| ("".to_owned(), legacy_name.clone()));
+        conn.execute(
+            "UPDATE executor_registry_local
+             SET scope_id = $2,
+                 executor_name = $3
+             WHERE legacy_executor_name = $1",
+            params![legacy_name, scope_id, executor_name],
+        )?;
+    }
+
+    conn.execute_batch(
+        "
+        ALTER TABLE executor_registry_local
+        DROP CONSTRAINT IF EXISTS executor_registry_local_pkey;
+        ALTER TABLE executor_registry_local
+        ALTER COLUMN executor_name SET NOT NULL;
+        ALTER TABLE executor_registry_local
+        DROP COLUMN legacy_executor_name;
+        ALTER TABLE executor_registry_local
+        ADD CONSTRAINT executor_registry_local_pkey PRIMARY KEY (scope_id, executor_name);
+        ",
+    )?;
+    Ok(())
+}
+
+fn ensure_discovered_peers_local_scope_index(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "
+        CREATE INDEX IF NOT EXISTS idx_discovered_peers_local_updated
+            ON discovered_peers_local(scope_id, updated_at DESC, node_id ASC);
+        ",
+    )?;
+    Ok(())
+}
+
 impl PgStore {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let conn = Connection::open(path)?;
@@ -162,6 +283,44 @@ impl PgStore {
                 status TEXT NOT NULL,
                 is_default BOOLEAN NOT NULL DEFAULT FALSE,
                 created_at TIMESTAMPTZ NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS local_config_json (
+                config_key TEXT PRIMARY KEY,
+                config_json TEXT NOT NULL,
+                updated_at TIMESTAMPTZ NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS executor_registry_local (
+                scope_id TEXT NOT NULL DEFAULT '',
+                executor_name TEXT NOT NULL,
+                base_url TEXT NOT NULL,
+                updated_at TIMESTAMPTZ NOT NULL,
+                PRIMARY KEY(scope_id, executor_name)
+            );
+
+            CREATE TABLE IF NOT EXISTS discovered_peers_local (
+                scope_id TEXT NOT NULL DEFAULT '',
+                node_id TEXT NOT NULL,
+                listen_addr TEXT,
+                discovered_at TIMESTAMPTZ NOT NULL,
+                updated_at TIMESTAMPTZ NOT NULL,
+                PRIMARY KEY(scope_id, node_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS remote_task_bridge_registry_local (
+                task_id TEXT NOT NULL,
+                executor TEXT NOT NULL,
+                profile TEXT NOT NULL,
+                announcement_id TEXT NOT NULL,
+                network_id TEXT NOT NULL,
+                source_node_id TEXT NOT NULL,
+                source_scope_hint TEXT NOT NULL,
+                detail_ref_digest TEXT,
+                candidate_id TEXT NOT NULL,
+                terminal_state TEXT NOT NULL,
+                bridged_at TIMESTAMPTZ NOT NULL,
+                PRIMARY KEY(task_id, executor, profile)
             );
 
             CREATE TABLE IF NOT EXISTS events (
@@ -1110,6 +1269,9 @@ impl PgStore {
             )?;
             ensure_boolean_column(&conn, "task_settlement", "implicit_settled", Some("FALSE"))?;
             ensure_boolean_column(&conn, "knowledge_lookups", "reuse_applied", Some("FALSE"))?;
+            migrate_executor_registry_local_scope_schema(&conn)?;
+            migrate_discovered_peers_local_scope_schema(&conn)?;
+            ensure_discovered_peers_local_scope_index(&conn)?;
             Ok(())
         })();
 

@@ -1,5 +1,5 @@
 use crate::control::{
-    ExecutorRegistryEntry, executor_registry_path, load_executor_registry, save_executor_registry,
+    ExecutorRegistryEntry, load_executor_registry_state, save_executor_registry_state,
 };
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
@@ -79,6 +79,8 @@ pub struct StartupConfig {
     #[serde(default)]
     pub network_mode: NetworkMode,
     #[serde(default)]
+    pub bootstrap_peers: Vec<String>,
+    #[serde(default)]
     pub core_agent: CoreAgentConfig,
 }
 
@@ -87,6 +89,7 @@ impl Default for StartupConfig {
         Self {
             display_name: default_display_name(),
             network_mode: NetworkMode::default(),
+            bootstrap_peers: Vec::new(),
             core_agent: CoreAgentConfig::default(),
         }
     }
@@ -107,6 +110,10 @@ fn default_core_agent_base_url() -> String {
 impl StartupConfig {
     pub fn normalized(mut self) -> Self {
         self.display_name = self.display_name.trim().to_owned();
+        self.bootstrap_peers = normalize_bootstrap_peers(&self.bootstrap_peers);
+        if matches!(self.network_mode, NetworkMode::Local) {
+            self.bootstrap_peers.clear();
+        }
         self.core_agent.provider = self.core_agent.provider.trim().to_owned();
         self.core_agent.base_url = self
             .core_agent
@@ -156,6 +163,18 @@ impl StartupConfig {
     }
 }
 
+fn normalize_bootstrap_peers(values: &[String]) -> Vec<String> {
+    let mut normalized = Vec::new();
+    for value in values {
+        let trimmed = value.trim();
+        if trimmed.is_empty() || normalized.iter().any(|existing| existing == trimmed) {
+            continue;
+        }
+        normalized.push(trimmed.to_owned());
+    }
+    normalized
+}
+
 pub fn startup_config_path(state_dir: &Path) -> PathBuf {
     state_dir.join("startup_config.json")
 }
@@ -186,15 +205,14 @@ pub fn sync_core_agent_executor(state_dir: &Path, config: &StartupConfig) -> Res
         return Ok(false);
     }
 
-    let reg_path = executor_registry_path(state_dir);
-    let mut reg = load_executor_registry(&reg_path)?;
+    let mut reg = load_executor_registry_state(state_dir)?;
     reg.entries
         .retain(|entry| entry.name != CORE_AGENT_EXECUTOR_NAME);
     reg.entries.push(ExecutorRegistryEntry {
         name: CORE_AGENT_EXECUTOR_NAME.to_owned(),
         base_url: config.core_agent.base_url.clone(),
     });
-    save_executor_registry(&reg_path, &reg)?;
+    save_executor_registry_state(state_dir, &reg)?;
     Ok(true)
 }
 
@@ -218,6 +236,7 @@ mod tests {
                 base_url: String::new(),
                 ..CoreAgentConfig::default()
             },
+            ..StartupConfig::default()
         };
         assert!(config.validate().is_err());
     }
@@ -232,6 +251,7 @@ mod tests {
                 provider: "openclaw".to_owned(),
                 ..CoreAgentConfig::default()
             },
+            ..StartupConfig::default()
         };
         assert!(config.validate().is_err());
     }
@@ -242,6 +262,7 @@ mod tests {
             display_name: "Node A".to_owned(),
             network_mode: NetworkMode::Local,
             core_agent: CoreAgentConfig::default(),
+            ..StartupConfig::default()
         };
         assert!(config.validate().is_ok());
     }
@@ -249,5 +270,40 @@ mod tests {
     #[test]
     fn core_agent_executor_name_is_stable() {
         assert_eq!(core_agent_executor_name(), "core-agent");
+    }
+
+    #[test]
+    fn normalizes_bootstrap_peers_trim_and_dedup() {
+        let config = StartupConfig {
+            network_mode: NetworkMode::Lan,
+            bootstrap_peers: vec![
+                " /ip4/127.0.0.1/tcp/4001/p2p/peer-a ".to_owned(),
+                String::new(),
+                "/ip4/127.0.0.1/tcp/4001/p2p/peer-a".to_owned(),
+                "/ip4/127.0.0.1/tcp/4002/p2p/peer-b".to_owned(),
+            ],
+            ..StartupConfig::default()
+        }
+        .normalized();
+
+        assert_eq!(
+            config.bootstrap_peers,
+            vec![
+                "/ip4/127.0.0.1/tcp/4001/p2p/peer-a".to_owned(),
+                "/ip4/127.0.0.1/tcp/4002/p2p/peer-b".to_owned()
+            ]
+        );
+    }
+
+    #[test]
+    fn clears_bootstrap_peers_for_local_mode() {
+        let config = StartupConfig {
+            network_mode: NetworkMode::Local,
+            bootstrap_peers: vec!["/ip4/127.0.0.1/tcp/4001/p2p/peer-a".to_owned()],
+            ..StartupConfig::default()
+        }
+        .normalized();
+
+        assert!(config.bootstrap_peers.is_empty());
     }
 }

@@ -33,6 +33,35 @@ pub fn peer_id_from_ed25519_public_key(public_key_32: [u8; 32]) -> Result<PeerId
     Ok(PeerId::from_public_key(&public_key))
 }
 
+pub fn bootstrap_http_base_url(raw_addr: &str, port: u16) -> Result<String> {
+    use libp2p::multiaddr::Protocol;
+
+    let addr = raw_addr.parse::<Multiaddr>()?;
+    let mut host = None;
+    for protocol in addr.iter() {
+        match protocol {
+            Protocol::Ip4(ip) => {
+                host = Some(ip.to_string());
+                break;
+            }
+            Protocol::Ip6(ip) => {
+                host = Some(format!("[{ip}]"));
+                break;
+            }
+            Protocol::Dns(name)
+            | Protocol::Dns4(name)
+            | Protocol::Dns6(name)
+            | Protocol::Dnsaddr(name) => {
+                host = Some(name.to_string());
+                break;
+            }
+            _ => {}
+        }
+    }
+    let host = host.ok_or_else(|| anyhow!("bootstrap multiaddr missing routable host"))?;
+    Ok(format!("http://{host}:{port}"))
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct EventEnvelope {
     pub scope: SwarmScope,

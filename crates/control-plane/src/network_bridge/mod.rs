@@ -16,8 +16,10 @@ use crate::network_p2p::{
     SummaryAnnouncement, SwarmScope,
 };
 use crate::node::Node;
+use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 use std::env;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -61,6 +63,7 @@ const ENV_P2P_MDNS: &str = "WATTSWARM_P2P_MDNS";
 const ENV_P2P_PORT: &str = "WATTSWARM_P2P_PORT";
 const ENV_P2P_LISTEN_ADDRS: &str = "WATTSWARM_P2P_LISTEN_ADDRS";
 const ENV_P2P_BOOTSTRAP_PEERS: &str = "WATTSWARM_P2P_BOOTSTRAP_PEERS";
+const STARTUP_CONFIG_FILE: &str = "startup_config.json";
 const DEFAULT_P2P_PORT: u16 = 4001;
 const GLOBAL_HIGH_FREQUENCY_WINDOW: Duration = Duration::from_secs(5);
 const GLOBAL_HIGH_FREQUENCY_LIMIT: usize = 32;
@@ -332,6 +335,14 @@ pub fn network_config_from_env() -> NetworkP2pConfig {
     }
 }
 
+pub fn network_config_from_state_dir(state_dir: &Path) -> NetworkP2pConfig {
+    let mut config = network_config_from_env();
+    if config.bootstrap_peers.is_empty() {
+        config.bootstrap_peers = load_bootstrap_peers_from_startup_config(state_dir);
+    }
+    config
+}
+
 pub fn maybe_start_background_network_service(
     state_dir: PathBuf,
     db_path: PathBuf,
@@ -340,7 +351,7 @@ pub fn maybe_start_background_network_service(
         return Ok(false);
     }
 
-    let config = network_config_from_env();
+    let config = network_config_from_state_dir(&state_dir);
     let scopes = configured_network_scopes_from_env();
     config.validate()?;
     thread::spawn(move || {
@@ -1312,6 +1323,33 @@ impl NetworkBridgeService {
             NetworkRuntimeEvent::BackfillInboundFailure { peer, error } => {
                 Err(anyhow!("backfill inbound failure from {peer}: {error}"))
             }
+        }
+    }
+}
+#[derive(Debug, Deserialize, Default)]
+struct StartupBootstrapConfig {
+    #[serde(default)]
+    bootstrap_peers: Vec<String>,
+}
+
+fn load_bootstrap_peers_from_startup_config(state_dir: &Path) -> Vec<String> {
+    let path = state_dir.join(STARTUP_CONFIG_FILE);
+    let Ok(bytes) = fs::read(&path) else {
+        return Vec::new();
+    };
+    match serde_json::from_slice::<StartupBootstrapConfig>(&bytes) {
+        Ok(config) => config
+            .bootstrap_peers
+            .into_iter()
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty())
+            .collect(),
+        Err(error) => {
+            eprintln!(
+                "failed to parse startup bootstrap peers from {}: {error}",
+                path.display()
+            );
+            Vec::new()
         }
     }
 }

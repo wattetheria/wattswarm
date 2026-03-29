@@ -84,7 +84,7 @@ pub const STARTUP_HTML: &str = r#"<!DOCTYPE html>
       text-transform: uppercase;
       color: #4c4339;
     }
-    input, select {
+    input, select, textarea {
       width: 100%;
       border: 2px solid var(--line);
       background: #fff;
@@ -92,6 +92,10 @@ pub const STARTUP_HTML: &str = r#"<!DOCTYPE html>
       font: inherit;
       padding: 9px;
       border-radius: 0;
+    }
+    textarea {
+      min-height: 110px;
+      resize: vertical;
     }
     input[readonly] {
       background: #f6efe3;
@@ -281,6 +285,12 @@ pub const STARTUP_HTML: &str = r#"<!DOCTYPE html>
             <div class="meta-line"><span>Selected</span><code id="networkModeLabel">local</code></div>
             <div class="meta-line"><span>Meaning</span><code id="networkModeMeaning">single-machine startup</code></div>
           </div>
+          <div id="bootstrapPeersField" class="field hidden">
+            <label for="bootstrapPeers">Bootstrap Peers</label>
+            <textarea id="bootstrapPeers" rows="4" placeholder="/ip4/203.0.113.10/tcp/4001/p2p/12D3KooW...
+/dns4/bootstrap.example/tcp/4001/p2p/12D3KooW..."></textarea>
+            <div class="hint">Used for joining an existing LAN or WAN network. Enter one peer per line; comma-separated values are also accepted.</div>
+          </div>
           <div class="hint">Self-hosted gateway and servicenet deployment is intentionally left to CLI, compose, or direct config edits.</div>
         </div>
 
@@ -388,6 +398,10 @@ Those stay in CLI, compose, or config files for advanced operators.</pre>
           ? 'local-area distributed network'
           : 'single-machine startup';
       document.getElementById('networkModeMeaning').textContent = meaning;
+      if (mode === 'local') {
+        document.getElementById('bootstrapPeers').value = '';
+      }
+      document.getElementById('bootstrapPeersField').classList.toggle('hidden', mode === 'local');
     }
 
     function applyCoreAgentMode() {
@@ -401,6 +415,7 @@ Those stay in CLI, compose, or config files for advanced operators.</pre>
     function syncFormFromConfig(cfg) {
       startupConfig = cfg;
       document.getElementById('displayName').value = cfg.display_name || '';
+      document.getElementById('bootstrapPeers').value = (cfg.bootstrap_peers || []).join('\n');
       document.getElementById('coreAgentMode').value = cfg.core_agent?.mode || 'local_url';
       document.getElementById('coreBaseUrl').value = cfg.core_agent?.base_url || '';
       document.getElementById('coreProvider').value = cfg.core_agent?.provider || '';
@@ -411,9 +426,14 @@ Those stay in CLI, compose, or config files for advanced operators.</pre>
     }
 
     function buildPayload() {
+      const bootstrapPeers = document.getElementById('bootstrapPeers').value
+        .split(/[\n,]+/)
+        .map((value) => value.trim())
+        .filter(Boolean);
       return {
         display_name: document.getElementById('displayName').value,
         network_mode: startupConfig.network_mode,
+        bootstrap_peers: bootstrapPeers,
         core_agent: {
           mode: document.getElementById('coreAgentMode').value,
           base_url: document.getElementById('coreBaseUrl').value,

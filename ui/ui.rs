@@ -1,10 +1,10 @@
 use crate::control::{
-    ExecutorRegistryEntry, NodeMode, NodeState, RealTaskRunRequest, executor_registry_path,
-    load_executor_registry, local_node_id, local_peer_id, node_state_path, open_node,
-    resolve_node_mode, run_real_task_flow, save_executor_registry, write_node_state,
+    ExecutorRegistryEntry, NodeMode, NodeState, RealTaskRunRequest, load_executor_registry_state,
+    local_node_id, local_peer_id, node_state_path, open_node, resolve_node_mode,
+    run_real_task_flow, save_executor_registry_state, write_node_state,
 };
 use crate::egress_agent::{
-    EgressAgentConfig, egress_agent_config_path, load_egress_agent_config, save_egress_agent_config,
+    EgressAgentConfig, load_egress_agent_config_state, save_egress_agent_config_state,
 };
 use crate::run_control;
 use crate::run_queue::RunSubmitSpec;
@@ -165,6 +165,8 @@ struct TopicMessageWriteRequest {
 struct StartupConfigSaveRequest {
     display_name: String,
     network_mode: crate::startup_config::NetworkMode,
+    #[serde(default)]
+    bootstrap_peers: Vec<String>,
     core_agent: crate::startup_config::CoreAgentConfig,
 }
 
@@ -227,6 +229,7 @@ pub fn build_app(state: UiServerState) -> Router {
         .route("/api/node/down", post(node_down))
         .route("/api/node/status", get(node_status))
         .route("/api/network/local", get(network_local))
+        .route("/api/network/bootstrap", get(network_bootstrap))
         .route("/api/startup-config", get(startup_config_get))
         .route("/api/startup-config", post(startup_config_save))
         .route("/api/peers/list", get(peers_list))
@@ -389,7 +392,9 @@ async fn network_local(State(state): State<UiServerState>) -> Result<Json<Value>
     let state_clone = state.clone();
     let (peer_id, listen_addrs) = run_blocking(move || -> Result<(String, Vec<String>)> {
         let peer_id = local_peer_id(&state_clone.state_dir)?;
-        let listen_addrs = crate::network_bridge::network_config_from_env().listen_addrs;
+        let listen_addrs =
+            crate::network_bridge::network_config_from_state_dir(&state_clone.state_dir)
+                .listen_addrs;
         Ok((peer_id, listen_addrs))
     })
     .await?;
@@ -398,6 +403,19 @@ async fn network_local(State(state): State<UiServerState>) -> Result<Json<Value>
         "network_enabled": crate::network_bridge::network_enabled_from_env(),
         "local_peer_id": peer_id,
         "listen_addrs": listen_addrs
+    })))
+}
+
+async fn network_bootstrap(State(state): State<UiServerState>) -> Result<Json<Value>, ApiError> {
+    let state_clone = state.clone();
+    let bundle = run_blocking(move || -> Result<crate::types::NetworkBootstrapBundle> {
+        let node = open_node(&state_clone.state_dir, &state_clone.db_path)?;
+        node.store.load_network_bootstrap_bundle()
+    })
+    .await?;
+    Ok(Json(json!({
+        "ok": true,
+        "bundle": bundle,
     })))
 }
 
@@ -421,6 +439,7 @@ async fn startup_config_save(
     let payload = StartupConfig {
         display_name: req.display_name,
         network_mode: req.network_mode,
+        bootstrap_peers: req.bootstrap_peers,
         core_agent: req.core_agent,
     }
     .normalized();
@@ -486,19 +505,23 @@ async fn executors_add(
     State(state): State<UiServerState>,
     Json(req): Json<ExecutorAddRequest>,
 ) -> Result<Json<Value>, ApiError> {
-    let reg_path = executor_registry_path(&state.state_dir);
-    let mut reg = load_executor_registry(&reg_path)?;
-    reg.entries.retain(|e| e.name != req.name);
-    reg.entries.push(ExecutorRegistryEntry {
-        name: req.name.clone(),
-        base_url: req.base_url.clone(),
-    });
-    save_executor_registry(&reg_path, &reg)?;
+    let state_clone = state.clone();
+    run_blocking(move || -> Result<()> {
+        let mut reg = load_executor_registry_state(&state_clone.state_dir)?;
+        reg.entries.retain(|e| e.name != req.name);
+        reg.entries.push(ExecutorRegistryEntry {
+            name: req.name,
+            base_url: req.base_url,
+        });
+        save_executor_registry_state(&state_clone.state_dir, &reg)
+    })
+    .await?;
     Ok(Json(json!({"ok": true})))
 }
 
 async fn executors_list(State(state): State<UiServerState>) -> Result<Json<Value>, ApiError> {
-    let reg = load_executor_registry(&executor_registry_path(&state.state_dir))?;
+    let state_clone = state.clone();
+    let reg = run_blocking(move || load_executor_registry_state(&state_clone.state_dir)).await?;
     Ok(Json(json!({"ok": true, "executors": reg.entries})))
 }
 
@@ -506,7 +529,8 @@ async fn executors_check(
     State(state): State<UiServerState>,
     Json(req): Json<ExecutorCheckRequest>,
 ) -> Result<Json<Value>, ApiError> {
-    let reg = load_executor_registry(&executor_registry_path(&state.state_dir))?;
+    let state_clone = state.clone();
+    let reg = run_blocking(move || load_executor_registry_state(&state_clone.state_dir)).await?;
     let entry = reg
         .entries
         .iter()
@@ -523,10 +547,8 @@ async fn executors_check(
 
 async fn egress_agent_get(State(state): State<UiServerState>) -> Result<Json<Value>, ApiError> {
     let state_clone = state.clone();
-    let config = run_blocking(move || {
-        load_egress_agent_config(&egress_agent_config_path(&state_clone.state_dir))
-    })
-    .await?;
+    let config =
+        run_blocking(move || load_egress_agent_config_state(&state_clone.state_dir)).await?;
     Ok(Json(json!({"ok": true, "config": config})))
 }
 
@@ -537,13 +559,8 @@ async fn egress_agent_save(
     let state_clone = state.clone();
     let normalized = config.normalized();
     let saved = normalized.clone();
-    run_blocking(move || {
-        save_egress_agent_config(
-            &egress_agent_config_path(&state_clone.state_dir),
-            &normalized,
-        )
-    })
-    .await?;
+    run_blocking(move || save_egress_agent_config_state(&state_clone.state_dir, &normalized))
+        .await?;
     Ok(Json(json!({"ok": true, "config": saved})))
 }
 
@@ -569,7 +586,7 @@ async fn google_a2a_message_send(
     let request = serde_json::from_value::<crate::a2a::GoogleA2aSendRequest>(payload)
         .map_err(|err| anyhow!("invalid google a2a message/send request: {err}"))?;
     let response = run_blocking(move || {
-        let config = load_egress_agent_config(&egress_agent_config_path(&state_clone.state_dir))?;
+        let config = load_egress_agent_config_state(&state_clone.state_dir)?;
         if !config.enabled {
             return Err(anyhow!("egress agent is disabled"));
         }
@@ -595,7 +612,7 @@ async fn load_google_a2a_agent_card(
 ) -> Result<Value, ApiError> {
     let state_clone = state.clone();
     let card = run_blocking(move || {
-        let config = load_egress_agent_config(&egress_agent_config_path(&state_clone.state_dir))?;
+        let config = load_egress_agent_config_state(&state_clone.state_dir)?;
         if require_enabled && !config.enabled {
             return Err(anyhow!("egress agent is disabled"));
         }

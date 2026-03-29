@@ -1,8 +1,8 @@
 use super::*;
 use crate::crypto::{NodeIdentity, sha256_hex, verify_signature};
 use wattswarm_protocol::types::{
-    NetworkDescriptor, NetworkKind, NetworkProtocolParams, NetworkTopology, OrgDescriptor,
-    SignedNetworkProtocolParamsEnvelope, UnsignedNetworkProtocolParamsEnvelope,
+    NetworkBootstrapBundle, NetworkDescriptor, NetworkKind, NetworkProtocolParams, NetworkTopology,
+    OrgDescriptor, SignedNetworkProtocolParamsEnvelope, UnsignedNetworkProtocolParamsEnvelope,
 };
 
 pub const DEFAULT_LOCAL_ORG_NAME: &str = "Local Bootstrap";
@@ -703,6 +703,40 @@ impl PgStore {
         })
     }
 
+    pub fn load_network_bootstrap_bundle(&self) -> Result<NetworkBootstrapBundle> {
+        if !self.is_org_configured() {
+            anyhow::bail!("store org is not configured");
+        }
+        let topology = self.load_network_topology_for_org(self.org_id())?;
+        let verified = self.load_verified_network_protocol_params()?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
+        let row: Option<(String, i64, i64)> = conn
+            .query_row(
+                "SELECT control_mode, membership_version, policy_version
+                 FROM network_params
+                 WHERE network_id = $1",
+                params![&verified.network_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()?;
+        let Some((control_mode, membership_version, policy_version)) = row else {
+            anyhow::bail!(
+                "missing network_params metadata for network {}",
+                verified.network_id
+            );
+        };
+        Ok(NetworkBootstrapBundle {
+            topology,
+            control_mode,
+            membership_version: membership_version as u64,
+            policy_version: policy_version as u64,
+            signed_params: verified.signed,
+        })
+    }
+
     /// Read verified `NetworkProtocolParams` for the network that owns this store's org.
     pub fn load_network_protocol_params(&self) -> Result<NetworkProtocolParams> {
         Ok(self.load_verified_network_protocol_params()?.signed.params)
@@ -752,5 +786,81 @@ impl PgStore {
             params![json, network_id],
         )?;
         Ok(signed)
+    }
+
+    pub fn import_network_bootstrap_bundle(&self, bundle: &NetworkBootstrapBundle) -> Result<()> {
+        let network = &bundle.topology.network;
+        let org = &bundle.topology.org;
+        if network.network_id != bundle.signed_params.network_id {
+            anyhow::bail!("bootstrap bundle network_id mismatch");
+        }
+        if org.network_id != network.network_id {
+            anyhow::bail!("bootstrap bundle org/network mismatch");
+        }
+        if !network.network_kind.is_overlay() {
+            anyhow::bail!("bootstrap bundle requires overlay network kind");
+        }
+        verify_network_protocol_params(
+            &network.network_id,
+            &network.genesis_node_id,
+            &bundle.signed_params,
+        )?;
+
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
+        conn.execute(
+            "INSERT INTO network_registry(network_id, network_kind, parent_network_id, name, status, genesis_node_id, created_at)
+             VALUES ($1, $2, $3, $4, 'active', $5, NOW())
+             ON CONFLICT(network_id) DO UPDATE SET
+               network_kind = excluded.network_kind,
+               parent_network_id = excluded.parent_network_id,
+               name = excluded.name,
+               status = 'active',
+               genesis_node_id = excluded.genesis_node_id",
+            params![
+                &network.network_id,
+                network.network_kind.as_str(),
+                &network.parent_network_id,
+                &network.network_name,
+                &network.genesis_node_id,
+            ],
+        )?;
+        conn.execute(
+            "INSERT INTO network_params(network_id, control_mode, membership_version, policy_version, params_json, created_at, updated_at)
+             VALUES ($1, $2, $3, $4, $5, NOW(), NOW())
+             ON CONFLICT(network_id) DO UPDATE SET
+               control_mode = excluded.control_mode,
+               membership_version = excluded.membership_version,
+               policy_version = excluded.policy_version,
+               params_json = excluded.params_json,
+               updated_at = NOW()",
+            params![
+                &network.network_id,
+                &bundle.control_mode,
+                bundle.membership_version as i64,
+                bundle.policy_version as i64,
+                serde_json::to_string(&bundle.signed_params)?,
+            ],
+        )?;
+        conn.execute(
+            "INSERT INTO org_registry(org_id, network_id, org_kind, name, status, is_default, created_at)
+             VALUES ($1, $2, $3, $4, 'active', $5, NOW())
+             ON CONFLICT(org_id) DO UPDATE SET
+               network_id = excluded.network_id,
+               org_kind = excluded.org_kind,
+               name = excluded.name,
+               status = 'active',
+               is_default = excluded.is_default",
+            params![
+                &org.org_id,
+                &org.network_id,
+                &org.org_kind,
+                &org.network_org_name,
+                org.is_default,
+            ],
+        )?;
+        Ok(())
     }
 }

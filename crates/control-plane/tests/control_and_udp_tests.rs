@@ -16,19 +16,20 @@ use wattswarm_control_plane::control::{
     add_discovered_peer_endpoint, artifact_store_path, bridge_remote_task_into_local_execution,
     discovered_peers_path, executor_registry_path, fetch_checkpoint_artifact_json,
     fetch_evidence_artifact, fetch_snapshot_artifact_json, fetch_task_detail_artifact,
-    list_artifacts_needing_repair, load_discovered_peer_records, load_discovered_peers,
+    list_artifacts_needing_repair, load_discovered_peer_records,
+    load_discovered_peer_records_state, load_discovered_peers, load_discovered_peers_state,
     load_executor_registry, load_network_directory_snapshot, local_node_id,
     materialize_checkpoint_artifact_json, materialize_evidence_artifact,
     materialize_snapshot_artifact_json, materialize_task_detail_artifact, open_node,
-    open_node_on_network_id, remote_task_bridge_registry_path, run_real_task_flow,
-    save_discovered_peers, save_executor_registry,
+    open_node_on_network_id, run_real_task_flow, save_discovered_peers, save_executor_registry,
+    save_executor_registry_state,
 };
 use wattswarm_control_plane::crypto::{NodeIdentity, sha256_hex};
-use wattswarm_control_plane::storage::storage::pg::Connection;
+use wattswarm_control_plane::storage::{local_control_scope_id, storage::pg::Connection};
 use wattswarm_control_plane::task_template::sample_contract;
 use wattswarm_control_plane::types::{
-    Membership, NetworkKind, Role, SignedNetworkProtocolParamsEnvelope, TaskAnnouncedPayload,
-    UnsignedEvent,
+    Membership, NetworkBootstrapBundle, NetworkKind, NetworkProtocolParams, Role,
+    SignedNetworkProtocolParamsEnvelope, TaskAnnouncedPayload, UnsignedEvent,
 };
 use wattswarm_control_plane::udp_announce::{announce_startup, maybe_start_listener};
 
@@ -154,6 +155,88 @@ struct RuntimeStub {
     addr: SocketAddr,
     stop: Arc<AtomicBool>,
     handle: Option<std::thread::JoinHandle<()>>,
+}
+
+struct BootstrapBundleStub {
+    addr: SocketAddr,
+    stop: Arc<AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl BootstrapBundleStub {
+    fn start(bundle: NetworkBootstrapBundle) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind bootstrap bundle stub");
+        listener
+            .set_nonblocking(true)
+            .expect("set bootstrap bundle stub nonblocking");
+        let addr = listener
+            .local_addr()
+            .expect("bootstrap bundle stub local addr");
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_flag = Arc::clone(&stop);
+        let body = serde_json::json!({
+            "ok": true,
+            "bundle": bundle,
+        })
+        .to_string();
+
+        let handle = thread::spawn(move || {
+            while !stop_flag.load(Ordering::Relaxed) {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let request = read_http_request(&mut stream);
+                        if request.is_empty() {
+                            continue;
+                        }
+                        let request = String::from_utf8_lossy(&request);
+                        let line = request.lines().next().unwrap_or_default();
+                        let (status, payload) = if line.starts_with("GET /api/network/bootstrap ") {
+                            (200, body.clone())
+                        } else {
+                            (404, "{}".to_owned())
+                        };
+                        let response = format!(
+                            "HTTP/1.1 {} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            status,
+                            match status {
+                                200 => "OK",
+                                404 => "Not Found",
+                                _ => "Status",
+                            },
+                            payload.len(),
+                            payload
+                        );
+                        let _ = stream.write_all(response.as_bytes());
+                        let _ = stream.flush();
+                    }
+                    Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        Self {
+            addr,
+            stop,
+            handle: Some(handle),
+        }
+    }
+
+    fn bootstrap_peer_addr(&self, peer_id: &str) -> String {
+        format!("/ip4/127.0.0.1/tcp/{}/p2p/{peer_id}", self.addr.port())
+    }
+}
+
+impl Drop for BootstrapBundleStub {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        let _ = TcpStream::connect(self.addr);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
 }
 
 impl RuntimeStub {
@@ -353,6 +436,11 @@ fn discovered_peers_registry_roundtrip_and_legacy_parse() {
 
 #[test]
 fn add_discovered_peer_dedups_and_sorts() {
+    let _env_guard = env_lock();
+    let _db_lock = DbTestLock::acquire();
+    let schema = format!("test_{}", Uuid::new_v4().simple());
+    reset_test_schema(&schema);
+    let _schema_guard = EnvVarGuard::set("WATTSWARM_PG_SCHEMA", &schema);
     let dir = temp_test_dir("peers-add");
 
     assert!(add_discovered_peer(&dir, "node-c").expect("add node-c"));
@@ -369,10 +457,9 @@ fn add_discovered_peer_dedups_and_sorts() {
     );
     assert!(!add_discovered_peer(&dir, "   ").expect("add empty"));
 
-    let peers = load_discovered_peers(&discovered_peers_path(&dir)).expect("load peers");
+    let peers = load_discovered_peers_state(&dir).expect("load peers");
     assert_eq!(peers, vec!["node-a", "node-b", "node-c"]);
-    let records =
-        load_discovered_peer_records(&discovered_peers_path(&dir)).expect("load peer records");
+    let records = load_discovered_peer_records_state(&dir).expect("load peer records");
     assert_eq!(
         records,
         vec![
@@ -388,6 +475,30 @@ fn add_discovered_peer_dedups_and_sorts() {
                 node_id: "node-c".to_owned(),
                 listen_addr: None,
             }
+        ]
+    );
+
+    let conn = Connection::open(dir.join("local-control.state")).expect("open local control db");
+    let mut stmt = conn
+        .prepare(
+            "SELECT scope_id, node_id
+             FROM discovered_peers_local
+             ORDER BY node_id ASC",
+        )
+        .expect("prepare discovered peers raw query");
+    let raw_rows = stmt
+        .query_map(wattswarm_storage_core::params![], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        })
+        .expect("query discovered peers raw rows")
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .expect("collect discovered peers raw rows");
+    assert_eq!(
+        raw_rows,
+        vec![
+            (local_control_scope_id(&dir), "node-a".to_owned()),
+            (local_control_scope_id(&dir), "node-b".to_owned()),
+            (local_control_scope_id(&dir), "node-c".to_owned()),
         ]
     );
 
@@ -786,6 +897,117 @@ fn open_node_network_mode_rejects_unsigned_network_params() {
 }
 
 #[test]
+fn open_node_network_mode_auto_syncs_signed_bootstrap_bundle_from_remote() {
+    let _guard = env_lock();
+    let _db_lock = DbTestLock::acquire();
+    let local_schema = format!("test_local_{}", Uuid::new_v4().simple());
+    let remote_schema = format!("test_remote_{}", Uuid::new_v4().simple());
+    reset_test_schema(&local_schema);
+    reset_test_schema(&remote_schema);
+
+    let remote_identity = NodeIdentity::random();
+    let remote_node_id = remote_identity.node_id();
+    let network_id = "mainnet:watt-etheria";
+    let org_id = "mainnet:watt-etheria:bootstrap";
+    let bundle = {
+        let _remote_schema_guard = EnvVarGuard::set("WATTSWARM_PG_SCHEMA", &remote_schema);
+        let remote_dir = temp_test_dir("remote-bootstrap-bundle");
+        let remote_state_dir = remote_dir.join("state");
+        fs::create_dir_all(&remote_state_dir).expect("create remote state dir");
+        let remote_db_path = remote_state_dir.join("remote.state");
+        let remote_store = wattswarm_control_plane::storage::PgStore::open(&remote_db_path)
+            .expect("open remote bootstrap store");
+        remote_store
+            .ensure_mainnet_bootstrap_network_topology(
+                network_id,
+                "Watt Etheria",
+                &remote_node_id,
+                &remote_node_id,
+                1_700_000_000_000,
+            )
+            .expect("create remote mainnet bootstrap topology");
+        let conn = Connection::open("remote-bootstrap-bundle-setup")
+            .expect("open remote bootstrap bundle setup connection");
+        conn.execute(
+            "UPDATE org_registry SET name = 'Aether Genesis' WHERE org_id = $1",
+            wattswarm_storage_core::params![org_id],
+        )
+        .expect("rename remote bootstrap org");
+        remote_store
+            .put_network_protocol_params(
+                network_id,
+                &remote_identity,
+                &NetworkProtocolParams::default(),
+            )
+            .expect("sign remote network params");
+        let bundle = remote_store
+            .for_org(org_id)
+            .load_network_bootstrap_bundle()
+            .expect("load remote bootstrap bundle");
+        cleanup_dir(&remote_dir);
+        bundle
+    };
+
+    let remote_peer_id = wattswarm_control_plane::network_p2p::peer_id_from_ed25519_public_key(
+        remote_identity.verifying_key().to_bytes(),
+    )
+    .expect("derive remote peer id");
+    let bootstrap_stub = BootstrapBundleStub::start(bundle.clone());
+    let _local_schema_guard = EnvVarGuard::set("WATTSWARM_PG_SCHEMA", &local_schema);
+    let _mode_guard = EnvVarGuard::set("WATTSWARM_NODE_MODE", "network");
+    let _bootstrap_url_guard = EnvVarGuard::set(
+        "WATTSWARM_NETWORK_BOOTSTRAP_HTTP_URLS",
+        &format!("http://127.0.0.1:{}", bootstrap_stub.addr.port()),
+    );
+    let _bootstrap_peers_guard = EnvVarGuard::set(
+        "WATTSWARM_P2P_BOOTSTRAP_PEERS",
+        &bootstrap_stub.bootstrap_peer_addr(&remote_peer_id.to_string()),
+    );
+
+    let dir = temp_test_dir("open-node-network-mode-auto-sync");
+    let state_dir = dir.join("state");
+    fs::create_dir_all(&state_dir).expect("create local state dir");
+    let db_path = state_dir.join("local.state");
+    let local_node_id = local_node_id(&state_dir).expect("local node id");
+
+    let node = open_node(&state_dir, &db_path).expect("open node after bootstrap sync");
+    assert_eq!(node.store.org_id(), org_id);
+    assert_eq!(node.node_id(), local_node_id);
+
+    let verified = node
+        .store
+        .load_verified_network_protocol_params()
+        .expect("load synced network params");
+    assert_eq!(verified.network_id, network_id);
+    assert_eq!(verified.genesis_node_id, remote_node_id);
+    assert_eq!(verified.signed.signed_by, remote_node_id);
+    assert_eq!(verified.signed, bundle.signed_params);
+
+    let conn = Connection::open("network-bootstrap-auto-sync-verify")
+        .expect("open auto-sync verification connection");
+    let imported_org: (String, bool) = conn
+        .query_row(
+            "SELECT name, is_default FROM org_registry WHERE org_id = $1",
+            wattswarm_storage_core::params![org_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .expect("load imported org");
+    assert_eq!(imported_org.0, "Aether Genesis");
+    assert!(imported_org.1);
+
+    let home_network = conn
+        .query_row(
+            "SELECT home_network_id FROM node_registry WHERE node_id = $1",
+            wattswarm_storage_core::params![&local_node_id],
+            |r| r.get::<_, String>(0),
+        )
+        .expect("load local node registry row");
+    assert_eq!(home_network, network_id);
+
+    cleanup_dir(&dir);
+}
+
+#[test]
 fn network_mode_loads_subnet_topology_as_network_subtype() {
     let _guard = env_lock();
     let _db_lock = DbTestLock::acquire();
@@ -1175,8 +1397,8 @@ fn run_real_task_flow_rejects_unsupported_profile() {
     let stub = RuntimeStub::start(&["other-profile"]);
     wait_for_stub_listener(&stub);
 
-    save_executor_registry(
-        &executor_registry_path(&state_dir),
+    save_executor_registry_state(
+        &state_dir,
         &ExecutorRegistry {
             entries: vec![ExecutorRegistryEntry {
                 name: "rt".to_owned(),
@@ -1215,8 +1437,8 @@ fn run_real_task_flow_reports_task_file_parse_errors() {
     let stub = RuntimeStub::start(&["default"]);
     wait_for_stub_listener(&stub);
 
-    save_executor_registry(
-        &executor_registry_path(&state_dir),
+    save_executor_registry_state(
+        &state_dir,
         &ExecutorRegistry {
             entries: vec![ExecutorRegistryEntry {
                 name: "rt".to_owned(),
@@ -1264,8 +1486,8 @@ fn run_real_task_flow_completes_with_stub_runtime() {
     let stub = RuntimeStub::start(&["default"]);
     wait_for_stub_listener(&stub);
 
-    save_executor_registry(
-        &executor_registry_path(&state_dir),
+    save_executor_registry_state(
+        &state_dir,
         &ExecutorRegistry {
             entries: vec![ExecutorRegistryEntry {
                 name: "rt".to_owned(),
@@ -1311,8 +1533,8 @@ fn remote_task_bridge_materializes_executes_and_dedupes() {
     let stub = RuntimeStub::start(&["default"]);
     wait_for_stub_listener(&stub);
 
-    save_executor_registry(
-        &executor_registry_path(&state_dir),
+    save_executor_registry_state(
+        &state_dir,
         &ExecutorRegistry {
             entries: vec![ExecutorRegistryEntry {
                 name: "rt".to_owned(),
@@ -1406,10 +1628,31 @@ fn remote_task_bridge_materializes_executes_and_dedupes() {
     assert_eq!(members[0].participant_node_id, node.node_id());
     assert_eq!(members[0].status, "confirmed");
 
-    let registry: RemoteTaskBridgeRegistry = serde_json::from_slice(
-        &fs::read(remote_task_bridge_registry_path(&state_dir)).expect("read registry"),
-    )
-    .expect("parse registry");
+    let bridge_rows =
+        wattswarm_control_plane::storage::PgStore::open(state_dir.join("local-control.state"))
+            .expect("open local control store")
+            .list_local_remote_task_bridges(&local_control_scope_id(&state_dir))
+            .expect("list local remote task bridges");
+    let registry = RemoteTaskBridgeRegistry {
+        entries: bridge_rows
+            .into_iter()
+            .map(
+                |entry| wattswarm_control_plane::control::RemoteTaskBridgeRecord {
+                    task_id: entry.task_id,
+                    announcement_id: entry.announcement_id,
+                    network_id: entry.network_id,
+                    source_node_id: entry.source_node_id,
+                    source_scope_hint: entry.source_scope_hint,
+                    detail_ref_digest: entry.detail_ref_digest,
+                    executor: entry.executor,
+                    profile: entry.profile,
+                    candidate_id: entry.candidate_id,
+                    terminal_state: entry.terminal_state,
+                    bridged_at: entry.bridged_at,
+                },
+            )
+            .collect(),
+    };
     assert_eq!(registry.entries.len(), 1);
     assert_eq!(
         registry.entries[0].detail_ref_digest.as_deref(),
@@ -1429,11 +1672,12 @@ fn remote_task_bridge_materializes_executes_and_dedupes() {
     assert_eq!(deduped["bridge"]["deduped"], json!(true));
     assert_eq!(deduped["candidate_id"], out["candidate_id"]);
 
-    let registry_after: RemoteTaskBridgeRegistry = serde_json::from_slice(
-        &fs::read(remote_task_bridge_registry_path(&state_dir)).expect("read registry after"),
-    )
-    .expect("parse registry after");
-    assert_eq!(registry_after.entries.len(), 1);
+    let registry_after =
+        wattswarm_control_plane::storage::PgStore::open(state_dir.join("local-control.state"))
+            .expect("open local control store after")
+            .list_local_remote_task_bridges(&local_control_scope_id(&state_dir))
+            .expect("list local remote task bridges after");
+    assert_eq!(registry_after.len(), 1);
 
     cleanup_dir(&dir);
 }
@@ -1451,8 +1695,8 @@ fn remote_task_bridge_rejects_node_scoped_tasks_for_other_nodes() {
     let stub = RuntimeStub::start(&["default"]);
     wait_for_stub_listener(&stub);
 
-    save_executor_registry(
-        &executor_registry_path(&state_dir),
+    save_executor_registry_state(
+        &state_dir,
         &ExecutorRegistry {
             entries: vec![ExecutorRegistryEntry {
                 name: "rt".to_owned(),
@@ -1533,8 +1777,12 @@ fn remote_task_bridge_rejects_node_scoped_tasks_for_other_nodes() {
     .expect_err("bridge should reject mismatched node scope");
     assert!(err.to_string().contains("not eligible for local node"));
     assert!(
-        !remote_task_bridge_registry_path(&state_dir).exists(),
-        "rejected bridge should not persist dedupe registry"
+        wattswarm_control_plane::storage::PgStore::open(state_dir.join("local-control.state"))
+            .expect("open local control store")
+            .list_local_remote_task_bridges(&local_control_scope_id(&state_dir))
+            .expect("list local remote task bridges")
+            .is_empty(),
+        "rejected bridge should not persist dedupe registry rows"
     );
 
     cleanup_dir(&dir);
@@ -1553,8 +1801,8 @@ fn remote_task_bridge_allows_group_scoped_tasks_for_target_nodes() {
     let stub = RuntimeStub::start(&["default"]);
     wait_for_stub_listener(&stub);
 
-    save_executor_registry(
-        &executor_registry_path(&state_dir),
+    save_executor_registry_state(
+        &state_dir,
         &ExecutorRegistry {
             entries: vec![ExecutorRegistryEntry {
                 name: "rt".to_owned(),
@@ -1663,7 +1911,6 @@ fn udp_announce_startup_and_listener_paths_execute() {
     })
     .to_string();
 
-    let peer_path = discovered_peers_path(&dir);
     let mut found = false;
     for _ in 0..5 {
         let probe = UdpSocket::bind("127.0.0.1:0").expect("bind probe udp socket");
@@ -1679,7 +1926,7 @@ fn udp_announce_startup_and_listener_paths_execute() {
 
         let start = Instant::now();
         while start.elapsed() < Duration::from_millis(700) {
-            if let Ok(records) = load_discovered_peer_records(&peer_path)
+            if let Ok(records) = load_discovered_peer_records_state(&dir)
                 && records.iter().any(|record| {
                     record.node_id == "node-peer"
                         && record.listen_addr.as_deref() == Some("/ip4/127.0.0.1/tcp/4001")

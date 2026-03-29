@@ -1,7 +1,7 @@
 use crate::control::{
-    ExecutorRegistryEntry, NodeMode, NodeState, RealTaskRunRequest, executor_registry_path,
-    load_executor_registry, node_state_path, open_node, open_node_in_mode, resolve_node_mode,
-    run_real_task_flow, save_executor_registry, write_node_state,
+    ExecutorRegistryEntry, NodeMode, NodeState, RealTaskRunRequest, load_executor_registry_state,
+    node_state_path, open_node, open_node_in_mode, resolve_node_mode, run_real_task_flow,
+    save_executor_registry_state, write_node_state,
 };
 use crate::run_control;
 use crate::run_queue::{RunSubmitSpec, WorkerOptions};
@@ -294,8 +294,7 @@ fn handle_log(cmd: LogCommand, state_dir: &Path, db_path: &Path) -> Result<()> {
 }
 
 fn handle_executors(cmd: ExecutorsCommand, state_dir: &Path) -> Result<()> {
-    let reg_path = executor_registry_path(state_dir);
-    let mut reg = load_executor_registry(&reg_path)?;
+    let mut reg = load_executor_registry_state(state_dir)?;
     match cmd.action {
         ExecutorsAction::Add { name, base_url } => {
             reg.entries.retain(|e| e.name != name);
@@ -303,7 +302,7 @@ fn handle_executors(cmd: ExecutorsCommand, state_dir: &Path) -> Result<()> {
                 name: name.clone(),
                 base_url,
             });
-            save_executor_registry(&reg_path, &reg)?;
+            save_executor_registry_state(state_dir, &reg)?;
             println!("executor added: {name}");
         }
         ExecutorsAction::List => {

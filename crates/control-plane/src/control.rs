@@ -1,17 +1,18 @@
 use crate::crypto::{NodeIdentity, candidate_hash, vote_commit_hash};
 use crate::node::{Node, finality_sign};
 use crate::runtime::{HttpRuntimeClient, RuntimeCapabilities, RuntimeClient};
-use crate::storage::PgStore;
+use crate::storage::{PgStore, local_control_scope_id, local_control_store};
 use crate::task_template::sample_contract;
 use crate::types::{
     ClaimRole, EventPayload, ExecutionIntentDeclaredPayload, ExecutionSetConfirmedPayload,
-    ExecutionSetMember, FinalityProof, Membership, Role, TaskContract, VoteChoice,
-    VoteCommitPayload, VoteRevealPayload,
+    ExecutionSetMember, FinalityProof, Membership, NetworkBootstrapBundle, Role, TaskContract,
+    VoteChoice, VoteCommitPayload, VoteRevealPayload,
 };
 use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -168,6 +169,16 @@ struct PreparedRuntime {
     capabilities: RuntimeCapabilities,
 }
 
+const ENV_NETWORK_BOOTSTRAP_HTTP_URLS: &str = "WATTSWARM_NETWORK_BOOTSTRAP_HTTP_URLS";
+const DEFAULT_BOOTSTRAP_HTTP_PORT: u16 = 7788;
+const NETWORK_BOOTSTRAP_ROUTE: &str = "/api/network/bootstrap";
+
+#[derive(Debug, Deserialize)]
+struct NetworkBootstrapBundleResponse {
+    ok: bool,
+    bundle: NetworkBootstrapBundle,
+}
+
 pub fn executor_registry_path(state_dir: &Path) -> PathBuf {
     state_dir.join("executors.json")
 }
@@ -194,16 +205,87 @@ fn open_local_artifact_store(state_dir: &Path) -> Result<ArtifactStore> {
     Ok(store)
 }
 
-fn load_remote_task_bridge_registry(path: &Path) -> Result<RemoteTaskBridgeRegistry> {
+fn load_remote_task_bridge_registry_file(path: &Path) -> Result<RemoteTaskBridgeRegistry> {
     if !path.exists() {
         return Ok(RemoteTaskBridgeRegistry::default());
     }
     Ok(serde_json::from_slice(&fs::read(path)?)?)
 }
 
-fn save_remote_task_bridge_registry(path: &Path, reg: &RemoteTaskBridgeRegistry) -> Result<()> {
-    fs::write(path, serde_json::to_vec_pretty(reg)?)?;
-    Ok(())
+fn load_remote_task_bridge_registry(state_dir: &Path) -> Result<RemoteTaskBridgeRegistry> {
+    let store = local_control_store(state_dir)?;
+    let scope_id = local_control_scope_id(state_dir);
+    let entries = store.list_local_remote_task_bridges(&scope_id)?;
+    if !entries.is_empty() {
+        return Ok(RemoteTaskBridgeRegistry {
+            entries: entries
+                .into_iter()
+                .map(|entry| RemoteTaskBridgeRecord {
+                    task_id: entry.task_id,
+                    announcement_id: entry.announcement_id,
+                    network_id: entry.network_id,
+                    source_node_id: entry.source_node_id,
+                    source_scope_hint: entry.source_scope_hint,
+                    detail_ref_digest: entry.detail_ref_digest,
+                    executor: entry.executor,
+                    profile: entry.profile,
+                    candidate_id: entry.candidate_id,
+                    terminal_state: entry.terminal_state,
+                    bridged_at: entry.bridged_at,
+                })
+                .collect(),
+        });
+    }
+    let path = remote_task_bridge_registry_path(state_dir);
+    let legacy = load_remote_task_bridge_registry_file(&path)?;
+    if !legacy.entries.is_empty() {
+        for entry in &legacy.entries {
+            store.upsert_local_remote_task_bridge(
+                &scope_id,
+                &crate::storage::LocalRemoteTaskBridgeRow {
+                    task_id: entry.task_id.clone(),
+                    announcement_id: entry.announcement_id.clone(),
+                    network_id: entry.network_id.clone(),
+                    source_node_id: entry.source_node_id.clone(),
+                    source_scope_hint: entry.source_scope_hint.clone(),
+                    detail_ref_digest: entry.detail_ref_digest.clone(),
+                    executor: entry.executor.clone(),
+                    profile: entry.profile.clone(),
+                    candidate_id: entry.candidate_id.clone(),
+                    terminal_state: entry.terminal_state.clone(),
+                    bridged_at: entry.bridged_at,
+                },
+            )?;
+        }
+    }
+    Ok(legacy)
+}
+
+fn save_remote_task_bridge_registry(
+    state_dir: &Path,
+    reg: &RemoteTaskBridgeRegistry,
+) -> Result<()> {
+    let store = local_control_store(state_dir)?;
+    let scope_id = local_control_scope_id(state_dir);
+    store.replace_local_remote_task_bridges(
+        &scope_id,
+        &reg.entries
+            .iter()
+            .map(|entry| crate::storage::LocalRemoteTaskBridgeRow {
+                task_id: entry.task_id.clone(),
+                announcement_id: entry.announcement_id.clone(),
+                network_id: entry.network_id.clone(),
+                source_node_id: entry.source_node_id.clone(),
+                source_scope_hint: entry.source_scope_hint.clone(),
+                detail_ref_digest: entry.detail_ref_digest.clone(),
+                executor: entry.executor.clone(),
+                profile: entry.profile.clone(),
+                candidate_id: entry.candidate_id.clone(),
+                terminal_state: entry.terminal_state.clone(),
+                bridged_at: entry.bridged_at,
+            })
+            .collect::<Vec<_>>(),
+    )
 }
 
 fn prepare_runtime_for_executor(
@@ -211,7 +293,7 @@ fn prepare_runtime_for_executor(
     executor: &str,
     profile: &str,
 ) -> Result<PreparedRuntime> {
-    let reg = load_executor_registry(&executor_registry_path(state_dir))?;
+    let reg = load_executor_registry_state(state_dir)?;
     let entry = reg
         .entries
         .iter()
@@ -271,6 +353,109 @@ where
     }
 
     Err(last_err.unwrap_or_else(|| anyhow!("runtime probe failed without an error")))
+}
+
+fn bootstrap_bundle_endpoint_candidates() -> Result<Vec<String>> {
+    let mut seen = BTreeSet::new();
+    let mut endpoints = Vec::new();
+    if let Ok(raw) = env::var(ENV_NETWORK_BOOTSTRAP_HTTP_URLS) {
+        for value in raw
+            .split(',')
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            let endpoint = if value.contains("/api/") {
+                value.to_owned()
+            } else {
+                format!("{}/api/network/bootstrap", value.trim_end_matches('/'))
+            };
+            if seen.insert(endpoint.clone()) {
+                endpoints.push(endpoint);
+            }
+        }
+    }
+    if !endpoints.is_empty() {
+        return Ok(endpoints);
+    }
+
+    let config = crate::network_bridge::network_config_from_env();
+    for raw_addr in config.bootstrap_peers {
+        match crate::network_p2p::bootstrap_http_base_url(&raw_addr, DEFAULT_BOOTSTRAP_HTTP_PORT) {
+            Ok(base_url) => {
+                if seen.insert(base_url.clone()) {
+                    endpoints.push(format!("{base_url}{NETWORK_BOOTSTRAP_ROUTE}"));
+                }
+            }
+            Err(err) => {
+                eprintln!("skip invalid bootstrap HTTP candidate '{raw_addr}': {err}");
+            }
+        }
+    }
+    Ok(endpoints)
+}
+
+fn fetch_network_bootstrap_bundle(endpoint: &str) -> Result<NetworkBootstrapBundle> {
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(3))
+        .build()
+        .context("build bootstrap bundle HTTP client")?;
+    let response = client
+        .get(endpoint)
+        .send()
+        .with_context(|| format!("request bootstrap bundle from {endpoint}"))?
+        .error_for_status()
+        .with_context(|| format!("bootstrap bundle endpoint returned error: {endpoint}"))?;
+    let payload: NetworkBootstrapBundleResponse = response
+        .json()
+        .with_context(|| format!("decode bootstrap bundle response from {endpoint}"))?;
+    if !payload.ok {
+        anyhow::bail!("bootstrap bundle endpoint reported ok=false: {endpoint}");
+    }
+    Ok(payload.bundle)
+}
+
+fn maybe_sync_network_bootstrap_bundle(
+    store: &PgStore,
+    self_node_id: &str,
+    now: u64,
+) -> Result<bool> {
+    let local_bundle_ready = match store.resolve_network_bootstrap_topology_descriptor(
+        self_node_id,
+        self_node_id,
+        now,
+    ) {
+        Ok(topology) => store
+            .for_org(&topology.org.org_id)
+            .load_verified_network_protocol_params()
+            .is_ok(),
+        Err(_) => false,
+    };
+    if local_bundle_ready {
+        return Ok(false);
+    }
+
+    let endpoints = bootstrap_bundle_endpoint_candidates()?;
+    if endpoints.is_empty() {
+        return Ok(false);
+    }
+
+    let mut last_err = None;
+    for endpoint in endpoints {
+        match retry_runtime_probe(|| fetch_network_bootstrap_bundle(&endpoint)) {
+            Ok(bundle) => {
+                store.import_network_bootstrap_bundle(&bundle)?;
+                return Ok(true);
+            }
+            Err(err) => {
+                last_err = Some(err.context(format!("fetch bootstrap bundle via {endpoint}")))
+            }
+        }
+    }
+
+    if let Some(err) = last_err {
+        return Err(err);
+    }
+    Ok(false)
 }
 
 fn default_artifact_retry_after_ms() -> u64 {
@@ -343,7 +528,7 @@ pub fn load_network_directory_snapshot(
         .collect::<Vec<_>>();
 
     let mut sync_endpoints = BTreeMap::<(String, String), DirectorySyncEndpoint>::new();
-    for record in load_discovered_peer_records(&discovered_peers_path(state_dir))? {
+    for record in load_discovered_peer_records_state(state_dir)? {
         let Some(listen_addr) = record.listen_addr else {
             continue;
         };
@@ -1165,8 +1350,7 @@ pub fn bridge_remote_task_into_local_execution(
             scope_hint
         ));
     }
-    let reg_path = remote_task_bridge_registry_path(state_dir);
-    let mut registry = load_remote_task_bridge_registry(&reg_path)?;
+    let mut registry = load_remote_task_bridge_registry(state_dir)?;
 
     if let Some(existing) = registry.entries.iter().find(|entry| {
         entry.task_id == task_id
@@ -1244,7 +1428,7 @@ pub fn bridge_remote_task_into_local_execution(
             .then_with(|| left.executor.cmp(&right.executor))
             .then_with(|| left.profile.cmp(&right.profile))
     });
-    save_remote_task_bridge_registry(&reg_path, &registry)?;
+    save_remote_task_bridge_registry(state_dir, &registry)?;
 
     Ok(bridge_origin_payload(&task_id, false, &record, run))
 }
@@ -1331,7 +1515,7 @@ fn open_node_for_topology(
     if replay_on_open {
         node.replay_rebuild_projection()?;
     }
-    if let Ok(peers) = load_discovered_peers(&discovered_peers_path(state_dir)) {
+    if let Ok(peers) = load_discovered_peers_state(state_dir) {
         for peer_id in peers {
             if peer_id != self_node_id {
                 node.discover_peer(peer_id);
@@ -1346,6 +1530,9 @@ pub fn open_node_in_mode(state_dir: &Path, db_path: &Path, mode: NodeMode) -> Re
     let self_node_id = identity.node_id();
     let now = chrono::Utc::now().timestamp_millis().max(0) as u64;
     let store = PgStore::open(db_path)?;
+    if mode == NodeMode::Network {
+        maybe_sync_network_bootstrap_bundle(&store, &self_node_id, now)?;
+    }
     let topology = match mode {
         NodeMode::Local => {
             store.ensure_local_bootstrap_network_topology(&self_node_id, &self_node_id, now)?
@@ -1422,6 +1609,68 @@ pub fn save_discovered_peer_records(path: &Path, peers: &[DiscoveredPeerRecord])
     Ok(())
 }
 
+pub fn load_discovered_peers_state(state_dir: &Path) -> Result<Vec<String>> {
+    Ok(load_discovered_peer_records_state(state_dir)?
+        .into_iter()
+        .map(|record| record.node_id)
+        .collect())
+}
+
+pub fn load_discovered_peer_records_state(state_dir: &Path) -> Result<Vec<DiscoveredPeerRecord>> {
+    let store = local_control_store(state_dir)?;
+    let scope_id = local_control_scope_id(state_dir);
+    let rows = store.list_local_discovered_peers(&scope_id)?;
+    if !rows.is_empty() {
+        return Ok(rows
+            .into_iter()
+            .map(|row| DiscoveredPeerRecord {
+                node_id: row.node_id,
+                listen_addr: row.listen_addr,
+            })
+            .collect());
+    }
+    let path = discovered_peers_path(state_dir);
+    let legacy = load_discovered_peer_records(&path)?;
+    if !legacy.is_empty() {
+        let now = chrono::Utc::now().timestamp_millis().max(0) as u64;
+        store.replace_local_discovered_peers(
+            &scope_id,
+            &legacy
+                .iter()
+                .map(|record| crate::storage::LocalDiscoveredPeerRow {
+                    node_id: record.node_id.clone(),
+                    listen_addr: record.listen_addr.clone(),
+                    discovered_at: now,
+                    updated_at: now,
+                })
+                .collect::<Vec<_>>(),
+            now,
+        )?;
+    }
+    Ok(legacy)
+}
+
+pub fn save_discovered_peer_records_state(
+    state_dir: &Path,
+    peers: &[DiscoveredPeerRecord],
+) -> Result<()> {
+    let now = chrono::Utc::now().timestamp_millis().max(0) as u64;
+    let scope_id = local_control_scope_id(state_dir);
+    local_control_store(state_dir)?.replace_local_discovered_peers(
+        &scope_id,
+        &peers
+            .iter()
+            .map(|record| crate::storage::LocalDiscoveredPeerRow {
+                node_id: record.node_id.clone(),
+                listen_addr: record.listen_addr.clone(),
+                discovered_at: now,
+                updated_at: now,
+            })
+            .collect::<Vec<_>>(),
+        now,
+    )
+}
+
 pub fn add_discovered_peer(state_dir: &Path, peer_node_id: &str) -> Result<bool> {
     add_discovered_peer_endpoint(state_dir, peer_node_id, None)
 }
@@ -1436,30 +1685,9 @@ pub fn add_discovered_peer_endpoint(
         return Ok(false);
     }
     fs::create_dir_all(state_dir)?;
-    let path = discovered_peers_path(state_dir);
-    let mut peers = load_discovered_peer_records(&path)?;
-    let listen_addr = listen_addr
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToOwned::to_owned);
-
-    if let Some(existing) = peers.iter_mut().find(|record| record.node_id == peer) {
-        if listen_addr.is_some() && existing.listen_addr != listen_addr {
-            existing.listen_addr = listen_addr;
-            peers.sort();
-            save_discovered_peer_records(&path, &peers)?;
-            return Ok(true);
-        }
-        return Ok(false);
-    }
-    peers.push(DiscoveredPeerRecord {
-        node_id: peer.to_owned(),
-        listen_addr,
-    });
-    peers.sort();
-    peers.dedup();
-    save_discovered_peer_records(&path, &peers)?;
-    Ok(true)
+    let now = chrono::Utc::now().timestamp_millis().max(0) as u64;
+    let scope_id = local_control_scope_id(state_dir);
+    local_control_store(state_dir)?.upsert_local_discovered_peer(&scope_id, peer, listen_addr, now)
 }
 
 pub fn load_executor_registry(path: &Path) -> Result<ExecutorRegistry> {
@@ -1472,6 +1700,46 @@ pub fn load_executor_registry(path: &Path) -> Result<ExecutorRegistry> {
 pub fn save_executor_registry(path: &Path, reg: &ExecutorRegistry) -> Result<()> {
     fs::write(path, serde_json::to_vec_pretty(reg)?)?;
     Ok(())
+}
+
+pub fn load_executor_registry_state(state_dir: &Path) -> Result<ExecutorRegistry> {
+    let store = local_control_store(state_dir)?;
+    let scope_id = local_control_scope_id(state_dir);
+    let entries = store.list_local_executors(&scope_id)?;
+    if !entries.is_empty() {
+        return Ok(ExecutorRegistry {
+            entries: entries
+                .into_iter()
+                .map(|entry| ExecutorRegistryEntry {
+                    name: entry.name,
+                    base_url: entry.base_url,
+                })
+                .collect(),
+        });
+    }
+    let path = executor_registry_path(state_dir);
+    let legacy = load_executor_registry(&path)?;
+    if !legacy.entries.is_empty() {
+        save_executor_registry_state(state_dir, &legacy)?;
+    }
+    Ok(legacy)
+}
+
+pub fn save_executor_registry_state(state_dir: &Path, reg: &ExecutorRegistry) -> Result<()> {
+    let now = chrono::Utc::now().timestamp_millis().max(0) as u64;
+    let scope_id = local_control_scope_id(state_dir);
+    local_control_store(state_dir)?.replace_local_executors(
+        &scope_id,
+        &reg.entries
+            .iter()
+            .map(|entry| crate::storage::LocalExecutorEntryRow {
+                name: entry.name.clone(),
+                base_url: entry.base_url.clone(),
+                updated_at: now,
+            })
+            .collect::<Vec<_>>(),
+        now,
+    )
 }
 
 pub fn run_real_task_flow(

@@ -141,3 +141,28 @@ pub fn save_egress_agent_config(path: &Path, config: &EgressAgentConfig) -> Resu
     )?;
     Ok(())
 }
+
+pub fn load_egress_agent_config_state(state_dir: &Path) -> Result<EgressAgentConfig> {
+    let store = crate::storage::local_control_store(state_dir)?;
+    let scope_id = crate::storage::local_control_scope_id(state_dir);
+    if let Some(config) = store.load_local_egress_agent_config::<EgressAgentConfig>(&scope_id)? {
+        return Ok(config.normalized());
+    }
+    let path = egress_agent_config_path(state_dir);
+    let legacy = load_egress_agent_config(&path)?;
+    if legacy != EgressAgentConfig::default() {
+        save_egress_agent_config_state(state_dir, &legacy)?;
+    }
+    Ok(legacy)
+}
+
+pub fn save_egress_agent_config_state(state_dir: &Path, config: &EgressAgentConfig) -> Result<()> {
+    let normalized = config.clone().normalized();
+    let now = chrono::Utc::now().timestamp_millis().max(0) as u64;
+    let scope_id = crate::storage::local_control_scope_id(state_dir);
+    crate::storage::local_control_store(state_dir)?.save_local_egress_agent_config(
+        &scope_id,
+        &normalized,
+        now,
+    )
+}
