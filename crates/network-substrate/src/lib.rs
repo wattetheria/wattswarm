@@ -384,6 +384,8 @@ impl SubstrateConfig {
 pub type BackfillRequestId = request_response::OutboundRequestId;
 pub type BackfillResponseChannel = request_response::ResponseChannel<RawBackfillResponse>;
 
+const BACKFILL_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
 #[derive(Debug)]
 pub enum SubstrateBehaviourEvent {
     Gossipsub(GossipsubEvent),
@@ -474,6 +476,7 @@ pub enum SubstrateRuntimeEvent {
     },
     ConnectionEstablished {
         peer: PeerId,
+        remote_addr: Multiaddr,
     },
     ConnectionClosed {
         peer: PeerId,
@@ -547,6 +550,10 @@ struct BehaviourSeedParts {
     connection_limits: connection_limits::Behaviour,
 }
 
+fn backfill_request_response_config() -> request_response::Config {
+    request_response::Config::default().with_request_timeout(BACKFILL_REQUEST_TIMEOUT)
+}
+
 impl SubstrateNode {
     pub fn new(config: SubstrateConfig, local_key: identity::Keypair) -> Result<Self> {
         config.validate()?;
@@ -601,7 +608,7 @@ impl SubstrateNode {
 
         let request_response = request_response::cbor::Behaviour::new(
             [(BACKFILL_PROTOCOL, ProtocolSupport::Full)],
-            request_response::Config::default(),
+            backfill_request_response_config(),
         );
 
         let mut kad_config = kad::Config::new(KADEMLIA_PROTOCOL);
@@ -1273,10 +1280,14 @@ impl SubstrateRuntime {
                 }
                 Ok(Some(SubstrateRuntimeEvent::NewListenAddr { address }))
             }
-            SwarmEvent::ConnectionEstablished { peer_id, .. } => {
+            SwarmEvent::ConnectionEstablished {
+                peer_id, endpoint, ..
+            } => {
                 self.trigger_kademlia_refresh();
+                let remote_addr = endpoint.get_remote_address().clone();
                 Ok(Some(SubstrateRuntimeEvent::ConnectionEstablished {
                     peer: peer_id,
+                    remote_addr,
                 }))
             }
             SwarmEvent::ConnectionClosed {
@@ -1611,5 +1622,15 @@ mod tests {
         };
         assert_eq!(config.parse_listen_addrs().unwrap().len(), 1);
         assert_eq!(config.parse_bootstrap_peers().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn backfill_request_response_config_uses_extended_timeout() {
+        let config = backfill_request_response_config();
+        let rendered = format!("{config:?}");
+        assert!(
+            rendered.contains("30s"),
+            "request-response config should use 30s timeout, got: {rendered}"
+        );
     }
 }

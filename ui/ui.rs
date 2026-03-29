@@ -1,7 +1,8 @@
 use crate::control::{
-    ExecutorRegistryEntry, NodeMode, NodeState, RealTaskRunRequest, load_executor_registry_state,
-    local_node_id, local_peer_id, node_state_path, open_node, resolve_node_mode,
-    run_real_task_flow, save_executor_registry_state, write_node_state,
+    ExecutorRegistryEntry, NodeState, RealTaskRunRequest, load_executor_registry_state,
+    local_node_id, local_peer_id, node_state_path, open_configured_node, open_node,
+    require_configured_node_mode, resolve_node_mode, run_real_task_flow,
+    save_executor_registry_state, write_node_state,
 };
 use crate::egress_agent::{
     EgressAgentConfig, load_egress_agent_config_state, save_egress_agent_config_state,
@@ -179,10 +180,12 @@ pub fn run(state_dir: PathBuf, db_path: PathBuf, listen: String) -> Result<()> {
             crate::udp_announce::maybe_start_listener(state_dir.clone(), id.clone());
         }
     }
-    if crate::network_bridge::maybe_start_background_network_service(
+    let network_started = crate::network_bridge::maybe_start_background_network_service(
         state_dir.clone(),
         db_path.clone(),
-    )? {
+    )?;
+    if network_started {
+        mark_node_running_if_service_started(&state_dir, true)?;
         eprintln!("wattswarm p2p network enabled");
     } else {
         eprintln!("wattswarm p2p network disabled");
@@ -335,9 +338,13 @@ async fn swarm_page() -> Html<&'static str> {
 async fn node_up(State(state): State<UiServerState>) -> Result<Json<Value>, ApiError> {
     let state_clone = state.clone();
     run_blocking(move || -> Result<()> {
-        let node = open_node(&state_clone.state_dir, &state_clone.db_path)?;
-        let mode = resolve_node_mode(&state_clone.state_dir)?;
+        let node = open_configured_node(&state_clone.state_dir, &state_clone.db_path)?;
+        let mode = require_configured_node_mode(&state_clone.state_dir)?;
         write_node_state(&state_clone.state_dir, true, mode)?;
+        let _ = crate::network_bridge::maybe_start_background_network_service(
+            state_clone.state_dir.clone(),
+            state_clone.db_path.clone(),
+        )?;
         if crate::network_bridge::network_enabled_from_env() {
             crate::udp_announce::announce_startup("node-up-api", None, Some(&node.node_id()));
         }
@@ -355,37 +362,47 @@ async fn node_down(State(state): State<UiServerState>) -> Result<Json<Value>, Ap
 
 async fn node_status(State(state): State<UiServerState>) -> Result<Json<Value>, ApiError> {
     let state_clone = state.clone();
-    let (running, node_id, dist) = run_blocking(
-        move || -> Result<(bool, String, serde_json::Map<String, Value>)> {
-            let state_path = node_state_path(&state_clone.state_dir);
-            let runtime_state: NodeState = if state_path.exists() {
-                serde_json::from_slice(&fs::read(state_path)?)?
-            } else {
-                NodeState {
-                    running: false,
-                    mode: NodeMode::Local,
-                }
-            };
-            let node = open_node(&state_clone.state_dir, &state_clone.db_path)?;
-            let peers = node
-                .store
-                .peer_protocol_version_distribution(&node.identity.node_id())?;
-            let mut dist = serde_json::Map::new();
-            for (version, count) in peers {
-                dist.insert(version, Value::from(count));
+    let result = run_blocking(move || -> Result<Value> {
+        let state_path = node_state_path(&state_clone.state_dir);
+        let runtime_state: NodeState = if state_path.exists() {
+            serde_json::from_slice(&fs::read(state_path)?)?
+        } else {
+            NodeState {
+                running: false,
+                mode: resolve_node_mode(&state_clone.state_dir)?,
             }
-            Ok((runtime_state.running, node.node_id(), dist))
-        },
-    )
+        };
+        let node_id = local_node_id(&state_clone.state_dir).unwrap_or_default();
+
+        // Only read peer info if node has been explicitly started (has topology in DB).
+        let dist = if runtime_state.running {
+            match open_configured_node(&state_clone.state_dir, &state_clone.db_path) {
+                Ok(node) => {
+                    let peers = node
+                        .store
+                        .peer_protocol_version_distribution(&node.identity.node_id())?;
+                    let mut dist = serde_json::Map::new();
+                    for (version, count) in peers {
+                        dist.insert(version, Value::from(count));
+                    }
+                    dist
+                }
+                Err(_) => serde_json::Map::new(),
+            }
+        } else {
+            serde_json::Map::new()
+        };
+        Ok(json!({
+            "ok": true,
+            "running": runtime_state.running,
+            "node_id": node_id,
+            "mode": runtime_state.mode.as_str(),
+            "local_protocol_version": crate::constants::LOCAL_PROTOCOL_VERSION,
+            "peer_protocol_distribution": dist
+        }))
+    })
     .await?;
-    Ok(Json(json!({
-        "ok": true,
-        "running": running,
-        "node_id": node_id,
-        "mode": resolve_node_mode(&state.state_dir)?.as_str(),
-        "local_protocol_version": crate::constants::LOCAL_PROTOCOL_VERSION,
-        "peer_protocol_distribution": dist
-    })))
+    Ok(Json(result))
 }
 
 async fn network_local(State(state): State<UiServerState>) -> Result<Json<Value>, ApiError> {
@@ -409,7 +426,7 @@ async fn network_local(State(state): State<UiServerState>) -> Result<Json<Value>
 async fn network_bootstrap(State(state): State<UiServerState>) -> Result<Json<Value>, ApiError> {
     let state_clone = state.clone();
     let bundle = run_blocking(move || -> Result<crate::types::NetworkBootstrapBundle> {
-        let node = open_node(&state_clone.state_dir, &state_clone.db_path)?;
+        let node = open_configured_node(&state_clone.state_dir, &state_clone.db_path)?;
         node.store.load_network_bootstrap_bundle()
     })
     .await?;
@@ -451,6 +468,11 @@ async fn startup_config_save(
         sync_core_agent_executor(&state_clone.state_dir, &saved)
     })
     .await?;
+    let network_started = crate::network_bridge::maybe_start_background_network_service(
+        state.state_dir.clone(),
+        state.db_path.clone(),
+    )?;
+    mark_node_running_if_service_started(&state.state_dir, network_started)?;
     Ok(Json(json!({
         "ok": true,
         "config": payload,
@@ -462,11 +484,73 @@ async fn startup_config_save(
 async fn peers_list(State(state): State<UiServerState>) -> Result<Json<Value>, ApiError> {
     let state_clone = state.clone();
     let peers = run_blocking(move || -> Result<Vec<String>> {
-        let node = open_node(&state_clone.state_dir, &state_clone.db_path)?;
-        Ok(node.peers())
+        if let Some(peers) =
+            crate::network_bridge::latest_connected_peer_ids(&state_clone.state_dir)
+        {
+            return Ok(peers);
+        }
+        match open_configured_node(&state_clone.state_dir, &state_clone.db_path) {
+            Ok(node) => Ok(node.peers()),
+            Err(_) => Ok(Vec::new()),
+        }
     })
     .await?;
     Ok(Json(json!({"ok": true, "peers": peers})))
+}
+
+fn mark_node_running_if_service_started(state_dir: &std::path::Path, started: bool) -> Result<()> {
+    if !started {
+        return Ok(());
+    }
+    let mode = require_configured_node_mode(state_dir)?;
+    write_node_state(state_dir, true, mode)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::mark_node_running_if_service_started;
+    use crate::control::{NodeState, node_state_path};
+    use crate::startup_config::{
+        CoreAgentConfig, NetworkMode, StartupConfig, save_startup_config, startup_config_path,
+    };
+
+    #[test]
+    fn marks_running_true_when_background_service_starts() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state_dir = dir.path().join("state");
+        std::fs::create_dir_all(&state_dir).expect("create state dir");
+        save_startup_config(
+            &startup_config_path(&state_dir),
+            &StartupConfig {
+                display_name: "Node Agent".to_owned(),
+                network_mode: NetworkMode::Wan,
+                bootstrap_peers: vec!["/ip4/127.0.0.1/tcp/4001/p2p/12D3KooWBootstrap".to_owned()],
+                core_agent: CoreAgentConfig::default(),
+            },
+        )
+        .expect("save startup config");
+
+        mark_node_running_if_service_started(&state_dir, true).expect("mark node running");
+
+        let state: NodeState = serde_json::from_slice(
+            &std::fs::read(node_state_path(&state_dir)).expect("read node state"),
+        )
+        .expect("parse node state");
+        assert!(state.running);
+        assert_eq!(state.mode.as_str(), "network");
+    }
+
+    #[test]
+    fn does_not_write_running_state_when_service_not_started() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state_dir = dir.path().join("state");
+        std::fs::create_dir_all(&state_dir).expect("create state dir");
+
+        mark_node_running_if_service_started(&state_dir, false)
+            .expect("skip writing node running state");
+
+        assert!(!node_state_path(&state_dir).exists());
+    }
 }
 
 async fn log_head(State(state): State<UiServerState>) -> Result<Json<Value>, ApiError> {

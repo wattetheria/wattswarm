@@ -299,6 +299,7 @@ pub enum NetworkRuntimeEvent {
     },
     ConnectionEstablished {
         peer: PeerId,
+        remote_addr: Multiaddr,
     },
     ConnectionClosed {
         peer: PeerId,
@@ -457,8 +458,8 @@ impl NetworkRuntime {
             SubstrateRuntimeEvent::NewListenAddr { address } => {
                 NetworkRuntimeEvent::NewListenAddr { address }
             }
-            SubstrateRuntimeEvent::ConnectionEstablished { peer } => {
-                NetworkRuntimeEvent::ConnectionEstablished { peer }
+            SubstrateRuntimeEvent::ConnectionEstablished { peer, remote_addr } => {
+                NetworkRuntimeEvent::ConnectionEstablished { peer, remote_addr }
             }
             SubstrateRuntimeEvent::ConnectionClosed {
                 peer,

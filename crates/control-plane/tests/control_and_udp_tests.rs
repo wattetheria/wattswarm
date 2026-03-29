@@ -14,9 +14,9 @@ use wattswarm_control_plane::control::{
     DiscoveredPeerRecord, ExecutorRegistry, ExecutorRegistryEntry, RealTaskRunRequest,
     RemoteTaskBridgeRegistry, RemoteTaskBridgeRequest, add_discovered_peer,
     add_discovered_peer_endpoint, artifact_store_path, bridge_remote_task_into_local_execution,
-    discovered_peers_path, executor_registry_path, fetch_checkpoint_artifact_json,
-    fetch_evidence_artifact, fetch_snapshot_artifact_json, fetch_task_detail_artifact,
-    list_artifacts_needing_repair, load_discovered_peer_records,
+    configured_node_mode, discovered_peers_path, executor_registry_path,
+    fetch_checkpoint_artifact_json, fetch_evidence_artifact, fetch_snapshot_artifact_json,
+    fetch_task_detail_artifact, list_artifacts_needing_repair, load_discovered_peer_records,
     load_discovered_peer_records_state, load_discovered_peers, load_discovered_peers_state,
     load_executor_registry, load_network_directory_snapshot, local_node_id,
     materialize_checkpoint_artifact_json, materialize_evidence_artifact,
@@ -25,6 +25,7 @@ use wattswarm_control_plane::control::{
     save_executor_registry_state,
 };
 use wattswarm_control_plane::crypto::{NodeIdentity, sha256_hex};
+use wattswarm_control_plane::network_bridge::maybe_start_background_network_service;
 use wattswarm_control_plane::storage::{local_control_scope_id, storage::pg::Connection};
 use wattswarm_control_plane::task_template::sample_contract;
 use wattswarm_control_plane::types::{
@@ -70,6 +71,26 @@ fn clear_udp_env() {
         std::env::remove_var("WATTSWARM_UDP_ANNOUNCE_MODE");
         std::env::remove_var("WATTSWARM_UDP_ANNOUNCE_ADDR");
         std::env::remove_var("WATTSWARM_UDP_ANNOUNCE_PORT");
+    }
+}
+
+fn clear_node_mode_env() -> Option<String> {
+    let prev = std::env::var("WATTSWARM_NODE_MODE").ok();
+    // SAFETY: tests serialize env mutations via ENV_LOCK when needed.
+    unsafe {
+        std::env::remove_var("WATTSWARM_NODE_MODE");
+    }
+    prev
+}
+
+fn restore_node_mode_env(prev: Option<String>) {
+    // SAFETY: tests serialize env mutations via ENV_LOCK when needed.
+    unsafe {
+        if let Some(value) = prev {
+            std::env::set_var("WATTSWARM_NODE_MODE", value);
+        } else {
+            std::env::remove_var("WATTSWARM_NODE_MODE");
+        }
     }
 }
 
@@ -393,6 +414,63 @@ fn read_http_request(stream: &mut TcpStream) -> Vec<u8> {
     }
 
     request
+}
+
+#[test]
+fn configured_node_mode_requires_explicit_selection() {
+    let _env_lock = env_lock();
+    let prev_mode = clear_node_mode_env();
+    let state_dir = temp_test_dir("configured-node-mode");
+
+    assert_eq!(
+        configured_node_mode(&state_dir).expect("read configured mode"),
+        None
+    );
+
+    fs::write(
+        state_dir.join("startup_config.json"),
+        serde_json::to_vec(&json!({
+            "display_name": "Node Agent",
+            "network_mode": "wan",
+            "bootstrap_peers": [],
+            "core_agent": {
+                "mode": "local_url",
+                "base_url": "http://127.0.0.1:8787",
+                "provider": "openai-compatible",
+                "model": "",
+                "api_key": ""
+            }
+        }))
+        .expect("serialize startup config"),
+    )
+    .expect("write startup config");
+
+    assert_eq!(
+        configured_node_mode(&state_dir).expect("read configured startup mode"),
+        Some(wattswarm_control_plane::control::NodeMode::Network)
+    );
+
+    cleanup_dir(&state_dir);
+    restore_node_mode_env(prev_mode);
+}
+
+#[test]
+fn background_network_service_is_deferred_until_mode_is_configured() {
+    let _env_lock = env_lock();
+    let prev_mode = clear_node_mode_env();
+    let _p2p_enabled = EnvVarGuard::set("WATTSWARM_P2P_ENABLED", "true");
+    let state_dir = temp_test_dir("network-service-deferred");
+    let db_path = state_dir.join("wattswarm.db");
+
+    let started = maybe_start_background_network_service(state_dir.clone(), db_path)
+        .expect("attempt background network start");
+    assert!(
+        !started,
+        "service should not start before node mode is configured"
+    );
+
+    cleanup_dir(&state_dir);
+    restore_node_mode_env(prev_mode);
 }
 
 #[test]

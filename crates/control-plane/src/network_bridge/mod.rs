@@ -21,6 +21,7 @@ use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::runtime::Runtime;
@@ -68,6 +69,52 @@ const DEFAULT_P2P_PORT: u16 = 4001;
 const GLOBAL_HIGH_FREQUENCY_WINDOW: Duration = Duration::from_secs(5);
 const GLOBAL_HIGH_FREQUENCY_LIMIT: usize = 32;
 const DEFAULT_NETWORK_CONTEXT_ID: &str = "default";
+static STARTED_NETWORK_SERVICES: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
+static LATEST_NETWORK_OBSERVABILITY_SNAPSHOTS: OnceLock<
+    Mutex<HashMap<PathBuf, NetworkBridgeObservabilitySnapshot>>,
+> = OnceLock::new();
+
+fn started_network_services() -> &'static Mutex<HashSet<PathBuf>> {
+    STARTED_NETWORK_SERVICES.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+fn latest_network_observability_snapshots()
+-> &'static Mutex<HashMap<PathBuf, NetworkBridgeObservabilitySnapshot>> {
+    LATEST_NETWORK_OBSERVABILITY_SNAPSHOTS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn store_latest_network_observability_snapshot(
+    state_dir: &Path,
+    snapshot: NetworkBridgeObservabilitySnapshot,
+) {
+    let mut snapshots = latest_network_observability_snapshots()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    snapshots.insert(state_dir.to_path_buf(), snapshot);
+}
+
+fn clear_latest_network_observability_snapshot(state_dir: &Path) {
+    let mut snapshots = latest_network_observability_snapshots()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    snapshots.remove(state_dir);
+}
+
+pub fn latest_connected_peer_ids(state_dir: &Path) -> Option<Vec<String>> {
+    let snapshots = latest_network_observability_snapshots()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let snapshot = snapshots.get(state_dir)?;
+    let mut peers = snapshot
+        .peer_health
+        .iter()
+        .filter(|entry| entry.connected)
+        .map(|entry| entry.peer.clone())
+        .collect::<Vec<_>>();
+    peers.sort();
+    peers.dedup();
+    Some(peers)
+}
 
 fn current_network_context_id(node: &Node) -> String {
     if node.store.is_org_configured()
@@ -350,14 +397,36 @@ pub fn maybe_start_background_network_service(
     if !network_enabled_from_env() {
         return Ok(false);
     }
+    let Some(mode) = crate::control::configured_node_mode(&state_dir)? else {
+        eprintln!("wattswarm p2p network deferred (node mode not configured yet)");
+        return Ok(false);
+    };
+    if matches!(mode, crate::control::NodeMode::Local) {
+        return Ok(false);
+    }
 
     let config = network_config_from_state_dir(&state_dir);
     let scopes = configured_network_scopes_from_env();
     config.validate()?;
+    {
+        let mut started = started_network_services()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if started.contains(&state_dir) {
+            return Ok(true);
+        }
+        started.insert(state_dir.clone());
+    }
+    let state_dir_for_registry = state_dir.clone();
     thread::spawn(move || {
         if let Err(err) = run_background_network_service(&state_dir, &db_path, config, scopes) {
             eprintln!("network bridge stopped: {err}");
         }
+        clear_latest_network_observability_snapshot(&state_dir_for_registry);
+        let mut started = started_network_services()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        started.remove(&state_dir_for_registry);
     });
     Ok(true)
 }
@@ -369,7 +438,7 @@ fn run_background_network_service(
     configured_scopes: Vec<SwarmScope>,
 ) -> Result<()> {
     let bootstrap_peers = config.bootstrap_peers.clone();
-    let mut node = crate::control::open_node(state_dir, db_path)?;
+    let mut node = crate::control::open_configured_node(state_dir, db_path)?;
     let node_id = node.node_id();
     let scopes = merge_scopes(
         configured_scopes
@@ -392,6 +461,7 @@ fn run_background_network_service(
     config.validate()?;
     let mut service =
         NetworkBridgeService::new(NetworkP2pNode::generate(config)?, &scopes, &protocol_params)?;
+    store_latest_network_observability_snapshot(state_dir, service.observability_snapshot(&node)?);
     let mut announced_listen = false;
     let mut last_published_seq = node.head_seq()?;
     let mut next_dial_attempt_at = HashMap::new();
@@ -410,6 +480,10 @@ fn run_background_network_service(
                         );
                         announced_listen = true;
                     }
+                }
+                Ok(Some(NetworkBridgeTick::Connected { peer })) => {
+                    did_work = true;
+                    eprintln!("p2p peer connected: {peer}");
                 }
                 Ok(Some(_)) => {
                     did_work = true;
@@ -444,6 +518,10 @@ fn run_background_network_service(
         }
         if service.run_anti_entropy(&node)? > 0 {
             did_work = true;
+        }
+        match service.observability_snapshot(&node) {
+            Ok(snapshot) => store_latest_network_observability_snapshot(state_dir, snapshot),
+            Err(err) => eprintln!("network bridge observability snapshot failed: {err}"),
         }
         if !did_work {
             thread::sleep(IDLE_NETWORK_SLEEP);
@@ -1169,7 +1247,7 @@ impl NetworkBridgeService {
                     detail: format!("dcutr_upgrade_failed remote_peer={remote_peer} error={error}"),
                 })
             }
-            NetworkRuntimeEvent::ConnectionEstablished { peer } => {
+            NetworkRuntimeEvent::ConnectionEstablished { peer, .. } => {
                 self.mark_peer_connected(peer);
                 let _ = self.request_backfill_for_peer(&peer, node)?;
                 if !node.store.is_node_penalized(&node.node_id())? {

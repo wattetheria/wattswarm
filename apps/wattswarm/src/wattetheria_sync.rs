@@ -1,6 +1,6 @@
 use crate::control::{
-    NodeState, RealTaskRunRequest, local_node_id, node_state_path, open_node, resolve_node_mode,
-    run_real_task_flow,
+    NodeState, RealTaskRunRequest, local_node_id, node_state_path, open_configured_node,
+    require_configured_node_mode, resolve_node_mode, run_real_task_flow,
 };
 use crate::run_control;
 use crate::run_queue::{RunSubmitSpec, RunView};
@@ -192,6 +192,11 @@ fn read_node_running(state_dir: &Path) -> Result<(bool, String)> {
     ))
 }
 
+fn ensure_sync_node_mode_configured(state_dir: &Path) -> Result<()> {
+    let _ = require_configured_node_mode(state_dir)?;
+    Ok(())
+}
+
 fn resolve_network_id(node: &crate::node::Node) -> String {
     if node.store.is_org_configured()
         && let Ok(topology) = node
@@ -240,7 +245,8 @@ pub fn build_network_projection_snapshot(
     state_dir: &Path,
     db_path: &Path,
 ) -> Result<NetworkProjectionSnapshot> {
-    let node = open_node(state_dir, db_path)?;
+    ensure_sync_node_mode_configured(state_dir)?;
+    let node = open_configured_node(state_dir, db_path)?;
     let (running, mode) = read_node_running(state_dir)?;
     let distribution = node
         .store
@@ -268,7 +274,8 @@ pub fn build_task_run_projection_snapshot(
     task_limit: usize,
     run_limit: i64,
 ) -> Result<TaskRunProjectionSnapshot> {
-    let node = open_node(state_dir, db_path)?;
+    ensure_sync_node_mode_configured(state_dir)?;
+    let node = open_configured_node(state_dir, db_path)?;
     let recent_tasks = node
         .store
         .list_task_ids_recent(task_limit.clamp(1, 200))?
@@ -305,7 +312,8 @@ pub fn build_topic_activity_snapshot(
     if scope_hint.is_empty() {
         return Err(anyhow!("scope_hint is required"));
     }
-    let node = open_node(state_dir, db_path)?;
+    ensure_sync_node_mode_configured(state_dir)?;
+    let node = open_configured_node(state_dir, db_path)?;
     let subscriber_node_id = subscriber_node_id
         .map(str::trim)
         .filter(|value| !value.is_empty())
@@ -343,7 +351,8 @@ pub fn submit_brain_topic_publish(
     if scope_hint.is_empty() {
         return Err(anyhow!("scope_hint is required"));
     }
-    let mut node = open_node(state_dir, db_path)?;
+    ensure_sync_node_mode_configured(state_dir)?;
+    let mut node = open_configured_node(state_dir, db_path)?;
     let created_at = now_ms();
     let network_id = req.network_id.unwrap_or_else(|| resolve_network_id(&node));
     let event = node.emit_at(
@@ -381,7 +390,8 @@ pub fn submit_brain_task_real(
     db_path: &Path,
     req: BrainTaskRealRequest,
 ) -> Result<Value> {
-    let mut node = open_node(state_dir, db_path)?;
+    ensure_sync_node_mode_configured(state_dir)?;
+    let mut node = open_configured_node(state_dir, db_path)?;
     let profile = req.profile.unwrap_or_else(|| "default".to_owned());
     run_real_task_flow(
         &mut node,
@@ -405,7 +415,8 @@ pub fn build_task_decision_snapshot(
     if task_id.is_empty() {
         return Err(anyhow!("task_id is required"));
     }
-    let node = open_node(state_dir, db_path)?;
+    ensure_sync_node_mode_configured(state_dir)?;
+    let node = open_configured_node(state_dir, db_path)?;
     let task = node
         .task_view(task_id)?
         .ok_or_else(|| anyhow!("task not found: {task_id}"))?;
@@ -457,7 +468,8 @@ pub fn build_knowledge_export_snapshot(
     db_path: &Path,
     req: KnowledgeExportBody,
 ) -> Result<Value> {
-    let node = open_node(state_dir, db_path)?;
+    ensure_sync_node_mode_configured(state_dir)?;
+    let node = open_configured_node(state_dir, db_path)?;
     let knowledge = match (req.task_type.as_deref(), req.task_id.as_deref()) {
         (Some(task_type), None) => node.store.export_knowledge_by_task_type(task_type),
         (None, Some(task_id)) => node.store.export_knowledge_by_task(task_id),

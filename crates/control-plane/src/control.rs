@@ -355,7 +355,7 @@ where
     Err(last_err.unwrap_or_else(|| anyhow!("runtime probe failed without an error")))
 }
 
-fn bootstrap_bundle_endpoint_candidates() -> Result<Vec<String>> {
+fn bootstrap_bundle_endpoint_candidates(state_dir: &Path) -> Result<Vec<String>> {
     let mut seen = BTreeSet::new();
     let mut endpoints = Vec::new();
     if let Ok(raw) = env::var(ENV_NETWORK_BOOTSTRAP_HTTP_URLS) {
@@ -378,7 +378,7 @@ fn bootstrap_bundle_endpoint_candidates() -> Result<Vec<String>> {
         return Ok(endpoints);
     }
 
-    let config = crate::network_bridge::network_config_from_env();
+    let config = crate::network_bridge::network_config_from_state_dir(state_dir);
     for raw_addr in config.bootstrap_peers {
         match crate::network_p2p::bootstrap_http_base_url(&raw_addr, DEFAULT_BOOTSTRAP_HTTP_PORT) {
             Ok(base_url) => {
@@ -415,6 +415,7 @@ fn fetch_network_bootstrap_bundle(endpoint: &str) -> Result<NetworkBootstrapBund
 }
 
 fn maybe_sync_network_bootstrap_bundle(
+    state_dir: &Path,
     store: &PgStore,
     self_node_id: &str,
     now: u64,
@@ -434,7 +435,7 @@ fn maybe_sync_network_bootstrap_bundle(
         return Ok(false);
     }
 
-    let endpoints = bootstrap_bundle_endpoint_candidates()?;
+    let endpoints = bootstrap_bundle_endpoint_candidates(state_dir)?;
     if endpoints.is_empty() {
         return Ok(false);
     }
@@ -1453,14 +1454,51 @@ pub fn local_peer_id(state_dir: &Path) -> Result<String> {
 }
 
 pub fn resolve_node_mode(state_dir: &Path) -> Result<NodeMode> {
+    Ok(configured_node_mode(state_dir)?.unwrap_or(NodeMode::Local))
+}
+
+pub fn require_configured_node_mode(state_dir: &Path) -> Result<NodeMode> {
+    configured_node_mode(state_dir)?.ok_or_else(|| {
+        anyhow!(
+            "node mode is not configured yet; save startup config or set WATTSWARM_NODE_MODE first"
+        )
+    })
+}
+
+pub fn configured_node_mode(state_dir: &Path) -> Result<Option<NodeMode>> {
     let state_path = node_state_path(state_dir);
     if state_path.exists() {
         let state: NodeState = serde_json::from_slice(&fs::read(&state_path)?)?;
-        return Ok(state.mode);
+        return Ok(Some(state.mode));
     }
-    match env::var("WATTSWARM_NODE_MODE") {
-        Ok(value) => NodeMode::parse(&value),
-        Err(_) => Ok(NodeMode::Local),
+    if let Ok(value) = env::var("WATTSWARM_NODE_MODE") {
+        return NodeMode::parse(&value).map(Some);
+    }
+    configured_node_mode_from_startup_config(state_dir)
+}
+
+fn configured_node_mode_from_startup_config(state_dir: &Path) -> Result<Option<NodeMode>> {
+    let path = state_dir.join("startup_config.json");
+    let Ok(bytes) = fs::read(&path) else {
+        return Ok(None);
+    };
+    #[derive(Deserialize)]
+    struct StartupNetworkMode {
+        #[serde(default)]
+        network_mode: String,
+    }
+    let config: StartupNetworkMode = serde_json::from_slice(&bytes)
+        .with_context(|| format!("parse startup config at {}", path.display()))?;
+    if config.network_mode.trim().is_empty() {
+        return Ok(None);
+    }
+    match config.network_mode.trim().to_ascii_lowercase().as_str() {
+        "wan" => Ok(Some(NodeMode::Network)),
+        "lan" => Ok(Some(NodeMode::Lan)),
+        "local" => Ok(Some(NodeMode::Local)),
+        other => Err(anyhow!(
+            "unsupported startup-config node mode '{other}'; expected one of: local, lan, wan"
+        )),
     }
 }
 
@@ -1475,6 +1513,11 @@ pub fn write_node_state(state_dir: &Path, running: bool, mode: NodeMode) -> Resu
 
 pub fn open_node(state_dir: &Path, db_path: &Path) -> Result<Node> {
     let mode = resolve_node_mode(state_dir)?;
+    open_node_in_mode(state_dir, db_path, mode)
+}
+
+pub fn open_configured_node(state_dir: &Path, db_path: &Path) -> Result<Node> {
+    let mode = require_configured_node_mode(state_dir)?;
     open_node_in_mode(state_dir, db_path, mode)
 }
 
@@ -1531,7 +1574,7 @@ pub fn open_node_in_mode(state_dir: &Path, db_path: &Path, mode: NodeMode) -> Re
     let now = chrono::Utc::now().timestamp_millis().max(0) as u64;
     let store = PgStore::open(db_path)?;
     if mode == NodeMode::Network {
-        maybe_sync_network_bootstrap_bundle(&store, &self_node_id, now)?;
+        maybe_sync_network_bootstrap_bundle(state_dir, &store, &self_node_id, now)?;
     }
     let topology = match mode {
         NodeMode::Local => {
@@ -1803,4 +1846,85 @@ fn load_or_create_identity(seed_file: &Path) -> Result<NodeIdentity> {
     let random_seed: [u8; 32] = rand::random();
     fs::write(seed_file, hex::encode(random_seed))?;
     Ok(NodeIdentity::from_seed(random_seed))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ENV_NETWORK_BOOTSTRAP_HTTP_URLS, bootstrap_bundle_endpoint_candidates};
+    use std::fs;
+    use uuid::Uuid;
+
+    struct EnvVarGuard {
+        key: &'static str,
+        prev: Option<String>,
+    }
+
+    impl EnvVarGuard {
+        fn remove(key: &'static str) -> Self {
+            let prev = std::env::var(key).ok();
+            // SAFETY: test mutates process env and restores it on drop.
+            unsafe {
+                std::env::remove_var(key);
+            }
+            Self { key, prev }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            // SAFETY: test restores process env to its prior state.
+            unsafe {
+                if let Some(value) = &self.prev {
+                    std::env::set_var(self.key, value);
+                } else {
+                    std::env::remove_var(self.key);
+                }
+            }
+        }
+    }
+
+    fn temp_test_dir(prefix: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "wattswarm-control-{prefix}-{}",
+            Uuid::new_v4().simple()
+        ));
+        fs::create_dir_all(&dir).expect("create temp dir");
+        dir
+    }
+
+    #[test]
+    fn bootstrap_bundle_candidates_read_startup_config_peers_when_env_missing() {
+        let state_dir = temp_test_dir("bootstrap-candidates");
+        let startup_config_path = state_dir.join("startup_config.json");
+        fs::write(
+            &startup_config_path,
+            serde_json::to_vec(&serde_json::json!({
+                "display_name": "Node Agent",
+                "network_mode": "wan",
+                "bootstrap_peers": [
+                    "/ip4/13.55.201.222/tcp/4001/p2p/12D3KooWJecC4QsgJDf8ptXhdwBKkD43KiP8JBY79aDTHXSegJLV"
+                ],
+                "core_agent": {
+                    "mode": "local_url",
+                    "base_url": "http://127.0.0.1:8787",
+                    "provider": "openai-compatible",
+                    "model": "",
+                    "api_key": ""
+                }
+            }))
+            .expect("serialize startup config"),
+        )
+        .expect("write startup config");
+
+        let _http_guard = EnvVarGuard::remove(ENV_NETWORK_BOOTSTRAP_HTTP_URLS);
+        let _peers_guard = EnvVarGuard::remove("WATTSWARM_P2P_BOOTSTRAP_PEERS");
+
+        let endpoints =
+            bootstrap_bundle_endpoint_candidates(&state_dir).expect("load bootstrap candidates");
+        assert_eq!(
+            endpoints,
+            vec!["http://13.55.201.222:7788/api/network/bootstrap".to_owned()]
+        );
+        let _ = fs::remove_dir_all(state_dir);
+    }
 }

@@ -256,13 +256,13 @@ fn wait_for_connected_pair(
         }
         if matches!(
             tick_a.as_ref(),
-            Some(NetworkBridgeTick::Connected { peer }) if *peer == peer_b
+            Some(NetworkBridgeTick::Connected { peer, .. }) if *peer == peer_b
         ) {
             a_connected = true;
         }
         if matches!(
             tick_b.as_ref(),
-            Some(NetworkBridgeTick::Connected { peer }) if *peer == peer_a
+            Some(NetworkBridgeTick::Connected { peer, .. }) if *peer == peer_a
         ) {
             b_connected = true;
         }
@@ -340,13 +340,13 @@ pub fn two_nodes_sync_global_event_over_libp2p() {
         let tick_b = pump_once(&mut service_b, &mut node_b);
         if matches!(
             tick_a.as_ref(),
-            Some(NetworkBridgeTick::Connected { peer }) if *peer == peer_b
+            Some(NetworkBridgeTick::Connected { peer, .. }) if *peer == peer_b
         ) {
             a_connected = true;
         }
         if matches!(
             tick_b.as_ref(),
-            Some(NetworkBridgeTick::Connected { peer }) if *peer == peer_a
+            Some(NetworkBridgeTick::Connected { peer, .. }) if *peer == peer_a
         ) {
             b_connected = true;
         }
@@ -516,13 +516,13 @@ pub fn two_nodes_backfill_missing_events_over_request_response() {
         let tick_b = pump_once(&mut service_b, &mut node_b);
         if matches!(
             tick_a.as_ref(),
-            Some(NetworkBridgeTick::Connected { peer }) if *peer == peer_b
+            Some(NetworkBridgeTick::Connected { peer, .. }) if *peer == peer_b
         ) {
             a_connected = true;
         }
         if matches!(
             tick_b.as_ref(),
-            Some(NetworkBridgeTick::Connected { peer }) if *peer == peer_a
+            Some(NetworkBridgeTick::Connected { peer, .. }) if *peer == peer_a
         ) {
             b_connected = true;
         }
@@ -625,13 +625,13 @@ pub fn discovered_peer_endpoint_helper_dials_and_syncs_over_lan_state() {
         let tick_b = pump_once(&mut service_b, &mut node_b);
         if matches!(
             tick_a.as_ref(),
-            Some(NetworkBridgeTick::Connected { peer }) if *peer == peer_b
+            Some(NetworkBridgeTick::Connected { peer, .. }) if *peer == peer_b
         ) {
             a_connected = true;
         }
         if matches!(
             tick_b.as_ref(),
-            Some(NetworkBridgeTick::Connected { peer }) if *peer == peer_a
+            Some(NetworkBridgeTick::Connected { peer, .. }) if *peer == peer_a
         ) {
             b_connected = true;
         }

@@ -2209,3 +2209,84 @@ fn dial_discovered_peer_endpoints_skips_invalid_self_and_missing_addrs() {
     assert!(attempts.is_empty());
     let _ = std::fs::remove_dir_all(dir);
 }
+
+#[test]
+fn latest_connected_peer_ids_uses_runtime_observability_snapshot() {
+    let dir = std::env::temp_dir().join(format!(
+        "wattswarm-network-bridge-observability-{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    std::fs::create_dir_all(&dir).expect("create temp dir");
+
+    store_latest_network_observability_snapshot(
+        &dir,
+        NetworkBridgeObservabilitySnapshot {
+            local_peer_id: "local-peer".to_owned(),
+            listen_addrs: vec!["/ip4/127.0.0.1/tcp/4001".to_owned()],
+            subscribed_scopes: vec!["global".to_owned()],
+            connected_peer_count: 1,
+            nat_status: "unknown".to_owned(),
+            nat_public_address: None,
+            nat_confidence: 0,
+            relay_reservations: Vec::new(),
+            peer_health: vec![
+                NetworkBridgePeerHealth {
+                    peer: "peer-connected".to_owned(),
+                    connected: true,
+                    score: 0,
+                    blacklisted: false,
+                    reputation_tier: "healthy".to_owned(),
+                    quarantined: false,
+                    quarantine_remaining_ms: 0,
+                    ban_remaining_ms: 0,
+                    throttle_factor_percent: 100,
+                    known_scopes: vec!["global".to_owned()],
+                    inflight_backfills: 0,
+                    next_retry_in_ms: 0,
+                },
+                NetworkBridgePeerHealth {
+                    peer: "peer-disconnected".to_owned(),
+                    connected: false,
+                    score: 0,
+                    blacklisted: false,
+                    reputation_tier: "healthy".to_owned(),
+                    quarantined: false,
+                    quarantine_remaining_ms: 0,
+                    ban_remaining_ms: 0,
+                    throttle_factor_percent: 100,
+                    known_scopes: vec!["global".to_owned()],
+                    inflight_backfills: 0,
+                    next_retry_in_ms: 0,
+                },
+            ],
+            scope_traffic: Vec::new(),
+            summary_health: NetworkBridgeSummaryHealth {
+                imported_decision_memory_rows: 0,
+                imported_reputation_rows: 0,
+                imported_task_outcome_rows: 0,
+                checkpoint_rows: 0,
+            },
+            subnet_sync_health: NetworkBridgeSubnetSyncHealth {
+                network_id: "mainnet:watt-etheria".to_owned(),
+                network_kind: "mainnet".to_owned(),
+                parent_network_id: None,
+                parent_uplink_available: false,
+                parent_imported_task_outcome_rows: None,
+                parent_checkpoint_rows: None,
+            },
+            execution_set_health: NetworkBridgeExecutionSetHealth {
+                execution_set_count: 0,
+                execution_set_member_count: 0,
+            },
+        },
+    );
+
+    assert_eq!(
+        latest_connected_peer_ids(&dir),
+        Some(vec!["peer-connected".to_owned()])
+    );
+
+    clear_latest_network_observability_snapshot(&dir);
+    assert_eq!(latest_connected_peer_ids(&dir), None);
+    let _ = std::fs::remove_dir_all(dir);
+}

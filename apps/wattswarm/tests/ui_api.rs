@@ -227,6 +227,27 @@ fn reset_test_schema(schema: &str) {
     }
 }
 
+fn count_projection_rows(table: &str) -> i64 {
+    let conn = Connection::open("ui-count-projection-rows").expect("open pg connection");
+    let schema = std::env::var("WATTSWARM_PG_SCHEMA").unwrap_or_else(|_| "public".to_owned());
+    let table_exists = conn
+        .query_row(
+            "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = $1 AND table_name = $2",
+            wattswarm_storage_core::params![schema, table],
+            |row| row.get::<_, i64>(0),
+        )
+        .expect("check projection table existence");
+    if table_exists == 0 {
+        return 0;
+    }
+    conn.query_row(
+        &format!("SELECT COUNT(*) FROM {schema}.{table}"),
+        wattswarm_storage_core::params![],
+        |row| row.get::<_, i64>(0),
+    )
+    .expect("count projection rows")
+}
+
 async fn json_from(res: axum::response::Response) -> Value {
     let bytes = to_bytes(res.into_body(), usize::MAX).await.unwrap();
     serde_json::from_slice(&bytes).unwrap()
@@ -270,6 +291,7 @@ fn ui_supports_core_cli_operations() {
     let _db_lock = DbTestLock::acquire();
     reset_test_schema("test");
     let _schema_guard = EnvVarGuard::set("WATTSWARM_PG_SCHEMA", "test");
+    let _mode_guard = EnvVarGuard::set("WATTSWARM_NODE_MODE", "local");
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -829,6 +851,7 @@ fn ui_exposes_topic_message_history_and_cursor_queries() {
     let _db_lock = DbTestLock::acquire();
     reset_test_schema("test");
     let _schema_guard = EnvVarGuard::set("WATTSWARM_PG_SCHEMA", "test");
+    let _mode_guard = EnvVarGuard::set("WATTSWARM_NODE_MODE", "local");
     let dir = tempdir().unwrap();
     let state_dir = dir.path().join("state");
     std::fs::create_dir_all(&state_dir).unwrap();
@@ -1684,6 +1707,7 @@ fn ui_exposes_wattetheria_sync_http_boundaries() {
     let _db_lock = DbTestLock::acquire();
     reset_test_schema("test");
     let _schema_guard = EnvVarGuard::set("WATTSWARM_PG_SCHEMA", "test");
+    let _mode_guard = EnvVarGuard::set("WATTSWARM_NODE_MODE", "local");
     let dir = tempdir().unwrap();
     let state_dir = dir.path().join("state");
     std::fs::create_dir_all(&state_dir).unwrap();
@@ -2070,6 +2094,7 @@ fn ui_exposes_wattetheria_sync_grpc_streams() {
     let _db_lock = DbTestLock::acquire();
     reset_test_schema("test");
     let _schema_guard = EnvVarGuard::set("WATTSWARM_PG_SCHEMA", "test");
+    let _mode_guard = EnvVarGuard::set("WATTSWARM_NODE_MODE", "local");
     let dir = tempdir().unwrap();
     let state_dir = dir.path().join("state");
     std::fs::create_dir_all(&state_dir).unwrap();
@@ -2207,4 +2232,86 @@ fn ui_exposes_wattetheria_sync_grpc_streams() {
         grpc_task.abort();
         let _ = grpc_task.await;
     });
+}
+
+#[test]
+fn ui_rejects_node_up_until_mode_is_configured() {
+    let _guard = env_lock();
+    let _db_lock = DbTestLock::acquire();
+    reset_test_schema("test");
+    let _schema_guard = EnvVarGuard::set("WATTSWARM_PG_SCHEMA", "test");
+    let dir = tempdir().unwrap();
+    let state_dir = dir.path().join("state");
+    std::fs::create_dir_all(&state_dir).unwrap();
+    let db_path = state_dir.join("ui.state");
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let app = build_app(UiServerState::new(state_dir.clone(), db_path.clone()));
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/node/up")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        let json = json_from(res).await;
+        assert_eq!(json["ok"].as_bool(), Some(false));
+        assert!(
+            json["error"]
+                .as_str()
+                .is_some_and(|value| value.contains("node mode is not configured yet"))
+        );
+    });
+
+    assert_eq!(count_projection_rows("network_registry"), 0);
+    assert_eq!(count_projection_rows("node_registry"), 0);
+}
+
+#[test]
+fn ui_wattetheria_snapshot_does_not_initialize_local_topology_when_unconfigured() {
+    let _guard = env_lock();
+    let _db_lock = DbTestLock::acquire();
+    reset_test_schema("test");
+    let _schema_guard = EnvVarGuard::set("WATTSWARM_PG_SCHEMA", "test");
+    let dir = tempdir().unwrap();
+    let state_dir = dir.path().join("state");
+    std::fs::create_dir_all(&state_dir).unwrap();
+    let db_path = state_dir.join("ui.state");
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let app = build_app(UiServerState::new(state_dir.clone(), db_path.clone()));
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/wattetheria/network/snapshot")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        let json = json_from(res).await;
+        assert_eq!(json["ok"].as_bool(), Some(false));
+        assert!(
+            json["error"]
+                .as_str()
+                .is_some_and(|value| value.contains("node mode is not configured yet"))
+        );
+    });
+
+    assert_eq!(count_projection_rows("network_registry"), 0);
+    assert_eq!(count_projection_rows("node_registry"), 0);
 }
