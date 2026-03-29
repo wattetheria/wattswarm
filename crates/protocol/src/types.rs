@@ -678,6 +678,7 @@ impl NetworkKind {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NetworkDescriptor {
     pub network_id: String,
+    pub network_name: String,
     pub network_kind: NetworkKind,
     pub parent_network_id: Option<String>,
     pub genesis_node_id: String,
@@ -693,6 +694,7 @@ impl NetworkDescriptor {
 pub struct OrgDescriptor {
     pub org_id: String,
     pub network_id: String,
+    pub network_org_name: String,
     pub org_kind: String,
     pub is_default: bool,
 }

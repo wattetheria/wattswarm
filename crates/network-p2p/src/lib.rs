@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use libp2p::identify;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -24,6 +24,13 @@ pub const WATTSWARM_IDENTIFY_AGENT_PREFIX: &str = "wattswarm-network-p2p";
 
 pub fn encode_wattswarm_agent_version(metadata: &PeerHandshakeMetadata) -> String {
     metadata.encode_agent_version_with_prefix(WATTSWARM_IDENTIFY_AGENT_PREFIX)
+}
+
+pub fn peer_id_from_ed25519_public_key(public_key_32: [u8; 32]) -> Result<PeerId> {
+    let public_key = libp2p::identity::ed25519::PublicKey::try_from_bytes(&public_key_32)
+        .map_err(|err| anyhow!("parse libp2p ed25519 public key: {err}"))?;
+    let public_key = libp2p::identity::PublicKey::from(public_key);
+    Ok(PeerId::from_public_key(&public_key))
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

@@ -255,17 +255,21 @@ fn bootstrap_topology_returns_typed_network_and_org_descriptors() {
         .expect("bootstrap topology");
 
     assert_eq!(topology.network.network_id, "local:node-a");
+    assert_eq!(topology.network.network_name, "Local Network node-a");
     assert_eq!(topology.network.network_kind, NetworkKind::Local);
     assert_eq!(topology.network.parent_network_id, None);
     assert_eq!(topology.network.genesis_node_id, "node-a");
     assert_eq!(topology.org.org_id, "local:node-a:bootstrap");
     assert_eq!(topology.org.network_id, topology.network.network_id);
+    assert_eq!(topology.org.network_org_name, "Local Bootstrap");
     assert_eq!(topology.org.org_kind, "bootstrap");
     assert!(topology.org.is_default);
 
     let loaded = store
         .load_network_topology_for_org(&topology.org.org_id)
         .expect("load topology");
+    assert_eq!(loaded.network.network_name, "Local Network node-a");
+    assert_eq!(loaded.org.network_org_name, "Local Bootstrap");
     assert_eq!(loaded, topology);
 }
 

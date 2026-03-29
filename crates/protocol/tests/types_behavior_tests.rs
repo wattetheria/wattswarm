@@ -401,6 +401,7 @@ fn network_kind_and_topology_types_capture_subnet_as_network_subtype() {
     let topology = NetworkTopology {
         network: NetworkDescriptor {
             network_id: "subnet:alpha".to_owned(),
+            network_name: "Subnet Alpha".to_owned(),
             network_kind: NetworkKind::Subnet,
             parent_network_id: Some("mainnet:watt-galaxy".to_owned()),
             genesis_node_id: "node-genesis".to_owned(),
@@ -408,6 +409,7 @@ fn network_kind_and_topology_types_capture_subnet_as_network_subtype() {
         org: OrgDescriptor {
             org_id: "subnet:alpha:bootstrap".to_owned(),
             network_id: "subnet:alpha".to_owned(),
+            network_org_name: "Subnet Alpha Bootstrap".to_owned(),
             org_kind: "bootstrap".to_owned(),
             is_default: true,
         },

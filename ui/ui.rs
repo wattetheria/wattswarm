@@ -1,7 +1,7 @@
 use crate::control::{
     ExecutorRegistryEntry, NodeMode, NodeState, RealTaskRunRequest, executor_registry_path,
-    load_executor_registry, local_node_id, node_state_path, open_node, resolve_node_mode,
-    run_real_task_flow, save_executor_registry, write_node_state,
+    load_executor_registry, local_node_id, local_peer_id, node_state_path, open_node,
+    resolve_node_mode, run_real_task_flow, save_executor_registry, write_node_state,
 };
 use crate::egress_agent::{
     EgressAgentConfig, egress_agent_config_path, load_egress_agent_config, save_egress_agent_config,
@@ -226,6 +226,7 @@ pub fn build_app(state: UiServerState) -> Router {
         .route("/api/node/up", post(node_up))
         .route("/api/node/down", post(node_down))
         .route("/api/node/status", get(node_status))
+        .route("/api/network/local", get(network_local))
         .route("/api/startup-config", get(startup_config_get))
         .route("/api/startup-config", post(startup_config_save))
         .route("/api/peers/list", get(peers_list))
@@ -381,6 +382,22 @@ async fn node_status(State(state): State<UiServerState>) -> Result<Json<Value>, 
         "mode": resolve_node_mode(&state.state_dir)?.as_str(),
         "local_protocol_version": crate::constants::LOCAL_PROTOCOL_VERSION,
         "peer_protocol_distribution": dist
+    })))
+}
+
+async fn network_local(State(state): State<UiServerState>) -> Result<Json<Value>, ApiError> {
+    let state_clone = state.clone();
+    let (peer_id, listen_addrs) = run_blocking(move || -> Result<(String, Vec<String>)> {
+        let peer_id = local_peer_id(&state_clone.state_dir)?;
+        let listen_addrs = crate::network_bridge::network_config_from_env().listen_addrs;
+        Ok((peer_id, listen_addrs))
+    })
+    .await?;
+    Ok(Json(json!({
+        "ok": true,
+        "network_enabled": crate::network_bridge::network_enabled_from_env(),
+        "local_peer_id": peer_id,
+        "listen_addrs": listen_addrs
     })))
 }
 

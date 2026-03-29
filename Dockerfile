@@ -13,6 +13,9 @@ FROM chef AS planner
 COPY Cargo.toml Cargo.lock ./
 COPY crates/protocol/Cargo.toml crates/protocol/Cargo.toml
 COPY crates/crypto/Cargo.toml crates/crypto/Cargo.toml
+COPY crates/artifact-store/Cargo.toml crates/artifact-store/Cargo.toml
+COPY crates/network-substrate/Cargo.toml crates/network-substrate/Cargo.toml
+COPY crates/network-p2p/Cargo.toml crates/network-p2p/Cargo.toml
 COPY crates/policy-engine/Cargo.toml crates/policy-engine/Cargo.toml
 COPY crates/runtime-client/Cargo.toml crates/runtime-client/Cargo.toml
 COPY crates/storage-core/Cargo.toml crates/storage-core/Cargo.toml
@@ -25,6 +28,9 @@ COPY apps/wattswarm-runtime/Cargo.toml apps/wattswarm-runtime/Cargo.toml
 RUN mkdir -p \
     crates/protocol/src \
     crates/crypto/src \
+    crates/artifact-store/src \
+    crates/network-substrate/src \
+    crates/network-p2p/src \
     crates/policy-engine/src \
     crates/runtime-client/src \
     crates/storage-core/src \
@@ -35,6 +41,9 @@ RUN mkdir -p \
     apps/wattswarm-runtime/src \
     && printf "pub fn _planner_stub() {}\n" > crates/protocol/src/lib.rs \
     && printf "pub fn _planner_stub() {}\n" > crates/crypto/src/lib.rs \
+    && printf "pub fn _planner_stub() {}\n" > crates/artifact-store/src/lib.rs \
+    && printf "pub fn _planner_stub() {}\n" > crates/network-substrate/src/lib.rs \
+    && printf "pub fn _planner_stub() {}\n" > crates/network-p2p/src/lib.rs \
     && printf "pub fn _planner_stub() {}\n" > crates/policy-engine/src/lib.rs \
     && printf "pub fn _planner_stub() {}\n" > crates/runtime-client/src/lib.rs \
     && printf "pub fn _planner_stub() {}\n" > crates/storage-core/src/lib.rs \

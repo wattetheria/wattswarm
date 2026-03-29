@@ -138,20 +138,21 @@ impl PgStore {
         conn: &Connection,
         network_id: &str,
     ) -> Result<NetworkDescriptor> {
-        let row: Option<(String, String, Option<String>, String)> = conn
+        let row: Option<(String, String, String, Option<String>, String)> = conn
             .query_row(
-                "SELECT network_id, network_kind, parent_network_id, genesis_node_id
+                "SELECT network_id, name, network_kind, parent_network_id, genesis_node_id
                  FROM network_registry
                  WHERE network_id = $1",
                 params![network_id],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
             )
             .optional()?;
-        let Some((network_id, network_kind, parent_network_id, genesis_node_id)) = row else {
+        let Some((network_id, name, network_kind, parent_network_id, genesis_node_id)) = row else {
             anyhow::bail!("missing network_registry row for network {network_id}");
         };
         Ok(NetworkDescriptor {
             network_id,
+            network_name: name,
             network_kind: Self::parse_network_kind(&network_kind)?,
             parent_network_id,
             genesis_node_id,
@@ -159,21 +160,22 @@ impl PgStore {
     }
 
     fn load_org_descriptor_tx(conn: &Connection, org_id: &str) -> Result<OrgDescriptor> {
-        let row: Option<(String, String, String, bool)> = conn
+        let row: Option<(String, String, String, String, bool)> = conn
             .query_row(
-                "SELECT org_id, network_id, org_kind, is_default
+                "SELECT org_id, network_id, name, org_kind, is_default
                  FROM org_registry
                  WHERE org_id = $1",
                 params![org_id],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
             )
             .optional()?;
-        let Some((org_id, network_id, org_kind, is_default)) = row else {
+        let Some((org_id, network_id, network_org_name, org_kind, is_default)) = row else {
             anyhow::bail!("missing org_registry row for org {org_id}");
         };
         Ok(OrgDescriptor {
             org_id,
             network_id,
+            network_org_name,
             org_kind,
             is_default,
         })
@@ -185,7 +187,7 @@ impl PgStore {
     ) -> Result<OrgDescriptor> {
         let rows = conn
             .prepare(
-                "SELECT org_id, network_id, org_kind, is_default
+                "SELECT org_id, network_id, name, org_kind, is_default
                  FROM org_registry
                  WHERE network_id = $1
                    AND is_default = TRUE
@@ -197,8 +199,9 @@ impl PgStore {
                 Ok(OrgDescriptor {
                     org_id: r.get(0)?,
                     network_id: r.get(1)?,
-                    org_kind: r.get(2)?,
-                    is_default: r.get(3)?,
+                    network_org_name: r.get(2)?,
+                    org_kind: r.get(3)?,
+                    is_default: r.get(4)?,
                 })
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;

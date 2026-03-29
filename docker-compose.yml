@@ -21,7 +21,6 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-      target: dev
     container_name: wattswarm-kernel
     restart: unless-stopped
     depends_on:
@@ -45,41 +44,21 @@ services:
       WATTSWARM_UDP_ANNOUNCE_ADDR: ${WATTSWARM_UDP_ANNOUNCE_ADDR:-239.255.42.99}
       WATTSWARM_UDP_ANNOUNCE_PORT: ${WATTSWARM_UDP_ANNOUNCE_PORT:-37931}
     volumes:
-      - .:/app
-      - wattswarm_cargo_target:/app/target
-      - wattswarm_cargo_registry:/usr/local/cargo/registry
       - wattswarm_state_data:/var/lib/wattswarm
     ports:
       - "${WATTSWARM_UI_PORT:-7788}:7788"
       - "${WATTSWARM_P2P_HOST_PORT:-4001}:${WATTSWARM_P2P_PORT:-4001}"
       - "${WATTSWARM_UDP_ANNOUNCE_HOST_PORT:-37931}:${WATTSWARM_UDP_ANNOUNCE_PORT:-37931}/udp"
-    entrypoint: ["/bin/sh", "-c"]
-    command:
-      - >
-        exec /bin/sh /app/scripts/docker-kernel-hot-entrypoint.sh
+    entrypoint: ["/app/scripts/docker-kernel-entrypoint.sh"]
 
   runtime:
     build:
       context: .
       dockerfile: Dockerfile
-      target: dev
     container_name: wattswarm-runtime
     restart: unless-stopped
-    entrypoint: ["/bin/sh", "-c"]
-    command:
-      - >
-        exec cargo watch
-        --poll
-        --watch Cargo.toml
-        --watch Cargo.lock
-        --watch apps
-        --watch crates
-        --ignore target
-        --shell "cargo run -p wattswarm-runtime-app --bin wattswarm-runtime -- --listen 0.0.0.0:8787"
-    volumes:
-      - .:/app
-      - wattswarm_cargo_target:/app/target
-      - wattswarm_cargo_registry:/usr/local/cargo/registry
+    entrypoint: ["/app/target/release/wattswarm-runtime"]
+    command: ["--listen", "0.0.0.0:8787"]
     healthcheck:
       test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8787/health > /dev/null"]
       interval: 5s
@@ -93,7 +72,6 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-      target: dev
     container_name: wattswarm-worker
     restart: unless-stopped
     depends_on:
@@ -107,28 +85,29 @@ services:
       WATTSWARM_PG_URL: postgres://${WATTSWARM_PG_USER:-postgres}:${WATTSWARM_PG_PASSWORD:-postgres}@postgres:5432/${WATTSWARM_PG_DB:-wattswarm}
       WATTSWARM_STATE_DIR: /var/lib/wattswarm
       WATTSWARM_STORE_NAME: wattswarm.state
+      WATTSWARM_NODE_MODE: ${WATTSWARM_NODE_MODE:-local}
       WATTSWARM_WORKER_CONCURRENCY: ${WATTSWARM_WORKER_CONCURRENCY:-16}
       WATTSWARM_WORKER_POLL_MS: ${WATTSWARM_WORKER_POLL_MS:-250}
       WATTSWARM_WORKER_LEASE_MS: ${WATTSWARM_WORKER_LEASE_MS:-30000}
     volumes:
-      - .:/app
-      - wattswarm_cargo_target:/app/target
-      - wattswarm_cargo_registry:/usr/local/cargo/registry
       - wattswarm_state_data:/var/lib/wattswarm
-    entrypoint: ["/bin/sh", "-c"]
+    entrypoint: ["/app/target/release/wattswarm"]
     command:
-      - >
-        exec cargo watch
-        --poll
-        --watch Cargo.toml
-        --watch Cargo.lock
-        --watch apps
-        --watch crates
-        --ignore target
-        --shell "cargo run --bin wattswarm -- --state-dir \"$$WATTSWARM_STATE_DIR\" --store \"$$WATTSWARM_STORE_NAME\" run --pg-url \"$$WATTSWARM_PG_URL\" worker --concurrency \"$$WATTSWARM_WORKER_CONCURRENCY\" --poll-ms \"$$WATTSWARM_WORKER_POLL_MS\" --lease-ms \"$$WATTSWARM_WORKER_LEASE_MS\""
+      - --state-dir
+      - /var/lib/wattswarm
+      - --store
+      - wattswarm.state
+      - run
+      - --pg-url
+      - postgres://${WATTSWARM_PG_USER:-postgres}:${WATTSWARM_PG_PASSWORD:-postgres}@postgres:5432/${WATTSWARM_PG_DB:-wattswarm}
+      - worker
+      - --concurrency
+      - "${WATTSWARM_WORKER_CONCURRENCY:-16}"
+      - --poll-ms
+      - "${WATTSWARM_WORKER_POLL_MS:-250}"
+      - --lease-ms
+      - "${WATTSWARM_WORKER_LEASE_MS:-30000}"
 
 volumes:
   wattswarm_pg_data:
   wattswarm_state_data:
-  wattswarm_cargo_target:
-  wattswarm_cargo_registry:

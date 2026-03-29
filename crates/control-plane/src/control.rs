@@ -1253,6 +1253,21 @@ pub fn local_node_id(state_dir: &Path) -> Result<String> {
     Ok(load_or_create_identity(&state_dir.join("node_seed.hex"))?.node_id())
 }
 
+pub fn local_peer_id(state_dir: &Path) -> Result<String> {
+    let seed_file = state_dir.join("node_seed.hex");
+    let hex_seed = fs::read_to_string(&seed_file)
+        .with_context(|| format!("read node identity seed from {}", seed_file.display()))?;
+    let bytes = hex::decode(hex_seed.trim())?;
+    let arr: [u8; 32] = bytes
+        .try_into()
+        .map_err(|_| anyhow!("seed must be 32 bytes"))?;
+    let identity = NodeIdentity::from_seed(arr);
+    Ok(
+        crate::network_p2p::peer_id_from_ed25519_public_key(identity.verifying_key().to_bytes())?
+            .to_string(),
+    )
+}
+
 pub fn resolve_node_mode(state_dir: &Path) -> Result<NodeMode> {
     let state_path = node_state_path(state_dir);
     if state_path.exists() {

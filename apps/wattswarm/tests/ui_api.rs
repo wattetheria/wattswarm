@@ -476,6 +476,55 @@ fn ui_root_page_serves_startup_view_and_console_route_keeps_legacy_console() {
 }
 
 #[test]
+fn ui_exposes_local_network_peer_identity_and_listen_addrs() {
+    let _guard = env_lock();
+    let _p2p_enabled = EnvVarGuard::set("WATTSWARM_P2P_ENABLED", "true");
+    let _listen_addrs = EnvVarGuard::set(
+        "WATTSWARM_P2P_LISTEN_ADDRS",
+        "/ip4/127.0.0.1/tcp/4010,/ip4/0.0.0.0/tcp/4011",
+    );
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let dir = tempdir().unwrap();
+        let state_dir = dir.path().join("state");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        let db_path = state_dir.join("ui.state");
+        let _ = wattswarm::control::local_node_id(&state_dir).expect("create local identity");
+        let app = build_app(UiServerState::new(state_dir, db_path));
+
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/network/local")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let json = json_from(res).await;
+        assert_eq!(json["ok"].as_bool(), Some(true));
+        assert_eq!(json["network_enabled"].as_bool(), Some(true));
+        assert!(
+            json["local_peer_id"]
+                .as_str()
+                .is_some_and(|value| !value.is_empty())
+        );
+        assert_eq!(
+            json["listen_addrs"].as_array().unwrap(),
+            &vec![
+                Value::String("/ip4/127.0.0.1/tcp/4010".to_owned()),
+                Value::String("/ip4/0.0.0.0/tcp/4011".to_owned()),
+            ]
+        );
+    });
+}
+
+#[test]
 fn ui_startup_config_roundtrips_and_registers_core_agent_executor() {
     let _guard = env_lock();
     let _db_lock = DbTestLock::acquire();
