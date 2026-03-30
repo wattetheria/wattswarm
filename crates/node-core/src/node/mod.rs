@@ -18,13 +18,15 @@ use crate::runtime::{ExecuteRequest, RuntimeClient, VerifyRequest, verifier_resu
 use crate::storage::pg::ErrorCode;
 use crate::storage::{PgStore, RuntimeMetricObservation, TaskProjectionRow, VoteRevealRow};
 use crate::types::{
-    Candidate, CandidateProposedPayload, ClaimPayload, ClaimReleasePayload, ClaimRenewPayload,
-    ClaimRole, DecisionCommittedPayload, DecisionFinalizedPayload, EpochEndReason, Event,
-    EventPayload, EvidenceAddedPayload, EvidenceAvailablePayload, KnowledgeHit, KnowledgeHitType,
-    Membership, MembershipUpdatedPayload, Role, SeedBundle, SeedConstraints, SignatureEnvelope,
-    TaskContract, TaskErrorPayload, TaskRetryScheduledPayload, TaskTerminalState, UnsignedEvent,
-    VerificationStatus, VerifierResult, VerifierResultSubmittedPayload, VoteChoice,
-    VoteCommitPayload, VoteRevealPayload,
+    ArtifactRef, Candidate, CandidateProposedPayload, ClaimPayload, ClaimReleasePayload,
+    ClaimRenewPayload, ClaimRole, DecisionCommittedPayload, DecisionFinalizedPayload,
+    EpochEndReason, Event, EventPayload, EvidenceAddedPayload, EvidenceAvailablePayload,
+    ExecutionIntentDeclaredPayload, ExecutionSetConfirmedPayload, ExecutionSetMember, KnowledgeHit,
+    KnowledgeHitType, Membership, MembershipUpdatedPayload, Role, SeedBundle, SeedConstraints,
+    SignatureEnvelope, TaskAnnouncedPayload, TaskContract, TaskErrorPayload,
+    TaskRetryScheduledPayload, TaskTerminalState, UnsignedEvent, VerificationStatus,
+    VerifierResult, VerifierResultSubmittedPayload, VoteChoice, VoteCommitPayload,
+    VoteRevealPayload,
 };
 use anyhow::{Context, Result, anyhow};
 use base64::Engine;

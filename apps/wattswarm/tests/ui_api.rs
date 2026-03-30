@@ -12,9 +12,12 @@ use tonic::Request as GrpcRequest;
 use tower::ServiceExt;
 use wattswarm::control::open_node;
 use wattswarm::crypto::NodeIdentity;
+use wattswarm::node::build_event_for_external;
 use wattswarm::storage::local_control_scope_id;
 use wattswarm::types::NetworkProtocolParams;
-use wattswarm::types::{EventPayload, FeedSubscriptionUpdatedPayload, TopicMessagePostedPayload};
+use wattswarm::types::{
+    EventPayload, FeedSubscriptionUpdatedPayload, TaskTerminalState, TopicMessagePostedPayload,
+};
 use wattswarm::ui::{UiServerState, build_app};
 use wattswarm::wattetheria_sync;
 use wattswarm::wattetheria_sync::proto::ProjectionStreamRequest;
@@ -1094,6 +1097,274 @@ fn ui_accepts_topic_subscription_and_message_writes() {
         assert_eq!(cursor_json["ok"].as_bool(), Some(true));
         assert!(cursor_json["subscriber_node_id"].as_str().is_some());
     });
+}
+
+#[test]
+fn structured_topic_consensus_bridge_finalizes_and_publishes_result_topic() {
+    let _guard = env_lock();
+    let _db_lock = DbTestLock::acquire();
+    reset_test_schema("test");
+    let _schema_guard = EnvVarGuard::set("WATTSWARM_PG_SCHEMA", "test");
+    let dir = tempdir().unwrap();
+    let state_dir = dir.path().join("state");
+    std::fs::create_dir_all(&state_dir).unwrap();
+    let db_path = state_dir.join("ui.state");
+    let app = build_app(UiServerState::new(state_dir.clone(), db_path.clone()));
+    let node = open_node(&state_dir, &db_path).expect("open node");
+    let local_node_id = node.node_id();
+    drop(node);
+
+    let remote_a = NodeIdentity::from_seed([7; 32]);
+    let remote_b = NodeIdentity::from_seed([8; 32]);
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let subscription_res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/topic/subscriptions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({
+                            "feed_key": "crew.chat",
+                            "scope_hint": "group:crew-7",
+                            "active": true
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(subscription_res.status(), StatusCode::OK);
+
+        let proposal_res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/topic/messages")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({
+                            "feed_key": "crew.chat",
+                            "scope_hint": "group:crew-7",
+                            "content": {
+                                "kind": "proposal",
+                                "proposal_id": "proposal-upgrade-v1",
+                                "goal": "decide whether to adopt the upgrade",
+                                "participants": [local_node_id, remote_a.node_id(), remote_b.node_id()],
+                                "threshold_percent": 60,
+                                "result_feed_key": "crew.result"
+                            }
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(proposal_res.status(), StatusCode::OK);
+    });
+
+    let network_id = format!("local:{local_node_id}");
+    let mut node = open_node(&state_dir, &db_path).expect("reopen node");
+    for (created_at, remote, digest) in [
+        (10_u64, remote_a, "sha256:evidence-a"),
+        (20_u64, remote_b, "sha256:evidence-b"),
+    ] {
+        let event = build_event_for_external(
+            &remote,
+            1,
+            created_at,
+            EventPayload::TopicMessagePosted(TopicMessagePostedPayload {
+                network_id: network_id.clone(),
+                feed_key: "crew.chat".to_owned(),
+                scope_hint: "group:crew-7".to_owned(),
+                content: json!({
+                    "kind": "stance",
+                    "proposal_id": "proposal-upgrade-v1",
+                    "stance": "support",
+                    "summary": "evidence supports adoption",
+                    "evidence_refs": [{
+                        "uri": format!("https://example.com/{digest}"),
+                        "digest": digest,
+                        "size_bytes": 32,
+                        "mime": "application/json",
+                        "created_at": created_at,
+                        "producer": "discussion-test"
+                    }]
+                }),
+                reply_to_message_id: None,
+            }),
+        )
+        .expect("build remote event");
+        node.ingest_remote(event).expect("ingest remote stance");
+    }
+
+    let processed = wattetheria_sync::process_structured_topic_consensus(&mut node)
+        .expect("process structured topic consensus");
+    assert_eq!(processed, 1);
+
+    let result_messages = node
+        .store
+        .list_topic_messages("crew.result", "group:crew-7", 10)
+        .expect("list result messages");
+    assert!(result_messages.iter().any(|message| {
+        message.content["kind"].as_str() == Some("consensus_result")
+            && message.content["proposal_id"].as_str() == Some("proposal-upgrade-v1")
+            && message.content["decision"].as_str() == Some("support")
+    }));
+
+    let consensus_task_id = node
+        .store
+        .list_task_ids_recent(10)
+        .expect("list task ids")
+        .into_iter()
+        .find(|task_id| task_id.starts_with("topic-consensus-"))
+        .expect("consensus task id");
+    let task = node
+        .store
+        .task_projection(&consensus_task_id)
+        .expect("task projection")
+        .expect("consensus task exists");
+    assert_eq!(task.contract.task_type, "topic_consensus");
+    assert_eq!(task.terminal_state, TaskTerminalState::Finalized);
+
+    let memory_hits = node
+        .store
+        .list_local_decision_memory_hits_by_task_type("topic_consensus", 8)
+        .expect("decision memory");
+    assert!(!memory_hits.is_empty());
+}
+
+#[test]
+fn structured_topic_consensus_bridge_ignores_non_participant_stances() {
+    let _guard = env_lock();
+    let _db_lock = DbTestLock::acquire();
+    reset_test_schema("test");
+    let _schema_guard = EnvVarGuard::set("WATTSWARM_PG_SCHEMA", "test");
+    let dir = tempdir().unwrap();
+    let state_dir = dir.path().join("state");
+    std::fs::create_dir_all(&state_dir).unwrap();
+    let db_path = state_dir.join("ui.state");
+    let app = build_app(UiServerState::new(state_dir.clone(), db_path.clone()));
+    let node = open_node(&state_dir, &db_path).expect("open node");
+    let local_node_id = node.node_id();
+    drop(node);
+
+    let participant = NodeIdentity::from_seed([9; 32]);
+    let outsider = NodeIdentity::from_seed([10; 32]);
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let subscription_res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/topic/subscriptions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({
+                            "feed_key": "crew.chat",
+                            "scope_hint": "group:crew-7",
+                            "active": true
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(subscription_res.status(), StatusCode::OK);
+
+        let proposal_res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/topic/messages")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({
+                            "feed_key": "crew.chat",
+                            "scope_hint": "group:crew-7",
+                            "content": {
+                                "kind": "proposal",
+                                "proposal_id": "proposal-upgrade-v2",
+                                "goal": "decide whether to adopt the upgrade",
+                                "participants": [local_node_id, participant.node_id(), "peer-b"],
+                                "threshold_percent": 60,
+                                "result_feed_key": "crew.result"
+                            }
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(proposal_res.status(), StatusCode::OK);
+    });
+
+    let network_id = format!("local:{local_node_id}");
+    let mut node = open_node(&state_dir, &db_path).expect("reopen node");
+    for (created_at, remote, digest) in [
+        (10_u64, participant, "sha256:evidence-participant"),
+        (20_u64, outsider, "sha256:evidence-outsider"),
+    ] {
+        let event = build_event_for_external(
+            &remote,
+            1,
+            created_at,
+            EventPayload::TopicMessagePosted(TopicMessagePostedPayload {
+                network_id: network_id.clone(),
+                feed_key: "crew.chat".to_owned(),
+                scope_hint: "group:crew-7".to_owned(),
+                content: json!({
+                    "kind": "stance",
+                    "proposal_id": "proposal-upgrade-v2",
+                    "stance": "support",
+                    "summary": "evidence supports adoption",
+                    "evidence_refs": [{
+                        "uri": format!("https://example.com/{digest}"),
+                        "digest": digest,
+                        "size_bytes": 32,
+                        "mime": "application/json",
+                        "created_at": created_at,
+                        "producer": "discussion-test"
+                    }]
+                }),
+                reply_to_message_id: None,
+            }),
+        )
+        .expect("build remote event");
+        node.ingest_remote(event).expect("ingest remote stance");
+    }
+
+    let processed = wattetheria_sync::process_structured_topic_consensus(&mut node)
+        .expect("process structured topic consensus");
+    assert_eq!(processed, 0);
+
+    let result_messages = node
+        .store
+        .list_topic_messages("crew.result", "group:crew-7", 10)
+        .expect("list result messages");
+    assert!(result_messages.is_empty());
+    assert!(
+        node.store
+            .list_task_ids_recent(10)
+            .expect("list task ids")
+            .into_iter()
+            .all(|task_id| !task_id.starts_with("topic-consensus-"))
+    );
 }
 
 #[test]

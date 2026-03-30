@@ -54,7 +54,7 @@ impl PgRunQueue {
         self.org_id.as_str()
     }
 
-    pub(crate) fn connect(&self) -> Result<Client> {
+    pub fn connect(&self) -> Result<Client> {
         let mut client = Client::connect(&self.database_url, NoTls)
             .map_err(|err| anyhow!("connect postgres {}: {err}", self.database_url))?;
         if let Some(schema) = &self.schema {
@@ -66,7 +66,7 @@ impl PgRunQueue {
         Ok(client)
     }
 
-    pub(crate) fn finalize_run_if_terminal_tx(
+    pub fn finalize_run_if_terminal_tx(
         &self,
         tx: &mut Transaction<'_>,
         run_id: &str,
@@ -76,7 +76,11 @@ impl PgRunQueue {
             .run_status_tx(tx, run_id)?
             .ok_or_else(|| anyhow!("run not found: {run_id}"))?;
         let counts = step_counts_tx(tx, self.org_id(), run_id)?;
-        let active = counts.created + counts.queued + counts.leased + counts.retry_wait;
+        let active = counts.created
+            + counts.queued
+            + counts.leased
+            + counts.retry_wait
+            + counts.remote_dispatched;
         if active > 0 {
             return Ok(());
         }

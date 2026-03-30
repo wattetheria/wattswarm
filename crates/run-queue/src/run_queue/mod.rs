@@ -1,5 +1,6 @@
 mod admin_api;
 mod aggregation;
+pub mod network_bridge;
 mod queue;
 mod schema;
 mod status;

@@ -680,6 +680,9 @@ fn executor_registry_roundtrip_and_default_load() {
         entries: vec![ExecutorRegistryEntry {
             name: "rt".to_owned(),
             base_url: "http://127.0.0.1:7788".to_owned(),
+            kind: Default::default(),
+            target_node_id: None,
+            scope_hint: None,
         }],
     };
     save_executor_registry(&path, &reg).expect("save registry");
@@ -1481,6 +1484,9 @@ fn run_real_task_flow_rejects_unsupported_profile() {
             entries: vec![ExecutorRegistryEntry {
                 name: "rt".to_owned(),
                 base_url: stub.base_url(),
+                kind: Default::default(),
+                target_node_id: None,
+                scope_hint: None,
             }],
         },
     )
@@ -1521,6 +1527,9 @@ fn run_real_task_flow_reports_task_file_parse_errors() {
             entries: vec![ExecutorRegistryEntry {
                 name: "rt".to_owned(),
                 base_url: stub.base_url(),
+                kind: Default::default(),
+                target_node_id: None,
+                scope_hint: None,
             }],
         },
     )
@@ -1570,6 +1579,9 @@ fn run_real_task_flow_completes_with_stub_runtime() {
             entries: vec![ExecutorRegistryEntry {
                 name: "rt".to_owned(),
                 base_url: stub.base_url(),
+                kind: Default::default(),
+                target_node_id: None,
+                scope_hint: None,
             }],
         },
     )
@@ -1617,6 +1629,9 @@ fn remote_task_bridge_materializes_executes_and_dedupes() {
             entries: vec![ExecutorRegistryEntry {
                 name: "rt".to_owned(),
                 base_url: stub.base_url(),
+                kind: Default::default(),
+                target_node_id: None,
+                scope_hint: None,
             }],
         },
     )
@@ -1779,6 +1794,9 @@ fn remote_task_bridge_rejects_node_scoped_tasks_for_other_nodes() {
             entries: vec![ExecutorRegistryEntry {
                 name: "rt".to_owned(),
                 base_url: stub.base_url(),
+                kind: Default::default(),
+                target_node_id: None,
+                scope_hint: None,
             }],
         },
     )
@@ -1885,6 +1903,9 @@ fn remote_task_bridge_allows_group_scoped_tasks_for_target_nodes() {
             entries: vec![ExecutorRegistryEntry {
                 name: "rt".to_owned(),
                 base_url: stub.base_url(),
+                kind: Default::default(),
+                target_node_id: None,
+                scope_hint: None,
             }],
         },
     )

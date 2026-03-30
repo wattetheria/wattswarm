@@ -81,9 +81,23 @@ struct LogCommand {
 
 #[derive(Subcommand, Debug)]
 enum ExecutorsAction {
-    Add { name: String, base_url: String },
+    Add {
+        name: String,
+        base_url: String,
+        /// Register as a remote executor (dispatched via network gossip).
+        #[arg(long)]
+        remote: bool,
+        /// For remote executors: target node_id for directed dispatch.
+        #[arg(long)]
+        target_node: Option<String>,
+        /// For remote executors: network scope hint for announcement routing.
+        #[arg(long)]
+        scope: Option<String>,
+    },
     List,
-    Check { name: String },
+    Check {
+        name: String,
+    },
 }
 
 #[derive(Args, Debug)]
@@ -296,18 +310,47 @@ fn handle_log(cmd: LogCommand, state_dir: &Path, db_path: &Path) -> Result<()> {
 fn handle_executors(cmd: ExecutorsCommand, state_dir: &Path) -> Result<()> {
     let mut reg = load_executor_registry_state(state_dir)?;
     match cmd.action {
-        ExecutorsAction::Add { name, base_url } => {
+        ExecutorsAction::Add {
+            name,
+            base_url,
+            remote,
+            target_node,
+            scope,
+        } => {
+            let kind = if remote {
+                crate::control::ExecutorKind::Remote
+            } else {
+                crate::control::ExecutorKind::Local
+            };
             reg.entries.retain(|e| e.name != name);
             reg.entries.push(ExecutorRegistryEntry {
                 name: name.clone(),
                 base_url,
+                kind,
+                target_node_id: target_node,
+                scope_hint: scope,
             });
             save_executor_registry_state(state_dir, &reg)?;
-            println!("executor added: {name}");
+            let kind_label = if remote { "remote" } else { "local" };
+            println!("executor added: {name} ({kind_label})");
         }
         ExecutorsAction::List => {
-            for entry in reg.entries {
-                println!("{} {}", entry.name, entry.base_url);
+            for entry in &reg.entries {
+                let kind_label = if entry.is_remote() { "remote" } else { "local" };
+                let target = entry
+                    .target_node_id
+                    .as_deref()
+                    .map(|n| format!(" target={n}"))
+                    .unwrap_or_default();
+                let scope = entry
+                    .scope_hint
+                    .as_deref()
+                    .map(|s| format!(" scope={s}"))
+                    .unwrap_or_default();
+                println!(
+                    "{} {} [{}{}{}]",
+                    entry.name, entry.base_url, kind_label, target, scope
+                );
             }
         }
         ExecutorsAction::Check { name } => {

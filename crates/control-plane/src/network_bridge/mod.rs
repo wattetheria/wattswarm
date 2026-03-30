@@ -271,6 +271,87 @@ pub fn ingest_event_envelope(node: &mut Node, envelope: &EventEnvelope) -> Resul
     node.ingest_remote(envelope.event.clone())
 }
 
+/// Log run-queue-relevant gossip events to JSONL files for async processing.
+///
+/// - `TaskAnnounced` with feed_key `venue.run_queue` → `pending_bridge_tasks.jsonl`
+///   (executor side: this node should pick up and execute the task)
+/// - `CandidateProposed` for `run-*` tasks → `pending_run_queue_results.jsonl`
+///   (coordinator side: write remote result back to run_steps)
+pub fn log_run_queue_events_if_applicable(
+    state_dir: &Path,
+    local_node_id: &str,
+    event: &crate::types::Event,
+) {
+    if event.author_node_id == local_node_id {
+        return;
+    }
+
+    match &event.payload {
+        crate::types::EventPayload::TaskAnnounced(payload) => {
+            if payload.feed_key != "venue.run_queue" {
+                return;
+            }
+            let executor = payload
+                .summary
+                .get("executor")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            let profile = payload
+                .summary
+                .get("profile")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("default");
+            if executor.is_empty() {
+                return;
+            }
+            // Check that we have a matching local executor before queueing.
+            if let Ok(reg) = crate::control::load_executor_registry_state(state_dir) {
+                let has_local = reg
+                    .entries
+                    .iter()
+                    .any(|e| !e.is_remote() && e.name == executor);
+                if !has_local {
+                    return;
+                }
+            }
+            let entry = serde_json::json!({
+                "task_id": payload.task_id,
+                "executor": executor,
+                "profile": profile,
+                "queued_at": chrono::Utc::now().timestamp_millis(),
+            });
+            append_jsonl(state_dir, "pending_bridge_tasks.jsonl", &entry);
+        }
+        crate::types::EventPayload::CandidateProposed(payload) => {
+            if !payload.task_id.starts_with("run-") {
+                return;
+            }
+            let entry = serde_json::json!({
+                "task_id": payload.task_id,
+                "candidate_id": payload.candidate.candidate_id,
+                "candidate_output": payload.candidate.output,
+                "author_node_id": event.author_node_id,
+                "execution_id": payload.candidate.execution_id,
+                "received_at": chrono::Utc::now().timestamp_millis(),
+            });
+            append_jsonl(state_dir, "pending_run_queue_results.jsonl", &entry);
+        }
+        _ => {}
+    }
+}
+
+fn append_jsonl(state_dir: &Path, filename: &str, entry: &serde_json::Value) {
+    if let Ok(mut line) = serde_json::to_string(entry) {
+        line.push('\n');
+        let path = state_dir.join(filename);
+        let _ = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .and_then(|mut f| std::io::Write::write_all(&mut f, line.as_bytes()));
+    }
+}
+
 pub fn event_envelope_from_gossip(message: &GossipMessage) -> Result<&EventEnvelope> {
     match message {
         GossipMessage::Event(envelope) => Ok(envelope),
@@ -394,6 +475,17 @@ pub fn maybe_start_background_network_service(
     state_dir: PathBuf,
     db_path: PathBuf,
 ) -> Result<bool> {
+    maybe_start_background_network_service_with_hook(state_dir, db_path, None)
+}
+
+/// Start the background network service with an optional per-tick hook.
+/// The hook is invoked once per tick with mutable Node access and state_dir,
+/// enabling external modules (e.g. run-queue bridge) to process pending work.
+pub fn maybe_start_background_network_service_with_hook(
+    state_dir: PathBuf,
+    db_path: PathBuf,
+    post_tick_hook: Option<PostTickHook>,
+) -> Result<bool> {
     if !network_enabled_from_env() {
         return Ok(false);
     }
@@ -419,7 +511,13 @@ pub fn maybe_start_background_network_service(
     }
     let state_dir_for_registry = state_dir.clone();
     thread::spawn(move || {
-        if let Err(err) = run_background_network_service(&state_dir, &db_path, config, scopes) {
+        if let Err(err) = run_background_network_service_with_hook(
+            &state_dir,
+            &db_path,
+            config,
+            scopes,
+            post_tick_hook,
+        ) {
             eprintln!("network bridge stopped: {err}");
         }
         clear_latest_network_observability_snapshot(&state_dir_for_registry);
@@ -431,11 +529,16 @@ pub fn maybe_start_background_network_service(
     Ok(true)
 }
 
-fn run_background_network_service(
+/// Callback invoked once per tick of the background network service.
+/// Receives mutable Node access and the state_dir path.
+pub type PostTickHook = Box<dyn Fn(&mut Node, &Path) + Send + 'static>;
+
+fn run_background_network_service_with_hook(
     state_dir: &Path,
     db_path: &Path,
     config: NetworkP2pConfig,
     configured_scopes: Vec<SwarmScope>,
+    post_tick_hook: Option<PostTickHook>,
 ) -> Result<()> {
     let bootstrap_peers = config.bootstrap_peers.clone();
     let mut node = crate::control::open_configured_node(state_dir, db_path)?;
@@ -461,6 +564,7 @@ fn run_background_network_service(
     config.validate()?;
     let mut service =
         NetworkBridgeService::new(NetworkP2pNode::generate(config)?, &scopes, &protocol_params)?;
+    service.set_state_dir(state_dir.to_path_buf());
     store_latest_network_observability_snapshot(state_dir, service.observability_snapshot(&node)?);
     let mut announced_listen = false;
     let mut last_published_seq = node.head_seq()?;
@@ -522,6 +626,9 @@ fn run_background_network_service(
         match service.observability_snapshot(&node) {
             Ok(snapshot) => store_latest_network_observability_snapshot(state_dir, snapshot),
             Err(err) => eprintln!("network bridge observability snapshot failed: {err}"),
+        }
+        if let Some(hook) = &post_tick_hook {
+            hook(&mut node, state_dir);
         }
         if !did_work {
             thread::sleep(IDLE_NETWORK_SLEEP);
@@ -667,6 +774,8 @@ pub struct NetworkBridgeService {
     summary_reputation_limit: usize,
     summary_decision_memory_limit: u32,
     scope_traffic: HashMap<SwarmScope, ScopeTrafficStats>,
+    /// Optional state_dir for run-queue bridge hooks.
+    state_dir: Option<PathBuf>,
 }
 
 impl NetworkBridgeService {
@@ -701,7 +810,13 @@ impl NetworkBridgeService {
             summary_reputation_limit: protocol_params.summary_reputation_limit,
             summary_decision_memory_limit: protocol_params.summary_decision_memory_limit,
             scope_traffic: HashMap::new(),
+            state_dir: None,
         })
+    }
+
+    /// Set the state_dir for run-queue bridge hooks.
+    pub fn set_state_dir(&mut self, state_dir: PathBuf) {
+        self.state_dir = Some(state_dir);
     }
 
     pub fn local_peer_id(&self) -> PeerId {
@@ -1294,6 +1409,13 @@ impl NetworkBridgeService {
                 GossipMessage::Event(envelope) => {
                     self.record_peer_scope_activity(propagation_source, &envelope.scope);
                     ingest_event_envelope(node, &envelope)?;
+                    if let Some(state_dir) = &self.state_dir {
+                        log_run_queue_events_if_applicable(
+                            state_dir,
+                            &node.node_id(),
+                            &envelope.event,
+                        );
+                    }
                     self.record_scope_event_ingested(&envelope.scope);
                     Ok(NetworkBridgeTick::EventIngested {
                         peer: propagation_source,

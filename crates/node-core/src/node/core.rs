@@ -200,6 +200,89 @@ impl Node {
         self.emit_at(epoch, EventPayload::TaskCreated(contract), created_at)
     }
 
+    /// Announce a task to the network for remote execution.
+    /// Only the initiating node (Proposer) should call this.
+    pub fn announce_task(
+        &mut self,
+        task_id: &str,
+        announcement_id: &str,
+        feed_key: &str,
+        scope_hint: &str,
+        summary: Value,
+        detail_ref: Option<ArtifactRef>,
+        epoch: u64,
+        created_at: u64,
+    ) -> Result<Event> {
+        let network_id = self.current_network_context_id();
+        self.emit_at(
+            epoch,
+            EventPayload::TaskAnnounced(TaskAnnouncedPayload {
+                network_id,
+                task_id: task_id.to_owned(),
+                announcement_id: announcement_id.to_owned(),
+                feed_key: feed_key.to_owned(),
+                scope_hint: scope_hint.to_owned(),
+                summary,
+                detail_ref,
+            }),
+            created_at,
+        )
+    }
+
+    /// Declare this node's intent to participate in a remote task execution.
+    /// Called by executor nodes after receiving a TaskAnnounced.
+    pub fn declare_execution_intent(
+        &mut self,
+        task_id: &str,
+        execution_set_id: &str,
+        role_hint: &str,
+        scope_hint: &str,
+        intent: &str,
+        epoch: u64,
+        created_at: u64,
+    ) -> Result<Event> {
+        let network_id = self.current_network_context_id();
+        self.emit_at(
+            epoch,
+            EventPayload::ExecutionIntentDeclared(ExecutionIntentDeclaredPayload {
+                network_id,
+                task_id: task_id.to_owned(),
+                execution_set_id: execution_set_id.to_owned(),
+                participant_node_id: self.node_id(),
+                role_hint: role_hint.to_owned(),
+                scope_hint: scope_hint.to_owned(),
+                intent: intent.to_owned(),
+            }),
+            created_at,
+        )
+    }
+
+    /// Confirm the execution set for a task.
+    /// Only the initiating node (Committer) should call this after collecting enough intents.
+    pub fn confirm_execution_set(
+        &mut self,
+        task_id: &str,
+        execution_set_id: &str,
+        scope_hint: &str,
+        members: Vec<ExecutionSetMember>,
+        epoch: u64,
+        created_at: u64,
+    ) -> Result<Event> {
+        let network_id = self.current_network_context_id();
+        self.emit_at(
+            epoch,
+            EventPayload::ExecutionSetConfirmed(ExecutionSetConfirmedPayload {
+                network_id,
+                task_id: task_id.to_owned(),
+                execution_set_id: execution_set_id.to_owned(),
+                confirmed_by_node_id: self.node_id(),
+                scope_hint: scope_hint.to_owned(),
+                members,
+            }),
+            created_at,
+        )
+    }
+
     pub fn claim_task(
         &mut self,
         task_id: &str,

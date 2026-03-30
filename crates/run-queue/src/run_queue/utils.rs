@@ -6,6 +6,8 @@ use super::status::{
     STEP_STATUS_CANCELLED, STEP_STATUS_CREATED, STEP_STATUS_FAILED, STEP_STATUS_LEASED,
     STEP_STATUS_QUEUED, STEP_STATUS_RETRY_WAIT, STEP_STATUS_SUCCEEDED,
 };
+
+pub(crate) const STEP_STATUS_REMOTE_DISPATCHED: &str = "REMOTE_DISPATCHED";
 use super::types::RunStepCounts;
 
 pub(crate) fn ensure_run_queue_timestamp_column(
@@ -71,6 +73,7 @@ pub(crate) fn accumulate_counts(rows: Vec<postgres::Row>) -> RunStepCounts {
             STEP_STATUS_FAILED => counts.failed += count,
             STEP_STATUS_RETRY_WAIT => counts.retry_wait += count,
             STEP_STATUS_CANCELLED => counts.cancelled += count,
+            STEP_STATUS_REMOTE_DISPATCHED => counts.remote_dispatched += count,
             _ => {}
         }
     }

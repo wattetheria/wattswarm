@@ -69,10 +69,41 @@ impl NodeMode {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ExecutorKind {
+    Local,
+    Remote,
+}
+
+impl Default for ExecutorKind {
+    fn default() -> Self {
+        Self::Local
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExecutorRegistryEntry {
     pub name: String,
     pub base_url: String,
+    /// Executor kind: `local` (default) or `remote`.
+    /// Remote executors are dispatched via the network coordination protocol
+    /// instead of direct HTTP calls.
+    #[serde(default)]
+    pub kind: ExecutorKind,
+    /// For remote executors: the target node_id that should execute this task.
+    /// If empty, the task is announced to the network scope and any eligible node may pick it up.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_node_id: Option<String>,
+    /// For remote executors: the network scope hint for task announcement routing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope_hint: Option<String>,
+}
+
+impl ExecutorRegistryEntry {
+    pub fn is_remote(&self) -> bool {
+        self.kind == ExecutorKind::Remote
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -1339,6 +1370,17 @@ pub fn bridge_remote_task_into_local_execution(
         .get_task_announcement_detail_for_task(&task_id)?
         .ok_or_else(|| anyhow!("remote task announcement missing for task {}", task_id))?;
     let announcement = detail.announcement.clone();
+
+    // Coordinator-only constraint: the node that announced the task must not
+    // execute it locally. The initiator coordinates; remote nodes execute.
+    if announcement.announced_by_node_id == node.node_id() {
+        return Err(anyhow!(
+            "coordinator-only constraint: node {} announced task {} and cannot also execute it",
+            node.node_id(),
+            task_id
+        ));
+    }
+
     let network_id = current_network_context_id(node);
     let contract = bridged_task_contract(node, state_dir, &task_id)?;
     let route = contract.transport_route();
@@ -1756,6 +1798,9 @@ pub fn load_executor_registry_state(state_dir: &Path) -> Result<ExecutorRegistry
                 .map(|entry| ExecutorRegistryEntry {
                     name: entry.name,
                     base_url: entry.base_url,
+                    kind: ExecutorKind::default(),
+                    target_node_id: None,
+                    scope_hint: None,
                 })
                 .collect(),
         });

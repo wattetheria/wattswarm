@@ -116,6 +116,17 @@ pub fn run_worker(
         wait_polls = wait_polls.saturating_add(1);
         thread::sleep(Duration::from_millis(WORKER_MODE_WAIT_POLL_MS));
     }
+    // Start network bridge with run-queue hook so remote dispatch and
+    // result collection work in CLI-only mode (not just UI).
+    let _ = crate::network_bridge::maybe_start_background_network_service_with_hook(
+        state_dir.to_path_buf(),
+        db_path.to_path_buf(),
+        Some(Box::new(|node, sd| {
+            let _ = crate::run_queue::network_bridge::process_pending_bridge_tasks(node, sd);
+            let _ = crate::run_queue::network_bridge::process_pending_run_queue_results(sd);
+            let _ = crate::wattetheria_sync::process_structured_topic_consensus(node);
+        })),
+    );
     current_org_queue(state_dir, db_path, pg_url)?.run_worker(opts, state_dir, db_path)
 }
 

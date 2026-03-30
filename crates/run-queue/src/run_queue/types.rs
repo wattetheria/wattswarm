@@ -246,6 +246,9 @@ pub struct RunStepCounts {
     pub failed: i64,
     pub retry_wait: i64,
     pub cancelled: i64,
+    /// Steps dispatched to remote nodes awaiting gossip results.
+    #[serde(default)]
+    pub remote_dispatched: i64,
 }
 
 #[derive(Debug, Clone, Serialize)]

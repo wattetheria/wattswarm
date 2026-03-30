@@ -83,6 +83,12 @@ struct SubmitTaskRequest {
 struct ExecutorAddRequest {
     name: String,
     base_url: String,
+    #[serde(default)]
+    remote: bool,
+    #[serde(default)]
+    target_node_id: Option<String>,
+    #[serde(default)]
+    scope_hint: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -180,9 +186,14 @@ pub fn run(state_dir: PathBuf, db_path: PathBuf, listen: String) -> Result<()> {
             crate::udp_announce::maybe_start_listener(state_dir.clone(), id.clone());
         }
     }
-    let network_started = crate::network_bridge::maybe_start_background_network_service(
+    let network_started = crate::network_bridge::maybe_start_background_network_service_with_hook(
         state_dir.clone(),
         db_path.clone(),
+        Some(Box::new(|node, sd| {
+            let _ = crate::run_queue::network_bridge::process_pending_bridge_tasks(node, sd);
+            let _ = crate::run_queue::network_bridge::process_pending_run_queue_results(sd);
+            let _ = crate::wattetheria_sync::process_structured_topic_consensus(node);
+        })),
     )?;
     if network_started {
         mark_node_running_if_service_started(&state_dir, true)?;
@@ -341,9 +352,14 @@ async fn node_up(State(state): State<UiServerState>) -> Result<Json<Value>, ApiE
         let node = open_configured_node(&state_clone.state_dir, &state_clone.db_path)?;
         let mode = require_configured_node_mode(&state_clone.state_dir)?;
         write_node_state(&state_clone.state_dir, true, mode)?;
-        let _ = crate::network_bridge::maybe_start_background_network_service(
+        let _ = crate::network_bridge::maybe_start_background_network_service_with_hook(
             state_clone.state_dir.clone(),
             state_clone.db_path.clone(),
+            Some(Box::new(|node, sd| {
+                let _ = crate::run_queue::network_bridge::process_pending_bridge_tasks(node, sd);
+                let _ = crate::run_queue::network_bridge::process_pending_run_queue_results(sd);
+                let _ = crate::wattetheria_sync::process_structured_topic_consensus(node);
+            })),
         )?;
         if crate::network_bridge::network_enabled_from_env() {
             crate::udp_announce::announce_startup("node-up-api", None, Some(&node.node_id()));
@@ -468,9 +484,14 @@ async fn startup_config_save(
         sync_core_agent_executor(&state_clone.state_dir, &saved)
     })
     .await?;
-    let network_started = crate::network_bridge::maybe_start_background_network_service(
+    let network_started = crate::network_bridge::maybe_start_background_network_service_with_hook(
         state.state_dir.clone(),
         state.db_path.clone(),
+        Some(Box::new(|node, sd| {
+            let _ = crate::run_queue::network_bridge::process_pending_bridge_tasks(node, sd);
+            let _ = crate::run_queue::network_bridge::process_pending_run_queue_results(sd);
+            let _ = crate::wattetheria_sync::process_structured_topic_consensus(node);
+        })),
     )?;
     mark_node_running_if_service_started(&state.state_dir, network_started)?;
     Ok(Json(json!({
@@ -592,10 +613,18 @@ async fn executors_add(
     let state_clone = state.clone();
     run_blocking(move || -> Result<()> {
         let mut reg = load_executor_registry_state(&state_clone.state_dir)?;
+        let kind = if req.remote {
+            crate::control::ExecutorKind::Remote
+        } else {
+            crate::control::ExecutorKind::Local
+        };
         reg.entries.retain(|e| e.name != req.name);
         reg.entries.push(ExecutorRegistryEntry {
             name: req.name,
             base_url: req.base_url,
+            kind,
+            target_node_id: req.target_node_id,
+            scope_hint: req.scope_hint,
         });
         save_executor_registry_state(&state_clone.state_dir, &reg)
     })
@@ -1160,6 +1189,11 @@ async fn topic_message_post(
             ),
             created_at,
         )?;
+        let _ = crate::wattetheria_sync::process_structured_topic_consensus_for_topic(
+            &mut node,
+            &feed_key,
+            &scope_hint,
+        );
         Ok(json!({
             "ok": true,
             "event_id": event.event_id,

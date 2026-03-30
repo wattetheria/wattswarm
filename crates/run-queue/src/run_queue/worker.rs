@@ -1,12 +1,14 @@
 use anyhow::Result;
 use postgres::Transaction;
-use serde_json::json;
+use serde_json::{Value, json};
 use std::path::Path;
 use std::thread;
 use std::time::Duration;
 use uuid::Uuid;
 
-use crate::control::{RealTaskRunRequest, open_node, run_real_task_flow};
+use crate::control::{
+    ExecutorKind, RealTaskRunRequest, load_executor_registry_state, open_node, run_real_task_flow,
+};
 use crate::task_template::sample_contract;
 use crate::types::TaskContract;
 
@@ -17,7 +19,7 @@ use super::status::{
     STEP_STATUS_SUCCEEDED,
 };
 use super::types::{ClaimedStep, WorkerOptions};
-use super::utils::{build_step_inputs, now_ms, retry_delay_ms};
+use super::utils::{STEP_STATUS_REMOTE_DISPATCHED, build_step_inputs, now_ms, retry_delay_ms};
 
 impl PgRunQueue {
     pub fn run_worker(&self, opts: WorkerOptions, state_dir: &Path, db_path: &Path) -> Result<()> {
@@ -67,6 +69,21 @@ impl PgRunQueue {
             );
         }
 
+        let is_remote = self.is_remote_executor(state_dir, &step.executor);
+
+        if is_remote {
+            return self.dispatch_remote_step(&step, state_dir, db_path);
+        }
+
+        self.process_local_step(&step, state_dir, db_path)
+    }
+
+    fn process_local_step(
+        &self,
+        step: &ClaimedStep,
+        state_dir: &Path,
+        db_path: &Path,
+    ) -> Result<()> {
         let task_id = format!("run-{}-{}-{}", step.run_id, step.agent_id, step.attempt);
         let run_result = (|| -> Result<serde_json::Value> {
             let mut node = open_node(state_dir, db_path)?;
@@ -93,7 +110,7 @@ impl PgRunQueue {
 
         match run_result {
             Ok(result) => self.finish_step_terminal(
-                &step,
+                step,
                 STEP_STATUS_SUCCEEDED,
                 Some(&task_id),
                 Some(&result),
@@ -104,10 +121,10 @@ impl PgRunQueue {
                 if step.attempt < step.max_attempts && !Self::is_non_retryable_step_error(&err_text)
                 {
                     let delay_ms = retry_delay_ms(step.retry_policy.backoff_ms, step.attempt);
-                    self.finish_step_retry_wait(&step, &err_text, now_ms().saturating_add(delay_ms))
+                    self.finish_step_retry_wait(step, &err_text, now_ms().saturating_add(delay_ms))
                 } else {
                     self.finish_step_terminal(
-                        &step,
+                        step,
                         STEP_STATUS_FAILED,
                         Some(&task_id),
                         None,
@@ -116,6 +133,143 @@ impl PgRunQueue {
                 }
             }
         }
+    }
+
+    /// Dispatch a step to the network for remote execution.
+    /// The coordinator announces the task, marks the step as REMOTE_DISPATCHED,
+    /// and lets the gossip result listener handle completion.
+    fn dispatch_remote_step(
+        &self,
+        step: &ClaimedStep,
+        state_dir: &Path,
+        db_path: &Path,
+    ) -> Result<()> {
+        let task_id = format!("run-{}-{}-{}", step.run_id, step.agent_id, step.attempt);
+        let dispatch_result = (|| -> Result<Value> {
+            let mut node = open_node(state_dir, db_path)?;
+            let policy_hash = node
+                .policy_registry()
+                .binding_for("vp.schema_only.v1", json!({}))?
+                .policy_hash;
+            let mut contract: TaskContract = sample_contract(&task_id, policy_hash);
+            contract.task_type = step.task_type.clone();
+            contract.inputs = build_step_inputs(&step.shared_inputs, &step.prompt, &step.agent_id);
+
+            // Submit the task locally (creates TaskCreated event).
+            if node.task_view(&task_id)?.is_none() {
+                node.submit_task(contract, 1, now_ms() as u64)?;
+            }
+
+            // Resolve scope and target from executor registry.
+            let reg = load_executor_registry_state(state_dir)?;
+            let executor_entry = reg.entries.iter().find(|e| e.name == step.executor);
+            let target_node_id = executor_entry.and_then(|e| e.target_node_id.clone());
+            // If a target_node_id is set, use node-scoped routing so the
+            // announcement reaches only the intended executor node.
+            let scope_hint = match &target_node_id {
+                Some(node_id) => format!("node:{node_id}"),
+                None => executor_entry
+                    .and_then(|e| e.scope_hint.clone())
+                    .unwrap_or_else(|| "global".to_owned()),
+            };
+
+            let announcement_id = format!("ann-{}", Uuid::new_v4());
+            let summary = json!({
+                "task_type": step.task_type,
+                "run_id": step.run_id,
+                "step_id": step.step_id,
+                "agent_id": step.agent_id,
+                "executor": step.executor,
+                "profile": step.profile,
+            });
+
+            // Announce to the network — gossip will carry this to remote nodes.
+            node.announce_task(
+                &task_id,
+                &announcement_id,
+                "venue.run_queue",
+                &scope_hint,
+                summary,
+                None,
+                1,
+                now_ms() as u64,
+            )?;
+
+            Ok(json!({
+                "task_id": task_id,
+                "announcement_id": announcement_id,
+                "scope_hint": scope_hint,
+                "status": STEP_STATUS_REMOTE_DISPATCHED,
+            }))
+        })();
+
+        match dispatch_result {
+            Ok(_payload) => {
+                // Mark step as remote-dispatched. Keep the lease alive so
+                // the lease-expiry recovery can handle timeout if the remote
+                // node never responds.
+                self.mark_step_remote_dispatched(step)
+            }
+            Err(err) => {
+                let err_text = format!("{err:#}");
+                if step.attempt < step.max_attempts && !Self::is_non_retryable_step_error(&err_text)
+                {
+                    let delay_ms = retry_delay_ms(step.retry_policy.backoff_ms, step.attempt);
+                    self.finish_step_retry_wait(step, &err_text, now_ms().saturating_add(delay_ms))
+                } else {
+                    self.finish_step_terminal(
+                        step,
+                        STEP_STATUS_FAILED,
+                        Some(&format!(
+                            "run-{}-{}-{}",
+                            step.run_id, step.agent_id, step.attempt
+                        )),
+                        None,
+                        Some(&err_text),
+                    )
+                }
+            }
+        }
+    }
+
+    fn is_remote_executor(&self, state_dir: &Path, executor_name: &str) -> bool {
+        load_executor_registry_state(state_dir)
+            .ok()
+            .and_then(|reg| reg.entries.into_iter().find(|e| e.name == executor_name))
+            .is_some_and(|entry| entry.kind == ExecutorKind::Remote)
+    }
+
+    fn mark_step_remote_dispatched(&self, step: &ClaimedStep) -> Result<()> {
+        let now = now_ms();
+        let mut client = self.connect()?;
+        let mut tx = client.transaction()?;
+        tx.execute(
+            "UPDATE run_steps
+             SET status = $3, updated_at = TIMESTAMPTZ 'epoch' + ($4::bigint * INTERVAL '1 millisecond')
+             WHERE org_id = $1 AND step_id = $2 AND lease_id = $5 AND status = $6",
+            &[
+                &self.org_id(),
+                &step.step_id,
+                &STEP_STATUS_REMOTE_DISPATCHED,
+                &now,
+                &step.lease_id,
+                &STEP_STATUS_LEASED,
+            ],
+        )?;
+        self.insert_event_tx(
+            &mut tx,
+            &step.run_id,
+            "STEP_REMOTE_DISPATCHED",
+            &json!({
+                "step_id": step.step_id,
+                "executor": step.executor,
+                "agent_id": step.agent_id,
+                "attempt": step.attempt
+            }),
+            now,
+        )?;
+        tx.commit()?;
+        Ok(())
     }
 
     fn is_non_retryable_step_error(err_text: &str) -> bool {
@@ -128,6 +282,9 @@ impl PgRunQueue {
     }
 
     fn recover_expired_leases_tx(&self, tx: &mut Transaction<'_>, now: i64) -> Result<u64> {
+        // Recover both LEASED and REMOTE_DISPATCHED steps whose lease has expired.
+        // REMOTE_DISPATCHED steps expire when the remote node fails to return results
+        // within the lease window.
         let recovered = tx.execute(
             "UPDATE run_steps s
              SET status = $1,
@@ -141,11 +298,11 @@ impl PgRunQueue {
                      ELSE s.error_text
                  END
              FROM runs r
-             WHERE s.org_id = $7
-               AND r.org_id = $7
+             WHERE s.org_id = $8
+               AND r.org_id = $8
                AND s.run_id = r.run_id
                AND r.status IN ($3, $4, $5)
-               AND s.status = $6
+               AND s.status IN ($6, $7)
                AND s.lease_until IS NOT NULL
                AND s.lease_until < TIMESTAMPTZ 'epoch' + ($2::bigint * INTERVAL '1 millisecond')",
             &[
@@ -155,6 +312,7 @@ impl PgRunQueue {
                 &RUN_STATUS_RUNNING,
                 &RUN_STATUS_CANCELLING,
                 &STEP_STATUS_LEASED,
+                &STEP_STATUS_REMOTE_DISPATCHED,
                 &self.org_id(),
             ],
         )?;

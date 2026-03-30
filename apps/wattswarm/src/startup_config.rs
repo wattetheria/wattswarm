@@ -211,6 +211,9 @@ pub fn sync_core_agent_executor(state_dir: &Path, config: &StartupConfig) -> Res
     reg.entries.push(ExecutorRegistryEntry {
         name: CORE_AGENT_EXECUTOR_NAME.to_owned(),
         base_url: config.core_agent.base_url.clone(),
+        kind: Default::default(),
+        target_node_id: None,
+        scope_hint: None,
     });
     save_executor_registry_state(state_dir, &reg)?;
     Ok(true)
