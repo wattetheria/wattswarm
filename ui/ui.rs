@@ -174,7 +174,8 @@ struct StartupConfigSaveRequest {
     network_mode: crate::startup_config::NetworkMode,
     #[serde(default)]
     bootstrap_peers: Vec<String>,
-    core_agent: crate::startup_config::CoreAgentConfig,
+    #[serde(default)]
+    core_agent: Option<crate::startup_config::CoreAgentConfig>,
 }
 
 pub fn run(state_dir: PathBuf, db_path: PathBuf, listen: String) -> Result<()> {
@@ -472,19 +473,28 @@ async fn startup_config_save(
     Json(req): Json<StartupConfigSaveRequest>,
 ) -> Result<Json<Value>, ApiError> {
     let state_clone = state.clone();
+    let existing_state_dir = state_clone.state_dir.clone();
+    let existing =
+        run_blocking(move || load_startup_config(&startup_config_path(&existing_state_dir)))
+            .await?;
     let payload = StartupConfig {
         display_name: req.display_name,
         network_mode: req.network_mode,
         bootstrap_peers: req.bootstrap_peers,
-        core_agent: req.core_agent,
+        core_agent: req.core_agent.clone().unwrap_or(existing.core_agent),
     }
     .normalized();
     payload.validate()?;
     let saved = payload.clone();
+    let should_sync_core_agent = req.core_agent.is_some();
     let executor_registered = run_blocking(move || -> Result<bool> {
         let path = startup_config_path(&state_clone.state_dir);
         save_startup_config(&path, &saved)?;
-        sync_core_agent_executor(&state_clone.state_dir, &saved)
+        if should_sync_core_agent {
+            sync_core_agent_executor(&state_clone.state_dir, &saved)
+        } else {
+            Ok(false)
+        }
     })
     .await?;
     let network_started = crate::network_bridge::maybe_start_background_network_service_with_hook(

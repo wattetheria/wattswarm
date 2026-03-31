@@ -13,7 +13,6 @@ use tower::ServiceExt;
 use wattswarm::control::open_node;
 use wattswarm::crypto::NodeIdentity;
 use wattswarm::node::build_event_for_external;
-use wattswarm::storage::local_control_scope_id;
 use wattswarm::types::NetworkProtocolParams;
 use wattswarm::types::{
     EventPayload, FeedSubscriptionUpdatedPayload, TaskTerminalState, TopicMessagePostedPayload,
@@ -691,7 +690,7 @@ fn ui_exposes_network_bootstrap_bundle() {
 }
 
 #[test]
-fn ui_startup_config_roundtrips_and_registers_core_agent_executor() {
+fn ui_startup_config_roundtrips_network_settings_without_agent_binding() {
     let _guard = env_lock();
     let _db_lock = DbTestLock::acquire();
     reset_test_schema("test");
@@ -748,14 +747,7 @@ fn ui_startup_config_roundtrips_and_registers_core_agent_executor() {
                             "network_mode": "lan",
                             "bootstrap_peers": [
                                 "/ip4/127.0.0.1/tcp/4001/p2p/12D3KooWLanBootstrap"
-                            ],
-                            "core_agent": {
-                                "mode": "remote_url",
-                                "base_url": "http://127.0.0.1:9999",
-                                "provider": "openclaw",
-                                "model": "",
-                                "api_key": ""
-                            }
+                            ]
                         }))
                         .unwrap(),
                     ))
@@ -765,7 +757,7 @@ fn ui_startup_config_roundtrips_and_registers_core_agent_executor() {
             .unwrap();
         assert_eq!(save_res.status(), StatusCode::OK);
         let save_json = json_from(save_res).await;
-        assert_eq!(save_json["executor_registered"].as_bool(), Some(true));
+        assert_eq!(save_json["executor_registered"].as_bool(), Some(false));
 
         let get_saved_res = app
             .clone()
@@ -790,7 +782,7 @@ fn ui_startup_config_roundtrips_and_registers_core_agent_executor() {
         );
         assert_eq!(
             get_saved_json["config"]["core_agent"]["base_url"].as_str(),
-            Some("http://127.0.0.1:9999")
+            Some("http://127.0.0.1:8787")
         );
 
         let save_local_res = app
@@ -806,14 +798,7 @@ fn ui_startup_config_roundtrips_and_registers_core_agent_executor() {
                             "network_mode": "local",
                             "bootstrap_peers": [
                                 "/ip4/127.0.0.1/tcp/4001/p2p/12D3KooWShouldBeCleared"
-                            ],
-                            "core_agent": {
-                                "mode": "remote_url",
-                                "base_url": "http://127.0.0.1:9999",
-                                "provider": "openclaw",
-                                "model": "",
-                                "api_key": ""
-                            }
+                            ]
                         }))
                         .unwrap(),
                     ))
@@ -848,10 +833,7 @@ fn ui_startup_config_roundtrips_and_registers_core_agent_executor() {
                 .as_array()
                 .unwrap()
                 .iter()
-                .any(|entry| {
-                    entry["name"].as_str() == Some("core-agent")
-                        && entry["base_url"].as_str() == Some("http://127.0.0.1:9999")
-                })
+                .all(|entry| entry["name"].as_str() != Some("core-agent"))
         );
 
         let get_local_saved_res = app
@@ -899,14 +881,55 @@ fn ui_startup_config_roundtrips_and_registers_core_agent_executor() {
         .expect("query executor raw rows")
         .collect::<std::result::Result<Vec<_>, _>>()
         .expect("collect executor raw rows");
-    assert_eq!(
-        raw_rows,
-        vec![(
-            local_control_scope_id(&state_dir),
-            "core-agent".to_owned(),
-            "http://127.0.0.1:9999".to_owned(),
-        )]
-    );
+    assert!(raw_rows.is_empty());
+}
+
+#[test]
+fn ui_startup_config_still_accepts_legacy_core_agent_binding_payload() {
+    let _guard = env_lock();
+    let _db_lock = DbTestLock::acquire();
+    reset_test_schema("test");
+    let _schema_guard = EnvVarGuard::set("WATTSWARM_PG_SCHEMA", "test");
+    let dir = tempdir().unwrap();
+    let state_dir = dir.path().join("state");
+    std::fs::create_dir_all(&state_dir).unwrap();
+    let db_path = state_dir.join("ui.state");
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let app = build_app(UiServerState::new(state_dir.clone(), db_path.clone()));
+        let save_res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/startup-config")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({
+                            "display_name": "Legacy Node",
+                            "network_mode": "lan",
+                            "bootstrap_peers": [],
+                            "core_agent": {
+                                "mode": "remote_url",
+                                "base_url": "http://127.0.0.1:9999",
+                                "provider": "openclaw",
+                                "model": "",
+                                "api_key": ""
+                            }
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(save_res.status(), StatusCode::OK);
+        let save_json = json_from(save_res).await;
+        assert_eq!(save_json["executor_registered"].as_bool(), Some(true));
+    });
 }
 
 #[test]

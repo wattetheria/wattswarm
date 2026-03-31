@@ -295,48 +295,8 @@ pub const STARTUP_HTML: &str = r#"<!DOCTYPE html>
         </div>
 
         <div class="panel">
-          <h2>Core Agent</h2>
-          <div class="hint">This is the node-wide agent runtime profile. URL modes automatically update the local `core-agent` executor binding.</div>
-          <div class="field">
-            <label for="coreAgentMode">Agent Mode</label>
-            <select id="coreAgentMode" onchange="applyCoreAgentMode()">
-              <option value="local_url">local_url</option>
-              <option value="remote_url">remote_url</option>
-              <option value="cloud_api_key">cloud_api_key</option>
-            </select>
-          </div>
-
-          <div id="coreUrlFields">
-            <div class="field">
-              <label for="coreBaseUrl">Runtime URL</label>
-              <input id="coreBaseUrl" placeholder="http://127.0.0.1:8787" />
-            </div>
-          </div>
-
-          <div id="coreCloudFields" class="hidden">
-            <div class="field">
-              <label for="coreProvider">Provider</label>
-              <input id="coreProvider" placeholder="openclaw" />
-            </div>
-            <div class="field">
-              <label for="coreModel">Model</label>
-              <input id="coreModel" placeholder="gpt-4o-mini" />
-            </div>
-            <div class="field">
-              <label for="coreApiKey">API Key</label>
-              <input id="coreApiKey" type="password" placeholder="local secret" />
-            </div>
-          </div>
-
-          <div class="meta">
-            <div class="meta-line"><span>Executor</span><code>core-agent</code></div>
-            <div class="meta-line"><span>Profile</span><code>default</code></div>
-          </div>
-        </div>
-
-        <div class="panel">
           <h2>Save</h2>
-          <div class="hint">Saving this page writes the startup profile only. Advanced deployment for gateway or servicenet stays in developer tooling.</div>
+          <div class="hint">Saving this page writes wattswarm node startup only. Agent and model configuration now lives in Wattetheria.</div>
           <div class="row">
             <button type="button" onclick="saveStartupConfig()">save startup config</button>
             <button type="button" class="alt" onclick="refreshStartupConfig()">reload</button>
@@ -353,9 +313,10 @@ pub const STARTUP_HTML: &str = r#"<!DOCTYPE html>
         </div>
         <div class="monitor-block">
           <div class="monitor-label">Notes</div>
-          <pre>Required here: node identity, minimal network mode, and core agent mode.
+          <pre>Required here: node identity and minimal network mode.
 
 Not configured here:
+- Wattetheria brain provider / agent host
 - gateway deployment
 - servicenet deployment
 - P2P tuning
@@ -404,25 +365,11 @@ Those stay in CLI, compose, or config files for advanced operators.</pre>
       document.getElementById('bootstrapPeersField').classList.toggle('hidden', mode === 'local');
     }
 
-    function applyCoreAgentMode() {
-      const mode = document.getElementById('coreAgentMode').value;
-      startupConfig.core_agent.mode = mode;
-      const cloud = mode === 'cloud_api_key';
-      document.getElementById('coreCloudFields').classList.toggle('hidden', !cloud);
-      document.getElementById('coreUrlFields').classList.toggle('hidden', cloud);
-    }
-
     function syncFormFromConfig(cfg) {
       startupConfig = cfg;
       document.getElementById('displayName').value = cfg.display_name || '';
       document.getElementById('bootstrapPeers').value = (cfg.bootstrap_peers || []).join('\n');
-      document.getElementById('coreAgentMode').value = cfg.core_agent?.mode || 'local_url';
-      document.getElementById('coreBaseUrl').value = cfg.core_agent?.base_url || '';
-      document.getElementById('coreProvider').value = cfg.core_agent?.provider || '';
-      document.getElementById('coreModel').value = cfg.core_agent?.model || '';
-      document.getElementById('coreApiKey').value = cfg.core_agent?.api_key || '';
       setNetworkMode(cfg.network_mode || 'local');
-      applyCoreAgentMode();
     }
 
     function buildPayload() {
@@ -433,14 +380,7 @@ Those stay in CLI, compose, or config files for advanced operators.</pre>
       return {
         display_name: document.getElementById('displayName').value,
         network_mode: startupConfig.network_mode,
-        bootstrap_peers: bootstrapPeers,
-        core_agent: {
-          mode: document.getElementById('coreAgentMode').value,
-          base_url: document.getElementById('coreBaseUrl').value,
-          provider: document.getElementById('coreProvider').value,
-          model: document.getElementById('coreModel').value,
-          api_key: document.getElementById('coreApiKey').value
-        }
+        bootstrap_peers: bootstrapPeers
       };
     }
 
