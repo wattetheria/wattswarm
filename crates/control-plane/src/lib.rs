@@ -33,6 +33,8 @@ pub mod types {
 pub mod control;
 pub mod network_bridge;
 pub mod task_template;
+pub mod topic_consensus;
+pub mod topic_interpretation;
 pub mod udp_announce;
 
 pub use control::*;

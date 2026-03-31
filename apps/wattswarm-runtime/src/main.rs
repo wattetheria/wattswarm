@@ -84,6 +84,10 @@ async fn execute(
     State(state): State<AppState>,
     Json(req): Json<ExecuteRequest>,
 ) -> Result<Json<ExecuteResponse>, (StatusCode, String)> {
+    if req.task_type == "topic_interpretation" {
+        return execute_topic_interpretation(state, req);
+    }
+
     let prompt = req
         .inputs
         .get("prompt")
@@ -118,6 +122,173 @@ async fn execute(
     };
 
     Ok(Json(response))
+}
+
+fn execute_topic_interpretation(
+    state: AppState,
+    req: ExecuteRequest,
+) -> Result<Json<ExecuteResponse>, (StatusCode, String)> {
+    let source_message = req
+        .inputs
+        .get("source_message")
+        .and_then(|value| value.as_object())
+        .ok_or_else(|| {
+            (
+                StatusCode::BAD_REQUEST,
+                "topic_interpretation requires source_message".to_owned(),
+            )
+        })?;
+    let source_message_id = source_message
+        .get("message_id")
+        .and_then(|value| value.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_owned();
+    let reply_to_message_id = source_message
+        .get("reply_to_message_id")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned);
+    let message_text = source_message
+        .get("text")
+        .and_then(|value| value.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_owned();
+    let message_text_lower = message_text.to_ascii_lowercase();
+    let candidate_proposals = req
+        .inputs
+        .get("candidate_proposals")
+        .and_then(|value| value.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let prior_deliberations = req
+        .inputs
+        .get("prior_deliberations")
+        .and_then(|value| value.as_array())
+        .cloned()
+        .unwrap_or_default();
+
+    let chosen_proposal = if let Some(reply_to) = reply_to_message_id.as_deref() {
+        candidate_proposals.iter().find(|proposal| {
+            proposal
+                .get("proposal_message_id")
+                .and_then(|value| value.as_str())
+                .is_some_and(|value| value == reply_to)
+        })
+    } else if candidate_proposals.len() == 1 {
+        candidate_proposals.first()
+    } else {
+        candidate_proposals.iter().find(|proposal| {
+            proposal
+                .get("proposal_id")
+                .and_then(|value| value.as_str())
+                .is_some_and(|value| message_text_lower.contains(&value.to_ascii_lowercase()))
+        })
+    };
+    let proposal_id = chosen_proposal
+        .and_then(|proposal| proposal.get("proposal_id"))
+        .and_then(|value| value.as_str())
+        .unwrap_or("")
+        .to_owned();
+    let proposal_message_id = chosen_proposal
+        .and_then(|proposal| proposal.get("proposal_message_id"))
+        .and_then(|value| value.as_str())
+        .unwrap_or("")
+        .to_owned();
+
+    let stance = if contains_any(
+        &message_text_lower,
+        &["support", "agree", "approve", "adopt", "+1"],
+    ) {
+        "support"
+    } else if contains_any(
+        &message_text_lower,
+        &["reject", "oppose", "against", "decline", "disagree"],
+    ) {
+        "reject"
+    } else if !prior_deliberations.is_empty()
+        && contains_any(&message_text_lower, &["same as before"])
+    {
+        prior_deliberations
+            .first()
+            .and_then(|row| row.get("decision"))
+            .and_then(|value| value.as_str())
+            .filter(|decision| matches!(*decision, "support" | "reject" | "abstain"))
+            .unwrap_or("none")
+    } else if contains_any(&message_text_lower, &["abstain", "neutral"]) {
+        "abstain"
+    } else {
+        "none"
+    };
+    let needs_review = proposal_id.is_empty() || proposal_message_id.is_empty() || stance == "none";
+    let confidence = if needs_review { 0.2 } else { 0.91 };
+    let summary = if message_text.is_empty() {
+        "no interpretable text".to_owned()
+    } else {
+        message_text.clone()
+    };
+    let candidate_output = json!({
+        "source_message_id": source_message_id,
+        "proposal_id": proposal_id,
+        "proposal_message_id": proposal_message_id,
+        "stance": stance,
+        "answer": summary,
+        "summary": summary,
+        "confidence": confidence,
+        "needs_review": needs_review,
+        "evidence": if message_text.is_empty() {
+            Vec::<serde_json::Value>::new()
+        } else {
+            vec![json!({
+                "kind": "message_quote",
+                "message_id": source_message
+                    .get("message_id")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or(""),
+                "quote": message_text
+            })]
+        }
+    });
+    let evidence_payload = format!(
+        "{}|{}|{}|{}",
+        req.task_id, req.execution_id, stance, proposal_id
+    );
+    let evidence_digest = format!("sha256:{}", sha256_hex(evidence_payload.as_bytes()));
+    let now_ms = chrono::Utc::now().timestamp_millis().max(0) as u64;
+
+    Ok(Json(ExecuteResponse {
+        candidate_output,
+        evidence_inline: vec![InlineEvidence {
+            mime: "application/json".to_owned(),
+            content: serde_json::to_string(&json!({
+                "source_message_id": source_message
+                    .get("message_id")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or(""),
+                "reply_to_message_id": reply_to_message_id,
+                "candidate_proposals": candidate_proposals,
+                "prior_deliberations": prior_deliberations
+            }))
+            .map_err(|err| (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?,
+        }],
+        evidence_refs: vec![ArtifactRef {
+            uri: format!("https://runtime.local/{}/{}", req.task_id, req.execution_id),
+            digest: evidence_digest,
+            size_bytes: evidence_payload.len() as u64,
+            mime: "application/json".to_owned(),
+            created_at: now_ms,
+            producer: format!(
+                "{}/{}",
+                state.capabilities.provider_family, state.capabilities.model_id
+            ),
+        }],
+    }))
+}
+
+fn contains_any(haystack: &str, needles: &[&str]) -> bool {
+    needles.iter().any(|needle| haystack.contains(needle))
 }
 
 async fn verify(
@@ -175,7 +346,7 @@ mod tests {
     fn sample_state() -> AppState {
         AppState {
             capabilities: RuntimeCapabilities {
-                task_types: vec!["swarm".to_owned()],
+                task_types: vec!["swarm".to_owned(), "topic_interpretation".to_owned()],
                 profiles: vec!["default".to_owned()],
                 provider_family: "swarm-runtime".to_owned(),
                 model_id: "swarm-model-v1".to_owned(),
@@ -241,6 +412,38 @@ mod tests {
                 .producer
                 .contains("swarm-runtime/swarm-model-v1")
         );
+    }
+
+    #[tokio::test]
+    async fn execute_interprets_topic_messages_into_structured_output() {
+        let state = sample_state();
+        let policy = sample_policy_binding(&state);
+        let mut req = sample_execute_request(policy.policy_hash);
+        req.task_type = "topic_interpretation".to_owned();
+        req.inputs = json!({
+            "source_message": {
+                "message_id": "msg-7",
+                "reply_to_message_id": "proposal-msg-1",
+                "text": "I support this upgrade because it reduces rollback risk"
+            },
+            "candidate_proposals": [{
+                "proposal_id": "proposal-upgrade-v1",
+                "proposal_message_id": "proposal-msg-1"
+            }],
+            "prior_deliberations": []
+        });
+
+        let Json(resp) = execute(State(state), Json(req)).await.expect("execute ok");
+        assert_eq!(
+            resp.candidate_output["proposal_id"],
+            json!("proposal-upgrade-v1")
+        );
+        assert_eq!(
+            resp.candidate_output["proposal_message_id"],
+            json!("proposal-msg-1")
+        );
+        assert_eq!(resp.candidate_output["stance"], json!("support"));
+        assert_eq!(resp.candidate_output["needs_review"], json!(false));
     }
 
     #[tokio::test]

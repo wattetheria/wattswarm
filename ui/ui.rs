@@ -192,7 +192,8 @@ pub fn run(state_dir: PathBuf, db_path: PathBuf, listen: String) -> Result<()> {
         Some(Box::new(|node, sd| {
             let _ = crate::run_queue::network_bridge::process_pending_bridge_tasks(node, sd);
             let _ = crate::run_queue::network_bridge::process_pending_run_queue_results(sd);
-            let _ = crate::wattetheria_sync::process_structured_topic_consensus(node);
+            let _ = crate::control::topic_interpretation::process_topic_interpretation(node, sd);
+            let _ = crate::control::topic_consensus::process_structured_topic_consensus(node);
         })),
     )?;
     if network_started {
@@ -358,7 +359,9 @@ async fn node_up(State(state): State<UiServerState>) -> Result<Json<Value>, ApiE
             Some(Box::new(|node, sd| {
                 let _ = crate::run_queue::network_bridge::process_pending_bridge_tasks(node, sd);
                 let _ = crate::run_queue::network_bridge::process_pending_run_queue_results(sd);
-                let _ = crate::wattetheria_sync::process_structured_topic_consensus(node);
+                let _ =
+                    crate::control::topic_interpretation::process_topic_interpretation(node, sd);
+                let _ = crate::control::topic_consensus::process_structured_topic_consensus(node);
             })),
         )?;
         if crate::network_bridge::network_enabled_from_env() {
@@ -490,7 +493,8 @@ async fn startup_config_save(
         Some(Box::new(|node, sd| {
             let _ = crate::run_queue::network_bridge::process_pending_bridge_tasks(node, sd);
             let _ = crate::run_queue::network_bridge::process_pending_run_queue_results(sd);
-            let _ = crate::wattetheria_sync::process_structured_topic_consensus(node);
+            let _ = crate::control::topic_interpretation::process_topic_interpretation(node, sd);
+            let _ = crate::control::topic_consensus::process_structured_topic_consensus(node);
         })),
     )?;
     mark_node_running_if_service_started(&state.state_dir, network_started)?;
@@ -1189,7 +1193,13 @@ async fn topic_message_post(
             ),
             created_at,
         )?;
-        let _ = crate::wattetheria_sync::process_structured_topic_consensus_for_topic(
+        let _ = crate::control::topic_interpretation::process_topic_interpretation_for_topic(
+            &mut node,
+            &state_clone.state_dir,
+            &feed_key,
+            &scope_hint,
+        );
+        let _ = crate::control::topic_consensus::process_structured_topic_consensus_for_topic(
             &mut node,
             &feed_key,
             &scope_hint,

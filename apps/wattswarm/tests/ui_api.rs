@@ -72,6 +72,7 @@ struct UiStubRuntimeConfig {
     health_body: String,
     capabilities_body: String,
     execute_body: String,
+    execute_requests: Option<Arc<Mutex<Vec<Value>>>>,
 }
 
 struct UiStubRuntimeServer {
@@ -173,7 +174,67 @@ fn handle_stub_conn(mut stream: TcpStream, cfg: &UiStubRuntimeConfig) {
         return write_stub_response(stream, 200, &cfg.capabilities_body);
     }
     if line.starts_with("POST /execute ") {
-        return write_stub_response(stream, 200, &cfg.execute_body);
+        let mut execute_body = cfg.execute_body.clone();
+        if let Some(raw_body) = req.split("\r\n\r\n").nth(1)
+            && let (Ok(request_json), Ok(mut response_json)) = (
+                serde_json::from_str::<Value>(raw_body),
+                serde_json::from_str::<Value>(&cfg.execute_body),
+            )
+        {
+            if let Some(log) = &cfg.execute_requests
+                && let Ok(mut requests) = log.lock()
+            {
+                requests.push(request_json.clone());
+            }
+            if let Some(source_message_id) = request_json
+                .get("inputs")
+                .and_then(|value| value.get("source_message"))
+                .and_then(|value| value.get("message_id"))
+                .and_then(Value::as_str)
+            {
+                if response_json
+                    .get("candidate_output")
+                    .and_then(|value| value.get("source_message_id"))
+                    .and_then(Value::as_str)
+                    == Some("placeholder-overridden-by-test")
+                {
+                    response_json["candidate_output"]["source_message_id"] =
+                        json!(source_message_id);
+                }
+                if let Some(proposal_message_id) = request_json
+                    .get("inputs")
+                    .and_then(|value| value.get("candidate_proposals"))
+                    .and_then(Value::as_array)
+                    .and_then(|items| items.first())
+                    .and_then(|value| value.get("proposal_message_id"))
+                    .and_then(Value::as_str)
+                {
+                    if response_json
+                        .get("candidate_output")
+                        .and_then(|value| value.get("proposal_message_id"))
+                        .and_then(Value::as_str)
+                        == Some("placeholder-proposal-message-id")
+                    {
+                        response_json["candidate_output"]["proposal_message_id"] =
+                            json!(proposal_message_id);
+                    }
+                }
+                if let Some(first_evidence) = response_json
+                    .get_mut("candidate_output")
+                    .and_then(|value| value.get_mut("evidence"))
+                    .and_then(Value::as_array_mut)
+                    .and_then(|items| items.first_mut())
+                {
+                    if first_evidence.get("message_id").and_then(Value::as_str)
+                        == Some("placeholder-overridden-by-test")
+                    {
+                        first_evidence["message_id"] = json!(source_message_id);
+                    }
+                }
+                execute_body = response_json.to_string();
+            }
+        }
+        return write_stub_response(stream, 200, &execute_body);
     }
     if line.starts_with("POST /verify ") {
         return write_stub_response(
@@ -1206,8 +1267,9 @@ fn structured_topic_consensus_bridge_finalizes_and_publishes_result_topic() {
         node.ingest_remote(event).expect("ingest remote stance");
     }
 
-    let processed = wattetheria_sync::process_structured_topic_consensus(&mut node)
-        .expect("process structured topic consensus");
+    let processed =
+        wattswarm::control::topic_consensus::process_structured_topic_consensus(&mut node)
+            .expect("process structured topic consensus");
     assert_eq!(processed, 1);
 
     let result_messages = node
@@ -1349,8 +1411,9 @@ fn structured_topic_consensus_bridge_ignores_non_participant_stances() {
         node.ingest_remote(event).expect("ingest remote stance");
     }
 
-    let processed = wattetheria_sync::process_structured_topic_consensus(&mut node)
-        .expect("process structured topic consensus");
+    let processed =
+        wattswarm::control::topic_consensus::process_structured_topic_consensus(&mut node)
+            .expect("process structured topic consensus");
     assert_eq!(processed, 0);
 
     let result_messages = node
@@ -1364,6 +1427,611 @@ fn structured_topic_consensus_bridge_ignores_non_participant_stances() {
             .expect("list task ids")
             .into_iter()
             .all(|task_id| !task_id.starts_with("topic-consensus-"))
+    );
+}
+
+#[test]
+fn free_chat_is_interpreted_then_sedimented_into_topic_consensus() {
+    let _guard = env_lock();
+    let _db_lock = DbTestLock::acquire();
+    reset_test_schema("test");
+    let _schema_guard = EnvVarGuard::set("WATTSWARM_PG_SCHEMA", "test");
+    let dir = tempdir().unwrap();
+    let state_dir = dir.path().join("state");
+    std::fs::create_dir_all(&state_dir).unwrap();
+    let db_path = state_dir.join("ui.state");
+    let app = build_app(UiServerState::new(state_dir.clone(), db_path.clone()));
+    let stub = UiStubRuntimeServer::start(UiStubRuntimeConfig {
+        health_body: "{\"status\":\"ok\"}".to_owned(),
+        capabilities_body: json!({
+            "task_types": ["swarm", "topic_interpretation"],
+            "profiles": ["default"],
+            "provider_family": "stub",
+            "model_id": "stub-1"
+        })
+        .to_string(),
+        execute_body: json!({
+            "candidate_output": {
+                "source_message_id": "placeholder-overridden-by-test",
+                "proposal_id": "proposal-upgrade-v2",
+                "proposal_message_id": "placeholder-proposal-message-id",
+                "stance": "support",
+                "answer": "support",
+                "summary": "I support this upgrade because it reduces rollback risk",
+                "confidence": 0.92,
+                "needs_review": false,
+                "evidence": [{
+                    "kind": "message_quote",
+                    "message_id": "placeholder-overridden-by-test",
+                    "quote": "I support this upgrade because it reduces rollback risk"
+                }]
+            },
+            "evidence_inline": [],
+            "evidence_refs": []
+        })
+        .to_string(),
+        execute_requests: None,
+    });
+    wait_for_stub_listener(&stub);
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let free_chat_message_id = runtime.block_on(async {
+        let save_res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/startup-config")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({
+                            "display_name": "Captain Aurora",
+                            "network_mode": "lan",
+                            "bootstrap_peers": [],
+                            "core_agent": {
+                                "mode": "remote_url",
+                                "base_url": stub.base_url(),
+                                "provider": "openclaw",
+                                "model": "",
+                                "api_key": ""
+                            }
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(save_res.status(), StatusCode::OK);
+
+        let subscription_res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/topic/subscriptions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({
+                            "feed_key": "crew.chat",
+                            "scope_hint": "group:crew-7",
+                            "active": true
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(subscription_res.status(), StatusCode::OK);
+
+        let proposal_res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/topic/messages")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({
+                            "feed_key": "crew.chat",
+                            "scope_hint": "group:crew-7",
+                            "content": {
+                                "kind": "proposal",
+                                "proposal_id": "proposal-upgrade-v2",
+                                "goal": "decide whether to adopt the second upgrade",
+                                "threshold_percent": 60,
+                                "result_feed_key": "crew.result"
+                            }
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(proposal_res.status(), StatusCode::OK);
+
+        let free_chat_res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/topic/messages")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({
+                            "feed_key": "crew.chat",
+                            "scope_hint": "group:crew-7",
+                            "content": {
+                                "text": "I support this upgrade because it reduces rollback risk"
+                            }
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(free_chat_res.status(), StatusCode::OK);
+        json_from(free_chat_res).await["message_id"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    });
+
+    let node = open_node(&state_dir, &db_path).expect("open node");
+    let chat_messages = node
+        .store
+        .list_topic_messages("crew.chat", "group:crew-7", 20)
+        .expect("list topic messages");
+    let proposal_message_id = chat_messages
+        .iter()
+        .find(|message| message.content["kind"].as_str() == Some("proposal"))
+        .map(|message| message.message_id.clone())
+        .expect("proposal message id");
+    assert!(chat_messages.iter().any(|message| {
+        message.content["kind"].as_str() == Some("interpreted_stance")
+            && message.content["proposal_id"].as_str() == Some("proposal-upgrade-v2")
+            && message.content["proposal_message_id"].as_str() == Some(proposal_message_id.as_str())
+            && message.content["source_message_id"].as_str() == Some(free_chat_message_id.as_str())
+            && message.content["source_author_node_id"].as_str() == Some(node.node_id().as_str())
+    }));
+
+    let result_messages = node
+        .store
+        .list_topic_messages("crew.result", "group:crew-7", 10)
+        .expect("list result messages");
+    assert!(result_messages.iter().any(|message| {
+        message.content["kind"].as_str() == Some("consensus_result")
+            && message.content["proposal_id"].as_str() == Some("proposal-upgrade-v2")
+            && message.content["proposal_message_id"].as_str() == Some(proposal_message_id.as_str())
+            && message.content["decision"].as_str() == Some("support")
+    }));
+
+    let interpretation_hits = node
+        .store
+        .list_local_decision_memory_hits_by_task_type("topic_interpretation", 8)
+        .expect("interpretation memory");
+    assert!(!interpretation_hits.is_empty());
+
+    let consensus_hits = node
+        .store
+        .list_local_decision_memory_hits_by_task_type("topic_consensus", 8)
+        .expect("consensus memory");
+    assert!(!consensus_hits.is_empty());
+}
+
+#[test]
+fn topic_consensus_scopes_stances_to_proposal_rounds() {
+    let _guard = env_lock();
+    let _db_lock = DbTestLock::acquire();
+    reset_test_schema("test");
+    let _schema_guard = EnvVarGuard::set("WATTSWARM_PG_SCHEMA", "test");
+    let dir = tempdir().unwrap();
+    let state_dir = dir.path().join("state");
+    std::fs::create_dir_all(&state_dir).unwrap();
+    let db_path = state_dir.join("ui.state");
+    let app = build_app(UiServerState::new(state_dir.clone(), db_path.clone()));
+    let node = open_node(&state_dir, &db_path).expect("open node");
+    let local_node_id = node.node_id();
+    drop(node);
+
+    let remote_a = NodeIdentity::from_seed([11; 32]);
+    let remote_b = NodeIdentity::from_seed([12; 32]);
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let (round_one_proposal_message_id, round_two_proposal_message_id) = runtime.block_on(async {
+        let subscription_res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/topic/subscriptions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({
+                            "feed_key": "crew.chat",
+                            "scope_hint": "group:crew-7",
+                            "active": true
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(subscription_res.status(), StatusCode::OK);
+
+        let round_one_res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/topic/messages")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({
+                            "feed_key": "crew.chat",
+                            "scope_hint": "group:crew-7",
+                            "content": {
+                                "kind": "proposal",
+                                "proposal_id": "proposal-rounds-v1",
+                                "goal": "first round",
+                                "participants": [local_node_id, remote_a.node_id(), remote_b.node_id()],
+                                "threshold_percent": 100,
+                                "result_feed_key": "crew.result"
+                            }
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(round_one_res.status(), StatusCode::OK);
+        let round_one_message_id = json_from(round_one_res).await["message_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+        let round_two_res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/topic/messages")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({
+                            "feed_key": "crew.chat",
+                            "scope_hint": "group:crew-7",
+                            "content": {
+                                "kind": "proposal",
+                                "proposal_id": "proposal-rounds-v1",
+                                "goal": "second round",
+                                "participants": [local_node_id, remote_a.node_id(), remote_b.node_id()],
+                                "threshold_percent": 100,
+                                "result_feed_key": "crew.result"
+                            }
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(round_two_res.status(), StatusCode::OK);
+        let round_two_message_id = json_from(round_two_res).await["message_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+        (round_one_message_id, round_two_message_id)
+    });
+
+    let network_id = format!("local:{local_node_id}");
+    let mut node = open_node(&state_dir, &db_path).expect("reopen node");
+    let round_one_support = build_event_for_external(
+        &remote_a,
+        1,
+        10,
+        EventPayload::TopicMessagePosted(TopicMessagePostedPayload {
+            network_id: network_id.clone(),
+            feed_key: "crew.chat".to_owned(),
+            scope_hint: "group:crew-7".to_owned(),
+            content: json!({
+                "kind": "stance",
+                "proposal_id": "proposal-rounds-v1",
+                "proposal_message_id": round_one_proposal_message_id,
+                "stance": "support",
+                "summary": "support from round one"
+            }),
+            reply_to_message_id: Some(round_one_proposal_message_id.clone()),
+        }),
+    )
+    .expect("round one stance");
+    node.ingest_remote(round_one_support)
+        .expect("ingest round one stance");
+
+    node.emit_at(
+        1,
+        EventPayload::TopicMessagePosted(TopicMessagePostedPayload {
+            network_id: network_id.clone(),
+            feed_key: "crew.chat".to_owned(),
+            scope_hint: "group:crew-7".to_owned(),
+            content: json!({
+                "kind": "stance",
+                "proposal_id": "proposal-rounds-v1",
+                "proposal_message_id": round_two_proposal_message_id,
+                "stance": "support",
+                "summary": "local support in round two"
+            }),
+            reply_to_message_id: Some(round_two_proposal_message_id.clone()),
+        }),
+        20,
+    )
+    .expect("emit round two local stance");
+
+    let round_two_support = build_event_for_external(
+        &remote_b,
+        1,
+        30,
+        EventPayload::TopicMessagePosted(TopicMessagePostedPayload {
+            network_id,
+            feed_key: "crew.chat".to_owned(),
+            scope_hint: "group:crew-7".to_owned(),
+            content: json!({
+                "kind": "stance",
+                "proposal_id": "proposal-rounds-v1",
+                "proposal_message_id": round_two_proposal_message_id,
+                "stance": "support",
+                "summary": "second support only exists in round two"
+            }),
+            reply_to_message_id: Some(round_two_proposal_message_id.clone()),
+        }),
+    )
+    .expect("round two stance");
+    node.ingest_remote(round_two_support)
+        .expect("ingest round two stance");
+
+    let processed =
+        wattswarm::control::topic_consensus::process_structured_topic_consensus(&mut node)
+            .expect("process structured topic consensus");
+    assert_eq!(processed, 0);
+
+    let result_messages = node
+        .store
+        .list_topic_messages("crew.result", "group:crew-7", 10)
+        .expect("list result messages");
+    assert!(result_messages.is_empty());
+}
+
+#[test]
+fn topic_interpretation_receives_prior_deliberations_from_topic_consensus_history() {
+    let _guard = env_lock();
+    let _db_lock = DbTestLock::acquire();
+    reset_test_schema("test");
+    let _schema_guard = EnvVarGuard::set("WATTSWARM_PG_SCHEMA", "test");
+    let dir = tempdir().unwrap();
+    let state_dir = dir.path().join("state");
+    std::fs::create_dir_all(&state_dir).unwrap();
+    let db_path = state_dir.join("ui.state");
+    let app = build_app(UiServerState::new(state_dir.clone(), db_path.clone()));
+    let execute_requests = Arc::new(Mutex::new(Vec::<Value>::new()));
+    let stub = UiStubRuntimeServer::start(UiStubRuntimeConfig {
+        health_body: "{\"status\":\"ok\"}".to_owned(),
+        capabilities_body: json!({
+            "task_types": ["swarm", "topic_interpretation"],
+            "profiles": ["default"],
+            "provider_family": "stub",
+            "model_id": "stub-1"
+        })
+        .to_string(),
+        execute_body: json!({
+            "candidate_output": {
+                "source_message_id": "placeholder-overridden-by-test",
+                "proposal_id": "proposal-history-v1",
+                "proposal_message_id": "placeholder-proposal-message-id",
+                "stance": "support",
+                "answer": "support",
+                "summary": "same support as prior deliberation",
+                "confidence": 0.92,
+                "needs_review": false,
+                "evidence": []
+            },
+            "evidence_inline": [],
+            "evidence_refs": []
+        })
+        .to_string(),
+        execute_requests: Some(Arc::clone(&execute_requests)),
+    });
+    wait_for_stub_listener(&stub);
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let (first_proposal_message_id, second_proposal_message_id) = runtime.block_on(async {
+        let save_res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/startup-config")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({
+                            "display_name": "Captain Aurora",
+                            "network_mode": "lan",
+                            "bootstrap_peers": [],
+                            "core_agent": {
+                                "mode": "remote_url",
+                                "base_url": stub.base_url(),
+                                "provider": "openclaw",
+                                "model": "",
+                                "api_key": ""
+                            }
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(save_res.status(), StatusCode::OK);
+
+        let subscription_res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/topic/subscriptions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({
+                            "feed_key": "crew.chat",
+                            "scope_hint": "group:crew-7",
+                            "active": true
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(subscription_res.status(), StatusCode::OK);
+
+        let proposal_one_res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/topic/messages")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({
+                            "feed_key": "crew.chat",
+                            "scope_hint": "group:crew-7",
+                            "content": {
+                                "kind": "proposal",
+                                "proposal_id": "proposal-history-v1",
+                                "goal": "first history round",
+                                "threshold_percent": 60,
+                                "result_feed_key": "crew.result"
+                            }
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(proposal_one_res.status(), StatusCode::OK);
+        let proposal_one_message_id = json_from(proposal_one_res).await["message_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+        let first_chat_res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/topic/messages")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({
+                            "feed_key": "crew.chat",
+                            "scope_hint": "group:crew-7",
+                            "content": {
+                                "text": "I support the first history round"
+                            }
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(first_chat_res.status(), StatusCode::OK);
+
+        let proposal_two_res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/topic/messages")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({
+                            "feed_key": "crew.chat",
+                            "scope_hint": "group:crew-7",
+                            "content": {
+                                "kind": "proposal",
+                                "proposal_id": "proposal-history-v1",
+                                "goal": "second history round",
+                                "threshold_percent": 60,
+                                "result_feed_key": "crew.result"
+                            }
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(proposal_two_res.status(), StatusCode::OK);
+        let proposal_two_message_id = json_from(proposal_two_res).await["message_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+        let second_chat_res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/topic/messages")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({
+                            "feed_key": "crew.chat",
+                            "scope_hint": "group:crew-7",
+                            "content": {
+                                "text": "same as before"
+                            }
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(second_chat_res.status(), StatusCode::OK);
+
+        (proposal_one_message_id, proposal_two_message_id)
+    });
+
+    let requests = execute_requests.lock().expect("lock execute requests");
+    assert!(requests.len() >= 2);
+    let second_request = requests.last().expect("second interpretation request");
+    let prior_deliberations = second_request["inputs"]["prior_deliberations"]
+        .as_array()
+        .expect("prior deliberations array");
+    assert!(!prior_deliberations.is_empty());
+    assert!(prior_deliberations.iter().any(|row| {
+        row["proposal_message_id"].as_str() == Some(first_proposal_message_id.as_str())
+            && row["decision"].as_str() == Some("support")
+    }));
+    assert_eq!(
+        second_request["inputs"]["candidate_proposals"][0]["proposal_message_id"].as_str(),
+        Some(second_proposal_message_id.as_str())
     );
 }
 
@@ -1743,6 +2411,7 @@ fn ui_google_a2a_message_send_supports_direct_and_group_modes() {
             "evidence_refs": []
         })
         .to_string(),
+        execute_requests: None,
     });
     wait_for_stub_listener(&runtime_server);
 
@@ -1999,6 +2668,7 @@ fn ui_exposes_wattetheria_sync_http_boundaries() {
             "evidence_refs": []
         })
         .to_string(),
+        execute_requests: None,
     });
     wait_for_stub_listener(&runtime_server);
 

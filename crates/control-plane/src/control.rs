@@ -195,9 +195,9 @@ pub struct RemoteTaskBridgeRecord {
 }
 
 #[derive(Clone)]
-struct PreparedRuntime {
-    runtime: HttpRuntimeClient,
-    capabilities: RuntimeCapabilities,
+pub(crate) struct PreparedRuntime {
+    pub(crate) runtime: HttpRuntimeClient,
+    pub(crate) capabilities: RuntimeCapabilities,
 }
 
 const ENV_NETWORK_BOOTSTRAP_HTTP_URLS: &str = "WATTSWARM_NETWORK_BOOTSTRAP_HTTP_URLS";
@@ -319,7 +319,7 @@ fn save_remote_task_bridge_registry(
     )
 }
 
-fn prepare_runtime_for_executor(
+pub(crate) fn prepare_runtime_for_executor(
     state_dir: &Path,
     executor: &str,
     profile: &str,
@@ -1082,7 +1082,7 @@ pub fn list_artifacts_needing_repair(
     artifact_store.list_manifests_needing_repair(now_ms)
 }
 
-fn run_existing_task_with_runtime(
+pub(crate) fn run_existing_task_with_runtime(
     node: &mut Node,
     runtime: &dyn RuntimeClient,
     capabilities: &RuntimeCapabilities,
