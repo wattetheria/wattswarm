@@ -440,6 +440,15 @@ fn local_control_peer_metadata_and_relationship_roundtrip() {
                         .expect("protocols_json"),
                     handshake_status: "identified".to_owned(),
                     last_error: None,
+                    contact_material_json: Some(
+                        serde_json::to_string(&serde_json::json!({
+                            "peer_id": "peer-a",
+                            "listen_addrs": ["/ip4/203.0.113.10/tcp/4001"]
+                        }))
+                        .expect("contact material"),
+                    ),
+                    contact_material_signature: Some("sig-peer-a".to_owned()),
+                    contact_material_updated_at: Some(1_700_000_000_400),
                     first_identified_at: 1_700_000_000_000,
                     last_identified_at: 1_700_000_000_500,
                 },
@@ -474,6 +483,14 @@ fn local_control_peer_metadata_and_relationship_roundtrip() {
         );
         assert_eq!(metadata[0].params_version, Some(7));
         assert_eq!(metadata[0].handshake_status, "identified");
+        assert_eq!(
+            metadata[0].contact_material_signature.as_deref(),
+            Some("sig-peer-a")
+        );
+        assert_eq!(
+            metadata[0].contact_material_updated_at,
+            Some(1_700_000_000_400)
+        );
 
         let relationships = store
             .list_local_peer_relationships(&scope_id)
@@ -482,6 +499,56 @@ fn local_control_peer_metadata_and_relationship_roundtrip() {
         assert_eq!(relationships[0].remote_node_id, "peer-a");
         assert_eq!(relationships[0].relationship_state, "accepted");
         assert_eq!(relationships[0].last_action, "accept");
+
+        store
+            .upsert_local_peer_dm_thread(
+                &scope_id,
+                &wattswarm_storage_core::storage::LocalPeerDmThreadRow {
+                    remote_node_id: "peer-a".to_owned(),
+                    thread_id: "dm:peer-a:peer-b".to_owned(),
+                    thread_kind: "direct".to_owned(),
+                    session_state: "ready".to_owned(),
+                    relationship_established_at: Some(1_700_000_000_600),
+                    created_at: 1_700_000_000_600,
+                    updated_at: 1_700_000_000_700,
+                    last_message_at: Some(1_700_000_000_700),
+                },
+            )
+            .expect("save peer dm thread");
+        store
+            .upsert_local_peer_dm_message(
+                &scope_id,
+                &wattswarm_storage_core::storage::LocalPeerDmMessageRow {
+                    thread_id: "dm:peer-a:peer-b".to_owned(),
+                    message_id: "msg-1".to_owned(),
+                    remote_node_id: "peer-a".to_owned(),
+                    message_kind: "message".to_owned(),
+                    direction: "outbound".to_owned(),
+                    delivery_state: "delivered".to_owned(),
+                    a2a_protocol: "google_a2a".to_owned(),
+                    content_json: serde_json::to_string(&serde_json::json!({"text":"hello"}))
+                        .expect("content json"),
+                    encrypted_body: None,
+                    content_encoding: None,
+                    created_at: 1_700_000_000_700,
+                    acknowledged_at: Some(1_700_000_000_800),
+                },
+            )
+            .expect("save peer dm message");
+
+        let threads = store
+            .list_local_peer_dm_threads(&scope_id)
+            .expect("list peer dm threads");
+        assert_eq!(threads.len(), 1);
+        assert_eq!(threads[0].thread_id, "dm:peer-a:peer-b");
+        assert_eq!(threads[0].session_state, "ready");
+
+        let messages = store
+            .list_local_peer_dm_messages(&scope_id, "dm:peer-a:peer-b")
+            .expect("list peer dm messages");
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].message_id, "msg-1");
+        assert_eq!(messages[0].delivery_state, "delivered");
     });
 }
 

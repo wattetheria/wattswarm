@@ -153,6 +153,12 @@ pub struct PeerMetadataRecord {
     pub handshake_status: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub contact_material: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub contact_material_signature: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub contact_material_updated_at: Option<u64>,
     pub first_identified_at: u64,
     pub last_identified_at: u64,
 }
@@ -240,6 +246,143 @@ pub struct PeerRelationshipRecord {
     pub updated_at: u64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct AgentInteractionEnvelope {
+    pub protocol: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_agent_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_agent_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capability: Option<String>,
+    #[serde(default)]
+    pub message: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extensions: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PeerDmThreadKind {
+    Direct,
+}
+
+impl PeerDmThreadKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Direct => "direct",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PeerDmSessionState {
+    Established,
+    SessionPending,
+    Ready,
+    Blocked,
+}
+
+impl PeerDmSessionState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Established => "established",
+            Self::SessionPending => "session_pending",
+            Self::Ready => "ready",
+            Self::Blocked => "blocked",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PeerDmMessageKind {
+    RelationshipEstablished,
+    SessionInit,
+    Message,
+}
+
+impl PeerDmMessageKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::RelationshipEstablished => "relationship_established",
+            Self::SessionInit => "session_init",
+            Self::Message => "message",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PeerDmDirection {
+    Inbound,
+    Outbound,
+}
+
+impl PeerDmDirection {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Inbound => "inbound",
+            Self::Outbound => "outbound",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PeerDmDeliveryState {
+    Pending,
+    Delivered,
+    Rejected,
+}
+
+impl PeerDmDeliveryState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Delivered => "delivered",
+            Self::Rejected => "rejected",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PeerDmThreadRecord {
+    pub remote_node_id: String,
+    pub thread_id: String,
+    pub thread_kind: PeerDmThreadKind,
+    pub session_state: PeerDmSessionState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relationship_established_at: Option<u64>,
+    pub created_at: u64,
+    pub updated_at: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_message_at: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PeerDmMessageRecord {
+    pub thread_id: String,
+    pub message_id: String,
+    pub remote_node_id: String,
+    pub message_kind: PeerDmMessageKind,
+    pub direction: PeerDmDirection,
+    pub delivery_state: PeerDmDeliveryState,
+    pub a2a_protocol: String,
+    #[serde(default)]
+    pub content: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encrypted_body: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_encoding: Option<String>,
+    pub created_at: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acknowledged_at: Option<u64>,
+}
+
 fn parse_json_string_list(raw: &str) -> Vec<String> {
     serde_json::from_str::<Vec<String>>(raw).unwrap_or_default()
 }
@@ -272,6 +415,47 @@ fn peer_relationship_initiator_from_str(value: &str) -> PeerRelationshipInitiato
         "remote" => PeerRelationshipInitiator::Remote,
         "system" => PeerRelationshipInitiator::System,
         _ => PeerRelationshipInitiator::Local,
+    }
+}
+
+fn peer_dm_thread_kind_from_str(value: &str) -> PeerDmThreadKind {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "direct" => PeerDmThreadKind::Direct,
+        _ => PeerDmThreadKind::Direct,
+    }
+}
+
+fn peer_dm_session_state_from_str(value: &str) -> PeerDmSessionState {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "established" => PeerDmSessionState::Established,
+        "session_pending" => PeerDmSessionState::SessionPending,
+        "ready" => PeerDmSessionState::Ready,
+        "blocked" => PeerDmSessionState::Blocked,
+        _ => PeerDmSessionState::Established,
+    }
+}
+
+fn peer_dm_message_kind_from_str(value: &str) -> PeerDmMessageKind {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "relationship_established" => PeerDmMessageKind::RelationshipEstablished,
+        "session_init" => PeerDmMessageKind::SessionInit,
+        "message" => PeerDmMessageKind::Message,
+        _ => PeerDmMessageKind::Message,
+    }
+}
+
+fn peer_dm_direction_from_str(value: &str) -> PeerDmDirection {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "inbound" => PeerDmDirection::Inbound,
+        _ => PeerDmDirection::Outbound,
+    }
+}
+
+fn peer_dm_delivery_state_from_str(value: &str) -> PeerDmDeliveryState {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "delivered" => PeerDmDeliveryState::Delivered,
+        "rejected" => PeerDmDeliveryState::Rejected,
+        _ => PeerDmDeliveryState::Pending,
     }
 }
 
@@ -1632,6 +1816,10 @@ pub fn local_node_id(state_dir: &Path) -> Result<String> {
     Ok(load_or_create_identity(&state_dir.join("node_seed.hex"))?.node_id())
 }
 
+pub(crate) fn load_local_identity(state_dir: &Path) -> Result<NodeIdentity> {
+    load_or_create_identity(&state_dir.join("node_seed.hex"))
+}
+
 pub fn local_peer_id(state_dir: &Path) -> Result<String> {
     let seed_file = state_dir.join("node_seed.hex");
     let hex_seed = fs::read_to_string(&seed_file)
@@ -1932,6 +2120,12 @@ pub fn load_peer_metadata_records_state(state_dir: &Path) -> Result<Vec<PeerMeta
             protocols: parse_json_string_list(&row.protocols_json),
             handshake_status: row.handshake_status,
             last_error: row.last_error,
+            contact_material: row
+                .contact_material_json
+                .as_deref()
+                .and_then(|raw| serde_json::from_str(raw).ok()),
+            contact_material_signature: row.contact_material_signature,
+            contact_material_updated_at: row.contact_material_updated_at,
             first_identified_at: row.first_identified_at,
             last_identified_at: row.last_identified_at,
         })
@@ -1958,6 +2152,13 @@ pub fn save_peer_metadata_record_state(
             protocols_json: serde_json::to_string(&record.protocols)?,
             handshake_status: record.handshake_status.clone(),
             last_error: record.last_error.clone(),
+            contact_material_json: record
+                .contact_material
+                .as_ref()
+                .map(serde_json::to_string)
+                .transpose()?,
+            contact_material_signature: record.contact_material_signature.clone(),
+            contact_material_updated_at: record.contact_material_updated_at,
             first_identified_at: record.first_identified_at,
             last_identified_at: record.last_identified_at,
         },
@@ -2003,6 +2204,95 @@ pub fn save_peer_relationship_record_state(
             blocked_at: record.blocked_at,
             cleared_at: record.cleared_at,
             updated_at: record.updated_at,
+        },
+    )
+}
+
+pub fn load_peer_dm_thread_records_state(state_dir: &Path) -> Result<Vec<PeerDmThreadRecord>> {
+    let store = local_control_store(state_dir)?;
+    let scope_id = local_control_scope_id(state_dir);
+    Ok(store
+        .list_local_peer_dm_threads(&scope_id)?
+        .into_iter()
+        .map(|row| PeerDmThreadRecord {
+            remote_node_id: row.remote_node_id,
+            thread_id: row.thread_id,
+            thread_kind: peer_dm_thread_kind_from_str(&row.thread_kind),
+            session_state: peer_dm_session_state_from_str(&row.session_state),
+            relationship_established_at: row.relationship_established_at,
+            created_at: row.created_at,
+            updated_at: row.updated_at,
+            last_message_at: row.last_message_at,
+        })
+        .collect())
+}
+
+pub fn save_peer_dm_thread_record_state(
+    state_dir: &Path,
+    record: &PeerDmThreadRecord,
+) -> Result<()> {
+    let scope_id = local_control_scope_id(state_dir);
+    local_control_store(state_dir)?.upsert_local_peer_dm_thread(
+        &scope_id,
+        &crate::storage::LocalPeerDmThreadRow {
+            remote_node_id: record.remote_node_id.clone(),
+            thread_id: record.thread_id.clone(),
+            thread_kind: record.thread_kind.as_str().to_owned(),
+            session_state: record.session_state.as_str().to_owned(),
+            relationship_established_at: record.relationship_established_at,
+            created_at: record.created_at,
+            updated_at: record.updated_at,
+            last_message_at: record.last_message_at,
+        },
+    )
+}
+
+pub fn load_peer_dm_message_records_state(
+    state_dir: &Path,
+    thread_id: &str,
+) -> Result<Vec<PeerDmMessageRecord>> {
+    let store = local_control_store(state_dir)?;
+    let scope_id = local_control_scope_id(state_dir);
+    Ok(store
+        .list_local_peer_dm_messages(&scope_id, thread_id)?
+        .into_iter()
+        .map(|row| PeerDmMessageRecord {
+            thread_id: row.thread_id,
+            message_id: row.message_id,
+            remote_node_id: row.remote_node_id,
+            message_kind: peer_dm_message_kind_from_str(&row.message_kind),
+            direction: peer_dm_direction_from_str(&row.direction),
+            delivery_state: peer_dm_delivery_state_from_str(&row.delivery_state),
+            a2a_protocol: row.a2a_protocol,
+            content: serde_json::from_str(&row.content_json).unwrap_or_else(|_| json!({})),
+            encrypted_body: row.encrypted_body,
+            content_encoding: row.content_encoding,
+            created_at: row.created_at,
+            acknowledged_at: row.acknowledged_at,
+        })
+        .collect())
+}
+
+pub fn save_peer_dm_message_record_state(
+    state_dir: &Path,
+    record: &PeerDmMessageRecord,
+) -> Result<()> {
+    let scope_id = local_control_scope_id(state_dir);
+    local_control_store(state_dir)?.upsert_local_peer_dm_message(
+        &scope_id,
+        &crate::storage::LocalPeerDmMessageRow {
+            thread_id: record.thread_id.clone(),
+            message_id: record.message_id.clone(),
+            remote_node_id: record.remote_node_id.clone(),
+            message_kind: record.message_kind.as_str().to_owned(),
+            direction: record.direction.as_str().to_owned(),
+            delivery_state: record.delivery_state.as_str().to_owned(),
+            a2a_protocol: record.a2a_protocol.clone(),
+            content_json: serde_json::to_string(&record.content)?,
+            encrypted_body: record.encrypted_body.clone(),
+            content_encoding: record.content_encoding.clone(),
+            created_at: record.created_at,
+            acknowledged_at: record.acknowledged_at,
         },
     )
 }

@@ -12,13 +12,16 @@ use wattswarm_protocol::types::{EventKind, EventPayload};
 
 pub use substrate::{
     BackfillRequestId, BackfillResponseChannel, Multiaddr, NetworkRuntimeObservabilitySnapshot,
-    PeerDiscoverySourceKind, PeerHandshakeMetadata, PeerId, PeerIdentificationMetadata,
-    PeerRelationshipRequestId, PeerRelationshipResponseChannel, RawPeerRelationshipAction,
-    SwarmScope, TopicCatalog, TopicKind, TopicNamespace, TrafficGuardPeerHealth,
-    relay_reservation_addr, sanitize_segment,
+    PeerDirectMessageRequestId, PeerDirectMessageResponseChannel, PeerDiscoverySourceKind,
+    PeerHandshakeMetadata, PeerId, PeerIdentificationMetadata, PeerRelationshipRequestId,
+    PeerRelationshipResponseChannel, RawAgentEnvelope, RawContactMaterial,
+    RawPeerDirectMessageKind, RawPeerRelationshipAction, SwarmScope, TopicCatalog, TopicKind,
+    TopicNamespace, TrafficGuardPeerHealth, relay_reservation_addr, sanitize_segment,
 };
 
 pub type BackfillRequest = substrate::RawBackfillRequest;
+pub type PeerDirectMessageRequest = substrate::RawPeerDirectMessageRequest;
+pub type PeerDirectMessageResponse = substrate::RawPeerDirectMessageResponse;
 pub type PeerRelationshipRequest = substrate::RawPeerRelationshipRequest;
 pub type PeerRelationshipResponse = substrate::RawPeerRelationshipResponse;
 pub type WattSwarmBehaviour = substrate::SubstrateBehaviour;
@@ -364,6 +367,25 @@ pub enum NetworkRuntimeEvent {
         peer: PeerId,
         error: String,
     },
+    PeerDirectMessageRequest {
+        peer: PeerId,
+        request: PeerDirectMessageRequest,
+        channel: PeerDirectMessageResponseChannel,
+    },
+    PeerDirectMessageResponse {
+        peer: PeerId,
+        request_id: PeerDirectMessageRequestId,
+        response: PeerDirectMessageResponse,
+    },
+    PeerDirectMessageOutboundFailure {
+        peer: PeerId,
+        request_id: PeerDirectMessageRequestId,
+        error: String,
+    },
+    PeerDirectMessageInboundFailure {
+        peer: PeerId,
+        error: String,
+    },
     NatStatusChanged {
         old: String,
         new: String,
@@ -494,6 +516,23 @@ impl NetworkRuntime {
             .send_peer_relationship_response(channel, response)
     }
 
+    pub fn send_peer_direct_message_request(
+        &mut self,
+        peer: &PeerId,
+        request: PeerDirectMessageRequest,
+    ) -> Result<PeerDirectMessageRequestId> {
+        self.inner.send_peer_direct_message_request(peer, request)
+    }
+
+    pub fn send_peer_direct_message_response(
+        &mut self,
+        channel: PeerDirectMessageResponseChannel,
+        response: PeerDirectMessageResponse,
+    ) -> Result<()> {
+        self.inner
+            .send_peer_direct_message_response(channel, response)
+    }
+
     pub async fn next_event(&mut self) -> Result<NetworkRuntimeEvent> {
         Self::map_runtime_event(self.inner.next_event().await?)
     }
@@ -601,6 +640,36 @@ impl NetworkRuntime {
             },
             SubstrateRuntimeEvent::PeerRelationshipInboundFailure { peer, error } => {
                 NetworkRuntimeEvent::PeerRelationshipInboundFailure { peer, error }
+            }
+            SubstrateRuntimeEvent::PeerDirectMessageRequest {
+                peer,
+                request,
+                channel,
+            } => NetworkRuntimeEvent::PeerDirectMessageRequest {
+                peer,
+                request,
+                channel,
+            },
+            SubstrateRuntimeEvent::PeerDirectMessageResponse {
+                peer,
+                request_id,
+                response,
+            } => NetworkRuntimeEvent::PeerDirectMessageResponse {
+                peer,
+                request_id,
+                response,
+            },
+            SubstrateRuntimeEvent::PeerDirectMessageOutboundFailure {
+                peer,
+                request_id,
+                error,
+            } => NetworkRuntimeEvent::PeerDirectMessageOutboundFailure {
+                peer,
+                request_id,
+                error,
+            },
+            SubstrateRuntimeEvent::PeerDirectMessageInboundFailure { peer, error } => {
+                NetworkRuntimeEvent::PeerDirectMessageInboundFailure { peer, error }
             }
             SubstrateRuntimeEvent::NatStatusChanged {
                 old,

@@ -289,6 +289,8 @@ pub struct RawPeerRelationshipRequest {
     pub source_node_id: String,
     pub target_node_id: String,
     pub action: RawPeerRelationshipAction,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_envelope: Option<RawAgentEnvelope>,
 }
 
 impl RawPeerRelationshipRequest {
@@ -310,6 +312,8 @@ pub struct RawPeerRelationshipResponse {
     pub action: RawPeerRelationshipAction,
     pub applied: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_envelope: Option<RawAgentEnvelope>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub relationship_state: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
@@ -323,6 +327,110 @@ impl RawPeerRelationshipResponse {
         }
         if self.target_node_id.trim().is_empty() {
             bail!("peer relationship response target_node_id is required");
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct RawAgentEnvelope {
+    pub protocol: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_agent_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_agent_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capability: Option<String>,
+    #[serde(default)]
+    pub message_json: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extensions_json: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RawContactMaterial {
+    pub material_json: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature: Option<String>,
+    pub generated_at: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RawPeerDirectMessageKind {
+    RelationshipEstablished,
+    SessionInit,
+    Message,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RawPeerDirectMessageRequest {
+    pub source_node_id: String,
+    pub target_node_id: String,
+    pub thread_id: String,
+    pub message_id: String,
+    pub kind: RawPeerDirectMessageKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_envelope: Option<RawAgentEnvelope>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub contact_material: Option<RawContactMaterial>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encrypted_body: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_encoding: Option<String>,
+    #[serde(default)]
+    pub content_json: String,
+}
+
+impl RawPeerDirectMessageRequest {
+    pub fn validate(&self) -> Result<()> {
+        if self.source_node_id.trim().is_empty() {
+            bail!("peer direct message source_node_id is required");
+        }
+        if self.target_node_id.trim().is_empty() {
+            bail!("peer direct message target_node_id is required");
+        }
+        if self.thread_id.trim().is_empty() {
+            bail!("peer direct message thread_id is required");
+        }
+        if self.message_id.trim().is_empty() {
+            bail!("peer direct message message_id is required");
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RawPeerDirectMessageResponse {
+    pub source_node_id: String,
+    pub target_node_id: String,
+    pub thread_id: String,
+    pub message_id: String,
+    pub kind: RawPeerDirectMessageKind,
+    pub applied: bool,
+    pub delivery_state: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub contact_material: Option<RawContactMaterial>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    pub updated_at: u64,
+}
+
+impl RawPeerDirectMessageResponse {
+    pub fn validate(&self) -> Result<()> {
+        if self.source_node_id.trim().is_empty() {
+            bail!("peer direct message response source_node_id is required");
+        }
+        if self.target_node_id.trim().is_empty() {
+            bail!("peer direct message response target_node_id is required");
+        }
+        if self.thread_id.trim().is_empty() {
+            bail!("peer direct message response thread_id is required");
+        }
+        if self.message_id.trim().is_empty() {
+            bail!("peer direct message response message_id is required");
         }
         Ok(())
     }
@@ -454,18 +562,22 @@ impl SubstrateConfig {
 pub enum RawControlRequest {
     Backfill(RawBackfillRequest),
     PeerRelationship(RawPeerRelationshipRequest),
+    PeerDirectMessage(RawPeerDirectMessageRequest),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RawControlResponse {
     Backfill(RawBackfillResponse),
     PeerRelationship(RawPeerRelationshipResponse),
+    PeerDirectMessage(RawPeerDirectMessageResponse),
 }
 
 pub type BackfillRequestId = request_response::OutboundRequestId;
 pub type BackfillResponseChannel = request_response::ResponseChannel<RawControlResponse>;
 pub type PeerRelationshipRequestId = request_response::OutboundRequestId;
 pub type PeerRelationshipResponseChannel = request_response::ResponseChannel<RawControlResponse>;
+pub type PeerDirectMessageRequestId = request_response::OutboundRequestId;
+pub type PeerDirectMessageResponseChannel = request_response::ResponseChannel<RawControlResponse>;
 
 const BACKFILL_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -640,6 +752,25 @@ pub enum SubstrateRuntimeEvent {
         error: String,
     },
     PeerRelationshipInboundFailure {
+        peer: PeerId,
+        error: String,
+    },
+    PeerDirectMessageRequest {
+        peer: PeerId,
+        request: RawPeerDirectMessageRequest,
+        channel: PeerDirectMessageResponseChannel,
+    },
+    PeerDirectMessageResponse {
+        peer: PeerId,
+        request_id: PeerDirectMessageRequestId,
+        response: RawPeerDirectMessageResponse,
+    },
+    PeerDirectMessageOutboundFailure {
+        peer: PeerId,
+        request_id: PeerDirectMessageRequestId,
+        error: String,
+    },
+    PeerDirectMessageInboundFailure {
         peer: PeerId,
         error: String,
     },
@@ -1102,6 +1233,7 @@ pub struct SubstrateRuntime {
 enum PendingRequestKind {
     Backfill,
     PeerRelationship,
+    PeerDirectMessage,
 }
 
 impl SubstrateRuntime {
@@ -1358,6 +1490,36 @@ impl SubstrateRuntime {
         Ok(())
     }
 
+    pub fn send_peer_direct_message_request(
+        &mut self,
+        peer: &PeerId,
+        request: RawPeerDirectMessageRequest,
+    ) -> Result<PeerDirectMessageRequestId> {
+        request.validate()?;
+        let request_id = self
+            .swarm
+            .behaviour_mut()
+            .request_response
+            .send_request(peer, RawControlRequest::PeerDirectMessage(request));
+        self.pending_outbound_request_kinds
+            .insert(request_id, PendingRequestKind::PeerDirectMessage);
+        Ok(request_id)
+    }
+
+    pub fn send_peer_direct_message_response(
+        &mut self,
+        channel: PeerDirectMessageResponseChannel,
+        response: RawPeerDirectMessageResponse,
+    ) -> Result<()> {
+        response.validate()?;
+        self.swarm
+            .behaviour_mut()
+            .request_response
+            .send_response(channel, RawControlResponse::PeerDirectMessage(response))
+            .map_err(|_| anyhow!("peer direct message response channel closed"))?;
+        Ok(())
+    }
+
     pub async fn next_event(&mut self) -> Result<SubstrateRuntimeEvent> {
         if let Some(event) = self.pending_events.pop_front() {
             return Ok(event);
@@ -1564,6 +1726,15 @@ impl SubstrateRuntime {
                             channel,
                         }))
                     }
+                    RawControlRequest::PeerDirectMessage(request) => {
+                        self.pending_inbound_request_kinds
+                            .insert(request_id, PendingRequestKind::PeerDirectMessage);
+                        Ok(Some(SubstrateRuntimeEvent::PeerDirectMessageRequest {
+                            peer,
+                            request,
+                            channel,
+                        }))
+                    }
                 },
                 RequestResponseMessage::Response {
                     request_id,
@@ -1580,6 +1751,14 @@ impl SubstrateRuntime {
                     RawControlResponse::PeerRelationship(response) => {
                         self.pending_outbound_request_kinds.remove(&request_id);
                         Ok(Some(SubstrateRuntimeEvent::PeerRelationshipResponse {
+                            peer,
+                            request_id,
+                            response,
+                        }))
+                    }
+                    RawControlResponse::PeerDirectMessage(response) => {
+                        self.pending_outbound_request_kinds.remove(&request_id);
+                        Ok(Some(SubstrateRuntimeEvent::PeerDirectMessageResponse {
                             peer,
                             request_id,
                             response,
@@ -1611,6 +1790,13 @@ impl SubstrateRuntime {
                         error: error.to_string(),
                     },
                 )),
+                Some(PendingRequestKind::PeerDirectMessage) => Ok(Some(
+                    SubstrateRuntimeEvent::PeerDirectMessageOutboundFailure {
+                        peer,
+                        request_id,
+                        error: error.to_string(),
+                    },
+                )),
             },
             SwarmEvent::Behaviour(SubstrateBehaviourEvent::RequestResponse(
                 request_response::Event::InboundFailure {
@@ -1630,6 +1816,12 @@ impl SubstrateRuntime {
                 }
                 Some(PendingRequestKind::PeerRelationship) => Ok(Some(
                     SubstrateRuntimeEvent::PeerRelationshipInboundFailure {
+                        peer,
+                        error: error.to_string(),
+                    },
+                )),
+                Some(PendingRequestKind::PeerDirectMessage) => Ok(Some(
+                    SubstrateRuntimeEvent::PeerDirectMessageInboundFailure {
                         peer,
                         error: error.to_string(),
                     },
@@ -1909,6 +2101,55 @@ mod tests {
         assert!(
             rendered.contains("30s"),
             "request-response config should use 30s timeout, got: {rendered}"
+        );
+    }
+
+    #[test]
+    fn peer_relationship_wire_supports_agent_envelope_roundtrip() {
+        let envelope = RawAgentEnvelope {
+            protocol: "google_a2a".to_owned(),
+            source_agent_id: Some("agent-a".to_owned()),
+            target_agent_id: Some("agent-b".to_owned()),
+            capability: Some("peer.relationship.request".to_owned()),
+            message_json: "{\"intent\":\"friend_request\"}".to_owned(),
+            extensions_json: Some("{\"reason\":\"collaboration\"}".to_owned()),
+            signature: Some("sig-123".to_owned()),
+        };
+        let request = RawPeerRelationshipRequest {
+            source_node_id: "node-a".to_owned(),
+            target_node_id: "node-b".to_owned(),
+            action: RawPeerRelationshipAction::Request,
+            agent_envelope: Some(envelope.clone()),
+        };
+        let response = RawPeerRelationshipResponse {
+            source_node_id: "node-b".to_owned(),
+            target_node_id: "node-a".to_owned(),
+            action: RawPeerRelationshipAction::Accept,
+            applied: true,
+            agent_envelope: Some(envelope),
+            relationship_state: Some("accepted".to_owned()),
+            detail: None,
+            updated_at: 42,
+        };
+
+        let request_roundtrip: RawPeerRelationshipRequest =
+            serde_json::from_str(&serde_json::to_string(&request).unwrap()).unwrap();
+        let response_roundtrip: RawPeerRelationshipResponse =
+            serde_json::from_str(&serde_json::to_string(&response).unwrap()).unwrap();
+
+        assert_eq!(
+            request_roundtrip
+                .agent_envelope
+                .as_ref()
+                .and_then(|entry| entry.source_agent_id.as_deref()),
+            Some("agent-a")
+        );
+        assert_eq!(
+            response_roundtrip
+                .agent_envelope
+                .as_ref()
+                .and_then(|entry| entry.capability.as_deref()),
+            Some("peer.relationship.request")
         );
     }
 

@@ -235,6 +235,9 @@ pub struct LocalPeerMetadataRow {
     pub protocols_json: String,
     pub handshake_status: String,
     pub last_error: Option<String>,
+    pub contact_material_json: Option<String>,
+    pub contact_material_signature: Option<String>,
+    pub contact_material_updated_at: Option<u64>,
     pub first_identified_at: u64,
     pub last_identified_at: u64,
 }
@@ -250,6 +253,34 @@ pub struct LocalPeerRelationshipRow {
     pub blocked_at: Option<u64>,
     pub cleared_at: Option<u64>,
     pub updated_at: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalPeerDmThreadRow {
+    pub remote_node_id: String,
+    pub thread_id: String,
+    pub thread_kind: String,
+    pub session_state: String,
+    pub relationship_established_at: Option<u64>,
+    pub created_at: u64,
+    pub updated_at: u64,
+    pub last_message_at: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalPeerDmMessageRow {
+    pub thread_id: String,
+    pub message_id: String,
+    pub remote_node_id: String,
+    pub message_kind: String,
+    pub direction: String,
+    pub delivery_state: String,
+    pub a2a_protocol: String,
+    pub content_json: String,
+    pub encrypted_body: Option<String>,
+    pub content_encoding: Option<String>,
+    pub created_at: u64,
+    pub acknowledged_at: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

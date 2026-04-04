@@ -7,14 +7,16 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 use wattswarm_control_plane::control::{
-    PeerRelationshipAction, PeerRelationshipState, add_discovered_peer_endpoint,
+    PeerDmDeliveryState, PeerDmMessageKind, PeerDmSessionState, PeerRelationshipAction,
+    PeerRelationshipState, add_discovered_peer_endpoint, load_peer_dm_message_records_state,
+    load_peer_dm_thread_records_state, load_peer_metadata_records_state,
     load_peer_relationship_records_state,
 };
 use wattswarm_control_plane::crypto::NodeIdentity;
 use wattswarm_control_plane::network_bridge::{
     NetworkBridgeService, NetworkBridgeTick, build_knowledge_summary_for_task_type,
     build_reputation_summary_for_runtime, dial_discovered_peer_endpoints,
-    publish_pending_global_events, publish_pending_scoped_updates,
+    latest_connected_peer_ids, publish_pending_global_events, publish_pending_scoped_updates,
 };
 use wattswarm_control_plane::network_p2p::{
     NetworkP2pConfig, NetworkP2pNode, PeerHandshakeMetadata, SwarmScope, TopicNamespace,
@@ -312,6 +314,35 @@ fn relationship_state_for(path: &Path, remote_node_id: &str) -> Option<PeerRelat
         .map(|record| record.relationship_state)
 }
 
+fn dm_thread_id(local_node_id: &str, remote_node_id: &str) -> String {
+    let mut members = [local_node_id.to_owned(), remote_node_id.to_owned()];
+    members.sort();
+    format!("dm:{}:{}", members[0], members[1])
+}
+
+fn dm_thread_state_for(path: &Path, remote_node_id: &str) -> Option<PeerDmSessionState> {
+    load_peer_dm_thread_records_state(path)
+        .expect("load peer dm threads")
+        .into_iter()
+        .find(|record| record.remote_node_id == remote_node_id)
+        .map(|record| record.session_state)
+}
+
+fn dm_messages_for(
+    path: &Path,
+    thread_id: &str,
+) -> Vec<wattswarm_control_plane::control::PeerDmMessageRecord> {
+    load_peer_dm_message_records_state(path, thread_id).expect("load peer dm messages")
+}
+
+fn contact_material_for(path: &Path, remote_node_id: &str) -> Option<serde_json::Value> {
+    load_peer_metadata_records_state(path)
+        .expect("load peer metadata")
+        .into_iter()
+        .find(|record| record.node_id == remote_node_id)
+        .and_then(|record| record.contact_material)
+}
+
 pub fn two_nodes_sync_global_event_over_libp2p() {
     let identity_a = NodeIdentity::random();
     let identity_b = NodeIdentity::random();
@@ -437,8 +468,8 @@ pub fn two_nodes_execute_peer_relationship_request_and_accept_over_network() {
     let membership = membership_with_roles(&[identity_a.node_id(), identity_b.node_id()]);
     let mut node_a = make_node(identity_a, membership.clone());
     let mut node_b = make_node(identity_b, membership);
-    let mut service_a = make_fast_service_with_scopes(&[]);
-    let mut service_b = make_fast_service_with_scopes(&[]);
+    let mut service_a = make_fast_service();
+    let mut service_b = make_fast_service();
     let dir_a = temp_test_dir("peer-relationship-a");
     let dir_b = temp_test_dir("peer-relationship-b");
     service_a.set_state_dir(dir_a.clone());
@@ -457,7 +488,7 @@ pub fn two_nodes_execute_peer_relationship_request_and_accept_over_network() {
     let remote_a = service_a.local_peer_id().to_string();
 
     service_a
-        .send_peer_relationship_action(&remote_b, PeerRelationshipAction::Request)
+        .send_peer_relationship_action(&remote_b, PeerRelationshipAction::Request, None)
         .expect("send relationship request");
 
     let request_synced = wait_until(scaled_timeout(Duration::from_secs(10)), || {
@@ -474,7 +505,7 @@ pub fn two_nodes_execute_peer_relationship_request_and_accept_over_network() {
     );
 
     service_b
-        .send_peer_relationship_action(&remote_a, PeerRelationshipAction::Accept)
+        .send_peer_relationship_action(&remote_a, PeerRelationshipAction::Accept, None)
         .expect("send relationship accept");
 
     let accepted = wait_until(scaled_timeout(Duration::from_secs(10)), || {
@@ -517,7 +548,7 @@ pub fn two_nodes_execute_peer_relationship_request_and_block_over_network() {
     let remote_a = service_a.local_peer_id().to_string();
 
     service_a
-        .send_peer_relationship_action(&remote_b, PeerRelationshipAction::Request)
+        .send_peer_relationship_action(&remote_b, PeerRelationshipAction::Request, None)
         .expect("send relationship request");
 
     let request_synced = wait_until(scaled_timeout(Duration::from_secs(10)), || {
@@ -534,7 +565,7 @@ pub fn two_nodes_execute_peer_relationship_request_and_block_over_network() {
     );
 
     service_b
-        .send_peer_relationship_action(&remote_a, PeerRelationshipAction::Block)
+        .send_peer_relationship_action(&remote_a, PeerRelationshipAction::Block, None)
         .expect("send relationship block");
 
     let blocked = wait_until(scaled_timeout(Duration::from_secs(10)), || {
@@ -546,6 +577,178 @@ pub fn two_nodes_execute_peer_relationship_request_and_block_over_network() {
             && relationship_state_for(&dir_b, &remote_a) == Some(PeerRelationshipState::Blocked)
     });
     assert!(blocked, "relationship block should sync to both peers");
+
+    cleanup_dir(&dir_a);
+    cleanup_dir(&dir_b);
+}
+
+pub fn two_nodes_establish_dm_session_and_exchange_messages_over_network() {
+    let identity_a = NodeIdentity::random();
+    let identity_b = NodeIdentity::random();
+    let membership = membership_with_roles(&[identity_a.node_id(), identity_b.node_id()]);
+    let mut node_a = make_node(identity_a, membership.clone());
+    let mut node_b = make_node(identity_b, membership);
+    let mut service_a = make_fast_service_with_scopes(&[]);
+    let mut service_b = make_fast_service_with_scopes(&[]);
+    let dir_a = temp_test_dir("peer-dm-a");
+    let dir_b = temp_test_dir("peer-dm-b");
+    service_a.set_state_dir(dir_a.clone());
+    service_b.set_state_dir(dir_b.clone());
+
+    connect_services(&mut service_a, &mut node_a, &mut service_b, &mut node_b);
+    pump_services_for(
+        &mut service_a,
+        &mut node_a,
+        &mut service_b,
+        &mut node_b,
+        reconnect_quiet_period(),
+    );
+
+    let remote_b = service_b.local_peer_id().to_string();
+    let remote_a = service_a.local_peer_id().to_string();
+    let thread_id = dm_thread_id(&remote_a, &remote_b);
+
+    let send_without_relationship =
+        service_a.send_peer_direct_message(&remote_b, None, json!({"text":"pre-relationship"}));
+    assert!(
+        send_without_relationship.is_err(),
+        "dm should be rejected before an accepted relationship exists"
+    );
+
+    service_a
+        .send_peer_relationship_action(&remote_b, PeerRelationshipAction::Request, None)
+        .expect("send relationship request");
+    let request_synced = wait_until(scaled_timeout(Duration::from_secs(10)), || {
+        for _ in 0..32 {
+            let _ = pump_once(&mut service_a, &mut node_a);
+            let _ = pump_once(&mut service_b, &mut node_b);
+        }
+        relationship_state_for(&dir_a, &remote_b) == Some(PeerRelationshipState::Requested)
+            && relationship_state_for(&dir_b, &remote_a) == Some(PeerRelationshipState::Requested)
+    });
+    assert!(
+        request_synced,
+        "relationship request should sync to both peers"
+    );
+
+    service_b
+        .send_peer_relationship_action(&remote_a, PeerRelationshipAction::Accept, None)
+        .expect("send relationship accept");
+
+    let mut last_direct_tick_a = String::new();
+    let mut last_direct_tick_b = String::new();
+    let session_ready = wait_until(scaled_timeout(Duration::from_secs(10)), || {
+        for _ in 0..64 {
+            let tick_a = pump_once(&mut service_a, &mut node_a);
+            let tick_b = pump_once(&mut service_b, &mut node_b);
+            if let Some(
+                NetworkBridgeTick::PeerDirectMessageUpdated { .. }
+                | NetworkBridgeTick::PeerDirectMessageFailed { .. },
+            ) = tick_a.as_ref()
+            {
+                last_direct_tick_a = format!("{tick_a:?}");
+            }
+            if let Some(
+                NetworkBridgeTick::PeerDirectMessageUpdated { .. }
+                | NetworkBridgeTick::PeerDirectMessageFailed { .. },
+            ) = tick_b.as_ref()
+            {
+                last_direct_tick_b = format!("{tick_b:?}");
+            }
+        }
+        relationship_state_for(&dir_a, &remote_b) == Some(PeerRelationshipState::Accepted)
+            && relationship_state_for(&dir_b, &remote_a) == Some(PeerRelationshipState::Accepted)
+            && dm_thread_state_for(&dir_a, &remote_b) == Some(PeerDmSessionState::Ready)
+            && dm_thread_state_for(&dir_b, &remote_a) == Some(PeerDmSessionState::Ready)
+            && contact_material_for(&dir_a, &remote_b).is_some()
+            && contact_material_for(&dir_b, &remote_a).is_some()
+    });
+    assert!(
+        session_ready,
+        "accepted relationship should establish a ready dm session and exchange contact material; states: a={:?} b={:?} contact_a={} contact_b={} connected_a={:?} connected_b={:?} last_tick_a={} last_tick_b={}",
+        dm_thread_state_for(&dir_a, &remote_b),
+        dm_thread_state_for(&dir_b, &remote_a),
+        contact_material_for(&dir_a, &remote_b).is_some(),
+        contact_material_for(&dir_b, &remote_a).is_some(),
+        latest_connected_peer_ids(&dir_a),
+        latest_connected_peer_ids(&dir_b),
+        last_direct_tick_a,
+        last_direct_tick_b,
+    );
+
+    service_a
+        .send_peer_direct_message(&remote_b, None, json!({"text":"hello from a"}))
+        .expect("send direct message");
+
+    let delivered = wait_until(scaled_timeout(Duration::from_secs(10)), || {
+        for _ in 0..64 {
+            let _ = pump_once(&mut service_a, &mut node_a);
+            let _ = pump_once(&mut service_b, &mut node_b);
+        }
+        let messages_a = dm_messages_for(&dir_a, &thread_id);
+        let messages_b = dm_messages_for(&dir_b, &thread_id);
+        let outbound_delivered = messages_a.iter().any(|message| {
+            message.message_kind == PeerDmMessageKind::Message
+                && message.direction == wattswarm_control_plane::control::PeerDmDirection::Outbound
+                && message.delivery_state == PeerDmDeliveryState::Delivered
+                && message.content == json!({"text":"hello from a"})
+        });
+        let inbound_delivered = messages_b.iter().any(|message| {
+            message.message_kind == PeerDmMessageKind::Message
+                && message.direction == wattswarm_control_plane::control::PeerDmDirection::Inbound
+                && message.delivery_state == PeerDmDeliveryState::Delivered
+                && message.content == json!({"text":"hello from a"})
+        });
+        outbound_delivered && inbound_delivered
+    });
+    assert!(delivered, "accepted peers should exchange direct messages");
+
+    let messages_a = dm_messages_for(&dir_a, &thread_id);
+    let messages_b = dm_messages_for(&dir_b, &thread_id);
+    assert!(
+        messages_a
+            .iter()
+            .any(|message| message.message_kind == PeerDmMessageKind::RelationshipEstablished),
+        "local side should persist relationship established confirmation"
+    );
+    assert!(
+        messages_a
+            .iter()
+            .any(|message| message.message_kind == PeerDmMessageKind::SessionInit),
+        "local side should persist session init"
+    );
+    assert!(
+        messages_b
+            .iter()
+            .any(|message| message.message_kind == PeerDmMessageKind::RelationshipEstablished),
+        "remote side should persist relationship established confirmation"
+    );
+    assert!(
+        messages_b
+            .iter()
+            .any(|message| message.message_kind == PeerDmMessageKind::SessionInit),
+        "remote side should persist session init"
+    );
+
+    service_b
+        .send_peer_relationship_action(&remote_a, PeerRelationshipAction::Block, None)
+        .expect("send relationship block");
+    let blocked = wait_until(scaled_timeout(Duration::from_secs(10)), || {
+        for _ in 0..64 {
+            let _ = pump_once(&mut service_a, &mut node_a);
+            let _ = pump_once(&mut service_b, &mut node_b);
+        }
+        relationship_state_for(&dir_a, &remote_b) == Some(PeerRelationshipState::Blocked)
+            && relationship_state_for(&dir_b, &remote_a) == Some(PeerRelationshipState::Blocked)
+    });
+    assert!(blocked, "block should sync to both peers");
+
+    let blocked_send =
+        service_a.send_peer_direct_message(&remote_b, None, json!({"text":"post-block"}));
+    assert!(
+        blocked_send.is_err(),
+        "blocked peers should no longer be able to send direct messages"
+    );
 
     cleanup_dir(&dir_a);
     cleanup_dir(&dir_b);

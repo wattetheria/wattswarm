@@ -166,6 +166,34 @@ fn migrate_discovered_peers_local_source_kind_schema(conn: &Connection) -> Resul
     Ok(())
 }
 
+fn migrate_peer_metadata_local_contact_material_schema(conn: &Connection) -> Result<()> {
+    if !column_exists(conn, "peer_metadata_local", "contact_material_json") {
+        conn.execute_batch(
+            "
+            ALTER TABLE peer_metadata_local
+            ADD COLUMN contact_material_json TEXT;
+            ",
+        )?;
+    }
+    if !column_exists(conn, "peer_metadata_local", "contact_material_signature") {
+        conn.execute_batch(
+            "
+            ALTER TABLE peer_metadata_local
+            ADD COLUMN contact_material_signature TEXT;
+            ",
+        )?;
+    }
+    if !column_exists(conn, "peer_metadata_local", "contact_material_updated_at") {
+        conn.execute_batch(
+            "
+            ALTER TABLE peer_metadata_local
+            ADD COLUMN contact_material_updated_at TIMESTAMPTZ;
+            ",
+        )?;
+    }
+    Ok(())
+}
+
 fn migrate_executor_registry_local_scope_schema(conn: &Connection) -> Result<()> {
     if column_exists(conn, "executor_registry_local", "scope_id") {
         return Ok(());
@@ -337,6 +365,9 @@ impl PgStore {
                 protocols_json TEXT NOT NULL DEFAULT '[]',
                 handshake_status TEXT NOT NULL DEFAULT 'unknown',
                 last_error TEXT,
+                contact_material_json TEXT,
+                contact_material_signature TEXT,
+                contact_material_updated_at TIMESTAMPTZ,
                 first_identified_at TIMESTAMPTZ NOT NULL,
                 last_identified_at TIMESTAMPTZ NOT NULL,
                 PRIMARY KEY(scope_id, node_id)
@@ -355,6 +386,42 @@ impl PgStore {
                 updated_at TIMESTAMPTZ NOT NULL,
                 PRIMARY KEY(scope_id, remote_node_id)
             );
+
+            CREATE TABLE IF NOT EXISTS peer_dm_threads_local (
+                scope_id TEXT NOT NULL DEFAULT '',
+                remote_node_id TEXT NOT NULL,
+                thread_id TEXT NOT NULL,
+                thread_kind TEXT NOT NULL,
+                session_state TEXT NOT NULL,
+                relationship_established_at TIMESTAMPTZ,
+                created_at TIMESTAMPTZ NOT NULL,
+                updated_at TIMESTAMPTZ NOT NULL,
+                last_message_at TIMESTAMPTZ,
+                PRIMARY KEY(scope_id, thread_id)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_peer_dm_threads_local_remote_updated
+                ON peer_dm_threads_local(scope_id, remote_node_id, updated_at DESC, thread_id ASC);
+
+            CREATE TABLE IF NOT EXISTS peer_dm_messages_local (
+                scope_id TEXT NOT NULL DEFAULT '',
+                thread_id TEXT NOT NULL,
+                message_id TEXT NOT NULL,
+                remote_node_id TEXT NOT NULL,
+                message_kind TEXT NOT NULL,
+                direction TEXT NOT NULL,
+                delivery_state TEXT NOT NULL,
+                a2a_protocol TEXT NOT NULL,
+                content_json TEXT NOT NULL DEFAULT '{}',
+                encrypted_body TEXT,
+                content_encoding TEXT,
+                created_at TIMESTAMPTZ NOT NULL,
+                acknowledged_at TIMESTAMPTZ,
+                PRIMARY KEY(scope_id, message_id)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_peer_dm_messages_local_thread_created
+                ON peer_dm_messages_local(scope_id, thread_id, created_at ASC, message_id ASC);
 
             CREATE TABLE IF NOT EXISTS remote_task_bridge_registry_local (
                 task_id TEXT NOT NULL,
@@ -1320,6 +1387,7 @@ impl PgStore {
             migrate_executor_registry_local_scope_schema(&conn)?;
             migrate_discovered_peers_local_scope_schema(&conn)?;
             migrate_discovered_peers_local_source_kind_schema(&conn)?;
+            migrate_peer_metadata_local_contact_material_schema(&conn)?;
             ensure_discovered_peers_local_scope_index(&conn)?;
             Ok(())
         })();

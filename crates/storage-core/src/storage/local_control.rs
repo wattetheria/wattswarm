@@ -272,6 +272,9 @@ impl PgStore {
                     protocols_json,
                     handshake_status,
                     last_error,
+                    contact_material_json,
+                    contact_material_signature,
+                    (EXTRACT(EPOCH FROM contact_material_updated_at) * 1000)::BIGINT AS contact_material_updated_at_ms,
                     (EXTRACT(EPOCH FROM first_identified_at) * 1000)::BIGINT AS first_identified_at_ms,
                     (EXTRACT(EPOCH FROM last_identified_at) * 1000)::BIGINT AS last_identified_at_ms
              FROM peer_metadata_local
@@ -292,8 +295,11 @@ impl PgStore {
                 protocols_json: r.get(9)?,
                 handshake_status: r.get(10)?,
                 last_error: r.get(11)?,
-                first_identified_at: r.get::<_, i64>(12)? as u64,
-                last_identified_at: r.get::<_, i64>(13)? as u64,
+                contact_material_json: r.get(12)?,
+                contact_material_signature: r.get(13)?,
+                contact_material_updated_at: r.get::<_, Option<i64>>(14)?.map(|value| value as u64),
+                first_identified_at: r.get::<_, i64>(15)? as u64,
+                last_identified_at: r.get::<_, i64>(16)? as u64,
             })
         })?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
@@ -314,13 +320,16 @@ impl PgStore {
                 scope_id, node_id, network_id, params_version, params_hash,
                 agent_version_raw, agent_version_prefix, protocol_version, observed_addr,
                 listen_addrs_json, protocols_json, handshake_status, last_error,
+                contact_material_json, contact_material_signature, contact_material_updated_at,
                 first_identified_at, last_identified_at
              ) VALUES (
                 $1, $2, $3, $4, $5,
                 $6, $7, $8, $9,
                 $10, $11, $12, $13,
-                TIMESTAMPTZ 'epoch' + ($14::bigint * INTERVAL '1 millisecond'),
-                TIMESTAMPTZ 'epoch' + ($15::bigint * INTERVAL '1 millisecond')
+                $14, $15,
+                CASE WHEN $16::bigint < 0::bigint THEN NULL ELSE TIMESTAMPTZ 'epoch' + ($16::bigint * INTERVAL '1 millisecond') END,
+                TIMESTAMPTZ 'epoch' + ($17::bigint * INTERVAL '1 millisecond'),
+                TIMESTAMPTZ 'epoch' + ($18::bigint * INTERVAL '1 millisecond')
              )
              ON CONFLICT(scope_id, node_id) DO UPDATE SET
                 network_id = excluded.network_id,
@@ -334,6 +343,9 @@ impl PgStore {
                 protocols_json = excluded.protocols_json,
                 handshake_status = excluded.handshake_status,
                 last_error = excluded.last_error,
+                contact_material_json = excluded.contact_material_json,
+                contact_material_signature = excluded.contact_material_signature,
+                contact_material_updated_at = excluded.contact_material_updated_at,
                 last_identified_at = excluded.last_identified_at",
             params![
                 scope_id,
@@ -349,6 +361,9 @@ impl PgStore {
                 row.protocols_json,
                 row.handshake_status,
                 row.last_error,
+                row.contact_material_json,
+                row.contact_material_signature,
+                row.contact_material_updated_at.map(|value| value as i64).unwrap_or(-1),
                 row.first_identified_at as i64,
                 row.last_identified_at as i64
             ],
@@ -440,6 +455,178 @@ impl PgStore {
                 blocked_at_ms,
                 cleared_at_ms,
                 row.updated_at as i64
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_local_peer_dm_threads(&self, scope_id: &str) -> Result<Vec<LocalPeerDmThreadRow>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
+        let mut stmt = conn.prepare(
+            "SELECT remote_node_id,
+                    thread_id,
+                    thread_kind,
+                    session_state,
+                    (EXTRACT(EPOCH FROM relationship_established_at) * 1000)::BIGINT AS relationship_established_at_ms,
+                    (EXTRACT(EPOCH FROM created_at) * 1000)::BIGINT AS created_at_ms,
+                    (EXTRACT(EPOCH FROM updated_at) * 1000)::BIGINT AS updated_at_ms,
+                    (EXTRACT(EPOCH FROM last_message_at) * 1000)::BIGINT AS last_message_at_ms
+             FROM peer_dm_threads_local
+             WHERE scope_id = $1
+             ORDER BY remote_node_id ASC, updated_at DESC, thread_id ASC",
+        )?;
+        let rows = stmt.query_map(params![scope_id], |r| {
+            Ok(LocalPeerDmThreadRow {
+                remote_node_id: r.get(0)?,
+                thread_id: r.get(1)?,
+                thread_kind: r.get(2)?,
+                session_state: r.get(3)?,
+                relationship_established_at: r.get::<_, Option<i64>>(4)?.map(|value| value as u64),
+                created_at: r.get::<_, i64>(5)? as u64,
+                updated_at: r.get::<_, i64>(6)? as u64,
+                last_message_at: r.get::<_, Option<i64>>(7)?.map(|value| value as u64),
+            })
+        })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
+    pub fn upsert_local_peer_dm_thread(
+        &self,
+        scope_id: &str,
+        row: &LocalPeerDmThreadRow,
+    ) -> Result<()> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
+        conn.execute(
+            "INSERT INTO peer_dm_threads_local(
+                scope_id, remote_node_id, thread_id, thread_kind, session_state,
+                relationship_established_at, created_at, updated_at, last_message_at
+             ) VALUES (
+                $1, $2, $3, $4, $5,
+                CASE WHEN $6::bigint < 0::bigint THEN NULL ELSE TIMESTAMPTZ 'epoch' + ($6::bigint * INTERVAL '1 millisecond') END,
+                TIMESTAMPTZ 'epoch' + ($7::bigint * INTERVAL '1 millisecond'),
+                TIMESTAMPTZ 'epoch' + ($8::bigint * INTERVAL '1 millisecond'),
+                CASE WHEN $9::bigint < 0::bigint THEN NULL ELSE TIMESTAMPTZ 'epoch' + ($9::bigint * INTERVAL '1 millisecond') END
+             )
+             ON CONFLICT(scope_id, thread_id) DO UPDATE SET
+                remote_node_id = excluded.remote_node_id,
+                thread_kind = excluded.thread_kind,
+                session_state = excluded.session_state,
+                relationship_established_at = excluded.relationship_established_at,
+                updated_at = excluded.updated_at,
+                last_message_at = excluded.last_message_at",
+            params![
+                scope_id,
+                &row.remote_node_id,
+                &row.thread_id,
+                &row.thread_kind,
+                &row.session_state,
+                row.relationship_established_at.map(|value| value as i64).unwrap_or(-1),
+                row.created_at as i64,
+                row.updated_at as i64,
+                row.last_message_at.map(|value| value as i64).unwrap_or(-1)
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_local_peer_dm_messages(
+        &self,
+        scope_id: &str,
+        thread_id: &str,
+    ) -> Result<Vec<LocalPeerDmMessageRow>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
+        let mut stmt = conn.prepare(
+            "SELECT thread_id,
+                    message_id,
+                    remote_node_id,
+                    message_kind,
+                    direction,
+                    delivery_state,
+                    a2a_protocol,
+                    content_json,
+                    encrypted_body,
+                    content_encoding,
+                    (EXTRACT(EPOCH FROM created_at) * 1000)::BIGINT AS created_at_ms,
+                    (EXTRACT(EPOCH FROM acknowledged_at) * 1000)::BIGINT AS acknowledged_at_ms
+             FROM peer_dm_messages_local
+             WHERE scope_id = $1 AND thread_id = $2
+             ORDER BY created_at ASC, message_id ASC",
+        )?;
+        let rows = stmt.query_map(params![scope_id, thread_id], |r| {
+            Ok(LocalPeerDmMessageRow {
+                thread_id: r.get(0)?,
+                message_id: r.get(1)?,
+                remote_node_id: r.get(2)?,
+                message_kind: r.get(3)?,
+                direction: r.get(4)?,
+                delivery_state: r.get(5)?,
+                a2a_protocol: r.get(6)?,
+                content_json: r.get(7)?,
+                encrypted_body: r.get(8)?,
+                content_encoding: r.get(9)?,
+                created_at: r.get::<_, i64>(10)? as u64,
+                acknowledged_at: r.get::<_, Option<i64>>(11)?.map(|value| value as u64),
+            })
+        })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
+    pub fn upsert_local_peer_dm_message(
+        &self,
+        scope_id: &str,
+        row: &LocalPeerDmMessageRow,
+    ) -> Result<()> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
+        conn.execute(
+            "INSERT INTO peer_dm_messages_local(
+                scope_id, thread_id, message_id, remote_node_id, message_kind, direction,
+                delivery_state, a2a_protocol, content_json, encrypted_body, content_encoding,
+                created_at, acknowledged_at
+             ) VALUES (
+                $1, $2, $3, $4, $5, $6,
+                $7, $8, $9, $10, $11,
+                TIMESTAMPTZ 'epoch' + ($12::bigint * INTERVAL '1 millisecond'),
+                CASE WHEN $13::bigint < 0::bigint THEN NULL ELSE TIMESTAMPTZ 'epoch' + ($13::bigint * INTERVAL '1 millisecond') END
+             )
+             ON CONFLICT(scope_id, message_id) DO UPDATE SET
+                thread_id = excluded.thread_id,
+                remote_node_id = excluded.remote_node_id,
+                message_kind = excluded.message_kind,
+                direction = excluded.direction,
+                delivery_state = excluded.delivery_state,
+                a2a_protocol = excluded.a2a_protocol,
+                content_json = excluded.content_json,
+                encrypted_body = excluded.encrypted_body,
+                content_encoding = excluded.content_encoding,
+                acknowledged_at = excluded.acknowledged_at",
+            params![
+                scope_id,
+                &row.thread_id,
+                &row.message_id,
+                &row.remote_node_id,
+                &row.message_kind,
+                &row.direction,
+                &row.delivery_state,
+                &row.a2a_protocol,
+                &row.content_json,
+                row.encrypted_body,
+                row.content_encoding,
+                row.created_at as i64,
+                row.acknowledged_at.map(|value| value as i64).unwrap_or(-1)
             ],
         )?;
         Ok(())

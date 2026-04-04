@@ -118,6 +118,7 @@ The workspace now includes dedicated crates and a control-plane bridge for node-
   - defines network envelopes for events, rule broadcasts, checkpoint announcements, and summaries
   - defines typed backfill request/response messages
   - defines typed peer-relationship request/response messages for node-to-node relationship execution
+  - defines typed peer direct-message request/response messages for accepted node relationships
   - builds the minimal libp2p behaviour set used by WattSwarm networking:
     - gossipsub
     - identify
@@ -125,7 +126,7 @@ The workspace now includes dedicated crates and a control-plane bridge for node-
     - relay client
     - AutoNAT
     - DCUtR
-    - request-response (CBOR backfill + peer relationship control)
+    - request-response (CBOR backfill + peer relationship control + peer direct messaging)
     - mDNS
   - exposes a pollable network runtime for listen/dial/publish/backfill/relationship-control flows
 - `crates/control-plane/src/network_bridge.rs`
@@ -141,6 +142,10 @@ The workspace now includes dedicated crates and a control-plane bridge for node-
   - can dial peer listen addresses discovered through the local PostgreSQL peer cache (`discovered_peers_local`)
   - persists identify/handshake metadata into `peer_metadata_local`
   - executes node-to-node relationship requests over request-response and persists local relationship state into `peer_relationships_local`
+  - supports DIAP-inspired (`Decentralized Intelligent Agent Protocol`) secure relationship execution by exchanging protected contact material after relationship acceptance and persisting it into `peer_metadata_local`
+  - emits a point-to-point `relationship_established` confirmation after `accept`
+  - persists direct-message threads into `peer_dm_threads_local`
+  - persists direct-message payloads and delivery state into `peer_dm_messages_local`
 - `crates/artifact-store`
   - owns the node-local filesystem layout for evidence, checkpoints, snapshots, and event batches
   - provides read/write helpers for byte and JSON payloads
@@ -154,6 +159,7 @@ Current coverage in tests:
 - integration tests for region/node scoped sync and summary import
 - integration tests for event revoke rollback and summary revoke cleanup across nodes
 - integration tests for two-node peer relationship request/accept and request/block flows over libp2p
+- integration tests for two-node relationship-established handshake, protected contact material exchange, and accepted-only direct messaging over libp2p
 - integration tests for periodic anti-entropy catch-up and reconnect recovery after a partition-like disconnect
 
 Runtime toggles:
@@ -439,6 +445,16 @@ network-level specialization / faster recovery / more stable convergence"]
   - imported reputation summaries
 - `BackfillRequest` / `BackfillResponse` messages:
   - missing event pages for catch-up
+- direct relationship control payloads:
+  - structured node-to-node relationship requests and responses
+  - optional A2A-style agent envelope for agent-level decision context
+- direct-message payloads:
+  - `relationship_established`
+  - `session_init`
+  - `message`
+- DIAP-inspired (`Decentralized Intelligent Agent Protocol`) security material:
+  - protected contact material exchanged after relationship acceptance
+  - point-to-point relationship-established handshake before normal DM traffic
 - peer discovery payloads:
   - `node_id`
   - listen address hints for LAN dialing
@@ -480,8 +496,17 @@ network-level specialization / faster recovery / more stable convergence"]
 - Node relationship execution today:
   - node-to-node relationship actions are point-to-point request/response messages, not gossip subscriptions
   - supported actions are `request`, `accept`, `reject`, `cancel`, `remove`, `block`, and `unblock`
+  - relationship requests and responses can carry an A2A-style agent envelope so agent-level intent/capability context travels with the node-level action
   - local relationship state is persisted into `peer_relationships_local`
-  - current scope is relationship execution only; DM/private messaging is not implemented yet
+- Direct messaging today:
+  - direct messages are point-to-point request/response messages, not gossip topics
+  - only `accepted` relationships may open a DM thread
+  - `accept` triggers an explicit `relationship_established` message so both sides have a concrete “relationship is live” event
+  - `relationship_established` exchanges DIAP-inspired (`Decentralized Intelligent Agent Protocol`) protected contact material and moves the thread into a ready session state
+  - subsequent direct messages use the same request/response channel and persist into:
+    - `peer_dm_threads_local`
+    - `peer_dm_messages_local`
+  - current scope is execution-layer DM only; there is no product-layer chat UI or agent decision UX yet
 - Traffic protection today:
   - duplicate gossip payloads are dropped
   - per-peer gossip and per-peer backfill request windows are rate-limited
@@ -516,6 +541,35 @@ For each subscribed scope, the node derives five topic kinds:
 `messages` is the topic family used for topic-scoped agent chat traffic such as `TopicMessagePosted`.
 
 This means the current model is still scope-based routing, not semantic capability routing. A node cannot yet declare "I only want writing tasks" or "I only want stock-analysis tasks" and have the network route tasks that way automatically.
+
+#### How node relationships and direct messaging work
+
+WattSwarm now separates three node-local peer layers:
+
+- `discovered_peers_local`
+  - discovery registry for LAN and WAN peer sightings
+- `peer_metadata_local`
+  - identify/handshake metadata plus protected contact material snapshots
+- `peer_relationships_local`
+  - local relationship state machine (`requested`, `accepted`, `rejected`, `blocked`, etc.)
+
+Relationship execution is point-to-point:
+
+1. a node sends a structured relationship request over libp2p request-response
+2. the remote node applies the request to its local relationship state
+3. the remote node returns a structured response
+4. if the relationship transitions to `accepted`, the accepting side immediately sends `relationship_established`
+5. `relationship_established` exchanges DIAP-inspired (`Decentralized Intelligent Agent Protocol`) protected contact material and creates a ready DM thread on both nodes
+
+Direct messaging is also point-to-point:
+
+1. the sender must already have `accepted` relationship state for the remote node
+2. the DM thread must be in `ready` session state
+3. the sender emits a structured direct-message request with optional A2A-style agent envelope
+4. the receiver persists the inbound message and returns delivery acknowledgement
+5. the sender updates local delivery state when the acknowledgement arrives
+
+This DM path is execution-layer only. Product-layer agent decisions about whether to request, accept, reject, or initiate a DM still belong above WattSwarm.
 
 #### How propagation actually spreads
 
