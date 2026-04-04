@@ -121,6 +121,158 @@ pub struct DiscoveredPeerRecord {
     pub node_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub listen_addr: Option<String>,
+    #[serde(default = "default_discovered_peer_source_kind")]
+    pub source_kind: String,
+}
+
+fn default_discovered_peer_source_kind() -> String {
+    "unknown".to_owned()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PeerMetadataRecord {
+    pub node_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub params_version: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub params_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_version_raw: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_version_prefix: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protocol_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_addr: Option<String>,
+    #[serde(default)]
+    pub listen_addrs: Vec<String>,
+    #[serde(default)]
+    pub protocols: Vec<String>,
+    pub handshake_status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+    pub first_identified_at: u64,
+    pub last_identified_at: u64,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PeerRelationshipState {
+    None,
+    Requested,
+    Accepted,
+    Rejected,
+    Blocked,
+}
+
+impl PeerRelationshipState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Requested => "requested",
+            Self::Accepted => "accepted",
+            Self::Rejected => "rejected",
+            Self::Blocked => "blocked",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PeerRelationshipAction {
+    Request,
+    Accept,
+    Reject,
+    Cancel,
+    Remove,
+    Block,
+    Unblock,
+}
+
+impl PeerRelationshipAction {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Request => "request",
+            Self::Accept => "accept",
+            Self::Reject => "reject",
+            Self::Cancel => "cancel",
+            Self::Remove => "remove",
+            Self::Block => "block",
+            Self::Unblock => "unblock",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PeerRelationshipInitiator {
+    Local,
+    Remote,
+    System,
+}
+
+impl PeerRelationshipInitiator {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Local => "local",
+            Self::Remote => "remote",
+            Self::System => "system",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PeerRelationshipRecord {
+    pub remote_node_id: String,
+    pub relationship_state: PeerRelationshipState,
+    pub last_action: PeerRelationshipAction,
+    pub initiated_by: PeerRelationshipInitiator,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_at: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub responded_at: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocked_at: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cleared_at: Option<u64>,
+    pub updated_at: u64,
+}
+
+fn parse_json_string_list(raw: &str) -> Vec<String> {
+    serde_json::from_str::<Vec<String>>(raw).unwrap_or_default()
+}
+
+fn peer_relationship_state_from_str(value: &str) -> PeerRelationshipState {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "requested" => PeerRelationshipState::Requested,
+        "accepted" => PeerRelationshipState::Accepted,
+        "rejected" => PeerRelationshipState::Rejected,
+        "blocked" => PeerRelationshipState::Blocked,
+        _ => PeerRelationshipState::None,
+    }
+}
+
+fn peer_relationship_action_from_str(value: &str) -> PeerRelationshipAction {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "request" => PeerRelationshipAction::Request,
+        "accept" => PeerRelationshipAction::Accept,
+        "reject" => PeerRelationshipAction::Reject,
+        "cancel" => PeerRelationshipAction::Cancel,
+        "remove" => PeerRelationshipAction::Remove,
+        "block" => PeerRelationshipAction::Block,
+        "unblock" => PeerRelationshipAction::Unblock,
+        _ => PeerRelationshipAction::Remove,
+    }
+}
+
+fn peer_relationship_initiator_from_str(value: &str) -> PeerRelationshipInitiator {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "remote" => PeerRelationshipInitiator::Remote,
+        "system" => PeerRelationshipInitiator::System,
+        _ => PeerRelationshipInitiator::Local,
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1665,6 +1817,7 @@ pub fn load_discovered_peer_records(path: &Path) -> Result<Vec<DiscoveredPeerRec
             .map(|node_id| DiscoveredPeerRecord {
                 node_id,
                 listen_addr: None,
+                source_kind: default_discovered_peer_source_kind(),
             })
             .collect());
     }
@@ -1681,6 +1834,7 @@ pub fn save_discovered_peers(path: &Path, peers: &[String]) -> Result<()> {
         .map(|node_id| DiscoveredPeerRecord {
             node_id,
             listen_addr: None,
+            source_kind: default_discovered_peer_source_kind(),
         })
         .collect::<Vec<_>>();
     save_discovered_peer_records(path, &records)
@@ -1711,6 +1865,7 @@ pub fn load_discovered_peer_records_state(state_dir: &Path) -> Result<Vec<Discov
             .map(|row| DiscoveredPeerRecord {
                 node_id: row.node_id,
                 listen_addr: row.listen_addr,
+                source_kind: row.source_kind,
             })
             .collect());
     }
@@ -1725,6 +1880,7 @@ pub fn load_discovered_peer_records_state(state_dir: &Path) -> Result<Vec<Discov
                 .map(|record| crate::storage::LocalDiscoveredPeerRow {
                     node_id: record.node_id.clone(),
                     listen_addr: record.listen_addr.clone(),
+                    source_kind: record.source_kind.clone(),
                     discovered_at: now,
                     updated_at: now,
                 })
@@ -1748,6 +1904,7 @@ pub fn save_discovered_peer_records_state(
             .map(|record| crate::storage::LocalDiscoveredPeerRow {
                 node_id: record.node_id.clone(),
                 listen_addr: record.listen_addr.clone(),
+                source_kind: record.source_kind.clone(),
                 discovered_at: now,
                 updated_at: now,
             })
@@ -1756,14 +1913,233 @@ pub fn save_discovered_peer_records_state(
     )
 }
 
+pub fn load_peer_metadata_records_state(state_dir: &Path) -> Result<Vec<PeerMetadataRecord>> {
+    let store = local_control_store(state_dir)?;
+    let scope_id = local_control_scope_id(state_dir);
+    Ok(store
+        .list_local_peer_metadata(&scope_id)?
+        .into_iter()
+        .map(|row| PeerMetadataRecord {
+            node_id: row.node_id,
+            network_id: row.network_id,
+            params_version: row.params_version,
+            params_hash: row.params_hash,
+            agent_version_raw: row.agent_version_raw,
+            agent_version_prefix: row.agent_version_prefix,
+            protocol_version: row.protocol_version,
+            observed_addr: row.observed_addr,
+            listen_addrs: parse_json_string_list(&row.listen_addrs_json),
+            protocols: parse_json_string_list(&row.protocols_json),
+            handshake_status: row.handshake_status,
+            last_error: row.last_error,
+            first_identified_at: row.first_identified_at,
+            last_identified_at: row.last_identified_at,
+        })
+        .collect())
+}
+
+pub fn save_peer_metadata_record_state(
+    state_dir: &Path,
+    record: &PeerMetadataRecord,
+) -> Result<()> {
+    let scope_id = local_control_scope_id(state_dir);
+    local_control_store(state_dir)?.upsert_local_peer_metadata(
+        &scope_id,
+        &crate::storage::LocalPeerMetadataRow {
+            node_id: record.node_id.clone(),
+            network_id: record.network_id.clone(),
+            params_version: record.params_version,
+            params_hash: record.params_hash.clone(),
+            agent_version_raw: record.agent_version_raw.clone(),
+            agent_version_prefix: record.agent_version_prefix.clone(),
+            protocol_version: record.protocol_version.clone(),
+            observed_addr: record.observed_addr.clone(),
+            listen_addrs_json: serde_json::to_string(&record.listen_addrs)?,
+            protocols_json: serde_json::to_string(&record.protocols)?,
+            handshake_status: record.handshake_status.clone(),
+            last_error: record.last_error.clone(),
+            first_identified_at: record.first_identified_at,
+            last_identified_at: record.last_identified_at,
+        },
+    )
+}
+
+pub fn load_peer_relationship_records_state(
+    state_dir: &Path,
+) -> Result<Vec<PeerRelationshipRecord>> {
+    let store = local_control_store(state_dir)?;
+    let scope_id = local_control_scope_id(state_dir);
+    Ok(store
+        .list_local_peer_relationships(&scope_id)?
+        .into_iter()
+        .map(|row| PeerRelationshipRecord {
+            remote_node_id: row.remote_node_id,
+            relationship_state: peer_relationship_state_from_str(&row.relationship_state),
+            last_action: peer_relationship_action_from_str(&row.last_action),
+            initiated_by: peer_relationship_initiator_from_str(&row.initiated_by),
+            requested_at: row.requested_at,
+            responded_at: row.responded_at,
+            blocked_at: row.blocked_at,
+            cleared_at: row.cleared_at,
+            updated_at: row.updated_at,
+        })
+        .collect())
+}
+
+pub fn save_peer_relationship_record_state(
+    state_dir: &Path,
+    record: &PeerRelationshipRecord,
+) -> Result<()> {
+    let scope_id = local_control_scope_id(state_dir);
+    local_control_store(state_dir)?.upsert_local_peer_relationship(
+        &scope_id,
+        &crate::storage::LocalPeerRelationshipRow {
+            remote_node_id: record.remote_node_id.clone(),
+            relationship_state: record.relationship_state.as_str().to_owned(),
+            last_action: record.last_action.as_str().to_owned(),
+            initiated_by: record.initiated_by.as_str().to_owned(),
+            requested_at: record.requested_at,
+            responded_at: record.responded_at,
+            blocked_at: record.blocked_at,
+            cleared_at: record.cleared_at,
+            updated_at: record.updated_at,
+        },
+    )
+}
+
+pub fn apply_peer_relationship_action_state(
+    state_dir: &Path,
+    remote_node_id: &str,
+    action: PeerRelationshipAction,
+    initiated_by: PeerRelationshipInitiator,
+) -> Result<PeerRelationshipRecord> {
+    let remote_node_id = remote_node_id.trim();
+    if remote_node_id.is_empty() {
+        return Err(anyhow!("remote_node_id is required"));
+    }
+    let now = chrono::Utc::now().timestamp_millis().max(0) as u64;
+    let existing = load_peer_relationship_records_state(state_dir)?
+        .into_iter()
+        .find(|record| record.remote_node_id == remote_node_id);
+    let mut record = existing.unwrap_or(PeerRelationshipRecord {
+        remote_node_id: remote_node_id.to_owned(),
+        relationship_state: PeerRelationshipState::None,
+        last_action: PeerRelationshipAction::Remove,
+        initiated_by,
+        requested_at: None,
+        responded_at: None,
+        blocked_at: None,
+        cleared_at: None,
+        updated_at: now,
+    });
+    record.initiated_by = initiated_by;
+    record.last_action = action;
+    record.updated_at = now;
+    match action {
+        PeerRelationshipAction::Request => {
+            if record.relationship_state == PeerRelationshipState::Blocked {
+                return Err(anyhow!(
+                    "cannot request relationship while remote_node_id={} is blocked",
+                    remote_node_id
+                ));
+            }
+            record.relationship_state = PeerRelationshipState::Requested;
+            record.requested_at = Some(now);
+            record.responded_at = None;
+            record.blocked_at = None;
+            record.cleared_at = None;
+        }
+        PeerRelationshipAction::Accept => {
+            if record.relationship_state != PeerRelationshipState::Requested {
+                return Err(anyhow!(
+                    "cannot accept relationship for remote_node_id={} without a pending request",
+                    remote_node_id
+                ));
+            }
+            record.relationship_state = PeerRelationshipState::Accepted;
+            record.responded_at = Some(now);
+            record.blocked_at = None;
+            record.cleared_at = None;
+        }
+        PeerRelationshipAction::Reject => {
+            if record.relationship_state != PeerRelationshipState::Requested {
+                return Err(anyhow!(
+                    "cannot reject relationship for remote_node_id={} without a pending request",
+                    remote_node_id
+                ));
+            }
+            record.relationship_state = PeerRelationshipState::Rejected;
+            record.responded_at = Some(now);
+            record.blocked_at = None;
+            record.cleared_at = None;
+        }
+        PeerRelationshipAction::Cancel | PeerRelationshipAction::Remove => {
+            let can_clear = matches!(
+                (action, record.relationship_state),
+                (
+                    PeerRelationshipAction::Cancel,
+                    PeerRelationshipState::Requested
+                ) | (
+                    PeerRelationshipAction::Remove,
+                    PeerRelationshipState::Accepted | PeerRelationshipState::Rejected
+                )
+            );
+            if !can_clear {
+                return Err(anyhow!(
+                    "cannot {} relationship for remote_node_id={} from state={}",
+                    action.as_str(),
+                    remote_node_id,
+                    record.relationship_state.as_str()
+                ));
+            }
+            record.relationship_state = PeerRelationshipState::None;
+            record.cleared_at = Some(now);
+            record.blocked_at = None;
+        }
+        PeerRelationshipAction::Block => {
+            if record.relationship_state == PeerRelationshipState::Blocked {
+                return Err(anyhow!(
+                    "remote_node_id={} is already blocked",
+                    remote_node_id
+                ));
+            }
+            record.relationship_state = PeerRelationshipState::Blocked;
+            record.blocked_at = Some(now);
+            record.cleared_at = None;
+        }
+        PeerRelationshipAction::Unblock => {
+            if record.relationship_state != PeerRelationshipState::Blocked {
+                return Err(anyhow!(
+                    "cannot unblock remote_node_id={} because it is not blocked",
+                    remote_node_id
+                ));
+            }
+            record.relationship_state = PeerRelationshipState::None;
+            record.blocked_at = None;
+            record.cleared_at = Some(now);
+        }
+    }
+    save_peer_relationship_record_state(state_dir, &record)?;
+    Ok(record)
+}
+
 pub fn add_discovered_peer(state_dir: &Path, peer_node_id: &str) -> Result<bool> {
-    add_discovered_peer_endpoint(state_dir, peer_node_id, None)
+    add_discovered_peer_endpoint_with_source(state_dir, peer_node_id, None, "unknown")
 }
 
 pub fn add_discovered_peer_endpoint(
     state_dir: &Path,
     peer_node_id: &str,
     listen_addr: Option<&str>,
+) -> Result<bool> {
+    add_discovered_peer_endpoint_with_source(state_dir, peer_node_id, listen_addr, "udp")
+}
+
+pub fn add_discovered_peer_endpoint_with_source(
+    state_dir: &Path,
+    peer_node_id: &str,
+    listen_addr: Option<&str>,
+    source_kind: &str,
 ) -> Result<bool> {
     let peer = peer_node_id.trim();
     if peer.is_empty() {
@@ -1772,7 +2148,13 @@ pub fn add_discovered_peer_endpoint(
     fs::create_dir_all(state_dir)?;
     let now = chrono::Utc::now().timestamp_millis().max(0) as u64;
     let scope_id = local_control_scope_id(state_dir);
-    local_control_store(state_dir)?.upsert_local_discovered_peer(&scope_id, peer, listen_addr, now)
+    local_control_store(state_dir)?.upsert_local_discovered_peer(
+        &scope_id,
+        peer,
+        listen_addr,
+        source_kind,
+        now,
+    )
 }
 
 pub fn load_executor_registry(path: &Path) -> Result<ExecutorRegistry> {

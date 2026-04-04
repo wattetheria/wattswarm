@@ -320,7 +320,7 @@ fn legacy_discovered_peers_rows_are_migrated_to_scope_and_real_node_id() {
 
         let rows = conn
             .prepare(
-                "SELECT scope_id, node_id, listen_addr
+                "SELECT scope_id, node_id, listen_addr, source_kind
                  FROM discovered_peers_local",
             )
             .expect("prepare migrated discovered peers query")
@@ -329,6 +329,7 @@ fn legacy_discovered_peers_rows_are_migrated_to_scope_and_real_node_id() {
                     row.get::<usize, String>(0)?,
                     row.get::<usize, String>(1)?,
                     row.get::<usize, Option<String>>(2)?,
+                    row.get::<usize, String>(3)?,
                 ))
             })
             .expect("query migrated discovered peers")
@@ -341,6 +342,7 @@ fn legacy_discovered_peers_rows_are_migrated_to_scope_and_real_node_id() {
                 scope_id,
                 "peer-a".to_owned(),
                 Some("/ip4/127.0.0.1/tcp/4001".to_owned()),
+                "unknown".to_owned(),
             )]
         );
     });
@@ -406,6 +408,80 @@ fn legacy_executor_registry_rows_are_migrated_to_scope_and_real_executor_name() 
                 "http://host.docker.internal:9077/runtime/Boss".to_owned(),
             )]
         );
+    });
+}
+
+#[test]
+fn local_control_peer_metadata_and_relationship_roundtrip() {
+    with_test_schema(|| {
+        let store =
+            PgStore::open("peer-metadata-relationship-roundtrip.state").expect("open store");
+        let scope_id = local_control_scope_id(std::path::Path::new("/tmp/wattswarm-state"));
+
+        store
+            .upsert_local_peer_metadata(
+                &scope_id,
+                &wattswarm_storage_core::storage::LocalPeerMetadataRow {
+                    node_id: "peer-a".to_owned(),
+                    network_id: Some("mainnet:watt-galaxy".to_owned()),
+                    params_version: Some(7),
+                    params_hash: Some("params-abc".to_owned()),
+                    agent_version_raw: Some(
+                        "wattswarm-network-p2p|mainnet:watt-galaxy|7|params-abc".to_owned(),
+                    ),
+                    agent_version_prefix: Some("wattswarm-network-p2p".to_owned()),
+                    protocol_version: Some("wattswarm/1.0.0".to_owned()),
+                    observed_addr: Some("/ip4/198.51.100.2/tcp/4001".to_owned()),
+                    listen_addrs_json: serde_json::to_string(&vec![
+                        "/ip4/203.0.113.10/tcp/4001".to_owned(),
+                    ])
+                    .expect("listen_addrs_json"),
+                    protocols_json: serde_json::to_string(&vec!["/meshsub/1.1.0".to_owned()])
+                        .expect("protocols_json"),
+                    handshake_status: "identified".to_owned(),
+                    last_error: None,
+                    first_identified_at: 1_700_000_000_000,
+                    last_identified_at: 1_700_000_000_500,
+                },
+            )
+            .expect("save peer metadata");
+
+        store
+            .upsert_local_peer_relationship(
+                &scope_id,
+                &wattswarm_storage_core::storage::LocalPeerRelationshipRow {
+                    remote_node_id: "peer-a".to_owned(),
+                    relationship_state: "accepted".to_owned(),
+                    last_action: "accept".to_owned(),
+                    initiated_by: "local".to_owned(),
+                    requested_at: Some(1_700_000_000_100),
+                    responded_at: Some(1_700_000_000_200),
+                    blocked_at: None,
+                    cleared_at: None,
+                    updated_at: 1_700_000_000_200,
+                },
+            )
+            .expect("save peer relationship");
+
+        let metadata = store
+            .list_local_peer_metadata(&scope_id)
+            .expect("list peer metadata");
+        assert_eq!(metadata.len(), 1);
+        assert_eq!(metadata[0].node_id, "peer-a");
+        assert_eq!(
+            metadata[0].network_id.as_deref(),
+            Some("mainnet:watt-galaxy")
+        );
+        assert_eq!(metadata[0].params_version, Some(7));
+        assert_eq!(metadata[0].handshake_status, "identified");
+
+        let relationships = store
+            .list_local_peer_relationships(&scope_id)
+            .expect("list peer relationships");
+        assert_eq!(relationships.len(), 1);
+        assert_eq!(relationships[0].remote_node_id, "peer-a");
+        assert_eq!(relationships[0].relationship_state, "accepted");
+        assert_eq!(relationships[0].last_action, "accept");
     });
 }
 

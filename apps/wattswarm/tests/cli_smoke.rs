@@ -421,39 +421,51 @@ fn cli_run_queue_lifecycle_smoke() {
         .success()
         .stdout(predicate::str::contains("run queue schema initialized"));
 
-    cmd(schema.as_str())
+    let mut submit = cmd(schema.as_str());
+    submit.env("WATTSWARM_NODE_MODE", "local");
+    submit
         .args(["run", "submit", spec_file.to_str().unwrap(), "--kickoff"])
         .assert()
         .success()
         .stdout(predicate::str::contains("\"ok\": true"))
         .stdout(predicate::str::contains(&run_id));
 
-    cmd(schema.as_str())
+    let mut watch = cmd(schema.as_str());
+    watch.env("WATTSWARM_NODE_MODE", "local");
+    watch
         .args(["run", "watch", &run_id])
         .assert()
         .success()
         .stdout(predicate::str::contains(&run_id))
         .stdout(predicate::str::contains("\"status\":"));
 
-    cmd(schema.as_str())
+    let mut events = cmd(schema.as_str());
+    events.env("WATTSWARM_NODE_MODE", "local");
+    events
         .args(["run", "events", &run_id, "--limit", "1"])
         .assert()
         .success()
         .stdout(predicate::str::contains("RUN_"));
 
-    cmd(schema.as_str())
+    let mut cancel = cmd(schema.as_str());
+    cancel.env("WATTSWARM_NODE_MODE", "local");
+    cancel
         .args(["run", "cancel", &run_id])
         .assert()
         .success()
         .stdout(predicate::str::contains("cancel requested"));
 
-    cmd(schema.as_str())
+    let mut result = cmd(schema.as_str());
+    result.env("WATTSWARM_NODE_MODE", "local");
+    result
         .args(["run", "result", &run_id])
         .assert()
         .success()
         .stdout(predicate::str::contains("\"status\": \"CANCELL"));
 
-    cmd(schema.as_str())
+    let mut retry = cmd(schema.as_str());
+    retry.env("WATTSWARM_NODE_MODE", "local");
+    retry
         .args(["run", "retry", "run-does-not-exist"])
         .assert()
         .failure()

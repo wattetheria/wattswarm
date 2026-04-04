@@ -12,11 +12,15 @@ use wattswarm_protocol::types::{EventKind, EventPayload};
 
 pub use substrate::{
     BackfillRequestId, BackfillResponseChannel, Multiaddr, NetworkRuntimeObservabilitySnapshot,
-    PeerHandshakeMetadata, PeerId, SwarmScope, TopicCatalog, TopicKind, TopicNamespace,
-    TrafficGuardPeerHealth, relay_reservation_addr, sanitize_segment,
+    PeerDiscoverySourceKind, PeerHandshakeMetadata, PeerId, PeerIdentificationMetadata,
+    PeerRelationshipRequestId, PeerRelationshipResponseChannel, RawPeerRelationshipAction,
+    SwarmScope, TopicCatalog, TopicKind, TopicNamespace, TrafficGuardPeerHealth,
+    relay_reservation_addr, sanitize_segment,
 };
 
 pub type BackfillRequest = substrate::RawBackfillRequest;
+pub type PeerRelationshipRequest = substrate::RawPeerRelationshipRequest;
+pub type PeerRelationshipResponse = substrate::RawPeerRelationshipResponse;
 pub type WattSwarmBehaviour = substrate::SubstrateBehaviour;
 pub type WattSwarmBehaviourEvent = substrate::SubstrateBehaviourEvent;
 
@@ -294,6 +298,15 @@ impl NetworkP2pNode {
 
 #[derive(Debug)]
 pub enum NetworkRuntimeEvent {
+    PeerDiscovered {
+        peer: PeerId,
+        address: Multiaddr,
+        source: PeerDiscoverySourceKind,
+    },
+    PeerIdentified {
+        peer: PeerId,
+        metadata: PeerIdentificationMetadata,
+    },
     NewListenAddr {
         address: Multiaddr,
     },
@@ -329,6 +342,25 @@ pub enum NetworkRuntimeEvent {
         error: String,
     },
     BackfillInboundFailure {
+        peer: PeerId,
+        error: String,
+    },
+    PeerRelationshipRequest {
+        peer: PeerId,
+        request: PeerRelationshipRequest,
+        channel: PeerRelationshipResponseChannel,
+    },
+    PeerRelationshipResponse {
+        peer: PeerId,
+        request_id: PeerRelationshipRequestId,
+        response: PeerRelationshipResponse,
+    },
+    PeerRelationshipOutboundFailure {
+        peer: PeerId,
+        request_id: PeerRelationshipRequestId,
+        error: String,
+    },
+    PeerRelationshipInboundFailure {
         peer: PeerId,
         error: String,
     },
@@ -389,7 +421,10 @@ impl NetworkRuntime {
         self.inner.allows_outbound_backfill_to(peer)
     }
 
-    pub fn validate_identify_info(&self, info: &identify::Info) -> Result<Vec<Multiaddr>> {
+    pub fn validate_identify_info(
+        &self,
+        info: &identify::Info,
+    ) -> Result<(Vec<Multiaddr>, PeerIdentificationMetadata)> {
         self.inner.validate_identify_info(info)
     }
 
@@ -442,6 +477,23 @@ impl NetworkRuntime {
         )
     }
 
+    pub fn send_peer_relationship_request(
+        &mut self,
+        peer: &PeerId,
+        request: PeerRelationshipRequest,
+    ) -> Result<PeerRelationshipRequestId> {
+        self.inner.send_peer_relationship_request(peer, request)
+    }
+
+    pub fn send_peer_relationship_response(
+        &mut self,
+        channel: PeerRelationshipResponseChannel,
+        response: PeerRelationshipResponse,
+    ) -> Result<()> {
+        self.inner
+            .send_peer_relationship_response(channel, response)
+    }
+
     pub async fn next_event(&mut self) -> Result<NetworkRuntimeEvent> {
         Self::map_runtime_event(self.inner.next_event().await?)
     }
@@ -455,6 +507,18 @@ impl NetworkRuntime {
 
     fn map_runtime_event(event: SubstrateRuntimeEvent) -> Result<NetworkRuntimeEvent> {
         Ok(match event {
+            SubstrateRuntimeEvent::PeerDiscovered {
+                peer,
+                address,
+                source,
+            } => NetworkRuntimeEvent::PeerDiscovered {
+                peer,
+                address,
+                source,
+            },
+            SubstrateRuntimeEvent::PeerIdentified { peer, metadata } => {
+                NetworkRuntimeEvent::PeerIdentified { peer, metadata }
+            }
             SubstrateRuntimeEvent::NewListenAddr { address } => {
                 NetworkRuntimeEvent::NewListenAddr { address }
             }
@@ -507,6 +571,36 @@ impl NetworkRuntime {
             },
             SubstrateRuntimeEvent::BackfillInboundFailure { peer, error } => {
                 NetworkRuntimeEvent::BackfillInboundFailure { peer, error }
+            }
+            SubstrateRuntimeEvent::PeerRelationshipRequest {
+                peer,
+                request,
+                channel,
+            } => NetworkRuntimeEvent::PeerRelationshipRequest {
+                peer,
+                request,
+                channel,
+            },
+            SubstrateRuntimeEvent::PeerRelationshipResponse {
+                peer,
+                request_id,
+                response,
+            } => NetworkRuntimeEvent::PeerRelationshipResponse {
+                peer,
+                request_id,
+                response,
+            },
+            SubstrateRuntimeEvent::PeerRelationshipOutboundFailure {
+                peer,
+                request_id,
+                error,
+            } => NetworkRuntimeEvent::PeerRelationshipOutboundFailure {
+                peer,
+                request_id,
+                error,
+            },
+            SubstrateRuntimeEvent::PeerRelationshipInboundFailure { peer, error } => {
+                NetworkRuntimeEvent::PeerRelationshipInboundFailure { peer, error }
             }
             SubstrateRuntimeEvent::NatStatusChanged {
                 old,

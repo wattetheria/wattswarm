@@ -16,7 +16,7 @@ use libp2p::{
     StreamProtocol, Swarm, SwarmBuilder, autonat, dcutr, identity, noise, relay, tcp, yamux,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::time::{Duration, Instant};
 
@@ -222,6 +222,19 @@ impl PeerHandshakeMetadata {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PeerIdentificationMetadata {
+    pub network_id: String,
+    pub params_version: u64,
+    pub params_hash: String,
+    pub agent_version_raw: String,
+    pub agent_version_prefix: String,
+    pub protocol_version: String,
+    pub observed_addr: String,
+    pub listen_addrs: Vec<String>,
+    pub protocols: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RawBackfillRequest {
     pub scope: SwarmScope,
     pub from_event_seq: u64,
@@ -257,6 +270,62 @@ pub struct RawBackfillResponse {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub feed_key: Option<String>,
     pub items: Vec<Vec<u8>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RawPeerRelationshipAction {
+    Request,
+    Accept,
+    Reject,
+    Cancel,
+    Remove,
+    Block,
+    Unblock,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RawPeerRelationshipRequest {
+    pub source_node_id: String,
+    pub target_node_id: String,
+    pub action: RawPeerRelationshipAction,
+}
+
+impl RawPeerRelationshipRequest {
+    pub fn validate(&self) -> Result<()> {
+        if self.source_node_id.trim().is_empty() {
+            bail!("peer relationship request source_node_id is required");
+        }
+        if self.target_node_id.trim().is_empty() {
+            bail!("peer relationship request target_node_id is required");
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RawPeerRelationshipResponse {
+    pub source_node_id: String,
+    pub target_node_id: String,
+    pub action: RawPeerRelationshipAction,
+    pub applied: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relationship_state: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    pub updated_at: u64,
+}
+
+impl RawPeerRelationshipResponse {
+    pub fn validate(&self) -> Result<()> {
+        if self.source_node_id.trim().is_empty() {
+            bail!("peer relationship response source_node_id is required");
+        }
+        if self.target_node_id.trim().is_empty() {
+            bail!("peer relationship response target_node_id is required");
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -381,10 +450,48 @@ impl SubstrateConfig {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RawControlRequest {
+    Backfill(RawBackfillRequest),
+    PeerRelationship(RawPeerRelationshipRequest),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RawControlResponse {
+    Backfill(RawBackfillResponse),
+    PeerRelationship(RawPeerRelationshipResponse),
+}
+
 pub type BackfillRequestId = request_response::OutboundRequestId;
-pub type BackfillResponseChannel = request_response::ResponseChannel<RawBackfillResponse>;
+pub type BackfillResponseChannel = request_response::ResponseChannel<RawControlResponse>;
+pub type PeerRelationshipRequestId = request_response::OutboundRequestId;
+pub type PeerRelationshipResponseChannel = request_response::ResponseChannel<RawControlResponse>;
 
 const BACKFILL_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PeerDiscoverySourceKind {
+    Udp,
+    Mdns,
+    Bootstrap,
+    Identify,
+    Kademlia,
+    Unknown,
+}
+
+impl PeerDiscoverySourceKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Udp => "udp",
+            Self::Mdns => "mdns",
+            Self::Bootstrap => "bootstrap",
+            Self::Identify => "identify",
+            Self::Kademlia => "kademlia",
+            Self::Unknown => "unknown",
+        }
+    }
+}
 
 #[derive(Debug)]
 pub enum SubstrateBehaviourEvent {
@@ -394,7 +501,7 @@ pub enum SubstrateBehaviourEvent {
     Relay(relay::client::Event),
     Autonat(autonat::Event),
     Dcutr(dcutr::Event),
-    RequestResponse(request_response::Event<RawBackfillRequest, RawBackfillResponse>),
+    RequestResponse(request_response::Event<RawControlRequest, RawControlResponse>),
     Mdns(mdns::Event),
 }
 
@@ -434,10 +541,10 @@ impl From<dcutr::Event> for SubstrateBehaviourEvent {
     }
 }
 
-impl From<request_response::Event<RawBackfillRequest, RawBackfillResponse>>
+impl From<request_response::Event<RawControlRequest, RawControlResponse>>
     for SubstrateBehaviourEvent
 {
-    fn from(value: request_response::Event<RawBackfillRequest, RawBackfillResponse>) -> Self {
+    fn from(value: request_response::Event<RawControlRequest, RawControlResponse>) -> Self {
         Self::RequestResponse(value)
     }
 }
@@ -464,13 +571,21 @@ pub struct SubstrateBehaviour {
     pub relay_client: relay::client::Behaviour,
     pub autonat: autonat::Behaviour,
     pub dcutr: dcutr::Behaviour,
-    pub request_response:
-        request_response::cbor::Behaviour<RawBackfillRequest, RawBackfillResponse>,
+    pub request_response: request_response::cbor::Behaviour<RawControlRequest, RawControlResponse>,
     pub mdns: Toggle<mdns::tokio::Behaviour>,
 }
 
 #[derive(Debug)]
 pub enum SubstrateRuntimeEvent {
+    PeerDiscovered {
+        peer: PeerId,
+        address: Multiaddr,
+        source: PeerDiscoverySourceKind,
+    },
+    PeerIdentified {
+        peer: PeerId,
+        metadata: PeerIdentificationMetadata,
+    },
     NewListenAddr {
         address: Multiaddr,
     },
@@ -506,6 +621,25 @@ pub enum SubstrateRuntimeEvent {
         error: String,
     },
     BackfillInboundFailure {
+        peer: PeerId,
+        error: String,
+    },
+    PeerRelationshipRequest {
+        peer: PeerId,
+        request: RawPeerRelationshipRequest,
+        channel: PeerRelationshipResponseChannel,
+    },
+    PeerRelationshipResponse {
+        peer: PeerId,
+        request_id: PeerRelationshipRequestId,
+        response: RawPeerRelationshipResponse,
+    },
+    PeerRelationshipOutboundFailure {
+        peer: PeerId,
+        request_id: PeerRelationshipRequestId,
+        error: String,
+    },
+    PeerRelationshipInboundFailure {
         peer: PeerId,
         error: String,
     },
@@ -545,7 +679,7 @@ struct BehaviourSeedParts {
     identify: identify::Behaviour,
     kademlia: kad::Behaviour<MemoryStore>,
     autonat: autonat::Behaviour,
-    request_response: request_response::cbor::Behaviour<RawBackfillRequest, RawBackfillResponse>,
+    request_response: request_response::cbor::Behaviour<RawControlRequest, RawControlResponse>,
     mdns: Toggle<mdns::tokio::Behaviour>,
     connection_limits: connection_limits::Behaviour,
 }
@@ -951,6 +1085,10 @@ pub struct SubstrateRuntime {
     swarm: Swarm<SubstrateBehaviour>,
     listen_addrs: Vec<Multiaddr>,
     subscribed_topics: HashSet<String>,
+    pending_events: VecDeque<SubstrateRuntimeEvent>,
+    pending_outbound_request_kinds:
+        HashMap<request_response::OutboundRequestId, PendingRequestKind>,
+    pending_inbound_request_kinds: HashMap<request_response::InboundRequestId, PendingRequestKind>,
     traffic_guard: TrafficGuard,
     relay_reservations: HashSet<String>,
     expected_agent_version_prefix: String,
@@ -958,6 +1096,12 @@ pub struct SubstrateRuntime {
     nat_status: String,
     nat_public_address: Option<Multiaddr>,
     nat_confidence: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PendingRequestKind {
+    Backfill,
+    PeerRelationship,
 }
 
 impl SubstrateRuntime {
@@ -973,6 +1117,9 @@ impl SubstrateRuntime {
             swarm,
             listen_addrs: Vec::new(),
             subscribed_topics: HashSet::new(),
+            pending_events: VecDeque::new(),
+            pending_outbound_request_kinds: HashMap::new(),
+            pending_inbound_request_kinds: HashMap::new(),
             traffic_guard: TrafficGuard::new(),
             relay_reservations: HashSet::new(),
             expected_agent_version_prefix,
@@ -1037,7 +1184,10 @@ impl SubstrateRuntime {
             .allows_outbound_backfill(*peer, Instant::now())
     }
 
-    pub fn validate_identify_info(&self, info: &identify::Info) -> Result<Vec<Multiaddr>> {
+    pub fn validate_identify_info(
+        &self,
+        info: &identify::Info,
+    ) -> Result<(Vec<Multiaddr>, PeerIdentificationMetadata)> {
         if info.protocol_version != self.config.protocol_version {
             bail!(
                 "identify protocol_version mismatch expected={} got={}",
@@ -1075,7 +1225,20 @@ impl SubstrateRuntime {
                 remote.params_hash
             );
         }
-        Ok(info.listen_addrs.clone())
+        Ok((
+            info.listen_addrs.clone(),
+            PeerIdentificationMetadata {
+                network_id: remote.network_id,
+                params_version: remote.params_version,
+                params_hash: remote.params_hash,
+                agent_version_raw: info.agent_version.clone(),
+                agent_version_prefix: remote_prefix,
+                protocol_version: info.protocol_version.clone(),
+                observed_addr: info.observed_addr.to_string(),
+                listen_addrs: info.listen_addrs.iter().map(ToString::to_string).collect(),
+                protocols: info.protocols.iter().map(ToString::to_string).collect(),
+            },
+        ))
     }
 
     pub fn subscribe_scope(&mut self, scope: &SwarmScope) -> Result<()> {
@@ -1142,11 +1305,14 @@ impl SubstrateRuntime {
             self.config.max_backfill_events,
             self.config.max_backfill_events_hard_limit,
         )?;
-        Ok(self
+        let request_id = self
             .swarm
             .behaviour_mut()
             .request_response
-            .send_request(peer, request))
+            .send_request(peer, RawControlRequest::Backfill(request));
+        self.pending_outbound_request_kinds
+            .insert(request_id, PendingRequestKind::Backfill);
+        Ok(request_id)
     }
 
     pub fn send_backfill_response(
@@ -1157,12 +1323,45 @@ impl SubstrateRuntime {
         self.swarm
             .behaviour_mut()
             .request_response
-            .send_response(channel, response)
+            .send_response(channel, RawControlResponse::Backfill(response))
             .map_err(|_| anyhow!("backfill response channel closed"))?;
         Ok(())
     }
 
+    pub fn send_peer_relationship_request(
+        &mut self,
+        peer: &PeerId,
+        request: RawPeerRelationshipRequest,
+    ) -> Result<PeerRelationshipRequestId> {
+        request.validate()?;
+        let request_id = self
+            .swarm
+            .behaviour_mut()
+            .request_response
+            .send_request(peer, RawControlRequest::PeerRelationship(request));
+        self.pending_outbound_request_kinds
+            .insert(request_id, PendingRequestKind::PeerRelationship);
+        Ok(request_id)
+    }
+
+    pub fn send_peer_relationship_response(
+        &mut self,
+        channel: PeerRelationshipResponseChannel,
+        response: RawPeerRelationshipResponse,
+    ) -> Result<()> {
+        response.validate()?;
+        self.swarm
+            .behaviour_mut()
+            .request_response
+            .send_response(channel, RawControlResponse::PeerRelationship(response))
+            .map_err(|_| anyhow!("peer relationship response channel closed"))?;
+        Ok(())
+    }
+
     pub async fn next_event(&mut self) -> Result<SubstrateRuntimeEvent> {
+        if let Some(event) = self.pending_events.pop_front() {
+            return Ok(event);
+        }
         loop {
             let swarm_event = self.swarm.select_next_some().await;
             if let Some(event) = self.handle_swarm_event(swarm_event)? {
@@ -1172,6 +1371,9 @@ impl SubstrateRuntime {
     }
 
     pub fn try_next_event(&mut self) -> Result<Option<SubstrateRuntimeEvent>> {
+        if let Some(event) = self.pending_events.pop_front() {
+            return Ok(Some(event));
+        }
         loop {
             let Some(event) = self.swarm.select_next_some().now_or_never() else {
                 return Ok(None);
@@ -1191,7 +1393,7 @@ impl SubstrateRuntime {
 
     fn seed_bootstrap_peers(&mut self) -> Result<()> {
         for (peer, addr) in self.config.parse_bootstrap_peers()? {
-            self.register_peer_address(peer, addr.clone());
+            self.register_peer_address(peer, addr.clone(), PeerDiscoverySourceKind::Bootstrap);
             match self.swarm.dial(addr.clone()) {
                 Ok(()) => {}
                 Err(err)
@@ -1207,7 +1409,12 @@ impl SubstrateRuntime {
         Ok(())
     }
 
-    fn register_peer_address(&mut self, peer: PeerId, addr: Multiaddr) {
+    fn register_peer_address(
+        &mut self,
+        peer: PeerId,
+        addr: Multiaddr,
+        source: PeerDiscoverySourceKind,
+    ) {
         self.swarm.add_peer_address(peer, addr.clone());
         self.swarm
             .behaviour_mut()
@@ -1220,7 +1427,13 @@ impl SubstrateRuntime {
         self.swarm
             .behaviour_mut()
             .autonat
-            .add_server(peer, Some(addr));
+            .add_server(peer, Some(addr.clone()));
+        self.pending_events
+            .push_back(SubstrateRuntimeEvent::PeerDiscovered {
+                peer,
+                address: addr,
+                source,
+            });
     }
 
     fn ensure_relay_reservation(
@@ -1240,15 +1453,15 @@ impl SubstrateRuntime {
         Ok(())
     }
 
-    fn maybe_dial_peer(&mut self, peer: PeerId, addr: Multiaddr) {
+    fn maybe_dial_peer(&mut self, peer: PeerId, addr: Multiaddr, source: PeerDiscoverySourceKind) {
         if peer == self.local_peer_id {
             return;
         }
         if self.swarm.is_connected(&peer) {
-            self.register_peer_address(peer, addr);
+            self.register_peer_address(peer, addr, source);
             return;
         }
-        self.register_peer_address(peer, addr.clone());
+        self.register_peer_address(peer, addr.clone(), source);
         match self.swarm.dial(addr) {
             Ok(()) => {}
             Err(err)
@@ -1323,28 +1536,56 @@ impl SubstrateRuntime {
                 request_response::Event::Message { peer, message, .. },
             )) => match message {
                 RequestResponseMessage::Request {
-                    request, channel, ..
-                } => {
-                    if !self
-                        .traffic_guard
-                        .allow_backfill_request(peer, Instant::now())
-                    {
-                        return Ok(None);
+                    request_id,
+                    request,
+                    channel,
+                } => match request {
+                    RawControlRequest::Backfill(request) => {
+                        if !self
+                            .traffic_guard
+                            .allow_backfill_request(peer, Instant::now())
+                        {
+                            return Ok(None);
+                        }
+                        self.pending_inbound_request_kinds
+                            .insert(request_id, PendingRequestKind::Backfill);
+                        Ok(Some(SubstrateRuntimeEvent::BackfillRequest {
+                            peer,
+                            request,
+                            channel,
+                        }))
                     }
-                    Ok(Some(SubstrateRuntimeEvent::BackfillRequest {
-                        peer,
-                        request,
-                        channel,
-                    }))
-                }
+                    RawControlRequest::PeerRelationship(request) => {
+                        self.pending_inbound_request_kinds
+                            .insert(request_id, PendingRequestKind::PeerRelationship);
+                        Ok(Some(SubstrateRuntimeEvent::PeerRelationshipRequest {
+                            peer,
+                            request,
+                            channel,
+                        }))
+                    }
+                },
                 RequestResponseMessage::Response {
                     request_id,
                     response,
-                } => Ok(Some(SubstrateRuntimeEvent::BackfillResponse {
-                    peer,
-                    request_id,
-                    response,
-                })),
+                } => match response {
+                    RawControlResponse::Backfill(response) => {
+                        self.pending_outbound_request_kinds.remove(&request_id);
+                        Ok(Some(SubstrateRuntimeEvent::BackfillResponse {
+                            peer,
+                            request_id,
+                            response,
+                        }))
+                    }
+                    RawControlResponse::PeerRelationship(response) => {
+                        self.pending_outbound_request_kinds.remove(&request_id);
+                        Ok(Some(SubstrateRuntimeEvent::PeerRelationshipResponse {
+                            peer,
+                            request_id,
+                            response,
+                        }))
+                    }
+                },
             },
             SwarmEvent::Behaviour(SubstrateBehaviourEvent::RequestResponse(
                 request_response::Event::OutboundFailure {
@@ -1353,30 +1594,58 @@ impl SubstrateRuntime {
                     error,
                     ..
                 },
-            )) => {
-                self.traffic_guard
-                    .note_backfill_failure(peer, Instant::now());
-                Ok(Some(SubstrateRuntimeEvent::BackfillOutboundFailure {
+            )) => match self.pending_outbound_request_kinds.remove(&request_id) {
+                Some(PendingRequestKind::Backfill) | None => {
+                    self.traffic_guard
+                        .note_backfill_failure(peer, Instant::now());
+                    Ok(Some(SubstrateRuntimeEvent::BackfillOutboundFailure {
+                        peer,
+                        request_id,
+                        error: error.to_string(),
+                    }))
+                }
+                Some(PendingRequestKind::PeerRelationship) => Ok(Some(
+                    SubstrateRuntimeEvent::PeerRelationshipOutboundFailure {
+                        peer,
+                        request_id,
+                        error: error.to_string(),
+                    },
+                )),
+            },
+            SwarmEvent::Behaviour(SubstrateBehaviourEvent::RequestResponse(
+                request_response::Event::InboundFailure {
                     peer,
                     request_id,
-                    error: error.to_string(),
-                }))
-            }
+                    error,
+                    ..
+                },
+            )) => match self.pending_inbound_request_kinds.remove(&request_id) {
+                Some(PendingRequestKind::Backfill) | None => {
+                    self.traffic_guard
+                        .note_backfill_failure(peer, Instant::now());
+                    Ok(Some(SubstrateRuntimeEvent::BackfillInboundFailure {
+                        peer,
+                        error: error.to_string(),
+                    }))
+                }
+                Some(PendingRequestKind::PeerRelationship) => Ok(Some(
+                    SubstrateRuntimeEvent::PeerRelationshipInboundFailure {
+                        peer,
+                        error: error.to_string(),
+                    },
+                )),
+            },
             SwarmEvent::Behaviour(SubstrateBehaviourEvent::RequestResponse(
-                request_response::Event::InboundFailure { peer, error, .. },
+                request_response::Event::ResponseSent { request_id, .. },
             )) => {
-                self.traffic_guard
-                    .note_backfill_failure(peer, Instant::now());
-                Ok(Some(SubstrateRuntimeEvent::BackfillInboundFailure {
-                    peer,
-                    error: error.to_string(),
-                }))
+                self.pending_inbound_request_kinds.remove(&request_id);
+                Ok(None)
             }
             SwarmEvent::Behaviour(SubstrateBehaviourEvent::Mdns(mdns::Event::Discovered(
                 discovered,
             ))) => {
                 for (peer, addr) in discovered {
-                    self.maybe_dial_peer(peer, addr);
+                    self.maybe_dial_peer(peer, addr, PeerDiscoverySourceKind::Mdns);
                 }
                 Ok(None)
             }
@@ -1392,10 +1661,19 @@ impl SubstrateRuntime {
             SwarmEvent::Behaviour(SubstrateBehaviourEvent::Identify(
                 identify::Event::Received { peer_id, info, .. },
             )) => match self.validate_identify_info(&info) {
-                Ok(listen_addrs) => {
+                Ok((listen_addrs, metadata)) => {
                     for addr in listen_addrs {
-                        self.register_peer_address(peer_id, addr);
+                        self.register_peer_address(
+                            peer_id,
+                            addr,
+                            PeerDiscoverySourceKind::Identify,
+                        );
                     }
+                    self.pending_events
+                        .push_back(SubstrateRuntimeEvent::PeerIdentified {
+                            peer: peer_id,
+                            metadata,
+                        });
                     self.trigger_kademlia_refresh();
                     Ok(None)
                 }
@@ -1469,7 +1747,7 @@ impl SubstrateRuntime {
                 },
             )) => {
                 for addr in addresses.into_vec() {
-                    self.maybe_dial_peer(peer, addr);
+                    self.maybe_dial_peer(peer, addr, PeerDiscoverySourceKind::Kademlia);
                 }
                 Ok(None)
             }
@@ -1481,7 +1759,7 @@ impl SubstrateRuntime {
             )) => {
                 for peer in ok.peers {
                     for addr in peer.addrs {
-                        self.maybe_dial_peer(peer.peer_id, addr);
+                        self.maybe_dial_peer(peer.peer_id, addr, PeerDiscoverySourceKind::Kademlia);
                     }
                 }
                 Ok(None)
@@ -1632,5 +1910,37 @@ mod tests {
             rendered.contains("30s"),
             "request-response config should use 30s timeout, got: {rendered}"
         );
+    }
+
+    #[tokio::test]
+    async fn bootstrap_peers_emit_discovery_events() {
+        let bootstrap_key = identity::Keypair::generate_ed25519();
+        let bootstrap_peer = bootstrap_key.public().to_peer_id();
+        let config = SubstrateConfig {
+            listen_addrs: vec!["/ip4/127.0.0.1/tcp/0".to_owned()],
+            bootstrap_peers: vec![format!("/ip4/127.0.0.1/tcp/4102/p2p/{bootstrap_peer}")],
+            enable_mdns: false,
+            ..SubstrateConfig::default()
+        };
+
+        let node = SubstrateNode::generate(config).expect("node");
+        let mut runtime = SubstrateRuntime::new(node).expect("runtime");
+        let event = runtime
+            .try_next_event()
+            .expect("runtime event poll")
+            .expect("bootstrap discovery event");
+
+        match event {
+            SubstrateRuntimeEvent::PeerDiscovered {
+                peer,
+                address,
+                source,
+            } => {
+                assert_eq!(peer, bootstrap_peer);
+                assert_eq!(address.to_string(), "/ip4/127.0.0.1/tcp/4102");
+                assert_eq!(source, PeerDiscoverySourceKind::Bootstrap);
+            }
+            other => panic!("expected bootstrap peer discovery event, got {other:?}"),
+        }
     }
 }

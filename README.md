@@ -117,6 +117,7 @@ The workspace now includes dedicated crates and a control-plane bridge for node-
   - owns scope-aware topic naming (`global` / `region.*` / `node.*`)
   - defines network envelopes for events, rule broadcasts, checkpoint announcements, and summaries
   - defines typed backfill request/response messages
+  - defines typed peer-relationship request/response messages for node-to-node relationship execution
   - builds the minimal libp2p behaviour set used by WattSwarm networking:
     - gossipsub
     - identify
@@ -124,9 +125,9 @@ The workspace now includes dedicated crates and a control-plane bridge for node-
     - relay client
     - AutoNAT
     - DCUtR
-    - request-response (CBOR backfill)
+    - request-response (CBOR backfill + peer relationship control)
     - mDNS
-  - exposes a pollable network runtime for listen/dial/publish/backfill flows
+  - exposes a pollable network runtime for listen/dial/publish/backfill/relationship-control flows
 - `crates/control-plane/src/network_bridge.rs`
   - bridges libp2p gossip events into `node-core::ingest_remote`
   - serves scope-aware backfill requests from the local event log
@@ -138,6 +139,8 @@ The workspace now includes dedicated crates and a control-plane bridge for node-
   - propagates append-only revoke/penalty events so malicious event effects can be rolled back without deleting the event log
   - suppresses summary fanout while local publish backlog is high, keeping event catch-up ahead of summary traffic
   - can dial peer listen addresses discovered through the local PostgreSQL peer cache (`discovered_peers_local`)
+  - persists identify/handshake metadata into `peer_metadata_local`
+  - executes node-to-node relationship requests over request-response and persists local relationship state into `peer_relationships_local`
 - `crates/artifact-store`
   - owns the node-local filesystem layout for evidence, checkpoints, snapshots, and event batches
   - provides read/write helpers for byte and JSON payloads
@@ -150,6 +153,7 @@ Current coverage in tests:
 - integration tests for two-node global gossip sync and request-response backfill sync
 - integration tests for region/node scoped sync and summary import
 - integration tests for event revoke rollback and summary revoke cleanup across nodes
+- integration tests for two-node peer relationship request/accept and request/block flows over libp2p
 - integration tests for periodic anti-entropy catch-up and reconnect recovery after a partition-like disconnect
 
 Runtime toggles:
@@ -471,6 +475,13 @@ network-level specialization / faster recovery / more stable convergence"]
   - Kademlia bootstrap and closest-peer queries are used to widen discovery
   - bootstrap peers are also used as initial AutoNAT probe servers
   - relay reservations are attempted through configured bootstrap peers so relayed paths exist before direct punch-through
+  - discovered WAN peers are persisted into local PostgreSQL `discovered_peers_local` with source kinds such as `bootstrap`, `identify`, and `kademlia`
+  - identify metadata is persisted separately into `peer_metadata_local`
+- Node relationship execution today:
+  - node-to-node relationship actions are point-to-point request/response messages, not gossip subscriptions
+  - supported actions are `request`, `accept`, `reject`, `cancel`, `remove`, `block`, and `unblock`
+  - local relationship state is persisted into `peer_relationships_local`
+  - current scope is relationship execution only; DM/private messaging is not implemented yet
 - Traffic protection today:
   - duplicate gossip payloads are dropped
   - per-peer gossip and per-peer backfill request windows are rate-limited
@@ -704,6 +715,7 @@ Optional UDP announce switch (default off):
 - `WATTSWARM_UDP_ANNOUNCE_ADDR=239.255.42.99` (multicast default) or `255.255.255.255` for broadcast
 - `WATTSWARM_UDP_ANNOUNCE_PORT=37931`
 - with switch enabled, startup emits announce payload and UI process listens on the same port and records discovered peer IDs into PostgreSQL `discovered_peers_local`
+- the same local peer registry also stores WAN discoveries; `source_kind` distinguishes `udp`, `mdns`, `bootstrap`, `identify`, and `kademlia`
 - when a peer advertise includes a libp2p listen address, that address is also recorded and used by the background network bridge for automatic LAN dialing
 - `peers list` and `/api/peers/list` include the discovered peers loaded from that local PostgreSQL cache
 

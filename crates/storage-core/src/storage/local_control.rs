@@ -120,6 +120,7 @@ impl PgStore {
         let mut stmt = conn.prepare(
             "SELECT node_id,
                     listen_addr,
+                    source_kind,
                     (EXTRACT(EPOCH FROM discovered_at) * 1000)::BIGINT AS discovered_at_ms,
                     (EXTRACT(EPOCH FROM updated_at) * 1000)::BIGINT AS updated_at_ms
              FROM discovered_peers_local
@@ -130,8 +131,9 @@ impl PgStore {
             Ok(LocalDiscoveredPeerRow {
                 node_id: r.get(0)?,
                 listen_addr: r.get(1)?,
-                discovered_at: r.get::<_, i64>(2)? as u64,
-                updated_at: r.get::<_, i64>(3)? as u64,
+                source_kind: r.get(2)?,
+                discovered_at: r.get::<_, i64>(3)? as u64,
+                updated_at: r.get::<_, i64>(4)? as u64,
             })
         })?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
@@ -156,18 +158,20 @@ impl PgStore {
             )?;
             for peer in peers {
                 conn.execute(
-                    "INSERT INTO discovered_peers_local(scope_id, node_id, listen_addr, discovered_at, updated_at)
+                    "INSERT INTO discovered_peers_local(scope_id, node_id, listen_addr, source_kind, discovered_at, updated_at)
                      VALUES (
                         $1,
                         $2,
                         $3,
-                        TIMESTAMPTZ 'epoch' + ($4::bigint * INTERVAL '1 millisecond'),
-                        TIMESTAMPTZ 'epoch' + ($5::bigint * INTERVAL '1 millisecond')
+                        $4,
+                        TIMESTAMPTZ 'epoch' + ($5::bigint * INTERVAL '1 millisecond'),
+                        TIMESTAMPTZ 'epoch' + ($6::bigint * INTERVAL '1 millisecond')
                      )",
                     params![
                         scope_id,
                         &peer.node_id,
                         peer.listen_addr,
+                        &peer.source_kind,
                         peer.discovered_at as i64,
                         now as i64
                     ],
@@ -188,6 +192,7 @@ impl PgStore {
         scope_id: &str,
         node_id: &str,
         listen_addr: Option<&str>,
+        source_kind: &str,
         now: u64,
     ) -> Result<bool> {
         let conn = self
@@ -196,44 +201,248 @@ impl PgStore {
             .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
         let existing = conn
             .query_row(
-                "SELECT listen_addr
+                "SELECT listen_addr, source_kind
                  FROM discovered_peers_local
                  WHERE scope_id = $1 AND node_id = $2",
                 params![scope_id, node_id],
-                |r| r.get::<_, Option<String>>(0),
+                |r| Ok((r.get::<_, Option<String>>(0)?, r.get::<_, String>(1)?)),
             )
             .optional()?;
         let normalized = listen_addr
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .map(ToOwned::to_owned);
+        let normalized_source = source_kind.trim();
+        let normalized_source = if normalized_source.is_empty() {
+            "unknown"
+        } else {
+            normalized_source
+        };
         match existing {
-            Some(current) if normalized.is_none() || current == normalized => Ok(false),
+            Some((current_addr, current_source))
+                if (normalized.is_none() || current_addr == normalized)
+                    && current_source == normalized_source =>
+            {
+                Ok(false)
+            }
             Some(_) => {
                 conn.execute(
                     "UPDATE discovered_peers_local
                      SET listen_addr = $2,
-                         updated_at = TIMESTAMPTZ 'epoch' + ($3::bigint * INTERVAL '1 millisecond')
-                     WHERE scope_id = $1 AND node_id = $4",
-                    params![scope_id, normalized, now as i64, node_id],
+                         source_kind = $3,
+                         updated_at = TIMESTAMPTZ 'epoch' + ($4::bigint * INTERVAL '1 millisecond')
+                     WHERE scope_id = $1 AND node_id = $5",
+                    params![scope_id, normalized, normalized_source, now as i64, node_id],
                 )?;
                 Ok(true)
             }
             None => {
                 conn.execute(
-                    "INSERT INTO discovered_peers_local(scope_id, node_id, listen_addr, discovered_at, updated_at)
+                    "INSERT INTO discovered_peers_local(scope_id, node_id, listen_addr, source_kind, discovered_at, updated_at)
                      VALUES (
                         $1,
                         $2,
                         $3,
-                        TIMESTAMPTZ 'epoch' + ($4::bigint * INTERVAL '1 millisecond'),
-                        TIMESTAMPTZ 'epoch' + ($4::bigint * INTERVAL '1 millisecond')
+                        $4,
+                        TIMESTAMPTZ 'epoch' + ($5::bigint * INTERVAL '1 millisecond'),
+                        TIMESTAMPTZ 'epoch' + ($5::bigint * INTERVAL '1 millisecond')
                      )",
-                    params![scope_id, node_id, normalized, now as i64],
+                    params![scope_id, node_id, normalized, normalized_source, now as i64],
                 )?;
                 Ok(true)
             }
         }
+    }
+
+    pub fn list_local_peer_metadata(&self, scope_id: &str) -> Result<Vec<LocalPeerMetadataRow>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
+        let mut stmt = conn.prepare(
+            "SELECT node_id,
+                    network_id,
+                    params_version,
+                    params_hash,
+                    agent_version_raw,
+                    agent_version_prefix,
+                    protocol_version,
+                    observed_addr,
+                    listen_addrs_json,
+                    protocols_json,
+                    handshake_status,
+                    last_error,
+                    (EXTRACT(EPOCH FROM first_identified_at) * 1000)::BIGINT AS first_identified_at_ms,
+                    (EXTRACT(EPOCH FROM last_identified_at) * 1000)::BIGINT AS last_identified_at_ms
+             FROM peer_metadata_local
+             WHERE scope_id = $1
+             ORDER BY node_id ASC",
+        )?;
+        let rows = stmt.query_map(params![scope_id], |r| {
+            Ok(LocalPeerMetadataRow {
+                node_id: r.get(0)?,
+                network_id: r.get(1)?,
+                params_version: r.get::<_, Option<i64>>(2)?.map(|value| value as u64),
+                params_hash: r.get(3)?,
+                agent_version_raw: r.get(4)?,
+                agent_version_prefix: r.get(5)?,
+                protocol_version: r.get(6)?,
+                observed_addr: r.get(7)?,
+                listen_addrs_json: r.get(8)?,
+                protocols_json: r.get(9)?,
+                handshake_status: r.get(10)?,
+                last_error: r.get(11)?,
+                first_identified_at: r.get::<_, i64>(12)? as u64,
+                last_identified_at: r.get::<_, i64>(13)? as u64,
+            })
+        })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
+    pub fn upsert_local_peer_metadata(
+        &self,
+        scope_id: &str,
+        row: &LocalPeerMetadataRow,
+    ) -> Result<()> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
+        conn.execute(
+            "INSERT INTO peer_metadata_local(
+                scope_id, node_id, network_id, params_version, params_hash,
+                agent_version_raw, agent_version_prefix, protocol_version, observed_addr,
+                listen_addrs_json, protocols_json, handshake_status, last_error,
+                first_identified_at, last_identified_at
+             ) VALUES (
+                $1, $2, $3, $4, $5,
+                $6, $7, $8, $9,
+                $10, $11, $12, $13,
+                TIMESTAMPTZ 'epoch' + ($14::bigint * INTERVAL '1 millisecond'),
+                TIMESTAMPTZ 'epoch' + ($15::bigint * INTERVAL '1 millisecond')
+             )
+             ON CONFLICT(scope_id, node_id) DO UPDATE SET
+                network_id = excluded.network_id,
+                params_version = excluded.params_version,
+                params_hash = excluded.params_hash,
+                agent_version_raw = excluded.agent_version_raw,
+                agent_version_prefix = excluded.agent_version_prefix,
+                protocol_version = excluded.protocol_version,
+                observed_addr = excluded.observed_addr,
+                listen_addrs_json = excluded.listen_addrs_json,
+                protocols_json = excluded.protocols_json,
+                handshake_status = excluded.handshake_status,
+                last_error = excluded.last_error,
+                last_identified_at = excluded.last_identified_at",
+            params![
+                scope_id,
+                &row.node_id,
+                row.network_id,
+                row.params_version.map(|value| value as i64),
+                row.params_hash,
+                row.agent_version_raw,
+                row.agent_version_prefix,
+                row.protocol_version,
+                row.observed_addr,
+                row.listen_addrs_json,
+                row.protocols_json,
+                row.handshake_status,
+                row.last_error,
+                row.first_identified_at as i64,
+                row.last_identified_at as i64
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_local_peer_relationships(
+        &self,
+        scope_id: &str,
+    ) -> Result<Vec<LocalPeerRelationshipRow>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
+        let mut stmt = conn.prepare(
+            "SELECT remote_node_id,
+                    relationship_state,
+                    last_action,
+                    initiated_by,
+                    (EXTRACT(EPOCH FROM requested_at) * 1000)::BIGINT AS requested_at_ms,
+                    (EXTRACT(EPOCH FROM responded_at) * 1000)::BIGINT AS responded_at_ms,
+                    (EXTRACT(EPOCH FROM blocked_at) * 1000)::BIGINT AS blocked_at_ms,
+                    (EXTRACT(EPOCH FROM cleared_at) * 1000)::BIGINT AS cleared_at_ms,
+                    (EXTRACT(EPOCH FROM updated_at) * 1000)::BIGINT AS updated_at_ms
+             FROM peer_relationships_local
+             WHERE scope_id = $1
+             ORDER BY remote_node_id ASC",
+        )?;
+        let rows = stmt.query_map(params![scope_id], |r| {
+            Ok(LocalPeerRelationshipRow {
+                remote_node_id: r.get(0)?,
+                relationship_state: r.get(1)?,
+                last_action: r.get(2)?,
+                initiated_by: r.get(3)?,
+                requested_at: r.get::<_, Option<i64>>(4)?.map(|value| value as u64),
+                responded_at: r.get::<_, Option<i64>>(5)?.map(|value| value as u64),
+                blocked_at: r.get::<_, Option<i64>>(6)?.map(|value| value as u64),
+                cleared_at: r.get::<_, Option<i64>>(7)?.map(|value| value as u64),
+                updated_at: r.get::<_, i64>(8)? as u64,
+            })
+        })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
+    pub fn upsert_local_peer_relationship(
+        &self,
+        scope_id: &str,
+        row: &LocalPeerRelationshipRow,
+    ) -> Result<()> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
+        let requested_at_ms = row.requested_at.map(|value| value as i64).unwrap_or(-1);
+        let responded_at_ms = row.responded_at.map(|value| value as i64).unwrap_or(-1);
+        let blocked_at_ms = row.blocked_at.map(|value| value as i64).unwrap_or(-1);
+        let cleared_at_ms = row.cleared_at.map(|value| value as i64).unwrap_or(-1);
+        conn.execute(
+            "INSERT INTO peer_relationships_local(
+                scope_id, remote_node_id, relationship_state, last_action, initiated_by,
+                requested_at, responded_at, blocked_at, cleared_at, updated_at
+             ) VALUES (
+                $1, $2, $3, $4, $5,
+                CASE WHEN $6::bigint < 0::bigint THEN NULL ELSE TIMESTAMPTZ 'epoch' + ($6::bigint * INTERVAL '1 millisecond') END,
+                CASE WHEN $7::bigint < 0::bigint THEN NULL ELSE TIMESTAMPTZ 'epoch' + ($7::bigint * INTERVAL '1 millisecond') END,
+                CASE WHEN $8::bigint < 0::bigint THEN NULL ELSE TIMESTAMPTZ 'epoch' + ($8::bigint * INTERVAL '1 millisecond') END,
+                CASE WHEN $9::bigint < 0::bigint THEN NULL ELSE TIMESTAMPTZ 'epoch' + ($9::bigint * INTERVAL '1 millisecond') END,
+                TIMESTAMPTZ 'epoch' + ($10::bigint * INTERVAL '1 millisecond')
+             )
+             ON CONFLICT(scope_id, remote_node_id) DO UPDATE SET
+                relationship_state = excluded.relationship_state,
+                last_action = excluded.last_action,
+                initiated_by = excluded.initiated_by,
+                requested_at = excluded.requested_at,
+                responded_at = excluded.responded_at,
+                blocked_at = excluded.blocked_at,
+                cleared_at = excluded.cleared_at,
+                updated_at = excluded.updated_at",
+            params![
+                scope_id,
+                &row.remote_node_id,
+                row.relationship_state.as_str(),
+                row.last_action.as_str(),
+                row.initiated_by.as_str(),
+                requested_at_ms,
+                responded_at_ms,
+                blocked_at_ms,
+                cleared_at_ms,
+                row.updated_at as i64
+            ],
+        )?;
+        Ok(())
     }
 
     pub fn load_local_config_json<T: DeserializeOwned>(

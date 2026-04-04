@@ -489,10 +489,12 @@ fn discovered_peers_registry_roundtrip_and_legacy_parse() {
             DiscoveredPeerRecord {
                 node_id: "node-b".to_owned(),
                 listen_addr: None,
+                source_kind: "unknown".to_owned(),
             },
             DiscoveredPeerRecord {
                 node_id: "node-a".to_owned(),
                 listen_addr: None,
+                source_kind: "unknown".to_owned(),
             }
         ]
     );
@@ -544,14 +546,17 @@ fn add_discovered_peer_dedups_and_sorts() {
             DiscoveredPeerRecord {
                 node_id: "node-a".to_owned(),
                 listen_addr: Some("/ip4/127.0.0.1/tcp/4001".to_owned()),
+                source_kind: "udp".to_owned(),
             },
             DiscoveredPeerRecord {
                 node_id: "node-b".to_owned(),
                 listen_addr: None,
+                source_kind: "unknown".to_owned(),
             },
             DiscoveredPeerRecord {
                 node_id: "node-c".to_owned(),
                 listen_addr: None,
+                source_kind: "unknown".to_owned(),
             }
         ]
     );
@@ -559,14 +564,18 @@ fn add_discovered_peer_dedups_and_sorts() {
     let conn = Connection::open(dir.join("local-control.state")).expect("open local control db");
     let mut stmt = conn
         .prepare(
-            "SELECT scope_id, node_id
+            "SELECT scope_id, node_id, source_kind
              FROM discovered_peers_local
              ORDER BY node_id ASC",
         )
         .expect("prepare discovered peers raw query");
     let raw_rows = stmt
         .query_map(wattswarm_storage_core::params![], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+            ))
         })
         .expect("query discovered peers raw rows")
         .collect::<std::result::Result<Vec<_>, _>>()
@@ -574,9 +583,21 @@ fn add_discovered_peer_dedups_and_sorts() {
     assert_eq!(
         raw_rows,
         vec![
-            (local_control_scope_id(&dir), "node-a".to_owned()),
-            (local_control_scope_id(&dir), "node-b".to_owned()),
-            (local_control_scope_id(&dir), "node-c".to_owned()),
+            (
+                local_control_scope_id(&dir),
+                "node-a".to_owned(),
+                "udp".to_owned(),
+            ),
+            (
+                local_control_scope_id(&dir),
+                "node-b".to_owned(),
+                "unknown".to_owned(),
+            ),
+            (
+                local_control_scope_id(&dir),
+                "node-c".to_owned(),
+                "unknown".to_owned(),
+            ),
         ]
     );
 

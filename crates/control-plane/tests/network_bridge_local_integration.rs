@@ -16,6 +16,16 @@ fn two_nodes_backfill_missing_events_over_request_response() {
 }
 
 #[test]
+fn two_nodes_execute_peer_relationship_request_and_accept_over_network() {
+    support::network_bridge::two_nodes_execute_peer_relationship_request_and_accept_over_network();
+}
+
+#[test]
+fn two_nodes_execute_peer_relationship_request_and_block_over_network() {
+    support::network_bridge::two_nodes_execute_peer_relationship_request_and_block_over_network();
+}
+
+#[test]
 fn region_scoped_backfill_only_reaches_region_subscribers() {
     support::network_bridge::region_scoped_backfill_only_reaches_region_subscribers();
 }

@@ -1,5 +1,5 @@
 use crate::constants::LOCAL_PROTOCOL_VERSION;
-use crate::control::add_discovered_peer_endpoint;
+use crate::control::add_discovered_peer_endpoint_with_source;
 use serde_json::json;
 use std::env;
 use std::net::{Ipv4Addr, SocketAddrV4, UdpSocket};
@@ -175,8 +175,12 @@ pub fn maybe_start_listener(state_dir: PathBuf, self_node_id: String) {
             if peer_id == self_node_id {
                 continue;
             }
-            let _ =
-                add_discovered_peer_endpoint(&state_dir, &peer_id, packet.listen_addr.as_deref());
+            let _ = add_discovered_peer_endpoint_with_source(
+                &state_dir,
+                &peer_id,
+                packet.listen_addr.as_deref(),
+                "udp",
+            );
         }
     });
 }

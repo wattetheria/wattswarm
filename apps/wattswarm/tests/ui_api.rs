@@ -2064,6 +2064,7 @@ fn ui_exposes_run_queue_http_apis() {
     let _db_lock = DbTestLock::acquire();
     reset_test_schema("test");
     let _schema_guard = EnvVarGuard::set("WATTSWARM_PG_SCHEMA", "test");
+    let _mode_guard = EnvVarGuard::set("WATTSWARM_NODE_MODE", "local");
     let dir = tempdir().unwrap();
     let state_dir = dir.path().join("state");
     std::fs::create_dir_all(&state_dir).unwrap();
@@ -2414,6 +2415,7 @@ fn ui_google_a2a_message_send_supports_direct_and_group_modes() {
     let _db_lock = DbTestLock::acquire();
     reset_test_schema("test");
     let _schema_guard = EnvVarGuard::set("WATTSWARM_PG_SCHEMA", "test");
+    let _mode_guard = EnvVarGuard::set("WATTSWARM_NODE_MODE", "local");
     let dir = tempdir().unwrap();
     let state_dir = dir.path().join("state");
     std::fs::create_dir_all(&state_dir).unwrap();

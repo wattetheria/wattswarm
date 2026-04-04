@@ -152,6 +152,20 @@ fn migrate_discovered_peers_local_scope_schema(conn: &Connection) -> Result<()> 
     Ok(())
 }
 
+fn migrate_discovered_peers_local_source_kind_schema(conn: &Connection) -> Result<()> {
+    if column_exists(conn, "discovered_peers_local", "source_kind") {
+        return Ok(());
+    }
+
+    conn.execute_batch(
+        "
+        ALTER TABLE discovered_peers_local
+        ADD COLUMN source_kind TEXT NOT NULL DEFAULT 'unknown';
+        ",
+    )?;
+    Ok(())
+}
+
 fn migrate_executor_registry_local_scope_schema(conn: &Connection) -> Result<()> {
     if column_exists(conn, "executor_registry_local", "scope_id") {
         return Ok(());
@@ -303,9 +317,43 @@ impl PgStore {
                 scope_id TEXT NOT NULL DEFAULT '',
                 node_id TEXT NOT NULL,
                 listen_addr TEXT,
+                source_kind TEXT NOT NULL DEFAULT 'unknown',
                 discovered_at TIMESTAMPTZ NOT NULL,
                 updated_at TIMESTAMPTZ NOT NULL,
                 PRIMARY KEY(scope_id, node_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS peer_metadata_local (
+                scope_id TEXT NOT NULL DEFAULT '',
+                node_id TEXT NOT NULL,
+                network_id TEXT,
+                params_version BIGINT,
+                params_hash TEXT,
+                agent_version_raw TEXT,
+                agent_version_prefix TEXT,
+                protocol_version TEXT,
+                observed_addr TEXT,
+                listen_addrs_json TEXT NOT NULL DEFAULT '[]',
+                protocols_json TEXT NOT NULL DEFAULT '[]',
+                handshake_status TEXT NOT NULL DEFAULT 'unknown',
+                last_error TEXT,
+                first_identified_at TIMESTAMPTZ NOT NULL,
+                last_identified_at TIMESTAMPTZ NOT NULL,
+                PRIMARY KEY(scope_id, node_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS peer_relationships_local (
+                scope_id TEXT NOT NULL DEFAULT '',
+                remote_node_id TEXT NOT NULL,
+                relationship_state TEXT NOT NULL,
+                last_action TEXT NOT NULL,
+                initiated_by TEXT NOT NULL,
+                requested_at TIMESTAMPTZ,
+                responded_at TIMESTAMPTZ,
+                blocked_at TIMESTAMPTZ,
+                cleared_at TIMESTAMPTZ,
+                updated_at TIMESTAMPTZ NOT NULL,
+                PRIMARY KEY(scope_id, remote_node_id)
             );
 
             CREATE TABLE IF NOT EXISTS remote_task_bridge_registry_local (
@@ -1271,6 +1319,7 @@ impl PgStore {
             ensure_boolean_column(&conn, "knowledge_lookups", "reuse_applied", Some("FALSE"))?;
             migrate_executor_registry_local_scope_schema(&conn)?;
             migrate_discovered_peers_local_scope_schema(&conn)?;
+            migrate_discovered_peers_local_source_kind_schema(&conn)?;
             ensure_discovered_peers_local_scope_index(&conn)?;
             Ok(())
         })();

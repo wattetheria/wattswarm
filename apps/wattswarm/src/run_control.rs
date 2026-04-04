@@ -8,7 +8,7 @@ use std::time::Duration;
 
 const DEFAULT_RUN_QUEUE_PG_URL: &str = "postgres://postgres:postgres@127.0.0.1:55432/wattswarm";
 const WORKER_MODE_WAIT_POLL_MS: u64 = 250;
-const WORKER_MODE_WAIT_LOG_EVERY_POLLS: u64 = 120;
+const WORKER_MODE_WAIT_LOG_EVERY_POLLS: u64 = 1_200;
 
 pub fn resolve_run_queue_pg_url(flag_value: Option<String>) -> String {
     flag_value
@@ -109,12 +109,17 @@ pub fn run_worker(
     opts: WorkerOptions,
 ) -> Result<()> {
     let mut wait_polls = 0_u64;
+    let mut logged_waiting = false;
     while configured_node_mode(state_dir)?.is_none() {
         if should_log_waiting_for_mode(wait_polls) {
             eprintln!("wattswarm worker waiting for node mode configuration");
+            logged_waiting = true;
         }
         wait_polls = wait_polls.saturating_add(1);
         thread::sleep(Duration::from_millis(WORKER_MODE_WAIT_POLL_MS));
+    }
+    if logged_waiting {
+        eprintln!("wattswarm worker detected node mode configuration; resuming queue loop");
     }
     // Start network bridge with run-queue hook so remote dispatch and
     // result collection work in CLI-only mode (not just UI).
@@ -143,8 +148,8 @@ mod tests {
     fn worker_wait_logging_repeats_every_interval() {
         assert!(should_log_waiting_for_mode(0));
         assert!(!should_log_waiting_for_mode(1));
-        assert!(!should_log_waiting_for_mode(119));
-        assert!(should_log_waiting_for_mode(120));
-        assert!(should_log_waiting_for_mode(240));
+        assert!(!should_log_waiting_for_mode(1_199));
+        assert!(should_log_waiting_for_mode(1_200));
+        assert!(should_log_waiting_for_mode(2_400));
     }
 }

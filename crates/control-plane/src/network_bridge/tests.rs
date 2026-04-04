@@ -1,5 +1,6 @@
 use super::*;
 use crate::crypto::NodeIdentity;
+use crate::network_p2p::PeerDiscoverySourceKind;
 use crate::node::build_event_for_external;
 use crate::storage::{
     DecisionMemoryHitRow, ImportedTaskOutcomeRow, PgStore, ProjectionScope, ReputationSnapshotRow,
@@ -989,6 +990,95 @@ fn connection_closed_with_zero_remaining_removes_peer_state() {
     assert!(matches!(tick, NetworkBridgeTick::Disconnected { peer: seen } if seen == peer));
     assert!(!service.connected_peers.contains(&peer));
     assert!(!service.peer_sync_state.contains_key(&peer));
+}
+
+#[test]
+fn peer_discovered_event_persists_wan_source_into_local_registry() {
+    let dir = temp_startup_dir("peer-discovered-persist");
+    let mut node = Node::open_in_memory_with_roles(&[Role::Proposer]).expect("node");
+    let mut service = NetworkBridgeService::new(
+        NetworkP2pNode::generate(NetworkP2pConfig::default()).expect("node"),
+        &[SwarmScope::Global],
+        &NetworkProtocolParams::default(),
+    )
+    .expect("service");
+    service.set_state_dir(dir.clone());
+    let peer = PeerId::random();
+    let address = "/ip4/203.0.113.10/tcp/4001"
+        .parse::<Multiaddr>()
+        .expect("addr");
+
+    let tick = service
+        .process_runtime_event(
+            &mut node,
+            NetworkRuntimeEvent::PeerDiscovered {
+                peer,
+                address: address.clone(),
+                source: PeerDiscoverySourceKind::Bootstrap,
+            },
+        )
+        .expect("process event");
+
+    assert!(matches!(tick, NetworkBridgeTick::TransportNotice { .. }));
+    let rows = crate::control::load_discovered_peer_records_state(&dir).expect("load rows");
+    assert_eq!(
+        rows,
+        vec![crate::control::DiscoveredPeerRecord {
+            node_id: peer.to_string(),
+            listen_addr: Some(address.to_string()),
+            source_kind: "bootstrap".to_owned(),
+        }]
+    );
+
+    std::fs::remove_dir_all(dir).expect("cleanup");
+}
+
+#[test]
+fn peer_identified_event_persists_peer_metadata_locally() {
+    let dir = temp_startup_dir("peer-identified-metadata");
+    let mut node = Node::open_in_memory_with_roles(&[Role::Proposer]).expect("node");
+    let mut service = NetworkBridgeService::new(
+        NetworkP2pNode::generate(NetworkP2pConfig::default()).expect("node"),
+        &[SwarmScope::Global],
+        &NetworkProtocolParams::default(),
+    )
+    .expect("service");
+    service.set_state_dir(dir.clone());
+    let peer = PeerId::random();
+
+    let tick = service
+        .process_runtime_event(
+            &mut node,
+            NetworkRuntimeEvent::PeerIdentified {
+                peer,
+                metadata: crate::network_p2p::PeerIdentificationMetadata {
+                    network_id: "mainnet:watt-galaxy".to_owned(),
+                    params_version: 7,
+                    params_hash: "params-abc".to_owned(),
+                    agent_version_raw: "wattswarm-network-p2p|mainnet:watt-galaxy|7|params-abc"
+                        .to_owned(),
+                    agent_version_prefix: "wattswarm-network-p2p".to_owned(),
+                    protocol_version: "wattswarm/1.0.0".to_owned(),
+                    observed_addr: "/ip4/198.51.100.2/tcp/4001".to_owned(),
+                    listen_addrs: vec!["/ip4/203.0.113.10/tcp/4001".to_owned()],
+                    protocols: vec!["/meshsub/1.1.0".to_owned()],
+                },
+            },
+        )
+        .expect("process event");
+
+    assert!(matches!(tick, NetworkBridgeTick::TransportNotice { .. }));
+    let rows = crate::control::load_peer_metadata_records_state(&dir).expect("load rows");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].node_id, peer.to_string());
+    assert_eq!(rows[0].network_id.as_deref(), Some("mainnet:watt-galaxy"));
+    assert_eq!(rows[0].params_version, Some(7));
+    assert_eq!(rows[0].params_hash.as_deref(), Some("params-abc"));
+    assert_eq!(rows[0].handshake_status, "identified");
+    assert_eq!(rows[0].listen_addrs, vec!["/ip4/203.0.113.10/tcp/4001"]);
+    assert_eq!(rows[0].protocols, vec!["/meshsub/1.1.0"]);
+
+    std::fs::remove_dir_all(dir).expect("cleanup");
 }
 
 #[test]
@@ -2177,14 +2267,17 @@ fn dial_discovered_peer_endpoints_skips_invalid_self_and_missing_addrs() {
             crate::control::DiscoveredPeerRecord {
                 node_id: "self".to_owned(),
                 listen_addr: Some("/ip4/127.0.0.1/tcp/4001".to_owned()),
+                source_kind: "udp".to_owned(),
             },
             crate::control::DiscoveredPeerRecord {
                 node_id: "peer-a".to_owned(),
                 listen_addr: None,
+                source_kind: "unknown".to_owned(),
             },
             crate::control::DiscoveredPeerRecord {
                 node_id: "peer-b".to_owned(),
                 listen_addr: Some("not-a-multiaddr".to_owned()),
+                source_kind: "unknown".to_owned(),
             },
         ],
     )

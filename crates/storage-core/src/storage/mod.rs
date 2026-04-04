@@ -216,7 +216,39 @@ pub struct LocalExecutorEntryRow {
 pub struct LocalDiscoveredPeerRow {
     pub node_id: String,
     pub listen_addr: Option<String>,
+    pub source_kind: String,
     pub discovered_at: u64,
+    pub updated_at: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalPeerMetadataRow {
+    pub node_id: String,
+    pub network_id: Option<String>,
+    pub params_version: Option<u64>,
+    pub params_hash: Option<String>,
+    pub agent_version_raw: Option<String>,
+    pub agent_version_prefix: Option<String>,
+    pub protocol_version: Option<String>,
+    pub observed_addr: Option<String>,
+    pub listen_addrs_json: String,
+    pub protocols_json: String,
+    pub handshake_status: String,
+    pub last_error: Option<String>,
+    pub first_identified_at: u64,
+    pub last_identified_at: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalPeerRelationshipRow {
+    pub remote_node_id: String,
+    pub relationship_state: String,
+    pub last_action: String,
+    pub initiated_by: String,
+    pub requested_at: Option<u64>,
+    pub responded_at: Option<u64>,
+    pub blocked_at: Option<u64>,
+    pub cleared_at: Option<u64>,
     pub updated_at: u64,
 }
 

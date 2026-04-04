@@ -13,7 +13,8 @@ use crate::constants::BACKFILL_BATCH_EVENTS;
 use crate::network_p2p::{
     BackfillRequest, BackfillRequestId, EventEnvelope, GossipMessage, Multiaddr, NetworkP2pConfig,
     NetworkP2pNode, NetworkRuntime, NetworkRuntimeEvent, PeerHandshakeMetadata, PeerId,
-    SummaryAnnouncement, SwarmScope,
+    PeerRelationshipRequest, PeerRelationshipRequestId, PeerRelationshipResponse,
+    RawPeerRelationshipAction, SummaryAnnouncement, SwarmScope,
 };
 use crate::node::Node;
 use serde::Deserialize;
@@ -157,6 +158,34 @@ fn scope_hint_label(scope: &SwarmScope) -> String {
     }
 }
 
+fn wire_peer_relationship_action(
+    action: crate::control::PeerRelationshipAction,
+) -> RawPeerRelationshipAction {
+    match action {
+        crate::control::PeerRelationshipAction::Request => RawPeerRelationshipAction::Request,
+        crate::control::PeerRelationshipAction::Accept => RawPeerRelationshipAction::Accept,
+        crate::control::PeerRelationshipAction::Reject => RawPeerRelationshipAction::Reject,
+        crate::control::PeerRelationshipAction::Cancel => RawPeerRelationshipAction::Cancel,
+        crate::control::PeerRelationshipAction::Remove => RawPeerRelationshipAction::Remove,
+        crate::control::PeerRelationshipAction::Block => RawPeerRelationshipAction::Block,
+        crate::control::PeerRelationshipAction::Unblock => RawPeerRelationshipAction::Unblock,
+    }
+}
+
+fn control_peer_relationship_action(
+    action: RawPeerRelationshipAction,
+) -> crate::control::PeerRelationshipAction {
+    match action {
+        RawPeerRelationshipAction::Request => crate::control::PeerRelationshipAction::Request,
+        RawPeerRelationshipAction::Accept => crate::control::PeerRelationshipAction::Accept,
+        RawPeerRelationshipAction::Reject => crate::control::PeerRelationshipAction::Reject,
+        RawPeerRelationshipAction::Cancel => crate::control::PeerRelationshipAction::Cancel,
+        RawPeerRelationshipAction::Remove => crate::control::PeerRelationshipAction::Remove,
+        RawPeerRelationshipAction::Block => crate::control::PeerRelationshipAction::Block,
+        RawPeerRelationshipAction::Unblock => crate::control::PeerRelationshipAction::Unblock,
+    }
+}
+
 fn maybe_record_topic_cursor(
     node: &Node,
     subscriber_node_id: &str,
@@ -265,6 +294,13 @@ impl PeerSyncState {
             known_scopes: HashSet::new(),
         }
     }
+}
+
+#[derive(Debug, Clone)]
+struct PendingPeerRelationshipRequest {
+    peer: PeerId,
+    remote_node_id: String,
+    action: crate::control::PeerRelationshipAction,
 }
 
 pub fn ingest_event_envelope(node: &mut Node, envelope: &EventEnvelope) -> Result<()> {
@@ -685,6 +721,17 @@ pub enum NetworkBridgeTick {
         request_id: BackfillRequestId,
         error: String,
     },
+    PeerRelationshipUpdated {
+        peer: PeerId,
+        action: crate::control::PeerRelationshipAction,
+        relationship_state: crate::control::PeerRelationshipState,
+        initiated_by: crate::control::PeerRelationshipInitiator,
+    },
+    PeerRelationshipFailed {
+        peer: PeerId,
+        action: crate::control::PeerRelationshipAction,
+        error: String,
+    },
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -774,6 +821,8 @@ pub struct NetworkBridgeService {
     summary_reputation_limit: usize,
     summary_decision_memory_limit: u32,
     scope_traffic: HashMap<SwarmScope, ScopeTrafficStats>,
+    pending_relationship_requests:
+        HashMap<PeerRelationshipRequestId, PendingPeerRelationshipRequest>,
     /// Optional state_dir for run-queue bridge hooks.
     state_dir: Option<PathBuf>,
 }
@@ -810,6 +859,7 @@ impl NetworkBridgeService {
             summary_reputation_limit: protocol_params.summary_reputation_limit,
             summary_decision_memory_limit: protocol_params.summary_decision_memory_limit,
             scope_traffic: HashMap::new(),
+            pending_relationship_requests: HashMap::new(),
             state_dir: None,
         })
     }
@@ -856,6 +906,50 @@ impl NetworkBridgeService {
     pub fn dial(&mut self, addr: Multiaddr) -> Result<()> {
         let _guard = self.tokio_runtime.enter();
         self.runtime.dial(addr)
+    }
+
+    pub fn send_peer_relationship_action(
+        &mut self,
+        remote_node_id: &str,
+        action: crate::control::PeerRelationshipAction,
+    ) -> Result<PeerRelationshipRequestId> {
+        let Some(state_dir) = &self.state_dir else {
+            bail!("peer relationship actions require state_dir to be configured");
+        };
+        let remote_node_id = remote_node_id.trim();
+        if remote_node_id.is_empty() {
+            bail!("remote_node_id is required");
+        }
+        let peer = remote_node_id
+            .parse::<PeerId>()
+            .map_err(|err| anyhow!("parse remote_node_id as peer id: {err}"))?;
+        if !self.connected_peers.contains(&peer) {
+            bail!("peer relationship actions require a connected peer");
+        }
+        crate::control::apply_peer_relationship_action_state(
+            state_dir,
+            remote_node_id,
+            action,
+            crate::control::PeerRelationshipInitiator::Local,
+        )?;
+        let _guard = self.tokio_runtime.enter();
+        let request_id = self.runtime.send_peer_relationship_request(
+            &peer,
+            PeerRelationshipRequest {
+                source_node_id: self.local_peer_id().to_string(),
+                target_node_id: remote_node_id.to_owned(),
+                action: wire_peer_relationship_action(action),
+            },
+        )?;
+        self.pending_relationship_requests.insert(
+            request_id,
+            PendingPeerRelationshipRequest {
+                peer,
+                remote_node_id: remote_node_id.to_owned(),
+                action,
+            },
+        );
+        Ok(request_id)
     }
 
     pub fn publish_event_for_scope(
@@ -1277,6 +1371,8 @@ impl NetworkBridgeService {
     fn mark_peer_disconnected(&mut self, peer: PeerId) {
         self.connected_peers.remove(&peer);
         self.peer_sync_state.remove(&peer);
+        self.pending_relationship_requests
+            .retain(|_, pending| pending.peer != peer);
     }
 
     fn mark_backfill_completed(&mut self, peer: PeerId) {
@@ -1318,6 +1414,63 @@ impl NetworkBridgeService {
         event: NetworkRuntimeEvent,
     ) -> Result<NetworkBridgeTick> {
         match event {
+            NetworkRuntimeEvent::PeerDiscovered {
+                peer,
+                address,
+                source,
+            } => {
+                if let Some(state_dir) = &self.state_dir {
+                    let _ = crate::control::add_discovered_peer_endpoint_with_source(
+                        state_dir,
+                        &peer.to_string(),
+                        Some(&address.to_string()),
+                        source.as_str(),
+                    );
+                }
+                Ok(NetworkBridgeTick::TransportNotice {
+                    detail: format!(
+                        "peer_discovered peer={peer} source={} address={address}",
+                        source.as_str()
+                    ),
+                })
+            }
+            NetworkRuntimeEvent::PeerIdentified { peer, metadata } => {
+                if let Some(state_dir) = &self.state_dir {
+                    let now = chrono::Utc::now().timestamp_millis().max(0) as u64;
+                    let existing = crate::control::load_peer_metadata_records_state(state_dir)
+                        .ok()
+                        .and_then(|records| {
+                            records
+                                .into_iter()
+                                .find(|record| record.node_id == peer.to_string())
+                        });
+                    let record = crate::control::PeerMetadataRecord {
+                        node_id: peer.to_string(),
+                        network_id: Some(metadata.network_id.clone()),
+                        params_version: Some(metadata.params_version),
+                        params_hash: Some(metadata.params_hash.clone()),
+                        agent_version_raw: Some(metadata.agent_version_raw.clone()),
+                        agent_version_prefix: Some(metadata.agent_version_prefix.clone()),
+                        protocol_version: Some(metadata.protocol_version.clone()),
+                        observed_addr: Some(metadata.observed_addr.clone()),
+                        listen_addrs: metadata.listen_addrs.clone(),
+                        protocols: metadata.protocols.clone(),
+                        handshake_status: "identified".to_owned(),
+                        last_error: None,
+                        first_identified_at: existing
+                            .as_ref()
+                            .map_or(now, |entry| entry.first_identified_at),
+                        last_identified_at: now,
+                    };
+                    let _ = crate::control::save_peer_metadata_record_state(state_dir, &record);
+                }
+                Ok(NetworkBridgeTick::TransportNotice {
+                    detail: format!(
+                        "peer_identified peer={peer} network_id={} params_version={}",
+                        metadata.network_id, metadata.params_version
+                    ),
+                })
+            }
             NetworkRuntimeEvent::NewListenAddr { address } => {
                 Ok(NetworkBridgeTick::Listening { address })
             }
@@ -1383,6 +1536,49 @@ impl NetworkBridgeService {
             }
             NetworkRuntimeEvent::PeerHandshakeRejected { peer, detail } => {
                 self.mark_peer_disconnected(peer);
+                if let Some(state_dir) = &self.state_dir {
+                    let now = chrono::Utc::now().timestamp_millis().max(0) as u64;
+                    let existing = crate::control::load_peer_metadata_records_state(state_dir)
+                        .ok()
+                        .and_then(|records| {
+                            records
+                                .into_iter()
+                                .find(|record| record.node_id == peer.to_string())
+                        });
+                    let record = crate::control::PeerMetadataRecord {
+                        node_id: peer.to_string(),
+                        network_id: existing.as_ref().and_then(|entry| entry.network_id.clone()),
+                        params_version: existing.as_ref().and_then(|entry| entry.params_version),
+                        params_hash: existing
+                            .as_ref()
+                            .and_then(|entry| entry.params_hash.clone()),
+                        agent_version_raw: existing
+                            .as_ref()
+                            .and_then(|entry| entry.agent_version_raw.clone()),
+                        agent_version_prefix: existing
+                            .as_ref()
+                            .and_then(|entry| entry.agent_version_prefix.clone()),
+                        protocol_version: existing
+                            .as_ref()
+                            .and_then(|entry| entry.protocol_version.clone()),
+                        observed_addr: existing
+                            .as_ref()
+                            .and_then(|entry| entry.observed_addr.clone()),
+                        listen_addrs: existing
+                            .as_ref()
+                            .map_or_else(Vec::new, |entry| entry.listen_addrs.clone()),
+                        protocols: existing
+                            .as_ref()
+                            .map_or_else(Vec::new, |entry| entry.protocols.clone()),
+                        handshake_status: "rejected".to_owned(),
+                        last_error: Some(detail.clone()),
+                        first_identified_at: existing
+                            .as_ref()
+                            .map_or(now, |entry| entry.first_identified_at),
+                        last_identified_at: now,
+                    };
+                    let _ = crate::control::save_peer_metadata_record_state(state_dir, &record);
+                }
                 Ok(NetworkBridgeTick::TransportNotice {
                     detail: format!("peer_handshake_rejected peer={peer} {detail}"),
                 })
@@ -1484,8 +1680,19 @@ impl NetworkBridgeService {
                     self.runtime.config().max_backfill_events_hard_limit,
                 )?;
                 let events = response.events.len();
-                self.runtime.send_backfill_response(channel, response)?;
-                Ok(NetworkBridgeTick::BackfillServed { peer, events })
+                match self.runtime.send_backfill_response(channel, response) {
+                    Ok(()) => Ok(NetworkBridgeTick::BackfillServed { peer, events }),
+                    Err(error)
+                        if error
+                            .to_string()
+                            .contains("backfill response channel closed") =>
+                    {
+                        Ok(NetworkBridgeTick::TransportNotice {
+                            detail: format!("backfill_response_dropped peer={peer} reason={error}"),
+                        })
+                    }
+                    Err(error) => Err(error),
+                }
             }
             NetworkRuntimeEvent::BackfillResponse {
                 peer,
@@ -1521,8 +1728,225 @@ impl NetworkBridgeService {
                 })
             }
             NetworkRuntimeEvent::BackfillInboundFailure { peer, error } => {
-                Err(anyhow!("backfill inbound failure from {peer}: {error}"))
+                Ok(NetworkBridgeTick::TransportNotice {
+                    detail: format!("backfill_inbound_failure peer={peer} error={error}"),
+                })
             }
+            NetworkRuntimeEvent::PeerRelationshipRequest {
+                peer,
+                request,
+                channel,
+            } => {
+                let action = control_peer_relationship_action(request.action);
+                let local_node_id = self.local_peer_id().to_string();
+                let now = observed_at_ms();
+                let (response, tick) = if request.source_node_id != peer.to_string() {
+                    let error = format!(
+                        "peer relationship request source_node_id mismatch: payload={} transport={peer}",
+                        request.source_node_id
+                    );
+                    (
+                        PeerRelationshipResponse {
+                            source_node_id: local_node_id,
+                            target_node_id: request.source_node_id.clone(),
+                            action: request.action,
+                            applied: false,
+                            relationship_state: None,
+                            detail: Some(error.clone()),
+                            updated_at: now,
+                        },
+                        NetworkBridgeTick::PeerRelationshipFailed {
+                            peer,
+                            action,
+                            error,
+                        },
+                    )
+                } else if request.target_node_id != local_node_id {
+                    let error = format!(
+                        "peer relationship request target_node_id mismatch: payload={} local={local_node_id}",
+                        request.target_node_id
+                    );
+                    (
+                        PeerRelationshipResponse {
+                            source_node_id: local_node_id,
+                            target_node_id: request.source_node_id.clone(),
+                            action: request.action,
+                            applied: false,
+                            relationship_state: None,
+                            detail: Some(error.clone()),
+                            updated_at: now,
+                        },
+                        NetworkBridgeTick::PeerRelationshipFailed {
+                            peer,
+                            action,
+                            error,
+                        },
+                    )
+                } else if let Some(state_dir) = &self.state_dir {
+                    match crate::control::apply_peer_relationship_action_state(
+                        state_dir,
+                        &request.source_node_id,
+                        action,
+                        crate::control::PeerRelationshipInitiator::Remote,
+                    ) {
+                        Ok(record) => (
+                            PeerRelationshipResponse {
+                                source_node_id: local_node_id,
+                                target_node_id: request.source_node_id.clone(),
+                                action: request.action,
+                                applied: true,
+                                relationship_state: Some(
+                                    record.relationship_state.as_str().to_owned(),
+                                ),
+                                detail: None,
+                                updated_at: record.updated_at,
+                            },
+                            NetworkBridgeTick::PeerRelationshipUpdated {
+                                peer,
+                                action,
+                                relationship_state: record.relationship_state,
+                                initiated_by: crate::control::PeerRelationshipInitiator::Remote,
+                            },
+                        ),
+                        Err(error) => {
+                            let error = error.to_string();
+                            (
+                                PeerRelationshipResponse {
+                                    source_node_id: local_node_id,
+                                    target_node_id: request.source_node_id.clone(),
+                                    action: request.action,
+                                    applied: false,
+                                    relationship_state: None,
+                                    detail: Some(error.clone()),
+                                    updated_at: now,
+                                },
+                                NetworkBridgeTick::PeerRelationshipFailed {
+                                    peer,
+                                    action,
+                                    error,
+                                },
+                            )
+                        }
+                    }
+                } else {
+                    let error =
+                        "peer relationship request received before state_dir was configured"
+                            .to_owned();
+                    (
+                        PeerRelationshipResponse {
+                            source_node_id: local_node_id,
+                            target_node_id: request.source_node_id.clone(),
+                            action: request.action,
+                            applied: false,
+                            relationship_state: None,
+                            detail: Some(error.clone()),
+                            updated_at: now,
+                        },
+                        NetworkBridgeTick::PeerRelationshipFailed {
+                            peer,
+                            action,
+                            error,
+                        },
+                    )
+                };
+                self.runtime
+                    .send_peer_relationship_response(channel, response)?;
+                Ok(tick)
+            }
+            NetworkRuntimeEvent::PeerRelationshipResponse {
+                peer,
+                request_id,
+                response,
+            } => {
+                let Some(pending) = self.pending_relationship_requests.remove(&request_id) else {
+                    return Ok(NetworkBridgeTick::TransportNotice {
+                        detail: format!(
+                            "peer_relationship_response_without_pending peer={peer} request_id={request_id:?}"
+                        ),
+                    });
+                };
+                let action = pending.action;
+                let expected_action = wire_peer_relationship_action(action);
+                let local_node_id = self.local_peer_id().to_string();
+                if pending.peer != peer {
+                    return Ok(NetworkBridgeTick::PeerRelationshipFailed {
+                        peer,
+                        action,
+                        error: format!(
+                            "peer relationship response peer mismatch: expected={} actual={peer}",
+                            pending.peer
+                        ),
+                    });
+                }
+                if response.source_node_id != pending.remote_node_id
+                    || response.target_node_id != local_node_id
+                    || response.action != expected_action
+                {
+                    return Ok(NetworkBridgeTick::PeerRelationshipFailed {
+                        peer,
+                        action,
+                        error: format!(
+                            "peer relationship response payload mismatch source={} target={} action={:?}",
+                            response.source_node_id, response.target_node_id, response.action
+                        ),
+                    });
+                }
+                if !response.applied {
+                    return Ok(NetworkBridgeTick::PeerRelationshipFailed {
+                        peer,
+                        action,
+                        error: response
+                            .detail
+                            .unwrap_or_else(|| "peer relationship action rejected".to_owned()),
+                    });
+                }
+                let Some(state_dir) = &self.state_dir else {
+                    return Ok(NetworkBridgeTick::PeerRelationshipFailed {
+                        peer,
+                        action,
+                        error:
+                            "peer relationship response received before state_dir was configured"
+                                .to_owned(),
+                    });
+                };
+                let local_state = crate::control::load_peer_relationship_records_state(state_dir)?
+                    .into_iter()
+                    .find(|record| record.remote_node_id == pending.remote_node_id)
+                    .map(|record| record.relationship_state);
+                match local_state {
+                    Some(relationship_state) => Ok(NetworkBridgeTick::PeerRelationshipUpdated {
+                        peer,
+                        action,
+                        relationship_state,
+                        initiated_by: crate::control::PeerRelationshipInitiator::Local,
+                    }),
+                    None => Ok(NetworkBridgeTick::PeerRelationshipFailed {
+                        peer,
+                        action,
+                        error: "peer relationship response applied without a local state record"
+                            .to_owned(),
+                    }),
+                }
+            }
+            NetworkRuntimeEvent::PeerRelationshipOutboundFailure {
+                peer,
+                request_id,
+                error,
+            } => {
+                let action = self
+                    .pending_relationship_requests
+                    .remove(&request_id)
+                    .map(|pending| pending.action)
+                    .unwrap_or(crate::control::PeerRelationshipAction::Request);
+                Ok(NetworkBridgeTick::PeerRelationshipFailed {
+                    peer,
+                    action,
+                    error,
+                })
+            }
+            NetworkRuntimeEvent::PeerRelationshipInboundFailure { peer, error } => Err(anyhow!(
+                "peer relationship inbound failure from {peer}: {error}"
+            )),
         }
     }
 }

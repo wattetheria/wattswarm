@@ -6,7 +6,10 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use uuid::Uuid;
-use wattswarm_control_plane::control::add_discovered_peer_endpoint;
+use wattswarm_control_plane::control::{
+    PeerRelationshipAction, PeerRelationshipState, add_discovered_peer_endpoint,
+    load_peer_relationship_records_state,
+};
 use wattswarm_control_plane::crypto::NodeIdentity;
 use wattswarm_control_plane::network_bridge::{
     NetworkBridgeService, NetworkBridgeTick, build_knowledge_summary_for_task_type,
@@ -301,6 +304,14 @@ fn connect_services(
     wait_for_connected_pair(dialer, dialer_node, receiver, receiver_node);
 }
 
+fn relationship_state_for(path: &Path, remote_node_id: &str) -> Option<PeerRelationshipState> {
+    load_peer_relationship_records_state(path)
+        .expect("load peer relationships")
+        .into_iter()
+        .find(|record| record.remote_node_id == remote_node_id)
+        .map(|record| record.relationship_state)
+}
+
 pub fn two_nodes_sync_global_event_over_libp2p() {
     let identity_a = NodeIdentity::random();
     let identity_b = NodeIdentity::random();
@@ -418,6 +429,126 @@ pub fn two_nodes_sync_global_event_over_libp2p() {
         task.contract.inputs["prompt"],
         json!("ship this over gossip")
     );
+}
+
+pub fn two_nodes_execute_peer_relationship_request_and_accept_over_network() {
+    let identity_a = NodeIdentity::random();
+    let identity_b = NodeIdentity::random();
+    let membership = membership_with_roles(&[identity_a.node_id(), identity_b.node_id()]);
+    let mut node_a = make_node(identity_a, membership.clone());
+    let mut node_b = make_node(identity_b, membership);
+    let mut service_a = make_fast_service_with_scopes(&[]);
+    let mut service_b = make_fast_service_with_scopes(&[]);
+    let dir_a = temp_test_dir("peer-relationship-a");
+    let dir_b = temp_test_dir("peer-relationship-b");
+    service_a.set_state_dir(dir_a.clone());
+    service_b.set_state_dir(dir_b.clone());
+
+    connect_services(&mut service_a, &mut node_a, &mut service_b, &mut node_b);
+    pump_services_for(
+        &mut service_a,
+        &mut node_a,
+        &mut service_b,
+        &mut node_b,
+        reconnect_quiet_period(),
+    );
+
+    let remote_b = service_b.local_peer_id().to_string();
+    let remote_a = service_a.local_peer_id().to_string();
+
+    service_a
+        .send_peer_relationship_action(&remote_b, PeerRelationshipAction::Request)
+        .expect("send relationship request");
+
+    let request_synced = wait_until(scaled_timeout(Duration::from_secs(10)), || {
+        for _ in 0..32 {
+            let _ = pump_once(&mut service_a, &mut node_a);
+            let _ = pump_once(&mut service_b, &mut node_b);
+        }
+        relationship_state_for(&dir_a, &remote_b) == Some(PeerRelationshipState::Requested)
+            && relationship_state_for(&dir_b, &remote_a) == Some(PeerRelationshipState::Requested)
+    });
+    assert!(
+        request_synced,
+        "relationship request should sync to both peers"
+    );
+
+    service_b
+        .send_peer_relationship_action(&remote_a, PeerRelationshipAction::Accept)
+        .expect("send relationship accept");
+
+    let accepted = wait_until(scaled_timeout(Duration::from_secs(10)), || {
+        for _ in 0..32 {
+            let _ = pump_once(&mut service_a, &mut node_a);
+            let _ = pump_once(&mut service_b, &mut node_b);
+        }
+        relationship_state_for(&dir_a, &remote_b) == Some(PeerRelationshipState::Accepted)
+            && relationship_state_for(&dir_b, &remote_a) == Some(PeerRelationshipState::Accepted)
+    });
+    assert!(accepted, "relationship accept should sync to both peers");
+
+    cleanup_dir(&dir_a);
+    cleanup_dir(&dir_b);
+}
+
+pub fn two_nodes_execute_peer_relationship_request_and_block_over_network() {
+    let identity_a = NodeIdentity::random();
+    let identity_b = NodeIdentity::random();
+    let membership = membership_with_roles(&[identity_a.node_id(), identity_b.node_id()]);
+    let mut node_a = make_node(identity_a, membership.clone());
+    let mut node_b = make_node(identity_b, membership);
+    let mut service_a = make_fast_service_with_scopes(&[]);
+    let mut service_b = make_fast_service_with_scopes(&[]);
+    let dir_a = temp_test_dir("peer-relationship-block-a");
+    let dir_b = temp_test_dir("peer-relationship-block-b");
+    service_a.set_state_dir(dir_a.clone());
+    service_b.set_state_dir(dir_b.clone());
+
+    connect_services(&mut service_a, &mut node_a, &mut service_b, &mut node_b);
+    pump_services_for(
+        &mut service_a,
+        &mut node_a,
+        &mut service_b,
+        &mut node_b,
+        reconnect_quiet_period(),
+    );
+
+    let remote_b = service_b.local_peer_id().to_string();
+    let remote_a = service_a.local_peer_id().to_string();
+
+    service_a
+        .send_peer_relationship_action(&remote_b, PeerRelationshipAction::Request)
+        .expect("send relationship request");
+
+    let request_synced = wait_until(scaled_timeout(Duration::from_secs(10)), || {
+        for _ in 0..32 {
+            let _ = pump_once(&mut service_a, &mut node_a);
+            let _ = pump_once(&mut service_b, &mut node_b);
+        }
+        relationship_state_for(&dir_a, &remote_b) == Some(PeerRelationshipState::Requested)
+            && relationship_state_for(&dir_b, &remote_a) == Some(PeerRelationshipState::Requested)
+    });
+    assert!(
+        request_synced,
+        "relationship request should sync to both peers"
+    );
+
+    service_b
+        .send_peer_relationship_action(&remote_a, PeerRelationshipAction::Block)
+        .expect("send relationship block");
+
+    let blocked = wait_until(scaled_timeout(Duration::from_secs(10)), || {
+        for _ in 0..32 {
+            let _ = pump_once(&mut service_a, &mut node_a);
+            let _ = pump_once(&mut service_b, &mut node_b);
+        }
+        relationship_state_for(&dir_a, &remote_b) == Some(PeerRelationshipState::Blocked)
+            && relationship_state_for(&dir_b, &remote_a) == Some(PeerRelationshipState::Blocked)
+    });
+    assert!(blocked, "relationship block should sync to both peers");
+
+    cleanup_dir(&dir_a);
+    cleanup_dir(&dir_b);
 }
 
 pub fn global_task_detail_sync_excludes_process_firehose() {

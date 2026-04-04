@@ -1,8 +1,9 @@
 use crate::control::{
-    ExecutorRegistryEntry, NodeState, RealTaskRunRequest, load_executor_registry_state,
-    local_node_id, local_peer_id, node_state_path, open_configured_node, open_node,
-    require_configured_node_mode, resolve_node_mode, run_real_task_flow,
-    save_executor_registry_state, write_node_state,
+    ExecutorRegistryEntry, NodeState, PeerRelationshipAction, PeerRelationshipInitiator,
+    RealTaskRunRequest, apply_peer_relationship_action_state, load_executor_registry_state,
+    load_peer_metadata_records_state, load_peer_relationship_records_state, local_node_id,
+    local_peer_id, node_state_path, open_configured_node, open_node, require_configured_node_mode,
+    resolve_node_mode, run_real_task_flow, save_executor_registry_state, write_node_state,
 };
 use crate::egress_agent::{
     EgressAgentConfig, load_egress_agent_config_state, save_egress_agent_config_state,
@@ -28,6 +29,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{Value, json};
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
 
@@ -94,6 +96,14 @@ struct ExecutorAddRequest {
 #[derive(Debug, Deserialize)]
 struct ExecutorCheckRequest {
     name: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct PeerRelationshipActionRequest {
+    remote_node_id: String,
+    action: PeerRelationshipAction,
+    #[serde(default)]
+    initiated_by: Option<PeerRelationshipInitiator>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -249,6 +259,8 @@ pub fn build_app(state: UiServerState) -> Router {
         .route("/api/startup-config", get(startup_config_get))
         .route("/api/startup-config", post(startup_config_save))
         .route("/api/peers/list", get(peers_list))
+        .route("/api/peers/relationships", get(peer_relationships_list))
+        .route("/api/peers/relationships", post(peer_relationships_update))
         .route("/api/log/head", get(log_head))
         .route("/api/log/replay", post(log_replay))
         .route("/api/log/verify", post(log_verify))
@@ -518,19 +530,130 @@ async fn startup_config_save(
 
 async fn peers_list(State(state): State<UiServerState>) -> Result<Json<Value>, ApiError> {
     let state_clone = state.clone();
-    let peers = run_blocking(move || -> Result<Vec<String>> {
-        if let Some(peers) =
-            crate::network_bridge::latest_connected_peer_ids(&state_clone.state_dir)
-        {
-            return Ok(peers);
-        }
-        match open_configured_node(&state_clone.state_dir, &state_clone.db_path) {
-            Ok(node) => Ok(node.peers()),
-            Err(_) => Ok(Vec::new()),
-        }
+    let payload = run_blocking(move || {
+        build_peers_list_payload(&state_clone.state_dir, &state_clone.db_path)
     })
     .await?;
-    Ok(Json(json!({"ok": true, "peers": peers})))
+    Ok(Json(payload))
+}
+
+async fn peer_relationships_list(
+    State(state): State<UiServerState>,
+) -> Result<Json<Value>, ApiError> {
+    let state_clone = state.clone();
+    let payload =
+        run_blocking(move || build_peer_relationships_payload(&state_clone.state_dir)).await?;
+    Ok(Json(payload))
+}
+
+async fn peer_relationships_update(
+    State(state): State<UiServerState>,
+    Json(req): Json<PeerRelationshipActionRequest>,
+) -> Result<Json<Value>, ApiError> {
+    let state_clone = state.clone();
+    let payload = run_blocking(move || {
+        update_peer_relationship_payload(
+            &state_clone.state_dir,
+            &req.remote_node_id,
+            req.action,
+            req.initiated_by.unwrap_or(PeerRelationshipInitiator::Local),
+        )
+    })
+    .await?;
+    Ok(Json(payload))
+}
+
+fn build_peers_list_payload(
+    state_dir: &std::path::Path,
+    db_path: &std::path::Path,
+) -> Result<Value> {
+    let connected_peers =
+        if let Some(peers) = crate::network_bridge::latest_connected_peer_ids(state_dir) {
+            peers
+        } else {
+            match open_configured_node(state_dir, db_path) {
+                Ok(node) => node.peers(),
+                Err(_) => Vec::new(),
+            }
+        };
+    let discovered =
+        crate::control::load_discovered_peer_records_state(state_dir).unwrap_or_default();
+    let metadata = load_peer_metadata_records_state(state_dir).unwrap_or_default();
+    let relationships = load_peer_relationship_records_state(state_dir).unwrap_or_default();
+    let mut records = BTreeMap::<String, Value>::new();
+    for peer in &connected_peers {
+        records.insert(
+            peer.clone(),
+            json!({
+                "node_id": peer,
+                "connected": true,
+                "discovery": Value::Null,
+                "metadata": Value::Null,
+                "relationship": Value::Null,
+            }),
+        );
+    }
+    for record in discovered {
+        records.entry(record.node_id.clone()).or_insert_with(|| {
+            json!({
+                "node_id": record.node_id,
+                "connected": false,
+                "discovery": Value::Null,
+                "metadata": Value::Null,
+                "relationship": Value::Null,
+            })
+        })["discovery"] = serde_json::to_value(&record)?;
+    }
+    for record in metadata {
+        records.entry(record.node_id.clone()).or_insert_with(|| {
+            json!({
+                "node_id": record.node_id,
+                "connected": false,
+                "discovery": Value::Null,
+                "metadata": Value::Null,
+                "relationship": Value::Null,
+            })
+        })["metadata"] = serde_json::to_value(&record)?;
+    }
+    for record in relationships {
+        records
+            .entry(record.remote_node_id.clone())
+            .or_insert_with(|| {
+                json!({
+                    "node_id": record.remote_node_id,
+                    "connected": false,
+                    "discovery": Value::Null,
+                    "metadata": Value::Null,
+                    "relationship": Value::Null,
+                })
+            })["relationship"] = serde_json::to_value(&record)?;
+    }
+    for peer in &connected_peers {
+        if let Some(entry) = records.get_mut(peer) {
+            entry["connected"] = Value::Bool(true);
+        }
+    }
+    Ok(json!({
+        "ok": true,
+        "peers": connected_peers,
+        "records": records.into_values().collect::<Vec<_>>(),
+    }))
+}
+
+fn build_peer_relationships_payload(state_dir: &std::path::Path) -> Result<Value> {
+    let relationships = load_peer_relationship_records_state(state_dir)?;
+    Ok(json!({"ok": true, "relationships": relationships}))
+}
+
+fn update_peer_relationship_payload(
+    state_dir: &std::path::Path,
+    remote_node_id: &str,
+    action: PeerRelationshipAction,
+    initiated_by: PeerRelationshipInitiator,
+) -> Result<Value> {
+    let record =
+        apply_peer_relationship_action_state(state_dir, remote_node_id, action, initiated_by)?;
+    Ok(json!({"ok": true, "relationship": record}))
 }
 
 fn mark_node_running_if_service_started(state_dir: &std::path::Path, started: bool) -> Result<()> {
@@ -543,7 +666,10 @@ fn mark_node_running_if_service_started(state_dir: &std::path::Path, started: bo
 
 #[cfg(test)]
 mod tests {
-    use super::mark_node_running_if_service_started;
+    use super::{
+        build_peer_relationships_payload, build_peers_list_payload,
+        mark_node_running_if_service_started, update_peer_relationship_payload,
+    };
     use crate::control::{NodeState, node_state_path};
     use crate::startup_config::{
         CoreAgentConfig, NetworkMode, StartupConfig, save_startup_config, startup_config_path,
@@ -585,6 +711,224 @@ mod tests {
             .expect("skip writing node running state");
 
         assert!(!node_state_path(&state_dir).exists());
+    }
+
+    #[test]
+    fn peers_list_payload_includes_discovery_metadata_and_relationship_state() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state_dir = dir.path().join("state");
+        let db_path = state_dir.join("ui.state");
+        std::fs::create_dir_all(&state_dir).expect("create state dir");
+        crate::control::save_discovered_peer_records_state(
+            &state_dir,
+            &[crate::control::DiscoveredPeerRecord {
+                node_id: "peer-alpha".to_owned(),
+                listen_addr: Some("/ip4/203.0.113.10/tcp/4001".to_owned()),
+                source_kind: "bootstrap".to_owned(),
+            }],
+        )
+        .expect("save discovered peers");
+        crate::control::save_peer_metadata_record_state(
+            &state_dir,
+            &crate::control::PeerMetadataRecord {
+                node_id: "peer-alpha".to_owned(),
+                network_id: Some("mainnet:watt-galaxy".to_owned()),
+                params_version: Some(7),
+                params_hash: Some("params-abc".to_owned()),
+                agent_version_raw: Some(
+                    "wattswarm-network-p2p|mainnet:watt-galaxy|7|params-abc".to_owned(),
+                ),
+                agent_version_prefix: Some("wattswarm-network-p2p".to_owned()),
+                protocol_version: Some("wattswarm/1.0.0".to_owned()),
+                observed_addr: Some("/ip4/198.51.100.2/tcp/4001".to_owned()),
+                listen_addrs: vec!["/ip4/203.0.113.10/tcp/4001".to_owned()],
+                protocols: vec!["/meshsub/1.1.0".to_owned()],
+                handshake_status: "identified".to_owned(),
+                last_error: None,
+                first_identified_at: 1_700_000_000_000,
+                last_identified_at: 1_700_000_000_500,
+            },
+        )
+        .expect("save peer metadata");
+        crate::control::apply_peer_relationship_action_state(
+            &state_dir,
+            "peer-alpha",
+            crate::control::PeerRelationshipAction::Request,
+            crate::control::PeerRelationshipInitiator::Local,
+        )
+        .expect("save relationship");
+        let payload = build_peers_list_payload(&state_dir, &db_path).expect("build peers payload");
+        let records = payload["records"].as_array().expect("records array");
+        let peer = records
+            .iter()
+            .find(|entry| entry["node_id"].as_str() == Some("peer-alpha"))
+            .expect("peer-alpha record");
+        assert_eq!(peer["discovery"]["source_kind"].as_str(), Some("bootstrap"));
+        assert_eq!(
+            peer["metadata"]["network_id"].as_str(),
+            Some("mainnet:watt-galaxy")
+        );
+        assert_eq!(
+            peer["relationship"]["relationship_state"].as_str(),
+            Some("requested")
+        );
+    }
+
+    #[test]
+    fn peer_relationship_payloads_cover_full_lifecycle() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state_dir = dir.path().join("state");
+        std::fs::create_dir_all(&state_dir).expect("create state dir");
+        let requested = update_peer_relationship_payload(
+            &state_dir,
+            "peer-a",
+            crate::control::PeerRelationshipAction::Request,
+            crate::control::PeerRelationshipInitiator::Local,
+        )
+        .expect("request");
+        assert_eq!(
+            requested["relationship"]["relationship_state"].as_str(),
+            Some("requested")
+        );
+
+        let cancelled = update_peer_relationship_payload(
+            &state_dir,
+            "peer-a",
+            crate::control::PeerRelationshipAction::Cancel,
+            crate::control::PeerRelationshipInitiator::Local,
+        )
+        .expect("cancel");
+        assert_eq!(
+            cancelled["relationship"]["relationship_state"].as_str(),
+            Some("none")
+        );
+        assert_eq!(
+            cancelled["relationship"]["last_action"].as_str(),
+            Some("cancel")
+        );
+
+        update_peer_relationship_payload(
+            &state_dir,
+            "peer-b",
+            crate::control::PeerRelationshipAction::Request,
+            crate::control::PeerRelationshipInitiator::Local,
+        )
+        .expect("request peer-b");
+        let accepted = update_peer_relationship_payload(
+            &state_dir,
+            "peer-b",
+            crate::control::PeerRelationshipAction::Accept,
+            crate::control::PeerRelationshipInitiator::Local,
+        )
+        .expect("accept peer-b");
+        assert_eq!(
+            accepted["relationship"]["relationship_state"].as_str(),
+            Some("accepted")
+        );
+
+        let removed = update_peer_relationship_payload(
+            &state_dir,
+            "peer-b",
+            crate::control::PeerRelationshipAction::Remove,
+            crate::control::PeerRelationshipInitiator::Local,
+        )
+        .expect("remove peer-b");
+        assert_eq!(
+            removed["relationship"]["relationship_state"].as_str(),
+            Some("none")
+        );
+        assert_eq!(
+            removed["relationship"]["last_action"].as_str(),
+            Some("remove")
+        );
+
+        update_peer_relationship_payload(
+            &state_dir,
+            "peer-c",
+            crate::control::PeerRelationshipAction::Request,
+            crate::control::PeerRelationshipInitiator::Local,
+        )
+        .expect("request peer-c");
+        let rejected = update_peer_relationship_payload(
+            &state_dir,
+            "peer-c",
+            crate::control::PeerRelationshipAction::Reject,
+            crate::control::PeerRelationshipInitiator::Local,
+        )
+        .expect("reject peer-c");
+        assert_eq!(
+            rejected["relationship"]["relationship_state"].as_str(),
+            Some("rejected")
+        );
+
+        let blocked = update_peer_relationship_payload(
+            &state_dir,
+            "peer-d",
+            crate::control::PeerRelationshipAction::Block,
+            crate::control::PeerRelationshipInitiator::Local,
+        )
+        .expect("block peer-d");
+        assert_eq!(
+            blocked["relationship"]["relationship_state"].as_str(),
+            Some("blocked")
+        );
+        let unblocked = update_peer_relationship_payload(
+            &state_dir,
+            "peer-d",
+            crate::control::PeerRelationshipAction::Unblock,
+            crate::control::PeerRelationshipInitiator::Local,
+        )
+        .expect("unblock peer-d");
+        assert_eq!(
+            unblocked["relationship"]["relationship_state"].as_str(),
+            Some("none")
+        );
+        assert_eq!(
+            unblocked["relationship"]["last_action"].as_str(),
+            Some("unblock")
+        );
+
+        let payload = build_peer_relationships_payload(&state_dir).expect("list relationships");
+        let relationships = payload["relationships"].as_array().expect("relationships");
+        assert!(relationships.iter().any(|entry| {
+            entry["remote_node_id"].as_str() == Some("peer-b")
+                && entry["last_action"].as_str() == Some("remove")
+        }));
+        assert!(relationships.iter().any(|entry| {
+            entry["remote_node_id"].as_str() == Some("peer-d")
+                && entry["last_action"].as_str() == Some("unblock")
+        }));
+    }
+
+    #[test]
+    fn peer_relationship_payloads_reject_invalid_transitions() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state_dir = dir.path().join("state");
+        std::fs::create_dir_all(&state_dir).expect("create state dir");
+
+        let accept_err = update_peer_relationship_payload(
+            &state_dir,
+            "peer-z",
+            crate::control::PeerRelationshipAction::Accept,
+            crate::control::PeerRelationshipInitiator::Local,
+        )
+        .expect_err("accept without request should fail");
+        assert!(
+            accept_err.to_string().contains("without a pending request"),
+            "unexpected error: {accept_err}"
+        );
+
+        let unblock_err = update_peer_relationship_payload(
+            &state_dir,
+            "peer-z",
+            crate::control::PeerRelationshipAction::Unblock,
+            crate::control::PeerRelationshipInitiator::Local,
+        )
+        .expect_err("unblock without block should fail");
+        assert!(
+            unblock_err.to_string().contains("is not blocked"),
+            "unexpected error: {unblock_err}"
+        );
     }
 }
 
