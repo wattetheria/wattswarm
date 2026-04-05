@@ -9,20 +9,24 @@ use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
-use wattswarm_control_plane::artifact_store::{ArtifactAvailabilityStatus, ArtifactKind};
+use wattswarm_control_plane::artifact_store::{
+    ArtifactAvailabilityStatus, ArtifactKind, ArtifactStore,
+};
 use wattswarm_control_plane::control::{
-    DiscoveredPeerRecord, ExecutorRegistry, ExecutorRegistryEntry, RealTaskRunRequest,
-    RemoteTaskBridgeRegistry, RemoteTaskBridgeRequest, add_discovered_peer,
-    add_discovered_peer_endpoint, artifact_store_path, bridge_remote_task_into_local_execution,
-    configured_node_mode, discovered_peers_path, executor_registry_path,
-    fetch_checkpoint_artifact_json, fetch_evidence_artifact, fetch_snapshot_artifact_json,
-    fetch_task_detail_artifact, list_artifacts_needing_repair, load_discovered_peer_records,
+    DataSourceBindingKind, DataSourceBindingRecord, DiscoveredPeerRecord, ExecutorRegistry,
+    ExecutorRegistryEntry, PeerMetadataRecord, RealTaskRunRequest, RemoteTaskBridgeRegistry,
+    RemoteTaskBridgeRequest, add_discovered_peer, add_discovered_peer_endpoint,
+    artifact_store_path, bridge_remote_task_into_local_execution, configured_node_mode,
+    discovered_peers_path, executor_registry_path, fetch_checkpoint_artifact_json,
+    fetch_evidence_artifact, fetch_snapshot_artifact_json, fetch_task_detail_artifact,
+    list_artifacts_needing_repair, load_discovered_peer_records,
     load_discovered_peer_records_state, load_discovered_peers, load_discovered_peers_state,
-    load_executor_registry, load_network_directory_snapshot, local_node_id,
+    load_executor_registry, load_network_directory_snapshot, local_node_id, local_peer_id,
     materialize_checkpoint_artifact_json, materialize_evidence_artifact,
     materialize_snapshot_artifact_json, materialize_task_detail_artifact, open_node,
-    open_node_on_network_id, run_real_task_flow, save_discovered_peers, save_executor_registry,
-    save_executor_registry_state,
+    open_node_on_network_id, recommended_transfer_route_for_remote_node, run_real_task_flow,
+    save_data_source_binding_record_state, save_discovered_peers, save_executor_registry,
+    save_executor_registry_state, save_peer_metadata_record_state,
 };
 use wattswarm_control_plane::crypto::{NodeIdentity, sha256_hex};
 use wattswarm_control_plane::network_bridge::maybe_start_background_network_service;
@@ -33,6 +37,10 @@ use wattswarm_control_plane::types::{
     SignedNetworkProtocolParamsEnvelope, TaskAnnouncedPayload, UnsignedEvent,
 };
 use wattswarm_control_plane::udp_announce::{announce_startup, maybe_start_listener};
+use wattswarm_network_transport_core::{TransferIntent, TransferKind, TransportRoute};
+use wattswarm_network_transport_iroh::{
+    export_local_contact_material, shutdown_local_iroh_data_plane,
+};
 
 static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 const TEST_DB_LOCK_KEY: i64 = 1_987_654_321;
@@ -51,7 +59,106 @@ fn temp_test_dir(prefix: &str) -> PathBuf {
 }
 
 fn cleanup_dir(path: &Path) {
+    shutdown_local_iroh_data_plane(path);
     let _ = fs::remove_dir_all(path);
+}
+
+fn load_transport_decisions(state_dir: &Path) -> Vec<serde_json::Value> {
+    let path = state_dir.join("transport_decisions.jsonl");
+    let Ok(raw) = fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    raw.lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| serde_json::from_str(line).expect("valid transport decision json"))
+        .collect()
+}
+
+fn save_iroh_peer_metadata(state_dir: &Path, node_id: &str, peer_id: &str, updated_at: u64) {
+    save_peer_metadata_record_state(
+        state_dir,
+        &PeerMetadataRecord {
+            node_id: node_id.to_owned(),
+            network_id: Some("wan".to_owned()),
+            params_version: Some(7),
+            params_hash: Some("params-iroh".to_owned()),
+            agent_version_raw: Some("wattswarm-network-p2p|wan|7|params-iroh".to_owned()),
+            agent_version_prefix: Some("wattswarm-network-p2p".to_owned()),
+            protocol_version: Some("wattswarm/1.0.0".to_owned()),
+            observed_addr: Some(format!("/p2p/{peer_id}")),
+            listen_addrs: vec![format!("/p2p/{peer_id}")],
+            protocols: vec![],
+            handshake_status: "contact_material".to_owned(),
+            last_error: None,
+            contact_material: Some(json!({
+                "peer_id": peer_id,
+                "transports": [{
+                    "transport": "iroh_direct",
+                    "peer_id": peer_id,
+                    "metadata": {
+                        "route": "iroh_direct",
+                        "generated_at": updated_at,
+                        "endpoint_id": format!("endpoint-{node_id}"),
+                        "alpn": "/wattswarm/iroh/1",
+                        "listen_addrs": [format!("/p2p/{peer_id}")],
+                        "capabilities": {
+                            "supports_iroh_direct": true,
+                            "supports_streaming": true,
+                            "max_recommended_inline_bytes": 16384,
+                            "preferred_data_route": "iroh_direct"
+                        }
+                    },
+                    "extra": {
+                        "endpoint_id": format!("endpoint-{node_id}"),
+                        "alpn": "/wattswarm/iroh/1"
+                    }
+                }]
+            })),
+            contact_material_signature: Some(format!("sig-{node_id}")),
+            contact_material_updated_at: Some(updated_at),
+            first_identified_at: updated_at,
+            last_identified_at: updated_at,
+        },
+    )
+    .expect("save iroh peer metadata");
+}
+
+fn save_real_iroh_peer_metadata(
+    state_dir: &Path,
+    node_id: &str,
+    remote_state_dir: &Path,
+    updated_at: u64,
+) {
+    let remote_peer_id = local_peer_id(remote_state_dir).expect("remote peer id");
+    let remote_peer_id = remote_peer_id.parse().expect("parse remote peer id");
+    let transport = export_local_contact_material(remote_state_dir, &remote_peer_id, updated_at)
+        .expect("export remote iroh contact material");
+    save_peer_metadata_record_state(
+        state_dir,
+        &PeerMetadataRecord {
+            node_id: node_id.to_owned(),
+            network_id: Some("wan".to_owned()),
+            params_version: Some(7),
+            params_hash: Some("params-iroh".to_owned()),
+            agent_version_raw: Some("wattswarm-network-p2p|wan|7|params-iroh".to_owned()),
+            agent_version_prefix: Some("wattswarm-network-p2p".to_owned()),
+            protocol_version: Some("wattswarm/1.0.0".to_owned()),
+            observed_addr: Some(format!("/p2p/{}", transport.peer_id)),
+            listen_addrs: transport.metadata.listen_addrs.clone(),
+            protocols: vec![],
+            handshake_status: "contact_material".to_owned(),
+            last_error: None,
+            contact_material: Some(json!({
+                "peer_id": transport.peer_id,
+                "transports": [transport],
+            })),
+            contact_material_signature: Some(format!("sig-{node_id}")),
+            contact_material_updated_at: Some(updated_at),
+            first_identified_at: updated_at,
+            last_identified_at: updated_at,
+        },
+    )
+    .expect("save real iroh peer metadata");
 }
 
 fn with_udp_env(enabled: &str, mode: &str, addr: &str, port: u16) {
@@ -627,6 +734,55 @@ fn network_directory_snapshot_lists_networks_feeds_domains_and_sync_endpoints() 
         Some("/ip4/127.0.0.1/tcp/4999/p2p/12D3KooWJ5r1D8N8QYp8JDs7u9mM4rY2kQ6xXK7Z6A6V4t7N3sQX"),
     )
     .expect("save discovered peer");
+    save_peer_metadata_record_state(
+        &state_dir,
+        &PeerMetadataRecord {
+            node_id: "peer-udp".to_owned(),
+            network_id: Some("local".to_owned()),
+            params_version: Some(1),
+            params_hash: Some("params-local".to_owned()),
+            agent_version_raw: Some("wattswarm-network-p2p|local|1|params-local".to_owned()),
+            agent_version_prefix: Some("wattswarm-network-p2p".to_owned()),
+            protocol_version: Some("wattswarm/1.0.0".to_owned()),
+            observed_addr: Some(
+                "/ip4/127.0.0.1/tcp/4999/p2p/12D3KooWJ5r1D8N8QYp8JDs7u9mM4rY2kQ6xXK7Z6A6V4t7N3sQX"
+                    .to_owned(),
+            ),
+            listen_addrs: vec!["/ip4/127.0.0.1/tcp/4999/p2p/12D3KooWJ5r1D8N8QYp8JDs7u9mM4rY2kQ6xXK7Z6A6V4t7N3sQX".to_owned()],
+            protocols: vec![],
+            handshake_status: "contact_material".to_owned(),
+            last_error: None,
+            contact_material: Some(json!({
+                "peer_id": "12D3KooWJ5r1D8N8QYp8JDs7u9mM4rY2kQ6xXK7Z6A6V4t7N3sQX",
+                "transports": [{
+                    "transport": "iroh_direct",
+                    "peer_id": "12D3KooWJ5r1D8N8QYp8JDs7u9mM4rY2kQ6xXK7Z6A6V4t7N3sQX",
+                    "metadata": {
+                        "route": "iroh_direct",
+                        "generated_at": 42,
+                        "endpoint_id": "peer-udp-endpoint",
+                        "alpn": "/wattswarm/iroh/1",
+                        "listen_addrs": ["/p2p/12D3KooWJ5r1D8N8QYp8JDs7u9mM4rY2kQ6xXK7Z6A6V4t7N3sQX"],
+                        "capabilities": {
+                            "supports_iroh_direct": true,
+                            "supports_streaming": true,
+                            "max_recommended_inline_bytes": 16384,
+                            "preferred_data_route": "iroh_direct"
+                        }
+                    },
+                    "extra": {
+                        "endpoint_id": "peer-udp-endpoint",
+                        "alpn": "/wattswarm/iroh/1"
+                    }
+                }]
+            })),
+            contact_material_signature: Some("sig-peer-udp".to_owned()),
+            contact_material_updated_at: Some(42),
+            first_identified_at: 42,
+            last_identified_at: 42,
+        },
+    )
+    .expect("save peer metadata");
     node.store
         .upsert_feed_subscription("node-a", "feed-market", "region:sol-1", true, 10)
         .expect("feed subscription");
@@ -685,6 +841,102 @@ fn network_directory_snapshot_lists_networks_feeds_domains_and_sync_endpoints() 
             .iter()
             .any(|entry| entry.source_kind == "bootstrap")
     );
+    let udp_entry = snapshot
+        .sync_endpoints
+        .iter()
+        .find(|entry| entry.node_id == "peer-udp")
+        .expect("udp sync endpoint");
+    assert_eq!(udp_entry.transports, vec!["iroh_direct".to_owned()]);
+    assert_eq!(
+        udp_entry
+            .recommended_routes
+            .get("backfill_chunk")
+            .map(String::as_str),
+        Some("iroh_direct")
+    );
+    assert_eq!(
+        udp_entry
+            .recommended_routes
+            .get("artifact_blob")
+            .map(String::as_str),
+        Some("iroh_direct")
+    );
+    assert_eq!(
+        udp_entry
+            .recommended_routes
+            .get("checkpoint_snapshot")
+            .map(String::as_str),
+        Some("iroh_direct")
+    );
+
+    cleanup_dir(&dir);
+}
+
+#[test]
+fn recommended_transfer_route_uses_peer_contact_material_capabilities() {
+    let _guard = env_lock();
+    let _db_lock = DbTestLock::acquire();
+    let schema = format!("test_{}", Uuid::new_v4().simple());
+    reset_test_schema(&schema);
+    let _schema_guard = EnvVarGuard::set("WATTSWARM_PG_SCHEMA", &schema);
+    let dir = temp_test_dir("recommended-transfer-route");
+    let state_dir = dir.join("state");
+    fs::create_dir_all(&state_dir).expect("create state dir");
+    save_peer_metadata_record_state(
+        &state_dir,
+        &PeerMetadataRecord {
+            node_id: "peer-iroh".to_owned(),
+            network_id: Some("wan".to_owned()),
+            params_version: Some(7),
+            params_hash: Some("params-iroh".to_owned()),
+            agent_version_raw: Some("wattswarm-network-p2p|wan|7|params-iroh".to_owned()),
+            agent_version_prefix: Some("wattswarm-network-p2p".to_owned()),
+            protocol_version: Some("wattswarm/1.0.0".to_owned()),
+            observed_addr: Some("/ip4/198.51.100.7/tcp/4001".to_owned()),
+            listen_addrs: vec![],
+            protocols: vec![],
+            handshake_status: "contact_material".to_owned(),
+            last_error: None,
+            contact_material: Some(json!({
+                "peer_id": "peer-iroh-id",
+                "transports": [{
+                    "transport": "iroh_direct",
+                    "peer_id": "peer-iroh-id",
+                    "metadata": {
+                        "route": "iroh_direct",
+                        "generated_at": 7,
+                        "endpoint_id": "endpoint-7",
+                        "alpn": "/wattswarm/iroh/1",
+                        "listen_addrs": [],
+                        "capabilities": {
+                            "supports_iroh_direct": true,
+                            "supports_streaming": true,
+                            "max_recommended_inline_bytes": 16384,
+                            "preferred_data_route": "iroh_direct"
+                        }
+                    },
+                    "extra": {}
+                }]
+            })),
+            contact_material_signature: None,
+            contact_material_updated_at: Some(7),
+            first_identified_at: 7,
+            last_identified_at: 7,
+        },
+    )
+    .expect("save peer metadata");
+
+    let route = recommended_transfer_route_for_remote_node(
+        &state_dir,
+        "peer-iroh",
+        &TransferIntent {
+            kind: TransferKind::BackfillChunk,
+            payload_bytes: 64 * 1024,
+            requires_streaming: true,
+        },
+    )
+    .expect("recommended route");
+    assert_eq!(route, TransportRoute::IrohDirect);
 
     cleanup_dir(&dir);
 }
@@ -1452,6 +1704,412 @@ fn checkpoint_and_snapshot_artifacts_roundtrip_and_record_missing_retries() {
         fetch_snapshot_artifact_json::<serde_json::Value>(&state_dir, "region:sol-1", "snap-1", 36)
             .expect("fetch snapshot");
     assert_eq!(snapshot["epoch"], json!(7));
+
+    cleanup_dir(&dir);
+}
+
+#[test]
+fn missing_task_and_evidence_artifacts_record_remote_source_route() {
+    let _guard = env_lock();
+    let _db_lock = DbTestLock::acquire();
+    let schema = format!("test_{}", Uuid::new_v4().simple());
+    reset_test_schema(&schema);
+    let _schema_guard = EnvVarGuard::set("WATTSWARM_PG_SCHEMA", &schema);
+    let dir = temp_test_dir("artifact-source-route");
+    let state_dir = dir.join("state");
+    fs::create_dir_all(&state_dir).expect("create state dir");
+    let db_path = state_dir.join("test.state");
+    let mut node = open_node(&state_dir, &db_path).expect("open node");
+    let policy_hash = node
+        .policy_registry()
+        .binding_for("vp.schema_only.v1", json!({}))
+        .expect("policy binding")
+        .policy_hash;
+    let mut contract = sample_contract("task-remote-artifact", policy_hash);
+    contract.inputs = json!({"prompt":"remote artifact"});
+    node.submit_task(contract, 1, 39).expect("submit task");
+
+    save_iroh_peer_metadata(&state_dir, "node-remote", "12D3KooWRemoteSourceRoute", 40);
+
+    let detail_bytes = br#"{"detail":"remote"}"#;
+    let detail_digest = format!("sha256:{}", sha256_hex(detail_bytes));
+    node.announce_task(
+        "task-remote-artifact",
+        "announce-remote-artifact",
+        "feed-artifacts",
+        "global",
+        json!({"headline":"remote detail"}),
+        Some(wattswarm_control_plane::types::ArtifactRef {
+            uri: "ipfs://task-remote-artifact".to_owned(),
+            digest: detail_digest.clone(),
+            size_bytes: detail_bytes.len() as u64,
+            mime: "application/json".to_owned(),
+            created_at: 40,
+            producer: "node-remote".to_owned(),
+        }),
+        1,
+        40,
+    )
+    .expect("announce remote detail");
+
+    let missing_detail = fetch_task_detail_artifact(&state_dir, &node, "task-remote-artifact", 41);
+    assert!(missing_detail.is_err());
+
+    node.claim_task(
+        "task-remote-artifact",
+        wattswarm_control_plane::types::ClaimRole::Propose,
+        "exec-remote-evidence",
+        500,
+        1,
+        42,
+    )
+    .expect("claim task");
+    let evidence_bytes = br#"{"evidence":"remote"}"#;
+    let evidence_digest = format!("sha256:{}", sha256_hex(evidence_bytes));
+    let candidate = wattswarm_control_plane::types::Candidate {
+        candidate_id: "cand-remote-evidence".to_owned(),
+        execution_id: "exec-remote-evidence".to_owned(),
+        output: json!({"answer":"ok"}),
+        evidence_inline: vec![],
+        evidence_refs: vec![],
+    };
+    node.propose_candidate("task-remote-artifact", candidate, 1, 43)
+        .expect("propose candidate");
+    node.add_evidence(
+        "task-remote-artifact",
+        "cand-remote-evidence",
+        "exec-remote-evidence",
+        vec![wattswarm_control_plane::types::ArtifactRef {
+            uri: "ipfs://evidence-remote-artifact".to_owned(),
+            digest: evidence_digest.clone(),
+            size_bytes: evidence_bytes.len() as u64,
+            mime: "application/json".to_owned(),
+            created_at: 43,
+            producer: "node-remote".to_owned(),
+        }],
+        1,
+        44,
+    )
+    .expect("add remote evidence");
+
+    let missing_evidence = fetch_evidence_artifact(
+        &state_dir,
+        &node,
+        "task-remote-artifact",
+        "cand-remote-evidence",
+        &evidence_digest,
+        45,
+    );
+    assert!(missing_evidence.is_err());
+
+    let decisions = load_transport_decisions(&state_dir);
+    assert!(decisions.iter().any(|entry| {
+        entry["kind"] == json!("artifact_blob")
+            && entry["route"] == json!("iroh_direct")
+            && entry["source_node_id"] == json!("node-remote")
+            && entry["subject"]["artifact_kind"] == json!("task_detail")
+    }));
+    assert!(decisions.iter().any(|entry| {
+        entry["kind"] == json!("evidence_blob")
+            && entry["route"] == json!("iroh_direct")
+            && entry["source_node_id"] == json!("node-remote")
+            && entry["subject"]["artifact_kind"] == json!("evidence")
+    }));
+
+    cleanup_dir(&dir);
+}
+
+#[test]
+fn fetch_task_and_evidence_artifacts_over_iroh_when_remote_contact_material_is_available() {
+    let _guard = env_lock();
+    let _db_lock = DbTestLock::acquire();
+    let schema = format!("test_{}", Uuid::new_v4().simple());
+    reset_test_schema(&schema);
+    let _schema_guard = EnvVarGuard::set("WATTSWARM_PG_SCHEMA", &schema);
+
+    let dir = temp_test_dir("artifact-source-iroh");
+    let state_dir = dir.join("state");
+    let remote_state_dir = dir.join("remote-state");
+    fs::create_dir_all(&state_dir).expect("create state dir");
+    fs::create_dir_all(&remote_state_dir).expect("create remote state dir");
+    let db_path = state_dir.join("test.state");
+    let mut node = open_node(&state_dir, &db_path).expect("open node");
+
+    let policy_hash = node
+        .policy_registry()
+        .binding_for("vp.schema_only.v1", json!({}))
+        .expect("policy binding")
+        .policy_hash;
+    let mut contract = sample_contract("task-remote-artifact-iroh", policy_hash);
+    contract.inputs = json!({"prompt":"remote artifact over iroh"});
+    node.submit_task(contract, 1, 60).expect("submit task");
+
+    let _ = local_node_id(&remote_state_dir).expect("create remote node seed");
+    save_real_iroh_peer_metadata(&state_dir, "node-remote", &remote_state_dir, 61);
+
+    let remote_store = ArtifactStore::new(artifact_store_path(&remote_state_dir));
+    remote_store.ensure_layout().expect("remote store layout");
+
+    let detail_bytes = br#"{"detail":"remote-via-iroh"}"#;
+    let detail_digest = format!("sha256:{}", sha256_hex(detail_bytes));
+    remote_store
+        .write_validated_bytes(
+            ArtifactKind::Reference,
+            &detail_digest,
+            None,
+            detail_bytes,
+            Some(&detail_digest),
+            Some(detail_bytes.len() as u64),
+        )
+        .expect("write remote detail");
+    node.announce_task(
+        "task-remote-artifact-iroh",
+        "announce-remote-artifact-iroh",
+        "feed-artifacts",
+        "global",
+        json!({"headline":"remote detail"}),
+        Some(wattswarm_control_plane::types::ArtifactRef {
+            uri: "ipfs://task-remote-artifact-iroh".to_owned(),
+            digest: detail_digest.clone(),
+            size_bytes: detail_bytes.len() as u64,
+            mime: "application/json".to_owned(),
+            created_at: 61,
+            producer: "node-remote".to_owned(),
+        }),
+        1,
+        61,
+    )
+    .expect("announce remote detail");
+
+    let loaded_detail =
+        fetch_task_detail_artifact(&state_dir, &node, "task-remote-artifact-iroh", 62)
+            .expect("fetch detail over iroh");
+    assert_eq!(loaded_detail, detail_bytes);
+
+    node.claim_task(
+        "task-remote-artifact-iroh",
+        wattswarm_control_plane::types::ClaimRole::Propose,
+        "exec-remote-evidence-iroh",
+        500,
+        1,
+        63,
+    )
+    .expect("claim task");
+    let candidate = wattswarm_control_plane::types::Candidate {
+        candidate_id: "cand-remote-evidence-iroh".to_owned(),
+        execution_id: "exec-remote-evidence-iroh".to_owned(),
+        output: json!({"answer":"ok"}),
+        evidence_inline: vec![],
+        evidence_refs: vec![],
+    };
+    node.propose_candidate("task-remote-artifact-iroh", candidate, 1, 64)
+        .expect("propose candidate");
+
+    let evidence_bytes = br#"{"evidence":"remote-via-iroh"}"#;
+    let evidence_digest = format!("sha256:{}", sha256_hex(evidence_bytes));
+    remote_store
+        .write_validated_bytes(
+            ArtifactKind::Evidence,
+            &evidence_digest,
+            None,
+            evidence_bytes,
+            Some(&evidence_digest),
+            Some(evidence_bytes.len() as u64),
+        )
+        .expect("write remote evidence");
+    node.add_evidence(
+        "task-remote-artifact-iroh",
+        "cand-remote-evidence-iroh",
+        "exec-remote-evidence-iroh",
+        vec![wattswarm_control_plane::types::ArtifactRef {
+            uri: "ipfs://evidence-remote-artifact-iroh".to_owned(),
+            digest: evidence_digest.clone(),
+            size_bytes: evidence_bytes.len() as u64,
+            mime: "application/json".to_owned(),
+            created_at: 65,
+            producer: "node-remote".to_owned(),
+        }],
+        1,
+        65,
+    )
+    .expect("add evidence");
+
+    let loaded_evidence = fetch_evidence_artifact(
+        &state_dir,
+        &node,
+        "task-remote-artifact-iroh",
+        "cand-remote-evidence-iroh",
+        &evidence_digest,
+        66,
+    )
+    .expect("fetch evidence over iroh");
+    assert_eq!(loaded_evidence, evidence_bytes);
+
+    cleanup_dir(&dir);
+}
+
+#[test]
+fn missing_checkpoint_and_snapshot_artifacts_use_saved_source_binding_for_route() {
+    let _guard = env_lock();
+    let _db_lock = DbTestLock::acquire();
+    let schema = format!("test_{}", Uuid::new_v4().simple());
+    reset_test_schema(&schema);
+    let _schema_guard = EnvVarGuard::set("WATTSWARM_PG_SCHEMA", &schema);
+    let dir = temp_test_dir("checkpoint-snapshot-source-route");
+    let state_dir = dir.join("state");
+    fs::create_dir_all(&state_dir).expect("create state dir");
+    let db_path = state_dir.join("test.state");
+    let node = open_node(&state_dir, &db_path).expect("open node");
+
+    save_iroh_peer_metadata(&state_dir, "node-sync", "12D3KooWSyncSourceRoute", 50);
+    save_data_source_binding_record_state(
+        &state_dir,
+        &DataSourceBindingRecord {
+            binding_kind: DataSourceBindingKind::Checkpoint,
+            binding_scope: Some("global".to_owned()),
+            binding_key: "cp-source-1".to_owned(),
+            source_node_id: "node-sync".to_owned(),
+            source_uri: Some("ipfs://checkpoint-source-1".to_owned()),
+            updated_at: 50,
+        },
+    )
+    .expect("save checkpoint binding");
+    save_data_source_binding_record_state(
+        &state_dir,
+        &DataSourceBindingRecord {
+            binding_kind: DataSourceBindingKind::Snapshot,
+            binding_scope: Some("region:sol-1".to_owned()),
+            binding_key: "snap-source-1".to_owned(),
+            source_node_id: "node-sync".to_owned(),
+            source_uri: Some("ipfs://snapshot-source-1".to_owned()),
+            updated_at: 50,
+        },
+    )
+    .expect("save snapshot binding");
+
+    node.store
+        .put_checkpoint_announcement("global", "cp-source-1", "ipfs://checkpoint-source-1", 51)
+        .expect("put checkpoint announcement");
+
+    let missing_checkpoint = fetch_checkpoint_artifact_json::<serde_json::Value>(
+        &state_dir,
+        &node,
+        "global",
+        "cp-source-1",
+        52,
+    );
+    assert!(missing_checkpoint.is_err());
+
+    let missing_snapshot = fetch_snapshot_artifact_json::<serde_json::Value>(
+        &state_dir,
+        "region:sol-1",
+        "snap-source-1",
+        53,
+    );
+    assert!(missing_snapshot.is_err());
+
+    let decisions = load_transport_decisions(&state_dir);
+    assert!(decisions.iter().any(|entry| {
+        entry["kind"] == json!("checkpoint_snapshot")
+            && entry["route"] == json!("iroh_direct")
+            && entry["source_node_id"] == json!("node-sync")
+            && entry["subject"]["artifact_kind"] == json!("checkpoint")
+    }));
+    assert!(decisions.iter().any(|entry| {
+        entry["kind"] == json!("checkpoint_snapshot")
+            && entry["route"] == json!("iroh_direct")
+            && entry["source_node_id"] == json!("node-sync")
+            && entry["subject"]["artifact_kind"] == json!("snapshot")
+    }));
+
+    cleanup_dir(&dir);
+}
+
+#[test]
+fn fetch_checkpoint_and_snapshot_artifacts_over_iroh_when_remote_contact_material_is_available() {
+    let _guard = env_lock();
+    let _db_lock = DbTestLock::acquire();
+    let schema = format!("test_{}", Uuid::new_v4().simple());
+    reset_test_schema(&schema);
+    let _schema_guard = EnvVarGuard::set("WATTSWARM_PG_SCHEMA", &schema);
+
+    let dir = temp_test_dir("checkpoint-snapshot-iroh");
+    let state_dir = dir.join("state");
+    let remote_state_dir = dir.join("remote-state");
+    fs::create_dir_all(&state_dir).expect("create state dir");
+    fs::create_dir_all(&remote_state_dir).expect("create remote state dir");
+    let db_path = state_dir.join("test.state");
+    let node = open_node(&state_dir, &db_path).expect("open node");
+
+    let _ = local_node_id(&remote_state_dir).expect("create remote node seed");
+    save_real_iroh_peer_metadata(&state_dir, "node-sync", &remote_state_dir, 80);
+
+    save_data_source_binding_record_state(
+        &state_dir,
+        &DataSourceBindingRecord {
+            binding_kind: DataSourceBindingKind::Checkpoint,
+            binding_scope: Some("global".to_owned()),
+            binding_key: "cp-iroh-1".to_owned(),
+            source_node_id: "node-sync".to_owned(),
+            source_uri: Some("ipfs://checkpoint-iroh-1".to_owned()),
+            updated_at: 80,
+        },
+    )
+    .expect("save checkpoint binding");
+    save_data_source_binding_record_state(
+        &state_dir,
+        &DataSourceBindingRecord {
+            binding_kind: DataSourceBindingKind::Snapshot,
+            binding_scope: Some("region:sol-1".to_owned()),
+            binding_key: "snap-iroh-1".to_owned(),
+            source_node_id: "node-sync".to_owned(),
+            source_uri: Some("ipfs://snapshot-iroh-1".to_owned()),
+            updated_at: 80,
+        },
+    )
+    .expect("save snapshot binding");
+
+    node.store
+        .put_checkpoint_announcement("global", "cp-iroh-1", "ipfs://checkpoint-iroh-1", 81)
+        .expect("checkpoint announcement");
+
+    let remote_store = ArtifactStore::new(artifact_store_path(&remote_state_dir));
+    remote_store.ensure_layout().expect("remote store layout");
+    remote_store
+        .write_json(
+            &remote_store
+                .checkpoint_path("cp-iroh-1")
+                .expect("checkpoint path"),
+            &json!({"checkpoint":"cp-iroh-1","up_to_seq":77}),
+        )
+        .expect("write remote checkpoint");
+    remote_store
+        .write_json(
+            &remote_store
+                .snapshot_path("region:sol-1", "snap-iroh-1")
+                .expect("snapshot path"),
+            &json!({"snapshot":"snap-iroh-1","epoch":9}),
+        )
+        .expect("write remote snapshot");
+
+    let checkpoint = fetch_checkpoint_artifact_json::<serde_json::Value>(
+        &state_dir,
+        &node,
+        "global",
+        "cp-iroh-1",
+        82,
+    )
+    .expect("fetch checkpoint over iroh");
+    assert_eq!(checkpoint["up_to_seq"], json!(77));
+
+    let snapshot = fetch_snapshot_artifact_json::<serde_json::Value>(
+        &state_dir,
+        "region:sol-1",
+        "snap-iroh-1",
+        83,
+    )
+    .expect("fetch snapshot over iroh");
+    assert_eq!(snapshot["epoch"], json!(9));
 
     cleanup_dir(&dir);
 }

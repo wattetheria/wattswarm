@@ -5,6 +5,8 @@ members = [
   "crates/crypto",
   "crates/artifact-store",
   "crates/network-substrate",
+  "crates/network-transport-core",
+  "crates/network-transport-iroh",
   "crates/network-p2p",
   "crates/policy-engine",
   "crates/runtime-client",
@@ -44,6 +46,8 @@ wattswarm-protocol = { path = "crates/protocol" }
 wattswarm-crypto = { path = "crates/crypto" }
 wattswarm-artifact-store = { path = "crates/artifact-store" }
 wattswarm-network-substrate = { path = "crates/network-substrate" }
+wattswarm-network-transport-core = { path = "crates/network-transport-core" }
+wattswarm-network-transport-iroh = { path = "crates/network-transport-iroh" }
 wattswarm-network-p2p = { path = "crates/network-p2p" }
 wattswarm-policy-engine = { path = "crates/policy-engine" }
 wattswarm-runtime-client = { path = "crates/runtime-client" }

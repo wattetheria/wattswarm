@@ -1,66 +1,89 @@
 mod support;
 
+use std::sync::{Mutex, MutexGuard, OnceLock};
+
+fn network_bridge_local_test_guard() -> MutexGuard<'static, ()> {
+    static GUARD: OnceLock<Mutex<()>> = OnceLock::new();
+    GUARD
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .expect("network bridge local integration mutex poisoned")
+}
+
 #[test]
 fn two_nodes_sync_global_event_over_libp2p() {
+    let _guard = network_bridge_local_test_guard();
     support::network_bridge::two_nodes_sync_global_event_over_libp2p();
 }
 
 #[test]
 fn global_task_detail_sync_excludes_process_firehose() {
+    let _guard = network_bridge_local_test_guard();
     support::network_bridge::global_task_detail_sync_excludes_process_firehose();
 }
 
 #[test]
 fn two_nodes_backfill_missing_events_over_request_response() {
+    let _guard = network_bridge_local_test_guard();
     support::network_bridge::two_nodes_backfill_missing_events_over_request_response();
 }
 
 #[test]
 fn two_nodes_execute_peer_relationship_request_and_accept_over_network() {
+    let _guard = network_bridge_local_test_guard();
     support::network_bridge::two_nodes_execute_peer_relationship_request_and_accept_over_network();
 }
 
 #[test]
 fn two_nodes_execute_peer_relationship_request_and_block_over_network() {
+    let _guard = network_bridge_local_test_guard();
     support::network_bridge::two_nodes_execute_peer_relationship_request_and_block_over_network();
 }
 
 #[test]
 fn two_nodes_establish_dm_session_and_exchange_messages_over_network() {
+    let _guard = network_bridge_local_test_guard();
     support::network_bridge::two_nodes_establish_dm_session_and_exchange_messages_over_network();
 }
 
 #[test]
 fn region_scoped_backfill_only_reaches_region_subscribers() {
+    let _guard = network_bridge_local_test_guard();
     support::network_bridge::region_scoped_backfill_only_reaches_region_subscribers();
 }
 
 #[test]
 fn node_scoped_live_sync_only_reaches_matching_node_scope() {
+    let _guard = network_bridge_local_test_guard();
     support::network_bridge::node_scoped_live_sync_only_reaches_matching_node_scope();
 }
 
 #[test]
 fn group_scoped_live_sync_only_reaches_matching_group_scope() {
+    let _guard = network_bridge_local_test_guard();
     support::network_bridge::group_scoped_live_sync_only_reaches_matching_group_scope();
 }
 
 #[test]
 fn subnet_nodes_sync_and_mainnet_overlay_stays_isolated() {
+    let _guard = network_bridge_local_test_guard();
     support::network_bridge::subnet_nodes_sync_and_mainnet_overlay_stays_isolated();
 }
 
 #[test]
 fn summary_gossip_imports_knowledge_and_reputation_into_remote_store() {
+    let _guard = network_bridge_local_test_guard();
     support::network_bridge::summary_gossip_imports_knowledge_and_reputation_into_remote_store();
 }
 
 #[test]
 fn revoked_event_propagates_and_removes_remote_projection_state() {
+    let _guard = network_bridge_local_test_guard();
     support::network_bridge::revoked_event_propagates_and_removes_remote_projection_state();
 }
 
 #[test]
 fn revoked_summary_event_removes_remote_imported_state() {
+    let _guard = network_bridge_local_test_guard();
     support::network_bridge::revoked_summary_event_removes_remote_imported_state();
 }

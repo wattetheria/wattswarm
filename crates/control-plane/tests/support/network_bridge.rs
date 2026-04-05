@@ -229,6 +229,7 @@ fn temp_test_dir(prefix: &str) -> PathBuf {
 }
 
 fn cleanup_dir(path: &Path) {
+    wattswarm_network_transport_iroh::shutdown_local_iroh_data_plane(path);
     let _ = fs::remove_dir_all(path);
 }
 
@@ -675,6 +676,58 @@ pub fn two_nodes_establish_dm_session_and_exchange_messages_over_network() {
         last_direct_tick_a,
         last_direct_tick_b,
     );
+
+    let contact_a = contact_material_for(&dir_a, &remote_b).expect("contact material for b on a");
+    let contact_b = contact_material_for(&dir_b, &remote_a).expect("contact material for a on b");
+    for contact in [&contact_a, &contact_b] {
+        let transports = contact
+            .get("transports")
+            .and_then(|value| value.as_array())
+            .expect("transports array");
+        assert!(
+            transports.iter().any(|entry| {
+                entry.get("transport").and_then(|value| value.as_str()) == Some("iroh_direct")
+            }),
+            "contact material should advertise iroh_direct transport"
+        );
+        let routes = contact
+            .get("recommended_routes")
+            .expect("recommended_routes object");
+        assert_eq!(
+            routes
+                .get("direct_message")
+                .and_then(|value| value.as_str()),
+            Some("iroh_direct")
+        );
+        assert_eq!(
+            routes
+                .get("backfill_chunk")
+                .and_then(|value| value.as_str()),
+            Some("iroh_direct")
+        );
+        assert_eq!(
+            routes.get("topic_sync").and_then(|value| value.as_str()),
+            Some("iroh_direct")
+        );
+        assert_eq!(
+            routes.get("task_sync").and_then(|value| value.as_str()),
+            Some("iroh_direct")
+        );
+        assert_eq!(
+            routes.get("artifact_blob").and_then(|value| value.as_str()),
+            Some("iroh_direct")
+        );
+        assert_eq!(
+            routes.get("evidence_blob").and_then(|value| value.as_str()),
+            Some("iroh_direct")
+        );
+        assert_eq!(
+            routes
+                .get("checkpoint_snapshot")
+                .and_then(|value| value.as_str()),
+            Some("iroh_direct")
+        );
+    }
 
     service_a
         .send_peer_direct_message(&remote_b, None, json!({"text":"hello from a"}))

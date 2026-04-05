@@ -8,7 +8,7 @@ use crate::types::{
     ExecutionSetMember, FinalityProof, Membership, NetworkBootstrapBundle, Role, TaskContract,
     VoteChoice, VoteCommitPayload, VoteRevealPayload,
 };
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
@@ -22,6 +22,11 @@ use uuid::Uuid;
 use wattswarm_artifact_store::{
     ArtifactAvailabilityManifest, ArtifactAvailabilityStatus, ArtifactKind, ArtifactStore,
 };
+use wattswarm_network_transport_core::{
+    DirectDataFetchRequest, DirectDataObjectKind, PeerTransportCapabilities, TransferIntent,
+    TransferKind, TransportContactMaterial, TransportRoute as DataTransportRoute, TransportRouter,
+};
+use wattswarm_network_transport_iroh::fetch_direct_data;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeState {
@@ -161,6 +166,102 @@ pub struct PeerMetadataRecord {
     pub contact_material_updated_at: Option<u64>,
     pub first_identified_at: u64,
     pub last_identified_at: u64,
+}
+
+impl PeerMetadataRecord {
+    pub fn contact_material_transport_peer_id(&self) -> Option<String> {
+        self.contact_material
+            .as_ref()
+            .and_then(|material| material.get("peer_id"))
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+    }
+
+    pub fn transport_capabilities(&self) -> Option<PeerTransportCapabilities> {
+        let material = self.contact_material.as_ref()?;
+        let transports = material.get("transports")?.as_array()?;
+        transports.iter().find_map(|entry| {
+            serde_json::from_value::<TransportContactMaterial>(entry.clone())
+                .ok()
+                .map(|contact| contact.metadata.capabilities)
+        })
+    }
+
+    pub fn advertised_transports(&self) -> Vec<String> {
+        let Some(material) = &self.contact_material else {
+            return Vec::new();
+        };
+        let Some(transports) = material.get("transports").and_then(Value::as_array) else {
+            return Vec::new();
+        };
+        transports
+            .iter()
+            .filter_map(|entry| entry.get("transport").and_then(Value::as_str))
+            .map(str::to_owned)
+            .collect()
+    }
+
+    pub fn recommended_data_routes(&self) -> BTreeMap<String, String> {
+        recommended_data_routes(self.transport_capabilities().as_ref())
+    }
+
+    pub fn transport_contact_material(
+        &self,
+        route: DataTransportRoute,
+    ) -> Option<TransportContactMaterial> {
+        let material = self.contact_material.as_ref()?;
+        let transports = material.get("transports")?.as_array()?;
+        transports.iter().find_map(|entry| {
+            let contact = serde_json::from_value::<TransportContactMaterial>(entry.clone()).ok()?;
+            if contact.metadata.route == route {
+                Some(contact)
+            } else {
+                None
+            }
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DataSourceBindingKind {
+    TaskDetail,
+    Evidence,
+    Checkpoint,
+    Snapshot,
+}
+
+impl DataSourceBindingKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::TaskDetail => "task_detail",
+            Self::Evidence => "evidence",
+            Self::Checkpoint => "checkpoint",
+            Self::Snapshot => "snapshot",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "task_detail" => Ok(Self::TaskDetail),
+            "evidence" => Ok(Self::Evidence),
+            "checkpoint" => Ok(Self::Checkpoint),
+            "snapshot" => Ok(Self::Snapshot),
+            other => Err(anyhow!("unsupported data source binding kind '{other}'")),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DataSourceBindingRecord {
+    pub binding_kind: DataSourceBindingKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binding_scope: Option<String>,
+    pub binding_key: String,
+    pub source_node_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_uri: Option<String>,
+    pub updated_at: u64,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -482,6 +583,10 @@ pub struct DirectorySyncEndpoint {
     pub node_id: String,
     pub listen_addr: String,
     pub source_kind: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub transports: Vec<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub recommended_routes: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -830,6 +935,315 @@ fn default_artifact_retry_after_ms() -> u64 {
     30_000
 }
 
+fn transport_intents() -> Vec<TransferIntent> {
+    vec![
+        TransferIntent {
+            kind: TransferKind::DirectMessage,
+            payload_bytes: 4 * 1024,
+            requires_streaming: false,
+        },
+        TransferIntent {
+            kind: TransferKind::TopicSync,
+            payload_bytes: 8 * 1024,
+            requires_streaming: false,
+        },
+        TransferIntent {
+            kind: TransferKind::TaskSync,
+            payload_bytes: 8 * 1024,
+            requires_streaming: false,
+        },
+        TransferIntent {
+            kind: TransferKind::BackfillChunk,
+            payload_bytes: 64 * 1024,
+            requires_streaming: true,
+        },
+        TransferIntent {
+            kind: TransferKind::ArtifactBlob,
+            payload_bytes: 256 * 1024,
+            requires_streaming: true,
+        },
+        TransferIntent {
+            kind: TransferKind::EvidenceBlob,
+            payload_bytes: 256 * 1024,
+            requires_streaming: true,
+        },
+        TransferIntent {
+            kind: TransferKind::CheckpointSnapshot,
+            payload_bytes: 256 * 1024,
+            requires_streaming: true,
+        },
+    ]
+}
+
+pub fn recommended_data_routes(
+    capabilities: Option<&PeerTransportCapabilities>,
+) -> BTreeMap<String, String> {
+    transport_intents()
+        .into_iter()
+        .map(|intent| {
+            (
+                intent.kind.as_str().to_owned(),
+                TransportRouter::select(&intent, capabilities)
+                    .as_str()
+                    .to_owned(),
+            )
+        })
+        .collect()
+}
+
+pub fn recommended_transfer_route_for_remote_node(
+    state_dir: &Path,
+    remote_node_id: &str,
+    intent: &TransferIntent,
+) -> Result<DataTransportRoute> {
+    let capabilities = load_peer_metadata_records_state(state_dir)?
+        .into_iter()
+        .find(|record| record.node_id == remote_node_id)
+        .and_then(|record| record.transport_capabilities());
+    Ok(TransportRouter::select(intent, capabilities.as_ref()))
+}
+
+pub fn load_peer_metadata_record_for_transport_peer_id_state(
+    state_dir: &Path,
+    peer_id: &str,
+) -> Result<Option<PeerMetadataRecord>> {
+    Ok(load_peer_metadata_records_state(state_dir)?
+        .into_iter()
+        .find(|record| record.contact_material_transport_peer_id().as_deref() == Some(peer_id)))
+}
+
+fn load_peer_metadata_record_for_remote_node_state(
+    state_dir: &Path,
+    remote_node_id: &str,
+) -> Result<Option<PeerMetadataRecord>> {
+    Ok(load_peer_metadata_records_state(state_dir)?
+        .into_iter()
+        .find(|record| record.node_id == remote_node_id))
+}
+
+fn append_transport_decision_entry(state_dir: &Path, entry: &Value) {
+    let path = state_dir.join("transport_decisions.jsonl");
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    if let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(&path) {
+        let _ = std::io::Write::write_all(&mut file, entry.to_string().as_bytes());
+        let _ = std::io::Write::write_all(&mut file, b"\n");
+    }
+}
+
+fn task_detail_binding_key(task_id: &str) -> String {
+    task_id.to_owned()
+}
+
+fn evidence_binding_key(task_id: &str, candidate_id: &str, evidence_digest: &str) -> String {
+    format!("{task_id}:{candidate_id}:{evidence_digest}")
+}
+
+fn checkpoint_binding_key(checkpoint_id: &str) -> String {
+    checkpoint_id.to_owned()
+}
+
+fn snapshot_binding_key(snapshot_id: &str) -> String {
+    snapshot_id.to_owned()
+}
+
+fn record_transport_decision_for_binding(
+    state_dir: &Path,
+    binding: Option<&DataSourceBindingRecord>,
+    intent: &TransferIntent,
+    route: DataTransportRoute,
+    subject: Value,
+) {
+    append_transport_decision_entry(
+        state_dir,
+        &json!({
+            "kind": intent.kind.as_str(),
+            "route": route.as_str(),
+            "source_node_id": binding.map(|row| row.source_node_id.clone()),
+            "binding_kind": binding.map(|row| row.binding_kind.as_str().to_owned()),
+            "binding_scope": binding.and_then(|row| row.binding_scope.clone()),
+            "binding_key": binding.map(|row| row.binding_key.clone()),
+            "source_uri": binding.and_then(|row| row.source_uri.clone()),
+            "decided_at": observed_at_ms(),
+            "subject": subject,
+        }),
+    );
+}
+
+fn record_missing_manifest_with_binding(
+    artifact_store: &ArtifactStore,
+    kind: ArtifactKind,
+    artifact_id: &str,
+    scope: Option<&str>,
+    source_uri: Option<&str>,
+    expected_digest: Option<&str>,
+    mime: Option<&str>,
+    size_bytes: Option<u64>,
+    observed_at: u64,
+    binding: Option<&DataSourceBindingRecord>,
+    route: DataTransportRoute,
+    error: anyhow::Error,
+) -> Result<()> {
+    let detail = match binding {
+        Some(binding) => format!(
+            "{}; source_node_id={}; route={}",
+            error,
+            binding.source_node_id,
+            route.as_str()
+        ),
+        None => format!("{error}; route={}", route.as_str()),
+    };
+    write_missing_manifest(
+        artifact_store,
+        kind,
+        artifact_id,
+        scope,
+        source_uri,
+        expected_digest,
+        mime,
+        size_bytes,
+        observed_at,
+        anyhow!(detail),
+    )
+}
+
+fn resolve_route_for_binding(
+    state_dir: &Path,
+    binding: Option<&DataSourceBindingRecord>,
+    intent: &TransferIntent,
+) -> Result<DataTransportRoute> {
+    let Some(binding) = binding else {
+        return Ok(DataTransportRoute::Libp2pControl);
+    };
+    recommended_transfer_route_for_remote_node(state_dir, &binding.source_node_id, intent)
+}
+
+fn fetch_via_iroh_route(
+    state_dir: &Path,
+    remote_node_id: &str,
+    request: &DirectDataFetchRequest,
+) -> Result<Vec<u8>> {
+    let metadata = load_peer_metadata_record_for_remote_node_state(state_dir, remote_node_id)?
+        .ok_or_else(|| anyhow!("missing peer metadata for {remote_node_id}"))?;
+    let contact = metadata
+        .transport_contact_material(DataTransportRoute::IrohDirect)
+        .ok_or_else(|| anyhow!("missing iroh_direct contact material for {remote_node_id}"))?;
+    let local_peer_id = local_peer_id(state_dir)?
+        .parse()
+        .map_err(|err| anyhow!("parse local peer id: {err}"))?;
+    let response = fetch_direct_data(state_dir, &local_peer_id, &contact, request)?;
+    Ok(response.bytes)
+}
+
+fn maybe_fetch_reference_artifact_via_transport(
+    state_dir: &Path,
+    kind: ArtifactKind,
+    artifact_id: &str,
+    source_uri: &str,
+    expected_digest: &str,
+    mime: &str,
+    size_bytes: u64,
+    observed_at: u64,
+    binding: Option<&DataSourceBindingRecord>,
+    route: DataTransportRoute,
+) -> Result<Option<Vec<u8>>> {
+    if route != DataTransportRoute::IrohDirect {
+        return Ok(None);
+    }
+    let Some(binding) = binding else {
+        return Ok(None);
+    };
+    let object_kind = match kind {
+        ArtifactKind::Reference => DirectDataObjectKind::ReferenceArtifact,
+        ArtifactKind::Evidence => DirectDataObjectKind::EvidenceArtifact,
+        _ => bail!("unsupported reference artifact kind {:?}", kind),
+    };
+    let bytes = fetch_via_iroh_route(
+        state_dir,
+        &binding.source_node_id,
+        &DirectDataFetchRequest {
+            object_kind,
+            object_id: artifact_id.to_owned(),
+            scope: None,
+            source_uri: Some(source_uri.to_owned()),
+            expected_digest: Some(expected_digest.to_owned()),
+            expected_size: Some(size_bytes),
+        },
+    )?;
+    let _ = materialize_reference_artifact(
+        state_dir,
+        kind,
+        artifact_id,
+        source_uri,
+        expected_digest,
+        mime,
+        size_bytes,
+        &bytes,
+        observed_at,
+    )?;
+    Ok(Some(bytes))
+}
+
+fn maybe_fetch_json_artifact_via_transport(
+    state_dir: &Path,
+    kind: ArtifactKind,
+    scope_key: &str,
+    artifact_id: &str,
+    source_uri: Option<&str>,
+    observed_at: u64,
+    binding: Option<&DataSourceBindingRecord>,
+    route: DataTransportRoute,
+) -> Result<Option<Vec<u8>>> {
+    if route != DataTransportRoute::IrohDirect {
+        return Ok(None);
+    }
+    let Some(binding) = binding else {
+        return Ok(None);
+    };
+    let object_kind = match kind {
+        ArtifactKind::Checkpoint => DirectDataObjectKind::CheckpointJson,
+        ArtifactKind::Snapshot => DirectDataObjectKind::SnapshotJson,
+        _ => bail!("unsupported json artifact kind {:?}", kind),
+    };
+    let bytes = fetch_via_iroh_route(
+        state_dir,
+        &binding.source_node_id,
+        &DirectDataFetchRequest {
+            object_kind,
+            object_id: artifact_id.to_owned(),
+            scope: Some(scope_key.to_owned()),
+            source_uri: source_uri.map(str::to_owned),
+            expected_digest: None,
+            expected_size: None,
+        },
+    )?;
+    let artifact_store = open_local_artifact_store(state_dir)?;
+    let path = match kind {
+        ArtifactKind::Checkpoint => artifact_store.checkpoint_path(artifact_id)?,
+        ArtifactKind::Snapshot => artifact_store.snapshot_path(scope_key, artifact_id)?,
+        _ => unreachable!("validated above"),
+    };
+    artifact_store.write_bytes(&path, &bytes)?;
+    let manifest = availability_manifest(
+        kind,
+        artifact_id,
+        Some(scope_key),
+        source_uri,
+        None,
+        Some("application/json"),
+        None,
+        Some(&path),
+        ArtifactAvailabilityStatus::Available,
+        observed_at,
+        0,
+        None,
+        None,
+    );
+    artifact_store.write_availability_manifest(&manifest)?;
+    Ok(Some(bytes))
+}
+
 fn observed_at_ms() -> u64 {
     chrono::Utc::now().timestamp_millis().max(0) as u64
 }
@@ -895,11 +1309,21 @@ pub fn load_network_directory_snapshot(
         })
         .collect::<Vec<_>>();
 
+    let peer_metadata = load_peer_metadata_records_state(state_dir)?
+        .into_iter()
+        .map(|record| (record.node_id.clone(), record))
+        .collect::<BTreeMap<_, _>>();
     let mut sync_endpoints = BTreeMap::<(String, String), DirectorySyncEndpoint>::new();
     for record in load_discovered_peer_records_state(state_dir)? {
         let Some(listen_addr) = record.listen_addr else {
             continue;
         };
+        let transports = peer_metadata
+            .get(&record.node_id)
+            .map_or_else(Vec::new, PeerMetadataRecord::advertised_transports);
+        let recommended_routes = peer_metadata
+            .get(&record.node_id)
+            .map_or_else(BTreeMap::new, PeerMetadataRecord::recommended_data_routes);
         sync_endpoints.insert(
             (record.node_id.clone(), listen_addr.clone()),
             DirectorySyncEndpoint {
@@ -907,6 +1331,8 @@ pub fn load_network_directory_snapshot(
                 node_id: record.node_id,
                 listen_addr,
                 source_kind: "udp_discovery".to_owned(),
+                transports,
+                recommended_routes,
             },
         );
     }
@@ -920,6 +1346,12 @@ pub fn load_network_directory_snapshot(
         }
         let node_id = node_id.trim().to_owned();
         let key = (node_id.clone(), raw_addr.clone());
+        let transports = peer_metadata
+            .get(&node_id)
+            .map_or_else(Vec::new, PeerMetadataRecord::advertised_transports);
+        let recommended_routes = peer_metadata
+            .get(&node_id)
+            .map_or_else(BTreeMap::new, PeerMetadataRecord::recommended_data_routes);
         sync_endpoints
             .entry(key)
             .and_modify(|entry| entry.source_kind = "bootstrap".to_owned())
@@ -928,6 +1360,8 @@ pub fn load_network_directory_snapshot(
                 node_id,
                 listen_addr: raw_addr,
                 source_kind: "bootstrap".to_owned(),
+                transports,
+                recommended_routes,
             });
     }
 
@@ -985,6 +1419,25 @@ fn load_task_detail_reference(node: &Node, task_id: &str) -> Result<crate::types
         .ok_or_else(|| anyhow!("task announcement detail_ref missing for task {task_id}"))
 }
 
+fn task_detail_data_source_binding(
+    task_id: &str,
+    reference: &crate::types::ArtifactRef,
+    observed_at: u64,
+) -> Option<DataSourceBindingRecord> {
+    let source_node_id = reference.producer.trim();
+    if source_node_id.is_empty() {
+        return None;
+    }
+    Some(DataSourceBindingRecord {
+        binding_kind: DataSourceBindingKind::TaskDetail,
+        binding_scope: None,
+        binding_key: task_detail_binding_key(task_id),
+        source_node_id: source_node_id.to_owned(),
+        source_uri: Some(reference.uri.clone()),
+        updated_at: observed_at,
+    })
+}
+
 fn load_evidence_reference(
     node: &Node,
     task_id: &str,
@@ -1008,6 +1461,27 @@ fn load_evidence_reference(
         .ok_or_else(|| {
             anyhow!("evidence ref {evidence_digest} missing for candidate {candidate_id}")
         })
+}
+
+fn evidence_data_source_binding(
+    task_id: &str,
+    candidate_id: &str,
+    evidence_digest: &str,
+    reference: &crate::types::ArtifactRef,
+    observed_at: u64,
+) -> Option<DataSourceBindingRecord> {
+    let source_node_id = reference.producer.trim();
+    if source_node_id.is_empty() {
+        return None;
+    }
+    Some(DataSourceBindingRecord {
+        binding_kind: DataSourceBindingKind::Evidence,
+        binding_scope: None,
+        binding_key: evidence_binding_key(task_id, candidate_id, evidence_digest),
+        source_node_id: source_node_id.to_owned(),
+        source_uri: Some(reference.uri.clone()),
+        updated_at: observed_at,
+    })
 }
 
 fn write_missing_manifest(
@@ -1092,6 +1566,9 @@ fn fetch_reference_artifact(
     mime: &str,
     size_bytes: u64,
     observed_at: u64,
+    binding: Option<&DataSourceBindingRecord>,
+    intent: &TransferIntent,
+    subject: Value,
 ) -> Result<Vec<u8>> {
     let artifact_store = open_local_artifact_store(state_dir)?;
     match artifact_store.read_validated_bytes(
@@ -1128,7 +1605,25 @@ fn fetch_reference_artifact(
             Ok(bytes)
         }
         Err(err) => {
-            write_missing_manifest(
+            let route = resolve_route_for_binding(state_dir, binding, intent)?;
+            let transport_fetch_error = match maybe_fetch_reference_artifact_via_transport(
+                state_dir,
+                kind,
+                artifact_id,
+                source_uri,
+                expected_digest,
+                mime,
+                size_bytes,
+                observed_at,
+                binding,
+                route,
+            ) {
+                Ok(Some(bytes)) => return Ok(bytes),
+                Ok(None) => None,
+                Err(fetch_err) => Some(fetch_err),
+            };
+            record_transport_decision_for_binding(state_dir, binding, intent, route, subject);
+            record_missing_manifest_with_binding(
                 &artifact_store,
                 kind,
                 artifact_id,
@@ -1138,7 +1633,14 @@ fn fetch_reference_artifact(
                 Some(mime),
                 Some(size_bytes),
                 observed_at,
-                err.context("fetch reference artifact"),
+                binding,
+                route,
+                match transport_fetch_error {
+                    Some(fetch_err) => {
+                        err.context(format!("iroh fetch reference artifact: {fetch_err}"))
+                    }
+                    None => err.context("fetch reference artifact"),
+                },
             )?;
             Err(anyhow!("artifact {} is not locally available", artifact_id))
         }
@@ -1173,6 +1675,10 @@ pub fn fetch_task_detail_artifact(
     observed_at: u64,
 ) -> Result<Vec<u8>> {
     let reference = load_task_detail_reference(node, task_id)?;
+    let binding = task_detail_data_source_binding(task_id, &reference, observed_at);
+    if let Some(binding) = binding.as_ref() {
+        save_data_source_binding_record_state(state_dir, binding)?;
+    }
     fetch_reference_artifact(
         state_dir,
         ArtifactKind::Reference,
@@ -1182,6 +1688,17 @@ pub fn fetch_task_detail_artifact(
         &reference.mime,
         reference.size_bytes,
         observed_at,
+        binding.as_ref(),
+        &TransferIntent {
+            kind: TransferKind::ArtifactBlob,
+            payload_bytes: reference.size_bytes as usize,
+            requires_streaming: reference.size_bytes > 16 * 1024,
+        },
+        json!({
+            "artifact_kind": "task_detail",
+            "task_id": task_id,
+            "artifact_id": reference.digest,
+        }),
     )
 }
 
@@ -1217,6 +1734,16 @@ pub fn fetch_evidence_artifact(
     observed_at: u64,
 ) -> Result<Vec<u8>> {
     let reference = load_evidence_reference(node, task_id, candidate_id, evidence_digest)?;
+    let binding = evidence_data_source_binding(
+        task_id,
+        candidate_id,
+        evidence_digest,
+        &reference,
+        observed_at,
+    );
+    if let Some(binding) = binding.as_ref() {
+        save_data_source_binding_record_state(state_dir, binding)?;
+    }
     fetch_reference_artifact(
         state_dir,
         ArtifactKind::Evidence,
@@ -1226,6 +1753,18 @@ pub fn fetch_evidence_artifact(
         &reference.mime,
         reference.size_bytes,
         observed_at,
+        binding.as_ref(),
+        &TransferIntent {
+            kind: TransferKind::EvidenceBlob,
+            payload_bytes: reference.size_bytes as usize,
+            requires_streaming: reference.size_bytes > 16 * 1024,
+        },
+        json!({
+            "artifact_kind": "evidence",
+            "task_id": task_id,
+            "candidate_id": candidate_id,
+            "artifact_id": reference.digest,
+        }),
     )
 }
 
@@ -1307,7 +1846,44 @@ pub fn fetch_checkpoint_artifact_json<T: DeserializeOwned>(
             Ok(value)
         }
         Err(err) => {
-            write_missing_manifest(
+            let binding = load_data_source_binding_record_state(
+                state_dir,
+                DataSourceBindingKind::Checkpoint,
+                Some(scope_key),
+                &checkpoint_binding_key(checkpoint_id),
+            )?;
+            let intent = TransferIntent {
+                kind: TransferKind::CheckpointSnapshot,
+                payload_bytes: 256 * 1024,
+                requires_streaming: true,
+            };
+            let route = resolve_route_for_binding(state_dir, binding.as_ref(), &intent)?;
+            let transport_fetch_error = match maybe_fetch_json_artifact_via_transport(
+                state_dir,
+                ArtifactKind::Checkpoint,
+                scope_key,
+                checkpoint_id,
+                Some(&checkpoint.artifact_path),
+                observed_at,
+                binding.as_ref(),
+                route,
+            ) {
+                Ok(Some(bytes)) => return Ok(serde_json::from_slice(&bytes)?),
+                Ok(None) => None,
+                Err(fetch_err) => Some(fetch_err),
+            };
+            record_transport_decision_for_binding(
+                state_dir,
+                binding.as_ref(),
+                &intent,
+                route,
+                json!({
+                    "artifact_kind": "checkpoint",
+                    "scope_key": scope_key,
+                    "checkpoint_id": checkpoint_id,
+                }),
+            );
+            record_missing_manifest_with_binding(
                 &artifact_store,
                 ArtifactKind::Checkpoint,
                 checkpoint_id,
@@ -1317,7 +1893,14 @@ pub fn fetch_checkpoint_artifact_json<T: DeserializeOwned>(
                 Some("application/json"),
                 None,
                 observed_at,
-                err.context("fetch checkpoint artifact"),
+                binding.as_ref(),
+                route,
+                match transport_fetch_error {
+                    Some(fetch_err) => {
+                        err.context(format!("iroh fetch checkpoint artifact: {fetch_err}"))
+                    }
+                    None => err.context("fetch checkpoint artifact"),
+                },
             )?;
             Err(anyhow!(
                 "checkpoint artifact {checkpoint_id} is not locally available"
@@ -1391,7 +1974,44 @@ pub fn fetch_snapshot_artifact_json<T: DeserializeOwned>(
             Ok(value)
         }
         Err(err) => {
-            write_missing_manifest(
+            let binding = load_data_source_binding_record_state(
+                state_dir,
+                DataSourceBindingKind::Snapshot,
+                Some(scope_key),
+                &snapshot_binding_key(snapshot_id),
+            )?;
+            let intent = TransferIntent {
+                kind: TransferKind::CheckpointSnapshot,
+                payload_bytes: 256 * 1024,
+                requires_streaming: true,
+            };
+            let route = resolve_route_for_binding(state_dir, binding.as_ref(), &intent)?;
+            let transport_fetch_error = match maybe_fetch_json_artifact_via_transport(
+                state_dir,
+                ArtifactKind::Snapshot,
+                scope_key,
+                snapshot_id,
+                None,
+                observed_at,
+                binding.as_ref(),
+                route,
+            ) {
+                Ok(Some(bytes)) => return Ok(serde_json::from_slice(&bytes)?),
+                Ok(None) => None,
+                Err(fetch_err) => Some(fetch_err),
+            };
+            record_transport_decision_for_binding(
+                state_dir,
+                binding.as_ref(),
+                &intent,
+                route,
+                json!({
+                    "artifact_kind": "snapshot",
+                    "scope_key": scope_key,
+                    "snapshot_id": snapshot_id,
+                }),
+            );
+            record_missing_manifest_with_binding(
                 &artifact_store,
                 ArtifactKind::Snapshot,
                 snapshot_id,
@@ -1401,7 +2021,14 @@ pub fn fetch_snapshot_artifact_json<T: DeserializeOwned>(
                 Some("application/json"),
                 None,
                 observed_at,
-                err.context("fetch snapshot artifact"),
+                binding.as_ref(),
+                route,
+                match transport_fetch_error {
+                    Some(fetch_err) => {
+                        err.context(format!("iroh fetch snapshot artifact: {fetch_err}"))
+                    }
+                    None => err.context("fetch snapshot artifact"),
+                },
             )?;
             Err(anyhow!(
                 "snapshot artifact {snapshot_id} is not locally available"
@@ -2161,6 +2788,75 @@ pub fn save_peer_metadata_record_state(
             contact_material_updated_at: record.contact_material_updated_at,
             first_identified_at: record.first_identified_at,
             last_identified_at: record.last_identified_at,
+        },
+    )
+}
+
+pub fn load_data_source_binding_records_state(
+    state_dir: &Path,
+) -> Result<Vec<DataSourceBindingRecord>> {
+    let store = local_control_store(state_dir)?;
+    let scope_id = local_control_scope_id(state_dir);
+    Ok(store
+        .list_local_data_source_bindings(&scope_id)?
+        .into_iter()
+        .map(|row| -> Result<DataSourceBindingRecord> {
+            let binding_kind = DataSourceBindingKind::parse(&row.binding_kind)?;
+            Ok(DataSourceBindingRecord {
+                binding_kind,
+                binding_scope: (!row.binding_scope.is_empty()).then_some(row.binding_scope),
+                binding_key: row.binding_key,
+                source_node_id: row.source_node_id,
+                source_uri: row.source_uri,
+                updated_at: row.updated_at,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?)
+}
+
+pub fn load_data_source_binding_record_state(
+    state_dir: &Path,
+    binding_kind: DataSourceBindingKind,
+    binding_scope: Option<&str>,
+    binding_key: &str,
+) -> Result<Option<DataSourceBindingRecord>> {
+    let store = local_control_store(state_dir)?;
+    let scope_id = local_control_scope_id(state_dir);
+    Ok(store
+        .get_local_data_source_binding(
+            &scope_id,
+            binding_kind.as_str(),
+            binding_scope.unwrap_or(""),
+            binding_key,
+        )?
+        .map(|row| -> Result<DataSourceBindingRecord> {
+            let binding_kind = DataSourceBindingKind::parse(&row.binding_kind)?;
+            Ok(DataSourceBindingRecord {
+                binding_kind,
+                binding_scope: (!row.binding_scope.is_empty()).then_some(row.binding_scope),
+                binding_key: row.binding_key,
+                source_node_id: row.source_node_id,
+                source_uri: row.source_uri,
+                updated_at: row.updated_at,
+            })
+        })
+        .transpose()?)
+}
+
+pub fn save_data_source_binding_record_state(
+    state_dir: &Path,
+    record: &DataSourceBindingRecord,
+) -> Result<()> {
+    let scope_id = local_control_scope_id(state_dir);
+    local_control_store(state_dir)?.upsert_local_data_source_binding(
+        &scope_id,
+        &crate::storage::LocalDataSourceBindingRow {
+            binding_kind: record.binding_kind.as_str().to_owned(),
+            binding_scope: record.binding_scope.clone().unwrap_or_default(),
+            binding_key: record.binding_key.clone(),
+            source_node_id: record.source_node_id.clone(),
+            source_uri: record.source_uri.clone(),
+            updated_at: record.updated_at,
         },
     )
 }

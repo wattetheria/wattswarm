@@ -129,6 +129,14 @@ The workspace now includes dedicated crates and a control-plane bridge for node-
     - request-response (CBOR backfill + peer relationship control + peer direct messaging)
     - mDNS
   - exposes a pollable network runtime for listen/dial/publish/backfill/relationship-control flows
+- `crates/network-transport-core`
+  - owns the shared data-plane transport abstraction used across WattSwarm-family projects
+  - defines transport capabilities, protected contact material, transfer intents, and route selection
+  - keeps `libp2p` as the control plane while allowing direct data-plane routing to evolve independently
+- `crates/network-transport-iroh`
+  - provides the shared Iroh-based direct data-plane implementation
+  - exports `iroh_direct` transport capabilities/contact material for remote peers
+  - serves large or reliability-sensitive direct transfers selected by the shared transport router
 - `crates/control-plane/src/network_bridge.rs`
   - bridges libp2p gossip events into `node-core::ingest_remote`
   - serves scope-aware backfill requests from the local event log
@@ -146,6 +154,8 @@ The workspace now includes dedicated crates and a control-plane bridge for node-
   - emits a point-to-point `relationship_established` confirmation after `accept`
   - persists direct-message threads into `peer_dm_threads_local`
   - persists direct-message payloads and delivery state into `peer_dm_messages_local`
+  - records source-peer/data-source bindings for missing artifacts, evidence, checkpoints, and snapshots so direct fetch requests know which remote node to target
+  - executes Iroh-backed direct fetch requests for artifact/evidence/checkpoint/snapshot recovery when remote contact material is available
 - `crates/artifact-store`
   - owns the node-local filesystem layout for evidence, checkpoints, snapshots, and event batches
   - provides read/write helpers for byte and JSON payloads
@@ -161,6 +171,7 @@ Current coverage in tests:
 - integration tests for two-node peer relationship request/accept and request/block flows over libp2p
 - integration tests for two-node relationship-established handshake, protected contact material exchange, and accepted-only direct messaging over libp2p
 - integration tests for periodic anti-entropy catch-up and reconnect recovery after a partition-like disconnect
+- integration tests for Iroh-backed direct fetch of task/evidence/checkpoint/snapshot data when remote contact material is available
 
 Runtime toggles:
 
@@ -201,6 +212,40 @@ WattSwarm's current decentralized networking model is:
 - eventual consistency by replaying events into each node's local store
 
 This means nodes do not replicate PostgreSQL state directly. Instead, they exchange selected network messages, then each node re-applies those messages into its own local event log and projections.
+
+### Shared Control Plane vs Shared Data Plane
+
+WattSwarm now treats networking as two coordinated layers:
+
+- `libp2p` remains the shared control plane for:
+  - peer discovery
+  - gossip/topic propagation
+  - identify/Kademlia/relay-assisted reachability
+  - relationship control messages
+  - smaller request-response control flows
+- the shared transport/data-plane layer handles:
+  - source-aware backfill payload recovery
+  - artifact/evidence/blob transfer
+  - checkpoint/snapshot fetch
+  - future direct session/data exchange
+- `Iroh` is the first shared direct data-plane implementation behind that transport layer
+
+This split keeps WattSwarm's existing decentralized network organization intact while moving large or reliability-sensitive payload transfer onto a stronger direct data path.
+
+### Shared Network Consumers
+
+The shared networking crates are no longer just internal WattSwarm implementation details:
+
+- `watt-servicenet` now consumes:
+  - `wattswarm-network-substrate`
+  - `wattswarm-network-transport-core`
+  - `wattswarm-network-transport-iroh`
+- `wattetheria-gateway` now exports and surfaces the same shared transport capabilities/contact material through its API layer so globally deployed gateways can participate in the same underlying network model instead of relying only on HTTP snapshot sync
+
+This means the longer-term deployment model is:
+
+- WattSwarm provides the shared network substrate and transport foundation
+- service-network and gateway processes reuse that same foundation instead of reimplementing separate P2P/data-plane stacks
 
 ```mermaid
 flowchart TD

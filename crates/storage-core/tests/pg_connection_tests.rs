@@ -501,6 +501,27 @@ fn local_control_peer_metadata_and_relationship_roundtrip() {
         assert_eq!(relationships[0].last_action, "accept");
 
         store
+            .upsert_local_data_source_binding(
+                &scope_id,
+                &wattswarm_storage_core::storage::LocalDataSourceBindingRow {
+                    binding_kind: "checkpoint".to_owned(),
+                    binding_scope: "global".to_owned(),
+                    binding_key: "cp-1".to_owned(),
+                    source_node_id: "peer-a".to_owned(),
+                    source_uri: Some("ipfs://checkpoint-1".to_owned()),
+                    updated_at: 1_700_000_000_500,
+                },
+            )
+            .expect("save data source binding");
+
+        let binding = store
+            .get_local_data_source_binding(&scope_id, "checkpoint", "global", "cp-1")
+            .expect("get data source binding")
+            .expect("binding should exist");
+        assert_eq!(binding.source_node_id, "peer-a");
+        assert_eq!(binding.source_uri.as_deref(), Some("ipfs://checkpoint-1"));
+
+        store
             .upsert_local_peer_dm_thread(
                 &scope_id,
                 &wattswarm_storage_core::storage::LocalPeerDmThreadRow {

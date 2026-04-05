@@ -846,4 +846,98 @@ impl PgStore {
         }
         result
     }
+
+    pub fn get_local_data_source_binding(
+        &self,
+        scope_id: &str,
+        binding_kind: &str,
+        binding_scope: &str,
+        binding_key: &str,
+    ) -> Result<Option<LocalDataSourceBindingRow>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
+        conn.query_row(
+            "SELECT binding_kind, binding_scope, binding_key, source_node_id, source_uri,
+                    (EXTRACT(EPOCH FROM updated_at) * 1000)::BIGINT AS updated_at_ms
+             FROM data_source_bindings_local
+             WHERE scope_id = $1 AND binding_kind = $2 AND binding_scope = $3 AND binding_key = $4",
+            params![scope_id, binding_kind, binding_scope, binding_key],
+            |r| {
+                Ok(LocalDataSourceBindingRow {
+                    binding_kind: r.get(0)?,
+                    binding_scope: r.get(1)?,
+                    binding_key: r.get(2)?,
+                    source_node_id: r.get(3)?,
+                    source_uri: r.get(4)?,
+                    updated_at: r.get::<_, i64>(5)? as u64,
+                })
+            },
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    pub fn list_local_data_source_bindings(
+        &self,
+        scope_id: &str,
+    ) -> Result<Vec<LocalDataSourceBindingRow>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
+        let mut stmt = conn.prepare(
+            "SELECT binding_kind, binding_scope, binding_key, source_node_id, source_uri,
+                    (EXTRACT(EPOCH FROM updated_at) * 1000)::BIGINT AS updated_at_ms
+             FROM data_source_bindings_local
+             WHERE scope_id = $1
+             ORDER BY binding_kind ASC, binding_scope ASC, binding_key ASC",
+        )?;
+        let rows = stmt.query_map(params![scope_id], |r| {
+            Ok(LocalDataSourceBindingRow {
+                binding_kind: r.get(0)?,
+                binding_scope: r.get(1)?,
+                binding_key: r.get(2)?,
+                source_node_id: r.get(3)?,
+                source_uri: r.get(4)?,
+                updated_at: r.get::<_, i64>(5)? as u64,
+            })
+        })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
+    pub fn upsert_local_data_source_binding(
+        &self,
+        scope_id: &str,
+        row: &LocalDataSourceBindingRow,
+    ) -> Result<()> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
+        conn.execute(
+            "INSERT INTO data_source_bindings_local(
+                scope_id, binding_kind, binding_scope, binding_key, source_node_id, source_uri, updated_at
+             ) VALUES (
+                $1, $2, $3, $4, $5, $6,
+                TIMESTAMPTZ 'epoch' + ($7::bigint * INTERVAL '1 millisecond')
+             )
+             ON CONFLICT(scope_id, binding_kind, binding_scope, binding_key) DO UPDATE SET
+                source_node_id = excluded.source_node_id,
+                source_uri = excluded.source_uri,
+                updated_at = excluded.updated_at",
+            params![
+                scope_id,
+                row.binding_kind,
+                row.binding_scope,
+                row.binding_key,
+                row.source_node_id,
+                row.source_uri,
+                row.updated_at as i64
+            ],
+        )?;
+        Ok(())
+    }
 }

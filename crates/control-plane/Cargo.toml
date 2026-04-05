@@ -21,6 +21,8 @@ uuid = { workspace = true }
 wattswarm-artifact-store = { workspace = true }
 wattswarm-crypto = { workspace = true }
 wattswarm-network-p2p = { workspace = true }
+wattswarm-network-transport-core = { workspace = true }
+wattswarm-network-transport-iroh = { workspace = true }
 wattswarm-node-core = { workspace = true }
 wattswarm-protocol = { workspace = true }
 wattswarm-runtime-client = { workspace = true }

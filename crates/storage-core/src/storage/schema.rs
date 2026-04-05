@@ -438,6 +438,20 @@ impl PgStore {
                 PRIMARY KEY(task_id, executor, profile)
             );
 
+            CREATE TABLE IF NOT EXISTS data_source_bindings_local (
+                scope_id TEXT NOT NULL DEFAULT '',
+                binding_kind TEXT NOT NULL,
+                binding_scope TEXT NOT NULL DEFAULT '',
+                binding_key TEXT NOT NULL,
+                source_node_id TEXT NOT NULL,
+                source_uri TEXT,
+                updated_at TIMESTAMPTZ NOT NULL,
+                PRIMARY KEY(scope_id, binding_kind, binding_scope, binding_key)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_data_source_bindings_local_source
+                ON data_source_bindings_local(scope_id, source_node_id, updated_at DESC, binding_kind ASC);
+
             CREATE TABLE IF NOT EXISTS events (
                 seq BIGSERIAL PRIMARY KEY,
                 org_id TEXT NOT NULL DEFAULT '__unset_org__',

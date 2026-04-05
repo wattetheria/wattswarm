@@ -3,9 +3,15 @@ use anyhow::Result;
 use super::queue::PgRunQueue;
 use super::utils::ensure_run_queue_timestamp_column;
 
+const RUN_QUEUE_SCHEMA_INIT_LOCK_KEY: i64 = 4_281_337_019;
+
 impl PgRunQueue {
     pub fn init_schema(&self) -> Result<()> {
         let mut client = self.connect()?;
+        client.query_one(
+            "SELECT pg_advisory_lock($1)",
+            &[&RUN_QUEUE_SCHEMA_INIT_LOCK_KEY],
+        )?;
         client.batch_execute(
             r#"
 CREATE TABLE IF NOT EXISTS runs (
@@ -133,6 +139,10 @@ ALTER TABLE run_events ALTER COLUMN org_id SET DEFAULT '__unset_org__';
         ensure_run_queue_timestamp_column(&mut client, "run_events", "created_at")?;
         ensure_run_queue_timestamp_column(&mut client, "run_steps", "next_run_at")?;
         ensure_run_queue_timestamp_column(&mut client, "run_steps", "lease_until")?;
+        client.query(
+            "SELECT pg_advisory_unlock($1)",
+            &[&RUN_QUEUE_SCHEMA_INIT_LOCK_KEY],
+        )?;
         Ok(())
     }
 }

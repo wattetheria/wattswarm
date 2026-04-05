@@ -299,6 +299,16 @@ pub struct LocalRemoteTaskBridgeRow {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalDataSourceBindingRow {
+    pub binding_kind: String,
+    pub binding_scope: String,
+    pub binding_key: String,
+    pub source_node_id: String,
+    pub source_uri: Option<String>,
+    pub updated_at: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExecutionSetMemberRow {
     pub task_id: String,
     pub execution_set_id: String,

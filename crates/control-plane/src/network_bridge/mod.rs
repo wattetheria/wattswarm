@@ -30,6 +30,10 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::runtime::Runtime;
 use uuid::Uuid;
+use wattswarm_network_transport_core::{
+    TransferIntent, TransferKind, TransportRoute as DataTransportRoute, TransportRouter,
+};
+use wattswarm_network_transport_iroh::export_local_contact_material;
 use wattswarm_protocol::types::NetworkProtocolParams;
 
 pub use announcements::{apply_checkpoint_announcement, apply_rule_announcement};
@@ -340,18 +344,20 @@ fn peer_dm_thread_id(local_node_id: &str, remote_node_id: &str) -> String {
     format!("dm:{}:{}", members[0], members[1])
 }
 
-fn build_contact_material(
-    state_dir: &Path,
-    local_peer_id: &str,
-    listen_addrs: &[Multiaddr],
-) -> Result<RawContactMaterial> {
+fn build_contact_material(state_dir: &Path, local_peer_id: &str) -> Result<RawContactMaterial> {
     let generated_at = observed_at_ms();
     let identity = crate::control::load_local_identity(state_dir)?;
+    let peer_id = local_peer_id
+        .parse::<PeerId>()
+        .map_err(|err| anyhow!("parse local_peer_id as peer id: {err}"))?;
+    let iroh_contact = export_local_contact_material(state_dir, &peer_id, generated_at)?;
     let material = json!({
         "node_id": identity.node_id(),
         "peer_id": local_peer_id,
-        "listen_addrs": listen_addrs.iter().map(ToString::to_string).collect::<Vec<_>>(),
+        "listen_addrs": iroh_contact.metadata.listen_addrs.clone(),
         "generated_at": generated_at,
+        "transports": [iroh_contact],
+        "recommended_routes": crate::control::recommended_data_routes(Some(&iroh_contact.metadata.capabilities)),
     });
     let signature = identity.sign_bytes(&serde_json::to_vec(&material)?);
     Ok(RawContactMaterial {
@@ -423,6 +429,26 @@ fn relationship_state_for(
             .find(|record| record.remote_node_id == remote_node_id)
             .map(|record| record.relationship_state),
     )
+}
+
+fn recommended_backfill_route_for_peer(
+    state_dir: &Path,
+    peer: &PeerId,
+) -> Result<DataTransportRoute> {
+    let peer_id = peer.to_string();
+    let record =
+        crate::control::load_peer_metadata_record_for_transport_peer_id_state(state_dir, &peer_id)?;
+    Ok(TransportRouter::select(
+        &TransferIntent {
+            kind: TransferKind::BackfillChunk,
+            payload_bytes: 64 * 1024,
+            requires_streaming: true,
+        },
+        record
+            .as_ref()
+            .and_then(|entry| entry.transport_capabilities())
+            .as_ref(),
+    ))
 }
 
 fn candidate_peer_addrs(state_dir: &Path, remote_node_id: &str) -> Result<Vec<Multiaddr>> {
@@ -1349,8 +1375,7 @@ impl NetworkBridgeService {
             Some(now),
             Some(now),
         )?;
-        let contact_material =
-            build_contact_material(state_dir, &local_node_id, self.listen_addrs())?;
+        let contact_material = build_contact_material(state_dir, &local_node_id)?;
         let message_id = Uuid::new_v4().to_string();
         let content = json!({
             "relationship_state": "accepted",
@@ -1690,6 +1715,25 @@ impl NetworkBridgeService {
         let local_node_id = node.node_id();
         let active_subscriptions = node.store.list_active_feed_subscriptions(&local_node_id)?;
         let mut requests_sent = 0usize;
+        let selected_route = self
+            .state_dir
+            .as_ref()
+            .map(|state_dir| recommended_backfill_route_for_peer(state_dir, peer))
+            .transpose()?
+            .unwrap_or(DataTransportRoute::Libp2pControl);
+        if let Some(state_dir) = &self.state_dir {
+            append_jsonl(
+                state_dir,
+                "transport_decisions.jsonl",
+                &json!({
+                    "kind": TransferKind::BackfillChunk.as_str(),
+                    "peer_id": peer.to_string(),
+                    "route": selected_route.as_str(),
+                    "scopes": scopes.iter().map(scope_hint_label).collect::<Vec<_>>(),
+                    "decided_at": observed_at_ms(),
+                }),
+            );
+        }
         for scope in scopes.iter().cloned() {
             let scope_hint = scope_hint_label(&scope);
             let from_event_seq = latest_scoped_event_seq(node, &scope)?;
@@ -2201,6 +2245,19 @@ impl NetworkBridgeService {
                 GossipMessage::Checkpoint(checkpoint) => {
                     self.record_peer_scope_activity(propagation_source, &checkpoint.scope);
                     apply_checkpoint_announcement(node, &checkpoint)?;
+                    if let Some(state_dir) = &self.state_dir {
+                        let _ = crate::control::save_data_source_binding_record_state(
+                            state_dir,
+                            &crate::control::DataSourceBindingRecord {
+                                binding_kind: crate::control::DataSourceBindingKind::Checkpoint,
+                                binding_scope: Some(checkpoint.scope.label()?),
+                                binding_key: checkpoint.checkpoint_id.clone(),
+                                source_node_id: propagation_source.to_string(),
+                                source_uri: Some(checkpoint.artifact_path.clone()),
+                                updated_at: observed_at_ms(),
+                            },
+                        );
+                    }
                     self.record_scope_checkpoint_applied(&checkpoint.scope);
                     Ok(NetworkBridgeTick::CheckpointApplied {
                         peer: propagation_source,
@@ -2695,7 +2752,6 @@ impl NetworkBridgeService {
                     Some(build_contact_material(
                         &state_dir,
                         &self.local_peer_id().to_string(),
-                        self.listen_addrs(),
                     )?)
                 } else {
                     None
