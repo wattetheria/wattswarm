@@ -11,7 +11,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::{Arc, Mutex, OnceLock};
-use tokio::runtime::{Builder as RuntimeBuilder, Runtime};
+use tokio::runtime::{Builder as RuntimeBuilder, Runtime, RuntimeFlavor};
 use wattswarm_artifact_store::{ArtifactKind, ArtifactStore};
 use wattswarm_network_transport_core::{
     DirectDataFetchRequest, DirectDataFetchResponse, DirectDataTransportAdapter,
@@ -287,13 +287,25 @@ impl IrohDataPlaneService {
             .worker_threads(2)
             .enable_all()
             .build()?;
-        let endpoint = runtime.block_on(async {
+        let endpoint_future = || async {
             Endpoint::builder(presets::N0)
                 .secret_key(secret_key)
                 .alpns(vec![adapter.config.alpn.as_bytes().to_vec()])
                 .bind()
                 .await
-        })?;
+        };
+        let endpoint = match tokio::runtime::Handle::try_current() {
+            Ok(handle) if handle.runtime_flavor() == RuntimeFlavor::MultiThread => {
+                tokio::task::block_in_place(|| runtime.block_on(endpoint_future()))?
+            }
+            Ok(_) => std::thread::scope(|scope| {
+                scope
+                    .spawn(|| runtime.block_on(endpoint_future()))
+                    .join()
+                    .expect("join iroh endpoint init thread")
+            })?,
+            Err(_) => runtime.block_on(endpoint_future())?,
+        };
         let service = Arc::new(Self {
             state_dir: state_dir.to_path_buf(),
             runtime,
@@ -465,7 +477,26 @@ pub fn shutdown_local_iroh_data_plane(state_dir: &Path) {
         services.remove(state_dir)
     };
     if let Some(service) = service {
-        service.shutdown();
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) if handle.runtime_flavor() == RuntimeFlavor::MultiThread => {
+                tokio::task::block_in_place(|| {
+                    service.shutdown();
+                    drop(service);
+                });
+            }
+            Ok(_) => {
+                std::thread::scope(|scope| {
+                    scope.spawn(|| {
+                        service.shutdown();
+                        drop(service);
+                    });
+                });
+            }
+            Err(_) => {
+                service.shutdown();
+                drop(service);
+            }
+        }
     }
 }
 
