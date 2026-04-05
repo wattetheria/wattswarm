@@ -22,6 +22,7 @@ use wattswarm::wattetheria_sync;
 use wattswarm::wattetheria_sync::proto::ProjectionStreamRequest;
 use wattswarm::wattetheria_sync::proto::wattetheria_sync_service_client::WattetheriaSyncServiceClient;
 use wattswarm_storage_core::storage::pg::Connection;
+use wattswarm_storage_core::types::ArtifactRef;
 
 static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 const TEST_DB_LOCK_KEY: i64 = 1_987_654_321;
@@ -31,6 +32,17 @@ fn env_lock() -> std::sync::MutexGuard<'static, ()> {
         .get_or_init(|| Mutex::new(()))
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn topic_content_ref(tag: &str, producer: &str, created_at: u64) -> ArtifactRef {
+    ArtifactRef {
+        uri: format!("artifact://topic-message/sha256:{tag}"),
+        digest: format!("sha256:{tag}"),
+        size_bytes: 128,
+        mime: "application/json".to_owned(),
+        created_at,
+        producer: producer.to_owned(),
+    }
 }
 
 struct EnvVarGuard {
@@ -966,7 +978,8 @@ fn ui_exposes_topic_message_history_and_cursor_queries() {
                 network_id: network_id.clone(),
                 feed_key: "crew.chat".to_owned(),
                 scope_hint: "group:crew-7".to_owned(),
-                content: serde_json::json!({"text":"hello crew"}),
+                content_ref: topic_content_ref("hello-crew", &subscriber_node_id, 110),
+                local_content_cache: Some(serde_json::json!({"text":"hello crew"})),
                 reply_to_message_id: None,
             }),
             110,
@@ -978,7 +991,8 @@ fn ui_exposes_topic_message_history_and_cursor_queries() {
                 network_id,
                 feed_key: "crew.chat".to_owned(),
                 scope_hint: "group:crew-7".to_owned(),
-                content: serde_json::json!({"text":"second ping"}),
+                content_ref: topic_content_ref("second-ping", &subscriber_node_id, 120),
+                local_content_cache: Some(serde_json::json!({"text":"second ping"})),
                 reply_to_message_id: None,
             }),
             120,
@@ -1269,7 +1283,12 @@ fn structured_topic_consensus_bridge_finalizes_and_publishes_result_topic() {
                 network_id: network_id.clone(),
                 feed_key: "crew.chat".to_owned(),
                 scope_hint: "group:crew-7".to_owned(),
-                content: json!({
+                content_ref: topic_content_ref(
+                    &format!("proposal-upgrade-v1-{created_at}"),
+                    &remote.node_id(),
+                    created_at,
+                ),
+                local_content_cache: Some(json!({
                     "kind": "stance",
                     "proposal_id": "proposal-upgrade-v1",
                     "stance": "support",
@@ -1282,7 +1301,7 @@ fn structured_topic_consensus_bridge_finalizes_and_publishes_result_topic() {
                         "created_at": created_at,
                         "producer": "discussion-test"
                     }]
-                }),
+                })),
                 reply_to_message_id: None,
             }),
         )
@@ -1290,9 +1309,10 @@ fn structured_topic_consensus_bridge_finalizes_and_publishes_result_topic() {
         node.ingest_remote(event).expect("ingest remote stance");
     }
 
-    let processed =
-        wattswarm::control::topic_consensus::process_structured_topic_consensus(&mut node)
-            .expect("process structured topic consensus");
+    let processed = wattswarm::control::topic_consensus::process_structured_topic_consensus(
+        &mut node, &state_dir,
+    )
+    .expect("process structured topic consensus");
     assert_eq!(processed, 1);
 
     let result_messages = node
@@ -1413,7 +1433,12 @@ fn structured_topic_consensus_bridge_ignores_non_participant_stances() {
                 network_id: network_id.clone(),
                 feed_key: "crew.chat".to_owned(),
                 scope_hint: "group:crew-7".to_owned(),
-                content: json!({
+                content_ref: topic_content_ref(
+                    &format!("proposal-upgrade-v2-{created_at}"),
+                    &remote.node_id(),
+                    created_at,
+                ),
+                local_content_cache: Some(json!({
                     "kind": "stance",
                     "proposal_id": "proposal-upgrade-v2",
                     "stance": "support",
@@ -1426,7 +1451,7 @@ fn structured_topic_consensus_bridge_ignores_non_participant_stances() {
                         "created_at": created_at,
                         "producer": "discussion-test"
                     }]
-                }),
+                })),
                 reply_to_message_id: None,
             }),
         )
@@ -1434,9 +1459,10 @@ fn structured_topic_consensus_bridge_ignores_non_participant_stances() {
         node.ingest_remote(event).expect("ingest remote stance");
     }
 
-    let processed =
-        wattswarm::control::topic_consensus::process_structured_topic_consensus(&mut node)
-            .expect("process structured topic consensus");
+    let processed = wattswarm::control::topic_consensus::process_structured_topic_consensus(
+        &mut node, &state_dir,
+    )
+    .expect("process structured topic consensus");
     assert_eq!(processed, 0);
 
     let result_messages = node
@@ -1768,13 +1794,14 @@ fn topic_consensus_scopes_stances_to_proposal_rounds() {
             network_id: network_id.clone(),
             feed_key: "crew.chat".to_owned(),
             scope_hint: "group:crew-7".to_owned(),
-            content: json!({
+            content_ref: topic_content_ref("proposal-round-one-support", &remote_a.node_id(), 10),
+            local_content_cache: Some(json!({
                 "kind": "stance",
                 "proposal_id": "proposal-rounds-v1",
                 "proposal_message_id": round_one_proposal_message_id,
                 "stance": "support",
                 "summary": "support from round one"
-            }),
+            })),
             reply_to_message_id: Some(round_one_proposal_message_id.clone()),
         }),
     )
@@ -1788,13 +1815,14 @@ fn topic_consensus_scopes_stances_to_proposal_rounds() {
             network_id: network_id.clone(),
             feed_key: "crew.chat".to_owned(),
             scope_hint: "group:crew-7".to_owned(),
-            content: json!({
+            content_ref: topic_content_ref("proposal-round-two-local-support", &local_node_id, 20),
+            local_content_cache: Some(json!({
                 "kind": "stance",
                 "proposal_id": "proposal-rounds-v1",
                 "proposal_message_id": round_two_proposal_message_id,
                 "stance": "support",
                 "summary": "local support in round two"
-            }),
+            })),
             reply_to_message_id: Some(round_two_proposal_message_id.clone()),
         }),
         20,
@@ -1809,13 +1837,18 @@ fn topic_consensus_scopes_stances_to_proposal_rounds() {
             network_id,
             feed_key: "crew.chat".to_owned(),
             scope_hint: "group:crew-7".to_owned(),
-            content: json!({
+            content_ref: topic_content_ref(
+                "proposal-round-two-remote-support",
+                &remote_b.node_id(),
+                30,
+            ),
+            local_content_cache: Some(json!({
                 "kind": "stance",
                 "proposal_id": "proposal-rounds-v1",
                 "proposal_message_id": round_two_proposal_message_id,
                 "stance": "support",
                 "summary": "second support only exists in round two"
-            }),
+            })),
             reply_to_message_id: Some(round_two_proposal_message_id.clone()),
         }),
     )
@@ -1823,9 +1856,10 @@ fn topic_consensus_scopes_stances_to_proposal_rounds() {
     node.ingest_remote(round_two_support)
         .expect("ingest round two stance");
 
-    let processed =
-        wattswarm::control::topic_consensus::process_structured_topic_consensus(&mut node)
-            .expect("process structured topic consensus");
+    let processed = wattswarm::control::topic_consensus::process_structured_topic_consensus(
+        &mut node, &state_dir,
+    )
+    .expect("process structured topic consensus");
     assert_eq!(processed, 0);
 
     let result_messages = node

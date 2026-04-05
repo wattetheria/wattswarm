@@ -1,4 +1,4 @@
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 
@@ -320,13 +320,45 @@ pub struct ArtifactRef {
     pub producer: String,
 }
 
+fn null_json_value() -> Value {
+    Value::Null
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Candidate {
     pub candidate_id: String,
     pub execution_id: String,
+    pub output_ref: ArtifactRef,
+    #[serde(default = "null_json_value")]
     pub output: Value,
     pub evidence_inline: Vec<InlineEvidence>,
     pub evidence_refs: Vec<ArtifactRef>,
+}
+
+impl Candidate {
+    pub fn has_resolved_output(&self) -> bool {
+        !self.output.is_null()
+    }
+
+    pub fn control_bytes(&self) -> Result<Vec<u8>, serde_json::Error> {
+        serde_json::to_vec(&CandidateWireView {
+            candidate_id: &self.candidate_id,
+            execution_id: &self.execution_id,
+            output_ref: &self.output_ref,
+            evidence_inline: &self.evidence_inline,
+            evidence_refs: &self.evidence_refs,
+        })
+    }
+
+    pub fn control_json(&self) -> Result<String, serde_json::Error> {
+        serde_json::to_string(&CandidateWireView {
+            candidate_id: &self.candidate_id,
+            execution_id: &self.execution_id,
+            output_ref: &self.output_ref,
+            evidence_inline: &self.evidence_inline,
+            evidence_refs: &self.evidence_refs,
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -434,10 +466,81 @@ pub struct ClaimReleasePayload {
     pub execution_id: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct CandidateProposedPayload {
     pub task_id: String,
     pub candidate: Candidate,
+}
+
+#[derive(Serialize)]
+struct CandidateWireView<'a> {
+    candidate_id: &'a str,
+    execution_id: &'a str,
+    output_ref: &'a ArtifactRef,
+    evidence_inline: &'a [InlineEvidence],
+    evidence_refs: &'a [ArtifactRef],
+}
+
+#[derive(Deserialize)]
+struct CandidateWireOwned {
+    candidate_id: String,
+    execution_id: String,
+    output_ref: ArtifactRef,
+    #[serde(default)]
+    evidence_inline: Vec<InlineEvidence>,
+    #[serde(default)]
+    evidence_refs: Vec<ArtifactRef>,
+}
+
+#[derive(Serialize)]
+struct CandidateProposedPayloadWireView<'a> {
+    task_id: &'a str,
+    candidate: CandidateWireView<'a>,
+}
+
+#[derive(Deserialize)]
+struct CandidateProposedPayloadWireOwned {
+    task_id: String,
+    candidate: CandidateWireOwned,
+}
+
+impl Serialize for CandidateProposedPayload {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        CandidateProposedPayloadWireView {
+            task_id: &self.task_id,
+            candidate: CandidateWireView {
+                candidate_id: &self.candidate.candidate_id,
+                execution_id: &self.candidate.execution_id,
+                output_ref: &self.candidate.output_ref,
+                evidence_inline: &self.candidate.evidence_inline,
+                evidence_refs: &self.candidate.evidence_refs,
+            },
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for CandidateProposedPayload {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = CandidateProposedPayloadWireOwned::deserialize(deserializer)?;
+        Ok(Self {
+            task_id: wire.task_id,
+            candidate: Candidate {
+                candidate_id: wire.candidate.candidate_id,
+                execution_id: wire.candidate.execution_id,
+                output_ref: wire.candidate.output_ref,
+                output: Value::Null,
+                evidence_inline: wire.candidate.evidence_inline,
+                evidence_refs: wire.candidate.evidence_refs,
+            },
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -630,7 +733,9 @@ pub struct TopicMessagePostedPayload {
     pub network_id: String,
     pub feed_key: String,
     pub scope_hint: String,
-    pub content: Value,
+    pub content_ref: ArtifactRef,
+    #[serde(default, skip_serializing, skip_deserializing)]
+    pub local_content_cache: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reply_to_message_id: Option<String>,
 }

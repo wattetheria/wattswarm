@@ -230,6 +230,32 @@ fn serve_fetch_request(
                 bytes,
             })
         }
+        wattswarm_network_transport_core::DirectDataObjectKind::TopicMessageJson => {
+            let bytes = artifact_store.read_validated_bytes(
+                ArtifactKind::TopicMessage,
+                &request.object_id,
+                None,
+                request.expected_digest.as_deref(),
+                request.expected_size,
+            )?;
+            Ok(ServedFetchPayload {
+                content_type: Some("application/json".to_owned()),
+                bytes,
+            })
+        }
+        wattswarm_network_transport_core::DirectDataObjectKind::DirectMessageJson => {
+            let bytes = artifact_store.read_validated_bytes(
+                ArtifactKind::DirectMessage,
+                &request.object_id,
+                None,
+                request.expected_digest.as_deref(),
+                request.expected_size,
+            )?;
+            Ok(ServedFetchPayload {
+                content_type: Some("application/json".to_owned()),
+                bytes,
+            })
+        }
         wattswarm_network_transport_core::DirectDataObjectKind::CheckpointJson => {
             let path = artifact_store.checkpoint_path(&request.object_id)?;
             let bytes = artifact_store.read_bytes(&path)?;

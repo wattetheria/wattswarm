@@ -829,6 +829,72 @@ impl Node {
             .store
             .task_projection(task_id)?
             .ok_or_else(|| anyhow!("task {task_id} missing"))?;
+        let req = self.build_execute_request_for_runtime(
+            task_id,
+            profile,
+            execution_id,
+            epoch,
+            created_at,
+        )?;
+        let execute_res = match runtime.execute(&req) {
+            Ok(res) => res,
+            Err(err) => {
+                let reason = if is_timeout_error(&err) {
+                    crate::types::TaskErrorReason::Timeout
+                } else {
+                    crate::types::TaskErrorReason::Other
+                };
+                let _ = self.task_error(
+                    task_id,
+                    reason,
+                    &format!("runtime /execute failed: {err}"),
+                    epoch,
+                    created_at,
+                );
+                return Err(anyhow!("runtime execute failed: {err}"));
+            }
+        };
+
+        if validate_schema_minimal(&task.contract.output_schema, &execute_res.candidate_output)
+            .is_err()
+        {
+            let _ = self.task_error(
+                task_id,
+                crate::types::TaskErrorReason::InvalidOutput,
+                "runtime /execute output does not match output_schema",
+                epoch,
+                created_at,
+            );
+            return Err(anyhow!("runtime output schema invalid"));
+        }
+
+        let candidate = Candidate {
+            candidate_id: format!("cand-{}", execution_id),
+            execution_id: execution_id.to_owned(),
+            output_ref: inline_candidate_output_ref(
+                &self.node_id(),
+                &execute_res.candidate_output,
+                created_at,
+            )?,
+            output: execute_res.candidate_output,
+            evidence_inline: execute_res.evidence_inline,
+            evidence_refs: execute_res.evidence_refs,
+        };
+        self.propose_candidate(task_id, candidate, epoch, created_at)
+    }
+
+    pub fn build_execute_request_for_runtime(
+        &mut self,
+        task_id: &str,
+        profile: &str,
+        execution_id: &str,
+        epoch: u64,
+        created_at: u64,
+    ) -> Result<ExecuteRequest> {
+        let task = self
+            .store
+            .task_projection(task_id)?
+            .ok_or_else(|| anyhow!("task {task_id} missing"))?;
         let lookup_hits = self.lookup_knowledge_hits(&task.contract)?;
         let exact_hit_exists = lookup_hits
             .iter()
@@ -877,7 +943,7 @@ impl Node {
             "EXPLORE".to_owned()
         };
 
-        let req = ExecuteRequest {
+        Ok(ExecuteRequest {
             task_id: task_id.to_owned(),
             execution_id: execution_id.to_owned(),
             task_type: task.contract.task_type.clone(),
@@ -887,47 +953,7 @@ impl Node {
             stage,
             attempt_id: execution_id.to_owned(),
             seed_bundle,
-        };
-        let execute_res = match runtime.execute(&req) {
-            Ok(res) => res,
-            Err(err) => {
-                let reason = if is_timeout_error(&err) {
-                    crate::types::TaskErrorReason::Timeout
-                } else {
-                    crate::types::TaskErrorReason::Other
-                };
-                let _ = self.task_error(
-                    task_id,
-                    reason,
-                    &format!("runtime /execute failed: {err}"),
-                    epoch,
-                    created_at,
-                );
-                return Err(anyhow!("runtime execute failed: {err}"));
-            }
-        };
-
-        if validate_schema_minimal(&task.contract.output_schema, &execute_res.candidate_output)
-            .is_err()
-        {
-            let _ = self.task_error(
-                task_id,
-                crate::types::TaskErrorReason::InvalidOutput,
-                "runtime /execute output does not match output_schema",
-                epoch,
-                created_at,
-            );
-            return Err(anyhow!("runtime output schema invalid"));
-        }
-
-        let candidate = Candidate {
-            candidate_id: format!("cand-{}", execution_id),
-            execution_id: execution_id.to_owned(),
-            output: execute_res.candidate_output,
-            evidence_inline: execute_res.evidence_inline,
-            evidence_refs: execute_res.evidence_refs,
-        };
-        self.propose_candidate(task_id, candidate, epoch, created_at)
+        })
     }
 
     pub fn auto_verify_candidate_with_runtime(
@@ -1039,6 +1065,23 @@ impl Node {
             }
         }
     }
+}
+
+fn inline_candidate_output_ref(
+    producer: &str,
+    output: &Value,
+    created_at: u64,
+) -> Result<ArtifactRef> {
+    let bytes = serde_json::to_vec(output)?;
+    let digest = format!("sha256:{}", sha256_hex(&bytes));
+    Ok(ArtifactRef {
+        uri: format!("inline://candidate-output/{digest}"),
+        digest,
+        size_bytes: bytes.len() as u64,
+        mime: "application/json".to_owned(),
+        created_at,
+        producer: producer.to_owned(),
+    })
 }
 
 fn event_requires_projection_rebuild(payload: &EventPayload) -> bool {

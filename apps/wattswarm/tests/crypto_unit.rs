@@ -3,13 +3,30 @@ use wattswarm::crypto::{
     NodeIdentity, candidate_hash, event_digest, sha256_hex, verify_event_signature,
     verify_signature, vote_commit_hash,
 };
-use wattswarm::types::{Candidate, EventPayload, TaskExpiredPayload, UnsignedEvent, VoteChoice};
+use wattswarm::types::{
+    ArtifactRef, Candidate, EventPayload, TaskExpiredPayload, UnsignedEvent, VoteChoice,
+};
+
+fn sample_output_ref(candidate_id: &str, output: &serde_json::Value) -> ArtifactRef {
+    let bytes = serde_json::to_vec(output).expect("serialize output");
+    let digest = sha256_hex(&bytes);
+    ArtifactRef {
+        uri: format!("artifact://reference/{candidate_id}"),
+        digest: format!("sha256:{digest}"),
+        size_bytes: bytes.len() as u64,
+        mime: "application/json".to_owned(),
+        created_at: 1,
+        producer: "test-producer".to_owned(),
+    }
+}
 
 fn sample_candidate() -> Candidate {
+    let output = json!({"answer":"ok","confidence":0.8});
     Candidate {
         candidate_id: "cand-1".to_owned(),
         execution_id: "exec-1".to_owned(),
-        output: json!({"answer":"ok","confidence":0.8}),
+        output_ref: sample_output_ref("cand-1", &output),
+        output,
         evidence_inline: vec![],
         evidence_refs: vec![],
     }

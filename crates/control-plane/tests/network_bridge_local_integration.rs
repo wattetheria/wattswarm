@@ -7,7 +7,7 @@ fn network_bridge_local_test_guard() -> MutexGuard<'static, ()> {
     GUARD
         .get_or_init(|| Mutex::new(()))
         .lock()
-        .expect("network bridge local integration mutex poisoned")
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 #[test]
@@ -44,6 +44,12 @@ fn two_nodes_execute_peer_relationship_request_and_block_over_network() {
 fn two_nodes_establish_dm_session_and_exchange_messages_over_network() {
     let _guard = network_bridge_local_test_guard();
     support::network_bridge::two_nodes_establish_dm_session_and_exchange_messages_over_network();
+}
+
+#[test]
+fn two_nodes_sync_topic_message_content_over_iroh() {
+    let _guard = network_bridge_local_test_guard();
+    support::network_bridge::two_nodes_sync_topic_message_content_over_iroh();
 }
 
 #[test]

@@ -3,9 +3,9 @@
 WattSwarm is an open-source swarm coordination kernel for agent networks.
 This repository now contains a Rust-first v0.1 implementation of:
 
-- P2P-style node sync primitives (gossip/backfill/anti-entropy/checkpoint)
+- Hybrid network architecture with `libp2p` control-plane sync primitives and `Iroh` data-plane transport
 - SEL append-only event log on PostgreSQL + replayable projections
-- Node-local artifact storage layout for evidence/checkpoints/snapshots/event batches
+- Node-local artifact/object storage for references, topic/direct-message bodies, task outputs, evidence, checkpoints, snapshots, event batches, and availability manifests
 - PostgreSQL-backed run queue for multi-agent orchestration (`runs`, `run_steps`, `run_events`)
 - Run queue aggregation policy supports optional quorum (`aggregation.quorum`), tie resolver chain (`aggregation.tie_policy`), and independent null resolver chain (`aggregation.null_policy`)
 - Default tie resolver is deterministic `STOCHASTIC` for tie-only paths; null paths use independent default `null_policy` chain
@@ -52,10 +52,10 @@ This repository now contains a Rust-first v0.1 implementation of:
 
 WattSwarm should be treated as a kernel-first project:
 
-- Kernel/Core: `src/node/*`, `src/storage/*`, `src/policy.rs`, `src/control.rs`, `src/types.rs`
-- Network layer: `crates/network-p2p`
+- Kernel/Core: `crates/node-core`, `crates/storage-core`, `crates/policy-engine`, `crates/protocol`, `crates/crypto`, `crates/runtime-client`
+- Network and transport layer: `crates/network-p2p`, `crates/network-substrate`, `crates/network-transport-core`, `crates/network-transport-iroh`
 - Artifact/object storage: `crates/artifact-store`
-- Network-to-kernel bridge: `crates/control-plane/src/network_bridge.rs`
+- Network-to-kernel bridge: `crates/control-plane/src/network_bridge/mod.rs`
 - UI/Console: `ui/*` (optional operational shell)
 
 You can remove or ignore `ui/*` and still run the kernel fully via CLI/runtime APIs.
@@ -71,9 +71,12 @@ WattSwarm now treats node-local storage as layered storage:
   - knowledge, reputation, runtime metrics, settlement
   - local run queue and dashboard queries
 - Local filesystem artifacts are the intended home for:
+  - references and availability manifests
+  - topic-message bodies and direct-message bodies
+  - candidate/task output bodies
   - evidence blobs and exported evidence bundles
   - checkpoint manifests and snapshot files
-  - event batch archives for backfill/bootstrap
+  - event batch archives for backfill/bootstrap and recovery
 
 This split is local to one node. Nodes do not synchronize PostgreSQL databases with each other.
 Inter-node sync remains protocol-driven: signed events, checkpoint metadata, summaries, and artifact references are exchanged over the network, then re-applied into each node's local store.
@@ -132,12 +135,12 @@ The workspace now includes dedicated crates and a control-plane bridge for node-
 - `crates/network-transport-core`
   - owns the shared data-plane transport abstraction used across WattSwarm-family projects
   - defines transport capabilities, protected contact material, transfer intents, and route selection
-  - keeps `libp2p` as the control plane while allowing direct data-plane routing to evolve independently
+  - keeps `libp2p` as the control plane while moving business-content payloads onto a separate data plane
 - `crates/network-transport-iroh`
   - provides the shared Iroh-based direct data-plane implementation
   - exports `iroh_direct` transport capabilities/contact material for remote peers
-  - serves large or reliability-sensitive direct transfers selected by the shared transport router
-- `crates/control-plane/src/network_bridge.rs`
+  - serves topic message bodies, direct-message bodies, task outputs, and reference/blob recovery selected by the shared transport router
+- `crates/control-plane/src/network_bridge/mod.rs`
   - bridges libp2p gossip events into `node-core::ingest_remote`
   - serves scope-aware backfill requests from the local event log
   - applies backfill responses into the local node projection pipeline
@@ -154,10 +157,12 @@ The workspace now includes dedicated crates and a control-plane bridge for node-
   - emits a point-to-point `relationship_established` confirmation after `accept`
   - persists direct-message threads into `peer_dm_threads_local`
   - persists direct-message payloads and delivery state into `peer_dm_messages_local`
+  - keeps direct-message control on `libp2p` while resolving direct-message content bodies over Iroh
+  - keeps topic/task control propagation on `libp2p` while resolving topic bodies and candidate/task output bodies over Iroh
   - records source-peer/data-source bindings for missing artifacts, evidence, checkpoints, and snapshots so direct fetch requests know which remote node to target
   - executes Iroh-backed direct fetch requests for artifact/evidence/checkpoint/snapshot recovery when remote contact material is available
 - `crates/artifact-store`
-  - owns the node-local filesystem layout for evidence, checkpoints, snapshots, and event batches
+  - owns the node-local filesystem/object layout for references, topic/direct-message bodies, candidate/task outputs, evidence, checkpoints, snapshots, event batches, and availability manifests
   - provides read/write helpers for byte and JSON payloads
 
 Current coverage in tests:
@@ -169,9 +174,10 @@ Current coverage in tests:
 - integration tests for region/node scoped sync and summary import
 - integration tests for event revoke rollback and summary revoke cleanup across nodes
 - integration tests for two-node peer relationship request/accept and request/block flows over libp2p
-- integration tests for two-node relationship-established handshake, protected contact material exchange, and accepted-only direct messaging over libp2p
+- integration tests for two-node relationship-established handshake, protected contact material exchange, and accepted-only direct messaging with `libp2p` control plus Iroh content fetch
 - integration tests for periodic anti-entropy catch-up and reconnect recovery after a partition-like disconnect
 - integration tests for Iroh-backed direct fetch of task/evidence/checkpoint/snapshot data when remote contact material is available
+- integration tests for topic-message body sync and DM body sync over Iroh after libp2p control delivery
 
 Runtime toggles:
 
@@ -200,18 +206,18 @@ Network-mode bootstrap behavior:
 
 WattSwarm's current decentralized networking model is:
 
-- topic-based publish/subscribe
-- gossip-style peer-to-peer dissemination
+- `libp2p` control-plane publish/subscribe for events, summaries, references, routes, and scope metadata
+- `Iroh` data-plane transfer for business-content payloads such as topic bodies, DM bodies, task outputs, and artifact recovery
 - bootstrap-peer and Kademlia-assisted peer discovery
 - relay-assisted WAN reachability with DCUtR upgrade attempts
 - AutoNAT reachability probing against known peers
 - inbound dedupe and per-peer/topic traffic guards
-- topic message dissemination for scoped agent chat traffic
-- persisted topic history with cursor/backfill recovery
-- request/response backfill for missed data
+- topic/message/task control dissemination for scoped coordination traffic
+- persisted topic history with cursor/backfill recovery plus content rehydration by reference
+- request/response backfill for missed control-plane history
 - eventual consistency by replaying events into each node's local store
 
-This means nodes do not replicate PostgreSQL state directly. Instead, they exchange selected network messages, then each node re-applies those messages into its own local event log and projections.
+This means nodes do not replicate PostgreSQL state directly. Instead, they exchange control-plane metadata over `libp2p`, resolve content bodies over `Iroh`, and then each node re-applies the resulting state into its own local event log, projections, and artifact/object store.
 
 ### Shared Control Plane vs Shared Data Plane
 
@@ -227,10 +233,18 @@ WattSwarm now treats networking as two coordinated layers:
   - source-aware backfill payload recovery
   - artifact/evidence/blob transfer
   - checkpoint/snapshot fetch
+  - direct-message bodies
+  - topic message bodies
+  - candidate/task output bodies
   - future direct session/data exchange
 - `Iroh` is the first shared direct data-plane implementation behind that transport layer
 
-This split keeps WattSwarm's existing decentralized network organization intact while moving large or reliability-sensitive payload transfer onto a stronger direct data path.
+This split keeps WattSwarm's decentralized network organization intact while enforcing a cleaner semantic boundary:
+
+- `libp2p` transports network control semantics
+- `Iroh` transports business-content payloads
+
+The separation is by role and protocol meaning, not by payload size.
 
 ### Shared Network Consumers
 
@@ -496,7 +510,7 @@ network-level specialization / faster recovery / more stable convergence"]
 - direct-message payloads:
   - `relationship_established`
   - `session_init`
-  - `message`
+  - `message` control envelopes carrying `content_ref`
 - DIAP-inspired (`Decentralized Intelligent Agent Protocol`) security material:
   - protected contact material exchanged after relationship acceptance
   - point-to-point relationship-established handshake before normal DM traffic
@@ -519,6 +533,7 @@ network-level specialization / faster recovery / more stable convergence"]
   - evidence blobs
   - checkpoint files
   - snapshot files
+- topic message bodies, direct-message bodies, and candidate output bodies no longer ride directly inside control-plane wire payloads; they are resolved over Iroh by reference
 - agent intermediate reasoning traces
 - capability-tag or interest-tag registries for semantic routing
 
@@ -530,6 +545,7 @@ network-level specialization / faster recovery / more stable convergence"]
   - LAN peer discovery via mDNS / UDP announce
 - Pull today:
   - missing historical events through request/response backfill
+  - topic message bodies, direct-message bodies, candidate outputs, and reference artifacts through Iroh using content/reference pointers carried by the control plane
 - WAN discovery today:
   - direct dialing of configured bootstrap peers
   - identify and mDNS addresses are inserted into Kademlia
@@ -544,13 +560,15 @@ network-level specialization / faster recovery / more stable convergence"]
   - relationship requests and responses can carry an A2A-style agent envelope so agent-level intent/capability context travels with the node-level action
   - local relationship state is persisted into `peer_relationships_local`
 - Direct messaging today:
-  - direct messages are point-to-point request/response messages, not gossip topics
+  - direct-message control is point-to-point request/response, not gossip topics
   - only `accepted` relationships may open a DM thread
   - `accept` triggers an explicit `relationship_established` message so both sides have a concrete “relationship is live” event
   - `relationship_established` exchanges DIAP-inspired (`Decentralized Intelligent Agent Protocol`) protected contact material and moves the thread into a ready session state
-  - subsequent direct messages use the same request/response channel and persist into:
+  - subsequent direct messages send control metadata over `libp2p` and resolve the message body over Iroh via `content_ref`
+  - persisted direct-message records still land in:
     - `peer_dm_threads_local`
     - `peer_dm_messages_local`
+  - current transport security comes from the Iroh/QUIC encrypted channel; WattSwarm has not yet enabled a separate application-layer `encrypted_body` envelope for DM content
   - current scope is execution-layer DM only; there is no product-layer chat UI or agent decision UX yet
 - Traffic protection today:
   - duplicate gossip payloads are dropped
@@ -583,7 +601,7 @@ For each subscribed scope, the node derives five topic kinds:
 - `checkpoints`
 - `summaries`
 
-`messages` is the topic family used for topic-scoped agent chat traffic such as `TopicMessagePosted`.
+`messages` is the topic family used for topic-scoped agent chat control traffic such as `TopicMessagePosted`. The topic message body itself is resolved from Iroh using the propagated `content_ref`.
 
 This means the current model is still scope-based routing, not semantic capability routing. A node cannot yet declare "I only want writing tasks" or "I only want stock-analysis tasks" and have the network route tasks that way automatically.
 
@@ -610,11 +628,17 @@ Direct messaging is also point-to-point:
 
 1. the sender must already have `accepted` relationship state for the remote node
 2. the DM thread must be in `ready` session state
-3. the sender emits a structured direct-message request with optional A2A-style agent envelope
-4. the receiver persists the inbound message and returns delivery acknowledgement
+3. the sender materializes the DM body into a local `DirectMessage` artifact and emits a structured direct-message control request with `content_ref` plus optional A2A-style agent envelope
+4. the receiver resolves the referenced DM body over Iroh, persists the inbound message, and returns delivery acknowledgement
 5. the sender updates local delivery state when the acknowledgement arrives
 
 This DM path is execution-layer only. Product-layer agent decisions about whether to request, accept, reject, or initiate a DM still belong above WattSwarm.
+
+Topic chat and task candidate propagation now follow the same principle:
+
+1. `libp2p` carries control metadata such as scope, route, references, cursors, and task/candidate state
+2. `Iroh` carries the corresponding message body or task output content
+3. each receiving node rehydrates content locally before updating its final local projection view
 
 #### How propagation actually spreads
 

@@ -165,6 +165,39 @@ fn mk_node(identity: NodeIdentity, membership: Membership) -> Node {
     Node::new(identity, PgStore::open_in_memory().unwrap(), membership).unwrap()
 }
 
+fn candidate_output_ref(
+    candidate_id: &str,
+    output: &serde_json::Value,
+) -> wattswarm::types::ArtifactRef {
+    let bytes = serde_json::to_vec(output).expect("serialize output");
+    let digest = sha256_hex(&bytes);
+    wattswarm::types::ArtifactRef {
+        uri: format!("artifact://reference/{candidate_id}"),
+        digest: format!("sha256:{digest}"),
+        size_bytes: bytes.len() as u64,
+        mime: "application/json".to_owned(),
+        created_at: 1,
+        producer: "test-producer".to_owned(),
+    }
+}
+
+fn make_candidate(
+    candidate_id: &str,
+    execution_id: &str,
+    output: serde_json::Value,
+    evidence_inline: Vec<wattswarm::types::InlineEvidence>,
+    evidence_refs: Vec<wattswarm::types::ArtifactRef>,
+) -> Candidate {
+    Candidate {
+        candidate_id: candidate_id.to_owned(),
+        execution_id: execution_id.to_owned(),
+        output_ref: candidate_output_ref(candidate_id, &output),
+        output,
+        evidence_inline,
+        evidence_refs,
+    }
+}
+
 fn seed_exact_decision_memory(
     node: &Node,
     history_task_id: &str,
@@ -422,12 +455,12 @@ fn auto_verify_invalid_output_emits_task_error() {
     .unwrap();
     node.propose_candidate(
         "task-auto-verify",
-        Candidate {
-            candidate_id: "cand-av".to_owned(),
-            execution_id: "exec-auto-prop".to_owned(),
-            output: serde_json::json!({"answer":"ok"}),
-            evidence_inline: vec![],
-            evidence_refs: vec![wattswarm::types::ArtifactRef {
+        make_candidate(
+            "cand-av",
+            "exec-auto-prop",
+            serde_json::json!({"answer":"ok"}),
+            vec![],
+            vec![wattswarm::types::ArtifactRef {
                 uri: "https://e".to_owned(),
                 digest: "sha256:1".to_owned(),
                 size_bytes: 1,
@@ -435,7 +468,7 @@ fn auto_verify_invalid_output_emits_task_error() {
                 created_at: 1,
                 producer: "r/p".to_owned(),
             }],
-        },
+        ),
         1,
         120,
     )
@@ -515,12 +548,12 @@ fn auto_verify_network_unreachable_marks_inconclusive() {
     .unwrap();
     node.propose_candidate(
         "task-net-split",
-        Candidate {
-            candidate_id: "cand-net".to_owned(),
-            execution_id: "exec-p".to_owned(),
-            output: serde_json::json!({"answer":"ok"}),
-            evidence_inline: vec![],
-            evidence_refs: vec![wattswarm::types::ArtifactRef {
+        make_candidate(
+            "cand-net",
+            "exec-p",
+            serde_json::json!({"answer":"ok"}),
+            vec![],
+            vec![wattswarm::types::ArtifactRef {
                 uri: "https://blocked.example.com/artifact".to_owned(),
                 digest: "sha256:1".to_owned(),
                 size_bytes: 1,
@@ -528,7 +561,7 @@ fn auto_verify_network_unreachable_marks_inconclusive() {
                 created_at: 1,
                 producer: "r/p".to_owned(),
             }],
-        },
+        ),
         1,
         120,
     )
@@ -700,12 +733,12 @@ fn lease_conflict_tiebreak_and_renew_behavior() {
     node.renew_claim("task-lease", ClaimRole::Propose, "a-exec", 2_000, 1, 200)
         .unwrap();
 
-    let candidate = Candidate {
-        candidate_id: "c-lease".to_owned(),
-        execution_id: "a-exec".to_owned(),
-        output: serde_json::json!({"answer":"x"}),
-        evidence_inline: vec![],
-        evidence_refs: vec![wattswarm::types::ArtifactRef {
+    let candidate = make_candidate(
+        "c-lease",
+        "a-exec",
+        serde_json::json!({"answer":"x"}),
+        vec![],
+        vec![wattswarm::types::ArtifactRef {
             uri: "https://e".to_owned(),
             digest: "sha256:1".to_owned(),
             size_bytes: 1,
@@ -713,7 +746,7 @@ fn lease_conflict_tiebreak_and_renew_behavior() {
             created_at: 1,
             producer: "r/p".to_owned(),
         }],
-    };
+    );
     node.propose_candidate("task-lease", candidate, 1, 1500)
         .unwrap();
 }
@@ -745,12 +778,12 @@ fn lease_tolerance_accepts_small_clock_skew() {
     )
     .unwrap();
 
-    let candidate = Candidate {
-        candidate_id: "c-skew-ok".to_owned(),
-        execution_id: "exec-skew".to_owned(),
-        output: serde_json::json!({"answer":"x"}),
-        evidence_inline: vec![],
-        evidence_refs: vec![wattswarm::types::ArtifactRef {
+    let candidate = make_candidate(
+        "c-skew-ok",
+        "exec-skew",
+        serde_json::json!({"answer":"x"}),
+        vec![],
+        vec![wattswarm::types::ArtifactRef {
             uri: "https://e".to_owned(),
             digest: "sha256:1".to_owned(),
             size_bytes: 1,
@@ -758,7 +791,7 @@ fn lease_tolerance_accepts_small_clock_skew() {
             created_at: 1,
             producer: "r/p".to_owned(),
         }],
-    };
+    );
 
     let slightly_after_expiry = 1_000 + CLOCK_SKEW_TOLERANCE_MS - 1;
     node.propose_candidate("task-skew-ok", candidate, 1, slightly_after_expiry)
@@ -792,12 +825,12 @@ fn lease_tolerance_rejects_beyond_clock_window() {
     )
     .unwrap();
 
-    let candidate = Candidate {
-        candidate_id: "c-skew-bad".to_owned(),
-        execution_id: "exec-skew".to_owned(),
-        output: serde_json::json!({"answer":"x"}),
-        evidence_inline: vec![],
-        evidence_refs: vec![wattswarm::types::ArtifactRef {
+    let candidate = make_candidate(
+        "c-skew-bad",
+        "exec-skew",
+        serde_json::json!({"answer":"x"}),
+        vec![],
+        vec![wattswarm::types::ArtifactRef {
             uri: "https://e".to_owned(),
             digest: "sha256:1".to_owned(),
             size_bytes: 1,
@@ -805,7 +838,7 @@ fn lease_tolerance_rejects_beyond_clock_window() {
             created_at: 1,
             producer: "r/p".to_owned(),
         }],
-    };
+    );
 
     let far_after_expiry = 1_000 + CLOCK_SKEW_TOLERANCE_MS + 1;
     assert!(
@@ -830,42 +863,42 @@ fn evidence_policy_and_event_size_rules() {
     node.claim_task("task-evi", ClaimRole::Propose, "exec-evi", 8_000, 1, 110)
         .unwrap();
 
-    let too_big_inline = Candidate {
-        candidate_id: "c-big".to_owned(),
-        execution_id: "exec-evi".to_owned(),
-        output: serde_json::json!({"answer":"x"}),
-        evidence_inline: vec![wattswarm::types::InlineEvidence {
+    let too_big_inline = make_candidate(
+        "c-big",
+        "exec-evi",
+        serde_json::json!({"answer":"x"}),
+        vec![wattswarm::types::InlineEvidence {
             mime: "text/plain".to_owned(),
             content: "a".repeat(70_000),
         }],
-        evidence_refs: vec![],
-    };
+        vec![],
+    );
     assert!(
         node.propose_candidate("task-evi", too_big_inline, 1, 120)
             .is_err()
     );
 
-    let media_inline = Candidate {
-        candidate_id: "c-media".to_owned(),
-        execution_id: "exec-evi".to_owned(),
-        output: serde_json::json!({"answer":"x"}),
-        evidence_inline: vec![wattswarm::types::InlineEvidence {
+    let media_inline = make_candidate(
+        "c-media",
+        "exec-evi",
+        serde_json::json!({"answer":"x"}),
+        vec![wattswarm::types::InlineEvidence {
             mime: "image/png".to_owned(),
             content: "tiny".to_owned(),
         }],
-        evidence_refs: vec![],
-    };
+        vec![],
+    );
     assert!(
         node.propose_candidate("task-evi", media_inline, 1, 121)
             .is_err()
     );
 
-    let missing_digest = Candidate {
-        candidate_id: "c-ref".to_owned(),
-        execution_id: "exec-evi".to_owned(),
-        output: serde_json::json!({"answer":"x"}),
-        evidence_inline: vec![],
-        evidence_refs: vec![wattswarm::types::ArtifactRef {
+    let missing_digest = make_candidate(
+        "c-ref",
+        "exec-evi",
+        serde_json::json!({"answer":"x"}),
+        vec![],
+        vec![wattswarm::types::ArtifactRef {
             uri: "https://e".to_owned(),
             digest: "".to_owned(),
             size_bytes: 1,
@@ -873,7 +906,7 @@ fn evidence_policy_and_event_size_rules() {
             created_at: 1,
             producer: "r/p".to_owned(),
         }],
-    };
+    );
     assert!(
         node.propose_candidate("task-evi", missing_digest, 1, 122)
             .is_err()
@@ -921,16 +954,16 @@ fn evidence_policy_rejects_hidden_media_base64_inside_json() {
         "artifact": encoded_media
     })
     .to_string();
-    let hidden_media = Candidate {
-        candidate_id: "c-hidden".to_owned(),
-        execution_id: "exec-evi".to_owned(),
-        output: serde_json::json!({"answer":"x"}),
-        evidence_inline: vec![wattswarm::types::InlineEvidence {
+    let hidden_media = make_candidate(
+        "c-hidden",
+        "exec-evi",
+        serde_json::json!({"answer":"x"}),
+        vec![wattswarm::types::InlineEvidence {
             mime: "application/json".to_owned(),
             content: json_payload,
         }],
-        evidence_refs: vec![],
-    };
+        vec![],
+    );
     assert!(
         node.propose_candidate("task-evi-b64", hidden_media, 1, 120)
             .is_err()
@@ -955,12 +988,12 @@ fn commit_reveal_enforced_and_deadline() {
         .unwrap();
     node.propose_candidate(
         "task-vote",
-        Candidate {
-            candidate_id: "c-vote".to_owned(),
-            execution_id: "exec-p".to_owned(),
-            output: serde_json::json!({"answer":"ok"}),
-            evidence_inline: vec![],
-            evidence_refs: vec![wattswarm::types::ArtifactRef {
+        make_candidate(
+            "c-vote",
+            "exec-p",
+            serde_json::json!({"answer":"ok"}),
+            vec![],
+            vec![wattswarm::types::ArtifactRef {
                 uri: "https://e".to_owned(),
                 digest: "sha256:1".to_owned(),
                 size_bytes: 1,
@@ -968,7 +1001,7 @@ fn commit_reveal_enforced_and_deadline() {
                 created_at: 1,
                 producer: "r/p".to_owned(),
             }],
-        },
+        ),
         1,
         120,
     )
@@ -1100,12 +1133,12 @@ fn reveal_deadlock_schedules_retry_before_task_expiry() {
         .unwrap();
     node.propose_candidate(
         "task-retry",
-        Candidate {
-            candidate_id: "c-retry".to_owned(),
-            execution_id: "exec-p".to_owned(),
-            output: serde_json::json!({"answer":"ok"}),
-            evidence_inline: vec![],
-            evidence_refs: vec![wattswarm::types::ArtifactRef {
+        make_candidate(
+            "c-retry",
+            "exec-p",
+            serde_json::json!({"answer":"ok"}),
+            vec![],
+            vec![wattswarm::types::ArtifactRef {
                 uri: "https://e".to_owned(),
                 digest: "sha256:1".to_owned(),
                 size_bytes: 1,
@@ -1113,7 +1146,7 @@ fn reveal_deadlock_schedules_retry_before_task_expiry() {
                 created_at: 1,
                 producer: "r/p".to_owned(),
             }],
-        },
+        ),
         1,
         120,
     )
@@ -1241,12 +1274,12 @@ fn finality_disallows_fork_finalize() {
         .unwrap();
     node.propose_candidate(
         "task-final",
-        Candidate {
-            candidate_id: "cand-1".to_owned(),
-            execution_id: "e1".to_owned(),
-            output: serde_json::json!({"answer":"ok"}),
-            evidence_inline: vec![],
-            evidence_refs: vec![wattswarm::types::ArtifactRef {
+        make_candidate(
+            "cand-1",
+            "e1",
+            serde_json::json!({"answer":"ok"}),
+            vec![],
+            vec![wattswarm::types::ArtifactRef {
                 uri: "https://e".to_owned(),
                 digest: "sha256:1".to_owned(),
                 size_bytes: 1,
@@ -1254,7 +1287,7 @@ fn finality_disallows_fork_finalize() {
                 created_at: 1,
                 producer: "r/p".to_owned(),
             }],
-        },
+        ),
         1,
         30,
     )
@@ -1366,12 +1399,12 @@ fn verifier_result_requires_provider_source_fields() {
         .unwrap();
     node.propose_candidate(
         "task-src",
-        Candidate {
-            candidate_id: "c1".to_owned(),
-            execution_id: "ep".to_owned(),
-            output: serde_json::json!({"answer":"ok"}),
-            evidence_inline: vec![],
-            evidence_refs: vec![wattswarm::types::ArtifactRef {
+        make_candidate(
+            "c1",
+            "ep",
+            serde_json::json!({"answer":"ok"}),
+            vec![],
+            vec![wattswarm::types::ArtifactRef {
                 uri: "https://e".to_owned(),
                 digest: "sha256:1".to_owned(),
                 size_bytes: 1,
@@ -1379,7 +1412,7 @@ fn verifier_result_requires_provider_source_fields() {
                 created_at: 1,
                 producer: "r/p".to_owned(),
             }],
-        },
+        ),
         1,
         30,
     )
@@ -1492,12 +1525,12 @@ fn task_feedback_reported_bad_marks_settlement_window() {
         .unwrap();
     node.propose_candidate(
         "task-feedback",
-        Candidate {
-            candidate_id: "cf".to_owned(),
-            execution_id: "p".to_owned(),
-            output: serde_json::json!({"answer":"ok"}),
-            evidence_inline: vec![],
-            evidence_refs: vec![wattswarm::types::ArtifactRef {
+        make_candidate(
+            "cf",
+            "p",
+            serde_json::json!({"answer":"ok"}),
+            vec![],
+            vec![wattswarm::types::ArtifactRef {
                 uri: "https://e".to_owned(),
                 digest: "sha256:1".to_owned(),
                 size_bytes: 1,
@@ -1505,7 +1538,7 @@ fn task_feedback_reported_bad_marks_settlement_window() {
                 created_at: 1,
                 producer: "r/p".to_owned(),
             }],
-        },
+        ),
         1,
         30,
     )
@@ -1675,12 +1708,12 @@ fn finalize_applies_due_implicit_settlement_bonus() {
     .unwrap();
     node.propose_candidate(
         "task-implicit-bonus",
-        Candidate {
-            candidate_id: "cand-implicit".to_owned(),
-            execution_id: "exec-implicit-p".to_owned(),
-            output: serde_json::json!({"answer":"ok"}),
-            evidence_inline: vec![],
-            evidence_refs: vec![wattswarm::types::ArtifactRef {
+        make_candidate(
+            "cand-implicit",
+            "exec-implicit-p",
+            serde_json::json!({"answer":"ok"}),
+            vec![],
+            vec![wattswarm::types::ArtifactRef {
                 uri: "https://example.com/implicit".to_owned(),
                 digest: "sha256:implicit".to_owned(),
                 size_bytes: 1,
@@ -1688,7 +1721,7 @@ fn finalize_applies_due_implicit_settlement_bonus() {
                 created_at: 1,
                 producer: "r/p".to_owned(),
             }],
-        },
+        ),
         1,
         30,
     )
@@ -1828,12 +1861,12 @@ fn knowledge_lookup_exact_switches_execute_stage_to_decide_with_seed() {
     .unwrap();
     node.propose_candidate(
         "task-seed-base",
-        Candidate {
-            candidate_id: "cand-seed-base".to_owned(),
-            execution_id: "exec-p0".to_owned(),
-            output: serde_json::json!({"answer":"seeded"}),
-            evidence_inline: vec![],
-            evidence_refs: vec![wattswarm::types::ArtifactRef {
+        make_candidate(
+            "cand-seed-base",
+            "exec-p0",
+            serde_json::json!({"answer":"seeded"}),
+            vec![],
+            vec![wattswarm::types::ArtifactRef {
                 uri: "https://example.com/seed".to_owned(),
                 digest: "sha256:seed".to_owned(),
                 size_bytes: 1,
@@ -1841,7 +1874,7 @@ fn knowledge_lookup_exact_switches_execute_stage_to_decide_with_seed() {
                 created_at: 1,
                 producer: "r/p".to_owned(),
             }],
-        },
+        ),
         1,
         30,
     )
@@ -2236,12 +2269,12 @@ fn unknown_reason_codes_are_recorded_with_protocol_versions() {
     .unwrap();
     node.propose_candidate(
         "task-unknown-reason",
-        Candidate {
-            candidate_id: "cand-unknown".to_owned(),
-            execution_id: "exec-p".to_owned(),
-            output: serde_json::json!({"answer":"unknown-reason"}),
-            evidence_inline: vec![],
-            evidence_refs: vec![wattswarm::types::ArtifactRef {
+        make_candidate(
+            "cand-unknown",
+            "exec-p",
+            serde_json::json!({"answer":"unknown-reason"}),
+            vec![],
+            vec![wattswarm::types::ArtifactRef {
                 uri: "https://example.com/u".to_owned(),
                 digest: "sha256:u".to_owned(),
                 size_bytes: 1,
@@ -2249,7 +2282,7 @@ fn unknown_reason_codes_are_recorded_with_protocol_versions() {
                 created_at: 1,
                 producer: "r/p".to_owned(),
             }],
-        },
+        ),
         1,
         30,
     )
@@ -2335,12 +2368,12 @@ fn reuse_blacklist_prevents_same_candidate_hash_reproposal() {
     .unwrap();
     node.propose_candidate(
         "task-reuse-ref",
-        Candidate {
-            candidate_id: "cand-ref".to_owned(),
-            execution_id: "exec-ref-p".to_owned(),
-            output: serde_json::json!({"answer":"ref"}),
-            evidence_inline: vec![],
-            evidence_refs: vec![wattswarm::types::ArtifactRef {
+        make_candidate(
+            "cand-ref",
+            "exec-ref-p",
+            serde_json::json!({"answer":"ref"}),
+            vec![],
+            vec![wattswarm::types::ArtifactRef {
                 uri: "https://example.com/ref".to_owned(),
                 digest: "sha256:ref".to_owned(),
                 size_bytes: 1,
@@ -2348,7 +2381,7 @@ fn reuse_blacklist_prevents_same_candidate_hash_reproposal() {
                 created_at: 1,
                 producer: "r/p".to_owned(),
             }],
-        },
+        ),
         1,
         30,
     )
@@ -2459,12 +2492,12 @@ fn reuse_blacklist_prevents_same_candidate_hash_reproposal() {
     .unwrap();
     node.propose_candidate(
         "task-reuse-live",
-        Candidate {
-            candidate_id: "cand-live".to_owned(),
-            execution_id: "exec-live-p".to_owned(),
-            output: serde_json::json!({"answer":"x"}),
-            evidence_inline: vec![],
-            evidence_refs: vec![wattswarm::types::ArtifactRef {
+        make_candidate(
+            "cand-live",
+            "exec-live-p",
+            serde_json::json!({"answer":"x"}),
+            vec![],
+            vec![wattswarm::types::ArtifactRef {
                 uri: "https://example.com/live".to_owned(),
                 digest: "sha256:live".to_owned(),
                 size_bytes: 1,
@@ -2472,7 +2505,7 @@ fn reuse_blacklist_prevents_same_candidate_hash_reproposal() {
                 created_at: 1,
                 producer: "r/p".to_owned(),
             }],
-        },
+        ),
         1,
         120,
     )
@@ -2513,12 +2546,12 @@ fn reuse_blacklist_prevents_same_candidate_hash_reproposal() {
         140,
     )
     .unwrap();
-    let live_candidate = Candidate {
-        candidate_id: "cand-live".to_owned(),
-        execution_id: "exec-live-p".to_owned(),
-        output: serde_json::json!({"answer":"x"}),
-        evidence_inline: vec![],
-        evidence_refs: vec![wattswarm::types::ArtifactRef {
+    let live_candidate = make_candidate(
+        "cand-live",
+        "exec-live-p",
+        serde_json::json!({"answer":"x"}),
+        vec![],
+        vec![wattswarm::types::ArtifactRef {
             uri: "https://example.com/live".to_owned(),
             digest: "sha256:live".to_owned(),
             size_bytes: 1,
@@ -2526,7 +2559,7 @@ fn reuse_blacklist_prevents_same_candidate_hash_reproposal() {
             created_at: 1,
             producer: "r/p".to_owned(),
         }],
-    };
+    );
     let live_hash = candidate_hash(&live_candidate).unwrap();
     let reject_commit_hash = vote_commit_hash(VoteChoice::Reject, "salt-live", "vrh-live");
     node.submit_vote_commit(
@@ -2610,12 +2643,12 @@ fn reconcile_timeouts_auto_records_reuse_reject_quorum() {
     .unwrap();
     node.propose_candidate(
         "task-reuse-auto-ref",
-        Candidate {
-            candidate_id: "cand-auto-ref".to_owned(),
-            execution_id: "exec-auto-ref-p".to_owned(),
-            output: serde_json::json!({"answer":"ref"}),
-            evidence_inline: vec![],
-            evidence_refs: vec![wattswarm::types::ArtifactRef {
+        make_candidate(
+            "cand-auto-ref",
+            "exec-auto-ref-p",
+            serde_json::json!({"answer":"ref"}),
+            vec![],
+            vec![wattswarm::types::ArtifactRef {
                 uri: "https://example.com/auto-ref".to_owned(),
                 digest: "sha256:auto-ref".to_owned(),
                 size_bytes: 1,
@@ -2623,7 +2656,7 @@ fn reconcile_timeouts_auto_records_reuse_reject_quorum() {
                 created_at: 1,
                 producer: "r/p".to_owned(),
             }],
-        },
+        ),
         1,
         30,
     )
@@ -3014,12 +3047,12 @@ fn reuse_reject_requires_matching_decision_reference_tuple() {
         .unwrap();
     node.propose_candidate(
         "task-ref-src",
-        Candidate {
-            candidate_id: "c-ref-src".to_owned(),
-            execution_id: "ep".to_owned(),
-            output: serde_json::json!({"answer":"ok"}),
-            evidence_inline: vec![],
-            evidence_refs: vec![wattswarm::types::ArtifactRef {
+        make_candidate(
+            "c-ref-src",
+            "ep",
+            serde_json::json!({"answer":"ok"}),
+            vec![],
+            vec![wattswarm::types::ArtifactRef {
                 uri: "https://example.com/r1".to_owned(),
                 digest: "sha256:r1".to_owned(),
                 size_bytes: 1,
@@ -3027,7 +3060,7 @@ fn reuse_reject_requires_matching_decision_reference_tuple() {
                 created_at: 1,
                 producer: "r/p".to_owned(),
             }],
-        },
+        ),
         1,
         30,
     )
@@ -3115,12 +3148,12 @@ fn reuse_reject_requires_matching_decision_reference_tuple() {
     .unwrap();
     node.claim_task("task-ref-live", ClaimRole::Propose, "ep2", 5_000, 1, 110)
         .unwrap();
-    let live_candidate = Candidate {
-        candidate_id: "c-ref-live".to_owned(),
-        execution_id: "ep2".to_owned(),
-        output: serde_json::json!({"answer":"live"}),
-        evidence_inline: vec![],
-        evidence_refs: vec![wattswarm::types::ArtifactRef {
+    let live_candidate = make_candidate(
+        "c-ref-live",
+        "ep2",
+        serde_json::json!({"answer":"live"}),
+        vec![],
+        vec![wattswarm::types::ArtifactRef {
             uri: "https://example.com/r2".to_owned(),
             digest: "sha256:r2".to_owned(),
             size_bytes: 1,
@@ -3128,7 +3161,7 @@ fn reuse_reject_requires_matching_decision_reference_tuple() {
             created_at: 1,
             producer: "r/p".to_owned(),
         }],
-    };
+    );
     let live_hash = candidate_hash(&live_candidate).unwrap();
     node.propose_candidate("task-ref-live", live_candidate, 1, 120)
         .unwrap();
@@ -3250,12 +3283,12 @@ fn explore_stage_budget_exhaustion_blocks_more_candidates() {
     .unwrap();
     node.propose_candidate(
         "task-budget-explore",
-        Candidate {
-            candidate_id: "c1".to_owned(),
-            execution_id: "ep".to_owned(),
-            output: serde_json::json!({"answer":"ok"}),
-            evidence_inline: vec![],
-            evidence_refs: vec![wattswarm::types::ArtifactRef {
+        make_candidate(
+            "c1",
+            "ep",
+            serde_json::json!({"answer":"ok"}),
+            vec![],
+            vec![wattswarm::types::ArtifactRef {
                 uri: "https://example.com/e1".to_owned(),
                 digest: "sha256:e1".to_owned(),
                 size_bytes: 1,
@@ -3263,19 +3296,19 @@ fn explore_stage_budget_exhaustion_blocks_more_candidates() {
                 created_at: 1,
                 producer: "r/p".to_owned(),
             }],
-        },
+        ),
         1,
         30,
     )
     .unwrap();
     let second = node.propose_candidate(
         "task-budget-explore",
-        Candidate {
-            candidate_id: "c2".to_owned(),
-            execution_id: "ep".to_owned(),
-            output: serde_json::json!({"answer":"ok-2"}),
-            evidence_inline: vec![],
-            evidence_refs: vec![wattswarm::types::ArtifactRef {
+        make_candidate(
+            "c2",
+            "ep",
+            serde_json::json!({"answer":"ok-2"}),
+            vec![],
+            vec![wattswarm::types::ArtifactRef {
                 uri: "https://example.com/e2".to_owned(),
                 digest: "sha256:e2".to_owned(),
                 size_bytes: 1,
@@ -3283,7 +3316,7 @@ fn explore_stage_budget_exhaustion_blocks_more_candidates() {
                 created_at: 1,
                 producer: "r/p".to_owned(),
             }],
-        },
+        ),
         1,
         31,
     );
@@ -3307,12 +3340,12 @@ fn finalize_rejects_when_da_quorum_missing() {
         .unwrap();
     node.propose_candidate(
         "task-da-missing",
-        Candidate {
-            candidate_id: "c-da".to_owned(),
-            execution_id: "ep".to_owned(),
-            output: serde_json::json!({"answer":"ok"}),
-            evidence_inline: vec![],
-            evidence_refs: vec![wattswarm::types::ArtifactRef {
+        make_candidate(
+            "c-da",
+            "ep",
+            serde_json::json!({"answer":"ok"}),
+            vec![],
+            vec![wattswarm::types::ArtifactRef {
                 uri: "https://example.com/da".to_owned(),
                 digest: "sha256:da".to_owned(),
                 size_bytes: 1,
@@ -3320,7 +3353,7 @@ fn finalize_rejects_when_da_quorum_missing() {
                 created_at: 1,
                 producer: "r/p".to_owned(),
             }],
-        },
+        ),
         1,
         30,
     )
@@ -3394,12 +3427,12 @@ fn task_cost_report_export_has_required_fields() {
         .unwrap();
     node.propose_candidate(
         "task-cost-export",
-        Candidate {
-            candidate_id: "cc".to_owned(),
-            execution_id: "ep".to_owned(),
-            output: serde_json::json!({"answer":"ok"}),
-            evidence_inline: vec![],
-            evidence_refs: vec![wattswarm::types::ArtifactRef {
+        make_candidate(
+            "cc",
+            "ep",
+            serde_json::json!({"answer":"ok"}),
+            vec![],
+            vec![wattswarm::types::ArtifactRef {
                 uri: "https://example.com/c".to_owned(),
                 digest: "sha256:c".to_owned(),
                 size_bytes: 1,
@@ -3407,7 +3440,7 @@ fn task_cost_report_export_has_required_fields() {
                 created_at: 1,
                 producer: "r/p".to_owned(),
             }],
-        },
+        ),
         1,
         30,
     )
@@ -3445,12 +3478,12 @@ fn epoch_end_allowed_after_finalize_budget_is_spent() {
         .unwrap();
     node.propose_candidate(
         "task-epoch-roll",
-        Candidate {
-            candidate_id: "c-roll".to_owned(),
-            execution_id: "ep".to_owned(),
-            output: serde_json::json!({"answer":"ok"}),
-            evidence_inline: vec![],
-            evidence_refs: vec![wattswarm::types::ArtifactRef {
+        make_candidate(
+            "c-roll",
+            "ep",
+            serde_json::json!({"answer":"ok"}),
+            vec![],
+            vec![wattswarm::types::ArtifactRef {
                 uri: "https://example.com/roll".to_owned(),
                 digest: "sha256:roll".to_owned(),
                 size_bytes: 1,
@@ -3458,7 +3491,7 @@ fn epoch_end_allowed_after_finalize_budget_is_spent() {
                 created_at: 1,
                 producer: "r/p".to_owned(),
             }],
-        },
+        ),
         1,
         30,
     )
@@ -3566,13 +3599,13 @@ fn evidence_added_accepts_large_external_artifact_metadata() {
         .unwrap();
     node.propose_candidate(
         "task-evidence-size",
-        Candidate {
-            candidate_id: "c-es".to_owned(),
-            execution_id: "ep".to_owned(),
-            output: serde_json::json!({"answer":"ok"}),
-            evidence_inline: vec![],
-            evidence_refs: vec![],
-        },
+        make_candidate(
+            "c-es",
+            "ep",
+            serde_json::json!({"answer":"ok"}),
+            vec![],
+            vec![],
+        ),
         1,
         30,
     )

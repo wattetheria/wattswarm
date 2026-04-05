@@ -433,31 +433,31 @@ fn should_publish_interpreted_stance(
 
 fn publish_interpreted_stance(
     node: &mut Node,
+    state_dir: &std::path::Path,
     message: &TopicMessageRow,
     output: &InterpretationOutput,
     created_at: u64,
 ) -> Result<()> {
     let network_id = resolve_network_id(node);
-    node.emit_at(
-        1,
-        crate::types::EventPayload::TopicMessagePosted(crate::types::TopicMessagePostedPayload {
-            network_id,
-            feed_key: message.feed_key.clone(),
-            scope_hint: message.scope_hint.clone(),
-            content: json!({
-                "kind": TOPIC_INTERPRETATION_MESSAGE_KIND,
-                "proposal_id": output.proposal_id,
-                "proposal_message_id": output.proposal_message_id,
-                "stance": output.stance,
-                "summary": output.summary,
-                "confidence": output.confidence,
-                "source_message_id": message.message_id,
-                "source_author_node_id": message.author_node_id,
-                "interpretation_answer": output.answer,
-                "evidence": output.evidence
-            }),
-            reply_to_message_id: Some(message.message_id.clone()),
+    crate::control::emit_topic_message_with_content(
+        node,
+        state_dir,
+        &network_id,
+        &message.feed_key,
+        &message.scope_hint,
+        json!({
+            "kind": TOPIC_INTERPRETATION_MESSAGE_KIND,
+            "proposal_id": output.proposal_id,
+            "proposal_message_id": output.proposal_message_id,
+            "stance": output.stance,
+            "summary": output.summary,
+            "confidence": output.confidence,
+            "source_message_id": message.message_id,
+            "source_author_node_id": message.author_node_id,
+            "interpretation_answer": output.answer,
+            "evidence": output.evidence
         }),
+        Some(message.message_id.clone()),
         created_at,
     )?;
     Ok(())
@@ -512,6 +512,7 @@ fn maybe_interpret_message(
         }
         let _ = run_existing_task_with_runtime(
             node,
+            state_dir,
             &prepared.runtime,
             &prepared.capabilities,
             CORE_AGENT_EXECUTOR_NAME,
@@ -528,7 +529,7 @@ fn maybe_interpret_message(
     if !should_publish_interpreted_stance(message, &candidate_proposals, &output) {
         return Ok(false);
     }
-    publish_interpreted_stance(node, message, &output, now_ms())?;
+    publish_interpreted_stance(node, state_dir, message, &output, now_ms())?;
     Ok(true)
 }
 

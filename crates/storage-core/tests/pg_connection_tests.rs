@@ -570,6 +570,30 @@ fn local_control_peer_metadata_and_relationship_roundtrip() {
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].message_id, "msg-1");
         assert_eq!(messages[0].delivery_state, "delivered");
+
+        store
+            .upsert_local_data_plane_status(
+                &scope_id,
+                &wattswarm_storage_core::storage::LocalDataPlaneStatusRow {
+                    object_kind: "dm_message".to_owned(),
+                    object_id: "msg-1".to_owned(),
+                    remote_node_id: Some("peer-a".to_owned()),
+                    route: "iroh_direct".to_owned(),
+                    status: "content_hydrated".to_owned(),
+                    detail: None,
+                    updated_at: 1_700_000_000_900,
+                },
+            )
+            .expect("save data plane status");
+
+        let statuses = store
+            .list_local_data_plane_statuses(&scope_id)
+            .expect("list data plane statuses");
+        assert_eq!(statuses.len(), 1);
+        assert_eq!(statuses[0].object_kind, "dm_message");
+        assert_eq!(statuses[0].object_id, "msg-1");
+        assert_eq!(statuses[0].route, "iroh_direct");
+        assert_eq!(statuses[0].status, "content_hydrated");
     });
 }
 

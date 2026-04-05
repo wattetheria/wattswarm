@@ -5722,6 +5722,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+ "wattswarm-protocol",
 ]
 
 [[package]]

@@ -35,6 +35,17 @@ fn temp_startup_dir(prefix: &str) -> PathBuf {
     dir
 }
 
+fn sample_topic_content_ref(digest: &str, producer: &str) -> crate::types::ArtifactRef {
+    crate::types::ArtifactRef {
+        uri: format!("artifact://topic-message/{digest}"),
+        digest: digest.to_owned(),
+        size_bytes: 64,
+        mime: "application/json".to_owned(),
+        created_at: 10,
+        producer: producer.to_owned(),
+    }
+}
+
 fn membership_with_roles(node_ids: &[String]) -> Membership {
     let mut membership = Membership::new();
     for node_id in node_ids {
@@ -108,6 +119,7 @@ fn ingest_event_envelope_applies_remote_event_to_local_node() {
     let envelope = EventEnvelope {
         scope: SwarmScope::Global,
         event: remote_event,
+        content_source_node_id: None,
     };
 
     ingest_event_envelope(&mut node, &envelope).expect("ingest envelope");
@@ -147,7 +159,8 @@ fn ingest_chat_gossip_applies_remote_topic_message_to_local_store() {
             network_id: "default".to_owned(),
             feed_key: "crew.chat".to_owned(),
             scope_hint: "group:crew-7".to_owned(),
-            content: json!({"text":"hello crew"}),
+            content_ref: sample_topic_content_ref("sha256:hello-crew", &remote.node_id()),
+            local_content_cache: Some(json!({"text":"hello crew"})),
             reply_to_message_id: None,
         }),
     )
@@ -177,6 +190,7 @@ fn ingest_chat_gossip_applies_remote_topic_message_to_local_store() {
                 message: GossipMessage::Chat(EventEnvelope {
                     scope: SwarmScope::Group("crew-7".to_owned()),
                     event: remote_event.clone(),
+                    content_source_node_id: None,
                 }),
             }),
         )
@@ -209,6 +223,7 @@ fn global_event_gossip_rejects_non_global_scope() {
             }),
         )
         .expect("event"),
+        content_source_node_id: None,
     };
 
     assert!(global_event_gossip(envelope).is_err());
@@ -232,6 +247,7 @@ fn backfill_response_for_request_wraps_global_events() {
 
     let response = backfill_response_for_request(
         &node,
+        "peer-local",
         &BackfillRequest {
             scope: SwarmScope::Global,
             from_event_seq: 0,
@@ -269,6 +285,7 @@ fn ingest_backfill_response_rejects_scope_mismatch() {
                 ),
             )
             .expect("event"),
+            content_source_node_id: None,
         }],
     };
 
@@ -284,7 +301,8 @@ fn topic_backfill_response_filters_by_feed_key() {
             network_id: "default".to_owned(),
             feed_key: "crew.chat".to_owned(),
             scope_hint: "group:crew-7".to_owned(),
-            content: json!({"text":"hello crew"}),
+            content_ref: sample_topic_content_ref("sha256:hello-crew", "node-local"),
+            local_content_cache: Some(json!({"text":"hello crew"})),
             reply_to_message_id: None,
         }),
         10,
@@ -296,7 +314,8 @@ fn topic_backfill_response_filters_by_feed_key() {
             network_id: "default".to_owned(),
             feed_key: "market.chat".to_owned(),
             scope_hint: "group:crew-7".to_owned(),
-            content: json!({"text":"ignore me"}),
+            content_ref: sample_topic_content_ref("sha256:ignore-me", "node-local"),
+            local_content_cache: Some(json!({"text":"ignore me"})),
             reply_to_message_id: None,
         }),
         11,
@@ -305,6 +324,7 @@ fn topic_backfill_response_filters_by_feed_key() {
 
     let response = backfill_response_for_request(
         &node,
+        "peer-local",
         &BackfillRequest {
             scope: SwarmScope::Group("crew-7".to_owned()),
             from_event_seq: 0,
@@ -358,7 +378,8 @@ fn topic_backfill_response_advances_local_cursor() {
             network_id: "default".to_owned(),
             feed_key: "crew.chat".to_owned(),
             scope_hint: "group:crew-7".to_owned(),
-            content: json!({"text":"cursor me"}),
+            content_ref: sample_topic_content_ref("sha256:cursor-me", &remote.node_id()),
+            local_content_cache: Some(json!({"text":"cursor me"})),
             reply_to_message_id: None,
         }),
     )
@@ -370,6 +391,7 @@ fn topic_backfill_response_advances_local_cursor() {
         events: vec![EventEnvelope {
             scope: SwarmScope::Group("crew-7".to_owned()),
             event: remote_event,
+            content_source_node_id: None,
         }],
     };
 
@@ -1169,6 +1191,7 @@ fn backfill_response_filters_by_scope() {
 
     let response = backfill_response_for_request(
         &node,
+        "peer-local",
         &BackfillRequest {
             scope: SwarmScope::Region("sol-1".to_owned()),
             from_event_seq: 0,
@@ -1224,6 +1247,7 @@ fn backfill_response_skips_network_substrate_events_for_other_networks() {
 
     let response = backfill_response_for_request(
         &node,
+        "peer-local",
         &BackfillRequest {
             scope: SwarmScope::Region("sol-1".to_owned()),
             from_event_seq: 0,
@@ -1261,6 +1285,7 @@ fn global_backfill_skips_task_process_layer_events() {
 
     let response = backfill_response_for_request(
         &node,
+        "peer-local",
         &BackfillRequest {
             scope: SwarmScope::Global,
             from_event_seq: 0,
@@ -1499,6 +1524,14 @@ fn task_outcome_summary_imports_compressed_result_facts() {
     let candidate = crate::types::Candidate {
         candidate_id: "cand-outcome".to_owned(),
         execution_id: "exec-outcome".to_owned(),
+        output_ref: crate::types::ArtifactRef {
+            uri: "artifact://reference/cand-outcome".to_owned(),
+            digest: "sha256:cand-outcome".to_owned(),
+            size_bytes: 90,
+            mime: "application/json".to_owned(),
+            created_at: 10,
+            producer: node_id.clone(),
+        },
         output: json!({
             "answer": "compressed answer",
             "decision": "approve",
@@ -1606,6 +1639,14 @@ fn subnet_outcome_summary_and_checkpoint_anchor_mirror_to_parent_network() {
     let candidate = crate::types::Candidate {
         candidate_id: "cand-parent-outcome".to_owned(),
         execution_id: "exec-parent-outcome".to_owned(),
+        output_ref: crate::types::ArtifactRef {
+            uri: "artifact://reference/cand-parent-outcome".to_owned(),
+            digest: "sha256:cand-parent-outcome".to_owned(),
+            size_bytes: 64,
+            mime: "application/json".to_owned(),
+            created_at: 10,
+            producer: node_id.clone(),
+        },
         output: json!({"answer":"uplinked","decision":"approve","check_summary":"compressed"}),
         evidence_inline: vec![],
         evidence_refs: vec![],

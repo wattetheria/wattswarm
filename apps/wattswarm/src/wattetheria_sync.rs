@@ -355,15 +355,14 @@ pub fn submit_brain_topic_publish(
     let mut node = open_configured_node(state_dir, db_path)?;
     let created_at = now_ms();
     let network_id = req.network_id.unwrap_or_else(|| resolve_network_id(&node));
-    let event = node.emit_at(
-        1,
-        crate::types::EventPayload::TopicMessagePosted(crate::types::TopicMessagePostedPayload {
-            network_id: network_id.clone(),
-            feed_key: feed_key.clone(),
-            scope_hint: scope_hint.clone(),
-            content: req.content,
-            reply_to_message_id: req.reply_to_message_id,
-        }),
+    let event = crate::control::emit_topic_message_with_content(
+        &mut node,
+        state_dir,
+        &network_id,
+        &feed_key,
+        &scope_hint,
+        req.content,
+        req.reply_to_message_id,
         created_at,
     )?;
     let _ = crate::control::topic_interpretation::process_topic_interpretation_for_topic(
@@ -374,6 +373,7 @@ pub fn submit_brain_topic_publish(
     );
     let _ = crate::control::topic_consensus::process_structured_topic_consensus_for_topic(
         &mut node,
+        state_dir,
         &feed_key,
         &scope_hint,
     );

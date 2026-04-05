@@ -7,12 +7,26 @@ use wattswarm::reason_codes::{
     REASON_EVIDENCE_DIGEST_MISMATCH, REASON_EVIDENCE_TIMEOUT, REASON_EVIDENCE_UNREACHABLE,
     REASON_SCHEMA_INVALID, REASON_SCORE_TOO_LOW,
 };
-use wattswarm::types::Candidate;
+use wattswarm::types::{ArtifactRef, Candidate};
+
+fn candidate_output_ref(candidate_id: &str, output: &Value) -> ArtifactRef {
+    let bytes = serde_json::to_vec(output).expect("serialize output");
+    let digest = wattswarm::crypto::sha256_hex(&bytes);
+    ArtifactRef {
+        uri: format!("artifact://reference/{candidate_id}"),
+        digest: format!("sha256:{digest}"),
+        size_bytes: bytes.len() as u64,
+        mime: "application/json".to_owned(),
+        created_at: 1,
+        producer: "test-producer".to_owned(),
+    }
+}
 
 fn candidate(output: Value) -> Candidate {
     Candidate {
         candidate_id: "c1".to_owned(),
         execution_id: "e1".to_owned(),
+        output_ref: candidate_output_ref("c1", &output),
         output,
         evidence_inline: vec![],
         evidence_refs: vec![],

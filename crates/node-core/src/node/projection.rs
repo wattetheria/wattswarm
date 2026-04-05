@@ -52,12 +52,17 @@ impl Node {
                 )?;
             }
             EventPayload::CandidateProposed(payload) => {
-                self.store.put_candidate(
-                    &payload.task_id,
-                    &event.author_node_id,
-                    &payload.candidate,
-                )?;
-                for reference in &payload.candidate.evidence_refs {
+                let mut candidate = payload.candidate.clone();
+                if !candidate.has_resolved_output()
+                    && let Some(cached_output) = self
+                        .store
+                        .cached_candidate_output(&payload.task_id, &candidate.candidate_id)?
+                {
+                    candidate.output = cached_output;
+                }
+                self.store
+                    .put_candidate(&payload.task_id, &event.author_node_id, &candidate)?;
+                for reference in &candidate.evidence_refs {
                     self.store.upsert_evidence_summary(
                         &reference.digest,
                         &reference.mime,
@@ -173,7 +178,16 @@ impl Node {
                     .ok_or_else(|| {
                         SwarmError::NotFound("candidate missing for finalization".into())
                     })?;
-                let output_digest = sha256_hex(&serde_json::to_vec(&candidate.output)?);
+                let output_digest = if candidate.has_resolved_output() {
+                    sha256_hex(&serde_json::to_vec(&candidate.output)?)
+                } else {
+                    candidate
+                        .output_ref
+                        .digest
+                        .strip_prefix("sha256:")
+                        .unwrap_or(&candidate.output_ref.digest)
+                        .to_owned()
+                };
                 let policy_snapshot_digest = sha256_hex(&serde_json::to_vec(
                     &task.contract.acceptance.verifier_policy,
                 )?);
@@ -388,7 +402,8 @@ impl Node {
                     &payload.feed_key,
                     &scope_hint,
                     &event.author_node_id,
-                    &payload.content,
+                    &payload.content_ref,
+                    payload.local_content_cache.as_ref(),
                     payload.reply_to_message_id.as_deref(),
                     event.created_at,
                 )?;

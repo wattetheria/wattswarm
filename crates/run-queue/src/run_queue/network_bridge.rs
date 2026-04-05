@@ -260,10 +260,6 @@ pub fn process_pending_run_queue_results(state_dir: &Path) -> Result<u64> {
             .get("candidate_id")
             .and_then(Value::as_str)
             .unwrap_or("");
-        let output = entry
-            .get("candidate_output")
-            .cloned()
-            .unwrap_or(Value::Null);
         let author_node_id = entry
             .get("author_node_id")
             .and_then(Value::as_str)
@@ -272,6 +268,24 @@ pub fn process_pending_run_queue_results(state_dir: &Path) -> Result<u64> {
         if task_id.is_empty() || candidate_id.is_empty() || author_node_id.is_empty() {
             continue;
         }
+
+        let output =
+            match crate::control::open_node(state_dir, std::path::Path::new(&queue.database_url))
+                .ok()
+                .and_then(|node| {
+                    node.store
+                        .get_candidate_by_id(task_id, candidate_id)
+                        .ok()
+                        .flatten()
+                })
+                .map(|candidate| candidate.output)
+            {
+                Some(output) => output,
+                None => {
+                    failed_lines.push(line.to_owned());
+                    continue;
+                }
+            };
 
         match complete_remote_step(
             &queue,

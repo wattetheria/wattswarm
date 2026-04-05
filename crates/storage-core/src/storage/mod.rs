@@ -185,7 +185,9 @@ pub struct TopicMessageRow {
     pub feed_key: String,
     pub scope_hint: String,
     pub author_node_id: String,
+    pub content_ref: ArtifactRef,
     pub content: Value,
+    pub content_resolved_at: Option<u64>,
     pub reply_to_message_id: Option<String>,
     pub created_at: u64,
 }
@@ -281,6 +283,17 @@ pub struct LocalPeerDmMessageRow {
     pub content_encoding: Option<String>,
     pub created_at: u64,
     pub acknowledged_at: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalDataPlaneStatusRow {
+    pub object_kind: String,
+    pub object_id: String,
+    pub remote_node_id: Option<String>,
+    pub route: String,
+    pub status: String,
+    pub detail: Option<String>,
+    pub updated_at: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

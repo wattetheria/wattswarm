@@ -36,6 +36,7 @@ struct AppState {
     policies: Arc<PolicyRegistry>,
 }
 
+#[cfg(not(test))]
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
@@ -63,6 +64,9 @@ async fn main() -> Result<()> {
     println!("wattswarm-runtime listening on {}", args.listen);
     axum::serve(listener, app).await.context("serve runtime")
 }
+
+#[cfg(test)]
+fn main() {}
 
 fn split_csv(raw: &str) -> Vec<String> {
     raw.split(',')
@@ -341,7 +345,7 @@ async fn verify(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use wattswarm::types::{Candidate, PolicyBinding};
+    use wattswarm::types::{ArtifactRef, Candidate, PolicyBinding};
 
     fn sample_state() -> AppState {
         AppState {
@@ -360,6 +364,19 @@ mod tests {
             .policies
             .binding_for("vp.schema_only.v1", json!({}))
             .expect("builtin policy binding")
+    }
+
+    fn sample_output_ref(candidate_id: &str, output: &serde_json::Value) -> ArtifactRef {
+        let bytes = serde_json::to_vec(output).expect("serialize output");
+        let digest = wattswarm::crypto::sha256_hex(&bytes);
+        ArtifactRef {
+            uri: format!("artifact://reference/{candidate_id}"),
+            digest: format!("sha256:{digest}"),
+            size_bytes: bytes.len() as u64,
+            mime: "application/json".to_owned(),
+            created_at: 1,
+            producer: "test-producer".to_owned(),
+        }
     }
 
     fn sample_execute_request(policy_hash: String) -> ExecuteRequest {
@@ -449,11 +466,13 @@ mod tests {
     #[tokio::test]
     async fn verify_returns_bad_request_for_invalid_policy_binding() {
         let state = sample_state();
+        let output = json!({"answer":"ok"});
         let req = VerifyRequest {
             candidate: Candidate {
                 candidate_id: "c1".to_owned(),
                 execution_id: "e1".to_owned(),
-                output: json!({"answer":"ok"}),
+                output_ref: sample_output_ref("c1", &output),
+                output,
                 evidence_inline: vec![],
                 evidence_refs: vec![],
             },
@@ -481,11 +500,13 @@ mod tests {
     async fn verify_returns_passed_status_for_valid_candidate() {
         let state = sample_state();
         let policy = sample_policy_binding(&state);
+        let output = json!({"answer":"ok"});
         let req = VerifyRequest {
             candidate: Candidate {
                 candidate_id: "c1".to_owned(),
                 execution_id: "e1".to_owned(),
-                output: json!({"answer":"ok"}),
+                output_ref: sample_output_ref("c1", &output),
+                output,
                 evidence_inline: vec![],
                 evidence_refs: vec![],
             },

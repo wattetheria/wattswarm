@@ -6,6 +6,7 @@ const DISCOVERY_DIAL_RETRY_AFTER: Duration = Duration::from_secs(3);
 
 pub fn backfill_response_for_request(
     node: &Node,
+    local_transport_node_id: &str,
     request: &BackfillRequest,
     max_limit: usize,
     hard_limit: usize,
@@ -46,6 +47,7 @@ pub fn backfill_response_for_request(
             envelopes.push(EventEnvelope {
                 scope: request.scope.clone(),
                 event,
+                content_source_node_id: Some(local_transport_node_id.to_owned()),
             });
             if envelopes.len() >= request.limit {
                 break;

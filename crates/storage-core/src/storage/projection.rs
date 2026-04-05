@@ -455,7 +455,8 @@ impl PgStore {
         feed_key: &str,
         scope_hint: &str,
         author_node_id: &str,
-        content: &serde_json::Value,
+        content_ref: &ArtifactRef,
+        content: Option<&serde_json::Value>,
         reply_to_message_id: Option<&str>,
         created_at: u64,
     ) -> Result<()> {
@@ -465,14 +466,19 @@ impl PgStore {
             .lock()
             .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
         conn.execute(
-            "INSERT INTO topic_messages(org_id, message_id, network_id, feed_key, scope_hint, author_node_id, content_json, reply_to_message_id, created_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, TIMESTAMPTZ 'epoch' + ($9::bigint * INTERVAL '1 millisecond'))
+            "INSERT INTO topic_messages(org_id, message_id, network_id, feed_key, scope_hint, author_node_id, content_ref_json, content_json, content_resolved_at, reply_to_message_id, created_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8,
+                     CASE WHEN $9::bigint < 0 THEN NULL ELSE TIMESTAMPTZ 'epoch' + ($9::bigint * INTERVAL '1 millisecond') END,
+                     $10,
+                     TIMESTAMPTZ 'epoch' + ($11::bigint * INTERVAL '1 millisecond'))
              ON CONFLICT(org_id, message_id) DO UPDATE SET
                network_id = excluded.network_id,
                feed_key = excluded.feed_key,
                scope_hint = excluded.scope_hint,
                author_node_id = excluded.author_node_id,
+               content_ref_json = excluded.content_ref_json,
                content_json = excluded.content_json,
+               content_resolved_at = excluded.content_resolved_at,
                reply_to_message_id = excluded.reply_to_message_id,
                created_at = excluded.created_at",
             params![
@@ -482,7 +488,9 @@ impl PgStore {
                 feed_key,
                 canonical_scope_hint,
                 author_node_id,
-                serde_json::to_string(content)?,
+                serde_json::to_string(content_ref)?,
+                serde_json::to_string(content.unwrap_or(&serde_json::Value::Null))?,
+                content.map(|_| created_at as i64).unwrap_or(-1),
                 reply_to_message_id,
                 created_at as i64
             ],
@@ -506,8 +514,9 @@ impl PgStore {
         let has_anchor = before_created_at.is_some();
         let before_created_at = before_created_at.unwrap_or(u64::MAX) as i64;
         let mut stmt = conn.prepare(
-            "SELECT message_id, network_id, author_node_id, content_json, reply_to_message_id,
-                    CAST(EXTRACT(EPOCH FROM created_at) * 1000 AS BIGINT)
+            "SELECT message_id, network_id, author_node_id, content_ref_json, content_json, reply_to_message_id,
+                    CAST(EXTRACT(EPOCH FROM created_at) * 1000 AS BIGINT),
+                    CASE WHEN content_resolved_at IS NULL THEN NULL ELSE CAST(EXTRACT(EPOCH FROM content_resolved_at) * 1000 AS BIGINT) END
              FROM topic_messages
              WHERE org_id = $1 AND feed_key = $2 AND scope_hint = $3
                AND (
@@ -533,18 +542,23 @@ impl PgStore {
                 limit as i64
             ],
             |r| {
-                let content_json: String = r.get(3)?;
-                let created_at_ms: i64 = r.get(5)?;
+                let content_ref_json: String = r.get(3)?;
+                let content_json: String = r.get(4)?;
+                let created_at_ms: i64 = r.get(6)?;
                 Ok(TopicMessageRow {
                     message_id: r.get(0)?,
                     network_id: r.get(1)?,
                     feed_key: feed_key.to_owned(),
                     scope_hint: canonical_scope_hint.clone(),
                     author_node_id: r.get(2)?,
+                    content_ref: serde_json::from_str(&content_ref_json).map_err(|e| {
+                        pg::Error::FromSqlConversionFailure(0, pg::types::Type::Text, Box::new(e))
+                    })?,
                     content: serde_json::from_str(&content_json).map_err(|e| {
                         pg::Error::FromSqlConversionFailure(0, pg::types::Type::Text, Box::new(e))
                     })?,
-                    reply_to_message_id: r.get(4)?,
+                    content_resolved_at: r.get::<_, Option<i64>>(7)?.map(|value| value as u64),
+                    reply_to_message_id: r.get(5)?,
                     created_at: created_at_ms as u64,
                 })
             },
@@ -563,6 +577,31 @@ impl PgStore {
         limit: usize,
     ) -> Result<Vec<TopicMessageRow>> {
         self.list_topic_messages_page(feed_key, scope_hint, None, None, limit)
+    }
+
+    pub fn update_topic_message_content(
+        &self,
+        message_id: &str,
+        content: &serde_json::Value,
+        resolved_at: u64,
+    ) -> Result<()> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
+        conn.execute(
+            "UPDATE topic_messages
+             SET content_json = $3,
+                 content_resolved_at = TIMESTAMPTZ 'epoch' + ($4::bigint * INTERVAL '1 millisecond')
+             WHERE org_id = $1 AND message_id = $2",
+            params![
+                self.org_id(),
+                message_id,
+                serde_json::to_string(content)?,
+                resolved_at as i64
+            ],
+        )?;
+        Ok(())
     }
 
     pub fn upsert_topic_cursor(
@@ -1296,20 +1335,25 @@ impl PgStore {
         proposer_node_id: &str,
         candidate: &Candidate,
     ) -> Result<()> {
-        let candidate_json = serde_json::to_string(candidate)?;
+        let candidate_json = candidate.control_json()?;
         let hash = candidate_hash(candidate)?;
+        let output_ref_json = serde_json::to_string(&candidate.output_ref)?;
+        let output_json = serde_json::to_string(&candidate.output)?;
         let conn = self
             .conn
             .lock()
             .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
         conn.execute(
-            "INSERT INTO candidates(org_id, task_id, candidate_id, candidate_hash, execution_id, proposer_node_id, candidate_json)
-             VALUES ($1, $2, $3, $4, $5, $6, $7)
+            "INSERT INTO candidates(org_id, task_id, candidate_id, candidate_hash, execution_id, proposer_node_id, candidate_json, output_ref_json, output_json, output_resolved_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, CASE WHEN $9 = 'null' THEN NULL ELSE NOW() END)
              ON CONFLICT(org_id, task_id, candidate_id) DO UPDATE SET
                candidate_hash = excluded.candidate_hash,
                execution_id = excluded.execution_id,
                proposer_node_id = excluded.proposer_node_id,
-               candidate_json = excluded.candidate_json",
+               candidate_json = excluded.candidate_json,
+               output_ref_json = excluded.output_ref_json,
+               output_json = excluded.output_json,
+               output_resolved_at = excluded.output_resolved_at",
             params![
                 self.org_id(),
                 task_id,
@@ -1317,10 +1361,89 @@ impl PgStore {
                 hash,
                 candidate.execution_id,
                 proposer_node_id,
-                candidate_json
+                candidate_json,
+                output_ref_json,
+                output_json,
+            ],
+        )?;
+        if candidate.has_resolved_output() {
+            conn.execute(
+                "INSERT INTO candidate_output_cache(org_id, task_id, candidate_id, output_json, updated_at)
+                 VALUES ($1, $2, $3, $4, NOW())
+                 ON CONFLICT(org_id, task_id, candidate_id) DO UPDATE SET
+                   output_json = excluded.output_json,
+                   updated_at = excluded.updated_at",
+                params![self.org_id(), task_id, candidate.candidate_id, output_json],
+            )?;
+        }
+        Ok(())
+    }
+
+    pub fn update_candidate_output(
+        &self,
+        task_id: &str,
+        candidate_id: &str,
+        output: &Value,
+        resolved_at: u64,
+    ) -> Result<()> {
+        let output_json = serde_json::to_string(output)?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
+        conn.execute(
+            "UPDATE candidates
+             SET output_json = $4,
+                 output_resolved_at = TIMESTAMPTZ 'epoch' + ($5::bigint * INTERVAL '1 millisecond')
+             WHERE org_id = $1 AND task_id = $2 AND candidate_id = $3",
+            params![
+                self.org_id(),
+                task_id,
+                candidate_id,
+                output_json,
+                resolved_at as i64
+            ],
+        )?;
+        conn.execute(
+            "INSERT INTO candidate_output_cache(org_id, task_id, candidate_id, output_json, updated_at)
+             VALUES ($1, $2, $3, $4, TIMESTAMPTZ 'epoch' + ($5::bigint * INTERVAL '1 millisecond'))
+             ON CONFLICT(org_id, task_id, candidate_id) DO UPDATE SET
+               output_json = excluded.output_json,
+               updated_at = excluded.updated_at",
+            params![
+                self.org_id(),
+                task_id,
+                candidate_id,
+                output_json,
+                resolved_at as i64
             ],
         )?;
         Ok(())
+    }
+
+    pub fn cached_candidate_output(
+        &self,
+        task_id: &str,
+        candidate_id: &str,
+    ) -> Result<Option<Value>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
+        conn.query_row(
+            "SELECT output_json
+             FROM candidate_output_cache
+             WHERE org_id = $1 AND task_id = $2 AND candidate_id = $3",
+            params![self.org_id(), task_id, candidate_id],
+            |r| {
+                let raw: String = r.get(0)?;
+                serde_json::from_str::<Value>(&raw).map_err(|e| {
+                    pg::Error::FromSqlConversionFailure(0, pg::types::Type::Text, Box::new(e))
+                })
+            },
+        )
+        .optional()
+        .map_err(Into::into)
     }
 
     pub fn get_candidate_by_id(
@@ -1333,12 +1456,16 @@ impl PgStore {
             .lock()
             .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
         conn.query_row(
-            "SELECT candidate_json FROM candidates WHERE org_id = $1 AND task_id = $2 AND candidate_id = $3",
+            "SELECT candidate_json, output_json FROM candidates WHERE org_id = $1 AND task_id = $2 AND candidate_id = $3",
             params![self.org_id(), task_id, candidate_id],
             |r| {
                 let json: String = r.get(0)?;
-                let c: Candidate = serde_json::from_str(&json).map_err(|e| {
+                let output_json: String = r.get(1)?;
+                let mut c: Candidate = serde_json::from_str(&json).map_err(|e| {
                     pg::Error::FromSqlConversionFailure(0, pg::types::Type::Text, Box::new(e))
+                })?;
+                c.output = serde_json::from_str(&output_json).map_err(|e| {
+                    pg::Error::FromSqlConversionFailure(1, pg::types::Type::Text, Box::new(e))
                 })?;
                 Ok(c)
             },
@@ -1357,12 +1484,16 @@ impl PgStore {
             .lock()
             .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
         conn.query_row(
-            "SELECT candidate_json FROM candidates WHERE org_id = $1 AND task_id = $2 AND execution_id = $3",
+            "SELECT candidate_json, output_json FROM candidates WHERE org_id = $1 AND task_id = $2 AND execution_id = $3",
             params![self.org_id(), task_id, execution_id],
             |r| {
                 let json: String = r.get(0)?;
-                let c: Candidate = serde_json::from_str(&json).map_err(|e| {
+                let output_json: String = r.get(1)?;
+                let mut c: Candidate = serde_json::from_str(&json).map_err(|e| {
                     pg::Error::FromSqlConversionFailure(0, pg::types::Type::Text, Box::new(e))
+                })?;
+                c.output = serde_json::from_str(&output_json).map_err(|e| {
+                    pg::Error::FromSqlConversionFailure(1, pg::types::Type::Text, Box::new(e))
                 })?;
                 Ok(c)
             },

@@ -29,7 +29,7 @@ pub fn vote_commit_hash(vote: VoteChoice, salt: &str, verifier_result_hash: &str
 }
 
 pub fn candidate_hash(candidate: &Candidate) -> Result<String> {
-    let payload = serde_json::to_vec(candidate)?;
+    let payload = candidate.control_bytes()?;
     Ok(sha256_hex(&payload))
 }
 
@@ -58,6 +58,10 @@ impl NodeIdentity {
 
     pub fn verifying_key(&self) -> VerifyingKey {
         self.signing_key.verifying_key()
+    }
+
+    pub fn secret_bytes(&self) -> [u8; 32] {
+        self.signing_key.to_bytes()
     }
 
     pub fn sign_bytes(&self, bytes: &[u8]) -> String {

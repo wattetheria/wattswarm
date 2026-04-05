@@ -91,6 +91,14 @@ fn sample_candidate(candidate_id: &str, execution_id: &str) -> Candidate {
     Candidate {
         candidate_id: candidate_id.to_owned(),
         execution_id: execution_id.to_owned(),
+        output_ref: ArtifactRef {
+            uri: format!("artifact://reference/sha256:{candidate_id}"),
+            digest: format!("sha256:{candidate_id}"),
+            size_bytes: 16,
+            mime: "application/json".to_owned(),
+            created_at: 1_700_000_000_000,
+            producer: "runtime/profile".to_owned(),
+        },
         output: serde_json::json!({"result":"ok"}),
         evidence_inline: vec![],
         evidence_refs: vec![ArtifactRef {

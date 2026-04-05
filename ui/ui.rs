@@ -204,7 +204,7 @@ pub fn run(state_dir: PathBuf, db_path: PathBuf, listen: String) -> Result<()> {
             let _ = crate::run_queue::network_bridge::process_pending_bridge_tasks(node, sd);
             let _ = crate::run_queue::network_bridge::process_pending_run_queue_results(sd);
             let _ = crate::control::topic_interpretation::process_topic_interpretation(node, sd);
-            let _ = crate::control::topic_consensus::process_structured_topic_consensus(node);
+            let _ = crate::control::topic_consensus::process_structured_topic_consensus(node, sd);
         })),
     )?;
     if network_started {
@@ -374,7 +374,8 @@ async fn node_up(State(state): State<UiServerState>) -> Result<Json<Value>, ApiE
                 let _ = crate::run_queue::network_bridge::process_pending_run_queue_results(sd);
                 let _ =
                     crate::control::topic_interpretation::process_topic_interpretation(node, sd);
-                let _ = crate::control::topic_consensus::process_structured_topic_consensus(node);
+                let _ =
+                    crate::control::topic_consensus::process_structured_topic_consensus(node, sd);
             })),
         )?;
         if crate::network_bridge::network_enabled_from_env() {
@@ -516,7 +517,7 @@ async fn startup_config_save(
             let _ = crate::run_queue::network_bridge::process_pending_bridge_tasks(node, sd);
             let _ = crate::run_queue::network_bridge::process_pending_run_queue_results(sd);
             let _ = crate::control::topic_interpretation::process_topic_interpretation(node, sd);
-            let _ = crate::control::topic_consensus::process_structured_topic_consensus(node);
+            let _ = crate::control::topic_consensus::process_structured_topic_consensus(node, sd);
         })),
     )?;
     mark_node_running_if_service_started(&state.state_dir, network_started)?;
@@ -1537,17 +1538,14 @@ async fn topic_message_post(
         let mut node = open_node(&state_clone.state_dir, &state_clone.db_path)?;
         let network_id = network_id.unwrap_or_else(|| resolve_network_id(&node));
         let created_at = chrono::Utc::now().timestamp_millis().max(0) as u64;
-        let event = node.emit_at(
-            1,
-            crate::types::EventPayload::TopicMessagePosted(
-                crate::types::TopicMessagePostedPayload {
-                    network_id: network_id.clone(),
-                    feed_key: feed_key.clone(),
-                    scope_hint: scope_hint.clone(),
-                    content,
-                    reply_to_message_id,
-                },
-            ),
+        let event = crate::control::emit_topic_message_with_content(
+            &mut node,
+            &state_clone.state_dir,
+            &network_id,
+            &feed_key,
+            &scope_hint,
+            content,
+            reply_to_message_id,
             created_at,
         )?;
         let _ = crate::control::topic_interpretation::process_topic_interpretation_for_topic(
@@ -1558,6 +1556,7 @@ async fn topic_message_post(
         );
         let _ = crate::control::topic_consensus::process_structured_topic_consensus_for_topic(
             &mut node,
+            &state_clone.state_dir,
             &feed_key,
             &scope_hint,
         );

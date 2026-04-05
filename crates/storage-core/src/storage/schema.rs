@@ -194,6 +194,130 @@ fn migrate_peer_metadata_local_contact_material_schema(conn: &Connection) -> Res
     Ok(())
 }
 
+fn migrate_topic_messages_content_ref_schema(conn: &Connection) -> Result<()> {
+    if !column_exists(conn, "topic_messages", "content_ref_json") {
+        conn.execute_batch(
+            "
+            ALTER TABLE topic_messages
+            ADD COLUMN content_ref_json TEXT;
+            ",
+        )?;
+    }
+    if !column_exists(conn, "topic_messages", "content_resolved_at") {
+        conn.execute_batch(
+            "
+            ALTER TABLE topic_messages
+            ADD COLUMN content_resolved_at TIMESTAMPTZ;
+            ",
+        )?;
+    }
+    Ok(())
+}
+
+fn migrate_candidates_content_ref_schema(conn: &Connection) -> Result<()> {
+    if !column_exists(conn, "candidates", "output_ref_json") {
+        conn.execute_batch(
+            "
+            ALTER TABLE candidates
+            ADD COLUMN output_ref_json TEXT;
+            ",
+        )?;
+    }
+    if !column_exists(conn, "candidates", "output_json") {
+        conn.execute_batch(
+            "
+            ALTER TABLE candidates
+            ADD COLUMN output_json TEXT NOT NULL DEFAULT 'null';
+            ",
+        )?;
+    }
+    if !column_exists(conn, "candidates", "output_resolved_at") {
+        conn.execute_batch(
+            "
+            ALTER TABLE candidates
+            ADD COLUMN output_resolved_at TIMESTAMPTZ;
+            ",
+        )?;
+    }
+    conn.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS candidate_output_cache (
+            org_id TEXT NOT NULL DEFAULT '__unset_org__',
+            task_id TEXT NOT NULL,
+            candidate_id TEXT NOT NULL,
+            output_json TEXT NOT NULL,
+            updated_at TIMESTAMPTZ NOT NULL,
+            PRIMARY KEY(org_id, task_id, candidate_id)
+        );
+        ",
+    )?;
+
+    let mut stmt = conn.prepare(
+        "SELECT org_id, task_id, candidate_id, proposer_node_id, candidate_json
+         FROM candidates",
+    )?;
+    let rows = stmt.query_map([], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, String>(2)?,
+            r.get::<_, String>(3)?,
+            r.get::<_, String>(4)?,
+        ))
+    })?;
+
+    for row in rows {
+        let (org_id, task_id, candidate_id, proposer_node_id, candidate_json) = row?;
+        let Ok(mut value) = serde_json::from_str::<serde_json::Value>(&candidate_json) else {
+            continue;
+        };
+        let Some(candidate_obj) = value.as_object_mut() else {
+            continue;
+        };
+        let Some(output_value) = candidate_obj.remove("output") else {
+            continue;
+        };
+        let output_json = serde_json::to_string(&output_value)?;
+        let output_bytes = serde_json::to_vec(&output_value)?;
+        let output_digest = format!("sha256:{}", wattswarm_crypto::sha256_hex(&output_bytes));
+        let output_ref = serde_json::json!({
+            "uri": format!("artifact://reference/{output_digest}"),
+            "digest": output_digest,
+            "size_bytes": output_bytes.len() as u64,
+            "mime": "application/json",
+            "created_at": 0_u64,
+            "producer": proposer_node_id,
+        });
+        candidate_obj.insert("output_ref".to_owned(), output_ref.clone());
+        let control_json = serde_json::to_string(&value)?;
+        conn.execute(
+            "UPDATE candidates
+             SET candidate_json = $4,
+                 output_ref_json = $5,
+                 output_json = $6,
+                 output_resolved_at = COALESCE(output_resolved_at, NOW())
+             WHERE org_id = $1 AND task_id = $2 AND candidate_id = $3",
+            params![
+                org_id,
+                task_id,
+                candidate_id,
+                control_json,
+                serde_json::to_string(&output_ref)?,
+                output_json,
+            ],
+        )?;
+        conn.execute(
+            "INSERT INTO candidate_output_cache(org_id, task_id, candidate_id, output_json, updated_at)
+             VALUES ($1, $2, $3, $4, NOW())
+             ON CONFLICT(org_id, task_id, candidate_id) DO UPDATE SET
+               output_json = excluded.output_json,
+               updated_at = excluded.updated_at",
+            params![org_id, task_id, candidate_id, output_json],
+        )?;
+    }
+    Ok(())
+}
+
 fn migrate_executor_registry_local_scope_schema(conn: &Connection) -> Result<()> {
     if column_exists(conn, "executor_registry_local", "scope_id") {
         return Ok(());
@@ -423,6 +547,21 @@ impl PgStore {
             CREATE INDEX IF NOT EXISTS idx_peer_dm_messages_local_thread_created
                 ON peer_dm_messages_local(scope_id, thread_id, created_at ASC, message_id ASC);
 
+            CREATE TABLE IF NOT EXISTS data_plane_status_local (
+                scope_id TEXT NOT NULL DEFAULT '',
+                object_kind TEXT NOT NULL,
+                object_id TEXT NOT NULL,
+                remote_node_id TEXT,
+                route TEXT NOT NULL,
+                status TEXT NOT NULL,
+                detail TEXT,
+                updated_at TIMESTAMPTZ NOT NULL,
+                PRIMARY KEY(scope_id, object_kind, object_id)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_data_plane_status_local_updated
+                ON data_plane_status_local(scope_id, updated_at DESC, object_kind ASC, object_id ASC);
+
             CREATE TABLE IF NOT EXISTS remote_task_bridge_registry_local (
                 task_id TEXT NOT NULL,
                 executor TEXT NOT NULL,
@@ -495,6 +634,18 @@ impl PgStore {
                 execution_id TEXT NOT NULL,
                 proposer_node_id TEXT NOT NULL,
                 candidate_json TEXT NOT NULL,
+                output_ref_json TEXT,
+                output_json TEXT NOT NULL DEFAULT 'null',
+                output_resolved_at TIMESTAMPTZ,
+                PRIMARY KEY(org_id, task_id, candidate_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS candidate_output_cache (
+                org_id TEXT NOT NULL DEFAULT '__unset_org__',
+                task_id TEXT NOT NULL,
+                candidate_id TEXT NOT NULL,
+                output_json TEXT NOT NULL,
+                updated_at TIMESTAMPTZ NOT NULL,
                 PRIMARY KEY(org_id, task_id, candidate_id)
             );
 
@@ -601,7 +752,9 @@ impl PgStore {
                 feed_key TEXT NOT NULL,
                 scope_hint TEXT NOT NULL,
                 author_node_id TEXT NOT NULL,
-                content_json TEXT NOT NULL,
+                content_ref_json TEXT,
+                content_json TEXT NOT NULL DEFAULT 'null',
+                content_resolved_at TIMESTAMPTZ,
                 reply_to_message_id TEXT,
                 created_at TIMESTAMPTZ NOT NULL,
                 PRIMARY KEY(org_id, message_id)
@@ -1402,6 +1555,8 @@ impl PgStore {
             migrate_discovered_peers_local_scope_schema(&conn)?;
             migrate_discovered_peers_local_source_kind_schema(&conn)?;
             migrate_peer_metadata_local_contact_material_schema(&conn)?;
+            migrate_topic_messages_content_ref_schema(&conn)?;
+            migrate_candidates_content_ref_schema(&conn)?;
             ensure_discovered_peers_local_scope_index(&conn)?;
             Ok(())
         })();

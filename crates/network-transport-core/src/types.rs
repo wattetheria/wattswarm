@@ -59,6 +59,8 @@ pub struct TransferIntent {
 pub enum DirectDataObjectKind {
     ReferenceArtifact,
     EvidenceArtifact,
+    TopicMessageJson,
+    DirectMessageJson,
     CheckpointJson,
     SnapshotJson,
 }

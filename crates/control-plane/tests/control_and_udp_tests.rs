@@ -74,6 +74,24 @@ fn load_transport_decisions(state_dir: &Path) -> Vec<serde_json::Value> {
         .collect()
 }
 
+fn candidate_output_ref(
+    candidate_id: &str,
+    output: &serde_json::Value,
+    created_at: u64,
+    producer: &str,
+) -> wattswarm_control_plane::types::ArtifactRef {
+    let bytes = serde_json::to_vec(output).expect("serialize candidate output");
+    let digest = sha256_hex(&bytes);
+    wattswarm_control_plane::types::ArtifactRef {
+        uri: format!("artifact://reference/{candidate_id}"),
+        digest: format!("sha256:{digest}"),
+        size_bytes: bytes.len() as u64,
+        mime: "application/json".to_owned(),
+        created_at,
+        producer: producer.to_owned(),
+    }
+}
+
 fn save_iroh_peer_metadata(state_dir: &Path, node_id: &str, peer_id: &str, updated_at: u64) {
     save_peer_metadata_record_state(
         state_dir,
@@ -1583,10 +1601,12 @@ fn task_detail_and_evidence_artifacts_roundtrip_and_missing_refs_schedule_repair
     .expect("claim task");
     let evidence_bytes = br#"{"evidence":"blob"}"#;
     let evidence_digest = format!("sha256:{}", sha256_hex(evidence_bytes));
+    let candidate_output = json!({"answer":"ok"});
     let candidate = wattswarm_control_plane::types::Candidate {
         candidate_id: "cand-artifact-1".to_owned(),
         execution_id: "exec-artifact-detail".to_owned(),
-        output: json!({"answer":"ok"}),
+        output_ref: candidate_output_ref("cand-artifact-1", &candidate_output, 24, &node.node_id()),
+        output: candidate_output,
         evidence_inline: vec![],
         evidence_refs: vec![],
     };
@@ -1766,10 +1786,17 @@ fn missing_task_and_evidence_artifacts_record_remote_source_route() {
     .expect("claim task");
     let evidence_bytes = br#"{"evidence":"remote"}"#;
     let evidence_digest = format!("sha256:{}", sha256_hex(evidence_bytes));
+    let candidate_output = json!({"answer":"ok"});
     let candidate = wattswarm_control_plane::types::Candidate {
         candidate_id: "cand-remote-evidence".to_owned(),
         execution_id: "exec-remote-evidence".to_owned(),
-        output: json!({"answer":"ok"}),
+        output_ref: candidate_output_ref(
+            "cand-remote-evidence",
+            &candidate_output,
+            43,
+            &node.node_id(),
+        ),
+        output: candidate_output,
         evidence_inline: vec![],
         evidence_refs: vec![],
     };
@@ -1895,10 +1922,17 @@ fn fetch_task_and_evidence_artifacts_over_iroh_when_remote_contact_material_is_a
         63,
     )
     .expect("claim task");
+    let candidate_output = json!({"answer":"ok"});
     let candidate = wattswarm_control_plane::types::Candidate {
         candidate_id: "cand-remote-evidence-iroh".to_owned(),
         execution_id: "exec-remote-evidence-iroh".to_owned(),
-        output: json!({"answer":"ok"}),
+        output_ref: candidate_output_ref(
+            "cand-remote-evidence-iroh",
+            &candidate_output,
+            64,
+            &node.node_id(),
+        ),
+        output: candidate_output,
         evidence_inline: vec![],
         evidence_refs: vec![],
     };

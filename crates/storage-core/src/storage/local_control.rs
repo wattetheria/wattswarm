@@ -632,6 +632,72 @@ impl PgStore {
         Ok(())
     }
 
+    pub fn list_local_data_plane_statuses(
+        &self,
+        scope_id: &str,
+    ) -> Result<Vec<LocalDataPlaneStatusRow>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
+        let mut stmt = conn.prepare(
+            "SELECT object_kind, object_id, remote_node_id, route, status, detail,
+                    (EXTRACT(EPOCH FROM updated_at) * 1000)::BIGINT AS updated_at_ms
+             FROM data_plane_status_local
+             WHERE scope_id = $1
+             ORDER BY updated_at DESC, object_kind ASC, object_id ASC",
+        )?;
+        let rows = stmt.query_map(params![scope_id], |r| {
+            Ok(LocalDataPlaneStatusRow {
+                object_kind: r.get(0)?,
+                object_id: r.get(1)?,
+                remote_node_id: r.get(2)?,
+                route: r.get(3)?,
+                status: r.get(4)?,
+                detail: r.get(5)?,
+                updated_at: r.get::<_, i64>(6)? as u64,
+            })
+        })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
+    pub fn upsert_local_data_plane_status(
+        &self,
+        scope_id: &str,
+        row: &LocalDataPlaneStatusRow,
+    ) -> Result<()> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
+        conn.execute(
+            "INSERT INTO data_plane_status_local(
+                scope_id, object_kind, object_id, remote_node_id, route, status, detail, updated_at
+             ) VALUES (
+                $1, $2, $3, $4, $5, $6, $7,
+                TIMESTAMPTZ 'epoch' + ($8::bigint * INTERVAL '1 millisecond')
+             )
+             ON CONFLICT(scope_id, object_kind, object_id) DO UPDATE SET
+                remote_node_id = excluded.remote_node_id,
+                route = excluded.route,
+                status = excluded.status,
+                detail = excluded.detail,
+                updated_at = excluded.updated_at",
+            params![
+                scope_id,
+                &row.object_kind,
+                &row.object_id,
+                &row.remote_node_id,
+                &row.route,
+                &row.status,
+                &row.detail,
+                row.updated_at as i64
+            ],
+        )?;
+        Ok(())
+    }
+
     pub fn load_local_config_json<T: DeserializeOwned>(
         &self,
         scope_id: &str,

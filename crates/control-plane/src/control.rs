@@ -1,12 +1,12 @@
-use crate::crypto::{NodeIdentity, candidate_hash, vote_commit_hash};
+use crate::crypto::{NodeIdentity, candidate_hash, sha256_hex, vote_commit_hash};
 use crate::node::{Node, finality_sign};
 use crate::runtime::{HttpRuntimeClient, RuntimeCapabilities, RuntimeClient};
 use crate::storage::{PgStore, local_control_scope_id, local_control_store};
 use crate::task_template::sample_contract;
 use crate::types::{
-    ClaimRole, EventPayload, ExecutionIntentDeclaredPayload, ExecutionSetConfirmedPayload,
-    ExecutionSetMember, FinalityProof, Membership, NetworkBootstrapBundle, Role, TaskContract,
-    VoteChoice, VoteCommitPayload, VoteRevealPayload,
+    Candidate, ClaimRole, EventPayload, ExecutionIntentDeclaredPayload,
+    ExecutionSetConfirmedPayload, ExecutionSetMember, FinalityProof, Membership,
+    NetworkBootstrapBundle, Role, TaskContract, VoteChoice, VoteCommitPayload, VoteRevealPayload,
 };
 use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -677,6 +677,196 @@ fn open_local_artifact_store(state_dir: &Path) -> Result<ArtifactStore> {
     Ok(store)
 }
 
+fn content_artifact_uri(kind: ArtifactKind, digest: &str) -> String {
+    let kind_str = match kind {
+        ArtifactKind::TopicMessage => "topic-message",
+        ArtifactKind::DirectMessage => "direct-message",
+        ArtifactKind::Reference => "reference",
+        ArtifactKind::Evidence => "evidence",
+        ArtifactKind::Checkpoint => "checkpoint",
+        ArtifactKind::Snapshot => "snapshot",
+        ArtifactKind::EventBatch => "event-batch",
+        ArtifactKind::Availability => "availability",
+    };
+    format!("artifact://{kind_str}/{digest}")
+}
+
+pub fn materialize_json_content_artifact(
+    state_dir: &Path,
+    kind: ArtifactKind,
+    producer: &str,
+    content: &Value,
+    created_at: u64,
+) -> Result<crate::types::ArtifactRef> {
+    let bytes = serde_json::to_vec(content)?;
+    let digest = format!("sha256:{}", sha256_hex(&bytes));
+    let artifact_store = open_local_artifact_store(state_dir)?;
+    let path = artifact_store.write_validated_bytes(
+        kind,
+        &digest,
+        None,
+        &bytes,
+        Some(&digest),
+        Some(bytes.len() as u64),
+    )?;
+    let manifest = availability_manifest(
+        kind,
+        &digest,
+        None,
+        Some(&content_artifact_uri(kind, &digest)),
+        Some(&digest),
+        Some("application/json"),
+        Some(bytes.len() as u64),
+        Some(&path),
+        ArtifactAvailabilityStatus::Available,
+        created_at,
+        0,
+        None,
+        None,
+    );
+    artifact_store.write_availability_manifest(&manifest)?;
+    Ok(crate::types::ArtifactRef {
+        uri: content_artifact_uri(kind, &digest),
+        digest,
+        size_bytes: bytes.len() as u64,
+        mime: "application/json".to_owned(),
+        created_at,
+        producer: producer.to_owned(),
+    })
+}
+
+pub fn fetch_json_content_artifact_via_iroh(
+    state_dir: &Path,
+    remote_node_id: &str,
+    kind: ArtifactKind,
+    reference: &crate::types::ArtifactRef,
+) -> Result<Value> {
+    let local_peer_id = local_peer_id(state_dir)?
+        .parse()
+        .map_err(|err| anyhow!("parse local peer id: {err}"))?;
+    fetch_json_content_artifact_via_iroh_with_local_peer_id(
+        state_dir,
+        &local_peer_id,
+        remote_node_id,
+        kind,
+        reference,
+    )
+}
+
+pub fn fetch_json_content_artifact_via_iroh_with_local_peer_id(
+    state_dir: &Path,
+    local_peer_id: &crate::network_p2p::PeerId,
+    remote_node_id: &str,
+    kind: ArtifactKind,
+    reference: &crate::types::ArtifactRef,
+) -> Result<Value> {
+    let object_kind = match kind {
+        ArtifactKind::TopicMessage => DirectDataObjectKind::TopicMessageJson,
+        ArtifactKind::DirectMessage => DirectDataObjectKind::DirectMessageJson,
+        ArtifactKind::Reference => DirectDataObjectKind::ReferenceArtifact,
+        ArtifactKind::Evidence => DirectDataObjectKind::EvidenceArtifact,
+        ArtifactKind::Checkpoint => DirectDataObjectKind::CheckpointJson,
+        ArtifactKind::Snapshot => DirectDataObjectKind::SnapshotJson,
+        ArtifactKind::EventBatch | ArtifactKind::Availability => {
+            bail!("unsupported JSON content artifact kind {:?}", kind)
+        }
+    };
+    let metadata = load_peer_metadata_record_for_remote_node_state(state_dir, remote_node_id)?
+        .ok_or_else(|| anyhow!("missing peer metadata for {remote_node_id}"))?;
+    let contact = metadata
+        .transport_contact_material(DataTransportRoute::IrohDirect)
+        .ok_or_else(|| anyhow!("missing iroh_direct contact material for {remote_node_id}"))?;
+    let bytes = fetch_direct_data(
+        state_dir,
+        local_peer_id,
+        &contact,
+        &DirectDataFetchRequest {
+            object_kind,
+            object_id: reference.digest.clone(),
+            scope: None,
+            source_uri: Some(reference.uri.clone()),
+            expected_digest: Some(reference.digest.clone()),
+            expected_size: Some(reference.size_bytes),
+        },
+    )?
+    .bytes;
+    let artifact_store = open_local_artifact_store(state_dir)?;
+    let path = artifact_store.write_validated_bytes(
+        kind,
+        &reference.digest,
+        None,
+        &bytes,
+        Some(&reference.digest),
+        Some(reference.size_bytes),
+    )?;
+    let manifest = availability_manifest(
+        kind,
+        &reference.digest,
+        None,
+        Some(&reference.uri),
+        Some(&reference.digest),
+        Some(&reference.mime),
+        Some(reference.size_bytes),
+        Some(&path),
+        ArtifactAvailabilityStatus::Available,
+        observed_at_ms(),
+        0,
+        None,
+        None,
+    );
+    artifact_store.write_availability_manifest(&manifest)?;
+    Ok(serde_json::from_slice(&bytes)?)
+}
+
+pub fn emit_topic_message_with_content(
+    node: &mut Node,
+    state_dir: &Path,
+    network_id: &str,
+    feed_key: &str,
+    scope_hint: &str,
+    content: Value,
+    reply_to_message_id: Option<String>,
+    created_at: u64,
+) -> Result<crate::types::Event> {
+    let content_ref = materialize_json_content_artifact(
+        state_dir,
+        ArtifactKind::TopicMessage,
+        &node.node_id(),
+        &content,
+        created_at,
+    )?;
+    let event = node.emit_at(
+        1,
+        crate::types::EventPayload::TopicMessagePosted(crate::types::TopicMessagePostedPayload {
+            network_id: network_id.to_owned(),
+            feed_key: feed_key.to_owned(),
+            scope_hint: scope_hint.to_owned(),
+            content_ref: content_ref.clone(),
+            local_content_cache: Some(content.clone()),
+            reply_to_message_id,
+        }),
+        created_at,
+    )?;
+    node.store
+        .update_topic_message_content(&event.event_id, &content, created_at)?;
+    Ok(event)
+}
+
+pub fn materialize_candidate_output_artifact(
+    state_dir: &Path,
+    producer: &str,
+    output: &Value,
+    created_at: u64,
+) -> Result<crate::types::ArtifactRef> {
+    materialize_json_content_artifact(
+        state_dir,
+        ArtifactKind::Reference,
+        producer,
+        output,
+        created_at,
+    )
+}
+
 fn load_remote_task_bridge_registry_file(path: &Path) -> Result<RemoteTaskBridgeRegistry> {
     if !path.exists() {
         return Ok(RemoteTaskBridgeRegistry::default());
@@ -1157,6 +1347,10 @@ fn maybe_fetch_reference_artifact_via_transport(
     let object_kind = match kind {
         ArtifactKind::Reference => DirectDataObjectKind::ReferenceArtifact,
         ArtifactKind::Evidence => DirectDataObjectKind::EvidenceArtifact,
+        ArtifactKind::TopicMessage => DirectDataObjectKind::TopicMessageJson,
+        ArtifactKind::DirectMessage => DirectDataObjectKind::DirectMessageJson,
+        ArtifactKind::Checkpoint => DirectDataObjectKind::CheckpointJson,
+        ArtifactKind::Snapshot => DirectDataObjectKind::SnapshotJson,
         _ => bail!("unsupported reference artifact kind {:?}", kind),
     };
     let bytes = fetch_via_iroh_route(
@@ -2047,6 +2241,7 @@ pub fn list_artifacts_needing_repair(
 
 pub(crate) fn run_existing_task_with_runtime(
     node: &mut Node,
+    state_dir: &Path,
     runtime: &dyn RuntimeClient,
     capabilities: &RuntimeCapabilities,
     executor: &str,
@@ -2069,14 +2264,29 @@ pub(crate) fn run_existing_task_with_runtime(
         1,
         now.saturating_add(1),
     )?;
-    node.auto_execute_with_runtime(
-        runtime,
+    let execute_req = node.build_execute_request_for_runtime(
         task_id,
         profile,
         &propose_execution_id,
         1,
         now.saturating_add(2),
     )?;
+    let execute_res = runtime.execute(&execute_req)?;
+    let candidate_output_ref = materialize_candidate_output_artifact(
+        state_dir,
+        &node.node_id(),
+        &execute_res.candidate_output,
+        now.saturating_add(2),
+    )?;
+    let candidate = Candidate {
+        candidate_id: format!("cand-{}", propose_execution_id),
+        execution_id: propose_execution_id.clone(),
+        output_ref: candidate_output_ref,
+        output: execute_res.candidate_output,
+        evidence_inline: execute_res.evidence_inline,
+        evidence_refs: execute_res.evidence_refs,
+    };
+    node.propose_candidate(task_id, candidate, 1, now.saturating_add(2))?;
 
     let candidate_id = format!("cand-{propose_execution_id}");
     node.claim_task(
@@ -2391,6 +2601,7 @@ pub fn bridge_remote_task_into_local_execution(
     )?;
     let run = run_existing_task_with_runtime(
         node,
+        state_dir,
         &prepared.runtime,
         &prepared.capabilities,
         &executor,
@@ -2993,6 +3204,38 @@ pub fn save_peer_dm_message_record_state(
     )
 }
 
+pub fn save_data_plane_status_record_state(
+    state_dir: &Path,
+    object_kind: &str,
+    object_id: &str,
+    remote_node_id: Option<&str>,
+    route: &str,
+    status: &str,
+    detail: Option<&str>,
+    updated_at: u64,
+) -> Result<()> {
+    let scope_id = local_control_scope_id(state_dir);
+    local_control_store(state_dir)?.upsert_local_data_plane_status(
+        &scope_id,
+        &crate::storage::LocalDataPlaneStatusRow {
+            object_kind: object_kind.to_owned(),
+            object_id: object_id.to_owned(),
+            remote_node_id: remote_node_id.map(ToOwned::to_owned),
+            route: route.to_owned(),
+            status: status.to_owned(),
+            detail: detail.map(ToOwned::to_owned),
+            updated_at,
+        },
+    )
+}
+
+pub fn load_data_plane_status_records_state(
+    state_dir: &Path,
+) -> Result<Vec<crate::storage::LocalDataPlaneStatusRow>> {
+    let scope_id = local_control_scope_id(state_dir);
+    local_control_store(state_dir)?.list_local_data_plane_statuses(&scope_id)
+}
+
 pub fn apply_peer_relationship_action_state(
     state_dir: &Path,
     remote_node_id: &str,
@@ -3237,6 +3480,7 @@ pub fn run_real_task_flow(
     node.submit_task(contract.clone(), 1, now)?;
     run_existing_task_with_runtime(
         node,
+        state_dir,
         &prepared.runtime,
         &prepared.capabilities,
         &executor,

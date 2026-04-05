@@ -15,6 +15,17 @@ fn open_test_store() -> PgStore {
         .for_org("local:test-storage:bootstrap")
 }
 
+fn sample_topic_content_ref(digest: &str, producer: &str) -> ArtifactRef {
+    ArtifactRef {
+        uri: format!("artifact://topic-message/{digest}"),
+        digest: digest.to_owned(),
+        size_bytes: 64,
+        mime: "application/json".to_owned(),
+        created_at: 123,
+        producer: producer.to_owned(),
+    }
+}
+
 #[test]
 fn network_substrate_reads_canonicalize_scope_hints() {
     let store = open_test_store();
@@ -113,7 +124,8 @@ fn topic_message_roundtrip_reads_scope_and_content() {
             "crew.chat",
             " group:crew-7 ",
             "node-a",
-            &serde_json::json!({"text":"hello crew"}),
+            &sample_topic_content_ref("sha256:msg-1", "node-a"),
+            Some(&serde_json::json!({"text":"hello crew"})),
             None,
             123,
         )
@@ -125,7 +137,8 @@ fn topic_message_roundtrip_reads_scope_and_content() {
             "crew.chat",
             "group:crew-7",
             "node-b",
-            &serde_json::json!({"text":"reply"}),
+            &sample_topic_content_ref("sha256:msg-2", "node-b"),
+            Some(&serde_json::json!({"text":"reply"})),
             Some("msg-1"),
             124,
         )
@@ -175,7 +188,8 @@ fn topic_message_pagination_uses_created_at_and_message_id_anchor() {
             "crew.chat",
             "group:crew-7",
             "node-a",
-            &serde_json::json!({"text":"first"}),
+            &sample_topic_content_ref("sha256:msg-1", "node-a"),
+            Some(&serde_json::json!({"text":"first"})),
             None,
             124,
         )
@@ -187,7 +201,8 @@ fn topic_message_pagination_uses_created_at_and_message_id_anchor() {
             "crew.chat",
             "group:crew-7",
             "node-b",
-            &serde_json::json!({"text":"second"}),
+            &sample_topic_content_ref("sha256:msg-2", "node-b"),
+            Some(&serde_json::json!({"text":"second"})),
             None,
             124,
         )
@@ -199,7 +214,8 @@ fn topic_message_pagination_uses_created_at_and_message_id_anchor() {
             "crew.chat",
             "group:crew-7",
             "node-c",
-            &serde_json::json!({"text":"third"}),
+            &sample_topic_content_ref("sha256:msg-3", "node-c"),
+            Some(&serde_json::json!({"text":"third"})),
             None,
             125,
         )
@@ -535,6 +551,14 @@ fn sample_candidate(candidate_id: &str, execution_id: &str) -> Candidate {
     Candidate {
         candidate_id: candidate_id.to_owned(),
         execution_id: execution_id.to_owned(),
+        output_ref: ArtifactRef {
+            uri: format!("artifact://reference/sha256:{candidate_id}"),
+            digest: format!("sha256:{candidate_id}"),
+            size_bytes: 16,
+            mime: "application/json".to_owned(),
+            created_at: 1_700_000_000_000,
+            producer: "runtime/profile".to_owned(),
+        },
         output: serde_json::json!({"answer":"ok"}),
         evidence_inline: vec![],
         evidence_refs: vec![ArtifactRef {

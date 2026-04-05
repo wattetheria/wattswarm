@@ -10,6 +10,8 @@ use wattswarm_crypto::sha256_hex;
 pub enum ArtifactKind {
     Reference,
     Evidence,
+    TopicMessage,
+    DirectMessage,
     Checkpoint,
     Snapshot,
     EventBatch,
@@ -21,6 +23,8 @@ impl ArtifactKind {
         match self {
             Self::Reference => "references",
             Self::Evidence => "evidence",
+            Self::TopicMessage => "topic-messages",
+            Self::DirectMessage => "direct-messages",
             Self::Checkpoint => "checkpoints",
             Self::Snapshot => "snapshots",
             Self::EventBatch => "event-batches",
@@ -85,6 +89,8 @@ impl ArtifactStore {
         for kind in [
             ArtifactKind::Reference,
             ArtifactKind::Evidence,
+            ArtifactKind::TopicMessage,
+            ArtifactKind::DirectMessage,
             ArtifactKind::Checkpoint,
             ArtifactKind::Snapshot,
             ArtifactKind::EventBatch,
@@ -261,6 +267,9 @@ impl ArtifactStore {
         match kind {
             ArtifactKind::Reference => self.reference_path(artifact_id),
             ArtifactKind::Evidence => self.evidence_path(artifact_id),
+            ArtifactKind::TopicMessage | ArtifactKind::DirectMessage => {
+                self.sharded_digest_path(kind, artifact_id)
+            }
             ArtifactKind::Checkpoint => self.checkpoint_path(artifact_id),
             ArtifactKind::Snapshot => self.snapshot_path(
                 scope.ok_or_else(|| anyhow::anyhow!("scope required"))?,
@@ -356,6 +365,8 @@ mod tests {
         for kind in [
             ArtifactKind::Reference,
             ArtifactKind::Evidence,
+            ArtifactKind::TopicMessage,
+            ArtifactKind::DirectMessage,
             ArtifactKind::Checkpoint,
             ArtifactKind::Snapshot,
             ArtifactKind::EventBatch,

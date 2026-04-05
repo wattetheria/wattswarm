@@ -392,12 +392,15 @@ impl Node {
                 SwarmError::InvalidEvent("reply_to_message_id must not be empty".into()).into(),
             );
         }
-        let content_bytes = serde_json::to_vec(&payload.content)?;
-        if payload.content.is_null()
-            || content_bytes.is_empty()
-            || content_bytes.len() > MAX_INLINE_EVIDENCE_BYTES
+        if payload.content_ref.uri.trim().is_empty()
+            || payload.content_ref.digest.trim().is_empty()
+            || payload.content_ref.mime.trim().is_empty()
+            || payload.content_ref.producer.trim().is_empty()
+            || payload.content_ref.size_bytes == 0
         {
-            return Err(SwarmError::InvalidEvent("topic message content invalid".into()).into());
+            return Err(
+                SwarmError::InvalidEvent("topic message content_ref invalid".into()).into(),
+            );
         }
         self.validate_network_substrate_scope(
             &payload.network_id,
@@ -833,12 +836,34 @@ impl Node {
         if task.terminal_state != TaskTerminalState::Open {
             return Err(SwarmError::InvalidEvent("candidate on closed task".into()).into());
         }
-        let output_bytes = serde_json::to_vec(&payload.candidate.output)?;
-        if output_bytes.len() > MAX_STRUCTURED_SUMMARY_BYTES {
-            return Err(SwarmError::InvalidEvent(
-                "candidate structured summary exceeds limit".into(),
-            )
-            .into());
+        if payload.candidate.output_ref.uri.trim().is_empty()
+            || payload.candidate.output_ref.digest.trim().is_empty()
+            || payload.candidate.output_ref.mime.trim().is_empty()
+            || payload.candidate.output_ref.producer.trim().is_empty()
+            || payload.candidate.output_ref.size_bytes == 0
+        {
+            return Err(SwarmError::InvalidEvent("candidate output_ref invalid".into()).into());
+        }
+        if payload.candidate.has_resolved_output() {
+            let output_bytes = serde_json::to_vec(&payload.candidate.output)?;
+            if output_bytes.len() > MAX_STRUCTURED_SUMMARY_BYTES {
+                return Err(SwarmError::InvalidEvent(
+                    "candidate structured summary exceeds limit".into(),
+                )
+                .into());
+            }
+            let output_digest = format!("sha256:{}", sha256_hex(&output_bytes));
+            if payload.candidate.output_ref.digest != output_digest {
+                return Err(SwarmError::InvalidEvent(
+                    "candidate output_ref digest mismatch".into(),
+                )
+                .into());
+            }
+            if payload.candidate.output_ref.size_bytes != output_bytes.len() as u64 {
+                return Err(
+                    SwarmError::InvalidEvent("candidate output_ref size mismatch".into()).into(),
+                );
+            }
         }
         let candidate_count = self.store.count_candidates(&payload.task_id)?;
         let passed_verifies = self.store.count_passed_verifier_results(&payload.task_id)?;
@@ -923,7 +948,10 @@ impl Node {
         if let Some(existing) = self
             .store
             .get_candidate_by_execution(&payload.task_id, &payload.candidate.execution_id)?
-            && existing.output != payload.candidate.output
+            && (existing.output_ref != payload.candidate.output_ref
+                || (existing.has_resolved_output()
+                    && payload.candidate.has_resolved_output()
+                    && existing.output != payload.candidate.output))
         {
             return Err(SwarmError::Conflict(
                 "execution_id idempotency violated for candidate output".into(),

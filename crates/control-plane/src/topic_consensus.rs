@@ -295,6 +295,7 @@ fn result_message_exists(
 
 fn publish_consensus_result_message(
     node: &mut Node,
+    state_dir: &std::path::Path,
     scope_hint: &str,
     result_feed_key: &str,
     proposal: &StructuredProposal,
@@ -307,29 +308,28 @@ fn publish_consensus_result_message(
     created_at: u64,
 ) -> Result<()> {
     let network_id = resolve_network_id(node);
-    node.emit_at(
-        1,
-        crate::types::EventPayload::TopicMessagePosted(crate::types::TopicMessagePostedPayload {
-            network_id,
-            feed_key: result_feed_key.to_owned(),
-            scope_hint: scope_hint.to_owned(),
-            content: json!({
-                "kind": TOPIC_CONSENSUS_MESSAGE_KIND_RESULT,
-                "proposal_id": proposal.proposal_id.clone(),
-                "proposal_message_id": proposal.source_message_id.clone(),
-                "decision": decision,
-                "support_count": support_count,
-                "reject_count": reject_count,
-                "abstain_count": abstain_count,
-                "required_count": required_count,
-                "threshold_percent": proposal.threshold_percent,
-                "participants": proposal.participants.clone(),
-                "coordinator_node_id": proposal.coordinator_node_id.clone(),
-                "consensus_task_id": task_id,
-                "goal": proposal.goal.clone(),
-            }),
-            reply_to_message_id: None,
+    crate::control::emit_topic_message_with_content(
+        node,
+        state_dir,
+        &network_id,
+        result_feed_key,
+        scope_hint,
+        json!({
+            "kind": TOPIC_CONSENSUS_MESSAGE_KIND_RESULT,
+            "proposal_id": proposal.proposal_id.clone(),
+            "proposal_message_id": proposal.source_message_id.clone(),
+            "decision": decision,
+            "support_count": support_count,
+            "reject_count": reject_count,
+            "abstain_count": abstain_count,
+            "required_count": required_count,
+            "threshold_percent": proposal.threshold_percent,
+            "participants": proposal.participants.clone(),
+            "coordinator_node_id": proposal.coordinator_node_id.clone(),
+            "consensus_task_id": task_id,
+            "goal": proposal.goal.clone(),
         }),
+        None,
         created_at,
     )?;
     Ok(())
@@ -337,6 +337,7 @@ fn publish_consensus_result_message(
 
 fn finalize_topic_consensus_task(
     node: &mut Node,
+    state_dir: &std::path::Path,
     feed_key: &str,
     scope_hint: &str,
     proposal: &StructuredProposal,
@@ -390,21 +391,29 @@ fn finalize_topic_consensus_task(
     );
     let verify_execution_id = format!("verify-{execution_id}");
     let lease_until = now.saturating_add(4_000);
+    let candidate_output = json!({
+        "decision": decision.to_ascii_uppercase(),
+        "answer": decision,
+        "confidence": 1.0,
+        "check_summary": format!("structured topic consensus reached for proposal {}", proposal.proposal_id),
+        "proposal_id": proposal.proposal_id.clone(),
+        "proposal_message_id": proposal.source_message_id.clone(),
+        "feed_key": feed_key,
+        "scope_hint": scope_hint,
+        "goal": proposal.goal.clone(),
+        "participants": proposal.participants.clone(),
+    });
+    let output_ref = crate::control::materialize_candidate_output_artifact(
+        state_dir,
+        &node.node_id(),
+        &candidate_output,
+        now,
+    )?;
     let candidate = crate::types::Candidate {
         candidate_id: candidate_id.clone(),
         execution_id: execution_id.clone(),
-        output: json!({
-            "decision": decision.to_ascii_uppercase(),
-            "answer": decision,
-            "confidence": 1.0,
-            "check_summary": format!("structured topic consensus reached for proposal {}", proposal.proposal_id),
-            "proposal_id": proposal.proposal_id.clone(),
-            "proposal_message_id": proposal.source_message_id.clone(),
-            "feed_key": feed_key,
-            "scope_hint": scope_hint,
-            "goal": proposal.goal.clone(),
-            "participants": proposal.participants.clone(),
-        }),
+        output_ref,
+        output: candidate_output,
         evidence_inline: vec![crate::types::InlineEvidence {
             mime: "application/json".to_owned(),
             content: serde_json::to_string(&json!({
@@ -565,6 +574,7 @@ fn finalize_topic_consensus_task(
 
 pub fn process_structured_topic_consensus_for_topic(
     node: &mut Node,
+    state_dir: &std::path::Path,
     feed_key: &str,
     scope_hint: &str,
 ) -> Result<usize> {
@@ -673,6 +683,7 @@ pub fn process_structured_topic_consensus_for_topic(
         } else {
             finalize_topic_consensus_task(
                 node,
+                state_dir,
                 feed_key,
                 scope_hint,
                 &proposal,
@@ -689,6 +700,7 @@ pub fn process_structured_topic_consensus_for_topic(
         )? {
             publish_consensus_result_message(
                 node,
+                state_dir,
                 scope_hint,
                 &proposal.result_feed_key,
                 &proposal,
@@ -707,12 +719,16 @@ pub fn process_structured_topic_consensus_for_topic(
     Ok(processed)
 }
 
-pub fn process_structured_topic_consensus(node: &mut Node) -> Result<usize> {
+pub fn process_structured_topic_consensus(
+    node: &mut Node,
+    state_dir: &std::path::Path,
+) -> Result<usize> {
     let subscriptions = node.store.list_active_feed_subscriptions(&node.node_id())?;
     let mut processed = 0_usize;
     for subscription in subscriptions {
         processed = processed.saturating_add(process_structured_topic_consensus_for_topic(
             node,
+            state_dir,
             &subscription.feed_key,
             &subscription.scope_hint,
         )?);

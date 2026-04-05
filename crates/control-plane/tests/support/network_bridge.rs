@@ -6,13 +6,15 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use uuid::Uuid;
+use wattswarm_artifact_store::{ArtifactKind, ArtifactStore};
 use wattswarm_control_plane::control::{
     PeerDmDeliveryState, PeerDmMessageKind, PeerDmSessionState, PeerRelationshipAction,
-    PeerRelationshipState, add_discovered_peer_endpoint, load_peer_dm_message_records_state,
-    load_peer_dm_thread_records_state, load_peer_metadata_records_state,
-    load_peer_relationship_records_state,
+    PeerRelationshipState, add_discovered_peer_endpoint, artifact_store_path,
+    emit_topic_message_with_content, load_data_plane_status_records_state,
+    load_peer_dm_message_records_state, load_peer_dm_thread_records_state,
+    load_peer_metadata_records_state, load_peer_relationship_records_state,
 };
-use wattswarm_control_plane::crypto::NodeIdentity;
+use wattswarm_control_plane::crypto::{NodeIdentity, sha256_hex};
 use wattswarm_control_plane::network_bridge::{
     NetworkBridgeService, NetworkBridgeTick, build_knowledge_summary_for_task_type,
     build_reputation_summary_for_runtime, dial_discovered_peer_endpoints,
@@ -152,6 +154,25 @@ fn make_service_with_config(
     .expect("network service")
 }
 
+fn make_service_with_config_and_state_dir(
+    scopes: &[SwarmScope],
+    params: &NetworkProtocolParams,
+    config: NetworkP2pConfig,
+    state_dir: &Path,
+) -> NetworkBridgeService {
+    let config = NetworkP2pConfig { ..config }.apply_protocol_params(params);
+    let identity = ensure_seeded_test_dir(state_dir);
+    let mut service = NetworkBridgeService::new(
+        NetworkP2pNode::from_ed25519_secret_bytes(config, identity.secret_bytes())
+            .expect("seeded network node"),
+        scopes,
+        params,
+    )
+    .expect("network service");
+    service.set_state_dir(state_dir.to_path_buf());
+    service
+}
+
 fn pump_once(service: &mut NetworkBridgeService, node: &mut Node) -> Option<NetworkBridgeTick> {
     service.try_tick(node).expect("tick")
 }
@@ -226,6 +247,18 @@ fn temp_test_dir(prefix: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("wattswarm-{prefix}-{}", Uuid::new_v4().simple()));
     fs::create_dir_all(&dir).expect("create temp dir");
     dir
+}
+
+fn ensure_seeded_test_dir(path: &Path) -> NodeIdentity {
+    let seed_file = path.join("node_seed.hex");
+    if let Ok(raw) = fs::read_to_string(&seed_file) {
+        let bytes = hex::decode(raw.trim()).expect("decode node seed");
+        let seed: [u8; 32] = bytes.try_into().expect("32-byte node seed");
+        return NodeIdentity::from_seed(seed);
+    }
+    let seed: [u8; 32] = rand::random();
+    fs::write(&seed_file, hex::encode(seed)).expect("write node seed");
+    NodeIdentity::from_seed(seed)
 }
 
 fn cleanup_dir(path: &Path) {
@@ -342,6 +375,25 @@ fn contact_material_for(path: &Path, remote_node_id: &str) -> Option<serde_json:
         .into_iter()
         .find(|record| record.node_id == remote_node_id)
         .and_then(|record| record.contact_material)
+}
+
+fn content_artifact_exists(path: &Path, kind: ArtifactKind, digest: &str) -> bool {
+    let store = ArtifactStore::new(artifact_store_path(path));
+    store
+        .read_validated_bytes(kind, digest, None, Some(digest), None)
+        .is_ok()
+}
+
+fn data_plane_statuses_for(
+    path: &Path,
+    object_kind: &str,
+    object_id: &str,
+) -> Vec<wattswarm_control_plane::storage::LocalDataPlaneStatusRow> {
+    load_data_plane_status_records_state(path)
+        .expect("load data plane status rows")
+        .into_iter()
+        .filter(|row| row.object_kind == object_kind && row.object_id == object_id)
+        .collect()
 }
 
 pub fn two_nodes_sync_global_event_over_libp2p() {
@@ -469,12 +521,28 @@ pub fn two_nodes_execute_peer_relationship_request_and_accept_over_network() {
     let membership = membership_with_roles(&[identity_a.node_id(), identity_b.node_id()]);
     let mut node_a = make_node(identity_a, membership.clone());
     let mut node_b = make_node(identity_b, membership);
-    let mut service_a = make_fast_service();
-    let mut service_b = make_fast_service();
     let dir_a = temp_test_dir("peer-relationship-a");
     let dir_b = temp_test_dir("peer-relationship-b");
-    service_a.set_state_dir(dir_a.clone());
-    service_b.set_state_dir(dir_b.clone());
+    let mut service_a = make_service_with_config_and_state_dir(
+        &[SwarmScope::Global],
+        &test_protocol_params(),
+        NetworkP2pConfig {
+            listen_addrs: vec!["/ip4/127.0.0.1/tcp/0".to_owned()],
+            enable_mdns: false,
+            ..NetworkP2pConfig::default()
+        },
+        &dir_a,
+    );
+    let mut service_b = make_service_with_config_and_state_dir(
+        &[SwarmScope::Global],
+        &test_protocol_params(),
+        NetworkP2pConfig {
+            listen_addrs: vec!["/ip4/127.0.0.1/tcp/0".to_owned()],
+            enable_mdns: false,
+            ..NetworkP2pConfig::default()
+        },
+        &dir_b,
+    );
 
     connect_services(&mut service_a, &mut node_a, &mut service_b, &mut node_b);
     pump_services_for(
@@ -529,12 +597,28 @@ pub fn two_nodes_execute_peer_relationship_request_and_block_over_network() {
     let membership = membership_with_roles(&[identity_a.node_id(), identity_b.node_id()]);
     let mut node_a = make_node(identity_a, membership.clone());
     let mut node_b = make_node(identity_b, membership);
-    let mut service_a = make_fast_service_with_scopes(&[]);
-    let mut service_b = make_fast_service_with_scopes(&[]);
     let dir_a = temp_test_dir("peer-relationship-block-a");
     let dir_b = temp_test_dir("peer-relationship-block-b");
-    service_a.set_state_dir(dir_a.clone());
-    service_b.set_state_dir(dir_b.clone());
+    let mut service_a = make_service_with_config_and_state_dir(
+        &[],
+        &test_protocol_params(),
+        NetworkP2pConfig {
+            listen_addrs: vec!["/ip4/127.0.0.1/tcp/0".to_owned()],
+            enable_mdns: false,
+            ..NetworkP2pConfig::default()
+        },
+        &dir_a,
+    );
+    let mut service_b = make_service_with_config_and_state_dir(
+        &[],
+        &test_protocol_params(),
+        NetworkP2pConfig {
+            listen_addrs: vec!["/ip4/127.0.0.1/tcp/0".to_owned()],
+            enable_mdns: false,
+            ..NetworkP2pConfig::default()
+        },
+        &dir_b,
+    );
 
     connect_services(&mut service_a, &mut node_a, &mut service_b, &mut node_b);
     pump_services_for(
@@ -589,12 +673,28 @@ pub fn two_nodes_establish_dm_session_and_exchange_messages_over_network() {
     let membership = membership_with_roles(&[identity_a.node_id(), identity_b.node_id()]);
     let mut node_a = make_node(identity_a, membership.clone());
     let mut node_b = make_node(identity_b, membership);
-    let mut service_a = make_fast_service_with_scopes(&[]);
-    let mut service_b = make_fast_service_with_scopes(&[]);
     let dir_a = temp_test_dir("peer-dm-a");
     let dir_b = temp_test_dir("peer-dm-b");
-    service_a.set_state_dir(dir_a.clone());
-    service_b.set_state_dir(dir_b.clone());
+    let mut service_a = make_service_with_config_and_state_dir(
+        &[],
+        &test_protocol_params(),
+        NetworkP2pConfig {
+            listen_addrs: vec!["/ip4/127.0.0.1/tcp/0".to_owned()],
+            enable_mdns: false,
+            ..NetworkP2pConfig::default()
+        },
+        &dir_a,
+    );
+    let mut service_b = make_service_with_config_and_state_dir(
+        &[],
+        &test_protocol_params(),
+        NetworkP2pConfig {
+            listen_addrs: vec!["/ip4/127.0.0.1/tcp/0".to_owned()],
+            enable_mdns: false,
+            ..NetworkP2pConfig::default()
+        },
+        &dir_b,
+    );
 
     connect_services(&mut service_a, &mut node_a, &mut service_b, &mut node_b);
     pump_services_for(
@@ -638,7 +738,7 @@ pub fn two_nodes_establish_dm_session_and_exchange_messages_over_network() {
 
     let mut last_direct_tick_a = String::new();
     let mut last_direct_tick_b = String::new();
-    let session_ready = wait_until(scaled_timeout(Duration::from_secs(10)), || {
+    let session_ready = wait_until(scaled_timeout(Duration::from_secs(30)), || {
         for _ in 0..64 {
             let tick_a = pump_once(&mut service_a, &mut node_a);
             let tick_b = pump_once(&mut service_b, &mut node_b);
@@ -657,12 +757,18 @@ pub fn two_nodes_establish_dm_session_and_exchange_messages_over_network() {
                 last_direct_tick_b = format!("{tick_b:?}");
             }
         }
-        relationship_state_for(&dir_a, &remote_b) == Some(PeerRelationshipState::Accepted)
-            && relationship_state_for(&dir_b, &remote_a) == Some(PeerRelationshipState::Accepted)
-            && dm_thread_state_for(&dir_a, &remote_b) == Some(PeerDmSessionState::Ready)
-            && dm_thread_state_for(&dir_b, &remote_a) == Some(PeerDmSessionState::Ready)
-            && contact_material_for(&dir_a, &remote_b).is_some()
-            && contact_material_for(&dir_b, &remote_a).is_some()
+        let rel_a = relationship_state_for(&dir_a, &remote_b);
+        let rel_b = relationship_state_for(&dir_b, &remote_a);
+        let dm_a = dm_thread_state_for(&dir_a, &remote_b);
+        let dm_b = dm_thread_state_for(&dir_b, &remote_a);
+        let contact_a = contact_material_for(&dir_a, &remote_b).is_some();
+        let contact_b = contact_material_for(&dir_b, &remote_a).is_some();
+        rel_a == Some(PeerRelationshipState::Accepted)
+            && rel_b == Some(PeerRelationshipState::Accepted)
+            && dm_a == Some(PeerDmSessionState::Ready)
+            && dm_b == Some(PeerDmSessionState::Ready)
+            && contact_a
+            && contact_b
     });
     assert!(
         session_ready,
@@ -758,6 +864,30 @@ pub fn two_nodes_establish_dm_session_and_exchange_messages_over_network() {
 
     let messages_a = dm_messages_for(&dir_a, &thread_id);
     let messages_b = dm_messages_for(&dir_b, &thread_id);
+    let outbound_message = messages_a
+        .iter()
+        .find(|message| {
+            message.message_kind == PeerDmMessageKind::Message
+                && message.direction == wattswarm_control_plane::control::PeerDmDirection::Outbound
+                && message.content == json!({"text":"hello from a"})
+        })
+        .expect("outbound dm message");
+    let sender_statuses =
+        data_plane_statuses_for(&dir_a, "dm_message", &outbound_message.message_id);
+    let receiver_statuses =
+        data_plane_statuses_for(&dir_b, "dm_message", &outbound_message.message_id);
+    let expected_dm_digest = format!(
+        "sha256:{}",
+        sha256_hex(&serde_json::to_vec(&json!({"text":"hello from a"})).expect("dm bytes"))
+    );
+    assert!(
+        content_artifact_exists(&dir_a, ArtifactKind::DirectMessage, &expected_dm_digest),
+        "sender should keep local direct-message artifact"
+    );
+    assert!(
+        content_artifact_exists(&dir_b, ArtifactKind::DirectMessage, &expected_dm_digest),
+        "receiver should fetch direct-message artifact over iroh"
+    );
     assert!(
         messages_a
             .iter()
@@ -782,6 +912,26 @@ pub fn two_nodes_establish_dm_session_and_exchange_messages_over_network() {
             .any(|message| message.message_kind == PeerDmMessageKind::SessionInit),
         "remote side should persist session init"
     );
+    assert_eq!(
+        sender_statuses.len(),
+        1,
+        "sender should persist one latest dm data-plane status row"
+    );
+    assert_eq!(
+        receiver_statuses.len(),
+        1,
+        "receiver should persist one latest dm data-plane status row"
+    );
+    assert!(
+        sender_statuses[0].route == "libp2p_control"
+            && sender_statuses[0].status == "control_acknowledged",
+        "sender should persist the final dm control-plane acknowledgement status"
+    );
+    assert!(
+        receiver_statuses[0].route == "iroh_direct"
+            && receiver_statuses[0].status == "content_hydrated",
+        "receiver should persist the final dm content hydration status"
+    );
 
     service_b
         .send_peer_relationship_action(&remote_a, PeerRelationshipAction::Block, None)
@@ -801,6 +951,133 @@ pub fn two_nodes_establish_dm_session_and_exchange_messages_over_network() {
     assert!(
         blocked_send.is_err(),
         "blocked peers should no longer be able to send direct messages"
+    );
+
+    cleanup_dir(&dir_a);
+    cleanup_dir(&dir_b);
+}
+
+pub fn two_nodes_sync_topic_message_content_over_iroh() {
+    let identity_a = NodeIdentity::random();
+    let identity_b = NodeIdentity::random();
+    let membership = membership_with_roles(&[identity_a.node_id(), identity_b.node_id()]);
+    let mut node_a = make_node(identity_a, membership.clone());
+    let mut node_b = make_node(identity_b, membership);
+    let scope = SwarmScope::Group("crew-7".to_owned());
+    let dir_a = temp_test_dir("topic-content-a");
+    let dir_b = temp_test_dir("topic-content-b");
+    let mut service_a = make_service_with_config_and_state_dir(
+        std::slice::from_ref(&scope),
+        &test_protocol_params(),
+        NetworkP2pConfig {
+            listen_addrs: vec!["/ip4/127.0.0.1/tcp/0".to_owned()],
+            enable_mdns: false,
+            ..NetworkP2pConfig::default()
+        },
+        &dir_a,
+    );
+    let mut service_b = make_service_with_config_and_state_dir(
+        std::slice::from_ref(&scope),
+        &test_protocol_params(),
+        NetworkP2pConfig {
+            listen_addrs: vec!["/ip4/127.0.0.1/tcp/0".to_owned()],
+            enable_mdns: false,
+            ..NetworkP2pConfig::default()
+        },
+        &dir_b,
+    );
+
+    connect_services(&mut service_a, &mut node_a, &mut service_b, &mut node_b);
+    pump_services_for(
+        &mut service_a,
+        &mut node_a,
+        &mut service_b,
+        &mut node_b,
+        reconnect_quiet_period(),
+    );
+    let remote_b = service_b.local_peer_id().to_string();
+    let remote_a = service_a.local_peer_id().to_string();
+    let contact_ready = wait_until(scaled_timeout(Duration::from_secs(10)), || {
+        for _ in 0..32 {
+            let _ = pump_once(&mut service_a, &mut node_a);
+            let _ = pump_once(&mut service_b, &mut node_b);
+        }
+        contact_material_for(&dir_a, &remote_b).is_some()
+            && contact_material_for(&dir_b, &remote_a).is_some()
+    });
+    assert!(
+        contact_ready,
+        "connected peers should exchange contact material before topic content sync"
+    );
+
+    let content = json!({
+        "text": "hello crew from iroh topic sync",
+        "kind": "topic.message"
+    });
+    let event = emit_topic_message_with_content(
+        &mut node_a,
+        &dir_a,
+        "default",
+        "crew.chat",
+        "group:crew-7",
+        content.clone(),
+        None,
+        100,
+    )
+    .expect("emit topic message with content");
+    let expected_digest = match &event.payload {
+        wattswarm_control_plane::types::EventPayload::TopicMessagePosted(payload) => {
+            payload.content_ref.digest.clone()
+        }
+        other => panic!("expected topic message payload, got {other:?}"),
+    };
+    let mut last_published_seq = 0;
+
+    let synced = wait_until(scaled_timeout(Duration::from_secs(10)), || {
+        last_published_seq = publish_pending_scoped_updates(
+            &mut service_a,
+            &node_a,
+            &node_a.node_id(),
+            last_published_seq,
+        )
+        .expect("publish scoped updates");
+        for _ in 0..64 {
+            let _ = pump_once(&mut service_a, &mut node_a);
+            let _ = pump_once(&mut service_b, &mut node_b);
+        }
+        node_b
+            .store
+            .list_topic_messages("crew.chat", "group:crew-7", 10)
+            .expect("list topic messages")
+            .into_iter()
+            .any(|message| {
+                message.message_id == event.event_id
+                    && message.content_ref.digest == expected_digest
+                    && message.content == content
+            })
+    });
+    assert!(
+        synced,
+        "remote peer should fetch topic message content over iroh using content_ref"
+    );
+    assert!(
+        content_artifact_exists(&dir_a, ArtifactKind::TopicMessage, &expected_digest),
+        "publisher should keep local topic-message artifact"
+    );
+    assert!(
+        content_artifact_exists(&dir_b, ArtifactKind::TopicMessage, &expected_digest),
+        "subscriber should fetch topic-message artifact over iroh"
+    );
+    let subscriber_statuses = data_plane_statuses_for(&dir_b, "topic_message", &event.event_id);
+    assert_eq!(
+        subscriber_statuses.len(),
+        1,
+        "subscriber should persist one latest topic data-plane status row"
+    );
+    assert!(
+        subscriber_statuses[0].route == "iroh_direct"
+            && subscriber_statuses[0].status == "content_hydrated",
+        "subscriber should persist the final topic content hydration status"
     );
 
     cleanup_dir(&dir_a);

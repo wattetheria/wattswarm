@@ -1,11 +1,23 @@
 use wattswarm_protocol::types::{
-    BudgetMode, CheckpointCreatedPayload, EventKind, EventPayload, EventRevokedPayload,
-    ExecutionIntentDeclaredPayload, ExecutionSetConfirmedPayload, FeedSubscriptionUpdatedPayload,
-    Membership, NetworkDescriptor, NetworkKind, NetworkTopology, NodePenalizedPayload,
-    OrgDescriptor, PolicyBinding, Role, ScopeHint, SummaryRevokedPayload, TaskAnnouncedPayload,
-    TaskContract, TaskDisseminationLayer, TaskExpiredPayload, TaskMode, TopicMessagePostedPayload,
-    TransportRoute, UnsignedEvent, canonical_scope_hint, normalized_scope_hint,
+    ArtifactRef, BudgetMode, CheckpointCreatedPayload, EventKind, EventPayload,
+    EventRevokedPayload, ExecutionIntentDeclaredPayload, ExecutionSetConfirmedPayload,
+    FeedSubscriptionUpdatedPayload, Membership, NetworkDescriptor, NetworkKind, NetworkTopology,
+    NodePenalizedPayload, OrgDescriptor, PolicyBinding, Role, ScopeHint, SummaryRevokedPayload,
+    TaskAnnouncedPayload, TaskContract, TaskDisseminationLayer, TaskExpiredPayload, TaskMode,
+    TopicMessagePostedPayload, TransportRoute, UnsignedEvent, canonical_scope_hint,
+    normalized_scope_hint,
 };
+
+fn sample_topic_content_ref() -> ArtifactRef {
+    ArtifactRef {
+        uri: "artifact://topic-message/sha256:topic-test".to_owned(),
+        digest: "sha256:topic-test".to_owned(),
+        size_bytes: 32,
+        mime: "application/json".to_owned(),
+        created_at: 1,
+        producer: "node-topic".to_owned(),
+    }
+}
 
 #[test]
 fn membership_grant_has_role_and_holders_work() {
@@ -67,7 +79,8 @@ fn event_payload_kind_and_task_id_cover_task_and_non_task_variants() {
         network_id: "default".to_owned(),
         feed_key: "crew.chat".to_owned(),
         scope_hint: "group:crew-7".to_owned(),
-        content: serde_json::json!({"text":"hello"}),
+        content_ref: sample_topic_content_ref(),
+        local_content_cache: Some(serde_json::json!({"text":"hello"})),
         reply_to_message_id: None,
     });
     assert_eq!(topic_message_payload.kind(), EventKind::TopicMessagePosted);
@@ -252,7 +265,8 @@ fn scope_hint_parse_and_canonicalization_are_shared() {
             network_id: "default".to_owned(),
             feed_key: "crew.chat".to_owned(),
             scope_hint: "group:crew-7".to_owned(),
-            content: serde_json::json!({"text":"hello"}),
+            content_ref: sample_topic_content_ref(),
+            local_content_cache: Some(serde_json::json!({"text":"hello"})),
             reply_to_message_id: Some("message-1".to_owned()),
         }
         .scope(),
@@ -483,7 +497,8 @@ fn dissemination_layer_marks_only_low_frequency_layers_as_global_safe() {
         network_id: "default".to_owned(),
         feed_key: "crew.chat".to_owned(),
         scope_hint: "group:crew-7".to_owned(),
-        content: serde_json::json!({"text":"hello"}),
+        content_ref: sample_topic_content_ref(),
+        local_content_cache: Some(serde_json::json!({"text":"hello"})),
         reply_to_message_id: None,
     });
     assert_eq!(chat.dissemination_layer(), TaskDisseminationLayer::Process);

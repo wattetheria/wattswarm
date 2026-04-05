@@ -19,6 +19,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::time::{Duration, Instant};
+use wattswarm_protocol::types::ArtifactRef;
 
 const DEFAULT_NAMESPACE: &str = "wattswarm";
 const DEFAULT_PROTOCOL_VERSION: &str = "/wattswarm/0.1.0";
@@ -357,6 +358,48 @@ pub struct RawContactMaterial {
     pub generated_at: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RawContactMaterialRequest {
+    pub source_node_id: String,
+    pub target_node_id: String,
+}
+
+impl RawContactMaterialRequest {
+    pub fn validate(&self) -> Result<()> {
+        if self.source_node_id.trim().is_empty() {
+            bail!("contact material request source_node_id is required");
+        }
+        if self.target_node_id.trim().is_empty() {
+            bail!("contact material request target_node_id is required");
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RawContactMaterialResponse {
+    pub source_node_id: String,
+    pub target_node_id: String,
+    pub applied: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub contact_material: Option<RawContactMaterial>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    pub updated_at: u64,
+}
+
+impl RawContactMaterialResponse {
+    pub fn validate(&self) -> Result<()> {
+        if self.source_node_id.trim().is_empty() {
+            bail!("contact material response source_node_id is required");
+        }
+        if self.target_node_id.trim().is_empty() {
+            bail!("contact material response target_node_id is required");
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RawPeerDirectMessageKind {
@@ -377,11 +420,13 @@ pub struct RawPeerDirectMessageRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub contact_material: Option<RawContactMaterial>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_ref: Option<ArtifactRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub encrypted_body: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content_encoding: Option<String>,
-    #[serde(default)]
-    pub content_json: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub control_json: Option<String>,
 }
 
 impl RawPeerDirectMessageRequest {
@@ -397,6 +442,27 @@ impl RawPeerDirectMessageRequest {
         }
         if self.message_id.trim().is_empty() {
             bail!("peer direct message message_id is required");
+        }
+        match self.kind {
+            RawPeerDirectMessageKind::Message => {
+                let Some(content_ref) = &self.content_ref else {
+                    bail!("peer direct message content_ref is required for message kind");
+                };
+                if content_ref.uri.trim().is_empty()
+                    || content_ref.digest.trim().is_empty()
+                    || content_ref.mime.trim().is_empty()
+                    || content_ref.producer.trim().is_empty()
+                    || content_ref.size_bytes == 0
+                {
+                    bail!("peer direct message content_ref is invalid");
+                }
+            }
+            RawPeerDirectMessageKind::RelationshipEstablished
+            | RawPeerDirectMessageKind::SessionInit => {
+                if self.control_json.as_deref().unwrap_or("").trim().is_empty() {
+                    bail!("peer direct message control_json is required for control kinds");
+                }
+            }
         }
         Ok(())
     }
@@ -561,6 +627,7 @@ impl SubstrateConfig {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RawControlRequest {
     Backfill(RawBackfillRequest),
+    ContactMaterial(RawContactMaterialRequest),
     PeerRelationship(RawPeerRelationshipRequest),
     PeerDirectMessage(RawPeerDirectMessageRequest),
 }
@@ -568,12 +635,15 @@ pub enum RawControlRequest {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RawControlResponse {
     Backfill(RawBackfillResponse),
+    ContactMaterial(RawContactMaterialResponse),
     PeerRelationship(RawPeerRelationshipResponse),
     PeerDirectMessage(RawPeerDirectMessageResponse),
 }
 
 pub type BackfillRequestId = request_response::OutboundRequestId;
 pub type BackfillResponseChannel = request_response::ResponseChannel<RawControlResponse>;
+pub type ContactMaterialRequestId = request_response::OutboundRequestId;
+pub type ContactMaterialResponseChannel = request_response::ResponseChannel<RawControlResponse>;
 pub type PeerRelationshipRequestId = request_response::OutboundRequestId;
 pub type PeerRelationshipResponseChannel = request_response::ResponseChannel<RawControlResponse>;
 pub type PeerDirectMessageRequestId = request_response::OutboundRequestId;
@@ -733,6 +803,25 @@ pub enum SubstrateRuntimeEvent {
         error: String,
     },
     BackfillInboundFailure {
+        peer: PeerId,
+        error: String,
+    },
+    ContactMaterialRequest {
+        peer: PeerId,
+        request: RawContactMaterialRequest,
+        channel: ContactMaterialResponseChannel,
+    },
+    ContactMaterialResponse {
+        peer: PeerId,
+        request_id: ContactMaterialRequestId,
+        response: RawContactMaterialResponse,
+    },
+    ContactMaterialOutboundFailure {
+        peer: PeerId,
+        request_id: ContactMaterialRequestId,
+        error: String,
+    },
+    ContactMaterialInboundFailure {
         peer: PeerId,
         error: String,
     },
@@ -1232,6 +1321,7 @@ pub struct SubstrateRuntime {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PendingRequestKind {
     Backfill,
+    ContactMaterial,
     PeerRelationship,
     PeerDirectMessage,
 }
@@ -1457,6 +1547,36 @@ impl SubstrateRuntime {
             .request_response
             .send_response(channel, RawControlResponse::Backfill(response))
             .map_err(|_| anyhow!("backfill response channel closed"))?;
+        Ok(())
+    }
+
+    pub fn send_contact_material_request(
+        &mut self,
+        peer: &PeerId,
+        request: RawContactMaterialRequest,
+    ) -> Result<ContactMaterialRequestId> {
+        request.validate()?;
+        let request_id = self
+            .swarm
+            .behaviour_mut()
+            .request_response
+            .send_request(peer, RawControlRequest::ContactMaterial(request));
+        self.pending_outbound_request_kinds
+            .insert(request_id, PendingRequestKind::ContactMaterial);
+        Ok(request_id)
+    }
+
+    pub fn send_contact_material_response(
+        &mut self,
+        channel: ContactMaterialResponseChannel,
+        response: RawContactMaterialResponse,
+    ) -> Result<()> {
+        response.validate()?;
+        self.swarm
+            .behaviour_mut()
+            .request_response
+            .send_response(channel, RawControlResponse::ContactMaterial(response))
+            .map_err(|_| anyhow!("contact material response channel closed"))?;
         Ok(())
     }
 
@@ -1717,6 +1837,15 @@ impl SubstrateRuntime {
                             channel,
                         }))
                     }
+                    RawControlRequest::ContactMaterial(request) => {
+                        self.pending_inbound_request_kinds
+                            .insert(request_id, PendingRequestKind::ContactMaterial);
+                        Ok(Some(SubstrateRuntimeEvent::ContactMaterialRequest {
+                            peer,
+                            request,
+                            channel,
+                        }))
+                    }
                     RawControlRequest::PeerRelationship(request) => {
                         self.pending_inbound_request_kinds
                             .insert(request_id, PendingRequestKind::PeerRelationship);
@@ -1743,6 +1872,14 @@ impl SubstrateRuntime {
                     RawControlResponse::Backfill(response) => {
                         self.pending_outbound_request_kinds.remove(&request_id);
                         Ok(Some(SubstrateRuntimeEvent::BackfillResponse {
+                            peer,
+                            request_id,
+                            response,
+                        }))
+                    }
+                    RawControlResponse::ContactMaterial(response) => {
+                        self.pending_outbound_request_kinds.remove(&request_id);
+                        Ok(Some(SubstrateRuntimeEvent::ContactMaterialResponse {
                             peer,
                             request_id,
                             response,
@@ -1783,6 +1920,13 @@ impl SubstrateRuntime {
                         error: error.to_string(),
                     }))
                 }
+                Some(PendingRequestKind::ContactMaterial) => Ok(Some(
+                    SubstrateRuntimeEvent::ContactMaterialOutboundFailure {
+                        peer,
+                        request_id,
+                        error: error.to_string(),
+                    },
+                )),
                 Some(PendingRequestKind::PeerRelationship) => Ok(Some(
                     SubstrateRuntimeEvent::PeerRelationshipOutboundFailure {
                         peer,
@@ -1810,6 +1954,12 @@ impl SubstrateRuntime {
                     self.traffic_guard
                         .note_backfill_failure(peer, Instant::now());
                     Ok(Some(SubstrateRuntimeEvent::BackfillInboundFailure {
+                        peer,
+                        error: error.to_string(),
+                    }))
+                }
+                Some(PendingRequestKind::ContactMaterial) => {
+                    Ok(Some(SubstrateRuntimeEvent::ContactMaterialInboundFailure {
                         peer,
                         error: error.to_string(),
                     }))

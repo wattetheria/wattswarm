@@ -25,15 +25,19 @@ impl PgStore {
             .lock()
             .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
         conn.query_row(
-            "SELECT candidate_json FROM candidates
+            "SELECT candidate_json, output_json FROM candidates
              WHERE org_id = $1 AND task_id = $2
              ORDER BY candidate_id DESC
              LIMIT 1",
             params![self.org_id(), task_id],
             |r| {
                 let json: String = r.get(0)?;
-                let candidate: Candidate = serde_json::from_str(&json).map_err(|e| {
+                let output_json: String = r.get(1)?;
+                let mut candidate: Candidate = serde_json::from_str(&json).map_err(|e| {
                     pg::Error::FromSqlConversionFailure(0, pg::types::Type::Text, Box::new(e))
+                })?;
+                candidate.output = serde_json::from_str(&output_json).map_err(|e| {
+                    pg::Error::FromSqlConversionFailure(1, pg::types::Type::Text, Box::new(e))
                 })?;
                 Ok(candidate)
             },

@@ -11,15 +11,19 @@ use wattswarm_protocol::types::{Event, NetworkProtocolParams};
 use wattswarm_protocol::types::{EventKind, EventPayload};
 
 pub use substrate::{
-    BackfillRequestId, BackfillResponseChannel, Multiaddr, NetworkRuntimeObservabilitySnapshot,
+    BackfillRequestId, BackfillResponseChannel, ContactMaterialRequestId,
+    ContactMaterialResponseChannel, Multiaddr, NetworkRuntimeObservabilitySnapshot,
     PeerDirectMessageRequestId, PeerDirectMessageResponseChannel, PeerDiscoverySourceKind,
     PeerHandshakeMetadata, PeerId, PeerIdentificationMetadata, PeerRelationshipRequestId,
     PeerRelationshipResponseChannel, RawAgentEnvelope, RawContactMaterial,
-    RawPeerDirectMessageKind, RawPeerRelationshipAction, SwarmScope, TopicCatalog, TopicKind,
-    TopicNamespace, TrafficGuardPeerHealth, relay_reservation_addr, sanitize_segment,
+    RawContactMaterialRequest, RawContactMaterialResponse, RawPeerDirectMessageKind,
+    RawPeerRelationshipAction, SwarmScope, TopicCatalog, TopicKind, TopicNamespace,
+    TrafficGuardPeerHealth, relay_reservation_addr, sanitize_segment,
 };
 
 pub type BackfillRequest = substrate::RawBackfillRequest;
+pub type ContactMaterialRequest = substrate::RawContactMaterialRequest;
+pub type ContactMaterialResponse = substrate::RawContactMaterialResponse;
 pub type PeerDirectMessageRequest = substrate::RawPeerDirectMessageRequest;
 pub type PeerDirectMessageResponse = substrate::RawPeerDirectMessageResponse;
 pub type PeerRelationshipRequest = substrate::RawPeerRelationshipRequest;
@@ -38,6 +42,13 @@ pub fn peer_id_from_ed25519_public_key(public_key_32: [u8; 32]) -> Result<PeerId
         .map_err(|err| anyhow!("parse libp2p ed25519 public key: {err}"))?;
     let public_key = libp2p::identity::PublicKey::from(public_key);
     Ok(PeerId::from_public_key(&public_key))
+}
+
+pub fn keypair_from_ed25519_secret_bytes(
+    secret_key_32: [u8; 32],
+) -> Result<libp2p::identity::Keypair> {
+    libp2p::identity::Keypair::ed25519_from_bytes(secret_key_32)
+        .map_err(|err| anyhow!("parse libp2p ed25519 secret key: {err}"))
 }
 
 pub fn bootstrap_http_base_url(raw_addr: &str, port: u16) -> Result<String> {
@@ -73,6 +84,8 @@ pub fn bootstrap_http_base_url(raw_addr: &str, port: u16) -> Result<String> {
 pub struct EventEnvelope {
     pub scope: SwarmScope,
     pub event: Event,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_source_node_id: Option<String>,
 }
 
 impl EventEnvelope {
@@ -273,6 +286,13 @@ impl NetworkP2pNode {
         Ok(Self { config, inner })
     }
 
+    pub fn from_ed25519_secret_bytes(
+        config: NetworkP2pConfig,
+        secret_key_32: [u8; 32],
+    ) -> Result<Self> {
+        Self::new(config, keypair_from_ed25519_secret_bytes(secret_key_32)?)
+    }
+
     pub fn generate(config: NetworkP2pConfig) -> Result<Self> {
         let inner = SubstrateNode::generate(config.as_substrate())?;
         Ok(Self { config, inner })
@@ -345,6 +365,25 @@ pub enum NetworkRuntimeEvent {
         error: String,
     },
     BackfillInboundFailure {
+        peer: PeerId,
+        error: String,
+    },
+    ContactMaterialRequest {
+        peer: PeerId,
+        request: ContactMaterialRequest,
+        channel: ContactMaterialResponseChannel,
+    },
+    ContactMaterialResponse {
+        peer: PeerId,
+        request_id: ContactMaterialRequestId,
+        response: ContactMaterialResponse,
+    },
+    ContactMaterialOutboundFailure {
+        peer: PeerId,
+        request_id: ContactMaterialRequestId,
+        error: String,
+    },
+    ContactMaterialInboundFailure {
         peer: PeerId,
         error: String,
     },
@@ -499,6 +538,22 @@ impl NetworkRuntime {
         )
     }
 
+    pub fn send_contact_material_request(
+        &mut self,
+        peer: &PeerId,
+        request: ContactMaterialRequest,
+    ) -> Result<ContactMaterialRequestId> {
+        self.inner.send_contact_material_request(peer, request)
+    }
+
+    pub fn send_contact_material_response(
+        &mut self,
+        channel: ContactMaterialResponseChannel,
+        response: ContactMaterialResponse,
+    ) -> Result<()> {
+        self.inner.send_contact_material_response(channel, response)
+    }
+
     pub fn send_peer_relationship_request(
         &mut self,
         peer: &PeerId,
@@ -610,6 +665,36 @@ impl NetworkRuntime {
             },
             SubstrateRuntimeEvent::BackfillInboundFailure { peer, error } => {
                 NetworkRuntimeEvent::BackfillInboundFailure { peer, error }
+            }
+            SubstrateRuntimeEvent::ContactMaterialRequest {
+                peer,
+                request,
+                channel,
+            } => NetworkRuntimeEvent::ContactMaterialRequest {
+                peer,
+                request,
+                channel,
+            },
+            SubstrateRuntimeEvent::ContactMaterialResponse {
+                peer,
+                request_id,
+                response,
+            } => NetworkRuntimeEvent::ContactMaterialResponse {
+                peer,
+                request_id,
+                response,
+            },
+            SubstrateRuntimeEvent::ContactMaterialOutboundFailure {
+                peer,
+                request_id,
+                error,
+            } => NetworkRuntimeEvent::ContactMaterialOutboundFailure {
+                peer,
+                request_id,
+                error,
+            },
+            SubstrateRuntimeEvent::ContactMaterialInboundFailure { peer, error } => {
+                NetworkRuntimeEvent::ContactMaterialInboundFailure { peer, error }
             }
             SubstrateRuntimeEvent::PeerRelationshipRequest {
                 peer,
@@ -767,6 +852,7 @@ mod tests {
         let message = GossipMessage::Event(EventEnvelope {
             scope: SwarmScope::Global,
             event: sample_event(),
+            content_source_node_id: None,
         });
         let encoded = message.encode_json().unwrap();
         let decoded = GossipMessage::decode_json(&encoded).unwrap();
@@ -817,6 +903,7 @@ mod tests {
         let envelope = EventEnvelope {
             scope: SwarmScope::Global,
             event: sample_event(),
+            content_source_node_id: None,
         };
         let response = decode_backfill_response(RawBackfillResponse {
             scope: SwarmScope::Global,
@@ -826,5 +913,17 @@ mod tests {
         })
         .unwrap();
         assert_eq!(response.events, vec![envelope]);
+    }
+
+    #[test]
+    fn seeded_network_node_derives_expected_peer_id() {
+        let seed = [9_u8; 32];
+        let node = NetworkP2pNode::from_ed25519_secret_bytes(NetworkP2pConfig::default(), seed)
+            .expect("seeded node");
+        let expected = keypair_from_ed25519_secret_bytes(seed)
+            .expect("seeded keypair")
+            .public()
+            .to_peer_id();
+        assert_eq!(node.local_peer_id(), expected);
     }
 }

@@ -14,6 +14,17 @@ use wattswarm_runtime_client::{
     ExecuteRequest, HttpRuntimeClient, RuntimeClient, VerifyRequest, verifier_result_from_response,
 };
 
+fn sample_output_ref(tag: &str) -> wattswarm_runtime_client::types::ArtifactRef {
+    wattswarm_runtime_client::types::ArtifactRef {
+        uri: format!("artifact://reference/sha256:{tag}"),
+        digest: format!("sha256:{tag}"),
+        size_bytes: 32,
+        mime: "application/json".to_owned(),
+        created_at: 1,
+        producer: "node-runtime".to_owned(),
+    }
+}
+
 #[derive(Clone)]
 struct StubConfig {
     health_status: u16,
@@ -284,6 +295,7 @@ fn http_runtime_client_covers_success_and_error_paths() {
             candidate: Candidate {
                 candidate_id: "cand-1".to_owned(),
                 execution_id: "exec-1".to_owned(),
+                output_ref: sample_output_ref("cand-1"),
                 output: serde_json::json!({"answer":"ok"}),
                 evidence_inline: vec![],
                 evidence_refs: vec![],
@@ -347,6 +359,7 @@ fn http_runtime_client_reports_status_and_decode_failures() {
             candidate: Candidate {
                 candidate_id: "cand-1".to_owned(),
                 execution_id: "exec-1".to_owned(),
+                output_ref: sample_output_ref("cand-2"),
                 output: serde_json::json!({}),
                 evidence_inline: vec![],
                 evidence_refs: vec![],
@@ -401,6 +414,7 @@ fn http_runtime_client_reports_status_and_decode_failures() {
                 candidate: Candidate {
                     candidate_id: "cand-1".to_owned(),
                     execution_id: "exec-1".to_owned(),
+                    output_ref: sample_output_ref("cand-3"),
                     output: serde_json::json!({}),
                     evidence_inline: vec![],
                     evidence_refs: vec![],
