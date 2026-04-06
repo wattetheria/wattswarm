@@ -337,6 +337,8 @@ pub struct PeerRelationshipRecord {
     pub last_action: PeerRelationshipAction,
     pub initiated_by: PeerRelationshipInitiator,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_envelope: Option<AgentInteractionEnvelope>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub requested_at: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub responded_at: Option<u64>,
@@ -473,6 +475,8 @@ pub struct PeerDmMessageRecord {
     pub direction: PeerDmDirection,
     pub delivery_state: PeerDmDeliveryState,
     pub a2a_protocol: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_envelope: Option<AgentInteractionEnvelope>,
     #[serde(default)]
     pub content: Value,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -3085,6 +3089,10 @@ pub fn load_peer_relationship_records_state(
             relationship_state: peer_relationship_state_from_str(&row.relationship_state),
             last_action: peer_relationship_action_from_str(&row.last_action),
             initiated_by: peer_relationship_initiator_from_str(&row.initiated_by),
+            agent_envelope: row
+                .agent_envelope_json
+                .as_deref()
+                .and_then(|value| serde_json::from_str(value).ok()),
             requested_at: row.requested_at,
             responded_at: row.responded_at,
             blocked_at: row.blocked_at,
@@ -3106,6 +3114,15 @@ pub fn save_peer_relationship_record_state(
             relationship_state: record.relationship_state.as_str().to_owned(),
             last_action: record.last_action.as_str().to_owned(),
             initiated_by: record.initiated_by.as_str().to_owned(),
+            agent_envelope_json: record
+                .agent_envelope
+                .as_ref()
+                .map(serde_json::to_string)
+                .transpose()?,
+            agent_signature: record
+                .agent_envelope
+                .as_ref()
+                .and_then(|envelope| envelope.signature.clone()),
             requested_at: record.requested_at,
             responded_at: record.responded_at,
             blocked_at: record.blocked_at,
@@ -3171,6 +3188,10 @@ pub fn load_peer_dm_message_records_state(
             direction: peer_dm_direction_from_str(&row.direction),
             delivery_state: peer_dm_delivery_state_from_str(&row.delivery_state),
             a2a_protocol: row.a2a_protocol,
+            agent_envelope: row
+                .agent_envelope_json
+                .as_deref()
+                .and_then(|value| serde_json::from_str(value).ok()),
             content: serde_json::from_str(&row.content_json).unwrap_or_else(|_| json!({})),
             encrypted_body: row.encrypted_body,
             content_encoding: row.content_encoding,
@@ -3196,6 +3217,15 @@ pub fn save_peer_dm_message_record_state(
             delivery_state: record.delivery_state.as_str().to_owned(),
             a2a_protocol: record.a2a_protocol.clone(),
             content_json: serde_json::to_string(&record.content)?,
+            agent_envelope_json: record
+                .agent_envelope
+                .as_ref()
+                .map(serde_json::to_string)
+                .transpose()?,
+            agent_signature: record
+                .agent_envelope
+                .as_ref()
+                .and_then(|envelope| envelope.signature.clone()),
             encrypted_body: record.encrypted_body.clone(),
             content_encoding: record.content_encoding.clone(),
             created_at: record.created_at,
@@ -3255,6 +3285,7 @@ pub fn apply_peer_relationship_action_state(
         relationship_state: PeerRelationshipState::None,
         last_action: PeerRelationshipAction::Remove,
         initiated_by,
+        agent_envelope: None,
         requested_at: None,
         responded_at: None,
         blocked_at: None,

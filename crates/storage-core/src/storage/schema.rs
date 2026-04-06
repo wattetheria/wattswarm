@@ -191,6 +191,34 @@ fn migrate_peer_metadata_local_contact_material_schema(conn: &Connection) -> Res
             ",
         )?;
     }
+    if !column_exists(conn, "peer_relationships_local", "agent_envelope_json") {
+        conn.execute(
+            "ALTER TABLE peer_relationships_local
+             ADD COLUMN agent_envelope_json TEXT;",
+            [],
+        )?;
+    }
+    if !column_exists(conn, "peer_relationships_local", "agent_signature") {
+        conn.execute(
+            "ALTER TABLE peer_relationships_local
+             ADD COLUMN agent_signature TEXT;",
+            [],
+        )?;
+    }
+    if !column_exists(conn, "peer_dm_messages_local", "agent_envelope_json") {
+        conn.execute(
+            "ALTER TABLE peer_dm_messages_local
+             ADD COLUMN agent_envelope_json TEXT;",
+            [],
+        )?;
+    }
+    if !column_exists(conn, "peer_dm_messages_local", "agent_signature") {
+        conn.execute(
+            "ALTER TABLE peer_dm_messages_local
+             ADD COLUMN agent_signature TEXT;",
+            [],
+        )?;
+    }
     Ok(())
 }
 
@@ -503,6 +531,8 @@ impl PgStore {
                 relationship_state TEXT NOT NULL,
                 last_action TEXT NOT NULL,
                 initiated_by TEXT NOT NULL,
+                agent_envelope_json TEXT,
+                agent_signature TEXT,
                 requested_at TIMESTAMPTZ,
                 responded_at TIMESTAMPTZ,
                 blocked_at TIMESTAMPTZ,
@@ -537,6 +567,8 @@ impl PgStore {
                 delivery_state TEXT NOT NULL,
                 a2a_protocol TEXT NOT NULL,
                 content_json TEXT NOT NULL DEFAULT '{}',
+                agent_envelope_json TEXT,
+                agent_signature TEXT,
                 encrypted_body TEXT,
                 content_encoding TEXT,
                 created_at TIMESTAMPTZ NOT NULL,

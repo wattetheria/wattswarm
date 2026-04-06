@@ -463,6 +463,8 @@ fn local_control_peer_metadata_and_relationship_roundtrip() {
                     relationship_state: "accepted".to_owned(),
                     last_action: "accept".to_owned(),
                     initiated_by: "local".to_owned(),
+                    agent_envelope_json: None,
+                    agent_signature: None,
                     requested_at: Some(1_700_000_000_100),
                     responded_at: Some(1_700_000_000_200),
                     blocked_at: None,
@@ -549,6 +551,8 @@ fn local_control_peer_metadata_and_relationship_roundtrip() {
                     a2a_protocol: "google_a2a".to_owned(),
                     content_json: serde_json::to_string(&serde_json::json!({"text":"hello"}))
                         .expect("content json"),
+                    agent_envelope_json: None,
+                    agent_signature: None,
                     encrypted_body: None,
                     content_encoding: None,
                     created_at: 1_700_000_000_700,

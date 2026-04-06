@@ -1,6 +1,7 @@
 use crate::control::{
     ExecutorRegistryEntry, NodeState, PeerRelationshipAction, PeerRelationshipInitiator,
     RealTaskRunRequest, apply_peer_relationship_action_state, load_executor_registry_state,
+    load_peer_dm_message_records_state, load_peer_dm_thread_records_state,
     load_peer_metadata_records_state, load_peer_relationship_records_state, local_node_id,
     local_peer_id, node_state_path, open_configured_node, open_node, require_configured_node_mode,
     resolve_node_mode, run_real_task_flow, save_executor_registry_state, write_node_state,
@@ -8,6 +9,11 @@ use crate::control::{
 use crate::egress_agent::{
     EgressAgentConfig, load_egress_agent_config_state, save_egress_agent_config_state,
 };
+use crate::network_bridge::{
+    enqueue_peer_direct_message_command, enqueue_peer_relationship_action_command,
+    network_service_started,
+};
+use crate::network_p2p::RawAgentEnvelope;
 use crate::run_control;
 use crate::run_queue::RunSubmitSpec;
 use crate::startup_config::{
@@ -21,7 +27,7 @@ use crate::task_template::sample_contract;
 use crate::types::TaskContract;
 use crate::ui_template::INDEX_HTML;
 use crate::wattetheria_sync;
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{Html, IntoResponse, Response};
@@ -104,6 +110,21 @@ struct PeerRelationshipActionRequest {
     action: PeerRelationshipAction,
     #[serde(default)]
     initiated_by: Option<PeerRelationshipInitiator>,
+    #[serde(default)]
+    agent_envelope: Option<RawAgentEnvelope>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PeerDirectMessageSendRequest {
+    remote_node_id: String,
+    content: Value,
+    #[serde(default)]
+    agent_envelope: Option<RawAgentEnvelope>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PeerDirectMessageQuery {
+    thread_id: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -261,6 +282,9 @@ pub fn build_app(state: UiServerState) -> Router {
         .route("/api/peers/list", get(peers_list))
         .route("/api/peers/relationships", get(peer_relationships_list))
         .route("/api/peers/relationships", post(peer_relationships_update))
+        .route("/api/peers/dm/threads", get(peer_dm_threads_list))
+        .route("/api/peers/dm/messages", get(peer_dm_messages_list))
+        .route("/api/peers/dm/messages", post(peer_dm_messages_send))
         .route("/api/log/head", get(log_head))
         .route("/api/log/replay", post(log_replay))
         .route("/api/log/verify", post(log_verify))
@@ -553,12 +577,89 @@ async fn peer_relationships_update(
 ) -> Result<Json<Value>, ApiError> {
     let state_clone = state.clone();
     let payload = run_blocking(move || {
-        update_peer_relationship_payload(
+        if network_service_started(&state_clone.state_dir) {
+            let agent_envelope = req.agent_envelope.ok_or_else(|| {
+                anyhow!("agent_envelope is required for network peer relationship actions")
+            })?;
+            enqueue_peer_relationship_action_command(
+                &state_clone.state_dir,
+                &req.remote_node_id,
+                req.action,
+                agent_envelope,
+            )?;
+            Ok(json!({
+                "ok": true,
+                "queued": true,
+                "remote_node_id": req.remote_node_id,
+                "action": req.action,
+            }))
+        } else {
+            update_peer_relationship_payload(
+                &state_clone.state_dir,
+                &req.remote_node_id,
+                req.action,
+                req.initiated_by.unwrap_or(PeerRelationshipInitiator::Local),
+            )
+        }
+    })
+    .await?;
+    Ok(Json(payload))
+}
+
+async fn peer_dm_threads_list(State(state): State<UiServerState>) -> Result<Json<Value>, ApiError> {
+    let state_clone = state.clone();
+    let payload = run_blocking(move || {
+        let threads = load_peer_dm_thread_records_state(&state_clone.state_dir)?;
+        Ok::<Value, anyhow::Error>(json!({
+            "ok": true,
+            "threads": threads,
+        }))
+    })
+    .await?;
+    Ok(Json(payload))
+}
+
+async fn peer_dm_messages_list(
+    State(state): State<UiServerState>,
+    Query(query): Query<PeerDirectMessageQuery>,
+) -> Result<Json<Value>, ApiError> {
+    let state_clone = state.clone();
+    let payload = run_blocking(move || {
+        let messages =
+            load_peer_dm_message_records_state(&state_clone.state_dir, &query.thread_id)?;
+        Ok::<Value, anyhow::Error>(json!({
+            "ok": true,
+            "thread_id": query.thread_id,
+            "messages": messages,
+        }))
+    })
+    .await?;
+    Ok(Json(payload))
+}
+
+async fn peer_dm_messages_send(
+    State(state): State<UiServerState>,
+    Json(req): Json<PeerDirectMessageSendRequest>,
+) -> Result<Json<Value>, ApiError> {
+    let state_clone = state.clone();
+    let payload = run_blocking(move || {
+        if !network_service_started(&state_clone.state_dir) {
+            bail!("peer direct messages require the background network service to be running");
+        }
+        let agent_envelope = req
+            .agent_envelope
+            .ok_or_else(|| anyhow!("agent_envelope is required for peer direct messages"))?;
+        enqueue_peer_direct_message_command(
             &state_clone.state_dir,
             &req.remote_node_id,
-            req.action,
-            req.initiated_by.unwrap_or(PeerRelationshipInitiator::Local),
-        )
+            agent_envelope,
+            req.content,
+        )?;
+        Ok::<Value, anyhow::Error>(json!({
+            "ok": true,
+            "queued": true,
+            "remote_node_id": req.remote_node_id,
+        }))
     })
     .await?;
     Ok(Json(payload))
