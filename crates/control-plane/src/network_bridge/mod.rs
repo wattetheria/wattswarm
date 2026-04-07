@@ -489,6 +489,12 @@ fn default_agent_envelope(
     }
 }
 
+fn peer_dm_content_from_control_envelope(
+    envelope: &crate::control::AgentInteractionEnvelope,
+) -> Value {
+    crate::control::peer_dm_content_from_envelope(envelope)
+}
+
 fn peer_dm_thread_id(local_node_id: &str, remote_node_id: &str) -> String {
     let mut members = [local_node_id.to_owned(), remote_node_id.to_owned()];
     members.sort();
@@ -694,14 +700,25 @@ fn save_dm_message(
     a2a_protocol: &str,
     agent_envelope: Option<&RawAgentEnvelope>,
     content: Value,
-    encrypted_body: Option<String>,
-    content_encoding: Option<String>,
     acknowledged_at: Option<u64>,
 ) -> Result<crate::control::PeerDmMessageRecord> {
     let now = observed_at_ms();
     let existing = crate::control::load_peer_dm_message_records_state(state_dir, thread_id)?
         .into_iter()
         .find(|record| record.message_id == message_id);
+    let agent_envelope = agent_envelope
+        .map(raw_agent_envelope_to_control_record)
+        .or_else(|| {
+            existing
+                .as_ref()
+                .and_then(|record| record.agent_envelope.clone())
+        })
+        .or_else(|| {
+            Some(crate::control::synthesize_peer_dm_envelope(
+                a2a_protocol,
+                &content,
+            ))
+        });
     let record = crate::control::PeerDmMessageRecord {
         thread_id: thread_id.to_owned(),
         message_id: message_id.to_owned(),
@@ -710,19 +727,12 @@ fn save_dm_message(
         direction,
         delivery_state,
         a2a_protocol: a2a_protocol.to_owned(),
-        agent_envelope: agent_envelope.map(raw_agent_envelope_to_control_record),
-        content: existing
+        content: agent_envelope
             .as_ref()
-            .map(|record| record.content.clone())
+            .map(peer_dm_content_from_control_envelope)
+            .or_else(|| existing.as_ref().map(|record| record.content.clone()))
             .unwrap_or(content),
-        encrypted_body: existing
-            .as_ref()
-            .and_then(|record| record.encrypted_body.clone())
-            .or(encrypted_body),
-        content_encoding: existing
-            .as_ref()
-            .and_then(|record| record.content_encoding.clone())
-            .or(content_encoding),
+        agent_envelope,
         created_at: existing.as_ref().map_or(now, |record| record.created_at),
         acknowledged_at: acknowledged_at
             .or_else(|| existing.as_ref().and_then(|record| record.acknowledged_at)),
@@ -1643,8 +1653,6 @@ impl NetworkBridgeService {
             Some(&envelope),
             content.clone(),
             None,
-            None,
-            None,
         )?;
         record_data_plane_status(
             &state_dir,
@@ -1667,8 +1675,6 @@ impl NetworkBridgeService {
                 agent_envelope: Some(envelope),
                 contact_material: None,
                 content_ref: Some(content_ref),
-                encrypted_body: None,
-                content_encoding: None,
                 control_json: None,
             },
         )?;
@@ -1843,8 +1849,6 @@ impl NetworkBridgeService {
                 "session_state": "ready",
                 "synthetic": true,
             }),
-            None,
-            None,
             acknowledged_at,
         )?;
         Ok(())
@@ -1884,8 +1888,6 @@ impl NetworkBridgeService {
                 "established_at": established_at,
                 "synthetic": true,
             }),
-            None,
-            None,
             Some(established_at),
         )?;
         self.record_dm_session_ready(
@@ -3467,8 +3469,6 @@ impl NetworkBridgeService {
                     &a2a_protocol,
                     request.agent_envelope.as_ref(),
                     content,
-                    request.encrypted_body.clone(),
-                    request.content_encoding.clone(),
                     None,
                 )?;
                 let response_contact_material = if matches!(
@@ -3573,8 +3573,6 @@ impl NetworkBridgeService {
                         None,
                         json!({}),
                         None,
-                        None,
-                        None,
                     )?;
                     return Ok(NetworkBridgeTick::PeerDirectMessageFailed {
                         peer,
@@ -3611,8 +3609,6 @@ impl NetworkBridgeService {
                     &pending.a2a_protocol,
                     None,
                     json!({}),
-                    None,
-                    None,
                     Some(response.updated_at),
                 )?;
                 let session_state = match pending.kind {
@@ -3676,8 +3672,6 @@ impl NetworkBridgeService {
                         &pending.a2a_protocol,
                         None,
                         json!({}),
-                        None,
-                        None,
                         None,
                     );
                 }

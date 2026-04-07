@@ -198,13 +198,6 @@ fn migrate_peer_metadata_local_contact_material_schema(conn: &Connection) -> Res
             [],
         )?;
     }
-    if !column_exists(conn, "peer_relationships_local", "agent_signature") {
-        conn.execute(
-            "ALTER TABLE peer_relationships_local
-             ADD COLUMN agent_signature TEXT;",
-            [],
-        )?;
-    }
     if !column_exists(conn, "peer_dm_messages_local", "agent_envelope_json") {
         conn.execute(
             "ALTER TABLE peer_dm_messages_local
@@ -212,12 +205,68 @@ fn migrate_peer_metadata_local_contact_material_schema(conn: &Connection) -> Res
             [],
         )?;
     }
-    if !column_exists(conn, "peer_dm_messages_local", "agent_signature") {
-        conn.execute(
-            "ALTER TABLE peer_dm_messages_local
-             ADD COLUMN agent_signature TEXT;",
-            [],
+    Ok(())
+}
+
+fn migrate_peer_relationships_local_trim_signature_column(conn: &Connection) -> Result<()> {
+    if column_exists(conn, "peer_relationships_local", "agent_signature") {
+        conn.execute_batch(
+            "ALTER TABLE peer_relationships_local
+             DROP COLUMN IF EXISTS agent_signature;",
         )?;
+    }
+    Ok(())
+}
+
+fn migrate_peer_dm_messages_local_trim_product_columns(conn: &Connection) -> Result<()> {
+    if column_exists(conn, "peer_dm_messages_local", "content_json") {
+        let mut stmt = conn.prepare(
+            "SELECT scope_id, message_id, a2a_protocol, content_json
+             FROM peer_dm_messages_local
+             WHERE agent_envelope_json IS NULL
+               AND content_json IS NOT NULL",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })?;
+        for row in rows {
+            let (scope_id, message_id, a2a_protocol, content_json) = row?;
+            let content_value = serde_json::from_str::<serde_json::Value>(&content_json)
+                .unwrap_or_else(|_| serde_json::Value::String(content_json.clone()));
+            let envelope_json = serde_json::json!({
+                "protocol": a2a_protocol,
+                "message": {
+                    "content": content_value,
+                }
+            })
+            .to_string();
+            conn.execute(
+                "UPDATE peer_dm_messages_local
+                 SET agent_envelope_json = $3
+                 WHERE scope_id = $1
+                   AND message_id = $2
+                   AND agent_envelope_json IS NULL",
+                params![scope_id, message_id, envelope_json],
+            )?;
+        }
+    }
+    for column in [
+        "content_json",
+        "agent_signature",
+        "encrypted_body",
+        "content_encoding",
+    ] {
+        if column_exists(conn, "peer_dm_messages_local", column) {
+            conn.execute_batch(&format!(
+                "ALTER TABLE peer_dm_messages_local
+                 DROP COLUMN IF EXISTS {column};"
+            ))?;
+        }
     }
     Ok(())
 }
@@ -532,7 +581,6 @@ impl PgStore {
                 last_action TEXT NOT NULL,
                 initiated_by TEXT NOT NULL,
                 agent_envelope_json TEXT,
-                agent_signature TEXT,
                 requested_at TIMESTAMPTZ,
                 responded_at TIMESTAMPTZ,
                 blocked_at TIMESTAMPTZ,
@@ -566,11 +614,7 @@ impl PgStore {
                 direction TEXT NOT NULL,
                 delivery_state TEXT NOT NULL,
                 a2a_protocol TEXT NOT NULL,
-                content_json TEXT NOT NULL DEFAULT '{}',
                 agent_envelope_json TEXT,
-                agent_signature TEXT,
-                encrypted_body TEXT,
-                content_encoding TEXT,
                 created_at TIMESTAMPTZ NOT NULL,
                 acknowledged_at TIMESTAMPTZ,
                 PRIMARY KEY(scope_id, message_id)
@@ -1587,6 +1631,8 @@ impl PgStore {
             migrate_discovered_peers_local_scope_schema(&conn)?;
             migrate_discovered_peers_local_source_kind_schema(&conn)?;
             migrate_peer_metadata_local_contact_material_schema(&conn)?;
+            migrate_peer_relationships_local_trim_signature_column(&conn)?;
+            migrate_peer_dm_messages_local_trim_product_columns(&conn)?;
             migrate_topic_messages_content_ref_schema(&conn)?;
             migrate_candidates_content_ref_schema(&conn)?;
             ensure_discovered_peers_local_scope_index(&conn)?;

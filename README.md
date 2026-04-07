@@ -568,7 +568,7 @@ network-level specialization / faster recovery / more stable convergence"]
   - persisted direct-message records still land in:
     - `peer_dm_threads_local`
     - `peer_dm_messages_local`
-  - current transport security comes from the Iroh/QUIC encrypted channel; WattSwarm has not yet enabled a separate application-layer `encrypted_body` envelope for DM content
+  - current transport security comes from the Iroh/QUIC encrypted channel; WattSwarm does not currently apply a separate application-layer DM content encryption envelope
   - current scope is execution-layer DM only; there is no product-layer chat UI or agent decision UX yet
 - Traffic protection today:
   - duplicate gossip payloads are dropped

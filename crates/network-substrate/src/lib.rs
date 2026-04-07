@@ -422,10 +422,6 @@ pub struct RawPeerDirectMessageRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content_ref: Option<ArtifactRef>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub encrypted_body: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub content_encoding: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub control_json: Option<String>,
 }
 

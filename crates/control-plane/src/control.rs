@@ -479,13 +479,30 @@ pub struct PeerDmMessageRecord {
     pub agent_envelope: Option<AgentInteractionEnvelope>,
     #[serde(default)]
     pub content: Value,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub encrypted_body: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub content_encoding: Option<String>,
     pub created_at: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub acknowledged_at: Option<u64>,
+}
+
+pub(crate) fn peer_dm_content_from_envelope(envelope: &AgentInteractionEnvelope) -> Value {
+    envelope
+        .message
+        .get("content")
+        .cloned()
+        .unwrap_or_else(|| envelope.message.clone())
+}
+
+pub(crate) fn synthesize_peer_dm_envelope(
+    a2a_protocol: &str,
+    content: &Value,
+) -> AgentInteractionEnvelope {
+    AgentInteractionEnvelope {
+        protocol: a2a_protocol.to_owned(),
+        message: json!({
+            "content": content.clone(),
+        }),
+        ..AgentInteractionEnvelope::default()
+    }
 }
 
 fn parse_json_string_list(raw: &str) -> Vec<String> {
@@ -3119,10 +3136,6 @@ pub fn save_peer_relationship_record_state(
                 .as_ref()
                 .map(serde_json::to_string)
                 .transpose()?,
-            agent_signature: record
-                .agent_envelope
-                .as_ref()
-                .and_then(|envelope| envelope.signature.clone()),
             requested_at: record.requested_at,
             responded_at: record.responded_at,
             blocked_at: record.blocked_at,
@@ -3180,23 +3193,27 @@ pub fn load_peer_dm_message_records_state(
     Ok(store
         .list_local_peer_dm_messages(&scope_id, thread_id)?
         .into_iter()
-        .map(|row| PeerDmMessageRecord {
-            thread_id: row.thread_id,
-            message_id: row.message_id,
-            remote_node_id: row.remote_node_id,
-            message_kind: peer_dm_message_kind_from_str(&row.message_kind),
-            direction: peer_dm_direction_from_str(&row.direction),
-            delivery_state: peer_dm_delivery_state_from_str(&row.delivery_state),
-            a2a_protocol: row.a2a_protocol,
-            agent_envelope: row
+        .map(|row| {
+            let agent_envelope = row
                 .agent_envelope_json
                 .as_deref()
-                .and_then(|value| serde_json::from_str(value).ok()),
-            content: serde_json::from_str(&row.content_json).unwrap_or_else(|_| json!({})),
-            encrypted_body: row.encrypted_body,
-            content_encoding: row.content_encoding,
-            created_at: row.created_at,
-            acknowledged_at: row.acknowledged_at,
+                .and_then(|value| serde_json::from_str::<AgentInteractionEnvelope>(value).ok());
+            PeerDmMessageRecord {
+                thread_id: row.thread_id,
+                message_id: row.message_id,
+                remote_node_id: row.remote_node_id,
+                message_kind: peer_dm_message_kind_from_str(&row.message_kind),
+                direction: peer_dm_direction_from_str(&row.direction),
+                delivery_state: peer_dm_delivery_state_from_str(&row.delivery_state),
+                a2a_protocol: row.a2a_protocol,
+                content: agent_envelope
+                    .as_ref()
+                    .map(peer_dm_content_from_envelope)
+                    .unwrap_or_else(|| json!({})),
+                agent_envelope,
+                created_at: row.created_at,
+                acknowledged_at: row.acknowledged_at,
+            }
         })
         .collect())
 }
@@ -3216,18 +3233,11 @@ pub fn save_peer_dm_message_record_state(
             direction: record.direction.as_str().to_owned(),
             delivery_state: record.delivery_state.as_str().to_owned(),
             a2a_protocol: record.a2a_protocol.clone(),
-            content_json: serde_json::to_string(&record.content)?,
             agent_envelope_json: record
                 .agent_envelope
                 .as_ref()
                 .map(serde_json::to_string)
                 .transpose()?,
-            agent_signature: record
-                .agent_envelope
-                .as_ref()
-                .and_then(|envelope| envelope.signature.clone()),
-            encrypted_body: record.encrypted_body.clone(),
-            content_encoding: record.content_encoding.clone(),
             created_at: record.created_at,
             acknowledged_at: record.acknowledged_at,
         },
@@ -3538,7 +3548,10 @@ fn load_or_create_identity(seed_file: &Path) -> Result<NodeIdentity> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ENV_NETWORK_BOOTSTRAP_HTTP_URLS, bootstrap_bundle_endpoint_candidates};
+    use super::{
+        ENV_NETWORK_BOOTSTRAP_HTTP_URLS, bootstrap_bundle_endpoint_candidates,
+        peer_dm_content_from_envelope, synthesize_peer_dm_envelope,
+    };
     use std::fs;
     use uuid::Uuid;
 
@@ -3614,5 +3627,13 @@ mod tests {
             vec!["http://13.55.201.222:7788/api/network/bootstrap".to_owned()]
         );
         let _ = fs::remove_dir_all(state_dir);
+    }
+
+    #[test]
+    fn synthesized_dm_envelope_round_trips_content_projection() {
+        let content = serde_json::json!({"text":"hello"});
+        let envelope = synthesize_peer_dm_envelope("google_a2a", &content);
+        assert_eq!(envelope.protocol, "google_a2a");
+        assert_eq!(peer_dm_content_from_envelope(&envelope), content);
     }
 }
