@@ -1,4 +1,37 @@
 use super::*;
+use std::collections::HashSet;
+use std::sync::{Mutex, OnceLock};
+
+static INITIALIZED_SCHEMA_KEYS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+
+fn initialized_schema_keys() -> &'static Mutex<HashSet<String>> {
+    INITIALIZED_SCHEMA_KEYS.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+fn current_schema_init_key(conn: &Connection) -> Result<String> {
+    conn.query_row(
+        "SELECT current_database(),
+                current_schema(),
+                COALESCE(
+                    (
+                        SELECT oid::TEXT
+                        FROM pg_namespace
+                        WHERE nspname = current_schema()
+                    ),
+                    'missing'
+                )",
+        params![],
+        |row| {
+            Ok(format!(
+                "{}:{}:{}",
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        },
+    )
+    .map_err(Into::into)
+}
 
 fn column_exists(conn: &Connection, table: &str, column: &str) -> bool {
     conn.query_row(
@@ -472,12 +505,43 @@ impl PgStore {
 
     fn initialize(conn: Connection) -> Result<Self> {
         const INIT_LOCK_KEY: i64 = 0x7773_696e_6974; // "wsinit"
+        let init_key = current_schema_init_key(&conn)?;
+
+        {
+            let initialized = initialized_schema_keys()
+                .lock()
+                .map_err(|_| SwarmError::Storage("schema init cache poisoned".into()))?;
+            if initialized.contains(&init_key) {
+                return Ok(Self {
+                    conn: Arc::new(Mutex::new(conn)),
+                    org_id: Arc::new(UNSET_ORG_ID.to_owned()),
+                });
+            }
+        }
 
         conn.query_row(
             "SELECT pg_advisory_lock($1)",
             params![INIT_LOCK_KEY],
             |_| Ok(()),
         )?;
+
+        {
+            let initialized = initialized_schema_keys()
+                .lock()
+                .map_err(|_| SwarmError::Storage("schema init cache poisoned".into()))?;
+            if initialized.contains(&init_key) {
+                let unlock_result = conn.query_row(
+                    "SELECT pg_advisory_unlock($1)",
+                    params![INIT_LOCK_KEY],
+                    |_| Ok(()),
+                );
+                unlock_result?;
+                return Ok(Self {
+                    conn: Arc::new(Mutex::new(conn)),
+                    org_id: Arc::new(UNSET_ORG_ID.to_owned()),
+                });
+            }
+        }
 
         let init_result: Result<()> = (|| {
             conn.execute_batch(
@@ -1647,6 +1711,10 @@ impl PgStore {
 
         init_result?;
         unlock_result?;
+        initialized_schema_keys()
+            .lock()
+            .map_err(|_| SwarmError::Storage("schema init cache poisoned".into()))?
+            .insert(init_key);
 
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),

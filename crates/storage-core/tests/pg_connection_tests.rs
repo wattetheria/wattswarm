@@ -149,6 +149,33 @@ fn connection_round_trip_covers_value_and_index_conversions() {
 }
 
 #[test]
+fn pg_store_can_open_same_schema_multiple_times_in_one_process() {
+    with_test_schema(|| {
+        let state_path = "pg-store-reopen.state";
+        let _first = PgStore::open(state_path).expect("open first pg store");
+        let conn = open_test_connection();
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS pg_store_reopen_probe (
+                id BIGINT PRIMARY KEY
+            )",
+        )
+        .expect("create probe table");
+
+        let _second = PgStore::open(state_path).expect("open second pg store");
+        let count = conn
+            .query_row(
+                "SELECT COUNT(*) FROM information_schema.tables
+                 WHERE table_schema = current_schema()
+                   AND table_name = 'pg_store_reopen_probe'",
+                wattswarm_storage_core::params![],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("probe table should remain visible");
+        assert_eq!(count, 1);
+    });
+}
+
+#[test]
 fn statement_query_map_populates_column_names() {
     with_test_schema(|| {
         let conn = open_test_connection();
