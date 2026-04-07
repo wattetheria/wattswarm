@@ -1,10 +1,10 @@
 use axum::body::{Body, to_bytes};
 use axum::http::{Request, StatusCode};
 use serde_json::{Value, json};
-use std::io::{Read, Write};
+use std::io::{ErrorKind, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 use tempfile::tempdir;
@@ -26,6 +26,7 @@ use wattswarm_storage_core::types::ArtifactRef;
 
 static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 const TEST_DB_LOCK_KEY: i64 = 1_987_654_321;
+static TEST_SCHEMA_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 fn env_lock() -> std::sync::MutexGuard<'static, ()> {
     ENV_LOCK
@@ -43,6 +44,21 @@ fn topic_content_ref(tag: &str, producer: &str, created_at: u64) -> ArtifactRef 
         created_at,
         producer: producer.to_owned(),
     }
+}
+
+fn next_test_schema(prefix: &str) -> String {
+    let id = TEST_SCHEMA_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let sanitized = prefix
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() {
+                ch.to_ascii_lowercase()
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    format!("{sanitized}_{}_{}", std::process::id(), id)
 }
 
 struct EnvVarGuard {
@@ -170,13 +186,70 @@ fn write_stub_response(mut stream: TcpStream, status: u16, body: &str) {
     let _ = stream.flush();
 }
 
+fn read_stub_request(stream: &mut TcpStream) -> std::io::Result<Vec<u8>> {
+    stream.set_read_timeout(Some(Duration::from_secs(2)))?;
+    let mut buf = vec![0_u8; 8192];
+    let mut offset = 0_usize;
+    let mut content_length = None;
+    loop {
+        if offset == buf.len() {
+            buf.resize(buf.len().saturating_mul(2), 0);
+        }
+        match stream.read(&mut buf[offset..]) {
+            Ok(0) => {
+                if offset == 0 {
+                    return Ok(Vec::new());
+                }
+                break;
+            }
+            Ok(n) => {
+                offset += n;
+                let req = &buf[..offset];
+                if content_length.is_none()
+                    && let Some(headers_end) =
+                        req.windows(4).position(|window| window == b"\r\n\r\n")
+                {
+                    let header_text = String::from_utf8_lossy(&req[..headers_end]);
+                    content_length = header_text
+                        .lines()
+                        .find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            if name.eq_ignore_ascii_case("content-length") {
+                                value.trim().parse::<usize>().ok()
+                            } else {
+                                None
+                            }
+                        })
+                        .or(Some(0));
+                }
+                if let Some(body_len) = content_length
+                    && let Some(headers_end) =
+                        req.windows(4).position(|window| window == b"\r\n\r\n")
+                {
+                    let expected_len = headers_end + 4 + body_len;
+                    if offset >= expected_len {
+                        break;
+                    }
+                }
+            }
+            Err(err) if matches!(err.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
+                break;
+            }
+            Err(err) => return Err(err),
+        }
+    }
+    buf.truncate(offset);
+    Ok(buf)
+}
+
 fn handle_stub_conn(mut stream: TcpStream, cfg: &UiStubRuntimeConfig) {
-    let mut buf = [0_u8; 8192];
-    let n = stream.read(&mut buf).unwrap_or(0);
-    if n == 0 {
+    let Ok(req_bytes) = read_stub_request(&mut stream) else {
+        return;
+    };
+    if req_bytes.is_empty() {
         return;
     }
-    let req = String::from_utf8_lossy(&buf[..n]);
+    let req = String::from_utf8_lossy(&req_bytes);
     let line = req.lines().next().unwrap_or_default();
     if line.starts_with("GET /health ") {
         return write_stub_response(stream, 200, &cfg.health_body);
@@ -280,7 +353,8 @@ impl Drop for DbTestLock {
     }
 }
 
-fn reset_test_schema(schema: &str) {
+fn reset_test_schema(schema: &str) -> String {
+    let schema = next_test_schema(schema);
     let prev_schema = std::env::var("WATTSWARM_PG_SCHEMA").ok();
     // SAFETY: tests serialize env mutations via ENV_LOCK.
     unsafe {
@@ -300,6 +374,7 @@ fn reset_test_schema(schema: &str) {
             std::env::remove_var("WATTSWARM_PG_SCHEMA");
         }
     }
+    schema
 }
 
 fn count_projection_rows(table: &str) -> i64 {
@@ -364,8 +439,8 @@ fn sample_run_spec(run_id: &str) -> Value {
 fn ui_supports_core_cli_operations() {
     let _guard = env_lock();
     let _db_lock = DbTestLock::acquire();
-    reset_test_schema("test");
-    let _schema_guard = EnvVarGuard::set("WATTSWARM_PG_SCHEMA", "test");
+    let schema = reset_test_schema("test");
+    let _schema_guard = EnvVarGuard::set("WATTSWARM_PG_SCHEMA", &schema);
     let _mode_guard = EnvVarGuard::set("WATTSWARM_NODE_MODE", "local");
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -628,8 +703,8 @@ fn ui_exposes_local_network_peer_identity_and_listen_addrs() {
 fn ui_exposes_network_bootstrap_bundle() {
     let _guard = env_lock();
     let _db_lock = DbTestLock::acquire();
-    reset_test_schema("test");
-    let _schema_guard = EnvVarGuard::set("WATTSWARM_PG_SCHEMA", "test");
+    let schema = reset_test_schema("test");
+    let _schema_guard = EnvVarGuard::set("WATTSWARM_PG_SCHEMA", &schema);
     let _mode_guard = EnvVarGuard::set("WATTSWARM_NODE_MODE", "network");
     let dir = tempdir().unwrap();
     let state_dir = dir.path().join("state");
@@ -705,8 +780,8 @@ fn ui_exposes_network_bootstrap_bundle() {
 fn ui_startup_config_roundtrips_network_settings_without_agent_binding() {
     let _guard = env_lock();
     let _db_lock = DbTestLock::acquire();
-    reset_test_schema("test");
-    let _schema_guard = EnvVarGuard::set("WATTSWARM_PG_SCHEMA", "test");
+    let schema = reset_test_schema("test");
+    let _schema_guard = EnvVarGuard::set("WATTSWARM_PG_SCHEMA", &schema);
     let dir = tempdir().unwrap();
     let state_dir = dir.path().join("state");
     std::fs::create_dir_all(&state_dir).unwrap();
@@ -900,8 +975,8 @@ fn ui_startup_config_roundtrips_network_settings_without_agent_binding() {
 fn ui_startup_config_still_accepts_legacy_core_agent_binding_payload() {
     let _guard = env_lock();
     let _db_lock = DbTestLock::acquire();
-    reset_test_schema("test");
-    let _schema_guard = EnvVarGuard::set("WATTSWARM_PG_SCHEMA", "test");
+    let schema = reset_test_schema("test");
+    let _schema_guard = EnvVarGuard::set("WATTSWARM_PG_SCHEMA", &schema);
     let dir = tempdir().unwrap();
     let state_dir = dir.path().join("state");
     std::fs::create_dir_all(&state_dir).unwrap();
@@ -948,8 +1023,8 @@ fn ui_startup_config_still_accepts_legacy_core_agent_binding_payload() {
 fn ui_exposes_topic_message_history_and_cursor_queries() {
     let _guard = env_lock();
     let _db_lock = DbTestLock::acquire();
-    reset_test_schema("test");
-    let _schema_guard = EnvVarGuard::set("WATTSWARM_PG_SCHEMA", "test");
+    let schema = reset_test_schema("test");
+    let _schema_guard = EnvVarGuard::set("WATTSWARM_PG_SCHEMA", &schema);
     let _mode_guard = EnvVarGuard::set("WATTSWARM_NODE_MODE", "local");
     let dir = tempdir().unwrap();
     let state_dir = dir.path().join("state");
@@ -1108,8 +1183,8 @@ fn ui_exposes_topic_message_history_and_cursor_queries() {
 fn ui_accepts_topic_subscription_and_message_writes() {
     let _guard = env_lock();
     let _db_lock = DbTestLock::acquire();
-    reset_test_schema("test");
-    let _schema_guard = EnvVarGuard::set("WATTSWARM_PG_SCHEMA", "test");
+    let schema = reset_test_schema("test");
+    let _schema_guard = EnvVarGuard::set("WATTSWARM_PG_SCHEMA", &schema);
     let dir = tempdir().unwrap();
     let state_dir = dir.path().join("state");
     std::fs::create_dir_all(&state_dir).unwrap();
@@ -1201,8 +1276,8 @@ fn ui_accepts_topic_subscription_and_message_writes() {
 fn structured_topic_consensus_bridge_finalizes_and_publishes_result_topic() {
     let _guard = env_lock();
     let _db_lock = DbTestLock::acquire();
-    reset_test_schema("test");
-    let _schema_guard = EnvVarGuard::set("WATTSWARM_PG_SCHEMA", "test");
+    let schema = reset_test_schema("test");
+    let _schema_guard = EnvVarGuard::set("WATTSWARM_PG_SCHEMA", &schema);
     let dir = tempdir().unwrap();
     let state_dir = dir.path().join("state");
     std::fs::create_dir_all(&state_dir).unwrap();
@@ -1351,8 +1426,8 @@ fn structured_topic_consensus_bridge_finalizes_and_publishes_result_topic() {
 fn structured_topic_consensus_bridge_ignores_non_participant_stances() {
     let _guard = env_lock();
     let _db_lock = DbTestLock::acquire();
-    reset_test_schema("test");
-    let _schema_guard = EnvVarGuard::set("WATTSWARM_PG_SCHEMA", "test");
+    let schema = reset_test_schema("test");
+    let _schema_guard = EnvVarGuard::set("WATTSWARM_PG_SCHEMA", &schema);
     let dir = tempdir().unwrap();
     let state_dir = dir.path().join("state");
     std::fs::create_dir_all(&state_dir).unwrap();
@@ -1483,8 +1558,8 @@ fn structured_topic_consensus_bridge_ignores_non_participant_stances() {
 fn free_chat_is_interpreted_then_sedimented_into_topic_consensus() {
     let _guard = env_lock();
     let _db_lock = DbTestLock::acquire();
-    reset_test_schema("test");
-    let _schema_guard = EnvVarGuard::set("WATTSWARM_PG_SCHEMA", "test");
+    let schema = reset_test_schema("test");
+    let _schema_guard = EnvVarGuard::set("WATTSWARM_PG_SCHEMA", &schema);
     let dir = tempdir().unwrap();
     let state_dir = dir.path().join("state");
     std::fs::create_dir_all(&state_dir).unwrap();
@@ -1678,8 +1753,8 @@ fn free_chat_is_interpreted_then_sedimented_into_topic_consensus() {
 fn topic_consensus_scopes_stances_to_proposal_rounds() {
     let _guard = env_lock();
     let _db_lock = DbTestLock::acquire();
-    reset_test_schema("test");
-    let _schema_guard = EnvVarGuard::set("WATTSWARM_PG_SCHEMA", "test");
+    let schema = reset_test_schema("test");
+    let _schema_guard = EnvVarGuard::set("WATTSWARM_PG_SCHEMA", &schema);
     let dir = tempdir().unwrap();
     let state_dir = dir.path().join("state");
     std::fs::create_dir_all(&state_dir).unwrap();
@@ -1873,8 +1948,8 @@ fn topic_consensus_scopes_stances_to_proposal_rounds() {
 fn topic_interpretation_receives_prior_deliberations_from_topic_consensus_history() {
     let _guard = env_lock();
     let _db_lock = DbTestLock::acquire();
-    reset_test_schema("test");
-    let _schema_guard = EnvVarGuard::set("WATTSWARM_PG_SCHEMA", "test");
+    let schema = reset_test_schema("test");
+    let _schema_guard = EnvVarGuard::set("WATTSWARM_PG_SCHEMA", &schema);
     let dir = tempdir().unwrap();
     let state_dir = dir.path().join("state");
     std::fs::create_dir_all(&state_dir).unwrap();
@@ -2096,8 +2171,8 @@ fn topic_interpretation_receives_prior_deliberations_from_topic_consensus_histor
 fn ui_exposes_run_queue_http_apis() {
     let _guard = env_lock();
     let _db_lock = DbTestLock::acquire();
-    reset_test_schema("test");
-    let _schema_guard = EnvVarGuard::set("WATTSWARM_PG_SCHEMA", "test");
+    let schema = reset_test_schema("test");
+    let _schema_guard = EnvVarGuard::set("WATTSWARM_PG_SCHEMA", &schema);
     let _mode_guard = EnvVarGuard::set("WATTSWARM_NODE_MODE", "local");
     let dir = tempdir().unwrap();
     let state_dir = dir.path().join("state");
@@ -2290,8 +2365,8 @@ fn ui_exposes_run_queue_http_apis() {
 fn ui_exposes_egress_agent_config_and_google_a2a_card() {
     let _guard = env_lock();
     let _db_lock = DbTestLock::acquire();
-    reset_test_schema("test");
-    let _schema_guard = EnvVarGuard::set("WATTSWARM_PG_SCHEMA", "test");
+    let schema = reset_test_schema("test");
+    let _schema_guard = EnvVarGuard::set("WATTSWARM_PG_SCHEMA", &schema);
     let dir = tempdir().unwrap();
     let state_dir = dir.path().join("state");
     std::fs::create_dir_all(&state_dir).unwrap();
@@ -2447,8 +2522,8 @@ fn ui_exposes_egress_agent_config_and_google_a2a_card() {
 fn ui_google_a2a_message_send_supports_direct_and_group_modes() {
     let _guard = env_lock();
     let _db_lock = DbTestLock::acquire();
-    reset_test_schema("test");
-    let _schema_guard = EnvVarGuard::set("WATTSWARM_PG_SCHEMA", "test");
+    let schema = reset_test_schema("test");
+    let _schema_guard = EnvVarGuard::set("WATTSWARM_PG_SCHEMA", &schema);
     let _mode_guard = EnvVarGuard::set("WATTSWARM_NODE_MODE", "local");
     let dir = tempdir().unwrap();
     let state_dir = dir.path().join("state");
@@ -2704,8 +2779,8 @@ fn ui_google_a2a_message_send_supports_direct_and_group_modes() {
 fn ui_exposes_wattetheria_sync_http_boundaries() {
     let _guard = env_lock();
     let _db_lock = DbTestLock::acquire();
-    reset_test_schema("test");
-    let _schema_guard = EnvVarGuard::set("WATTSWARM_PG_SCHEMA", "test");
+    let schema = reset_test_schema("test");
+    let _schema_guard = EnvVarGuard::set("WATTSWARM_PG_SCHEMA", &schema);
     let _mode_guard = EnvVarGuard::set("WATTSWARM_NODE_MODE", "local");
     let dir = tempdir().unwrap();
     let state_dir = dir.path().join("state");
@@ -3092,8 +3167,8 @@ fn ui_exposes_wattetheria_sync_http_boundaries() {
 fn ui_exposes_wattetheria_sync_grpc_streams() {
     let _guard = env_lock();
     let _db_lock = DbTestLock::acquire();
-    reset_test_schema("test");
-    let _schema_guard = EnvVarGuard::set("WATTSWARM_PG_SCHEMA", "test");
+    let schema = reset_test_schema("test");
+    let _schema_guard = EnvVarGuard::set("WATTSWARM_PG_SCHEMA", &schema);
     let _mode_guard = EnvVarGuard::set("WATTSWARM_NODE_MODE", "local");
     let dir = tempdir().unwrap();
     let state_dir = dir.path().join("state");
@@ -3238,8 +3313,8 @@ fn ui_exposes_wattetheria_sync_grpc_streams() {
 fn ui_rejects_node_up_until_mode_is_configured() {
     let _guard = env_lock();
     let _db_lock = DbTestLock::acquire();
-    reset_test_schema("test");
-    let _schema_guard = EnvVarGuard::set("WATTSWARM_PG_SCHEMA", "test");
+    let schema = reset_test_schema("test");
+    let _schema_guard = EnvVarGuard::set("WATTSWARM_PG_SCHEMA", &schema);
     let dir = tempdir().unwrap();
     let state_dir = dir.path().join("state");
     std::fs::create_dir_all(&state_dir).unwrap();
@@ -3279,8 +3354,8 @@ fn ui_rejects_node_up_until_mode_is_configured() {
 fn ui_wattetheria_snapshot_does_not_initialize_local_topology_when_unconfigured() {
     let _guard = env_lock();
     let _db_lock = DbTestLock::acquire();
-    reset_test_schema("test");
-    let _schema_guard = EnvVarGuard::set("WATTSWARM_PG_SCHEMA", "test");
+    let schema = reset_test_schema("test");
+    let _schema_guard = EnvVarGuard::set("WATTSWARM_PG_SCHEMA", &schema);
     let dir = tempdir().unwrap();
     let state_dir = dir.path().join("state");
     std::fs::create_dir_all(&state_dir).unwrap();
