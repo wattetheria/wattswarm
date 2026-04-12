@@ -37,28 +37,51 @@ pub(super) fn checkpoint_announcement_for_event(
     event: &crate::types::Event,
     scope: &SwarmScope,
 ) -> Result<Option<crate::network_p2p::CheckpointAnnouncement>> {
-    let crate::types::EventPayload::DecisionFinalized(payload) = &event.payload else {
-        return Ok(None);
-    };
-    let Some(task) = node.task_view(&payload.task_id)? else {
-        return Ok(None);
-    };
-    let checkpoint_id = crate::crypto::sha256_hex(&serde_json::to_vec(&serde_json::json!({
-        "task_id": payload.task_id,
-        "epoch": payload.epoch,
-        "candidate_id": payload.candidate_id,
-        "winning_candidate_hash": payload.winning_candidate_hash,
-        "scope": scope,
-    }))?);
-    let artifact_path = format!(
-        "finality://{}/{}/{}/{}",
-        task.contract.task_type, payload.task_id, payload.epoch, payload.candidate_id
-    );
-    Ok(Some(crate::network_p2p::CheckpointAnnouncement {
-        scope: scope.clone(),
-        checkpoint_id,
-        artifact_path,
-    }))
+    match &event.payload {
+        crate::types::EventPayload::DecisionFinalized(payload) => {
+            let Some(task) = node.task_view(&payload.task_id)? else {
+                return Ok(None);
+            };
+            let checkpoint_id =
+                crate::crypto::sha256_hex(&serde_json::to_vec(&serde_json::json!({
+                    "task_id": payload.task_id,
+                    "epoch": payload.epoch,
+                    "candidate_id": payload.candidate_id,
+                    "winning_candidate_hash": payload.winning_candidate_hash,
+                    "scope": scope,
+                }))?);
+            let artifact_path = format!(
+                "finality://{}/{}/{}/{}",
+                task.contract.task_type, payload.task_id, payload.epoch, payload.candidate_id
+            );
+            Ok(Some(crate::network_p2p::CheckpointAnnouncement {
+                scope: scope.clone(),
+                checkpoint_id,
+                artifact_path,
+            }))
+        }
+        crate::types::EventPayload::CheckpointCreated(payload) => {
+            let Some(checkpoint) = node
+                .store
+                .find_checkpoint_announcement(&payload.checkpoint_id)?
+            else {
+                return Ok(None);
+            };
+            let scope = match crate::storage::ProjectionScope::parse(&checkpoint.scope_key) {
+                Some(crate::storage::ProjectionScope::Global) => SwarmScope::Global,
+                Some(crate::storage::ProjectionScope::Region(id)) => SwarmScope::Region(id),
+                Some(crate::storage::ProjectionScope::Node(id)) => SwarmScope::Node(id),
+                Some(crate::storage::ProjectionScope::Group(id)) => SwarmScope::Group(id),
+                None => return Ok(None),
+            };
+            Ok(Some(crate::network_p2p::CheckpointAnnouncement {
+                scope,
+                checkpoint_id: checkpoint.checkpoint_id,
+                artifact_path: checkpoint.artifact_path,
+            }))
+        }
+        _ => Ok(None),
+    }
 }
 
 pub(super) fn mirror_checkpoint_to_parent_network(

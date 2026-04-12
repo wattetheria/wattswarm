@@ -412,7 +412,7 @@ fn legacy_executor_registry_rows_are_migrated_to_scope_and_real_executor_name() 
 
         let rows = conn
             .prepare(
-                "SELECT scope_id, executor_name, base_url
+                "SELECT scope_id, executor_name, base_url, kind, target_node_id, scope_hint
                  FROM executor_registry_local",
             )
             .expect("prepare migrated executor query")
@@ -421,6 +421,9 @@ fn legacy_executor_registry_rows_are_migrated_to_scope_and_real_executor_name() 
                     row.get::<usize, String>(0)?,
                     row.get::<usize, String>(1)?,
                     row.get::<usize, String>(2)?,
+                    row.get::<usize, String>(3)?,
+                    row.get::<usize, Option<String>>(4)?,
+                    row.get::<usize, Option<String>>(5)?,
                 ))
             })
             .expect("query migrated executors")
@@ -433,6 +436,9 @@ fn legacy_executor_registry_rows_are_migrated_to_scope_and_real_executor_name() 
                 scope_id,
                 "Boss".to_owned(),
                 "http://host.docker.internal:9077/runtime/Boss".to_owned(),
+                "local".to_owned(),
+                None,
+                None,
             )]
         );
     });

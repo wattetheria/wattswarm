@@ -162,17 +162,20 @@ pub fn process_pending_bridge_tasks(
     state_dir: &Path,
 ) -> Result<u64> {
     let pending_path = state_dir.join("pending_bridge_tasks.jsonl");
-    if !pending_path.exists() {
-        return Ok(0);
+    let processing_path = state_dir.join("pending_bridge_tasks.processing.jsonl");
+
+    if !processing_path.exists() {
+        if !pending_path.exists() {
+            return Ok(0);
+        }
+        std::fs::rename(&pending_path, &processing_path)?;
     }
 
-    let content = std::fs::read_to_string(&pending_path)?;
+    let content = std::fs::read_to_string(&processing_path)?;
     if content.trim().is_empty() {
+        let _ = std::fs::remove_file(&processing_path);
         return Ok(0);
     }
-
-    // Clear before processing, but collect failures to write back.
-    std::fs::write(&pending_path, "")?;
 
     let mut processed = 0u64;
     let mut failed_lines = Vec::new();
@@ -209,7 +212,12 @@ pub fn process_pending_bridge_tasks(
             }
         }
     }
-    // Write back failed lines so they can be retried next tick.
+
+    let _ = std::fs::remove_file(&processing_path);
+
+    // Write back failed lines so they can be retried next tick. If the process
+    // crashes mid-loop, the processing file remains on disk and the batch is
+    // replayed on restart rather than being lost after truncation.
     if !failed_lines.is_empty() {
         let mut retry_content = failed_lines.join("\n");
         retry_content.push('\n');
@@ -227,22 +235,25 @@ pub fn process_pending_bridge_tasks(
 /// result that should be written back to a REMOTE_DISPATCHED run_step.
 pub fn process_pending_run_queue_results(state_dir: &Path) -> Result<u64> {
     let results_path = state_dir.join("pending_run_queue_results.jsonl");
-    if !results_path.exists() {
-        return Ok(0);
+    let processing_path = state_dir.join("pending_run_queue_results.processing.jsonl");
+
+    if !processing_path.exists() {
+        if !results_path.exists() {
+            return Ok(0);
+        }
+        std::fs::rename(&results_path, &processing_path)?;
     }
 
-    let content = std::fs::read_to_string(&results_path)?;
+    let content = std::fs::read_to_string(&processing_path)?;
     if content.trim().is_empty() {
+        let _ = std::fs::remove_file(&processing_path);
         return Ok(0);
     }
 
     let queue = match resolve_run_queue(state_dir) {
         Some(q) => q,
-        None => return Ok(0), // File not cleared — retry next tick.
+        None => return Ok(0), // Processing file remains — retry next tick.
     };
-
-    // Clear only after queue is resolved, so failures don't lose data.
-    std::fs::write(&results_path, "")?;
 
     let mut processed = 0u64;
     let mut failed_lines = Vec::new();
@@ -304,7 +315,11 @@ pub fn process_pending_run_queue_results(state_dir: &Path) -> Result<u64> {
             }
         }
     }
-    // Write back failed lines so they can be retried next tick.
+
+    let _ = std::fs::remove_file(&processing_path);
+
+    // Write back failed lines so they can be retried next tick. Crashes keep
+    // the processing file on disk, so unacked work is replayed instead of lost.
     if !failed_lines.is_empty() {
         let mut retry_content = failed_lines.join("\n");
         retry_content.push('\n');

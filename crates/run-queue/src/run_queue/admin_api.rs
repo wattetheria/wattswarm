@@ -11,6 +11,20 @@ use super::types::{RunEvent, RunSubmitSpec, RunView};
 use super::utils::now_ms;
 
 impl PgRunQueue {
+    pub fn run_id_for_task_id(&self, task_id: &str) -> Result<Option<String>> {
+        let mut client = self.connect()?;
+        Ok(client
+            .query_opt(
+                "SELECT run_id
+                 FROM run_steps
+                 WHERE org_id = $1 AND task_id = $2
+                 ORDER BY updated_at DESC, step_id ASC
+                 LIMIT 1",
+                &[&self.org_id(), &task_id],
+            )?
+            .map(|row| row.get::<_, String>(0)))
+    }
+
     pub fn submit_run(&self, spec: RunSubmitSpec) -> Result<()> {
         self.validate_submit_spec(&spec)?;
         let now = now_ms();

@@ -1,11 +1,9 @@
-use crate::crypto::{candidate_hash, sha256_hex, vote_commit_hash};
-use crate::node::{Node, finality_sign};
+use crate::node::Node;
 use crate::storage::storage::TopicMessageRow;
-use anyhow::{Context, Result, anyhow};
+use anyhow::Result;
 use serde_json::{Value, json};
 use std::collections::{BTreeSet, HashMap};
 
-pub const TOPIC_CONSENSUS_TASK_TYPE: &str = "topic_consensus";
 const TOPIC_CONSENSUS_MESSAGE_KIND_PROPOSAL: &str = "proposal";
 const TOPIC_CONSENSUS_MESSAGE_KIND_STANCE: &str = "stance";
 const TOPIC_CONSENSUS_MESSAGE_KIND_INTERPRETED_STANCE: &str = "interpreted_stance";
@@ -17,9 +15,15 @@ struct StructuredProposal {
     source_message_id: String,
     coordinator_node_id: String,
     participants: Vec<String>,
+    min_participants: usize,
     threshold_percent: u32,
     result_feed_key: String,
     goal: Option<String>,
+    round_index: u32,
+    max_rounds: u32,
+    round_timeout_ms: u64,
+    fallback_decision: Option<String>,
+    created_at: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -27,8 +31,6 @@ struct StructuredStance {
     proposal_message_id: String,
     author_node_id: String,
     stance: String,
-    summary: Option<String>,
-    evidence_refs: Vec<crate::types::ArtifactRef>,
 }
 
 fn now_ms() -> u64 {
@@ -47,6 +49,32 @@ fn resolve_network_id(node: &Node) -> String {
         .load_verified_network_protocol_params()
         .map(|verified| verified.network_id)
         .unwrap_or_else(|_| format!("local:{}", node.node_id()))
+}
+
+fn distributed_topic_mode(node: &Node) -> bool {
+    !matches!(
+        node.store
+            .load_network_topology_for_org(node.store.org_id())
+            .map(|topology| topology.network.network_kind)
+            .unwrap_or(crate::types::NetworkKind::Local),
+        crate::types::NetworkKind::Local
+    )
+}
+
+fn effective_participant_list(
+    proposal: &StructuredProposal,
+    coordinator_node_id: &str,
+    distributed_mode: bool,
+) -> Vec<String> {
+    let mut seen = BTreeSet::new();
+    proposal
+        .participants
+        .iter()
+        .map(|participant| participant.trim().to_owned())
+        .filter(|participant| !participant.is_empty())
+        .filter(|participant| !(distributed_mode && participant == coordinator_node_id))
+        .filter(|participant| seen.insert(participant.clone()))
+        .collect()
 }
 
 fn parse_string_array(value: Option<&Value>) -> Vec<String> {
@@ -76,6 +104,20 @@ fn parse_structured_proposal(message: &TopicMessageRow) -> Option<StructuredProp
         .and_then(Value::as_u64)
         .unwrap_or(60)
         .clamp(1, 100) as u32;
+    let round_index = obj
+        .get("round_index")
+        .and_then(Value::as_u64)
+        .unwrap_or(1)
+        .max(1) as u32;
+    let max_rounds = obj
+        .get("max_rounds")
+        .and_then(Value::as_u64)
+        .unwrap_or(u64::from(round_index))
+        .max(u64::from(round_index)) as u32;
+    let round_timeout_ms = obj
+        .get("round_timeout_ms")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
     let result_feed_key = obj
         .get("result_feed_key")
         .and_then(Value::as_str)
@@ -90,11 +132,23 @@ fn parse_structured_proposal(message: &TopicMessageRow) -> Option<StructuredProp
         .filter(|value| !value.is_empty())
         .map(ToOwned::to_owned)
         .unwrap_or_else(|| message.author_node_id.clone());
+    let fallback_decision = obj
+        .get("fallback_decision")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| matches!(*value, "support" | "reject" | "abstain"))
+        .map(ToOwned::to_owned);
+    let min_participants = obj
+        .get("min_participants")
+        .and_then(Value::as_u64)
+        .map(|value| value.max(1) as usize)
+        .unwrap_or_else(|| participants.len().max(1));
     Some(StructuredProposal {
         proposal_id,
         source_message_id: message.message_id.clone(),
         coordinator_node_id,
         participants,
+        min_participants,
         threshold_percent,
         result_feed_key,
         goal: obj
@@ -103,6 +157,11 @@ fn parse_structured_proposal(message: &TopicMessageRow) -> Option<StructuredProp
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .map(ToOwned::to_owned),
+        round_index,
+        max_rounds,
+        round_timeout_ms,
+        fallback_decision,
+        created_at: message.created_at,
     })
 }
 
@@ -134,7 +193,7 @@ fn parse_artifact_ref(value: &Value) -> Option<crate::types::ArtifactRef> {
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .map(ToOwned::to_owned)
-            .unwrap_or_else(|| "topic-consensus-bridge".to_owned()),
+            .unwrap_or_else(|| "topic-consensus".to_owned()),
     })
 }
 
@@ -190,13 +249,13 @@ fn parse_structured_stance(
     if proposal_id.is_empty() || !matches!(stance.as_str(), "support" | "reject" | "abstain") {
         return None;
     }
-    let evidence_refs = obj
+    let _evidence_refs = obj
         .get("evidence_refs")
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
         .filter_map(parse_artifact_ref)
-        .collect();
+        .collect::<Vec<_>>();
     let proposal_message_id = resolve_proposal_message_id(message, &proposal_id, proposals)?;
     Some(StructuredStance {
         proposal_message_id,
@@ -208,13 +267,6 @@ fn parse_structured_stance(
             .map(ToOwned::to_owned)
             .unwrap_or_else(|| message.author_node_id.clone()),
         stance,
-        summary: obj
-            .get("summary")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(ToOwned::to_owned),
-        evidence_refs,
     })
 }
 
@@ -258,17 +310,41 @@ fn threshold_count(total: usize, threshold_percent: u32) -> usize {
     total.saturating_mul(threshold).div_ceil(100) as usize
 }
 
-fn deterministic_topic_consensus_task_id(
-    network_id: &str,
-    feed_key: &str,
-    scope_hint: &str,
-    proposal_message_id: &str,
+fn proposal_round_exists(
+    proposals: &[StructuredProposal],
+    proposal_id: &str,
+    round_index: u32,
+) -> bool {
+    proposals
+        .iter()
+        .any(|proposal| proposal.proposal_id == proposal_id && proposal.round_index == round_index)
+}
+
+fn resolve_required_participant_count(
+    proposal: &StructuredProposal,
+    effective_participants: &[String],
+    observed_stances: usize,
+) -> usize {
+    if proposal.participants.is_empty() {
+        proposal.min_participants.max(observed_stances)
+    } else {
+        proposal.min_participants.max(effective_participants.len())
+    }
+}
+
+fn fallback_decision(
+    proposal: &StructuredProposal,
+    support_count: usize,
+    reject_count: usize,
 ) -> String {
-    let digest = sha256_hex(
-        format!("topic-consensus-v2|{network_id}|{feed_key}|{scope_hint}|{proposal_message_id}")
-            .as_bytes(),
-    );
-    format!("topic-consensus-{}", &digest[..24])
+    if let Some(value) = &proposal.fallback_decision {
+        return value.clone();
+    }
+    match support_count.cmp(&reject_count) {
+        std::cmp::Ordering::Greater if support_count > 0 => "support".to_owned(),
+        std::cmp::Ordering::Less if reject_count > 0 => "reject".to_owned(),
+        _ => "abstain".to_owned(),
+    }
 }
 
 fn result_message_exists(
@@ -293,18 +369,23 @@ fn result_message_exists(
         }))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn publish_consensus_result_message(
     node: &mut Node,
     state_dir: &std::path::Path,
+    source_feed_key: &str,
     scope_hint: &str,
     result_feed_key: &str,
     proposal: &StructuredProposal,
-    task_id: &str,
+    effective_participants: &[String],
     decision: &str,
     support_count: usize,
     reject_count: usize,
     abstain_count: usize,
     required_count: usize,
+    fallback_applied: bool,
+    close_reason: Option<&str>,
+    observed_participant_count: usize,
     created_at: u64,
 ) -> Result<()> {
     let network_id = resolve_network_id(node);
@@ -323,10 +404,17 @@ fn publish_consensus_result_message(
             "reject_count": reject_count,
             "abstain_count": abstain_count,
             "required_count": required_count,
+            "observed_participant_count": observed_participant_count,
+            "min_participants": proposal.min_participants,
             "threshold_percent": proposal.threshold_percent,
-            "participants": proposal.participants.clone(),
+            "round_index": proposal.round_index,
+            "max_rounds": proposal.max_rounds,
+            "fallback_applied": fallback_applied,
+            "close_reason": close_reason,
+            "participants": effective_participants,
             "coordinator_node_id": proposal.coordinator_node_id.clone(),
-            "consensus_task_id": task_id,
+            "source_feed_key": source_feed_key,
+            "source_scope_hint": scope_hint,
             "goal": proposal.goal.clone(),
         }),
         None,
@@ -335,241 +423,51 @@ fn publish_consensus_result_message(
     Ok(())
 }
 
-fn finalize_topic_consensus_task(
+fn maybe_publish_next_round_proposal(
     node: &mut Node,
     state_dir: &std::path::Path,
     feed_key: &str,
     scope_hint: &str,
     proposal: &StructuredProposal,
-    stances: &[StructuredStance],
-    decision: &str,
-    required_count: usize,
-) -> Result<String> {
-    let now = now_ms();
-    let task_id = deterministic_topic_consensus_task_id(
-        &resolve_network_id(node),
+    effective_participants: &[String],
+    distributed_mode: bool,
+    proposals: &[StructuredProposal],
+    created_at: u64,
+) -> Result<bool> {
+    let next_round_index = proposal.round_index.saturating_add(1);
+    if proposal_round_exists(proposals, &proposal.proposal_id, next_round_index) {
+        return Ok(false);
+    }
+    let network_id = resolve_network_id(node);
+    crate::control::emit_topic_message_with_content(
+        node,
+        state_dir,
+        &network_id,
         feed_key,
         scope_hint,
-        &proposal.source_message_id,
-    );
-    let policy_hash = node
-        .policy_registry()
-        .binding_for("vp.schema_only.v1", json!({}))?
-        .policy_hash;
-    let mut contract = crate::task_template::sample_contract(&task_id, policy_hash);
-    contract.task_type = TOPIC_CONSENSUS_TASK_TYPE.to_owned();
-    contract.inputs = json!({
-        "proposal_id": proposal.proposal_id.clone(),
-        "proposal_message_id": proposal.source_message_id.clone(),
-        "goal": proposal.goal.clone(),
-        "feed_key": feed_key,
-        "scope_hint": scope_hint,
-        "threshold_percent": proposal.threshold_percent,
-        "required_count": required_count,
-        "participants": proposal.participants.clone(),
-        "stances": stances.iter().map(|stance| {
-            json!({
-                "author_node_id": stance.author_node_id,
-                "proposal_message_id": stance.proposal_message_id,
-                "stance": stance.stance,
-                "summary": stance.summary,
-                "evidence_refs": stance.evidence_refs,
-            })
-        }).collect::<Vec<_>>(),
-    });
-    contract.acceptance.quorum_threshold = 1;
-    contract.acceptance.da_quorum_threshold = 1;
-
-    if node.task_view(&task_id)?.is_none() {
-        node.submit_task(contract, 1, now)?;
-    }
-
-    let candidate_id = format!("consensus-{}", proposal.proposal_id);
-    let execution_id = format!(
-        "topic-consensus-{}",
-        &task_id[task_id.len().saturating_sub(8)..]
-    );
-    let verify_execution_id = format!("verify-{execution_id}");
-    let lease_until = now.saturating_add(4_000);
-    let candidate_output = json!({
-        "decision": decision.to_ascii_uppercase(),
-        "answer": decision,
-        "confidence": 1.0,
-        "check_summary": format!("structured topic consensus reached for proposal {}", proposal.proposal_id),
-        "proposal_id": proposal.proposal_id.clone(),
-        "proposal_message_id": proposal.source_message_id.clone(),
-        "feed_key": feed_key,
-        "scope_hint": scope_hint,
-        "goal": proposal.goal.clone(),
-        "participants": proposal.participants.clone(),
-    });
-    let output_ref = crate::control::materialize_candidate_output_artifact(
-        state_dir,
-        &node.node_id(),
-        &candidate_output,
-        now,
+        json!({
+            "kind": TOPIC_CONSENSUS_MESSAGE_KIND_PROPOSAL,
+            "proposal_id": proposal.proposal_id.clone(),
+            "goal": proposal.goal.clone(),
+            "participants": if distributed_mode {
+                json!(effective_participants)
+            } else {
+                json!(proposal.participants)
+            },
+            "min_participants": proposal.min_participants,
+            "threshold_percent": proposal.threshold_percent,
+            "result_feed_key": proposal.result_feed_key.clone(),
+            "coordinator_node_id": node.node_id(),
+            "round_index": next_round_index,
+            "max_rounds": proposal.max_rounds,
+            "round_timeout_ms": proposal.round_timeout_ms,
+            "fallback_decision": proposal.fallback_decision.clone(),
+            "previous_round_proposal_message_id": proposal.source_message_id.clone(),
+        }),
+        Some(proposal.source_message_id.clone()),
+        created_at,
     )?;
-    let candidate = crate::types::Candidate {
-        candidate_id: candidate_id.clone(),
-        execution_id: execution_id.clone(),
-        output_ref,
-        output: candidate_output,
-        evidence_inline: vec![crate::types::InlineEvidence {
-            mime: "application/json".to_owned(),
-            content: serde_json::to_string(&json!({
-                "proposal_id": proposal.proposal_id.clone(),
-                "proposal_message_id": proposal.source_message_id.clone(),
-                "feed_key": feed_key,
-                "scope_hint": scope_hint,
-                "goal": proposal.goal.clone(),
-                "stances": stances.iter().map(|stance| {
-                    json!({
-                        "author_node_id": stance.author_node_id,
-                        "proposal_message_id": stance.proposal_message_id,
-                        "stance": stance.stance,
-                        "summary": stance.summary
-                    })
-                }).collect::<Vec<_>>(),
-            }))?,
-        }],
-        evidence_refs: stances
-            .iter()
-            .flat_map(|stance| stance.evidence_refs.clone())
-            .collect(),
-    };
-    let candidate_hash_value = candidate_hash(&candidate)?;
-    let verifier_result_hash = sha256_hex(
-        serde_json::to_string(&json!({
-            "task_id": task_id.clone(),
-            "candidate_id": candidate_id.clone(),
-            "decision": decision,
-            "proposal_id": proposal.proposal_id.clone()
-            ,
-            "proposal_message_id": proposal.source_message_id.clone()
-        }))?
-        .as_bytes(),
-    );
-
-    node.claim_task(
-        &task_id,
-        crate::types::ClaimRole::Propose,
-        &execution_id,
-        lease_until,
-        1,
-        now.saturating_add(1),
-    )
-    .context("claim topic consensus propose lease")?;
-    node.propose_candidate(&task_id, candidate.clone(), 1, now.saturating_add(2))
-        .context("propose topic consensus candidate")?;
-    if !candidate.evidence_refs.is_empty() {
-        node.add_evidence(
-            &task_id,
-            &candidate_id,
-            &execution_id,
-            candidate.evidence_refs.clone(),
-            1,
-            now.saturating_add(3),
-        )
-        .context("attach topic consensus evidence refs")?;
-    }
-    node.claim_task(
-        &task_id,
-        crate::types::ClaimRole::Verify,
-        &verify_execution_id,
-        lease_until,
-        1,
-        now.saturating_add(5),
-    )
-    .context("claim topic consensus verify lease")?;
-    for evidence in &candidate.evidence_refs {
-        node.evidence_available(
-            &task_id,
-            &candidate_id,
-            &verify_execution_id,
-            &evidence.digest,
-            1,
-            now.saturating_add(6),
-        )
-        .with_context(|| {
-            format!(
-                "mark topic consensus evidence available {}",
-                evidence.digest
-            )
-        })?;
-    }
-    node.submit_verifier_result(
-        &task_id,
-        crate::types::VerifierResult {
-            candidate_id: candidate_id.clone(),
-            execution_id: verify_execution_id.clone(),
-            verification_status: crate::types::VerificationStatus::Passed,
-            passed: true,
-            score: 1.0,
-            reason_codes: vec![wattswarm_protocol::reason_codes::REASON_SCHEMA_OK],
-            verifier_result_hash: verifier_result_hash.clone(),
-            provider_family: "topic-consensus-bridge".to_owned(),
-            model_id: "structured-v1".to_owned(),
-            policy_id: "vp.schema_only.v1".to_owned(),
-            policy_version: "1".to_owned(),
-            policy_hash: node
-                .task_view(&task_id)?
-                .ok_or_else(|| anyhow!("task missing after submit: {task_id}"))?
-                .contract
-                .acceptance
-                .verifier_policy
-                .policy_hash,
-        },
-        1,
-        now.saturating_add(7),
-    )
-    .context("submit topic consensus verifier result")?;
-    let salt = format!("topic-consensus-salt-{}", proposal.proposal_id);
-    let commit_hash = vote_commit_hash(
-        crate::types::VoteChoice::Approve,
-        &salt,
-        &verifier_result_hash,
-    );
-    node.submit_vote_commit(
-        crate::types::VoteCommitPayload {
-            task_id: task_id.clone(),
-            candidate_id: candidate_id.clone(),
-            candidate_hash: candidate_hash_value.clone(),
-            execution_id: verify_execution_id.clone(),
-            verifier_result_hash: verifier_result_hash.clone(),
-            commit_hash,
-        },
-        1,
-        now.saturating_add(8),
-    )
-    .context("submit topic consensus vote commit")?;
-    node.submit_vote_reveal(
-        crate::types::VoteRevealPayload {
-            task_id: task_id.clone(),
-            candidate_id: candidate_id.clone(),
-            candidate_hash: candidate_hash_value,
-            execution_id: verify_execution_id,
-            verifier_result_hash,
-            vote: crate::types::VoteChoice::Approve,
-            salt,
-        },
-        1,
-        now.saturating_add(9),
-    )
-    .context("submit topic consensus vote reveal")?;
-    node.commit_decision(&task_id, 1, &candidate_id, now.saturating_add(10))
-        .context("commit topic consensus decision")?;
-    node.finalize_decision(
-        &task_id,
-        1,
-        &candidate_id,
-        crate::types::FinalityProof {
-            threshold: 1,
-            signatures: vec![finality_sign(&node.identity, &task_id, 1, &candidate_id)],
-        },
-        now.saturating_add(11),
-    )
-    .context("finalize topic consensus decision")?;
-    Ok(task_id)
+    Ok(true)
 }
 
 pub fn process_structured_topic_consensus_for_topic(
@@ -603,20 +501,22 @@ pub fn process_structured_topic_consensus_for_topic(
         }
     }
 
+    let distributed_mode = distributed_topic_mode(node);
+    let observed_at = now_ms();
     let mut processed = 0_usize;
-    for proposal in proposals {
+    for proposal in proposals.clone() {
         if proposal.coordinator_node_id != local_node_id {
             continue;
         }
+        let effective_participants =
+            effective_participant_list(&proposal, &proposal.coordinator_node_id, distributed_mode);
         let participant_filter = if proposal.participants.is_empty() {
             None
         } else {
             Some(
-                proposal
-                    .participants
+                effective_participants
                     .iter()
-                    .map(|participant| participant.trim().to_owned())
-                    .filter(|participant| !participant.is_empty())
+                    .cloned()
                     .collect::<BTreeSet<_>>(),
             )
         };
@@ -625,23 +525,18 @@ pub fn process_structured_topic_consensus_for_topic(
             .filter(|((proposal_message_id, _), _)| {
                 proposal_message_id == &proposal.source_message_id
             })
-            .filter(|((_, author_node_id), _)| {
-                participant_filter
-                    .as_ref()
-                    .is_none_or(|participants| participants.contains(author_node_id))
-            })
             .map(|(_, stance)| stance.clone())
             .collect::<Vec<_>>();
-        if stances.is_empty() {
-            continue;
+        if distributed_mode {
+            stances.retain(|stance| stance.author_node_id != proposal.coordinator_node_id);
+        }
+        if let Some(participants) = participant_filter.as_ref() {
+            stances.retain(|stance| participants.contains(&stance.author_node_id));
         }
         stances.sort_by(|left, right| left.author_node_id.cmp(&right.author_node_id));
 
-        let total_participants = if proposal.participants.is_empty() {
-            stances.len()
-        } else {
-            proposal.participants.len()
-        };
+        let total_participants =
+            resolve_required_participant_count(&proposal, &effective_participants, stances.len());
         let required_count = threshold_count(total_participants, proposal.threshold_percent);
         if required_count == 0 {
             continue;
@@ -665,33 +560,63 @@ pub fn process_structured_topic_consensus_for_topic(
         } else {
             None
         };
-        let Some(decision) = decision else {
+        if let Some(decision) = decision {
+            if !result_message_exists(
+                node,
+                &proposal.result_feed_key,
+                scope_hint,
+                &proposal.source_message_id,
+            )? {
+                publish_consensus_result_message(
+                    node,
+                    state_dir,
+                    feed_key,
+                    scope_hint,
+                    &proposal.result_feed_key,
+                    &proposal,
+                    &effective_participants,
+                    decision,
+                    support_count,
+                    reject_count,
+                    abstain_count,
+                    required_count,
+                    false,
+                    Some("threshold_met"),
+                    stances.len(),
+                    now_ms(),
+                )?;
+            }
+            processed = processed.saturating_add(1);
             continue;
-        };
+        }
 
-        let deterministic_task_id = deterministic_topic_consensus_task_id(
-            &resolve_network_id(node),
-            feed_key,
-            scope_hint,
-            &proposal.source_message_id,
-        );
-        let already_finalized = node
-            .task_view(&deterministic_task_id)?
-            .is_some_and(|task| task.terminal_state == crate::types::TaskTerminalState::Finalized);
-        let task_id = if already_finalized {
-            deterministic_task_id
-        } else {
-            finalize_topic_consensus_task(
+        if proposal.round_timeout_ms == 0
+            || observed_at
+                < proposal
+                    .created_at
+                    .saturating_add(proposal.round_timeout_ms)
+        {
+            continue;
+        }
+
+        if proposal.round_index < proposal.max_rounds {
+            if maybe_publish_next_round_proposal(
                 node,
                 state_dir,
                 feed_key,
                 scope_hint,
                 &proposal,
-                &stances,
-                decision,
-                required_count,
-            )?
-        };
+                &effective_participants,
+                distributed_mode,
+                &proposals,
+                observed_at.saturating_add(1),
+            )? {
+                processed = processed.saturating_add(1);
+            }
+            continue;
+        }
+
+        let fallback = fallback_decision(&proposal, support_count, reject_count);
         if !result_message_exists(
             node,
             &proposal.result_feed_key,
@@ -701,15 +626,19 @@ pub fn process_structured_topic_consensus_for_topic(
             publish_consensus_result_message(
                 node,
                 state_dir,
+                feed_key,
                 scope_hint,
                 &proposal.result_feed_key,
                 &proposal,
-                &task_id,
-                decision,
+                &effective_participants,
+                &fallback,
                 support_count,
                 reject_count,
                 abstain_count,
                 required_count,
+                true,
+                Some("max_rounds_fallback"),
+                stances.len(),
                 now_ms(),
             )?;
         }
@@ -734,4 +663,59 @@ pub fn process_structured_topic_consensus(
         )?);
     }
     Ok(processed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn proposal_with_participants(participants: &[&str]) -> StructuredProposal {
+        StructuredProposal {
+            proposal_id: "proposal-1".to_owned(),
+            source_message_id: "message-1".to_owned(),
+            coordinator_node_id: "node-a".to_owned(),
+            participants: participants
+                .iter()
+                .map(|value| (*value).to_owned())
+                .collect(),
+            min_participants: participants.len().max(1),
+            threshold_percent: 60,
+            result_feed_key: "feed.result".to_owned(),
+            goal: Some("decide".to_owned()),
+            round_index: 1,
+            max_rounds: 1,
+            round_timeout_ms: 0,
+            fallback_decision: None,
+            created_at: 10,
+        }
+    }
+
+    #[test]
+    fn effective_participant_list_excludes_steward_in_distributed_mode() {
+        let proposal = proposal_with_participants(&["node-a", "node-b", "node-c", "node-b"]);
+        let participants = effective_participant_list(&proposal, "node-a", true);
+        assert_eq!(participants, vec!["node-b".to_owned(), "node-c".to_owned()]);
+    }
+
+    #[test]
+    fn effective_participant_list_keeps_steward_in_local_mode() {
+        let proposal = proposal_with_participants(&["node-a", "node-b"]);
+        let participants = effective_participant_list(&proposal, "node-a", false);
+        assert_eq!(participants, vec!["node-a".to_owned(), "node-b".to_owned()]);
+    }
+
+    #[test]
+    fn effective_participant_list_dedups_participants_when_only_steward_exists() {
+        let proposal = proposal_with_participants(&["node-a"]);
+        let participants = effective_participant_list(&proposal, "node-a", true);
+        assert!(participants.is_empty());
+    }
+
+    #[test]
+    fn resolve_required_participant_count_prefers_min_participants() {
+        let mut proposal = proposal_with_participants(&["node-a", "node-b"]);
+        proposal.min_participants = 3;
+        let count = resolve_required_participant_count(&proposal, &["node-b".to_owned()], 1);
+        assert_eq!(count, 3);
+    }
 }

@@ -7,7 +7,8 @@ use std::time::Duration;
 use uuid::Uuid;
 
 use crate::control::{
-    ExecutorKind, RealTaskRunRequest, load_executor_registry_state, open_node, run_real_task_flow,
+    ExecutorKind, RealTaskRunRequest, load_executor_registry_state, normalize_executor_name,
+    open_node, run_real_task_flow,
 };
 use crate::task_template::sample_contract;
 use crate::types::TaskContract;
@@ -19,7 +20,10 @@ use super::status::{
     STEP_STATUS_SUCCEEDED,
 };
 use super::types::{ClaimedStep, WorkerOptions};
-use super::utils::{STEP_STATUS_REMOTE_DISPATCHED, build_step_inputs, now_ms, retry_delay_ms};
+use super::utils::{
+    STEP_STATUS_REMOTE_DISPATCHED, build_step_inputs, coordinator_must_not_execute_locally, now_ms,
+    retry_delay_ms,
+};
 
 impl PgRunQueue {
     pub fn run_worker(&self, opts: WorkerOptions, state_dir: &Path, db_path: &Path) -> Result<()> {
@@ -85,8 +89,17 @@ impl PgRunQueue {
         db_path: &Path,
     ) -> Result<()> {
         let task_id = format!("run-{}-{}-{}", step.run_id, step.agent_id, step.attempt);
+        let executor = normalize_executor_name(&step.executor).to_owned();
         let run_result = (|| -> Result<serde_json::Value> {
             let mut node = open_node(state_dir, db_path)?;
+            if coordinator_must_not_execute_locally(&step.shared_inputs, &node.node_id()) {
+                return Err(anyhow::anyhow!(
+                    "coordinator-only constraint: node {} coordinates run {} and cannot execute local step {}",
+                    node.node_id(),
+                    step.run_id,
+                    step.step_id
+                ));
+            }
             let policy_hash = node
                 .policy_registry()
                 .binding_for("vp.schema_only.v1", json!({}))?
@@ -99,7 +112,7 @@ impl PgRunQueue {
                 &mut node,
                 state_dir,
                 RealTaskRunRequest {
-                    executor: step.executor.clone(),
+                    executor: executor.clone(),
                     profile: step.profile.clone(),
                     task_id: Some(task_id.clone()),
                     task_file: None,
@@ -145,6 +158,7 @@ impl PgRunQueue {
         db_path: &Path,
     ) -> Result<()> {
         let task_id = format!("run-{}-{}-{}", step.run_id, step.agent_id, step.attempt);
+        let executor = normalize_executor_name(&step.executor).to_owned();
         let dispatch_result = (|| -> Result<Value> {
             let mut node = open_node(state_dir, db_path)?;
             let policy_hash = node
@@ -162,7 +176,7 @@ impl PgRunQueue {
 
             // Resolve scope and target from executor registry.
             let reg = load_executor_registry_state(state_dir)?;
-            let executor_entry = reg.entries.iter().find(|e| e.name == step.executor);
+            let executor_entry = reg.entries.iter().find(|e| e.name == executor);
             let target_node_id = executor_entry.and_then(|e| e.target_node_id.clone());
             // If a target_node_id is set, use node-scoped routing so the
             // announcement reaches only the intended executor node.
@@ -179,7 +193,7 @@ impl PgRunQueue {
                 "run_id": step.run_id,
                 "step_id": step.step_id,
                 "agent_id": step.agent_id,
-                "executor": step.executor,
+                "executor": executor,
                 "profile": step.profile,
             });
 
@@ -233,6 +247,7 @@ impl PgRunQueue {
     }
 
     fn is_remote_executor(&self, state_dir: &Path, executor_name: &str) -> bool {
+        let executor_name = normalize_executor_name(executor_name);
         load_executor_registry_state(state_dir)
             .ok()
             .and_then(|reg| reg.entries.into_iter().find(|e| e.name == executor_name))
@@ -617,7 +632,7 @@ mod tests {
             shared_inputs: json!({"resume":"text"}),
             agents: vec![RunAgentSpec {
                 agent_id: "agent-a".to_owned(),
-                executor: "rt".to_owned(),
+                executor: "core-agent".to_owned(),
                 profile: "default".to_owned(),
                 prompt: "review".to_owned(),
                 weight: 1.0,
@@ -636,7 +651,7 @@ mod tests {
             agents: vec![
                 RunAgentSpec {
                     agent_id: "agent-a".to_owned(),
-                    executor: "rt".to_owned(),
+                    executor: "core-agent".to_owned(),
                     profile: "default".to_owned(),
                     prompt: "review".to_owned(),
                     weight: 1.0,
@@ -644,7 +659,7 @@ mod tests {
                 },
                 RunAgentSpec {
                     agent_id: "agent-b".to_owned(),
-                    executor: "rt".to_owned(),
+                    executor: "core-agent".to_owned(),
                     profile: "default".to_owned(),
                     prompt: "review".to_owned(),
                     weight: 1.0,

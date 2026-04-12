@@ -49,7 +49,7 @@ impl PgStore {
             .lock()
             .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
         let mut stmt = conn.prepare(
-            "SELECT executor_name, base_url,
+            "SELECT executor_name, base_url, kind, target_node_id, scope_hint,
                     (EXTRACT(EPOCH FROM updated_at) * 1000)::BIGINT AS updated_at_ms
              FROM executor_registry_local
              WHERE scope_id = $1
@@ -59,7 +59,10 @@ impl PgStore {
             Ok(LocalExecutorEntryRow {
                 name: r.get(0)?,
                 base_url: r.get(1)?,
-                updated_at: r.get::<_, i64>(2)? as u64,
+                kind: r.get(2)?,
+                target_node_id: r.get(3)?,
+                scope_hint: r.get(4)?,
+                updated_at: r.get::<_, i64>(5)? as u64,
             })
         })?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
@@ -84,17 +87,25 @@ impl PgStore {
             )?;
             for entry in entries {
                 conn.execute(
-                    "INSERT INTO executor_registry_local(scope_id, executor_name, base_url, updated_at)
+                    "INSERT INTO executor_registry_local(
+                        scope_id, executor_name, base_url, kind, target_node_id, scope_hint, updated_at
+                     )
                      VALUES (
                         $1,
                         $2,
                         $3,
-                        TIMESTAMPTZ 'epoch' + ($4::bigint * INTERVAL '1 millisecond')
+                        $4,
+                        $5,
+                        $6,
+                        TIMESTAMPTZ 'epoch' + ($7::bigint * INTERVAL '1 millisecond')
                      )",
                     params![
                         scope_id,
                         &entry.name,
                         entry.base_url,
+                        &entry.kind,
+                        entry.target_node_id,
+                        entry.scope_hint,
                         updated_at as i64
                     ],
                 )?;

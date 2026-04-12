@@ -326,7 +326,7 @@ In local mode, one Wattswarm node can host multiple local agents or runtimes. Wa
 
 ```mermaid
 flowchart LR
-    U["Task / Intent Source"] --> K["Single Local Wattswarm Node"]
+    U["Task / Topic Source"] --> K["Single Local Wattswarm Node"]
 
     subgraph L["Local Multi-Agent Swarm"]
         A1["Agent A"]
@@ -395,12 +395,12 @@ specialization / faster convergence / more stable decisions"]
 
 #### How decentralized swarm intelligence emerges
 
-In decentralized mode, each network node represents one agent participant with its own local Wattswarm state and PostgreSQL store. The network does not replace the local swarm kernel. Instead, it links agent-nodes through event, summary, checkpoint, and repair exchange. Over time, finalized outcomes, imported summaries, reputation, and decision memory create a larger cross-node swarm memory that improves future tasks across the network.
+In decentralized mode, one node starts a swarm task or topic as the coordinator. The coordinator keeps the policy, round state, and closure rules in its local Wattswarm kernel, but does not execute the work itself. Other subscribed or selected nodes execute locally, publish shared facts back into the network, and the coordinator uses those facts to decide whether the round should close, continue, or fall back.
 
 ```mermaid
 flowchart LR
-    U["Task / Intent Source"] --> A["Node A
-Agent A + local Wattswarm store"]
+    U["Task / Topic Source"] --> A["Node A
+Coordinator node + local Wattswarm store"]
 
     subgraph N["Decentralized Network Overlay"]
         N1["LAN
@@ -413,35 +413,38 @@ gossip / backfill / anti-entropy"]
 global / region / node / group"]
     end
 
-    E --> N3
     N1 --> N3
     N2 --> N3
     N4 --> N3
 
-    A --> A1["Agent A local loop
-execute / verify / vote / publish summaries"]
-    A1 --> E["Event / Summary / Checkpoint Publication"]
+    A --> A1["Coordinator loop
+publish task or topic / watch shared facts / decide next round or close"]
+    A1 --> E["TaskAnnounced / topic message / checkpoint publication"]
 
     N3 --> B["Node B
-Agent B + local Wattswarm store"]
+Executor B + local Wattswarm store"]
     N3 --> C["Node C
-Agent C + local Wattswarm store"]
+Executor C + local Wattswarm store"]
     N3 --> D["Node D
-Agent D + local Wattswarm store"]
+Executor D + local Wattswarm store"]
 
-    B --> B1["Agent B local loop
-execute / verify / vote / import summaries"]
-    C --> C1["Agent C local loop
-execute / verify / vote / import summaries"]
-    D --> D1["Agent D local loop
-execute / verify / vote / import summaries"]
+    B --> B1["Local executor loop
+execute / verify / vote / publish facts"]
+    C --> C1["Local executor loop
+execute / verify / vote / publish facts"]
+    D --> D1["Local executor loop
+execute / verify / vote / publish facts"]
 
-    B1 --> F["Distributed outcome
-finalized decision / evidence availability / reputation"]
+    B1 --> F["Shared facts
+execution set / candidates / verifier results / vote reveals / checkpoints"]
     C1 --> F
     D1 --> F
 
-    F --> S["Shared swarm memory
+    F --> N3
+    N3 --> A1
+    A1 --> O["Coordinator decision
+close round / re-explore / next round / fallback finalize"]
+    O --> S["Shared swarm memory
 decision memory / reputation / task outcome summaries"]
 
     S --> R["Future tasks on any node
@@ -454,43 +457,42 @@ seed bundle / reuse / better routing / better decisions"]
 
 #### How decentralized swarm emergence evolves over time
 
-Decentralized swarm emergence appears when many agent-nodes keep exchanging results and summaries across tasks and time. Shared history does not live in one central database; it is reconstructed locally on each node from propagated events, imported summaries, and repaired history. That shared-but-local memory gradually changes trust, reuse, routing, and participation patterns across the network.
+Decentralized swarm emergence appears when the coordinator repeatedly drives rounds from shared facts and participating nodes keep contributing new execution facts. The coordinator remains responsible for policy and closure, but the factual surface seen by the network grows over time and changes which nodes participate, how quickly rounds close, and how future tasks are routed.
 
 ```mermaid
 flowchart LR
-    T["Task stream over time"] --> I["Initiator node
-starts task / intent"]
+    T["Task stream over time"] --> I["Coordinator node
+starts task or topic / stores policy / opens round 1"]
 
     subgraph G["Agent-node swarm"]
-        A["Node A = Agent A"]
-        B["Node B = Agent B"]
-        C["Node C = Agent C"]
-        D["Node D = Agent D"]
+        B["Executor node B"]
+        C["Executor node C"]
+        D["Executor node D"]
     end
 
-    I --> X["Cross-node coordination
-execute / verify / vote / import summaries / finalize"]
-    A --> X
+    I --> X["Round coordination
+select participants / publish work / wait for shared facts"]
     B --> X
     C --> X
     D --> X
 
-    X --> N["Network exchange
-events / summaries / checkpoints / backfill / anti-entropy"]
-    N --> L["Per-node local stores
-each node persists its own reconstructed swarm state"]
-    L --> H["Cross-node historical memory
-imported decision memory / reputation / task outcomes"]
-    H --> P["Adaptive network behavior
-better peer trust / selective reuse / reduced duplicate exploration / stronger scope fit"]
-    P --> A
+    X --> N["Shared fact exchange
+events / candidates / votes / checkpoints / backfill / anti-entropy"]
+    N --> H["Coordinator evaluation
+policy check / round close check / max-round check / fallback check"]
+    H --> R["Round result
+close now / start next round / finalize with fallback"]
+    R --> M["Persistent swarm memory
+decision memory / reputation / task outcome summaries"]
+    M --> P["Adaptive future behavior
+better participant selection / stronger scope fit / reduced duplicate exploration / more stable convergence"]
     P --> B
     P --> C
     P --> D
     P --> T
 
-    H --> E["Decentralized emergence patterns
-network-level specialization / faster recovery / more stable convergence"]
+    M --> E["Emergence patterns over time
+specialization / faster closure / more stable network-level behavior"]
 ```
 
 #### What propagates today

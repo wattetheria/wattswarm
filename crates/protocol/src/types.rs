@@ -82,6 +82,32 @@ pub struct TaskContract {
     pub evidence_policy: EvidencePolicy,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RoundCheckpointPhase {
+    Opening,
+    Active,
+    Closing,
+    Closed,
+    Finalized,
+    Takeover,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RoundCheckpoint {
+    pub task_id: String,
+    pub round_index: u32,
+    pub phase: RoundCheckpointPhase,
+    pub steward_node_id: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub open_participant_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub close_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_round_index: Option<u32>,
+    pub created_at: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct TransportRoute {
     #[serde(default, skip_serializing_if = "Option::is_none")]

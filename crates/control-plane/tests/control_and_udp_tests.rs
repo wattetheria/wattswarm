@@ -21,10 +21,11 @@ use wattswarm_control_plane::control::{
     fetch_evidence_artifact, fetch_snapshot_artifact_json, fetch_task_detail_artifact,
     list_artifacts_needing_repair, load_discovered_peer_records,
     load_discovered_peer_records_state, load_discovered_peers, load_discovered_peers_state,
-    load_executor_registry, load_network_directory_snapshot, local_node_id, local_peer_id,
-    materialize_checkpoint_artifact_json, materialize_evidence_artifact,
-    materialize_snapshot_artifact_json, materialize_task_detail_artifact, open_node,
-    open_node_on_network_id, recommended_transfer_route_for_remote_node, run_real_task_flow,
+    load_executor_registry, load_executor_registry_state, load_network_directory_snapshot,
+    local_node_id, local_peer_id, materialize_checkpoint_artifact_json,
+    materialize_evidence_artifact, materialize_snapshot_artifact_json,
+    materialize_task_detail_artifact, open_node, open_node_on_network_id,
+    recommended_transfer_route_for_remote_node, run_real_task_flow,
     save_data_source_binding_record_state, save_discovered_peers, save_executor_registry,
     save_executor_registry_state, save_peer_metadata_record_state,
 };
@@ -980,6 +981,69 @@ fn executor_registry_roundtrip_and_default_load() {
     let loaded = load_executor_registry(&path).expect("load registry");
     assert_eq!(loaded.entries.len(), 1);
     assert_eq!(loaded.entries[0].name, "rt");
+
+    cleanup_dir(&dir);
+}
+
+#[test]
+fn executor_registry_state_roundtrip_preserves_remote_metadata() {
+    let _guard = env_lock();
+    let _db_lock = DbTestLock::acquire();
+    reset_test_schema("test");
+    let _schema_guard = EnvVarGuard::set("WATTSWARM_PG_SCHEMA", "test");
+    let dir = temp_test_dir("executor-registry-state-roundtrip");
+    let state_dir = dir.join("state");
+    fs::create_dir_all(&state_dir).expect("create state dir");
+
+    save_executor_registry_state(
+        &state_dir,
+        &ExecutorRegistry {
+            entries: vec![
+                ExecutorRegistryEntry {
+                    name: "rt".to_owned(),
+                    base_url: "http://127.0.0.1:7788".to_owned(),
+                    kind: wattswarm_control_plane::control::ExecutorKind::Remote,
+                    target_node_id: Some("node-remote-a".to_owned()),
+                    scope_hint: Some("group:alpha".to_owned()),
+                },
+                ExecutorRegistryEntry {
+                    name: "local-aux".to_owned(),
+                    base_url: "http://127.0.0.1:8899".to_owned(),
+                    kind: wattswarm_control_plane::control::ExecutorKind::Local,
+                    target_node_id: None,
+                    scope_hint: None,
+                },
+            ],
+        },
+    )
+    .expect("save executor registry state");
+
+    let loaded = load_executor_registry_state(&state_dir).expect("load executor registry state");
+    assert_eq!(loaded.entries.len(), 2);
+
+    let remote = loaded
+        .entries
+        .iter()
+        .find(|entry| entry.name == "rt")
+        .expect("remote executor present");
+    assert_eq!(
+        remote.kind,
+        wattswarm_control_plane::control::ExecutorKind::Remote
+    );
+    assert_eq!(remote.target_node_id.as_deref(), Some("node-remote-a"));
+    assert_eq!(remote.scope_hint.as_deref(), Some("group:alpha"));
+
+    let local = loaded
+        .entries
+        .iter()
+        .find(|entry| entry.name == "local-aux")
+        .expect("local executor present");
+    assert_eq!(
+        local.kind,
+        wattswarm_control_plane::control::ExecutorKind::Local
+    );
+    assert_eq!(local.target_node_id, None);
+    assert_eq!(local.scope_hint, None);
 
     cleanup_dir(&dir);
 }
@@ -2195,7 +2259,7 @@ fn run_real_task_flow_rejects_unsupported_profile() {
         &state_dir,
         &ExecutorRegistry {
             entries: vec![ExecutorRegistryEntry {
-                name: "rt".to_owned(),
+                name: "core-agent".to_owned(),
                 base_url: stub.base_url(),
                 kind: Default::default(),
                 target_node_id: None,
@@ -2238,7 +2302,7 @@ fn run_real_task_flow_reports_task_file_parse_errors() {
         &state_dir,
         &ExecutorRegistry {
             entries: vec![ExecutorRegistryEntry {
-                name: "rt".to_owned(),
+                name: "core-agent".to_owned(),
                 base_url: stub.base_url(),
                 kind: Default::default(),
                 target_node_id: None,
@@ -2290,7 +2354,7 @@ fn run_real_task_flow_completes_with_stub_runtime() {
         &state_dir,
         &ExecutorRegistry {
             entries: vec![ExecutorRegistryEntry {
-                name: "rt".to_owned(),
+                name: "core-agent".to_owned(),
                 base_url: stub.base_url(),
                 kind: Default::default(),
                 target_node_id: None,
@@ -2340,7 +2404,7 @@ fn remote_task_bridge_materializes_executes_and_dedupes() {
         &state_dir,
         &ExecutorRegistry {
             entries: vec![ExecutorRegistryEntry {
-                name: "rt".to_owned(),
+                name: "core-agent".to_owned(),
                 base_url: stub.base_url(),
                 kind: Default::default(),
                 target_node_id: None,
@@ -2414,7 +2478,7 @@ fn remote_task_bridge_materializes_executes_and_dedupes() {
         &mut node,
         &state_dir,
         RemoteTaskBridgeRequest {
-            executor: "rt".to_owned(),
+            executor: "core-agent".to_owned(),
             profile: "default".to_owned(),
             task_id: task_id.clone(),
         },
@@ -2469,7 +2533,7 @@ fn remote_task_bridge_materializes_executes_and_dedupes() {
         &mut node,
         &state_dir,
         RemoteTaskBridgeRequest {
-            executor: "rt".to_owned(),
+            executor: "core-agent".to_owned(),
             profile: "default".to_owned(),
             task_id: task_id.clone(),
         },
@@ -2505,7 +2569,7 @@ fn remote_task_bridge_rejects_node_scoped_tasks_for_other_nodes() {
         &state_dir,
         &ExecutorRegistry {
             entries: vec![ExecutorRegistryEntry {
-                name: "rt".to_owned(),
+                name: "core-agent".to_owned(),
                 base_url: stub.base_url(),
                 kind: Default::default(),
                 target_node_id: None,
@@ -2578,7 +2642,7 @@ fn remote_task_bridge_rejects_node_scoped_tasks_for_other_nodes() {
         &mut node,
         &state_dir,
         RemoteTaskBridgeRequest {
-            executor: "rt".to_owned(),
+            executor: "core-agent".to_owned(),
             profile: "default".to_owned(),
             task_id: task_id.clone(),
         },
@@ -2614,7 +2678,7 @@ fn remote_task_bridge_allows_group_scoped_tasks_for_target_nodes() {
         &state_dir,
         &ExecutorRegistry {
             entries: vec![ExecutorRegistryEntry {
-                name: "rt".to_owned(),
+                name: "core-agent".to_owned(),
                 base_url: stub.base_url(),
                 kind: Default::default(),
                 target_node_id: None,
@@ -2698,7 +2762,7 @@ fn remote_task_bridge_allows_group_scoped_tasks_for_target_nodes() {
         &mut node,
         &state_dir,
         RemoteTaskBridgeRequest {
-            executor: "rt".to_owned(),
+            executor: "core-agent".to_owned(),
             profile: "default".to_owned(),
             task_id: task_id.clone(),
         },

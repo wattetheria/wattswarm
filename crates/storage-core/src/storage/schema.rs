@@ -482,6 +482,34 @@ fn migrate_executor_registry_local_scope_schema(conn: &Connection) -> Result<()>
     Ok(())
 }
 
+fn migrate_executor_registry_local_metadata_schema(conn: &Connection) -> Result<()> {
+    if !column_exists(conn, "executor_registry_local", "kind") {
+        conn.execute_batch(
+            "
+            ALTER TABLE executor_registry_local
+            ADD COLUMN kind TEXT NOT NULL DEFAULT 'local';
+            ",
+        )?;
+    }
+    if !column_exists(conn, "executor_registry_local", "target_node_id") {
+        conn.execute_batch(
+            "
+            ALTER TABLE executor_registry_local
+            ADD COLUMN target_node_id TEXT;
+            ",
+        )?;
+    }
+    if !column_exists(conn, "executor_registry_local", "scope_hint") {
+        conn.execute_batch(
+            "
+            ALTER TABLE executor_registry_local
+            ADD COLUMN scope_hint TEXT;
+            ",
+        )?;
+    }
+    Ok(())
+}
+
 fn ensure_discovered_peers_local_scope_index(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         "
@@ -602,6 +630,9 @@ impl PgStore {
                 scope_id TEXT NOT NULL DEFAULT '',
                 executor_name TEXT NOT NULL,
                 base_url TEXT NOT NULL,
+                kind TEXT NOT NULL DEFAULT 'local',
+                target_node_id TEXT,
+                scope_hint TEXT,
                 updated_at TIMESTAMPTZ NOT NULL,
                 PRIMARY KEY(scope_id, executor_name)
             );
@@ -1692,6 +1723,7 @@ impl PgStore {
             ensure_boolean_column(&conn, "task_settlement", "implicit_settled", Some("FALSE"))?;
             ensure_boolean_column(&conn, "knowledge_lookups", "reuse_applied", Some("FALSE"))?;
             migrate_executor_registry_local_scope_schema(&conn)?;
+            migrate_executor_registry_local_metadata_schema(&conn)?;
             migrate_discovered_peers_local_scope_schema(&conn)?;
             migrate_discovered_peers_local_source_kind_schema(&conn)?;
             migrate_peer_metadata_local_contact_material_schema(&conn)?;

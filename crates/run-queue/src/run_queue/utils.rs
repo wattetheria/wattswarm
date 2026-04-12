@@ -8,6 +8,7 @@ use super::status::{
 };
 
 pub(crate) const STEP_STATUS_REMOTE_DISPATCHED: &str = "REMOTE_DISPATCHED";
+const RUN_QUEUE_COORDINATION_KEY: &str = "_run_queue_coordination";
 use super::types::RunStepCounts;
 
 pub(crate) fn ensure_run_queue_timestamp_column(
@@ -94,6 +95,34 @@ pub(crate) fn build_step_inputs(shared_inputs: &Value, prompt: &str, agent_id: &
     Value::Object(merged)
 }
 
+pub(crate) fn coordinator_must_not_execute_locally(
+    shared_inputs: &Value,
+    local_node_id: &str,
+) -> bool {
+    let Some(coordination) = shared_inputs
+        .get(RUN_QUEUE_COORDINATION_KEY)
+        .and_then(Value::as_object)
+    else {
+        return false;
+    };
+    let coordinator_executes = coordination
+        .get("coordinator_executes")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+    let coordinator_node_id = coordination
+        .get("coordinator_node_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let mode = coordination
+        .get("mode")
+        .and_then(Value::as_str)
+        .unwrap_or("local");
+    !coordinator_executes
+        && matches!(mode, "lan" | "network")
+        && coordinator_node_id.is_some_and(|node_id| node_id == local_node_id)
+}
+
 pub(crate) fn retry_delay_ms(base: u64, attempt: u32) -> i64 {
     let exp = attempt.saturating_sub(1).min(16);
     let factor = 1_u64 << exp;
@@ -102,4 +131,44 @@ pub(crate) fn retry_delay_ms(base: u64, attempt: u32) -> i64 {
 
 pub(crate) fn now_ms() -> i64 {
     chrono::Utc::now().timestamp_millis()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn coordinator_must_not_execute_locally_only_for_distributed_coordinator() {
+        assert!(coordinator_must_not_execute_locally(
+            &json!({
+                "_run_queue_coordination": {
+                    "mode": "lan",
+                    "coordinator_node_id": "node-a",
+                    "coordinator_executes": false
+                }
+            }),
+            "node-a"
+        ));
+        assert!(!coordinator_must_not_execute_locally(
+            &json!({
+                "_run_queue_coordination": {
+                    "mode": "lan",
+                    "coordinator_node_id": "node-a",
+                    "coordinator_executes": false
+                }
+            }),
+            "node-b"
+        ));
+        assert!(!coordinator_must_not_execute_locally(
+            &json!({
+                "_run_queue_coordination": {
+                    "mode": "local",
+                    "coordinator_node_id": "node-a",
+                    "coordinator_executes": false
+                }
+            }),
+            "node-a"
+        ));
+    }
 }

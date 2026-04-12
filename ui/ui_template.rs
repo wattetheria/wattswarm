@@ -348,7 +348,7 @@ pub const INDEX_HTML: &str = r#"<!DOCTYPE html>
             <button onclick="decisionTask()" class="ghost">decision</button>
           </div>
           <div class="row">
-            <input id="runExecutor" placeholder="executor name" value="rt"/>
+            <input id="runExecutor" placeholder="executor name" value="core-agent"/>
             <input id="runProfile" placeholder="profile" value="default"/>
             <button onclick="runReal()">run-real</button>
           </div>

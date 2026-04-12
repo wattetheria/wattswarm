@@ -111,6 +111,17 @@ impl ExecutorRegistryEntry {
     }
 }
 
+pub const CORE_AGENT_EXECUTOR_NAME: &str = "core-agent";
+const LEGACY_RT_EXECUTOR_NAME: &str = "rt";
+
+pub fn normalize_executor_name(executor: &str) -> &str {
+    if executor.trim() == LEGACY_RT_EXECUTOR_NAME {
+        CORE_AGENT_EXECUTOR_NAME
+    } else {
+        executor
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ExecutorRegistry {
     pub entries: Vec<ExecutorRegistryEntry>,
@@ -977,6 +988,7 @@ pub(crate) fn prepare_runtime_for_executor(
     profile: &str,
 ) -> Result<PreparedRuntime> {
     let reg = load_executor_registry_state(state_dir)?;
+    let executor = normalize_executor_name(executor);
     let entry = reg
         .entries
         .iter()
@@ -2019,6 +2031,108 @@ pub fn materialize_checkpoint_artifact_json<T: Serialize>(
     Ok(manifest)
 }
 
+fn round_checkpoint_scope_key(contract: &TaskContract) -> String {
+    if let Some(scope_hint) = contract
+        .inputs
+        .get("scope_hint")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        return crate::types::normalized_scope_hint(scope_hint);
+    }
+    if let Some(route) = contract.transport_route()
+        && let Some(group_id) = route.group_id.as_deref()
+        && !group_id.trim().is_empty()
+    {
+        return crate::types::normalized_scope_hint(&format!("group:{group_id}"));
+    }
+    "global".to_owned()
+}
+
+fn round_checkpoint_phase_label(phase: crate::types::RoundCheckpointPhase) -> &'static str {
+    match phase {
+        crate::types::RoundCheckpointPhase::Opening => "opening",
+        crate::types::RoundCheckpointPhase::Active => "active",
+        crate::types::RoundCheckpointPhase::Closing => "closing",
+        crate::types::RoundCheckpointPhase::Closed => "closed",
+        crate::types::RoundCheckpointPhase::Finalized => "finalized",
+        crate::types::RoundCheckpointPhase::Takeover => "takeover",
+    }
+}
+
+pub fn round_checkpoint_artifact_id(
+    task_id: &str,
+    round_index: u32,
+    phase: crate::types::RoundCheckpointPhase,
+) -> Result<String> {
+    Ok(sha256_hex(&serde_json::to_vec(&json!({
+        "task_id": task_id,
+        "round_index": round_index,
+        "phase": round_checkpoint_phase_label(phase),
+    }))?))
+}
+
+fn round_checkpoint_id(checkpoint: &crate::types::RoundCheckpoint) -> Result<String> {
+    round_checkpoint_artifact_id(
+        &checkpoint.task_id,
+        checkpoint.round_index,
+        checkpoint.phase,
+    )
+}
+
+pub fn materialize_round_checkpoint_artifact(
+    state_dir: &Path,
+    node: &mut Node,
+    contract: &TaskContract,
+    round_index: u32,
+    steward_node_id: &str,
+    phase: crate::types::RoundCheckpointPhase,
+    open_participant_ids: Vec<String>,
+    close_reason: Option<String>,
+    next_round_index: Option<u32>,
+    observed_at: u64,
+) -> Result<ArtifactAvailabilityManifest> {
+    let checkpoint = crate::types::RoundCheckpoint {
+        task_id: contract.task_id.clone(),
+        round_index,
+        phase,
+        steward_node_id: steward_node_id.to_owned(),
+        open_participant_ids,
+        close_reason,
+        next_round_index,
+        created_at: observed_at,
+    };
+    let checkpoint_id = round_checkpoint_id(&checkpoint)?;
+    let scope_key = round_checkpoint_scope_key(contract);
+    let artifact_path = format!(
+        "task://{}/{}/round/{}/{}",
+        contract.task_type,
+        contract.task_id,
+        round_index,
+        round_checkpoint_phase_label(phase)
+    );
+    node.store.put_checkpoint_announcement(
+        &scope_key,
+        &checkpoint_id,
+        &artifact_path,
+        observed_at,
+    )?;
+    let epoch = node
+        .task_view(&contract.task_id)?
+        .map(|task| task.epoch)
+        .unwrap_or(1);
+    let _ = node.create_checkpoint(checkpoint_id.clone(), epoch, observed_at)?;
+    Ok(materialize_checkpoint_artifact_json(
+        state_dir,
+        node,
+        &scope_key,
+        &checkpoint_id,
+        &checkpoint,
+        observed_at,
+    )?)
+}
+
 pub fn fetch_checkpoint_artifact_json<T: DeserializeOwned>(
     state_dir: &Path,
     node: &Node,
@@ -2122,6 +2236,56 @@ pub fn fetch_checkpoint_artifact_json<T: DeserializeOwned>(
             ))
         }
     }
+}
+
+pub fn fetch_round_checkpoint_artifact(
+    state_dir: &Path,
+    node: &Node,
+    task_id: &str,
+    round_index: u32,
+    phase: crate::types::RoundCheckpointPhase,
+    observed_at: u64,
+) -> Result<Option<crate::types::RoundCheckpoint>> {
+    let checkpoint_id = round_checkpoint_artifact_id(task_id, round_index, phase)?;
+    let Some(row) = node.store.find_checkpoint_announcement(&checkpoint_id)? else {
+        return Ok(None);
+    };
+    Ok(Some(fetch_checkpoint_artifact_json(
+        state_dir,
+        node,
+        &row.scope_key,
+        &checkpoint_id,
+        observed_at,
+    )?))
+}
+
+pub fn fetch_latest_round_checkpoint_artifact(
+    state_dir: &Path,
+    node: &Node,
+    task_id: &str,
+    round_index: u32,
+    observed_at: u64,
+) -> Result<Option<crate::types::RoundCheckpoint>> {
+    for phase in [
+        crate::types::RoundCheckpointPhase::Takeover,
+        crate::types::RoundCheckpointPhase::Finalized,
+        crate::types::RoundCheckpointPhase::Closed,
+        crate::types::RoundCheckpointPhase::Closing,
+        crate::types::RoundCheckpointPhase::Active,
+        crate::types::RoundCheckpointPhase::Opening,
+    ] {
+        if let Some(checkpoint) = fetch_round_checkpoint_artifact(
+            state_dir,
+            node,
+            task_id,
+            round_index,
+            phase,
+            observed_at,
+        )? {
+            return Ok(Some(checkpoint));
+        }
+    }
+    Ok(None)
 }
 
 pub fn materialize_snapshot_artifact_json<T: Serialize>(
@@ -2406,6 +2570,18 @@ pub(crate) fn run_existing_task_with_runtime(
         .get("answer")
         .and_then(Value::as_str)
         .map(str::to_owned);
+    let _ = materialize_round_checkpoint_artifact(
+        state_dir,
+        node,
+        &task.contract,
+        1,
+        &node.node_id(),
+        crate::types::RoundCheckpointPhase::Finalized,
+        Vec::new(),
+        final_decision.clone(),
+        None,
+        now.saturating_add(9),
+    )?;
     let evidence_digests = candidate
         .evidence_refs
         .iter()
@@ -2559,6 +2735,7 @@ pub fn bridge_remote_task_into_local_execution(
         profile,
         task_id,
     } = req;
+    let executor = normalize_executor_name(&executor).to_owned();
     let detail = node
         .store
         .get_task_announcement_detail_for_task(&task_id)?
@@ -3450,9 +3627,13 @@ pub fn load_executor_registry_state(state_dir: &Path) -> Result<ExecutorRegistry
                 .map(|entry| ExecutorRegistryEntry {
                     name: entry.name,
                     base_url: entry.base_url,
-                    kind: ExecutorKind::default(),
-                    target_node_id: None,
-                    scope_hint: None,
+                    kind: if entry.kind.eq_ignore_ascii_case("remote") {
+                        ExecutorKind::Remote
+                    } else {
+                        ExecutorKind::Local
+                    },
+                    target_node_id: entry.target_node_id,
+                    scope_hint: entry.scope_hint,
                 })
                 .collect(),
         });
@@ -3475,6 +3656,12 @@ pub fn save_executor_registry_state(state_dir: &Path, reg: &ExecutorRegistry) ->
             .map(|entry| crate::storage::LocalExecutorEntryRow {
                 name: entry.name.clone(),
                 base_url: entry.base_url.clone(),
+                kind: match entry.kind {
+                    ExecutorKind::Local => "local".to_owned(),
+                    ExecutorKind::Remote => "remote".to_owned(),
+                },
+                target_node_id: entry.target_node_id.clone(),
+                scope_hint: entry.scope_hint.clone(),
                 updated_at: now,
             })
             .collect::<Vec<_>>(),
@@ -3519,6 +3706,18 @@ pub fn run_real_task_flow(
 
     let now = chrono::Utc::now().timestamp_millis().max(0) as u64;
     node.submit_task(contract.clone(), 1, now)?;
+    let _ = materialize_round_checkpoint_artifact(
+        state_dir,
+        node,
+        &contract,
+        1,
+        &node.node_id(),
+        crate::types::RoundCheckpointPhase::Opening,
+        Vec::new(),
+        None,
+        None,
+        now,
+    )?;
     run_existing_task_with_runtime(
         node,
         state_dir,

@@ -1,11 +1,11 @@
 use crate::control::{prepare_runtime_for_executor, run_existing_task_with_runtime};
 use crate::crypto::sha256_hex;
 use crate::node::Node;
-use crate::storage::storage::DecisionMemoryHitRow;
 use crate::storage::storage::TopicMessageRow;
 use anyhow::Result;
 use serde::Deserialize;
 use serde_json::{Value, json};
+use std::collections::BTreeSet;
 
 const TOPIC_INTERPRETATION_TASK_TYPE: &str = "topic_interpretation";
 const TOPIC_INTERPRETATION_MESSAGE_KIND: &str = "interpreted_stance";
@@ -56,6 +56,16 @@ fn resolve_network_id(node: &Node) -> String {
         .load_verified_network_protocol_params()
         .map(|verified| verified.network_id)
         .unwrap_or_else(|_| format!("local:{}", node.node_id()))
+}
+
+fn distributed_topic_mode(node: &Node) -> bool {
+    !matches!(
+        node.store
+            .load_network_topology_for_org(node.store.org_id())
+            .map(|topology| topology.network.network_kind)
+            .unwrap_or(crate::types::NetworkKind::Local),
+        crate::types::NetworkKind::Local
+    )
 }
 
 fn parse_string_array(value: Option<&Value>) -> Vec<String> {
@@ -255,13 +265,28 @@ fn select_candidate_proposals(
     proposals.to_vec()
 }
 
-fn local_coordinator_proposals(
+fn local_executor_proposals(
     proposals: &[StructuredProposal],
     local_node_id: &str,
+    distributed_mode: bool,
 ) -> Vec<StructuredProposal> {
     proposals
         .iter()
-        .filter(|proposal| proposal.coordinator_node_id == local_node_id)
+        .filter(|proposal| {
+            if !distributed_mode {
+                return true;
+            }
+            if proposal.coordinator_node_id == local_node_id {
+                return false;
+            }
+            if proposal.participants.is_empty() {
+                return true;
+            }
+            proposal
+                .participants
+                .iter()
+                .any(|participant| participant == local_node_id)
+        })
         .cloned()
         .collect()
 }
@@ -337,43 +362,44 @@ fn build_interpretation_task_contract(
     Ok(contract)
 }
 
-fn parse_prior_deliberation_row(
-    row: DecisionMemoryHitRow,
-    feed_key: &str,
-    scope_hint: &str,
+fn parse_prior_deliberation_message(
+    message: &TopicMessageRow,
     excluded_proposal_message_ids: &[String],
 ) -> Option<Value> {
-    let summary = row.result_summary.as_object()?;
-    let summary_feed_key = summary.get("feed_key")?.as_str()?;
-    let summary_scope_hint = summary.get("scope_hint")?.as_str()?;
-    let proposal_message_id = summary.get("proposal_message_id")?.as_str()?;
-    if summary_feed_key != feed_key
-        || summary_scope_hint != scope_hint
-        || excluded_proposal_message_ids
-            .iter()
-            .any(|current| current == proposal_message_id)
+    let content = message.content.as_object()?;
+    if content.get("kind")?.as_str()? != "consensus_result" {
+        return None;
+    }
+    let proposal_message_id = content.get("proposal_message_id")?.as_str()?;
+    if excluded_proposal_message_ids
+        .iter()
+        .any(|current| current == proposal_message_id)
     {
         return None;
     }
-    let decision = summary
-        .get("decision")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_ascii_lowercase();
     Some(json!({
-        "task_id": row.task_id,
-        "finalized_at": row.finalized_at,
-        "proposal_id": summary.get("proposal_id").and_then(Value::as_str).unwrap_or_default(),
+        "message_id": message.message_id,
+        "finalized_at": message.created_at,
+        "proposal_id": content.get("proposal_id").and_then(Value::as_str).unwrap_or_default(),
         "proposal_message_id": proposal_message_id,
-        "decision": decision,
-        "goal": summary.get("goal").and_then(Value::as_str),
-        "participants": summary.get("participants").cloned().unwrap_or_else(|| json!([]))
+        "decision": content
+            .get("decision")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_ascii_lowercase(),
+        "goal": content.get("goal").and_then(Value::as_str),
+        "participants": content.get("participants").cloned().unwrap_or_else(|| json!([])),
+        "source_feed_key": content.get("source_feed_key").cloned().unwrap_or_else(|| json!(null)),
+        "source_scope_hint": content
+            .get("source_scope_hint")
+            .cloned()
+            .unwrap_or_else(|| json!(null))
     }))
 }
 
 fn load_prior_deliberations(
     node: &Node,
-    feed_key: &str,
+    _feed_key: &str,
     scope_hint: &str,
     proposals: &[StructuredProposal],
 ) -> Result<Vec<Value>> {
@@ -381,14 +407,27 @@ fn load_prior_deliberations(
         .iter()
         .map(|proposal| proposal.source_message_id.clone())
         .collect::<Vec<_>>();
-    Ok(node
-        .store
-        .list_local_decision_memory_hits_by_task_type("topic_consensus", 32)?
-        .into_iter()
-        .filter_map(|row| {
-            parse_prior_deliberation_row(row, feed_key, scope_hint, &excluded_proposal_message_ids)
-        })
-        .collect())
+    let result_feeds = proposals
+        .iter()
+        .map(|proposal| proposal.result_feed_key.clone())
+        .collect::<BTreeSet<_>>();
+    let mut prior = Vec::new();
+    for result_feed_key in result_feeds {
+        prior.extend(
+            node.store
+                .list_topic_messages(&result_feed_key, scope_hint, 64)?
+                .into_iter()
+                .filter_map(|message| {
+                    parse_prior_deliberation_message(&message, &excluded_proposal_message_ids)
+                }),
+        );
+    }
+    prior.sort_by(|left, right| {
+        left["finalized_at"]
+            .as_u64()
+            .cmp(&right["finalized_at"].as_u64())
+    });
+    Ok(prior)
 }
 
 fn finalized_interpretation_output(
@@ -508,7 +547,21 @@ fn maybe_interpret_message(
                 &candidate_proposals,
                 all_messages,
             )?;
-            node.submit_task(contract, 1, now_ms())?;
+            let checkpoint_contract = contract.clone();
+            let observed_at = now_ms();
+            node.submit_task(contract, 1, observed_at)?;
+            let _ = crate::control::materialize_round_checkpoint_artifact(
+                state_dir,
+                node,
+                &checkpoint_contract,
+                1,
+                &node.node_id(),
+                crate::types::RoundCheckpointPhase::Opening,
+                Vec::new(),
+                None,
+                None,
+                observed_at,
+            )?;
         }
         let _ = run_existing_task_with_runtime(
             node,
@@ -560,7 +613,8 @@ pub fn process_topic_interpretation_for_topic(
     if proposals.is_empty() {
         return Ok(0);
     }
-    let proposals = local_coordinator_proposals(&proposals, &node.node_id());
+    let proposals =
+        local_executor_proposals(&proposals, &node.node_id(), distributed_topic_mode(node));
     if proposals.is_empty() {
         return Ok(0);
     }
@@ -586,4 +640,43 @@ pub fn process_topic_interpretation(node: &mut Node, state_dir: &std::path::Path
         )?);
     }
     Ok(processed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn proposal(participants: &[&str]) -> StructuredProposal {
+        StructuredProposal {
+            proposal_id: "proposal-1".to_owned(),
+            source_message_id: "message-1".to_owned(),
+            coordinator_node_id: "node-a".to_owned(),
+            participants: participants
+                .iter()
+                .map(|value| (*value).to_owned())
+                .collect(),
+            threshold_percent: 60,
+            result_feed_key: "feed.result".to_owned(),
+            goal: Some("decide".to_owned()),
+        }
+    }
+
+    #[test]
+    fn local_executor_proposals_excludes_coordinator_in_distributed_mode() {
+        let proposals = vec![proposal(&["node-a", "node-b"])];
+        assert!(local_executor_proposals(&proposals, "node-a", true).is_empty());
+        assert_eq!(
+            local_executor_proposals(&proposals, "node-b", true).len(),
+            1
+        );
+    }
+
+    #[test]
+    fn local_executor_proposals_keeps_local_behavior() {
+        let proposals = vec![proposal(&["node-a", "node-b"])];
+        assert_eq!(
+            local_executor_proposals(&proposals, "node-a", false).len(),
+            1
+        );
+    }
 }

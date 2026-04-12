@@ -302,6 +302,10 @@ pub fn build_app(state: UiServerState) -> Router {
         .route("/api/task/submit", post(task_submit))
         .route("/api/task/watch/:task_id", get(task_watch))
         .route("/api/task/decision/:task_id", get(task_decision))
+        .route(
+            "/api/task/facts/:task_id",
+            get(wattetheria_sync::task_facts_snapshot_http),
+        )
         .route("/api/task/run-real", post(task_run_real))
         .route("/api/run/submit", post(run_submit))
         .route("/api/run/kickoff/:run_id", post(run_kickoff))
@@ -326,6 +330,10 @@ pub fn build_app(state: UiServerState) -> Router {
         .route(
             "/api/wattetheria/task/decision/:task_id",
             get(wattetheria_sync::task_decision_snapshot_http),
+        )
+        .route(
+            "/api/wattetheria/task/facts/:task_id",
+            get(wattetheria_sync::task_facts_snapshot_http),
         )
         .route(
             "/api/wattetheria/run/result/:run_id",
@@ -1720,7 +1728,9 @@ async fn swarm_tick(
     Json(req): Json<SwarmTickRequest>,
 ) -> Result<Json<Value>, ApiError> {
     let state_clone = state.clone();
-    let executor = req.executor.unwrap_or_else(|| "rt".to_owned());
+    let executor = req
+        .executor
+        .unwrap_or_else(|| core_agent_executor_name().to_owned());
     let profile = req.profile.unwrap_or_else(|| "default".to_owned());
     let dashboard = tokio::task::spawn_blocking(move || -> Result<SwarmDashboardState> {
         let mut node = open_node(&state_clone.state_dir, &state_clone.db_path)?;

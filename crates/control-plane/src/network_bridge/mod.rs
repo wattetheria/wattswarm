@@ -69,6 +69,7 @@ const TASK_OUTCOME_SUMMARY_KIND: &str = "task_outcome_v1";
 const MAX_INFLIGHT_BACKFILLS_PER_PEER: usize = 1;
 const SUMMARY_BACKPRESSURE_HIGH_WATERMARK: u64 = 256;
 const IDLE_NETWORK_SLEEP: Duration = Duration::from_millis(50);
+const ANNOUNCED_PEER_TTL: Duration = Duration::from_secs(60 * 60);
 
 const ENV_P2P_ENABLED: &str = "WATTSWARM_P2P_ENABLED";
 const ENV_P2P_MDNS: &str = "WATTSWARM_P2P_MDNS";
@@ -87,6 +88,17 @@ static LATEST_NETWORK_OBSERVABILITY_SNAPSHOTS: OnceLock<
 
 fn started_network_services() -> &'static Mutex<HashSet<PathBuf>> {
     STARTED_NETWORK_SERVICES.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+fn record_peer_announcement(
+    announced_peers: &mut HashMap<String, Instant>,
+    peer: &str,
+    now: Instant,
+) -> bool {
+    announced_peers.retain(|_, announced_at| {
+        now.saturating_duration_since(*announced_at) <= ANNOUNCED_PEER_TTL
+    });
+    announced_peers.insert(peer.to_owned(), now).is_none()
 }
 
 fn latest_network_observability_snapshots()
@@ -857,6 +869,7 @@ pub fn log_run_queue_events_if_applicable(
                 .get("executor")
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or("");
+            let executor = crate::control::normalize_executor_name(executor);
             let profile = payload
                 .summary
                 .get("profile")
@@ -1146,6 +1159,7 @@ fn run_background_network_service_with_hook(
     service.set_state_dir(state_dir.to_path_buf());
     store_latest_network_observability_snapshot(state_dir, service.observability_snapshot(&node)?);
     let mut announced_listen = false;
+    let mut announced_peers: HashMap<String, Instant> = HashMap::new();
     let mut last_published_seq = node.head_seq()?;
     let mut next_dial_attempt_at = HashMap::new();
 
@@ -1166,7 +1180,10 @@ fn run_background_network_service_with_hook(
                 }
                 Ok(Some(NetworkBridgeTick::Connected { peer })) => {
                     did_work = true;
-                    eprintln!("p2p peer connected: {peer}");
+                    let peer_str = peer.to_string();
+                    if record_peer_announcement(&mut announced_peers, &peer_str, Instant::now()) {
+                        eprintln!("p2p peer connected: {peer}");
+                    }
                 }
                 Ok(Some(_)) => {
                     did_work = true;

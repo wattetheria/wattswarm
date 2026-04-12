@@ -1,6 +1,9 @@
-use crate::control::{configured_node_mode, open_configured_node};
+use crate::control::{
+    ExecutorKind, configured_node_mode, load_executor_registry_state, normalize_executor_name,
+    open_configured_node,
+};
 use crate::run_queue::{PgRunQueue, RunEvent, RunSubmitSpec, RunView, WorkerOptions};
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use serde_json::{Value, json};
 use std::path::Path;
 use std::thread;
@@ -25,6 +28,55 @@ fn current_org_queue(state_dir: &Path, db_path: &Path, pg_url: &str) -> Result<P
     Ok(PgRunQueue::new(pg_url.to_owned()).for_org(node.store.org_id().to_owned()))
 }
 
+fn annotate_and_filter_distributed_run_spec(
+    state_dir: &Path,
+    db_path: &Path,
+    mut spec: RunSubmitSpec,
+) -> Result<RunSubmitSpec> {
+    let mode = configured_node_mode(state_dir)?.unwrap_or(crate::control::NodeMode::Local);
+    if matches!(mode, crate::control::NodeMode::Local) {
+        return Ok(spec);
+    }
+
+    let node = open_configured_node(state_dir, db_path)?;
+    let coordinator_node_id = node.node_id();
+    let registry = load_executor_registry_state(state_dir).unwrap_or_default();
+    let original_agent_count = spec.agents.len();
+    spec.agents.retain(|agent| {
+        let executor_name = normalize_executor_name(&agent.executor);
+        !registry
+            .entries
+            .iter()
+            .find(|entry| entry.name == executor_name)
+            .is_some_and(|entry| entry.kind == ExecutorKind::Local)
+    });
+    if original_agent_count > 0 && spec.agents.is_empty() {
+        return Err(anyhow!(
+            "distributed run {} has no non-coordinator executors after filtering local executors",
+            spec.run_id
+        ));
+    }
+
+    let mut shared_inputs = match spec.shared_inputs {
+        Value::Object(obj) => obj,
+        other => {
+            let mut obj = serde_json::Map::new();
+            obj.insert("shared_inputs".to_owned(), other);
+            obj
+        }
+    };
+    shared_inputs.insert(
+        "_run_queue_coordination".to_owned(),
+        json!({
+            "mode": mode.as_str(),
+            "coordinator_node_id": coordinator_node_id,
+            "coordinator_executes": false,
+        }),
+    );
+    spec.shared_inputs = Value::Object(shared_inputs);
+    Ok(spec)
+}
+
 pub fn submit_run(
     state_dir: &Path,
     db_path: &Path,
@@ -33,6 +85,7 @@ pub fn submit_run(
     kickoff: bool,
 ) -> Result<Value> {
     let queue = current_org_queue(state_dir, db_path, pg_url)?;
+    let spec = annotate_and_filter_distributed_run_spec(state_dir, db_path, spec)?;
     let run_id = spec.run_id.clone();
     queue.submit_run(spec)?;
     if kickoff {

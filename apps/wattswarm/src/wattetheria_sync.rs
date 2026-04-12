@@ -1,10 +1,14 @@
 use crate::control::{
-    NodeState, RealTaskRunRequest, local_node_id, node_state_path, open_configured_node,
-    require_configured_node_mode, resolve_node_mode, run_real_task_flow,
+    NodeState, RealTaskRunRequest, fetch_checkpoint_artifact_json, local_node_id, node_state_path,
+    open_configured_node, open_node, require_configured_node_mode, resolve_node_mode,
+    run_real_task_flow,
 };
 use crate::run_control;
 use crate::run_queue::{RunSubmitSpec, RunView};
-use crate::storage::storage::{TaskProjectionRow, TopicCursorRow, TopicMessageRow};
+use crate::storage::storage::{
+    LocalRemoteTaskBridgeRow, TaskCandidateRow, TaskProjectionRow, TopicCursorRow, TopicMessageRow,
+    VerifierResultRow, VoteRevealRow,
+};
 use crate::ui::UiServerState;
 use anyhow::{Context, Result, anyhow};
 use async_stream::try_stream;
@@ -61,6 +65,103 @@ pub struct TaskRunProjectionSnapshot {
     pub generated_at: u64,
     pub recent_tasks: Vec<TaskProjectionSummary>,
     pub recent_runs: Vec<RunView>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskFactsSnapshot {
+    pub generated_at: u64,
+    pub task_id: String,
+    pub task: Option<TaskProjectionSummary>,
+    pub coordinator_run: Option<TaskCoordinatorRunSnapshot>,
+    pub execution_set_members: Vec<TaskExecutionSetMemberSnapshot>,
+    pub remote_bridges: Vec<TaskRemoteBridgeSnapshot>,
+    pub candidates: Vec<TaskCandidateSnapshot>,
+    pub verifier_results: Vec<TaskVerifierResultSnapshot>,
+    pub vote_reveals: Vec<TaskVoteRevealSnapshot>,
+    pub checkpoints: Vec<TaskCheckpointSnapshot>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskExecutionSetMemberSnapshot {
+    pub execution_set_id: String,
+    pub participant_node_id: String,
+    pub role_hint: String,
+    pub scope_hint: String,
+    pub status: String,
+    pub confirmed_by_node_id: Option<String>,
+    pub updated_at: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskRemoteBridgeSnapshot {
+    pub announcement_id: String,
+    pub network_id: String,
+    pub source_node_id: String,
+    pub source_scope_hint: String,
+    pub detail_ref_digest: Option<String>,
+    pub executor: String,
+    pub profile: String,
+    pub candidate_id: String,
+    pub terminal_state: String,
+    pub bridged_at: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskCandidateSnapshot {
+    pub proposer_node_id: String,
+    pub candidate_hash: String,
+    pub candidate_id: String,
+    pub execution_id: String,
+    pub output_resolved_at: Option<u64>,
+    pub output: Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskVerifierResultSnapshot {
+    pub candidate_id: String,
+    pub verifier_node_id: String,
+    pub passed: bool,
+    pub score: f64,
+    pub verification_status: String,
+    pub verifier_result_hash: String,
+    pub reason_codes: Vec<u16>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskVoteRevealSnapshot {
+    pub voter_node_id: String,
+    pub candidate_id: String,
+    pub candidate_hash: String,
+    pub vote: String,
+    pub valid: bool,
+    pub created_at: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskCheckpointSnapshot {
+    pub scope_key: String,
+    pub checkpoint_id: String,
+    pub artifact_path: String,
+    pub observed_at: u64,
+    pub checkpoint: Option<crate::types::RoundCheckpoint>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskCoordinatorRunSnapshot {
+    pub run_id: String,
+    pub round_status: String,
+    pub expected_executor_count: i64,
+    pub completed_executors: i64,
+    pub active_executors: i64,
+    pub run: RunView,
+    pub next_round_trigger: Option<TaskNextRoundTriggerSnapshot>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskNextRoundTriggerSnapshot {
+    pub event_type: String,
+    pub created_at: i64,
+    pub payload: Value,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -230,6 +331,109 @@ fn task_projection_summary(task_id: &str, row: TaskProjectionRow) -> TaskProject
     }
 }
 
+fn candidate_snapshot(row: TaskCandidateRow) -> TaskCandidateSnapshot {
+    TaskCandidateSnapshot {
+        proposer_node_id: row.proposer_node_id,
+        candidate_hash: row.candidate_hash,
+        candidate_id: row.candidate.candidate_id,
+        execution_id: row.candidate.execution_id,
+        output_resolved_at: row.output_resolved_at,
+        output: row.candidate.output,
+    }
+}
+
+fn verifier_result_snapshot(row: VerifierResultRow) -> TaskVerifierResultSnapshot {
+    TaskVerifierResultSnapshot {
+        candidate_id: row.candidate_id,
+        verifier_node_id: row.verifier_node_id,
+        passed: row.result.passed,
+        score: row.result.score,
+        verification_status: match row.result.verification_status {
+            crate::types::VerificationStatus::Passed => "passed".to_owned(),
+            crate::types::VerificationStatus::Failed => "failed".to_owned(),
+            crate::types::VerificationStatus::Inconclusive => "inconclusive".to_owned(),
+        },
+        verifier_result_hash: row.result.verifier_result_hash,
+        reason_codes: row.result.reason_codes,
+    }
+}
+
+fn remote_bridge_snapshot(row: LocalRemoteTaskBridgeRow) -> TaskRemoteBridgeSnapshot {
+    TaskRemoteBridgeSnapshot {
+        announcement_id: row.announcement_id,
+        network_id: row.network_id,
+        source_node_id: row.source_node_id,
+        source_scope_hint: row.source_scope_hint,
+        detail_ref_digest: row.detail_ref_digest,
+        executor: row.executor,
+        profile: row.profile,
+        candidate_id: row.candidate_id,
+        terminal_state: row.terminal_state,
+        bridged_at: row.bridged_at,
+    }
+}
+
+fn vote_reveal_snapshot(row: VoteRevealRow) -> TaskVoteRevealSnapshot {
+    TaskVoteRevealSnapshot {
+        voter_node_id: row.voter_node_id,
+        candidate_id: row.candidate_id,
+        candidate_hash: row.candidate_hash,
+        vote: match row.vote {
+            crate::types::VoteChoice::Approve => "approve".to_owned(),
+            crate::types::VoteChoice::Reject => "reject".to_owned(),
+        },
+        valid: row.valid,
+        created_at: row.created_at,
+    }
+}
+
+fn task_coordinator_run_snapshot(
+    state_dir: &Path,
+    org_id: &str,
+    task_id: &str,
+) -> Result<Option<TaskCoordinatorRunSnapshot>> {
+    let pg_url = run_control::resolve_run_queue_pg_url(None);
+    let queue = crate::run_queue::PgRunQueue::new(pg_url).for_org(org_id.to_owned());
+    let Some(run_id) = queue.run_id_for_task_id(task_id)? else {
+        return Ok(None);
+    };
+    let run = queue.run_view(&run_id)?;
+    let events = queue.run_events(&run_id, 20)?;
+    let next_round_trigger = events.into_iter().find_map(|event| {
+        if event.event_type == "RUN_TIE_REEXPLORE_TRIGGERED"
+            || event.event_type == "RUN_NULL_REEXPLORE_TRIGGERED"
+        {
+            Some(TaskNextRoundTriggerSnapshot {
+                event_type: event.event_type,
+                created_at: event.created_at,
+                payload: event.payload,
+            })
+        } else {
+            None
+        }
+    });
+    let expected_executor_count = run.counts.created
+        + run.counts.queued
+        + run.counts.leased
+        + run.counts.succeeded
+        + run.counts.failed
+        + run.counts.retry_wait
+        + run.counts.cancelled
+        + run.counts.remote_dispatched;
+    let completed_executors = run.counts.succeeded + run.counts.failed + run.counts.cancelled;
+    let active_executors = expected_executor_count - completed_executors;
+    let _ = state_dir;
+    Ok(Some(TaskCoordinatorRunSnapshot {
+        run_id,
+        round_status: run.status.clone(),
+        expected_executor_count,
+        completed_executors,
+        active_executors,
+        run,
+        next_round_trigger,
+    }))
+}
+
 pub fn grpc_listen_addr_from_env() -> Option<String> {
     std::env::var("WATTSWARM_WATTETHERIA_SYNC_GRPC_LISTEN")
         .ok()
@@ -246,7 +450,7 @@ pub fn build_network_projection_snapshot(
     db_path: &Path,
 ) -> Result<NetworkProjectionSnapshot> {
     ensure_sync_node_mode_configured(state_dir)?;
-    let node = open_configured_node(state_dir, db_path)?;
+    let node = open_node(state_dir, db_path)?;
     let (running, mode) = read_node_running(state_dir)?;
     let distribution = node
         .store
@@ -275,7 +479,7 @@ pub fn build_task_run_projection_snapshot(
     run_limit: i64,
 ) -> Result<TaskRunProjectionSnapshot> {
     ensure_sync_node_mode_configured(state_dir)?;
-    let node = open_configured_node(state_dir, db_path)?;
+    let node = open_node(state_dir, db_path)?;
     let recent_tasks = node
         .store
         .list_task_ids_recent(task_limit.clamp(1, 200))?
@@ -293,6 +497,94 @@ pub fn build_task_run_projection_snapshot(
         generated_at: now_ms(),
         recent_tasks,
         recent_runs: runs,
+    })
+}
+
+pub fn build_task_facts_snapshot(
+    state_dir: &Path,
+    db_path: &Path,
+    task_id: &str,
+) -> Result<TaskFactsSnapshot> {
+    let task_id = task_id.trim();
+    if task_id.is_empty() {
+        return Err(anyhow!("task_id is required"));
+    }
+    let node = open_node(state_dir, db_path)?;
+    let observed_at = now_ms();
+    let scope_id = crate::storage::local_control_scope_id(state_dir);
+    let task = node
+        .store
+        .task_projection(task_id)?
+        .map(|row| task_projection_summary(task_id, row));
+    let coordinator_run = task_coordinator_run_snapshot(state_dir, node.store.org_id(), task_id)?;
+    let execution_set_members = node
+        .store
+        .list_execution_set_members_for_task(task_id)?
+        .into_iter()
+        .map(|row| TaskExecutionSetMemberSnapshot {
+            execution_set_id: row.execution_set_id,
+            participant_node_id: row.participant_node_id,
+            role_hint: row.role_hint,
+            scope_hint: row.scope_hint,
+            status: row.status,
+            confirmed_by_node_id: row.confirmed_by_node_id,
+            updated_at: row.updated_at,
+        })
+        .collect();
+    let remote_bridges = crate::storage::local_control_store(state_dir)?
+        .list_local_remote_task_bridges(&scope_id)?
+        .into_iter()
+        .filter(|row| row.task_id == task_id)
+        .map(remote_bridge_snapshot)
+        .collect();
+    let candidates = node
+        .store
+        .list_candidates_for_task(task_id)?
+        .into_iter()
+        .map(candidate_snapshot)
+        .collect();
+    let verifier_results = node
+        .store
+        .list_verifier_results_for_task(task_id)?
+        .into_iter()
+        .map(verifier_result_snapshot)
+        .collect();
+    let vote_reveals = node
+        .store
+        .list_vote_reveals(task_id)?
+        .into_iter()
+        .map(vote_reveal_snapshot)
+        .collect();
+    let checkpoints = node
+        .store
+        .list_checkpoint_announcements_for_task(task_id, 64)?
+        .into_iter()
+        .map(|row| TaskCheckpointSnapshot {
+            checkpoint: fetch_checkpoint_artifact_json::<crate::types::RoundCheckpoint>(
+                state_dir,
+                &node,
+                &row.scope_key,
+                &row.checkpoint_id,
+                observed_at,
+            )
+            .ok(),
+            scope_key: row.scope_key,
+            checkpoint_id: row.checkpoint_id,
+            artifact_path: row.artifact_path,
+            observed_at: row.observed_at,
+        })
+        .collect();
+    Ok(TaskFactsSnapshot {
+        generated_at: observed_at,
+        task_id: task_id.to_owned(),
+        task,
+        coordinator_run,
+        execution_set_members,
+        remote_bridges,
+        candidates,
+        verifier_results,
+        vote_reveals,
+        checkpoints,
     })
 }
 
@@ -548,6 +840,18 @@ pub(crate) async fn task_decision_snapshot_http(
     let state_clone = state.clone();
     let payload = crate::ui::run_blocking(move || {
         build_task_decision_snapshot(&state_clone.state_dir, &state_clone.db_path, &task_id)
+    })
+    .await?;
+    Ok(Json(payload))
+}
+
+pub(crate) async fn task_facts_snapshot_http(
+    State(state): State<UiServerState>,
+    AxumPath(task_id): AxumPath<String>,
+) -> Result<Json<TaskFactsSnapshot>, crate::ui::ApiError> {
+    let state_clone = state.clone();
+    let payload = crate::ui::run_blocking(move || {
+        build_task_facts_snapshot(&state_clone.state_dir, &state_clone.db_path, &task_id)
     })
     .await?;
     Ok(Json(payload))

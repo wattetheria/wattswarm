@@ -878,6 +878,41 @@ impl PgStore {
         Ok(members)
     }
 
+    pub fn list_execution_set_members_for_task(
+        &self,
+        task_id: &str,
+    ) -> Result<Vec<ExecutionSetMemberRow>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
+        let mut stmt = conn.prepare(
+            "SELECT execution_set_id, participant_node_id, role_hint, scope_hint, status, confirmed_by_node_id,
+                    CAST(EXTRACT(EPOCH FROM updated_at) * 1000 AS BIGINT)
+             FROM execution_set_projection
+             WHERE org_id = $1 AND task_id = $2
+             ORDER BY execution_set_id ASC, participant_node_id ASC",
+        )?;
+        let rows = stmt.query_map(params![self.org_id(), task_id], |r| {
+            let updated_at_ms: i64 = r.get(6)?;
+            Ok(ExecutionSetMemberRow {
+                task_id: task_id.to_owned(),
+                execution_set_id: r.get(0)?,
+                participant_node_id: r.get(1)?,
+                role_hint: r.get(2)?,
+                scope_hint: Self::canonical_scope_hint_or_original(r.get(3)?),
+                status: r.get(4)?,
+                confirmed_by_node_id: r.get(5)?,
+                updated_at: updated_at_ms as u64,
+            })
+        })?;
+        let mut members = Vec::new();
+        for row in rows {
+            members.push(row?);
+        }
+        Ok(members)
+    }
+
     pub fn count_execution_set_members(&self) -> Result<u64> {
         let conn = self
             .conn
@@ -1016,6 +1051,35 @@ impl PgStore {
                     scope_key: scope_key.to_owned(),
                     checkpoint_id: checkpoint_id.to_owned(),
                     artifact_path: r.get(0)?,
+                    observed_at: observed_at_ms as u64,
+                })
+            },
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    pub fn find_checkpoint_announcement(
+        &self,
+        checkpoint_id: &str,
+    ) -> Result<Option<CheckpointAnnouncementRow>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
+        conn.query_row(
+            "SELECT scope_key, artifact_path, CAST(EXTRACT(EPOCH FROM observed_at) * 1000 AS BIGINT)
+             FROM network_checkpoint_announcements
+             WHERE org_id = $1 AND checkpoint_id = $2
+             ORDER BY observed_at DESC
+             LIMIT 1",
+            params![self.org_id(), checkpoint_id],
+            |r| {
+                let observed_at_ms: i64 = r.get(2)?;
+                Ok(CheckpointAnnouncementRow {
+                    scope_key: r.get(0)?,
+                    checkpoint_id: checkpoint_id.to_owned(),
+                    artifact_path: r.get(1)?,
                     observed_at: observed_at_ms as u64,
                 })
             },
@@ -1502,6 +1566,39 @@ impl PgStore {
         .map_err(Into::into)
     }
 
+    pub fn list_candidates_for_task(&self, task_id: &str) -> Result<Vec<TaskCandidateRow>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
+        let mut stmt = conn.prepare(
+            "SELECT proposer_node_id, candidate_hash, candidate_json, output_json,
+                    CASE WHEN output_resolved_at IS NULL THEN NULL ELSE CAST(EXTRACT(EPOCH FROM output_resolved_at) * 1000 AS BIGINT) END
+             FROM candidates
+             WHERE org_id = $1 AND task_id = $2
+             ORDER BY proposer_node_id ASC, candidate_hash ASC",
+        )?;
+        let rows = stmt.query_map(params![self.org_id(), task_id], |r| {
+            let candidate_json: String = r.get(2)?;
+            let output_json: String = r.get(3)?;
+            let mut candidate: Candidate = serde_json::from_str(&candidate_json).map_err(|e| {
+                pg::Error::FromSqlConversionFailure(2, pg::types::Type::Text, Box::new(e))
+            })?;
+            candidate.output = serde_json::from_str(&output_json).map_err(|e| {
+                pg::Error::FromSqlConversionFailure(3, pg::types::Type::Text, Box::new(e))
+            })?;
+            Ok(TaskCandidateRow {
+                task_id: task_id.to_owned(),
+                proposer_node_id: r.get(0)?,
+                candidate_hash: r.get(1)?,
+                output_resolved_at: r.get::<_, Option<i64>>(4)?.map(|value| value as u64),
+                candidate,
+            })
+        })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
     pub fn count_candidates(&self, task_id: &str) -> Result<u32> {
         let conn = self
             .conn
@@ -1602,6 +1699,33 @@ impl PgStore {
             .map_err(Into::into)
     }
 
+    pub fn list_verifier_results_for_task(&self, task_id: &str) -> Result<Vec<VerifierResultRow>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
+        let mut stmt = conn.prepare(
+            "SELECT candidate_id, verifier_node_id, result_json
+             FROM verifier_results
+             WHERE org_id = $1 AND task_id = $2
+             ORDER BY candidate_id ASC, verifier_node_id ASC",
+        )?;
+        let rows = stmt.query_map(params![self.org_id(), task_id], |r| {
+            let raw: String = r.get(2)?;
+            let result: VerifierResult = serde_json::from_str(&raw).map_err(|e| {
+                pg::Error::FromSqlConversionFailure(2, pg::types::Type::Text, Box::new(e))
+            })?;
+            Ok(VerifierResultRow {
+                task_id: task_id.to_owned(),
+                candidate_id: r.get(0)?,
+                verifier_node_id: r.get(1)?,
+                result,
+            })
+        })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn put_vote_commit(
         &self,
@@ -1668,6 +1792,79 @@ impl PgStore {
             "SELECT voter_node_id FROM vote_reveals WHERE org_id = $1 AND task_id = $2 AND valid = TRUE",
         )?;
         let rows = stmt.query_map(params![self.org_id(), task_id], |r| r.get(0))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
+    pub fn list_vote_reveals(&self, task_id: &str) -> Result<Vec<VoteRevealRow>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
+        let mut stmt = conn.prepare(
+            "SELECT voter_node_id, candidate_id, candidate_hash, vote, salt, verifier_result_hash, valid,
+                    CAST(EXTRACT(EPOCH FROM created_at) * 1000 AS BIGINT)
+             FROM vote_reveals
+             WHERE org_id = $1 AND task_id = $2
+             ORDER BY voter_node_id ASC, candidate_id ASC",
+        )?;
+        let rows = stmt.query_map(params![self.org_id(), task_id], |r| {
+            let created_at_ms: i64 = r.get(7)?;
+            let vote_raw: String = r.get(3)?;
+            let vote = match vote_raw.as_str() {
+                "approve" => VoteChoice::Approve,
+                "reject" => VoteChoice::Reject,
+                other => {
+                    return Err(pg::Error::FromSqlConversionFailure(
+                        3,
+                        pg::types::Type::Text,
+                        format!("unsupported vote choice '{other}'").into(),
+                    ));
+                }
+            };
+            Ok(VoteRevealRow {
+                task_id: task_id.to_owned(),
+                voter_node_id: r.get(0)?,
+                candidate_id: r.get(1)?,
+                candidate_hash: r.get(2)?,
+                vote,
+                salt: r.get(4)?,
+                verifier_result_hash: r.get(5)?,
+                valid: r.get(6)?,
+                created_at: created_at_ms as u64,
+            })
+        })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
+    pub fn list_checkpoint_announcements_for_task(
+        &self,
+        task_id: &str,
+        limit: usize,
+    ) -> Result<Vec<CheckpointAnnouncementRow>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
+        let pattern = format!("task://%/{task_id}/round/%");
+        let mut stmt = conn.prepare(
+            "SELECT scope_key, checkpoint_id, artifact_path,
+                    CAST(EXTRACT(EPOCH FROM observed_at) * 1000 AS BIGINT)
+             FROM network_checkpoint_announcements
+             WHERE org_id = $1 AND artifact_path LIKE $2
+             ORDER BY observed_at DESC, checkpoint_id DESC
+             LIMIT $3",
+        )?;
+        let rows = stmt.query_map(params![self.org_id(), pattern, limit as i64], |r| {
+            let observed_at_ms: i64 = r.get(3)?;
+            Ok(CheckpointAnnouncementRow {
+                scope_key: r.get(0)?,
+                checkpoint_id: r.get(1)?,
+                artifact_path: r.get(2)?,
+                observed_at: observed_at_ms as u64,
+            })
+        })?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
             .map_err(Into::into)
     }

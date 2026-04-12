@@ -68,6 +68,23 @@ pub struct TaskProjectionRow {
 }
 
 #[derive(Debug, Clone)]
+pub struct TaskCandidateRow {
+    pub task_id: String,
+    pub proposer_node_id: String,
+    pub candidate_hash: String,
+    pub output_resolved_at: Option<u64>,
+    pub candidate: Candidate,
+}
+
+#[derive(Debug, Clone)]
+pub struct VerifierResultRow {
+    pub task_id: String,
+    pub candidate_id: String,
+    pub verifier_node_id: String,
+    pub result: VerifierResult,
+}
+
+#[derive(Debug, Clone)]
 pub struct VoteCommitMetaRow {
     pub voter_node_id: String,
     pub created_at: u64,
@@ -211,6 +228,9 @@ pub struct TaskAnnouncementDetailRow {
 pub struct LocalExecutorEntryRow {
     pub name: String,
     pub base_url: String,
+    pub kind: String,
+    pub target_node_id: Option<String>,
+    pub scope_hint: Option<String>,
     pub updated_at: u64,
 }
 

@@ -11,11 +11,19 @@ use tempfile::tempdir;
 use tonic::Request as GrpcRequest;
 use tower::ServiceExt;
 use wattswarm::control::open_node;
+use wattswarm::control::{
+    ExecutorRegistry, ExecutorRegistryEntry, bridge_remote_task_into_local_execution,
+    materialize_task_detail_artifact, save_executor_registry_state,
+};
 use wattswarm::crypto::NodeIdentity;
 use wattswarm::node::build_event_for_external;
+use wattswarm::run_control;
+use wattswarm::run_queue::WorkerOptions;
+use wattswarm::task_template::sample_contract;
 use wattswarm::types::NetworkProtocolParams;
 use wattswarm::types::{
-    EventPayload, FeedSubscriptionUpdatedPayload, TaskTerminalState, TopicMessagePostedPayload,
+    EventPayload, FeedSubscriptionUpdatedPayload, Membership, Role, TaskAnnouncedPayload,
+    TopicMessagePostedPayload, UnsignedEvent,
 };
 use wattswarm::ui::{UiServerState, build_app};
 use wattswarm::wattetheria_sync;
@@ -997,7 +1005,7 @@ fn ui_startup_config_still_accepts_legacy_core_agent_binding_payload() {
                     .body(Body::from(
                         serde_json::to_vec(&json!({
                             "display_name": "Legacy Node",
-                            "network_mode": "lan",
+                            "network_mode": "local",
                             "bootstrap_peers": [],
                             "core_agent": {
                                 "mode": "remote_url",
@@ -1285,6 +1293,9 @@ fn structured_topic_consensus_bridge_finalizes_and_publishes_result_topic() {
     let app = build_app(UiServerState::new(state_dir.clone(), db_path.clone()));
     let node = open_node(&state_dir, &db_path).expect("open node");
     let local_node_id = node.node_id();
+    node.store
+        .upsert_feed_subscription(&local_node_id, "crew.chat", "group:crew-7", true, 1)
+        .expect("upsert topic subscription");
     drop(node);
 
     let remote_a = NodeIdentity::from_seed([7; 32]);
@@ -1294,27 +1305,6 @@ fn structured_topic_consensus_bridge_finalizes_and_publishes_result_topic() {
         .build()
         .unwrap();
     runtime.block_on(async {
-        let subscription_res = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/api/topic/subscriptions")
-                    .header("content-type", "application/json")
-                    .body(Body::from(
-                        serde_json::to_vec(&json!({
-                            "feed_key": "crew.chat",
-                            "scope_hint": "group:crew-7",
-                            "active": true
-                        }))
-                        .unwrap(),
-                    ))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(subscription_res.status(), StatusCode::OK);
-
         let proposal_res = app
             .clone()
             .oneshot(
@@ -1400,26 +1390,684 @@ fn structured_topic_consensus_bridge_finalizes_and_publishes_result_topic() {
             && message.content["decision"].as_str() == Some("support")
     }));
 
-    let consensus_task_id = node
-        .store
-        .list_task_ids_recent(10)
-        .expect("list task ids")
-        .into_iter()
-        .find(|task_id| task_id.starts_with("topic-consensus-"))
-        .expect("consensus task id");
-    let task = node
-        .store
-        .task_projection(&consensus_task_id)
-        .expect("task projection")
-        .expect("consensus task exists");
-    assert_eq!(task.contract.task_type, "topic_consensus");
-    assert_eq!(task.terminal_state, TaskTerminalState::Finalized);
+    assert!(
+        node.store
+            .list_task_ids_recent(10)
+            .expect("list task ids")
+            .into_iter()
+            .all(|task_id| !task_id.starts_with("topic-consensus-"))
+    );
+}
 
-    let memory_hits = node
+#[test]
+fn topic_consensus_result_exposes_shared_consensus_facts() {
+    let _guard = env_lock();
+    let _db_lock = DbTestLock::acquire();
+    let schema = reset_test_schema("test");
+    let _schema_guard = EnvVarGuard::set("WATTSWARM_PG_SCHEMA", &schema);
+    let dir = tempdir().unwrap();
+    let state_dir = dir.path().join("state");
+    std::fs::create_dir_all(&state_dir).unwrap();
+    let db_path = state_dir.join("ui.state");
+    let app = build_app(UiServerState::new(state_dir.clone(), db_path.clone()));
+    let node = open_node(&state_dir, &db_path).expect("open node");
+    let local_node_id = node.node_id();
+    drop(node);
+
+    let remote_a = NodeIdentity::from_seed([21; 32]);
+    let remote_b = NodeIdentity::from_seed([22; 32]);
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let proposal_message_id = runtime.block_on(async {
+        let subscription_res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/topic/subscriptions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({
+                            "feed_key": "crew.chat",
+                            "scope_hint": "group:crew-7",
+                            "active": true
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(subscription_res.status(), StatusCode::OK);
+
+        let proposal_res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/topic/messages")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({
+                            "feed_key": "crew.chat",
+                            "scope_hint": "group:crew-7",
+                            "content": {
+                                "kind": "proposal",
+                                "proposal_id": "proposal-facts-v1",
+                                "goal": "shared facts",
+                                "participants": [local_node_id, remote_a.node_id(), remote_b.node_id()],
+                                "threshold_percent": 60,
+                                "result_feed_key": "crew.result"
+                            }
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(proposal_res.status(), StatusCode::OK);
+        json_from(proposal_res).await["message_id"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    });
+
+    let network_id = format!("local:{local_node_id}");
+    let mut node = open_node(&state_dir, &db_path).expect("reopen node");
+    for (identity, created_at, summary) in [
+        (&remote_a, 10_u64, "support from remote a"),
+        (&remote_b, 20_u64, "support from remote b"),
+    ] {
+        let event = build_event_for_external(
+            identity,
+            1,
+            created_at,
+            EventPayload::TopicMessagePosted(TopicMessagePostedPayload {
+                network_id: network_id.clone(),
+                feed_key: "crew.chat".to_owned(),
+                scope_hint: "group:crew-7".to_owned(),
+                content_ref: topic_content_ref(summary, &identity.node_id(), created_at),
+                local_content_cache: Some(json!({
+                    "kind": "stance",
+                    "proposal_id": "proposal-facts-v1",
+                    "proposal_message_id": proposal_message_id,
+                    "stance": "support",
+                    "summary": summary,
+                })),
+                reply_to_message_id: Some(proposal_message_id.clone()),
+            }),
+        )
+        .expect("stance event");
+        node.ingest_remote(event).expect("ingest remote stance");
+    }
+    let processed = wattswarm::control::topic_consensus::process_structured_topic_consensus(
+        &mut node, &state_dir,
+    )
+    .expect("process structured topic consensus");
+    assert_eq!(processed, 1);
+    drop(node);
+
+    runtime.block_on(async {
+        let result_messages = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/topic/messages?feed_key=crew.result&scope_hint=group:crew-7&limit=4")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let result_json = json_from(result_messages).await;
+        let result_message = &result_json["messages"][0]["content"];
+        assert_eq!(
+            result_message["proposal_id"].as_str(),
+            Some("proposal-facts-v1")
+        );
+        assert_eq!(result_message["decision"].as_str(), Some("support"));
+        assert_eq!(result_message["round_index"].as_u64(), Some(1));
+        assert_eq!(result_message["threshold_percent"].as_u64(), Some(60));
+        assert_eq!(result_message["required_count"].as_u64(), Some(2));
+        assert_eq!(
+            result_message["observed_participant_count"].as_u64(),
+            Some(2)
+        );
+        assert!(
+            result_message["participants"]
+                .as_array()
+                .is_some_and(|items| !items.is_empty())
+        );
+        assert_eq!(
+            result_message["source_feed_key"].as_str(),
+            Some("crew.chat")
+        );
+        assert_eq!(
+            result_message["source_scope_hint"].as_str(),
+            Some("group:crew-7")
+        );
+    });
+}
+
+#[test]
+fn task_facts_snapshot_exposes_remote_bridge_facts() {
+    let _guard = env_lock();
+    let _db_lock = DbTestLock::acquire();
+    let schema = reset_test_schema("test");
+    let _schema_guard = EnvVarGuard::set("WATTSWARM_PG_SCHEMA", &schema);
+    let dir = tempdir().unwrap();
+    let state_dir = dir.path().join("state");
+    std::fs::create_dir_all(&state_dir).unwrap();
+    let db_path = state_dir.join("ui.state");
+    let app = build_app(UiServerState::new(state_dir.clone(), db_path.clone()));
+    let stub = UiStubRuntimeServer::start(UiStubRuntimeConfig {
+        health_body: r#"{"ok":true}"#.to_owned(),
+        capabilities_body: json!({
+            "task_types": ["swarm"],
+            "profiles": ["default"],
+            "provider_family": "stub",
+            "model_id": "stub-bridge"
+        })
+        .to_string(),
+        execute_body: serde_json::to_string(&json!({
+            "candidate_output": {
+                "decision": "PASS",
+                "answer": "bridged-ui-ok"
+            },
+            "evidence_inline": [],
+            "evidence_refs": []
+        }))
+        .unwrap(),
+        execute_requests: None,
+    });
+    wait_for_stub_listener(&stub);
+
+    save_executor_registry_state(
+        &state_dir,
+        &ExecutorRegistry {
+            entries: vec![ExecutorRegistryEntry {
+                name: "core-agent".to_owned(),
+                base_url: stub.base_url(),
+                kind: Default::default(),
+                target_node_id: None,
+                scope_hint: None,
+            }],
+        },
+    )
+    .expect("save executor registry");
+
+    let mut node = open_node(&state_dir, &db_path).expect("open node");
+    let local_node_id = node.node_id();
+    let remote = NodeIdentity::from_seed([31; 32]);
+    let remote_node_id = remote.node_id();
+    let mut membership = Membership::new();
+    for role in [
+        Role::Proposer,
+        Role::Verifier,
+        Role::Committer,
+        Role::Finalizer,
+    ] {
+        membership.grant(&local_node_id, role);
+    }
+    membership.grant(&remote_node_id, Role::Proposer);
+    node.store
+        .put_membership(&serde_json::to_string(&membership).expect("membership json"))
+        .expect("put membership");
+
+    let policy_hash = node
+        .policy_registry()
+        .binding_for("vp.schema_only.v1", json!({}))
+        .expect("policy binding")
+        .policy_hash;
+    let task_id = "remote-bridge-task-ui".to_owned();
+    let contract = sample_contract(&task_id, policy_hash);
+    let contract_bytes = serde_json::to_vec(&contract).expect("contract bytes");
+    let digest = format!("sha256:{}", wattswarm::crypto::sha256_hex(&contract_bytes));
+    let topology = node
         .store
-        .list_local_decision_memory_hits_by_task_type("topic_consensus", 8)
-        .expect("decision memory");
-    assert!(!memory_hits.is_empty());
+        .load_network_topology_for_org(node.store.org_id())
+        .expect("load topology");
+    let announcement = remote
+        .sign_unsigned_event(&UnsignedEvent::from_payload(
+            "0.1.0".to_owned(),
+            remote_node_id.clone(),
+            1,
+            100,
+            EventPayload::TaskAnnounced(TaskAnnouncedPayload {
+                network_id: topology.network.network_id.clone(),
+                task_id: task_id.clone(),
+                announcement_id: "ann-task-facts-ui".to_owned(),
+                feed_key: "remote-feed".to_owned(),
+                scope_hint: "global".to_owned(),
+                summary: json!({"title":"remote bridge task ui"}),
+                detail_ref: Some(wattswarm::types::ArtifactRef {
+                    uri: "ipfs://remote-task-detail-ui".to_owned(),
+                    digest: digest.clone(),
+                    size_bytes: contract_bytes.len() as u64,
+                    mime: "application/json".to_owned(),
+                    created_at: 100,
+                    producer: remote_node_id.clone(),
+                }),
+            }),
+        ))
+        .expect("sign remote announcement");
+    node.ingest_remote(announcement)
+        .expect("ingest remote announcement");
+    materialize_task_detail_artifact(&state_dir, &node, &task_id, &contract_bytes, 101)
+        .expect("materialize remote task detail");
+    bridge_remote_task_into_local_execution(
+        &mut node,
+        &state_dir,
+        wattswarm::control::RemoteTaskBridgeRequest {
+            executor: "core-agent".to_owned(),
+            profile: "default".to_owned(),
+            task_id: task_id.clone(),
+        },
+    )
+    .expect("bridge remote task into local execution");
+    drop(node);
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let facts_res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(format!("/api/task/facts/{task_id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(facts_res.status(), StatusCode::OK);
+        let facts = json_from(facts_res).await;
+        let remote_bridges = facts["remote_bridges"]
+            .as_array()
+            .expect("remote bridges array");
+        assert_eq!(remote_bridges.len(), 1);
+        assert_eq!(
+            remote_bridges[0]["announcement_id"].as_str(),
+            Some("ann-task-facts-ui")
+        );
+        assert_eq!(remote_bridges[0]["executor"].as_str(), Some("core-agent"));
+        assert_eq!(remote_bridges[0]["profile"].as_str(), Some("default"));
+        assert_eq!(
+            remote_bridges[0]["source_node_id"].as_str(),
+            Some(remote_node_id.as_str())
+        );
+        let bridged_candidate_id = remote_bridges[0]["candidate_id"]
+            .as_str()
+            .expect("bridge candidate id");
+        assert!(!bridged_candidate_id.is_empty());
+        assert!(
+            facts["candidates"]
+                .as_array()
+                .expect("candidates array")
+                .iter()
+                .any(|candidate| candidate["candidate_id"].as_str() == Some(bridged_candidate_id))
+        );
+        assert_eq!(
+            remote_bridges[0]["terminal_state"].as_str(),
+            Some("Finalized")
+        );
+        assert_eq!(
+            remote_bridges[0]["detail_ref_digest"].as_str(),
+            Some(digest.as_str())
+        );
+    });
+}
+
+#[test]
+fn structured_topic_consensus_timeout_opens_next_round() {
+    let _guard = env_lock();
+    let _db_lock = DbTestLock::acquire();
+    let schema = reset_test_schema("test");
+    let _schema_guard = EnvVarGuard::set("WATTSWARM_PG_SCHEMA", &schema);
+    let dir = tempdir().unwrap();
+    let state_dir = dir.path().join("state");
+    std::fs::create_dir_all(&state_dir).unwrap();
+    let db_path = state_dir.join("ui.state");
+    let app = build_app(UiServerState::new(state_dir.clone(), db_path.clone()));
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/topic/subscriptions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({
+                            "feed_key": "crew.chat",
+                            "scope_hint": "group:crew-7",
+                            "active": true
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+    });
+
+    let mut node = open_node(&state_dir, &db_path).expect("open node");
+    let local_node_id = node.node_id();
+    let remote_a = NodeIdentity::from_seed([31; 32]);
+    let remote_b = NodeIdentity::from_seed([32; 32]);
+    let network_id = format!("local:{local_node_id}");
+    let proposal_event = node
+        .emit_at(
+            1,
+            EventPayload::TopicMessagePosted(TopicMessagePostedPayload {
+                network_id: network_id.clone(),
+                feed_key: "crew.chat".to_owned(),
+                scope_hint: "group:crew-7".to_owned(),
+                content_ref: topic_content_ref("proposal-timeout-round-1", &local_node_id, 10),
+                local_content_cache: Some(json!({
+                    "kind": "proposal",
+                    "proposal_id": "proposal-timeout-v1",
+                    "goal": "collect enough support",
+                    "participants": [local_node_id, remote_a.node_id(), remote_b.node_id()],
+                    "min_participants": 3,
+                    "threshold_percent": 100,
+                    "result_feed_key": "crew.result",
+                    "round_index": 1,
+                    "max_rounds": 2,
+                    "round_timeout_ms": 1
+                })),
+                reply_to_message_id: None,
+            }),
+            10,
+        )
+        .expect("emit round one proposal");
+    let proposal_message_id = proposal_event.event_id.clone();
+    let stance = build_event_for_external(
+        &remote_a,
+        1,
+        20,
+        EventPayload::TopicMessagePosted(TopicMessagePostedPayload {
+            network_id,
+            feed_key: "crew.chat".to_owned(),
+            scope_hint: "group:crew-7".to_owned(),
+            content_ref: topic_content_ref("proposal-timeout-support", &remote_a.node_id(), 20),
+            local_content_cache: Some(json!({
+                "kind": "stance",
+                "proposal_id": "proposal-timeout-v1",
+                "proposal_message_id": proposal_message_id,
+                "stance": "support",
+                "summary": "only one support in round one"
+            })),
+            reply_to_message_id: Some(proposal_message_id.clone()),
+        }),
+    )
+    .expect("build support");
+    node.ingest_remote(stance).expect("ingest support");
+
+    let processed = wattswarm::control::topic_consensus::process_structured_topic_consensus(
+        &mut node, &state_dir,
+    )
+    .expect("process topic consensus");
+    assert_eq!(processed, 1);
+
+    let messages = node
+        .store
+        .list_topic_messages("crew.chat", "group:crew-7", 10)
+        .expect("list topic messages");
+    assert!(messages.iter().any(|message| {
+        message.content["kind"].as_str() == Some("proposal")
+            && message.content["proposal_id"].as_str() == Some("proposal-timeout-v1")
+            && message.content["round_index"].as_u64() == Some(2)
+            && message.content["previous_round_proposal_message_id"].as_str()
+                == Some(proposal_message_id.as_str())
+    }));
+    let result_messages = node
+        .store
+        .list_topic_messages("crew.result", "group:crew-7", 10)
+        .expect("list result messages");
+    assert!(result_messages.is_empty());
+}
+
+#[test]
+fn task_facts_snapshot_exposes_parent_run_round_state_for_run_queue_tasks() {
+    let _guard = env_lock();
+    let _db_lock = DbTestLock::acquire();
+    let schema = reset_test_schema("test");
+    let _schema_guard = EnvVarGuard::set("WATTSWARM_PG_SCHEMA", &schema);
+    let _mode_guard = EnvVarGuard::set("WATTSWARM_NODE_MODE", "local");
+    let dir = tempdir().unwrap();
+    let state_dir = dir.path().join("state");
+    std::fs::create_dir_all(&state_dir).unwrap();
+    let db_path = state_dir.join("ui.state");
+    let app = build_app(UiServerState::new(state_dir.clone(), db_path.clone()));
+    let stub = UiStubRuntimeServer::start(UiStubRuntimeConfig {
+        health_body: r#"{"ok":true}"#.to_owned(),
+        capabilities_body: json!({
+            "task_types": ["resume_review"],
+            "profiles": ["default"],
+            "provider_family": "stub",
+            "model_id": "stub-run-facts"
+        })
+        .to_string(),
+        execute_body: serde_json::to_string(&json!({
+            "candidate_output": {
+                "decision": "PASS",
+                "answer": "run-task-ok"
+            },
+            "evidence_inline": [],
+            "evidence_refs": []
+        }))
+        .unwrap(),
+        execute_requests: None,
+    });
+    wait_for_stub_listener(&stub);
+
+    save_executor_registry_state(
+        &state_dir,
+        &ExecutorRegistry {
+            entries: vec![ExecutorRegistryEntry {
+                name: "rt-ui".to_owned(),
+                base_url: stub.base_url(),
+                kind: Default::default(),
+                target_node_id: None,
+                scope_hint: None,
+            }],
+        },
+    )
+    .expect("save executor registry");
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let run_id = "task-facts-parent-run";
+    runtime.block_on(async {
+        let submit_res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/run/submit")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({
+                            "kickoff": true,
+                            "spec": sample_run_spec(run_id),
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(submit_res.status(), StatusCode::OK);
+    });
+
+    let pg_url = run_control::resolve_run_queue_pg_url(None);
+    run_control::run_worker(
+        &state_dir,
+        &db_path,
+        &pg_url,
+        WorkerOptions {
+            worker_id: "ui-test-worker".to_owned(),
+            concurrency: 4,
+            poll_ms: 25,
+            lease_ms: 5_000,
+            once: true,
+        },
+    )
+    .expect("run worker once");
+
+    let task_id = format!("run-{run_id}-CTO-1");
+    runtime.block_on(async {
+        let facts_res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(format!("/api/task/facts/{task_id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(facts_res.status(), StatusCode::OK);
+        let facts = json_from(facts_res).await;
+        let coordinator_run = &facts["coordinator_run"];
+        assert_eq!(coordinator_run["run_id"].as_str(), Some(run_id));
+        assert_eq!(coordinator_run["round_status"].as_str(), Some("FINALIZED"));
+        assert_eq!(coordinator_run["expected_executor_count"].as_i64(), Some(2));
+        assert_eq!(coordinator_run["completed_executors"].as_i64(), Some(2));
+        assert_eq!(coordinator_run["active_executors"].as_i64(), Some(0));
+        assert!(coordinator_run["next_round_trigger"].is_null());
+        assert_eq!(coordinator_run["run"]["run_id"].as_str(), Some(run_id));
+        assert_eq!(
+            coordinator_run["run"]["counts"]["succeeded"].as_i64(),
+            Some(2)
+        );
+    });
+}
+
+#[test]
+fn structured_topic_consensus_fallback_finalizes_after_max_rounds() {
+    let _guard = env_lock();
+    let _db_lock = DbTestLock::acquire();
+    let schema = reset_test_schema("test");
+    let _schema_guard = EnvVarGuard::set("WATTSWARM_PG_SCHEMA", &schema);
+    let dir = tempdir().unwrap();
+    let state_dir = dir.path().join("state");
+    std::fs::create_dir_all(&state_dir).unwrap();
+    let db_path = state_dir.join("ui.state");
+    let app = build_app(UiServerState::new(state_dir.clone(), db_path.clone()));
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/topic/subscriptions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({
+                            "feed_key": "crew.chat",
+                            "scope_hint": "group:crew-7",
+                            "active": true
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+    });
+
+    let mut node = open_node(&state_dir, &db_path).expect("open node");
+    let local_node_id = node.node_id();
+    let remote_a = NodeIdentity::from_seed([41; 32]);
+    let remote_b = NodeIdentity::from_seed([42; 32]);
+    let network_id = format!("local:{local_node_id}");
+    let proposal_event = node
+        .emit_at(
+            1,
+            EventPayload::TopicMessagePosted(TopicMessagePostedPayload {
+                network_id: network_id.clone(),
+                feed_key: "crew.chat".to_owned(),
+                scope_hint: "group:crew-7".to_owned(),
+                content_ref: topic_content_ref("proposal-fallback-round-1", &local_node_id, 10),
+                local_content_cache: Some(json!({
+                    "kind": "proposal",
+                    "proposal_id": "proposal-fallback-v1",
+                    "goal": "force fallback after timeout",
+                    "participants": [local_node_id, remote_a.node_id(), remote_b.node_id()],
+                    "min_participants": 3,
+                    "threshold_percent": 100,
+                    "result_feed_key": "crew.result",
+                    "round_index": 1,
+                    "max_rounds": 1,
+                    "round_timeout_ms": 1,
+                    "fallback_decision": "reject"
+                })),
+                reply_to_message_id: None,
+            }),
+            10,
+        )
+        .expect("emit fallback proposal");
+    let proposal_message_id = proposal_event.event_id.clone();
+    let stance = build_event_for_external(
+        &remote_a,
+        1,
+        20,
+        EventPayload::TopicMessagePosted(TopicMessagePostedPayload {
+            network_id,
+            feed_key: "crew.chat".to_owned(),
+            scope_hint: "group:crew-7".to_owned(),
+            content_ref: topic_content_ref("proposal-fallback-support", &remote_a.node_id(), 20),
+            local_content_cache: Some(json!({
+                "kind": "stance",
+                "proposal_id": "proposal-fallback-v1",
+                "proposal_message_id": proposal_message_id,
+                "stance": "support",
+                "summary": "insufficient support before timeout"
+            })),
+            reply_to_message_id: Some(proposal_message_id.clone()),
+        }),
+    )
+    .expect("build support");
+    node.ingest_remote(stance).expect("ingest support");
+
+    let processed = wattswarm::control::topic_consensus::process_structured_topic_consensus(
+        &mut node, &state_dir,
+    )
+    .expect("process topic consensus");
+    assert_eq!(processed, 1);
+
+    let result_messages = node
+        .store
+        .list_topic_messages("crew.result", "group:crew-7", 10)
+        .expect("list result messages");
+    assert!(result_messages.iter().any(|message| {
+        message.content["kind"].as_str() == Some("consensus_result")
+            && message.content["proposal_id"].as_str() == Some("proposal-fallback-v1")
+            && message.content["decision"].as_str() == Some("reject")
+            && message.content["fallback_applied"].as_bool() == Some(true)
+            && message.content["close_reason"].as_str() == Some("max_rounds_fallback")
+    }));
 }
 
 #[test]
@@ -1613,7 +2261,7 @@ fn free_chat_is_interpreted_then_sedimented_into_topic_consensus() {
                     .body(Body::from(
                         serde_json::to_vec(&json!({
                             "display_name": "Captain Aurora",
-                            "network_mode": "lan",
+                            "network_mode": "local",
                             "bootstrap_peers": [],
                             "core_agent": {
                                 "mode": "remote_url",
@@ -1708,6 +2356,7 @@ fn free_chat_is_interpreted_then_sedimented_into_topic_consensus() {
     });
 
     let node = open_node(&state_dir, &db_path).expect("open node");
+    let local_node_id = node.node_id();
     let chat_messages = node
         .store
         .list_topic_messages("crew.chat", "group:crew-7", 20)
@@ -1722,19 +2371,23 @@ fn free_chat_is_interpreted_then_sedimented_into_topic_consensus() {
             && message.content["proposal_id"].as_str() == Some("proposal-upgrade-v2")
             && message.content["proposal_message_id"].as_str() == Some(proposal_message_id.as_str())
             && message.content["source_message_id"].as_str() == Some(free_chat_message_id.as_str())
-            && message.content["source_author_node_id"].as_str() == Some(node.node_id().as_str())
+            && message.content["source_author_node_id"].as_str() == Some(local_node_id.as_str())
     }));
 
     let result_messages = node
         .store
         .list_topic_messages("crew.result", "group:crew-7", 10)
         .expect("list result messages");
-    assert!(result_messages.iter().any(|message| {
-        message.content["kind"].as_str() == Some("consensus_result")
-            && message.content["proposal_id"].as_str() == Some("proposal-upgrade-v2")
-            && message.content["proposal_message_id"].as_str() == Some(proposal_message_id.as_str())
-            && message.content["decision"].as_str() == Some("support")
-    }));
+    assert!(
+        result_messages.iter().any(|message| {
+            message.content["kind"].as_str() == Some("consensus_result")
+                && message.content["proposal_id"].as_str() == Some("proposal-upgrade-v2")
+                && message.content["proposal_message_id"].as_str()
+                    == Some(proposal_message_id.as_str())
+                && message.content["decision"].as_str() == Some("support")
+        }),
+        "result_messages={result_messages:?}"
+    );
 
     let interpretation_hits = node
         .store
@@ -1742,11 +2395,13 @@ fn free_chat_is_interpreted_then_sedimented_into_topic_consensus() {
         .expect("interpretation memory");
     assert!(!interpretation_hits.is_empty());
 
-    let consensus_hits = node
-        .store
-        .list_local_decision_memory_hits_by_task_type("topic_consensus", 8)
-        .expect("consensus memory");
-    assert!(!consensus_hits.is_empty());
+    assert!(
+        node.store
+            .list_task_ids_recent(16)
+            .expect("recent task ids")
+            .into_iter()
+            .all(|task_id| !task_id.starts_with("topic-consensus-"))
+    );
 }
 
 #[test]
@@ -2000,7 +2655,7 @@ fn topic_interpretation_receives_prior_deliberations_from_topic_consensus_histor
                     .body(Body::from(
                         serde_json::to_vec(&json!({
                             "display_name": "Captain Aurora",
-                            "network_mode": "lan",
+                            "network_mode": "local",
                             "bootstrap_peers": [],
                             "core_agent": {
                                 "mode": "remote_url",
@@ -2358,6 +3013,89 @@ fn ui_exposes_run_queue_http_apis() {
             .filter_map(|event| event["event_type"].as_str())
             .collect();
         assert!(retry_event_types.contains(&"RUN_RETRY_REQUESTED"));
+    });
+}
+
+#[test]
+fn ui_rejects_lan_run_submit_when_only_local_executors_are_available() {
+    let _guard = env_lock();
+    let _db_lock = DbTestLock::acquire();
+    let schema = reset_test_schema("test");
+    let _schema_guard = EnvVarGuard::set("WATTSWARM_PG_SCHEMA", &schema);
+    let dir = tempdir().unwrap();
+    let state_dir = dir.path().join("state");
+    std::fs::create_dir_all(&state_dir).unwrap();
+    let db_path = state_dir.join("ui.state");
+    let app = build_app(UiServerState::new(state_dir.clone(), db_path.clone()));
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let save_res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/startup-config")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({
+                            "display_name": "Captain Aurora",
+                            "network_mode": "lan",
+                            "bootstrap_peers": []
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(save_res.status(), StatusCode::OK);
+
+        let add_exec_res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/executors/add")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"name":"rt-ui","base_url":"http://127.0.0.1:8787"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(add_exec_res.status(), StatusCode::OK);
+
+        let submit_res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/run/submit")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({
+                            "kickoff": true,
+                            "spec": sample_run_spec("run-lan-only-local"),
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(submit_res.status(), StatusCode::BAD_REQUEST);
+        let submit_json = json_from(submit_res).await;
+        assert!(
+            submit_json["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("no non-coordinator executors")),
+            "unexpected submit response: {submit_json:?}"
+        );
     });
 }
 
