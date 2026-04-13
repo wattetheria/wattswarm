@@ -476,6 +476,7 @@ impl PgRunQueue {
         )?;
         self.finalize_run_if_terminal_tx(&mut tx, &step.run_id, now)?;
         tx.commit()?;
+        self.finalize_run_if_terminal(&step.run_id, now)?;
         Ok(())
     }
 
@@ -528,6 +529,7 @@ impl PgRunQueue {
         )?;
         self.finalize_run_if_terminal_tx(&mut tx, &step.run_id, now)?;
         tx.commit()?;
+        self.finalize_run_if_terminal(&step.run_id, now)?;
         Ok(())
     }
 }
@@ -740,6 +742,85 @@ mod tests {
                 Path::new("wattswarm.state"),
             )
             .expect("run worker once");
+    }
+
+    #[test]
+    fn finalize_run_if_terminal_recovers_stale_running_run_after_all_steps_finish() {
+        let _guard = test_guard();
+        let Some(queue) = queue_or_skip() else {
+            return;
+        };
+        let Some(_db_lock) = DbTestLock::acquire(&queue) else {
+            return;
+        };
+        queue.init_schema().expect("init schema");
+        if shared_db_is_busy(&queue) {
+            eprintln!("skip worker db test: shared database has active external runs");
+            return;
+        }
+        purge_worker_runs(&queue);
+
+        let run_id = format!("worker-stale-finalize-{}", Uuid::new_v4().simple());
+        cleanup_run(&queue, &run_id);
+        queue
+            .submit_run(sample_spec_two_agents(
+                &run_id,
+                AggregationPolicy::default(),
+            ))
+            .expect("submit");
+        queue.kickoff_run(&run_id).expect("kickoff");
+
+        let now = now_ms();
+        let mut client = queue.connect().expect("connect");
+        let mut tx = client.transaction().expect("tx");
+        tx.execute(
+            "UPDATE runs
+             SET status = $3,
+                 updated_at = TIMESTAMPTZ 'epoch' + ($4::bigint * INTERVAL '1 millisecond')
+             WHERE org_id = $1 AND run_id = $2",
+            &[&queue.org_id(), &run_id, &RUN_STATUS_RUNNING, &now],
+        )
+        .expect("update run");
+        tx.execute(
+            "UPDATE run_steps
+             SET status = $3,
+                 lease_id = NULL,
+                 lease_owner = NULL,
+                 lease_until = NULL,
+                 task_id = CONCAT('task-', step_id),
+                 result_json = $5,
+                 finished_at = TIMESTAMPTZ 'epoch' + ($4::bigint * INTERVAL '1 millisecond'),
+                 updated_at = TIMESTAMPTZ 'epoch' + ($4::bigint * INTERVAL '1 millisecond')
+             WHERE org_id = $1 AND run_id = $2",
+            &[
+                &queue.org_id(),
+                &run_id,
+                &STEP_STATUS_SUCCEEDED,
+                &now,
+                &json!({
+                    "candidate_output": {
+                        "decision": "PASS",
+                        "answer": "run-task-ok"
+                    }
+                })
+                .to_string(),
+            ],
+        )
+        .expect("update steps");
+        tx.commit().expect("commit");
+
+        let before = queue.run_view(&run_id).expect("view before");
+        assert_eq!(before.status, RUN_STATUS_RUNNING);
+        assert_eq!(before.counts.succeeded, 2);
+
+        queue
+            .finalize_run_if_terminal(&run_id, now_ms())
+            .expect("finalize stale run");
+
+        let after = queue.run_view(&run_id).expect("view after");
+        assert_eq!(after.status, super::super::status::RUN_STATUS_FINALIZED);
+        let events = queue.run_events(&run_id, 20).expect("events");
+        assert!(events.iter().any(|e| e.event_type == "RUN_FINALIZED"));
     }
 
     #[test]

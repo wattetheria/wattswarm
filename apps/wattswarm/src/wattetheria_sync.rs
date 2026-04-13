@@ -388,7 +388,7 @@ fn vote_reveal_snapshot(row: VoteRevealRow) -> TaskVoteRevealSnapshot {
 }
 
 fn task_coordinator_run_snapshot(
-    state_dir: &Path,
+    _state_dir: &Path,
     org_id: &str,
     task_id: &str,
 ) -> Result<Option<TaskCoordinatorRunSnapshot>> {
@@ -397,6 +397,8 @@ fn task_coordinator_run_snapshot(
     let Some(run_id) = queue.run_id_for_task_id(task_id)? else {
         return Ok(None);
     };
+    let now = now_ms() as i64;
+    queue.finalize_run_if_terminal(&run_id, now)?;
     let run = queue.run_view(&run_id)?;
     let events = queue.run_events(&run_id, 20)?;
     let next_round_trigger = events.into_iter().find_map(|event| {
@@ -422,7 +424,6 @@ fn task_coordinator_run_snapshot(
         + run.counts.remote_dispatched;
     let completed_executors = run.counts.succeeded + run.counts.failed + run.counts.cancelled;
     let active_executors = expected_executor_count - completed_executors;
-    let _ = state_dir;
     Ok(Some(TaskCoordinatorRunSnapshot {
         run_id,
         round_status: run.status.clone(),

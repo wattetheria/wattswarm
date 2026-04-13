@@ -158,6 +158,35 @@ fn topic_message_roundtrip_reads_scope_and_content() {
 }
 
 #[test]
+fn checkpoint_announcement_lookup_escapes_task_id_like_wildcards() {
+    let store = open_test_store();
+    let target_task_id = "task_%_literal";
+    store
+        .put_checkpoint_announcement(
+            "scope-a",
+            "checkpoint-a",
+            &format!("task://node-a/{target_task_id}/round/1/checkpoint.json"),
+            100,
+        )
+        .expect("put target checkpoint");
+    store
+        .put_checkpoint_announcement(
+            "scope-b",
+            "checkpoint-b",
+            "task://node-a/task-xyz-literal/round/1/checkpoint.json",
+            200,
+        )
+        .expect("put non-matching checkpoint");
+
+    let rows = store
+        .list_checkpoint_announcements_for_task(target_task_id, 10)
+        .expect("list checkpoint announcements");
+
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].checkpoint_id, "checkpoint-a");
+}
+
+#[test]
 fn topic_cursor_roundtrip_advances_only_forward() {
     let store = open_test_store();
     store

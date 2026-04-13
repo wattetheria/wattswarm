@@ -1847,12 +1847,16 @@ impl PgStore {
             .conn
             .lock()
             .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
-        let pattern = format!("task://%/{task_id}/round/%");
+        let escaped_task_id = task_id
+            .replace('\\', "\\\\")
+            .replace('%', "\\%")
+            .replace('_', "\\_");
+        let pattern = format!("task://%/{escaped_task_id}/round/%");
         let mut stmt = conn.prepare(
             "SELECT scope_key, checkpoint_id, artifact_path,
                     CAST(EXTRACT(EPOCH FROM observed_at) * 1000 AS BIGINT)
              FROM network_checkpoint_announcements
-             WHERE org_id = $1 AND artifact_path LIKE $2
+             WHERE org_id = $1 AND artifact_path LIKE $2 ESCAPE '\\'
              ORDER BY observed_at DESC, checkpoint_id DESC
              LIMIT $3",
         )?;

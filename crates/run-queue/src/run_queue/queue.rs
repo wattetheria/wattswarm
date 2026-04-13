@@ -75,6 +75,12 @@ impl PgRunQueue {
         let status = self
             .run_status_tx(tx, run_id)?
             .ok_or_else(|| anyhow!("run not found: {run_id}"))?;
+        if status != RUN_STATUS_QUEUED
+            && status != super::status::RUN_STATUS_RUNNING
+            && status != RUN_STATUS_CANCELLING
+        {
+            return Ok(());
+        }
         let counts = step_counts_tx(tx, self.org_id(), run_id)?;
         let active = counts.created
             + counts.queued
@@ -202,6 +208,14 @@ impl PgRunQueue {
             ],
         )?;
         self.insert_event_tx(tx, run_id, "RUN_FINALIZED", &summary.event_payload, now)?;
+        Ok(())
+    }
+
+    pub fn finalize_run_if_terminal(&self, run_id: &str, now: i64) -> Result<()> {
+        let mut client = self.connect()?;
+        let mut tx = client.transaction()?;
+        self.finalize_run_if_terminal_tx(&mut tx, run_id, now)?;
+        tx.commit()?;
         Ok(())
     }
 
