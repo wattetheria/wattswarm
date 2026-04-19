@@ -61,6 +61,8 @@ pub struct InvocationRequestEnvelope {
     #[serde(default)]
     pub payment_proof: Option<Value>,
     #[serde(default)]
+    pub settlement: Option<crate::ap2::NormalizedSettlementRequest>,
+    #[serde(default)]
     pub signature: Option<String>,
 }
 
@@ -120,6 +122,8 @@ pub struct GoogleA2aExtensions {
     pub auth_proof: Option<Value>,
     #[serde(default)]
     pub payment_proof: Option<Value>,
+    #[serde(default)]
+    pub settlement: Option<crate::ap2::SettlementRequest>,
     #[serde(default)]
     pub signature: Option<String>,
     #[serde(default)]
@@ -212,6 +216,7 @@ impl InvocationAdapter for GoogleA2aAdapter {
                 "profile": config.profile,
                 "publish_to_network": config.publish_to_network,
                 "accept_inbound_invocations": config.accept_inbound_invocations,
+                "supported_settlement_rails": crate::ap2::supported_settlement_rails(),
             }
         }))
     }
@@ -236,6 +241,7 @@ impl InvocationAdapter for GoogleA2aAdapter {
                 "extensions": {
                     "auth_proof": request.auth_proof,
                     "payment_proof": request.payment_proof,
+                    "settlement": request.settlement,
                     "signature": request.signature,
                 }
             }
@@ -293,6 +299,13 @@ pub fn handle_google_message_send(
         .extensions
         .as_ref()
         .and_then(|ext| ext.payment_proof.clone());
+    let settlement = crate::ap2::normalize_settlement_request(
+        request
+            .params
+            .extensions
+            .as_ref()
+            .and_then(|ext| ext.settlement.clone()),
+    )?;
     let signature = request
         .params
         .extensions
@@ -306,6 +319,7 @@ pub fn handle_google_message_send(
         payload,
         auth_proof,
         payment_proof,
+        settlement,
         signature,
     };
 
@@ -376,6 +390,7 @@ fn execute_direct_gateway(
         "payload": invocation.payload,
         "auth_proof": invocation.auth_proof,
         "payment_proof": invocation.payment_proof,
+        "settlement": invocation.settlement,
         "signature": invocation.signature,
         "protocol": "google_a2a",
     });
@@ -399,6 +414,7 @@ fn execute_direct_gateway(
             "executor": executor,
             "profile": config.profile,
             "task_id": task_id,
+            "settlement": invocation.settlement,
         })),
         error: None,
     })
@@ -428,6 +444,7 @@ fn execute_group_representative(
             "mode": "group_representative",
             "run_id": submit.get("run_id").cloned().unwrap_or(Value::Null),
             "kicked_off": submit.get("kicked_off").cloned().unwrap_or(Value::Bool(kickoff)),
+            "settlement": invocation.settlement,
         })),
         error: None,
     })

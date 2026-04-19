@@ -954,6 +954,21 @@ fn ui_startup_config_roundtrips_network_settings_without_agent_binding() {
                 .map(|items| items.len()),
             Some(0)
         );
+
+        let status_res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/node/status")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(status_res.status(), StatusCode::OK);
+        let status_json = json_from(status_res).await;
+        assert_eq!(status_json["mode"].as_str(), Some("local"));
     });
 
     let conn =
@@ -977,6 +992,76 @@ fn ui_startup_config_roundtrips_network_settings_without_agent_binding() {
         .collect::<std::result::Result<Vec<_>, _>>()
         .expect("collect executor raw rows");
     assert!(raw_rows.is_empty());
+}
+
+#[test]
+fn ui_startup_config_save_updates_existing_runtime_node_mode() {
+    let _guard = env_lock();
+    let _db_lock = DbTestLock::acquire();
+    let schema = reset_test_schema("test");
+    let _schema_guard = EnvVarGuard::set("WATTSWARM_PG_SCHEMA", &schema);
+    let dir = tempdir().unwrap();
+    let state_dir = dir.path().join("state");
+    std::fs::create_dir_all(&state_dir).unwrap();
+    let db_path = state_dir.join("ui.state");
+    std::fs::write(
+        state_dir.join("node_state.json"),
+        serde_json::to_vec_pretty(&json!({
+            "running": true,
+            "mode": "network"
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let app = build_app(UiServerState::new(state_dir.clone(), db_path));
+        let save_res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/startup-config")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({
+                            "display_name": "Captain Aurora",
+                            "network_mode": "local",
+                            "bootstrap_peers": []
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(save_res.status(), StatusCode::OK);
+
+        let status_res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/node/status")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(status_res.status(), StatusCode::OK);
+        let status_json = json_from(status_res).await;
+        assert_eq!(status_json["mode"].as_str(), Some("local"));
+        assert_eq!(status_json["running"].as_bool(), Some(true));
+    });
+
+    let runtime_state: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(state_dir.join("node_state.json")).unwrap()).unwrap();
+    assert_eq!(runtime_state["mode"].as_str(), Some("local"));
+    assert_eq!(runtime_state["running"].as_bool(), Some(true));
 }
 
 #[test]
@@ -3268,6 +3353,7 @@ fn ui_google_a2a_message_send_supports_direct_and_group_modes() {
     std::fs::create_dir_all(&state_dir).unwrap();
     let db_path = state_dir.join("ui.state");
     let app = build_app(UiServerState::new(state_dir.clone(), db_path));
+    let execute_requests = Arc::new(Mutex::new(Vec::<Value>::new()));
     let runtime_server = UiStubRuntimeServer::start(UiStubRuntimeConfig {
         health_body: "{}".to_owned(),
         capabilities_body: json!({
@@ -3283,7 +3369,7 @@ fn ui_google_a2a_message_send_supports_direct_and_group_modes() {
             "evidence_refs": []
         })
         .to_string(),
-        execute_requests: None,
+        execute_requests: Some(Arc::clone(&execute_requests)),
     });
     wait_for_stub_listener(&runtime_server);
 
@@ -3371,6 +3457,24 @@ fn ui_google_a2a_message_send_supports_direct_and_group_modes() {
             .unwrap();
         assert_eq!(add_exec_res.status(), StatusCode::OK);
 
+        let card_res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/a2a/google/agent-card")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(card_res.status(), StatusCode::OK);
+        let card_json = json_from(card_res).await;
+        assert_eq!(
+            card_json["metadata"]["supported_settlement_rails"][0]["rail"].as_str(),
+            Some("x402")
+        );
+
         let direct_res = app
             .clone()
             .oneshot(
@@ -3393,6 +3497,16 @@ fn ui_google_a2a_message_send_supports_direct_and_group_modes() {
                                 "extensions": {
                                     "auth_proof": {"kind":"did"},
                                     "payment_proof": {"kind":"watt"},
+                                    "settlement": {
+                                        "layer": "web3",
+                                        "rail": "x402",
+                                        "request": {
+                                        "facilitator": "https://facilitator.example.com/pay",
+                                        "network": "base-sepolia",
+                                        "pay_to": "0xabc123",
+                                        "payment_account_ref": "payment-account-123"
+                                        }
+                                    },
                                     "signature": "sig-1"
                                 }
                             }
@@ -3420,9 +3534,28 @@ fn ui_google_a2a_message_send_supports_direct_and_group_modes() {
             Some("direct_gateway")
         );
         assert_eq!(
+            direct_json["result"]["extensions"]["receipt"]["settlement"]["rail"].as_str(),
+            Some("x402")
+        );
+        assert_eq!(
             direct_json["result"]["artifacts"][0]["candidate_output"]["decision"].as_str(),
             Some("SENT")
         );
+        let requests = execute_requests.lock().expect("lock execute requests");
+        let execute_request = requests.last().expect("captured execute request");
+        assert_eq!(
+            execute_request["inputs"]["settlement"]["rail"].as_str(),
+            Some("x402")
+        );
+        assert_eq!(
+            execute_request["inputs"]["settlement"]["request"]["protocol"].as_str(),
+            Some("x402")
+        );
+        assert_eq!(
+            execute_request["inputs"]["settlement"]["request"]["payment_account_ref"].as_str(),
+            Some("payment-account-123")
+        );
+        drop(requests);
 
         let save_group_res = app
             .clone()
@@ -3470,6 +3603,13 @@ fn ui_google_a2a_message_send_supports_direct_and_group_modes() {
                                     "parts": [{"type":"data","data":{"resume":"alex"}}]
                                 },
                                 "extensions": {
+                                    "settlement": {
+                                        "layer": "web3",
+                                        "rail": "x402",
+                                        "request": {
+                                            "pay_to": "0xdef456"
+                                        }
+                                    },
                                     "kickoff": true,
                                     "run_spec": sample_run_spec(group_run_id)
                                 }
@@ -3488,6 +3628,10 @@ fn ui_google_a2a_message_send_supports_direct_and_group_modes() {
         assert_eq!(
             group_json["result"]["extensions"]["receipt"]["mode"].as_str(),
             Some("group_representative")
+        );
+        assert_eq!(
+            group_json["result"]["extensions"]["receipt"]["settlement"]["rail"].as_str(),
+            Some("x402")
         );
         assert_eq!(
             group_json["result"]["extensions"]["receipt"]["run_id"].as_str(),
