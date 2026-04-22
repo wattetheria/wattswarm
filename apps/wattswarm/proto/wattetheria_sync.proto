@@ -21,4 +21,5 @@ service WattetheriaSyncService {
   rpc StreamNetworkProjection(ProjectionStreamRequest) returns (stream ProjectionFrame);
   rpc StreamTaskRunProjection(ProjectionStreamRequest) returns (stream ProjectionFrame);
   rpc StreamTopicActivity(ProjectionStreamRequest) returns (stream ProjectionFrame);
+  rpc StreamSocialProjection(ProjectionStreamRequest) returns (stream ProjectionFrame);
 }

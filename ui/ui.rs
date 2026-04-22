@@ -10,8 +10,8 @@ use crate::egress_agent::{
     EgressAgentConfig, load_egress_agent_config_state, save_egress_agent_config_state,
 };
 use crate::network_bridge::{
-    enqueue_peer_direct_message_command, enqueue_peer_relationship_action_command,
-    network_service_started,
+    enqueue_agent_payment_command, enqueue_peer_direct_message_command,
+    enqueue_peer_relationship_action_command, network_service_started,
 };
 use crate::network_p2p::RawAgentEnvelope;
 use crate::run_control;
@@ -92,11 +92,17 @@ struct ExecutorAddRequest {
     name: String,
     base_url: String,
     #[serde(default)]
+    agent_event_callback_base_url: Option<String>,
+    #[serde(default)]
     remote: bool,
     #[serde(default)]
     target_node_id: Option<String>,
     #[serde(default)]
     scope_hint: Option<String>,
+    #[serde(default)]
+    commit_plane_endpoint: Option<String>,
+    #[serde(default)]
+    commit_plane_token_file: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -120,6 +126,13 @@ struct PeerDirectMessageSendRequest {
     content: Value,
     #[serde(default)]
     agent_envelope: Option<RawAgentEnvelope>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AgentPaymentSendRequest {
+    remote_node_id: String,
+    message_kind: String,
+    payment: Value,
 }
 
 #[derive(Debug, Deserialize)]
@@ -285,6 +298,7 @@ pub fn build_app(state: UiServerState) -> Router {
         .route("/api/peers/dm/threads", get(peer_dm_threads_list))
         .route("/api/peers/dm/messages", get(peer_dm_messages_list))
         .route("/api/peers/dm/messages", post(peer_dm_messages_send))
+        .route("/api/payments/messages", post(agent_payment_send))
         .route("/api/log/head", get(log_head))
         .route("/api/log/replay", post(log_replay))
         .route("/api/log/verify", post(log_verify))
@@ -668,6 +682,40 @@ async fn peer_dm_messages_send(
             "ok": true,
             "queued": true,
             "remote_node_id": req.remote_node_id,
+        }))
+    })
+    .await?;
+    Ok(Json(payload))
+}
+
+async fn agent_payment_send(
+    State(state): State<UiServerState>,
+    Json(req): Json<AgentPaymentSendRequest>,
+) -> Result<Json<Value>, ApiError> {
+    let state_clone = state.clone();
+    let payload = run_blocking(move || {
+        if !network_service_started(&state_clone.state_dir) {
+            bail!("agent payments require the background network service to be running");
+        }
+        let remote_node_id = req.remote_node_id.trim().to_owned();
+        if remote_node_id.is_empty() {
+            bail!("remote_node_id is required");
+        }
+        let message_kind = req.message_kind.trim().to_owned();
+        if message_kind.is_empty() {
+            bail!("message_kind is required");
+        }
+        enqueue_agent_payment_command(
+            &state_clone.state_dir,
+            &remote_node_id,
+            &message_kind,
+            req.payment,
+        )?;
+        Ok::<Value, anyhow::Error>(json!({
+            "ok": true,
+            "queued": true,
+            "remote_node_id": remote_node_id,
+            "message_kind": message_kind,
         }))
     })
     .await?;
@@ -1120,9 +1168,12 @@ async fn executors_add(
         reg.entries.push(ExecutorRegistryEntry {
             name: req.name,
             base_url: req.base_url,
+            agent_event_callback_base_url: req.agent_event_callback_base_url,
             kind,
             target_node_id: req.target_node_id,
             scope_hint: req.scope_hint,
+            commit_plane_endpoint: req.commit_plane_endpoint,
+            commit_plane_token_file: req.commit_plane_token_file,
         });
         save_executor_registry_state(&state_clone.state_dir, &reg)
     })

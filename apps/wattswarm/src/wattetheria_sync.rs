@@ -1,7 +1,8 @@
 use crate::control::{
-    NodeState, RealTaskRunRequest, fetch_checkpoint_artifact_json, local_node_id, node_state_path,
-    open_configured_node, open_node, require_configured_node_mode, resolve_node_mode,
-    run_real_task_flow,
+    NodeState, RealTaskRunRequest, fetch_checkpoint_artifact_json,
+    load_peer_dm_message_records_state, load_peer_dm_thread_records_state,
+    load_peer_relationship_records_state, local_node_id, node_state_path, open_configured_node,
+    open_node, require_configured_node_mode, resolve_node_mode, run_real_task_flow,
 };
 use crate::run_control;
 use crate::run_queue::{RunSubmitSpec, RunView};
@@ -174,6 +175,14 @@ pub struct TopicActivitySnapshot {
     pub cursor: Option<TopicCursorRow>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SocialProjectionSnapshot {
+    pub generated_at: u64,
+    pub relationships: Vec<Value>,
+    pub threads: Vec<Value>,
+    pub messages: Vec<Value>,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct TaskRunSnapshotQuery {
     pub task_limit: Option<usize>,
@@ -253,6 +262,12 @@ impl TaskRunProjectionSnapshot {
 impl TopicActivitySnapshot {
     fn frame(&self) -> Result<ProjectionFrame> {
         projection_frame("topic_activity", self.generated_at, self)
+    }
+}
+
+impl SocialProjectionSnapshot {
+    fn frame(&self) -> Result<ProjectionFrame> {
+        projection_frame("social_projection", self.generated_at, self)
     }
 }
 
@@ -631,6 +646,39 @@ pub fn build_topic_activity_snapshot(
     })
 }
 
+pub fn build_social_projection_snapshot(
+    state_dir: &Path,
+    limit: usize,
+) -> Result<SocialProjectionSnapshot> {
+    let relationships = load_peer_relationship_records_state(state_dir)?
+        .into_iter()
+        .map(serde_json::to_value)
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let threads = load_peer_dm_thread_records_state(state_dir)?
+        .into_iter()
+        .map(serde_json::to_value)
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let mut messages = Vec::new();
+    for thread in load_peer_dm_thread_records_state(state_dir)? {
+        let thread_messages = load_peer_dm_message_records_state(state_dir, &thread.thread_id)?
+            .into_iter()
+            .map(serde_json::to_value)
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        messages.extend(thread_messages);
+    }
+    messages.sort_by_key(|value| value.get("created_at").and_then(Value::as_u64).unwrap_or(0));
+    if messages.len() > limit {
+        let split_at = messages.len().saturating_sub(limit);
+        messages.drain(0..split_at);
+    }
+    Ok(SocialProjectionSnapshot {
+        generated_at: now_ms(),
+        relationships,
+        threads,
+        messages,
+    })
+}
+
 pub fn submit_brain_topic_publish(
     state_dir: &Path,
     db_path: &Path,
@@ -961,6 +1009,7 @@ impl WattetheriaSyncService for WattetheriaSyncGrpcService {
     type StreamNetworkProjectionStream = ProjectionStream;
     type StreamTaskRunProjectionStream = ProjectionStream;
     type StreamTopicActivityStream = ProjectionStream;
+    type StreamSocialProjectionStream = ProjectionStream;
 
     async fn stream_network_projection(
         &self,
@@ -1061,6 +1110,34 @@ impl WattetheriaSyncService for WattetheriaSyncGrpcService {
                 })
                 .await
                 .map_err(|err| Status::internal(format!("join topic activity task: {err}")))?
+                .map_err(|err| Status::internal(err.to_string()))?;
+                if frame.cursor != last_cursor {
+                    last_cursor = frame.cursor.clone();
+                    yield frame;
+                }
+                sleep(poll_interval).await;
+            }
+        };
+        Ok(Response::new(Box::pin(stream)))
+    }
+
+    async fn stream_social_projection(
+        &self,
+        request: Request<ProjectionStreamRequest>,
+    ) -> std::result::Result<Response<Self::StreamSocialProjectionStream>, Status> {
+        let runtime = self.runtime.clone();
+        let request = request.into_inner();
+        let poll_interval = Self::poll_interval(&request);
+        let limit = request.limit.max(1) as usize;
+        let stream = try_stream! {
+            let mut last_cursor = String::new();
+            loop {
+                let runtime_clone = runtime.clone();
+                let frame = tokio::task::spawn_blocking(move || -> Result<ProjectionFrame> {
+                    build_social_projection_snapshot(&runtime_clone.state_dir, limit)?.frame()
+                })
+                .await
+                .map_err(|err| Status::internal(format!("join social projection task: {err}")))?
                 .map_err(|err| Status::internal(err.to_string()))?;
                 if frame.cursor != last_cursor {
                     last_cursor = frame.cursor.clone();

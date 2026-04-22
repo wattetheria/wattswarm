@@ -228,9 +228,12 @@ pub struct TaskAnnouncementDetailRow {
 pub struct LocalExecutorEntryRow {
     pub name: String,
     pub base_url: String,
+    pub agent_event_callback_base_url: Option<String>,
     pub kind: String,
     pub target_node_id: Option<String>,
     pub scope_hint: Option<String>,
+    pub commit_plane_endpoint: Option<String>,
+    pub commit_plane_token_file: Option<String>,
     pub updated_at: u64,
 }
 
@@ -313,6 +316,48 @@ pub struct LocalDataPlaneStatusRow {
     pub status: String,
     pub detail: Option<String>,
     pub updated_at: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalAgentPaymentRow {
+    pub payment_id: String,
+    pub remote_node_id: String,
+    pub summary_id: String,
+    pub message_kind: String,
+    pub payment_json: String,
+    pub updated_at: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalAgentEventRow {
+    pub event_id: String,
+    pub event_type: String,
+    pub source_kind: String,
+    pub source_node_id: Option<String>,
+    pub target_agent_id: Option<String>,
+    pub target_executor: Option<String>,
+    pub payload_json: String,
+    pub allowed_actions_json: String,
+    pub requires_commit: bool,
+    pub status: String,
+    pub dedupe_key: Option<String>,
+    pub correlation_id: Option<String>,
+    pub created_at: u64,
+    pub updated_at: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalAgentEventDeliveryRow {
+    pub delivery_id: String,
+    pub event_id: String,
+    pub attempt_no: i64,
+    pub endpoint_url: String,
+    pub delivery_status: String,
+    pub response_code: Option<i64>,
+    pub response_body: Option<String>,
+    pub error_text: Option<String>,
+    pub next_retry_at: Option<u64>,
+    pub created_at: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

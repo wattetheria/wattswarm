@@ -49,7 +49,14 @@ impl PgStore {
             .lock()
             .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
         let mut stmt = conn.prepare(
-            "SELECT executor_name, base_url, kind, target_node_id, scope_hint,
+            "SELECT executor_name,
+                    base_url,
+                    agent_event_callback_base_url,
+                    kind,
+                    target_node_id,
+                    scope_hint,
+                    commit_plane_endpoint,
+                    commit_plane_token_file,
                     (EXTRACT(EPOCH FROM updated_at) * 1000)::BIGINT AS updated_at_ms
              FROM executor_registry_local
              WHERE scope_id = $1
@@ -59,10 +66,13 @@ impl PgStore {
             Ok(LocalExecutorEntryRow {
                 name: r.get(0)?,
                 base_url: r.get(1)?,
-                kind: r.get(2)?,
-                target_node_id: r.get(3)?,
-                scope_hint: r.get(4)?,
-                updated_at: r.get::<_, i64>(5)? as u64,
+                agent_event_callback_base_url: r.get(2)?,
+                kind: r.get(3)?,
+                target_node_id: r.get(4)?,
+                scope_hint: r.get(5)?,
+                commit_plane_endpoint: r.get(6)?,
+                commit_plane_token_file: r.get(7)?,
+                updated_at: r.get::<_, i64>(8)? as u64,
             })
         })?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
@@ -88,7 +98,16 @@ impl PgStore {
             for entry in entries {
                 conn.execute(
                     "INSERT INTO executor_registry_local(
-                        scope_id, executor_name, base_url, kind, target_node_id, scope_hint, updated_at
+                        scope_id,
+                        executor_name,
+                        base_url,
+                        agent_event_callback_base_url,
+                        kind,
+                        target_node_id,
+                        scope_hint,
+                        commit_plane_endpoint,
+                        commit_plane_token_file,
+                        updated_at
                      )
                      VALUES (
                         $1,
@@ -97,15 +116,21 @@ impl PgStore {
                         $4,
                         $5,
                         $6,
-                        TIMESTAMPTZ 'epoch' + ($7::bigint * INTERVAL '1 millisecond')
+                        $7,
+                        $8,
+                        $9,
+                        TIMESTAMPTZ 'epoch' + ($10::bigint * INTERVAL '1 millisecond')
                      )",
                     params![
                         scope_id,
                         &entry.name,
                         entry.base_url,
+                        entry.agent_event_callback_base_url,
                         &entry.kind,
                         entry.target_node_id,
                         entry.scope_hint,
+                        entry.commit_plane_endpoint,
+                        entry.commit_plane_token_file,
                         updated_at as i64
                     ],
                 )?;
@@ -263,6 +288,306 @@ impl PgStore {
                 Ok(true)
             }
         }
+    }
+
+    pub fn list_local_agent_events(&self, scope_id: &str) -> Result<Vec<LocalAgentEventRow>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
+        let mut stmt = conn.prepare(
+            "SELECT event_id,
+                    event_type,
+                    source_kind,
+                    source_node_id,
+                    target_agent_id,
+                    target_executor,
+                    payload_json,
+                    allowed_actions_json,
+                    requires_commit,
+                    status,
+                    dedupe_key,
+                    correlation_id,
+                    (EXTRACT(EPOCH FROM created_at) * 1000)::BIGINT AS created_at_ms,
+                    (EXTRACT(EPOCH FROM updated_at) * 1000)::BIGINT AS updated_at_ms
+             FROM agent_event_bus_local
+             WHERE scope_id = $1
+             ORDER BY updated_at DESC, event_id ASC",
+        )?;
+        let rows = stmt.query_map(params![scope_id], |r| {
+            Ok(LocalAgentEventRow {
+                event_id: r.get(0)?,
+                event_type: r.get(1)?,
+                source_kind: r.get(2)?,
+                source_node_id: r.get(3)?,
+                target_agent_id: r.get(4)?,
+                target_executor: r.get(5)?,
+                payload_json: r.get(6)?,
+                allowed_actions_json: r.get(7)?,
+                requires_commit: r.get(8)?,
+                status: r.get(9)?,
+                dedupe_key: r.get(10)?,
+                correlation_id: r.get(11)?,
+                created_at: r.get::<_, i64>(12)? as u64,
+                updated_at: r.get::<_, i64>(13)? as u64,
+            })
+        })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
+    pub fn find_local_agent_event_by_dedupe_key(
+        &self,
+        scope_id: &str,
+        dedupe_key: &str,
+    ) -> Result<Option<LocalAgentEventRow>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
+        conn.query_row(
+            "SELECT event_id,
+                    event_type,
+                    source_kind,
+                    source_node_id,
+                    target_agent_id,
+                    target_executor,
+                    payload_json,
+                    allowed_actions_json,
+                    requires_commit,
+                    status,
+                    dedupe_key,
+                    correlation_id,
+                    (EXTRACT(EPOCH FROM created_at) * 1000)::BIGINT AS created_at_ms,
+                    (EXTRACT(EPOCH FROM updated_at) * 1000)::BIGINT AS updated_at_ms
+             FROM agent_event_bus_local
+             WHERE scope_id = $1 AND dedupe_key = $2
+             LIMIT 1",
+            params![scope_id, dedupe_key],
+            |r| {
+                Ok(LocalAgentEventRow {
+                    event_id: r.get(0)?,
+                    event_type: r.get(1)?,
+                    source_kind: r.get(2)?,
+                    source_node_id: r.get(3)?,
+                    target_agent_id: r.get(4)?,
+                    target_executor: r.get(5)?,
+                    payload_json: r.get(6)?,
+                    allowed_actions_json: r.get(7)?,
+                    requires_commit: r.get(8)?,
+                    status: r.get(9)?,
+                    dedupe_key: r.get(10)?,
+                    correlation_id: r.get(11)?,
+                    created_at: r.get::<_, i64>(12)? as u64,
+                    updated_at: r.get::<_, i64>(13)? as u64,
+                })
+            },
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    pub fn upsert_local_agent_event(&self, scope_id: &str, row: &LocalAgentEventRow) -> Result<()> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
+        conn.execute(
+            "INSERT INTO agent_event_bus_local(
+                scope_id,
+                event_id,
+                event_type,
+                source_kind,
+                source_node_id,
+                target_agent_id,
+                target_executor,
+                payload_json,
+                allowed_actions_json,
+                requires_commit,
+                status,
+                dedupe_key,
+                correlation_id,
+                created_at,
+                updated_at
+             )
+             VALUES (
+                $1,
+                $2,
+                $3,
+                $4,
+                $5,
+                $6,
+                $7,
+                $8,
+                $9,
+                $10,
+                $11,
+                $12,
+                $13,
+                TIMESTAMPTZ 'epoch' + ($14::bigint * INTERVAL '1 millisecond'),
+                TIMESTAMPTZ 'epoch' + ($15::bigint * INTERVAL '1 millisecond')
+             )
+             ON CONFLICT(scope_id, event_id) DO UPDATE SET
+                event_type = excluded.event_type,
+                source_kind = excluded.source_kind,
+                source_node_id = excluded.source_node_id,
+                target_agent_id = excluded.target_agent_id,
+                target_executor = excluded.target_executor,
+                payload_json = excluded.payload_json,
+                allowed_actions_json = excluded.allowed_actions_json,
+                requires_commit = excluded.requires_commit,
+                status = excluded.status,
+                dedupe_key = excluded.dedupe_key,
+                correlation_id = excluded.correlation_id,
+                updated_at = excluded.updated_at",
+            params![
+                scope_id,
+                &row.event_id,
+                &row.event_type,
+                &row.source_kind,
+                &row.source_node_id,
+                &row.target_agent_id,
+                &row.target_executor,
+                &row.payload_json,
+                &row.allowed_actions_json,
+                row.requires_commit,
+                &row.status,
+                &row.dedupe_key,
+                &row.correlation_id,
+                row.created_at as i64,
+                row.updated_at as i64
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn append_local_agent_event_delivery(
+        &self,
+        scope_id: &str,
+        row: &LocalAgentEventDeliveryRow,
+    ) -> Result<()> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
+        let mut params = vec![
+            crate::storage::pg::to_param_value(scope_id),
+            crate::storage::pg::to_param_value(&row.delivery_id),
+            crate::storage::pg::to_param_value(&row.event_id),
+            crate::storage::pg::to_param_value(row.attempt_no),
+            crate::storage::pg::to_param_value(&row.endpoint_url),
+            crate::storage::pg::to_param_value(&row.delivery_status),
+        ];
+
+        let response_code_sql = if let Some(value) = row.response_code {
+            params.push(crate::storage::pg::to_param_value(value));
+            format!("${}::BIGINT", params.len())
+        } else {
+            "NULL".to_owned()
+        };
+
+        let response_body_sql = if let Some(value) = row.response_body.as_deref() {
+            params.push(crate::storage::pg::to_param_value(value));
+            format!("${}::TEXT", params.len())
+        } else {
+            "NULL".to_owned()
+        };
+
+        let error_text_sql = if let Some(value) = row.error_text.as_deref() {
+            params.push(crate::storage::pg::to_param_value(value));
+            format!("${}::TEXT", params.len())
+        } else {
+            "NULL".to_owned()
+        };
+
+        let next_retry_at_sql = if let Some(value) = row.next_retry_at.map(|value| value as i64) {
+            params.push(crate::storage::pg::to_param_value(value));
+            format!(
+                "TIMESTAMPTZ 'epoch' + (${}::bigint * INTERVAL '1 millisecond')",
+                params.len()
+            )
+        } else {
+            "NULL".to_owned()
+        };
+
+        params.push(crate::storage::pg::to_param_value(row.created_at as i64));
+        let created_at_sql = format!(
+            "TIMESTAMPTZ 'epoch' + (${}::bigint * INTERVAL '1 millisecond')",
+            params.len()
+        );
+
+        let sql = format!(
+            "INSERT INTO agent_event_delivery_local(
+                scope_id,
+                delivery_id,
+                event_id,
+                attempt_no,
+                endpoint_url,
+                delivery_status,
+                response_code,
+                response_body,
+                error_text,
+                next_retry_at,
+                created_at
+             )
+             VALUES (
+                $1,
+                $2,
+                $3,
+                $4,
+                $5,
+                $6,
+                {response_code_sql},
+                {response_body_sql},
+                {error_text_sql},
+                {next_retry_at_sql},
+                {created_at_sql}
+             )"
+        );
+        conn.execute(&sql, params)?;
+        Ok(())
+    }
+
+    pub fn list_local_agent_event_deliveries(
+        &self,
+        scope_id: &str,
+        event_id: &str,
+    ) -> Result<Vec<LocalAgentEventDeliveryRow>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
+        let mut stmt = conn.prepare(
+            "SELECT delivery_id,
+                    event_id,
+                    attempt_no,
+                    endpoint_url,
+                    delivery_status,
+                    response_code,
+                    response_body,
+                    error_text,
+                    (EXTRACT(EPOCH FROM next_retry_at) * 1000)::BIGINT AS next_retry_at_ms,
+                    (EXTRACT(EPOCH FROM created_at) * 1000)::BIGINT AS created_at_ms
+             FROM agent_event_delivery_local
+             WHERE scope_id = $1 AND event_id = $2
+             ORDER BY created_at ASC, attempt_no ASC",
+        )?;
+        let rows = stmt.query_map(params![scope_id, event_id], |r| {
+            Ok(LocalAgentEventDeliveryRow {
+                delivery_id: r.get(0)?,
+                event_id: r.get(1)?,
+                attempt_no: r.get(2)?,
+                endpoint_url: r.get(3)?,
+                delivery_status: r.get(4)?,
+                response_code: r.get(5)?,
+                response_body: r.get(6)?,
+                error_text: r.get(7)?,
+                next_retry_at: r.get::<_, Option<i64>>(8)?.map(|value| value as u64),
+                created_at: r.get::<_, i64>(9)? as u64,
+            })
+        })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(anyhow::Error::from)
     }
 
     pub fn list_local_peer_metadata(&self, scope_id: &str) -> Result<Vec<LocalPeerMetadataRow>> {
@@ -1008,6 +1333,71 @@ impl PgStore {
                 row.binding_key,
                 row.source_node_id,
                 row.source_uri,
+                row.updated_at as i64
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_local_agent_payments(&self, scope_id: &str) -> Result<Vec<LocalAgentPaymentRow>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
+        let mut stmt = conn.prepare(
+            "SELECT payment_id,
+                    remote_node_id,
+                    summary_id,
+                    message_kind,
+                    payment_json,
+                    (EXTRACT(EPOCH FROM updated_at) * 1000)::BIGINT AS updated_at_ms
+             FROM agent_payments_local
+             WHERE scope_id = $1
+             ORDER BY updated_at DESC, payment_id ASC",
+        )?;
+        let rows = stmt.query_map(params![scope_id], |r| {
+            Ok(LocalAgentPaymentRow {
+                payment_id: r.get(0)?,
+                remote_node_id: r.get(1)?,
+                summary_id: r.get(2)?,
+                message_kind: r.get(3)?,
+                payment_json: r.get(4)?,
+                updated_at: r.get::<_, i64>(5)? as u64,
+            })
+        })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
+    pub fn upsert_local_agent_payment(
+        &self,
+        scope_id: &str,
+        row: &LocalAgentPaymentRow,
+    ) -> Result<()> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
+        conn.execute(
+            "INSERT INTO agent_payments_local(
+                scope_id, payment_id, remote_node_id, summary_id, message_kind, payment_json, updated_at
+             ) VALUES (
+                $1, $2, $3, $4, $5, $6,
+                TIMESTAMPTZ 'epoch' + ($7::bigint * INTERVAL '1 millisecond')
+             )
+             ON CONFLICT(scope_id, payment_id) DO UPDATE SET
+                remote_node_id = excluded.remote_node_id,
+                summary_id = excluded.summary_id,
+                message_kind = excluded.message_kind,
+                payment_json = excluded.payment_json,
+                updated_at = excluded.updated_at",
+            params![
+                scope_id,
+                &row.payment_id,
+                &row.remote_node_id,
+                &row.summary_id,
+                &row.message_kind,
+                &row.payment_json,
                 row.updated_at as i64
             ],
         )?;

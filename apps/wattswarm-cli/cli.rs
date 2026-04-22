@@ -326,9 +326,12 @@ fn handle_executors(cmd: ExecutorsCommand, state_dir: &Path) -> Result<()> {
             reg.entries.push(ExecutorRegistryEntry {
                 name: name.clone(),
                 base_url,
+                agent_event_callback_base_url: None,
                 kind,
                 target_node_id: target_node,
                 scope_hint: scope,
+                commit_plane_endpoint: None,
+                commit_plane_token_file: None,
             });
             save_executor_registry_state(state_dir, &reg)?;
             let kind_label = if remote { "remote" } else { "local" };

@@ -2,6 +2,9 @@ mod announcements;
 mod backfill;
 mod publish;
 mod scope;
+mod service_dispatch;
+mod service_ops;
+mod service_runtime;
 mod summary;
 
 #[cfg(test)]
@@ -36,6 +39,7 @@ use wattswarm_network_transport_core::{
     TransferIntent, TransferKind, TransportRoute as DataTransportRoute, TransportRouter,
 };
 use wattswarm_network_transport_iroh::export_local_contact_material;
+use wattswarm_protocol::reason_codes::REASON_SCHEMA_OK;
 use wattswarm_protocol::types::NetworkProtocolParams;
 
 pub use announcements::{apply_checkpoint_announcement, apply_rule_announcement};
@@ -66,6 +70,8 @@ const ENV_P2P_NODE_IDS: &str = "WATTSWARM_P2P_NODE_IDS";
 const KNOWLEDGE_SUMMARY_KIND: &str = "knowledge_task_type_v1";
 const REPUTATION_SUMMARY_KIND: &str = "reputation_runtime_profile_v1";
 const TASK_OUTCOME_SUMMARY_KIND: &str = "task_outcome_v1";
+const AGENT_PAYMENT_SUMMARY_KIND: &str = "agent_payment_session_v1";
+const CORE_AGENT_EXECUTOR_NAME: &str = "core-agent";
 const MAX_INFLIGHT_BACKFILLS_PER_PEER: usize = 1;
 const SUMMARY_BACKPRESSURE_HIGH_WATERMARK: u64 = 256;
 const IDLE_NETWORK_SLEEP: Duration = Duration::from_millis(50);
@@ -361,6 +367,11 @@ enum PendingNetworkCommand {
         agent_envelope: RawAgentEnvelope,
         content: Value,
     },
+    AgentPayment {
+        remote_node_id: String,
+        message_kind: String,
+        payment: Value,
+    },
 }
 
 fn pending_network_commands_path(state_dir: &Path) -> PathBuf {
@@ -415,6 +426,22 @@ pub fn enqueue_peer_direct_message_command(
     )
 }
 
+pub fn enqueue_agent_payment_command(
+    state_dir: &Path,
+    remote_node_id: &str,
+    message_kind: &str,
+    payment: Value,
+) -> Result<()> {
+    enqueue_pending_network_command(
+        state_dir,
+        &PendingNetworkCommand::AgentPayment {
+            remote_node_id: remote_node_id.trim().to_owned(),
+            message_kind: message_kind.trim().to_owned(),
+            payment,
+        },
+    )
+}
+
 fn raw_agent_envelope_to_control_record(
     envelope: &RawAgentEnvelope,
 ) -> crate::control::AgentInteractionEnvelope {
@@ -430,6 +457,853 @@ fn raw_agent_envelope_to_control_record(
             .and_then(|value| serde_json::from_str(value).ok()),
         signature: envelope.signature.clone(),
     }
+}
+
+fn build_agent_payment_summary(
+    remote_node_id: &str,
+    message_kind: &str,
+    payment: Value,
+) -> SummaryAnnouncement {
+    let remote_node_id = remote_node_id.trim();
+    let payment_id = payment
+        .get("payment_id")
+        .and_then(Value::as_str)
+        .unwrap_or("payment");
+    SummaryAnnouncement {
+        summary_id: format!("payment:{payment_id}:{}", Uuid::new_v4()),
+        source_node_id: String::new(),
+        scope: SwarmScope::Node(remote_node_id.to_owned()),
+        summary_kind: AGENT_PAYMENT_SUMMARY_KIND.to_owned(),
+        artifact_path: None,
+        payload: json!({
+            "message_kind": message_kind,
+            "payment": payment,
+        }),
+    }
+}
+
+fn agent_event_status_label(status: wattswarm_protocol::types::AgentEventStatus) -> String {
+    serde_json::to_value(status)
+        .ok()
+        .and_then(|value| value.as_str().map(ToOwned::to_owned))
+        .unwrap_or_else(|| "pending".to_owned())
+}
+
+fn load_commit_plane_token(token_file: &str) -> Result<String> {
+    let token = std::fs::read_to_string(token_file)
+        .with_context(|| format!("read Wattetheria control token file: {token_file}"))?;
+    let token = token.trim().to_owned();
+    if token.is_empty() {
+        bail!("Wattetheria control token file is empty: {token_file}");
+    }
+    Ok(token)
+}
+
+fn route_agent_decision_to_wattetheria(
+    event: &wattswarm_protocol::types::AgentEvent,
+    decision: &wattswarm_protocol::types::AgentDecision,
+    entry: &crate::control::ExecutorRegistryEntry,
+) -> Result<(i64, String)> {
+    let commit_plane_endpoint = entry
+        .commit_plane_endpoint
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow!("core-agent executor missing commit_plane_endpoint"))?;
+    let commit_plane_token_file = entry
+        .commit_plane_token_file
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow!("core-agent executor missing commit_plane_token_file"))?;
+    let token = load_commit_plane_token(commit_plane_token_file)?;
+    let client = reqwest::blocking::Client::new();
+    let response = client
+        .post(format!(
+            "{}/v1/agent-actions/commit",
+            commit_plane_endpoint.trim_end_matches('/')
+        ))
+        .header("authorization", format!("Bearer {token}"))
+        .header("x-agent-event-id", &event.event_id)
+        .header("x-agent-decision-id", &decision.decision_id)
+        .json(&json!({
+            "event": event,
+            "decision": decision,
+        }))
+        .send()
+        .context("POST Wattetheria agent action commit")?;
+    let status_code = response.status().as_u16() as i64;
+    let body = response.text().unwrap_or_default();
+    if status_code < 200 || status_code >= 300 {
+        bail!("Wattetheria agent action commit returned {status_code}: {body}");
+    }
+    Ok((status_code, body))
+}
+
+fn required_event_payload_string(
+    payload: &Value,
+    key: &str,
+    event_type: &wattswarm_protocol::types::AgentEventType,
+) -> Result<String> {
+    payload
+        .get(key)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .ok_or_else(|| anyhow!("agent event {:?} missing {}", event_type, key))
+}
+
+fn route_topic_message_reply_to_wattswarm(
+    state_dir: &Path,
+    db_path: &Path,
+    event: &wattswarm_protocol::types::AgentEvent,
+    decision: &wattswarm_protocol::types::AgentDecision,
+) -> Result<(i64, String)> {
+    match decision.action.as_str() {
+        "ignore" => {
+            return Ok((
+                200,
+                json!({
+                    "ok": true,
+                    "status": "ignored",
+                    "store": "wattswarm",
+                    "event_id": event.event_id,
+                })
+                .to_string(),
+            ));
+        }
+        "reply" => {}
+        action => {
+            bail!(
+                "unsupported wattswarm_direct topic action {action} for event_type={:?}",
+                event.event_type
+            );
+        }
+    }
+
+    let feed_key = required_event_payload_string(&event.payload, "feed_key", &event.event_type)?;
+    let scope_hint =
+        required_event_payload_string(&event.payload, "scope_hint", &event.event_type)?;
+    let content = decision
+        .payload
+        .get("content")
+        .cloned()
+        .ok_or_else(|| anyhow!("topic reply decision requires payload.content"))?;
+    let reply_to_message_id = decision
+        .payload
+        .get("reply_to_message_id")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
+        .or_else(|| {
+            event
+                .payload
+                .get("message_id")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned)
+        });
+
+    let mut node = crate::control::open_node(state_dir, db_path)?;
+    let network_id = node
+        .store
+        .load_verified_network_protocol_params()
+        .map(|verified| verified.network_id)
+        .unwrap_or_else(|_| DEFAULT_NETWORK_CONTEXT_ID.to_owned());
+    let created_at = observed_at_ms();
+    let emitted = crate::control::emit_topic_message_with_content(
+        &mut node,
+        state_dir,
+        &network_id,
+        &feed_key,
+        &scope_hint,
+        content,
+        reply_to_message_id,
+        created_at,
+    )?;
+    let _ = crate::topic_interpretation::process_topic_interpretation_for_topic(
+        &mut node,
+        state_dir,
+        &feed_key,
+        &scope_hint,
+    );
+    let _ = crate::topic_consensus::process_structured_topic_consensus_for_topic(
+        &mut node,
+        state_dir,
+        &feed_key,
+        &scope_hint,
+    );
+
+    Ok((
+        201,
+        json!({
+            "ok": true,
+            "status": "posted",
+            "store": "wattswarm",
+            "message_id": emitted.event_id,
+            "feed_key": feed_key,
+            "scope_hint": scope_hint,
+        })
+        .to_string(),
+    ))
+}
+
+fn route_task_result_to_wattswarm(
+    state_dir: &Path,
+    db_path: &Path,
+    event: &wattswarm_protocol::types::AgentEvent,
+    decision: &wattswarm_protocol::types::AgentDecision,
+) -> Result<(i64, String)> {
+    let task_id = required_event_payload_string(&event.payload, "task_id", &event.event_type)?;
+    let event_kind =
+        required_event_payload_string(&event.payload, "event_kind", &event.event_type)?;
+    let mut node = crate::control::open_node(state_dir, db_path)?;
+    let task = node
+        .task_view(&task_id)?
+        .ok_or_else(|| anyhow!("task not found for task_result_received: {task_id}"))?;
+    let now = observed_at_ms();
+
+    match decision.action.as_str() {
+        "accept_result" => {
+            if event_kind == "candidate_proposed" {
+                let candidate_id = required_event_payload_string(
+                    &event.payload,
+                    "candidate_id",
+                    &event.event_type,
+                )?;
+                let candidate = node
+                    .store
+                    .get_candidate_by_id(&task_id, &candidate_id)?
+                    .ok_or_else(|| {
+                        anyhow!("candidate not found for task_result_received: {candidate_id}")
+                    })?;
+                let candidate_hash = crate::crypto::candidate_hash(&candidate)?;
+                let verify_execution_id = format!("agent-verify-{}", event.event_id);
+                let lease_until = now.saturating_add(task.contract.assignment.claim.lease_ms);
+                node.claim_task(
+                    &task_id,
+                    crate::types::ClaimRole::Verify,
+                    &verify_execution_id,
+                    lease_until,
+                    task.epoch,
+                    now.saturating_add(1),
+                )?;
+                let verifier_result_hash = format!(
+                    "agent-event-approve:{}:{}:{}",
+                    task_id, candidate_id, event.event_id
+                );
+                node.submit_verifier_result(
+                    &task_id,
+                    crate::types::VerifierResult {
+                        candidate_id: candidate_id.clone(),
+                        execution_id: verify_execution_id.clone(),
+                        verification_status: crate::types::VerificationStatus::Passed,
+                        passed: true,
+                        score: 1.0,
+                        reason_codes: vec![REASON_SCHEMA_OK],
+                        verifier_result_hash: verifier_result_hash.clone(),
+                        provider_family: "agent_event_bus".to_owned(),
+                        model_id: "local-agent-approval".to_owned(),
+                        policy_id: task.contract.acceptance.verifier_policy.policy_id.clone(),
+                        policy_version: task
+                            .contract
+                            .acceptance
+                            .verifier_policy
+                            .policy_version
+                            .clone(),
+                        policy_hash: task.contract.acceptance.verifier_policy.policy_hash.clone(),
+                    },
+                    task.epoch,
+                    now.saturating_add(2),
+                )?;
+                let salt = uuid::Uuid::new_v4().to_string();
+                let commit_hash = crate::crypto::vote_commit_hash(
+                    crate::types::VoteChoice::Approve,
+                    &salt,
+                    &verifier_result_hash,
+                );
+                node.submit_vote_commit(
+                    crate::types::VoteCommitPayload {
+                        task_id: task_id.clone(),
+                        candidate_id: candidate_id.clone(),
+                        candidate_hash: candidate_hash.clone(),
+                        execution_id: verify_execution_id.clone(),
+                        verifier_result_hash: verifier_result_hash.clone(),
+                        commit_hash,
+                    },
+                    task.epoch,
+                    now.saturating_add(3),
+                )?;
+                node.submit_vote_reveal(
+                    crate::types::VoteRevealPayload {
+                        task_id: task_id.clone(),
+                        candidate_id: candidate_id.clone(),
+                        candidate_hash,
+                        execution_id: verify_execution_id,
+                        verifier_result_hash,
+                        vote: crate::types::VoteChoice::Approve,
+                        salt,
+                    },
+                    task.epoch,
+                    now.saturating_add(4),
+                )?;
+                node.commit_decision(&task_id, task.epoch, &candidate_id, now.saturating_add(5))?;
+                node.finalize_decision(
+                    &task_id,
+                    task.epoch,
+                    &candidate_id,
+                    crate::types::FinalityProof {
+                        threshold: 1,
+                        signatures: vec![crate::node::finality_sign(
+                            &node.identity,
+                            &task_id,
+                            task.epoch,
+                            &candidate_id,
+                        )],
+                    },
+                    now.saturating_add(6),
+                )?;
+                return Ok((
+                    200,
+                    json!({
+                        "ok": true,
+                        "status": "finalized",
+                        "store": "wattswarm",
+                        "task_id": task_id,
+                        "candidate_id": candidate_id,
+                    })
+                    .to_string(),
+                ));
+            }
+            return Ok((
+                200,
+                json!({
+                    "ok": true,
+                    "status": "observed",
+                    "store": "wattswarm",
+                    "task_id": task_id,
+                    "event_kind": event_kind,
+                })
+                .to_string(),
+            ));
+        }
+        "reject_result" | "request_retry" => {
+            let next_attempt = task.retry_attempt.saturating_add(1);
+            let run_at = now.saturating_add(task.contract.acceptance.vote.reveal_deadline_ms);
+            node.schedule_retry(&task_id, next_attempt, run_at, task.epoch, now)?;
+            return Ok((
+                200,
+                json!({
+                    "ok": true,
+                    "status": "retry_scheduled",
+                    "store": "wattswarm",
+                    "task_id": task_id,
+                    "attempt": next_attempt,
+                    "run_at": run_at,
+                })
+                .to_string(),
+            ));
+        }
+        "inspect_task" => {
+            return Ok((
+                200,
+                json!({
+                    "ok": true,
+                    "status": "observed",
+                    "store": "wattswarm",
+                    "task_id": task_id,
+                })
+                .to_string(),
+            ));
+        }
+        action => {
+            bail!(
+                "unsupported wattswarm_direct task result action {action} for event_type={:?}",
+                event.event_type
+            );
+        }
+    }
+}
+
+fn route_task_claim_to_wattswarm(
+    event: &wattswarm_protocol::types::AgentEvent,
+    decision: &wattswarm_protocol::types::AgentDecision,
+) -> Result<(i64, String)> {
+    let task_id = required_event_payload_string(&event.payload, "task_id", &event.event_type)?;
+    match decision.action.as_str() {
+        "decide_claim" | "inspect_task" => Ok((
+            200,
+            json!({
+                "ok": true,
+                "status": "recorded",
+                "store": "wattswarm",
+                "task_id": task_id,
+                "detail": "task claim lifecycle is already authoritative in wattswarm; no secondary semantic commit is applied here"
+            })
+            .to_string(),
+        )),
+        action => bail!(
+            "unsupported wattswarm_direct task claim action {action} for event_type={:?}",
+            event.event_type
+        ),
+    }
+}
+
+fn route_agent_decision_to_wattswarm(
+    state_dir: &Path,
+    db_path: Option<&Path>,
+    event: &wattswarm_protocol::types::AgentEvent,
+    decision: &wattswarm_protocol::types::AgentDecision,
+) -> Result<(i64, String)> {
+    match event.event_type {
+        wattswarm_protocol::types::AgentEventType::TopicMessageRequiresReply => {
+            let db_path = db_path.ok_or_else(|| {
+                anyhow!("wattswarm_direct topic routing requires a configured db_path")
+            })?;
+            route_topic_message_reply_to_wattswarm(state_dir, db_path, event, decision)
+        }
+        wattswarm_protocol::types::AgentEventType::TaskResultReceived => {
+            let db_path = db_path.ok_or_else(|| {
+                anyhow!("wattswarm_direct task result routing requires a configured db_path")
+            })?;
+            route_task_result_to_wattswarm(state_dir, db_path, event, decision)
+        }
+        wattswarm_protocol::types::AgentEventType::TaskClaimReceived => {
+            route_task_claim_to_wattswarm(event, decision)
+        }
+        _ => bail!(
+            "wattswarm_direct decision routing is not supported yet for event_type={:?}",
+            event.event_type
+        ),
+    }
+}
+
+fn route_agent_decision(
+    state_dir: &Path,
+    db_path: Option<&Path>,
+    event: &wattswarm_protocol::types::AgentEvent,
+    decision: &wattswarm_protocol::types::AgentDecision,
+    entry: &crate::control::ExecutorRegistryEntry,
+) -> Result<Option<(String, i64, String)>> {
+    match decision.route {
+        wattswarm_protocol::types::AgentDecisionRoute::Noop => Ok(None),
+        wattswarm_protocol::types::AgentDecisionRoute::WattetheriaCommit => {
+            let (status_code, body) = route_agent_decision_to_wattetheria(event, decision, entry)?;
+            Ok(Some((
+                entry
+                    .commit_plane_endpoint
+                    .clone()
+                    .unwrap_or_else(|| String::from("wattetheria")),
+                status_code,
+                body,
+            )))
+        }
+        wattswarm_protocol::types::AgentDecisionRoute::WattswarmDirect => {
+            let (status_code, body) =
+                route_agent_decision_to_wattswarm(state_dir, db_path, event, decision)?;
+            Ok(Some(("wattswarm:direct".to_owned(), status_code, body)))
+        }
+    }
+}
+
+fn topic_message_kind(content: &Value) -> Option<&str> {
+    content
+        .as_object()
+        .and_then(|object| object.get("kind"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+fn topic_message_requires_reply(content: &Value) -> bool {
+    !matches!(
+        topic_message_kind(content),
+        Some("proposal" | "stance" | "interpreted_stance" | "consensus_result")
+    )
+}
+
+fn task_claim_agent_event(
+    event: &crate::types::Event,
+    payload: &crate::types::ClaimPayload,
+) -> wattswarm_protocol::types::AgentEvent {
+    build_agent_event(
+        wattswarm_protocol::types::AgentEventType::TaskClaimReceived,
+        wattswarm_protocol::types::AgentEventSourceKind::TaskLifecycle,
+        Some(event.author_node_id.clone()),
+        None,
+        json!({
+            "event_id": &event.event_id,
+            "event_kind": "task_claimed",
+            "task_id": &payload.task_id,
+            "claimer_node_id": &payload.claimer_node_id,
+            "execution_id": &payload.execution_id,
+            "role": payload.role,
+            "lease_until": payload.lease_until,
+            "created_at": event.created_at,
+        }),
+        false,
+        vec!["inspect_task".to_owned(), "decide_claim".to_owned()],
+        Some(payload.task_id.clone()),
+        Some(format!(
+            "task_claim:{}:{}",
+            payload.task_id, payload.execution_id
+        )),
+    )
+}
+
+fn task_result_agent_event(
+    node: &Node,
+    event: &crate::types::Event,
+) -> Result<Option<wattswarm_protocol::types::AgentEvent>> {
+    match &event.payload {
+        crate::types::EventPayload::CandidateProposed(payload) => {
+            let candidate_output = node
+                .store
+                .get_candidate_by_id(&payload.task_id, &payload.candidate.candidate_id)?
+                .map(|candidate| candidate.output)
+                .unwrap_or(Value::Null);
+            Ok(Some(build_agent_event(
+                wattswarm_protocol::types::AgentEventType::TaskResultReceived,
+                wattswarm_protocol::types::AgentEventSourceKind::TaskLifecycle,
+                Some(event.author_node_id.clone()),
+                None,
+                json!({
+                    "event_id": &event.event_id,
+                    "event_kind": "candidate_proposed",
+                    "task_id": &payload.task_id,
+                    "candidate_id": &payload.candidate.candidate_id,
+                    "execution_id": &payload.candidate.execution_id,
+                    "candidate_hash": &payload.candidate.output_ref.digest,
+                    "candidate_output": candidate_output,
+                    "created_at": event.created_at,
+                }),
+                false,
+                vec![
+                    "inspect_task".to_owned(),
+                    "accept_result".to_owned(),
+                    "reject_result".to_owned(),
+                    "request_retry".to_owned(),
+                ],
+                Some(payload.task_id.clone()),
+                Some(format!(
+                    "task_result:{}:{}",
+                    payload.task_id, payload.candidate.candidate_id
+                )),
+            )))
+        }
+        crate::types::EventPayload::DecisionFinalized(payload) => Ok(Some(build_agent_event(
+            wattswarm_protocol::types::AgentEventType::TaskResultReceived,
+            wattswarm_protocol::types::AgentEventSourceKind::TaskLifecycle,
+            Some(event.author_node_id.clone()),
+            None,
+            json!({
+                "event_id": &event.event_id,
+                "event_kind": "decision_finalized",
+                "task_id": &payload.task_id,
+                "candidate_id": &payload.candidate_id,
+                "winning_candidate_hash": &payload.winning_candidate_hash,
+                "finality_proof": &payload.finality_proof,
+                "created_at": event.created_at,
+            }),
+            false,
+            vec!["inspect_task".to_owned(), "accept_result".to_owned()],
+            Some(payload.task_id.clone()),
+            Some(format!(
+                "task_result:{}:finalized:{}",
+                payload.task_id, payload.candidate_id
+            )),
+        ))),
+        crate::types::EventPayload::TaskError(payload) => Ok(Some(build_agent_event(
+            wattswarm_protocol::types::AgentEventType::TaskResultReceived,
+            wattswarm_protocol::types::AgentEventSourceKind::TaskLifecycle,
+            Some(event.author_node_id.clone()),
+            None,
+            json!({
+                "event_id": &event.event_id,
+                "event_kind": "task_error",
+                "task_id": &payload.task_id,
+                "reason": payload.reason,
+                "reason_codes": &payload.reason_codes,
+                "message": &payload.message,
+                "custom_reason_namespace": &payload.custom_reason_namespace,
+                "custom_reason_code": &payload.custom_reason_code,
+                "custom_reason_message": &payload.custom_reason_message,
+                "created_at": event.created_at,
+            }),
+            false,
+            vec!["inspect_task".to_owned(), "request_retry".to_owned()],
+            Some(payload.task_id.clone()),
+            Some(format!(
+                "task_result:{}:error:{}",
+                payload.task_id, event.event_id
+            )),
+        ))),
+        crate::types::EventPayload::TaskRetryScheduled(payload) => Ok(Some(build_agent_event(
+            wattswarm_protocol::types::AgentEventType::TaskResultReceived,
+            wattswarm_protocol::types::AgentEventSourceKind::TaskLifecycle,
+            Some(event.author_node_id.clone()),
+            None,
+            json!({
+                "event_id": &event.event_id,
+                "event_kind": "task_retry_scheduled",
+                "task_id": &payload.task_id,
+                "attempt": payload.attempt,
+                "run_at": payload.run_at,
+                "created_at": event.created_at,
+            }),
+            false,
+            vec!["inspect_task".to_owned()],
+            Some(payload.task_id.clone()),
+            Some(format!(
+                "task_result:{}:retry:{}",
+                payload.task_id, payload.attempt
+            )),
+        ))),
+        _ => Ok(None),
+    }
+}
+
+fn topic_message_agent_event(
+    node: &Node,
+    event: &crate::types::Event,
+    payload: &crate::types::TopicMessagePostedPayload,
+) -> Result<Option<wattswarm_protocol::types::AgentEvent>> {
+    let Some(topic_message) = node.store.get_topic_message(&event.event_id)? else {
+        return Ok(None);
+    };
+    if !topic_message_requires_reply(&topic_message.content) {
+        return Ok(None);
+    }
+    Ok(Some(build_agent_event(
+        wattswarm_protocol::types::AgentEventType::TopicMessageRequiresReply,
+        wattswarm_protocol::types::AgentEventSourceKind::TopicMessage,
+        Some(event.author_node_id.clone()),
+        None,
+        json!({
+            "message_id": &event.event_id,
+            "network_id": &payload.network_id,
+            "feed_key": &payload.feed_key,
+            "scope_hint": &payload.scope_hint,
+            "author_node_id": &event.author_node_id,
+            "content": topic_message.content,
+            "reply_to_message_id": &payload.reply_to_message_id,
+            "created_at": event.created_at,
+        }),
+        false,
+        vec!["reply".to_owned(), "ignore".to_owned()],
+        Some(payload.feed_key.clone()),
+        Some(format!("topic_message:{}", event.event_id)),
+    )))
+}
+
+fn build_agent_event(
+    event_type: wattswarm_protocol::types::AgentEventType,
+    source_kind: wattswarm_protocol::types::AgentEventSourceKind,
+    source_node_id: Option<String>,
+    target_agent_id: Option<String>,
+    payload: Value,
+    requires_commit: bool,
+    allowed_actions: Vec<String>,
+    correlation_id: Option<String>,
+    dedupe_key: Option<String>,
+) -> wattswarm_protocol::types::AgentEvent {
+    wattswarm_protocol::types::AgentEvent {
+        event_id: Uuid::new_v4().to_string(),
+        event_type,
+        source_kind,
+        source_node_id,
+        target_agent_id,
+        target_executor: Some(CORE_AGENT_EXECUTOR_NAME.to_owned()),
+        payload,
+        requires_commit,
+        allowed_actions,
+        correlation_id,
+        dedupe_key,
+        created_at: observed_at_ms(),
+    }
+}
+
+fn deliver_agent_event_to_local_executor(
+    state_dir: &Path,
+    db_path: Option<&Path>,
+    event: &wattswarm_protocol::types::AgentEvent,
+) -> Result<()> {
+    if let Some(dedupe_key) = event.dedupe_key.as_deref()
+        && crate::control::find_agent_event_record_by_dedupe_key(state_dir, dedupe_key)?.is_some()
+    {
+        return Ok(());
+    }
+
+    let now = observed_at_ms();
+    crate::control::save_agent_event_record_state(
+        state_dir,
+        event,
+        wattswarm_protocol::types::AgentEventStatus::Pending,
+        now,
+    )?;
+
+    let registry = crate::control::load_executor_registry_state(state_dir)?;
+    let Some(entry) = registry
+        .entries
+        .into_iter()
+        .find(|candidate| candidate.name == CORE_AGENT_EXECUTOR_NAME)
+    else {
+        crate::control::save_agent_event_record_state(
+            state_dir,
+            event,
+            wattswarm_protocol::types::AgentEventStatus::Failed,
+            observed_at_ms(),
+        )?;
+        crate::control::append_agent_event_delivery_record_state(
+            state_dir,
+            &crate::storage::LocalAgentEventDeliveryRow {
+                delivery_id: Uuid::new_v4().to_string(),
+                event_id: event.event_id.clone(),
+                attempt_no: 1,
+                endpoint_url: String::new(),
+                delivery_status: "failed".to_owned(),
+                response_code: None,
+                response_body: None,
+                error_text: Some("core-agent executor is not registered".to_owned()),
+                next_retry_at: None,
+                created_at: observed_at_ms(),
+            },
+        )?;
+        return Ok(());
+    };
+
+    let callback_base_url = entry
+        .agent_event_callback_base_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| entry.base_url.trim_end_matches('/'));
+    let endpoint_url = format!("{}/agent-events", callback_base_url.trim_end_matches('/'));
+    let client = reqwest::blocking::Client::new();
+    let delivery_started_at = observed_at_ms();
+    let callback_request = wattswarm_protocol::types::AgentEventCallbackRequest {
+        event: event.clone(),
+    };
+    let result = client.post(&endpoint_url).json(&callback_request).send();
+    match result {
+        Ok(response) => {
+            let response_code = response.status().as_u16() as i64;
+            let body = response.text().unwrap_or_default();
+            let parsed = serde_json::from_str::<
+                wattswarm_protocol::types::AgentEventCallbackResponse,
+            >(&body)
+            .ok();
+            let status = if response_code >= 200 && response_code < 300 {
+                if parsed.as_ref().is_some_and(|ack| ack.ok) {
+                    wattswarm_protocol::types::AgentEventStatus::Acked
+                } else {
+                    wattswarm_protocol::types::AgentEventStatus::Delivered
+                }
+            } else {
+                wattswarm_protocol::types::AgentEventStatus::Failed
+            };
+            crate::control::save_agent_event_record_state(
+                state_dir,
+                event,
+                status.clone(),
+                observed_at_ms(),
+            )?;
+            crate::control::append_agent_event_delivery_record_state(
+                state_dir,
+                &crate::storage::LocalAgentEventDeliveryRow {
+                    delivery_id: Uuid::new_v4().to_string(),
+                    event_id: event.event_id.clone(),
+                    attempt_no: 1,
+                    endpoint_url,
+                    delivery_status: agent_event_status_label(status),
+                    response_code: Some(response_code),
+                    response_body: Some(body),
+                    error_text: None,
+                    next_retry_at: None,
+                    created_at: delivery_started_at,
+                },
+            )?;
+            if let Some(decision) = parsed.and_then(|ack| ack.decision) {
+                match route_agent_decision(state_dir, db_path, event, &decision, &entry) {
+                    Ok(commit_result) => {
+                        crate::control::save_agent_event_record_state(
+                            state_dir,
+                            event,
+                            wattswarm_protocol::types::AgentEventStatus::Completed,
+                            observed_at_ms(),
+                        )?;
+                        if let Some((endpoint_url, commit_code, commit_body)) = commit_result {
+                            crate::control::append_agent_event_delivery_record_state(
+                                state_dir,
+                                &crate::storage::LocalAgentEventDeliveryRow {
+                                    delivery_id: Uuid::new_v4().to_string(),
+                                    event_id: event.event_id.clone(),
+                                    attempt_no: 2,
+                                    endpoint_url,
+                                    delivery_status: "completed".to_owned(),
+                                    response_code: Some(commit_code),
+                                    response_body: Some(commit_body),
+                                    error_text: None,
+                                    next_retry_at: None,
+                                    created_at: observed_at_ms(),
+                                },
+                            )?;
+                        }
+                    }
+                    Err(error) => {
+                        crate::control::save_agent_event_record_state(
+                            state_dir,
+                            event,
+                            wattswarm_protocol::types::AgentEventStatus::Failed,
+                            observed_at_ms(),
+                        )?;
+                        crate::control::append_agent_event_delivery_record_state(
+                            state_dir,
+                            &crate::storage::LocalAgentEventDeliveryRow {
+                                delivery_id: Uuid::new_v4().to_string(),
+                                event_id: event.event_id.clone(),
+                                attempt_no: 2,
+                                endpoint_url: entry
+                                    .commit_plane_endpoint
+                                    .clone()
+                                    .unwrap_or_else(String::new),
+                                delivery_status: "failed".to_owned(),
+                                response_code: None,
+                                response_body: None,
+                                error_text: Some(error.to_string()),
+                                next_retry_at: None,
+                                created_at: observed_at_ms(),
+                            },
+                        )?;
+                    }
+                }
+            }
+        }
+        Err(error) => {
+            crate::control::save_agent_event_record_state(
+                state_dir,
+                event,
+                wattswarm_protocol::types::AgentEventStatus::Failed,
+                observed_at_ms(),
+            )?;
+            crate::control::append_agent_event_delivery_record_state(
+                state_dir,
+                &crate::storage::LocalAgentEventDeliveryRow {
+                    delivery_id: Uuid::new_v4().to_string(),
+                    event_id: event.event_id.clone(),
+                    attempt_no: 1,
+                    endpoint_url,
+                    delivery_status: "failed".to_owned(),
+                    response_code: None,
+                    response_body: None,
+                    error_text: Some(error.to_string()),
+                    next_retry_at: None,
+                    created_at: delivery_started_at,
+                },
+            )?;
+        }
+    }
+
+    Ok(())
 }
 
 #[derive(Debug, Serialize)]
@@ -753,6 +1627,73 @@ fn save_dm_message(
     Ok(record)
 }
 
+fn save_agent_payment_summary(
+    state_dir: &Path,
+    remote_node_id: &str,
+    summary: &SummaryAnnouncement,
+) -> Result<crate::control::AgentPaymentRecord> {
+    let message_kind = summary
+        .payload
+        .get("message_kind")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("agent payment summary missing message_kind"))?;
+    let payment = summary
+        .payload
+        .get("payment")
+        .cloned()
+        .ok_or_else(|| anyhow!("agent payment summary missing payment payload"))?;
+    let payment_id = payment
+        .get("payment_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("agent payment summary missing payment_id"))?;
+    let record = crate::control::AgentPaymentRecord {
+        payment_id: payment_id.to_owned(),
+        remote_node_id: remote_node_id.to_owned(),
+        summary_id: summary.summary_id.clone(),
+        message_kind: message_kind.to_owned(),
+        payment,
+        updated_at: observed_at_ms(),
+    };
+    crate::control::save_agent_payment_record_state(state_dir, &record)?;
+    let event_type = if message_kind == "payment_request" {
+        wattswarm_protocol::types::AgentEventType::PaymentRequest
+    } else {
+        wattswarm_protocol::types::AgentEventType::PaymentUpdate
+    };
+    let allowed_actions = payment_allowed_actions(message_kind);
+    let event = build_agent_event(
+        event_type,
+        wattswarm_protocol::types::AgentEventSourceKind::PaymentSummary,
+        Some(remote_node_id.to_owned()),
+        None,
+        json!({
+            "summary_id": summary.summary_id,
+            "message_kind": message_kind,
+            "payment": record.payment,
+        }),
+        true,
+        allowed_actions,
+        Some(record.payment_id.clone()),
+        Some(format!("payment:{}:{}", record.payment_id, message_kind)),
+    );
+    deliver_agent_event_to_local_executor(state_dir, None, &event)?;
+    Ok(record)
+}
+
+fn payment_allowed_actions(message_kind: &str) -> Vec<String> {
+    match message_kind {
+        "payment_request" => vec![
+            "authorize".to_owned(),
+            "reject".to_owned(),
+            "cancel".to_owned(),
+        ],
+        "payment_authorized" => vec!["submit".to_owned(), "cancel".to_owned()],
+        "payment_submitted" => vec!["settle".to_owned()],
+        "payment_settled" | "payment_rejected" | "payment_cancelled" => Vec::new(),
+        _ => Vec::new(),
+    }
+}
+
 fn process_pending_network_commands(
     service: &mut NetworkBridgeService,
     state_dir: &Path,
@@ -793,6 +1734,16 @@ fn process_pending_network_commands(
             } => service
                 .send_peer_direct_message(&remote_node_id, Some(agent_envelope), content)
                 .map(|_| ()),
+            PendingNetworkCommand::AgentPayment {
+                remote_node_id,
+                message_kind,
+                payment,
+            } => {
+                let mut summary =
+                    build_agent_payment_summary(&remote_node_id, &message_kind, payment);
+                summary.source_node_id = service.local_peer_id().to_string();
+                service.publish_summary(summary).map(|_| ())
+            }
         };
         match result {
             Ok(()) => processed += 1,
@@ -1156,7 +2107,7 @@ fn run_background_network_service_with_hook(
         &scopes,
         &protocol_params,
     )?;
-    service.set_state_dir(state_dir.to_path_buf());
+    service.set_state_dir(state_dir.to_path_buf(), db_path.to_path_buf());
     store_latest_network_observability_snapshot(state_dir, service.observability_snapshot(&node)?);
     let mut announced_listen = false;
     let mut announced_peers: HashMap<String, Instant> = HashMap::new();
@@ -1409,6 +2360,7 @@ pub struct NetworkBridgeService {
     pending_dm_requests: HashMap<PeerDirectMessageRequestId, PendingPeerDirectMessageRequest>,
     /// Optional state_dir for run-queue bridge hooks.
     state_dir: Option<PathBuf>,
+    db_path: Option<PathBuf>,
 }
 
 impl NetworkBridgeService {
@@ -1447,12 +2399,14 @@ impl NetworkBridgeService {
             pending_relationship_requests: HashMap::new(),
             pending_dm_requests: HashMap::new(),
             state_dir: None,
+            db_path: None,
         })
     }
 
-    /// Set the state_dir for run-queue bridge hooks.
-    pub fn set_state_dir(&mut self, state_dir: PathBuf) {
+    /// Set the local persistence paths for run-queue and agent-event hooks.
+    pub fn set_state_dir(&mut self, state_dir: PathBuf, db_path: PathBuf) {
         self.state_dir = Some(state_dir);
+        self.db_path = Some(db_path);
     }
 
     pub fn local_peer_id(&self) -> PeerId {
@@ -1493,2258 +2447,8 @@ impl NetworkBridgeService {
         let _guard = self.tokio_runtime.enter();
         self.runtime.dial(addr)
     }
-
-    pub fn send_peer_relationship_action(
-        &mut self,
-        remote_node_id: &str,
-        action: crate::control::PeerRelationshipAction,
-        agent_envelope: Option<RawAgentEnvelope>,
-    ) -> Result<PeerRelationshipRequestId> {
-        let Some(state_dir) = &self.state_dir else {
-            bail!("peer relationship actions require state_dir to be configured");
-        };
-        let remote_node_id = remote_node_id.trim();
-        if remote_node_id.is_empty() {
-            bail!("remote_node_id is required");
-        }
-        let peer = remote_node_id
-            .parse::<PeerId>()
-            .map_err(|err| anyhow!("parse remote_node_id as peer id: {err}"))?;
-        if !self.connected_peers.contains(&peer) {
-            bail!("peer relationship actions require a connected peer");
-        }
-        let relationship_record = crate::control::apply_peer_relationship_action_state(
-            state_dir,
-            remote_node_id,
-            action,
-            crate::control::PeerRelationshipInitiator::Local,
-        )?;
-        let local_node_id = self.local_peer_id().to_string();
-        let capability = match action {
-            crate::control::PeerRelationshipAction::Request => "peer.relationship.request",
-            crate::control::PeerRelationshipAction::Accept => "peer.relationship.accept",
-            crate::control::PeerRelationshipAction::Reject => "peer.relationship.reject",
-            crate::control::PeerRelationshipAction::Cancel => "peer.relationship.cancel",
-            crate::control::PeerRelationshipAction::Remove => "peer.relationship.remove",
-            crate::control::PeerRelationshipAction::Block => "peer.relationship.block",
-            crate::control::PeerRelationshipAction::Unblock => "peer.relationship.unblock",
-        };
-        let envelope = agent_envelope.unwrap_or_else(|| {
-            default_agent_envelope(
-                &local_node_id,
-                remote_node_id,
-                capability,
-                json!({
-                    "action": wire_peer_relationship_action(action),
-                    "remote_node_id": remote_node_id,
-                }),
-            )
-        });
-        if action == crate::control::PeerRelationshipAction::Accept
-            && relationship_record.relationship_state
-                == crate::control::PeerRelationshipState::Accepted
-        {
-            self.finalize_dm_session_from_relationship(
-                state_dir,
-                remote_node_id,
-                crate::control::PeerDmDirection::Outbound,
-                &envelope.protocol,
-                relationship_record.updated_at,
-            )?;
-        }
-        let _guard = self.tokio_runtime.enter();
-        let request_id = self.runtime.send_peer_relationship_request(
-            &peer,
-            PeerRelationshipRequest {
-                source_node_id: local_node_id,
-                target_node_id: remote_node_id.to_owned(),
-                action: wire_peer_relationship_action(action),
-                agent_envelope: Some(envelope),
-            },
-        )?;
-        self.pending_relationship_requests.insert(
-            request_id,
-            PendingPeerRelationshipRequest {
-                peer,
-                remote_node_id: remote_node_id.to_owned(),
-                action,
-            },
-        );
-        Ok(request_id)
-    }
-
-    fn request_peer_contact_material(
-        &mut self,
-        remote_node_id: &str,
-    ) -> Result<ContactMaterialRequestId> {
-        let Some(state_dir) = self.state_dir.clone() else {
-            bail!("contact material requests require state_dir to be configured");
-        };
-        let peer = remote_node_id
-            .parse::<PeerId>()
-            .map_err(|err| anyhow!("parse remote_node_id as peer id: {err}"))?;
-        self.ensure_peer_connected(&state_dir, &peer, remote_node_id)?;
-        if !self.connected_peers.contains(&peer) {
-            bail!("contact material requests require a connected peer");
-        }
-        let local_node_id = self.local_peer_id().to_string();
-        let request_id = self.runtime.send_contact_material_request(
-            &peer,
-            RawContactMaterialRequest {
-                source_node_id: local_node_id,
-                target_node_id: remote_node_id.to_owned(),
-            },
-        )?;
-        self.pending_contact_material_requests.insert(
-            request_id,
-            PendingContactMaterialRequest {
-                peer,
-                remote_node_id: remote_node_id.to_owned(),
-            },
-        );
-        Ok(request_id)
-    }
-
-    pub fn send_peer_direct_message(
-        &mut self,
-        remote_node_id: &str,
-        agent_envelope: Option<RawAgentEnvelope>,
-        content: Value,
-    ) -> Result<PeerDirectMessageRequestId> {
-        let Some(state_dir) = self.state_dir.clone() else {
-            bail!("peer direct messages require state_dir to be configured");
-        };
-        if relationship_state_for(&state_dir, remote_node_id)?
-            != Some(crate::control::PeerRelationshipState::Accepted)
-        {
-            bail!("peer direct messages require an accepted relationship");
-        }
-        let remote_node_id = remote_node_id.trim();
-        if remote_node_id.is_empty() {
-            bail!("remote_node_id is required");
-        }
-        let peer = remote_node_id
-            .parse::<PeerId>()
-            .map_err(|err| anyhow!("parse remote_node_id as peer id: {err}"))?;
-        if !self.connected_peers.contains(&peer) {
-            self.ensure_peer_connected(&state_dir, &peer, remote_node_id)?;
-        }
-        if !self.connected_peers.contains(&peer) {
-            bail!("peer direct messages require a connected peer");
-        }
-        let local_node_id = self.local_peer_id().to_string();
-        let thread_id = peer_dm_thread_id(&local_node_id, remote_node_id);
-        let thread = crate::control::load_peer_dm_thread_records_state(&state_dir)?
-            .into_iter()
-            .find(|record| record.thread_id == thread_id)
-            .ok_or_else(|| anyhow!("peer direct messages require an established session"))?;
-        if thread.session_state != crate::control::PeerDmSessionState::Ready {
-            bail!("peer direct messages require a ready session");
-        }
-        let message_id = Uuid::new_v4().to_string();
-        let content_ref = crate::control::materialize_json_content_artifact(
-            &state_dir,
-            wattswarm_artifact_store::ArtifactKind::DirectMessage,
-            &local_node_id,
-            &content,
-            observed_at_ms(),
-        )?;
-        let envelope = agent_envelope.unwrap_or_else(|| {
-            default_agent_envelope(
-                &local_node_id,
-                remote_node_id,
-                "peer.dm.message",
-                content.clone(),
-            )
-        });
-        let a2a_protocol = envelope.protocol.clone();
-        save_dm_message(
-            &state_dir,
-            remote_node_id,
-            &thread_id,
-            &message_id,
-            crate::control::PeerDmMessageKind::Message,
-            crate::control::PeerDmDirection::Outbound,
-            crate::control::PeerDmDeliveryState::Pending,
-            &envelope.protocol,
-            Some(&envelope),
-            content.clone(),
-            None,
-        )?;
-        record_data_plane_status(
-            &state_dir,
-            "dm_message",
-            &message_id,
-            Some(remote_node_id),
-            "iroh_direct",
-            "content_materialized",
-            None,
-        )?;
-        let _guard = self.tokio_runtime.enter();
-        let request_id = self.runtime.send_peer_direct_message_request(
-            &peer,
-            PeerDirectMessageRequest {
-                source_node_id: local_node_id,
-                target_node_id: remote_node_id.to_owned(),
-                thread_id: thread_id.clone(),
-                message_id: message_id.clone(),
-                kind: RawPeerDirectMessageKind::Message,
-                agent_envelope: Some(envelope),
-                contact_material: None,
-                content_ref: Some(content_ref),
-                control_json: None,
-            },
-        )?;
-        record_data_plane_status(
-            &state_dir,
-            "dm_message",
-            &message_id,
-            Some(remote_node_id),
-            "libp2p_control",
-            "control_sent",
-            None,
-        )?;
-        self.pending_dm_requests.insert(
-            request_id,
-            PendingPeerDirectMessageRequest {
-                peer,
-                remote_node_id: remote_node_id.to_owned(),
-                thread_id,
-                message_id,
-                kind: crate::control::PeerDmMessageKind::Message,
-                a2a_protocol,
-            },
-        );
-        Ok(request_id)
-    }
-
-    fn maybe_sync_topic_message_content(
-        &mut self,
-        node: &mut Node,
-        event: &crate::types::Event,
-        content_source_node_id: Option<&str>,
-    ) -> Result<()> {
-        let Some(state_dir) = self.state_dir.as_ref() else {
-            return Ok(());
-        };
-        let crate::types::EventPayload::TopicMessagePosted(payload) = &event.payload else {
-            return Ok(());
-        };
-        let remote_node_id = content_source_node_id.unwrap_or(&payload.content_ref.producer);
-        record_data_plane_status(
-            state_dir,
-            "topic_message",
-            &event.event_id,
-            Some(remote_node_id),
-            "libp2p_control",
-            "control_received",
-            None,
-        )?;
-        let content = match crate::control::fetch_json_content_artifact_via_iroh_with_local_peer_id(
-            state_dir,
-            &self.local_peer_id(),
-            remote_node_id,
-            wattswarm_artifact_store::ArtifactKind::TopicMessage,
-            &payload.content_ref,
-        ) {
-            Ok(content) => content,
-            Err(err) => {
-                let _ = record_data_plane_status(
-                    state_dir,
-                    "topic_message",
-                    &event.event_id,
-                    Some(remote_node_id),
-                    "iroh_direct",
-                    "hydrate_failed",
-                    Some(&err.to_string()),
-                );
-                return Err(err);
-            }
-        };
-        node.store
-            .update_topic_message_content(&event.event_id, &content, observed_at_ms())?;
-        record_data_plane_status(
-            state_dir,
-            "topic_message",
-            &event.event_id,
-            Some(remote_node_id),
-            "iroh_direct",
-            "content_hydrated",
-            None,
-        )?;
-        Ok(())
-    }
-
-    fn maybe_sync_candidate_output(
-        &mut self,
-        node: &mut Node,
-        event: &crate::types::Event,
-    ) -> Result<()> {
-        let Some(state_dir) = self.state_dir.as_ref() else {
-            return Ok(());
-        };
-        let crate::types::EventPayload::CandidateProposed(payload) = &event.payload else {
-            return Ok(());
-        };
-        if payload.candidate.has_resolved_output()
-            || node
-                .store
-                .get_candidate_by_id(&payload.task_id, &payload.candidate.candidate_id)?
-                .is_some_and(|candidate| candidate.has_resolved_output())
-        {
-            return Ok(());
-        }
-        record_data_plane_status(
-            state_dir,
-            "candidate_output",
-            &payload.candidate.candidate_id,
-            Some(&payload.candidate.output_ref.producer),
-            "libp2p_control",
-            "control_received",
-            None,
-        )?;
-        let content = match crate::control::fetch_json_content_artifact_via_iroh_with_local_peer_id(
-            state_dir,
-            &self.local_peer_id(),
-            &payload.candidate.output_ref.producer,
-            wattswarm_artifact_store::ArtifactKind::Reference,
-            &payload.candidate.output_ref,
-        ) {
-            Ok(content) => content,
-            Err(err) => {
-                let _ = record_data_plane_status(
-                    state_dir,
-                    "candidate_output",
-                    &payload.candidate.candidate_id,
-                    Some(&payload.candidate.output_ref.producer),
-                    "iroh_direct",
-                    "hydrate_failed",
-                    Some(&err.to_string()),
-                );
-                return Err(err);
-            }
-        };
-        node.store.update_candidate_output(
-            &payload.task_id,
-            &payload.candidate.candidate_id,
-            &content,
-            observed_at_ms(),
-        )?;
-        record_data_plane_status(
-            state_dir,
-            "candidate_output",
-            &payload.candidate.candidate_id,
-            Some(&payload.candidate.output_ref.producer),
-            "iroh_direct",
-            "content_hydrated",
-            None,
-        )?;
-        Ok(())
-    }
-
-    fn record_dm_session_ready(
-        &self,
-        state_dir: &Path,
-        remote_node_id: &str,
-        thread_id: &str,
-        direction: crate::control::PeerDmDirection,
-        a2a_protocol: &str,
-        acknowledged_at: Option<u64>,
-    ) -> Result<()> {
-        save_dm_message(
-            state_dir,
-            remote_node_id,
-            thread_id,
-            &format!("session-init:{thread_id}"),
-            crate::control::PeerDmMessageKind::SessionInit,
-            direction,
-            crate::control::PeerDmDeliveryState::Delivered,
-            a2a_protocol,
-            None,
-            json!({
-                "thread_id": thread_id,
-                "session_state": "ready",
-                "synthetic": true,
-            }),
-            acknowledged_at,
-        )?;
-        Ok(())
-    }
-
-    fn finalize_dm_session_from_relationship(
-        &self,
-        state_dir: &Path,
-        remote_node_id: &str,
-        direction: crate::control::PeerDmDirection,
-        a2a_protocol: &str,
-        established_at: u64,
-    ) -> Result<()> {
-        let local_node_id = self.local_peer_id().to_string();
-        let thread_id = peer_dm_thread_id(&local_node_id, remote_node_id);
-        upsert_dm_thread(
-            state_dir,
-            remote_node_id,
-            &thread_id,
-            crate::control::PeerDmSessionState::Ready,
-            Some(established_at),
-            Some(established_at),
-        )?;
-        save_dm_message(
-            state_dir,
-            remote_node_id,
-            &thread_id,
-            &format!("relationship-established:{thread_id}"),
-            crate::control::PeerDmMessageKind::RelationshipEstablished,
-            direction,
-            crate::control::PeerDmDeliveryState::Delivered,
-            a2a_protocol,
-            None,
-            json!({
-                "relationship_state": "accepted",
-                "thread_id": thread_id,
-                "established_at": established_at,
-                "synthetic": true,
-            }),
-            Some(established_at),
-        )?;
-        self.record_dm_session_ready(
-            state_dir,
-            remote_node_id,
-            &thread_id,
-            direction,
-            a2a_protocol,
-            Some(established_at),
-        )?;
-        Ok(())
-    }
-
-    fn ensure_peer_connected(
-        &mut self,
-        state_dir: &Path,
-        peer: &PeerId,
-        remote_node_id: &str,
-    ) -> Result<()> {
-        if self.connected_peers.contains(peer) {
-            return Ok(());
-        }
-        for addr in candidate_peer_addrs(state_dir, remote_node_id)? {
-            match self.dial(addr.clone()) {
-                Ok(()) => {}
-                Err(err)
-                    if err
-                        .to_string()
-                        .to_ascii_lowercase()
-                        .contains("duplicate connection") => {}
-                Err(err) => {
-                    eprintln!("peer reconnect dial failed for {remote_node_id} via {addr}: {err}");
-                }
-            }
-        }
-        Ok(())
-    }
-
-    pub fn publish_event_for_scope(
-        &mut self,
-        scope: &SwarmScope,
-        event: crate::types::Event,
-    ) -> Result<()> {
-        if !self.global_publish_rate_guard.allow(scope, &event) {
-            bail!("GlobalTopicRateLimited");
-        }
-        self.runtime.publish_gossip(&event_gossip(EventEnvelope {
-            scope: scope.clone(),
-            event,
-            content_source_node_id: None,
-        }))
-    }
-
-    pub fn publish_chat_for_scope(
-        &mut self,
-        scope: &SwarmScope,
-        event: crate::types::Event,
-    ) -> Result<()> {
-        if !self.global_publish_rate_guard.allow(scope, &event) {
-            bail!("GlobalTopicRateLimited");
-        }
-        self.runtime.publish_gossip(&chat_gossip(EventEnvelope {
-            scope: scope.clone(),
-            event,
-            content_source_node_id: Some(self.local_peer_id().to_string()),
-        }))
-    }
-
-    pub fn publish_global_event(&mut self, event: crate::types::Event) -> Result<()> {
-        self.publish_event_for_scope(&SwarmScope::Global, event)
-    }
-
-    pub fn publish_summary(&mut self, summary: SummaryAnnouncement) -> Result<()> {
-        self.runtime
-            .publish_gossip(&GossipMessage::Summary(summary))
-    }
-
-    pub fn publish_checkpoint(
-        &mut self,
-        checkpoint: crate::network_p2p::CheckpointAnnouncement,
-    ) -> Result<()> {
-        self.runtime
-            .publish_gossip(&GossipMessage::Checkpoint(checkpoint))
-    }
-
-    pub fn observability_snapshot(
-        &self,
-        node: &Node,
-    ) -> Result<NetworkBridgeObservabilitySnapshot> {
-        let runtime = self.runtime.observability_snapshot();
-        let topology = node
-            .store
-            .load_network_topology_for_org(node.store.org_id())?;
-        let parent_uplink = parent_uplink_store(node)?;
-        let parent_imported_task_outcome_rows = parent_uplink
-            .as_ref()
-            .map(|store| store.count_imported_task_outcomes())
-            .transpose()?;
-        let parent_checkpoint_rows = parent_uplink
-            .as_ref()
-            .map(|store| store.count_checkpoint_announcements())
-            .transpose()?;
-
-        let traffic_scores = runtime
-            .peer_health
-            .iter()
-            .map(|entry| (entry.peer.clone(), entry))
-            .collect::<HashMap<_, _>>();
-        let mut peer_ids = self
-            .peer_sync_state
-            .keys()
-            .map(ToString::to_string)
-            .collect::<Vec<_>>();
-        for entry in &runtime.peer_health {
-            if !peer_ids.iter().any(|peer| peer == &entry.peer) {
-                peer_ids.push(entry.peer.clone());
-            }
-        }
-        peer_ids.sort();
-        peer_ids.dedup();
-
-        let now = Instant::now();
-        let mut peer_health = Vec::with_capacity(peer_ids.len());
-        for peer in peer_ids {
-            let traffic = traffic_scores.get(&peer);
-            let sync = self
-                .peer_sync_state
-                .iter()
-                .find(|(peer_id, _)| peer_id.to_string() == peer)
-                .map(|(_, state)| state);
-            let mut known_scopes = sync
-                .map(|state| {
-                    let mut scopes = state
-                        .known_scopes
-                        .iter()
-                        .map(scope_hint_label)
-                        .collect::<Vec<_>>();
-                    scopes.sort();
-                    scopes
-                })
-                .unwrap_or_default();
-            known_scopes.sort();
-            peer_health.push(NetworkBridgePeerHealth {
-                peer: peer.clone(),
-                connected: self
-                    .connected_peers
-                    .iter()
-                    .any(|peer_id| peer_id.to_string() == peer),
-                score: traffic.map_or(0, |entry| entry.score),
-                blacklisted: traffic.is_some_and(|entry| entry.blacklisted),
-                reputation_tier: traffic
-                    .map(|entry| entry.reputation_tier.clone())
-                    .unwrap_or_else(|| "healthy".to_owned()),
-                quarantined: traffic.is_some_and(|entry| entry.quarantined),
-                quarantine_remaining_ms: traffic.map_or(0, |entry| entry.quarantine_remaining_ms),
-                ban_remaining_ms: traffic.map_or(0, |entry| entry.ban_remaining_ms),
-                throttle_factor_percent: traffic.map_or(100, |entry| entry.throttle_factor_percent),
-                known_scopes,
-                inflight_backfills: sync.map_or(0, |state| state.inflight_backfills),
-                next_retry_in_ms: sync.map_or(0, |state| {
-                    state
-                        .next_retry_at
-                        .saturating_duration_since(now)
-                        .as_millis() as u64
-                }),
-            });
-        }
-
-        let mut scope_traffic = self
-            .scope_traffic
-            .iter()
-            .map(|(scope, stats)| NetworkBridgeScopeTraffic {
-                scope: scope_hint_label(scope),
-                stats: stats.clone(),
-            })
-            .collect::<Vec<_>>();
-        scope_traffic.sort_by(|left, right| left.scope.cmp(&right.scope));
-
-        Ok(NetworkBridgeObservabilitySnapshot {
-            local_peer_id: self.local_peer_id().to_string(),
-            listen_addrs: self
-                .listen_addrs()
-                .iter()
-                .map(ToString::to_string)
-                .collect(),
-            subscribed_scopes: self
-                .subscribed_scopes
-                .iter()
-                .map(scope_hint_label)
-                .collect(),
-            connected_peer_count: self.connected_peers.len(),
-            nat_status: runtime.nat_status,
-            nat_public_address: runtime.nat_public_address,
-            nat_confidence: runtime.nat_confidence,
-            relay_reservations: runtime.relay_reservations,
-            peer_health,
-            scope_traffic,
-            summary_health: NetworkBridgeSummaryHealth {
-                imported_decision_memory_rows: node.store.count_imported_decision_memory()?,
-                imported_reputation_rows: node.store.count_imported_reputation_snapshots()?,
-                imported_task_outcome_rows: node.store.count_imported_task_outcomes()?,
-                checkpoint_rows: node.store.count_checkpoint_announcements()?,
-            },
-            subnet_sync_health: NetworkBridgeSubnetSyncHealth {
-                network_id: topology.network.network_id,
-                network_kind: topology.network.network_kind.as_str().to_owned(),
-                parent_network_id: topology.network.parent_network_id,
-                parent_uplink_available: parent_uplink.is_some(),
-                parent_imported_task_outcome_rows,
-                parent_checkpoint_rows,
-            },
-            execution_set_health: NetworkBridgeExecutionSetHealth {
-                execution_set_count: node.store.count_distinct_execution_sets()?,
-                execution_set_member_count: node.store.count_execution_set_members()?,
-            },
-        })
-    }
-
-    pub fn request_global_backfill(
-        &mut self,
-        peer: &PeerId,
-        from_event_seq: u64,
-        limit: usize,
-    ) -> Result<BackfillRequestId> {
-        let _guard = self.tokio_runtime.enter();
-        self.runtime.send_backfill_request(
-            peer,
-            BackfillRequest {
-                scope: SwarmScope::Global,
-                from_event_seq,
-                limit,
-                feed_key: None,
-            },
-        )
-    }
-
-    pub fn tick(&mut self, node: &mut Node) -> Result<NetworkBridgeTick> {
-        let event = self.tokio_runtime.block_on(self.runtime.next_event());
-        self.handle_runtime_event(node, event)
-    }
-
-    fn request_backfill_for_peer(&mut self, peer: &PeerId, node: &Node) -> Result<bool> {
-        let scopes = self.scopes_to_request_for_peer(peer);
-        self.request_backfill_scopes_for_peer(peer, node, &scopes)
-    }
-
-    fn request_backfill_scopes_for_peer(
-        &mut self,
-        peer: &PeerId,
-        node: &Node,
-        scopes: &[SwarmScope],
-    ) -> Result<bool> {
-        let now = Instant::now();
-        let state = self
-            .peer_sync_state
-            .entry(*peer)
-            .or_insert_with(|| PeerSyncState::new(now));
-        if state.inflight_backfills >= MAX_INFLIGHT_BACKFILLS_PER_PEER || state.next_retry_at > now
-        {
-            return Ok(false);
-        }
-        if scopes.is_empty() {
-            return Ok(false);
-        }
-        let local_node_id = node.node_id();
-        let active_subscriptions = node.store.list_active_feed_subscriptions(&local_node_id)?;
-        let mut requests_sent = 0usize;
-        let selected_route = self
-            .state_dir
-            .as_ref()
-            .map(|state_dir| recommended_backfill_route_for_peer(state_dir, peer))
-            .transpose()?
-            .unwrap_or(DataTransportRoute::Libp2pControl);
-        if let Some(state_dir) = &self.state_dir {
-            append_jsonl(
-                state_dir,
-                "transport_decisions.jsonl",
-                &json!({
-                    "kind": TransferKind::BackfillChunk.as_str(),
-                    "peer_id": peer.to_string(),
-                    "route": selected_route.as_str(),
-                    "scopes": scopes.iter().map(scope_hint_label).collect::<Vec<_>>(),
-                    "decided_at": observed_at_ms(),
-                }),
-            );
-        }
-        for scope in scopes.iter().cloned() {
-            let scope_hint = scope_hint_label(&scope);
-            let from_event_seq = latest_scoped_event_seq(node, &scope)?;
-            let _guard = self.tokio_runtime.enter();
-            let _ = self.runtime.send_backfill_request(
-                peer,
-                BackfillRequest {
-                    scope: scope.clone(),
-                    from_event_seq,
-                    limit: BACKFILL_BATCH_EVENTS,
-                    feed_key: None,
-                },
-            )?;
-            requests_sent += 1;
-            for subscription in active_subscriptions
-                .iter()
-                .filter(|subscription| subscription.scope_hint == scope_hint)
-            {
-                let from_event_seq = node
-                    .store
-                    .get_topic_cursor(&local_node_id, &subscription.feed_key)?
-                    .map_or(0, |cursor| cursor.last_event_seq);
-                let _ = self.runtime.send_backfill_request(
-                    peer,
-                    BackfillRequest {
-                        scope: scope.clone(),
-                        from_event_seq,
-                        limit: BACKFILL_BATCH_EVENTS,
-                        feed_key: Some(subscription.feed_key.clone()),
-                    },
-                )?;
-                requests_sent += 1;
-            }
-        }
-        state.inflight_backfills += requests_sent;
-        state.last_backfill_request_at = Some(now);
-        state.next_retry_at = now + self.backfill_retry_after;
-        Ok(requests_sent > 0)
-    }
-
-    pub fn run_anti_entropy(&mut self, node: &Node) -> Result<usize> {
-        let now = Instant::now();
-        let mut requested = 0usize;
-        let mut scopes = self.subscribed_scopes.clone();
-        scopes.sort_by_key(|scope| matches!(scope, SwarmScope::Global));
-        let mut requests_by_peer: HashMap<PeerId, Vec<SwarmScope>> = HashMap::new();
-        for scope in scopes {
-            let Some(peer) = self.preferred_backfill_peer_for_scope(&scope, now) else {
-                continue;
-            };
-            requests_by_peer.entry(peer).or_default().push(scope);
-        }
-        for (peer, scopes) in requests_by_peer {
-            if self.request_backfill_scopes_for_peer(&peer, node, &scopes)? {
-                requested += 1;
-            }
-        }
-        Ok(requested)
-    }
-
-    fn scopes_to_request_for_peer(&self, peer: &PeerId) -> Vec<SwarmScope> {
-        let Some(state) = self.peer_sync_state.get(peer) else {
-            return self.subscribed_scopes.clone();
-        };
-        if state.known_scopes.is_empty() {
-            return self.subscribed_scopes.clone();
-        }
-        self.subscribed_scopes
-            .iter()
-            .filter(|scope| state.known_scopes.contains(*scope))
-            .cloned()
-            .collect()
-    }
-
-    fn preferred_backfill_peer_for_scope(
-        &self,
-        scope: &SwarmScope,
-        now: Instant,
-    ) -> Option<PeerId> {
-        let peers = self.connected_peers.iter().copied().collect::<Vec<_>>();
-        self.best_peer_for_scope(peers.iter().copied(), scope, now, true)
-            .or_else(|| self.best_peer_for_scope(peers.into_iter(), scope, now, false))
-    }
-
-    fn best_peer_for_scope<I>(
-        &self,
-        peers: I,
-        scope: &SwarmScope,
-        now: Instant,
-        require_known_scope: bool,
-    ) -> Option<PeerId>
-    where
-        I: Iterator<Item = PeerId>,
-    {
-        let runtime = self.runtime.observability_snapshot();
-        let peer_scores = runtime
-            .peer_health
-            .into_iter()
-            .map(|entry| (entry.peer.clone(), entry))
-            .collect::<HashMap<_, _>>();
-        peers
-            .filter(|peer| self.peer_is_eligible_for_scope(peer, scope, now, require_known_scope))
-            .max_by(|left, right| {
-                let left_key = peer_scores
-                    .get(&left.to_string())
-                    .map_or((0_i64, 100_u32), |entry| {
-                        (entry.score, entry.throttle_factor_percent)
-                    });
-                let right_key = peer_scores
-                    .get(&right.to_string())
-                    .map_or((0_i64, 100_u32), |entry| {
-                        (entry.score, entry.throttle_factor_percent)
-                    });
-                left_key
-                    .cmp(&right_key)
-                    .then_with(|| left.to_string().cmp(&right.to_string()))
-            })
-    }
-
-    fn peer_is_eligible_for_scope(
-        &self,
-        peer: &PeerId,
-        scope: &SwarmScope,
-        now: Instant,
-        require_known_scope: bool,
-    ) -> bool {
-        if !self.runtime.allows_outbound_backfill_to(peer) {
-            return false;
-        }
-        match self.peer_sync_state.get(peer) {
-            Some(state) => {
-                if require_known_scope && !state.known_scopes.contains(scope) {
-                    return false;
-                }
-                state.inflight_backfills < MAX_INFLIGHT_BACKFILLS_PER_PEER
-                    && state.next_retry_at <= now
-                    && state.last_backfill_request_at.map_or(true, |last| {
-                        now.duration_since(last) >= self.anti_entropy_interval
-                    })
-            }
-            None => !require_known_scope,
-        }
-    }
-
-    fn record_peer_scope_activity(&mut self, peer: PeerId, scope: &SwarmScope) {
-        self.peer_sync_state
-            .entry(peer)
-            .or_insert_with(|| PeerSyncState::new(Instant::now()))
-            .known_scopes
-            .insert(scope.clone());
-    }
-
-    fn scope_traffic_mut(&mut self, scope: &SwarmScope) -> &mut ScopeTrafficStats {
-        self.scope_traffic.entry(scope.clone()).or_default()
-    }
-
-    pub(crate) fn record_scope_event_published(&mut self, scope: &SwarmScope) {
-        self.scope_traffic_mut(scope).published_events += 1;
-    }
-
-    fn record_scope_event_ingested(&mut self, scope: &SwarmScope) {
-        self.scope_traffic_mut(scope).ingested_events += 1;
-    }
-
-    fn record_scope_summary_applied(&mut self, scope: &SwarmScope) {
-        self.scope_traffic_mut(scope).summaries_applied += 1;
-    }
-
-    fn record_scope_rule_applied(&mut self, scope: &SwarmScope) {
-        self.scope_traffic_mut(scope).rules_applied += 1;
-    }
-
-    fn record_scope_checkpoint_applied(&mut self, scope: &SwarmScope) {
-        self.scope_traffic_mut(scope).checkpoints_applied += 1;
-    }
-
-    fn record_scope_backfill_applied(&mut self, scope: &SwarmScope, events: usize) {
-        let stats = self.scope_traffic_mut(scope);
-        stats.backfills_applied += 1;
-        stats.backfill_events_applied += events as u64;
-    }
-
-    fn mark_peer_connected(&mut self, peer: PeerId) {
-        self.connected_peers.insert(peer);
-        self.peer_sync_state
-            .entry(peer)
-            .or_insert_with(|| PeerSyncState::new(Instant::now()));
-    }
-
-    fn mark_peer_disconnected(&mut self, peer: PeerId) {
-        self.connected_peers.remove(&peer);
-        self.peer_sync_state.remove(&peer);
-        self.pending_relationship_requests
-            .retain(|_, pending| pending.peer != peer);
-        self.pending_dm_requests
-            .retain(|_, pending| pending.peer != peer);
-    }
-
-    fn mark_backfill_completed(&mut self, peer: PeerId) {
-        if let Some(state) = self.peer_sync_state.get_mut(&peer) {
-            state.inflight_backfills = state.inflight_backfills.saturating_sub(1);
-            state.next_retry_at = Instant::now() + self.anti_entropy_interval;
-        }
-    }
-
-    fn mark_backfill_failed(&mut self, peer: PeerId) {
-        if let Some(state) = self.peer_sync_state.get_mut(&peer) {
-            state.inflight_backfills = state.inflight_backfills.saturating_sub(1);
-            state.next_retry_at = Instant::now() + self.backfill_retry_after;
-        }
-    }
-
-    pub fn try_tick(&mut self, node: &mut Node) -> Result<Option<NetworkBridgeTick>> {
-        let event = {
-            let _guard = self.tokio_runtime.enter();
-            self.runtime.try_next_event()?
-        };
-        let Some(event) = event else {
-            return Ok(None);
-        };
-        Ok(Some(self.process_runtime_event(node, event)?))
-    }
-
-    fn handle_runtime_event(
-        &mut self,
-        node: &mut Node,
-        event: Result<NetworkRuntimeEvent>,
-    ) -> Result<NetworkBridgeTick> {
-        self.process_runtime_event(node, event?)
-    }
-
-    fn process_runtime_event(
-        &mut self,
-        node: &mut Node,
-        event: NetworkRuntimeEvent,
-    ) -> Result<NetworkBridgeTick> {
-        match event {
-            NetworkRuntimeEvent::PeerDiscovered {
-                peer,
-                address,
-                source,
-            } => {
-                if let Some(state_dir) = &self.state_dir {
-                    let _ = crate::control::add_discovered_peer_endpoint_with_source(
-                        state_dir,
-                        &peer.to_string(),
-                        Some(&address.to_string()),
-                        source.as_str(),
-                    );
-                }
-                Ok(NetworkBridgeTick::TransportNotice {
-                    detail: format!(
-                        "peer_discovered peer={peer} source={} address={address}",
-                        source.as_str()
-                    ),
-                })
-            }
-            NetworkRuntimeEvent::PeerIdentified { peer, metadata } => {
-                let mut missing_contact_material = false;
-                if let Some(state_dir) = &self.state_dir {
-                    let now = chrono::Utc::now().timestamp_millis().max(0) as u64;
-                    let existing = crate::control::load_peer_metadata_records_state(state_dir)
-                        .ok()
-                        .and_then(|records| {
-                            records
-                                .into_iter()
-                                .find(|record| record.node_id == peer.to_string())
-                        });
-                    let record = crate::control::PeerMetadataRecord {
-                        node_id: peer.to_string(),
-                        network_id: Some(metadata.network_id.clone()),
-                        params_version: Some(metadata.params_version),
-                        params_hash: Some(metadata.params_hash.clone()),
-                        agent_version_raw: Some(metadata.agent_version_raw.clone()),
-                        agent_version_prefix: Some(metadata.agent_version_prefix.clone()),
-                        protocol_version: Some(metadata.protocol_version.clone()),
-                        observed_addr: Some(metadata.observed_addr.clone()),
-                        listen_addrs: metadata.listen_addrs.clone(),
-                        protocols: metadata.protocols.clone(),
-                        handshake_status: "identified".to_owned(),
-                        last_error: None,
-                        contact_material: existing
-                            .as_ref()
-                            .and_then(|entry| entry.contact_material.clone()),
-                        contact_material_signature: existing
-                            .as_ref()
-                            .and_then(|entry| entry.contact_material_signature.clone()),
-                        contact_material_updated_at: existing
-                            .as_ref()
-                            .and_then(|entry| entry.contact_material_updated_at),
-                        first_identified_at: existing
-                            .as_ref()
-                            .map_or(now, |entry| entry.first_identified_at),
-                        last_identified_at: now,
-                    };
-                    missing_contact_material = record.contact_material.is_none();
-                    let _ = crate::control::save_peer_metadata_record_state(state_dir, &record);
-                }
-                if missing_contact_material
-                    && let Err(err) = self.request_peer_contact_material(&peer.to_string())
-                {
-                    eprintln!("contact material request failed for {peer}: {err}");
-                }
-                Ok(NetworkBridgeTick::TransportNotice {
-                    detail: format!(
-                        "peer_identified peer={peer} network_id={} params_version={}",
-                        metadata.network_id, metadata.params_version
-                    ),
-                })
-            }
-            NetworkRuntimeEvent::NewListenAddr { address } => {
-                Ok(NetworkBridgeTick::Listening { address })
-            }
-            NetworkRuntimeEvent::NatStatusChanged {
-                old,
-                new,
-                public_address,
-                confidence,
-            } => Ok(NetworkBridgeTick::TransportNotice {
-                detail: format!(
-                    "nat_status_changed old={old} new={new} public_address={} confidence={confidence}",
-                    public_address
-                        .map(|addr| addr.to_string())
-                        .unwrap_or_else(|| "none".to_owned())
-                ),
-            }),
-            NetworkRuntimeEvent::RelayReservationAccepted {
-                relay_peer,
-                renewal,
-            } => Ok(NetworkBridgeTick::TransportNotice {
-                detail: format!(
-                    "relay_reservation_accepted relay_peer={relay_peer} renewal={renewal}"
-                ),
-            }),
-            NetworkRuntimeEvent::RelayCircuitEstablished { relay_peer } => {
-                Ok(NetworkBridgeTick::TransportNotice {
-                    detail: format!("relay_circuit_established relay_peer={relay_peer}"),
-                })
-            }
-            NetworkRuntimeEvent::RelayInboundCircuitEstablished { source_peer } => {
-                Ok(NetworkBridgeTick::TransportNotice {
-                    detail: format!("relay_inbound_circuit_established source_peer={source_peer}"),
-                })
-            }
-            NetworkRuntimeEvent::DcutrConnectionUpgradeSucceeded { remote_peer } => {
-                Ok(NetworkBridgeTick::TransportNotice {
-                    detail: format!("dcutr_upgrade_succeeded remote_peer={remote_peer}"),
-                })
-            }
-            NetworkRuntimeEvent::DcutrConnectionUpgradeFailed { remote_peer, error } => {
-                Ok(NetworkBridgeTick::TransportNotice {
-                    detail: format!("dcutr_upgrade_failed remote_peer={remote_peer} error={error}"),
-                })
-            }
-            NetworkRuntimeEvent::ConnectionEstablished { peer, remote_addr } => {
-                self.mark_peer_connected(peer);
-                if let Some(state_dir) = &self.state_dir {
-                    let remote_addr_text = remote_addr.to_string();
-                    let _ = crate::control::add_discovered_peer_endpoint_with_source(
-                        state_dir,
-                        &peer.to_string(),
-                        Some(remote_addr_text.as_str()),
-                        "connected",
-                    );
-                }
-                let _ = self.request_backfill_for_peer(&peer, node)?;
-                if !node.store.is_node_penalized(&node.node_id())? {
-                    for entry in node
-                        .store
-                        .list_local_reputation_snapshots(self.summary_reputation_limit)?
-                    {
-                        if let Some(summary) = build_reputation_summary_for_runtime(
-                            node,
-                            &entry.runtime_id,
-                            &entry.profile_id,
-                        )? {
-                            let _ = self.publish_summary(summary);
-                        }
-                    }
-                }
-                Ok(NetworkBridgeTick::Connected { peer })
-            }
-            NetworkRuntimeEvent::PeerHandshakeRejected { peer, detail } => {
-                self.mark_peer_disconnected(peer);
-                if let Some(state_dir) = &self.state_dir {
-                    let now = chrono::Utc::now().timestamp_millis().max(0) as u64;
-                    let existing = crate::control::load_peer_metadata_records_state(state_dir)
-                        .ok()
-                        .and_then(|records| {
-                            records
-                                .into_iter()
-                                .find(|record| record.node_id == peer.to_string())
-                        });
-                    let record = crate::control::PeerMetadataRecord {
-                        node_id: peer.to_string(),
-                        network_id: existing.as_ref().and_then(|entry| entry.network_id.clone()),
-                        params_version: existing.as_ref().and_then(|entry| entry.params_version),
-                        params_hash: existing
-                            .as_ref()
-                            .and_then(|entry| entry.params_hash.clone()),
-                        agent_version_raw: existing
-                            .as_ref()
-                            .and_then(|entry| entry.agent_version_raw.clone()),
-                        agent_version_prefix: existing
-                            .as_ref()
-                            .and_then(|entry| entry.agent_version_prefix.clone()),
-                        protocol_version: existing
-                            .as_ref()
-                            .and_then(|entry| entry.protocol_version.clone()),
-                        observed_addr: existing
-                            .as_ref()
-                            .and_then(|entry| entry.observed_addr.clone()),
-                        listen_addrs: existing
-                            .as_ref()
-                            .map_or_else(Vec::new, |entry| entry.listen_addrs.clone()),
-                        protocols: existing
-                            .as_ref()
-                            .map_or_else(Vec::new, |entry| entry.protocols.clone()),
-                        handshake_status: "rejected".to_owned(),
-                        last_error: Some(detail.clone()),
-                        contact_material: existing
-                            .as_ref()
-                            .and_then(|entry| entry.contact_material.clone()),
-                        contact_material_signature: existing
-                            .as_ref()
-                            .and_then(|entry| entry.contact_material_signature.clone()),
-                        contact_material_updated_at: existing
-                            .as_ref()
-                            .and_then(|entry| entry.contact_material_updated_at),
-                        first_identified_at: existing
-                            .as_ref()
-                            .map_or(now, |entry| entry.first_identified_at),
-                        last_identified_at: now,
-                    };
-                    let _ = crate::control::save_peer_metadata_record_state(state_dir, &record);
-                }
-                Ok(NetworkBridgeTick::TransportNotice {
-                    detail: format!("peer_handshake_rejected peer={peer} {detail}"),
-                })
-            }
-            NetworkRuntimeEvent::ConnectionClosed {
-                peer,
-                remaining_established,
-            } => {
-                if remaining_established == 0 {
-                    self.mark_peer_disconnected(peer);
-                    Ok(NetworkBridgeTick::Disconnected { peer })
-                } else {
-                    Ok(NetworkBridgeTick::TransportNotice {
-                        detail: format!(
-                            "connection_closed peer={peer} remaining_established={remaining_established}"
-                        ),
-                    })
-                }
-            }
-            NetworkRuntimeEvent::Gossip {
-                propagation_source,
-                message,
-            } => match message {
-                GossipMessage::Event(envelope) => {
-                    self.record_peer_scope_activity(propagation_source, &envelope.scope);
-                    let ingested_event = ingest_event_envelope(node, &envelope)?;
-                    if let Err(err) = self.maybe_sync_candidate_output(node, &ingested_event) {
-                        eprintln!(
-                            "candidate output sync failed for {}: {err}",
-                            ingested_event.event_id
-                        );
-                    }
-                    if let Some(state_dir) = &self.state_dir {
-                        log_run_queue_events_if_applicable(node, state_dir, &ingested_event);
-                    }
-                    self.record_scope_event_ingested(&envelope.scope);
-                    Ok(NetworkBridgeTick::EventIngested {
-                        peer: propagation_source,
-                        event_id: ingested_event.event_id.clone(),
-                    })
-                }
-                GossipMessage::Chat(envelope) => {
-                    self.record_peer_scope_activity(propagation_source, &envelope.scope);
-                    let ingested_event = ingest_event_envelope(node, &envelope)?;
-                    if let Err(err) = self.maybe_sync_candidate_output(node, &ingested_event) {
-                        eprintln!(
-                            "candidate output sync failed for {}: {err}",
-                            ingested_event.event_id
-                        );
-                    }
-                    if let Err(err) = self.maybe_sync_topic_message_content(
-                        node,
-                        &ingested_event,
-                        envelope.content_source_node_id.as_deref(),
-                    ) {
-                        eprintln!(
-                            "topic content sync failed for {}: {err}",
-                            ingested_event.event_id
-                        );
-                    }
-                    if let crate::types::EventPayload::TopicMessagePosted(payload) =
-                        &ingested_event.payload
-                    {
-                        maybe_record_topic_cursor_for_event_id(
-                            node,
-                            &node.node_id(),
-                            &payload.feed_key,
-                            &envelope.scope,
-                            &ingested_event.event_id,
-                            ingested_event.created_at,
-                        )?;
-                    }
-                    self.record_scope_event_ingested(&envelope.scope);
-                    Ok(NetworkBridgeTick::EventIngested {
-                        peer: propagation_source,
-                        event_id: ingested_event.event_id.clone(),
-                    })
-                }
-                GossipMessage::Summary(summary) => {
-                    self.record_peer_scope_activity(propagation_source, &summary.scope);
-                    apply_summary_announcement(node, &summary)?;
-                    self.record_scope_summary_applied(&summary.scope);
-                    Ok(NetworkBridgeTick::SummaryApplied {
-                        peer: propagation_source,
-                        summary_kind: summary.summary_kind,
-                    })
-                }
-                GossipMessage::Rule(rule) => {
-                    self.record_peer_scope_activity(propagation_source, &rule.scope);
-                    apply_rule_announcement(node, &rule)?;
-                    self.record_scope_rule_applied(&rule.scope);
-                    Ok(NetworkBridgeTick::RuleApplied {
-                        peer: propagation_source,
-                        rule_set: rule.rule_set,
-                        rule_version: rule.rule_version,
-                    })
-                }
-                GossipMessage::Checkpoint(checkpoint) => {
-                    self.record_peer_scope_activity(propagation_source, &checkpoint.scope);
-                    apply_checkpoint_announcement(node, &checkpoint)?;
-                    if let Some(state_dir) = &self.state_dir {
-                        let _ = crate::control::save_data_source_binding_record_state(
-                            state_dir,
-                            &crate::control::DataSourceBindingRecord {
-                                binding_kind: crate::control::DataSourceBindingKind::Checkpoint,
-                                binding_scope: Some(checkpoint.scope.label()?),
-                                binding_key: checkpoint.checkpoint_id.clone(),
-                                source_node_id: propagation_source.to_string(),
-                                source_uri: Some(checkpoint.artifact_path.clone()),
-                                updated_at: observed_at_ms(),
-                            },
-                        );
-                    }
-                    self.record_scope_checkpoint_applied(&checkpoint.scope);
-                    Ok(NetworkBridgeTick::CheckpointApplied {
-                        peer: propagation_source,
-                        checkpoint_id: checkpoint.checkpoint_id,
-                    })
-                }
-            },
-            NetworkRuntimeEvent::BackfillRequest {
-                peer,
-                request,
-                channel,
-            } => {
-                let response = backfill_response_for_request(
-                    node,
-                    &self.local_peer_id().to_string(),
-                    &request,
-                    self.runtime.config().max_backfill_events,
-                    self.runtime.config().max_backfill_events_hard_limit,
-                )?;
-                let events = response.events.len();
-                match self.runtime.send_backfill_response(channel, response) {
-                    Ok(()) => Ok(NetworkBridgeTick::BackfillServed { peer, events }),
-                    Err(error)
-                        if error
-                            .to_string()
-                            .contains("backfill response channel closed") =>
-                    {
-                        Ok(NetworkBridgeTick::TransportNotice {
-                            detail: format!("backfill_response_dropped peer={peer} reason={error}"),
-                        })
-                    }
-                    Err(error) => Err(error),
-                }
-            }
-            NetworkRuntimeEvent::BackfillResponse {
-                peer,
-                request_id,
-                response,
-            } => {
-                self.record_peer_scope_activity(peer, &response.scope);
-                self.mark_backfill_completed(peer);
-                let events = ingest_backfill_response(node, &response)?;
-                for envelope in &response.events {
-                    if let Err(err) = self.maybe_sync_candidate_output(node, &envelope.event) {
-                        eprintln!(
-                            "candidate output sync failed for {}: {err}",
-                            envelope.event.event_id
-                        );
-                    }
-                    if let Err(err) = self.maybe_sync_topic_message_content(
-                        node,
-                        &envelope.event,
-                        envelope.content_source_node_id.as_deref(),
-                    ) {
-                        eprintln!(
-                            "topic content sync failed for {}: {err}",
-                            envelope.event.event_id
-                        );
-                    }
-                }
-                maybe_record_topic_cursor_for_response(
-                    node,
-                    &node.node_id(),
-                    &response,
-                    observed_at_ms(),
-                )?;
-                self.record_scope_backfill_applied(&response.scope, events);
-                Ok(NetworkBridgeTick::BackfillApplied {
-                    peer,
-                    request_id,
-                    events,
-                })
-            }
-            NetworkRuntimeEvent::BackfillOutboundFailure {
-                peer,
-                request_id,
-                error,
-            } => {
-                self.mark_backfill_failed(peer);
-                Ok(NetworkBridgeTick::BackfillFailed {
-                    peer,
-                    request_id,
-                    error,
-                })
-            }
-            NetworkRuntimeEvent::BackfillInboundFailure { peer, error } => {
-                Ok(NetworkBridgeTick::TransportNotice {
-                    detail: format!("backfill_inbound_failure peer={peer} error={error}"),
-                })
-            }
-            NetworkRuntimeEvent::ContactMaterialRequest {
-                peer,
-                request,
-                channel,
-            } => {
-                let local_node_id = self.local_peer_id().to_string();
-                let now = observed_at_ms();
-                let response = if request.source_node_id != peer.to_string() {
-                    RawContactMaterialResponse {
-                        source_node_id: local_node_id,
-                        target_node_id: request.source_node_id,
-                        applied: false,
-                        contact_material: None,
-                        detail: Some("contact material request source_node_id mismatch".to_owned()),
-                        updated_at: now,
-                    }
-                } else if let Some(state_dir) = self.state_dir.as_ref() {
-                    RawContactMaterialResponse {
-                        source_node_id: self.local_peer_id().to_string(),
-                        target_node_id: request.source_node_id,
-                        applied: true,
-                        contact_material: Some(build_contact_material(
-                            state_dir,
-                            &self.local_peer_id().to_string(),
-                        )?),
-                        detail: None,
-                        updated_at: now,
-                    }
-                } else {
-                    RawContactMaterialResponse {
-                        source_node_id: self.local_peer_id().to_string(),
-                        target_node_id: request.source_node_id,
-                        applied: false,
-                        contact_material: None,
-                        detail: Some("state_dir is not configured".to_owned()),
-                        updated_at: now,
-                    }
-                };
-                self.runtime
-                    .send_contact_material_response(channel, response)?;
-                Ok(NetworkBridgeTick::TransportNotice {
-                    detail: format!("contact_material_served peer={peer}"),
-                })
-            }
-            NetworkRuntimeEvent::ContactMaterialResponse {
-                peer,
-                request_id,
-                response,
-            } => {
-                let Some(pending) = self.pending_contact_material_requests.remove(&request_id)
-                else {
-                    return Ok(NetworkBridgeTick::TransportNotice {
-                        detail: format!(
-                            "contact_material_response_without_pending peer={peer} request_id={request_id:?}"
-                        ),
-                    });
-                };
-                if pending.peer != peer
-                    || response.source_node_id != pending.remote_node_id
-                    || response.target_node_id != self.local_peer_id().to_string()
-                {
-                    return Ok(NetworkBridgeTick::TransportNotice {
-                        detail: format!(
-                            "contact_material_response_mismatch peer={peer} remote={} source={} target={}",
-                            pending.remote_node_id,
-                            response.source_node_id,
-                            response.target_node_id
-                        ),
-                    });
-                }
-                if !response.applied {
-                    return Ok(NetworkBridgeTick::TransportNotice {
-                        detail: format!(
-                            "contact_material_rejected peer={peer} detail={}",
-                            response.detail.unwrap_or_else(|| "unknown".to_owned())
-                        ),
-                    });
-                }
-                if let (Some(state_dir), Some(contact_material)) =
-                    (self.state_dir.as_ref(), response.contact_material.as_ref())
-                {
-                    upsert_contact_material_for_peer(
-                        state_dir,
-                        &pending.remote_node_id,
-                        contact_material,
-                    )?;
-                }
-                Ok(NetworkBridgeTick::TransportNotice {
-                    detail: format!("contact_material_updated peer={peer}"),
-                })
-            }
-            NetworkRuntimeEvent::ContactMaterialOutboundFailure {
-                peer,
-                request_id,
-                error,
-            } => {
-                self.pending_contact_material_requests.remove(&request_id);
-                Ok(NetworkBridgeTick::TransportNotice {
-                    detail: format!(
-                        "contact_material_outbound_failure peer={peer} request_id={request_id:?} error={error}"
-                    ),
-                })
-            }
-            NetworkRuntimeEvent::ContactMaterialInboundFailure { peer, error } => {
-                Ok(NetworkBridgeTick::TransportNotice {
-                    detail: format!("contact_material_inbound_failure peer={peer} error={error}"),
-                })
-            }
-            NetworkRuntimeEvent::PeerRelationshipRequest {
-                peer,
-                request,
-                channel,
-            } => {
-                let action = control_peer_relationship_action(request.action);
-                let local_node_id = self.local_peer_id().to_string();
-                let now = observed_at_ms();
-                let (response, tick) = if request.source_node_id != peer.to_string() {
-                    let error = format!(
-                        "peer relationship request source_node_id mismatch: payload={} transport={peer}",
-                        request.source_node_id
-                    );
-                    (
-                        PeerRelationshipResponse {
-                            source_node_id: local_node_id.clone(),
-                            target_node_id: request.source_node_id.clone(),
-                            action: request.action,
-                            applied: false,
-                            agent_envelope: Some(default_agent_envelope(
-                                &local_node_id,
-                                &request.source_node_id,
-                                "peer.relationship.response",
-                                json!({
-                                    "action": request.action,
-                                    "applied": false,
-                                    "detail": error,
-                                }),
-                            )),
-                            relationship_state: None,
-                            detail: Some(error.clone()),
-                            updated_at: now,
-                        },
-                        NetworkBridgeTick::PeerRelationshipFailed {
-                            peer,
-                            action,
-                            error,
-                        },
-                    )
-                } else if request.target_node_id != local_node_id {
-                    let error = format!(
-                        "peer relationship request target_node_id mismatch: payload={} local={local_node_id}",
-                        request.target_node_id
-                    );
-                    (
-                        PeerRelationshipResponse {
-                            source_node_id: local_node_id.clone(),
-                            target_node_id: request.source_node_id.clone(),
-                            action: request.action,
-                            applied: false,
-                            agent_envelope: Some(default_agent_envelope(
-                                &local_node_id,
-                                &request.source_node_id,
-                                "peer.relationship.response",
-                                json!({
-                                    "action": request.action,
-                                    "applied": false,
-                                    "detail": error,
-                                }),
-                            )),
-                            relationship_state: None,
-                            detail: Some(error.clone()),
-                            updated_at: now,
-                        },
-                        NetworkBridgeTick::PeerRelationshipFailed {
-                            peer,
-                            action,
-                            error,
-                        },
-                    )
-                } else if let Some(state_dir) = self.state_dir.clone() {
-                    if let Some(agent_envelope) = request.agent_envelope.as_ref() {
-                        verify_agent_envelope_signature(agent_envelope)?;
-                    }
-                    match crate::control::apply_peer_relationship_action_state(
-                        &state_dir,
-                        &request.source_node_id,
-                        action,
-                        crate::control::PeerRelationshipInitiator::Remote,
-                    ) {
-                        Ok(record) => {
-                            if let Some(agent_envelope) = request.agent_envelope.as_ref() {
-                                attach_agent_envelope_to_relationship(
-                                    &state_dir,
-                                    &request.source_node_id,
-                                    agent_envelope,
-                                )?;
-                            }
-                            if action == crate::control::PeerRelationshipAction::Accept
-                                && record.relationship_state
-                                    == crate::control::PeerRelationshipState::Accepted
-                            {
-                                let a2a_protocol = request
-                                    .agent_envelope
-                                    .as_ref()
-                                    .map(|envelope| envelope.protocol.clone())
-                                    .unwrap_or_else(|| "google_a2a".to_owned());
-                                self.finalize_dm_session_from_relationship(
-                                    &state_dir,
-                                    &request.source_node_id,
-                                    crate::control::PeerDmDirection::Inbound,
-                                    &a2a_protocol,
-                                    record.updated_at,
-                                )?;
-                            }
-                            (
-                                PeerRelationshipResponse {
-                                    source_node_id: local_node_id.clone(),
-                                    target_node_id: request.source_node_id.clone(),
-                                    action: request.action,
-                                    applied: true,
-                                    agent_envelope: Some(default_agent_envelope(
-                                        &local_node_id,
-                                        &request.source_node_id,
-                                        "peer.relationship.response",
-                                        json!({
-                                            "action": request.action,
-                                            "applied": true,
-                                            "relationship_state": record.relationship_state.as_str(),
-                                        }),
-                                    )),
-                                    relationship_state: Some(
-                                        record.relationship_state.as_str().to_owned(),
-                                    ),
-                                    detail: None,
-                                    updated_at: record.updated_at,
-                                },
-                                NetworkBridgeTick::PeerRelationshipUpdated {
-                                    peer,
-                                    action,
-                                    relationship_state: record.relationship_state,
-                                    initiated_by: crate::control::PeerRelationshipInitiator::Remote,
-                                },
-                            )
-                        }
-                        Err(error) => {
-                            let error = error.to_string();
-                            (
-                                PeerRelationshipResponse {
-                                    source_node_id: local_node_id.clone(),
-                                    target_node_id: request.source_node_id.clone(),
-                                    action: request.action,
-                                    applied: false,
-                                    agent_envelope: Some(default_agent_envelope(
-                                        &local_node_id,
-                                        &request.source_node_id,
-                                        "peer.relationship.response",
-                                        json!({
-                                            "action": request.action,
-                                            "applied": false,
-                                            "detail": error,
-                                        }),
-                                    )),
-                                    relationship_state: None,
-                                    detail: Some(error.clone()),
-                                    updated_at: now,
-                                },
-                                NetworkBridgeTick::PeerRelationshipFailed {
-                                    peer,
-                                    action,
-                                    error,
-                                },
-                            )
-                        }
-                    }
-                } else {
-                    let error =
-                        "peer relationship request received before state_dir was configured"
-                            .to_owned();
-                    (
-                        PeerRelationshipResponse {
-                            source_node_id: local_node_id.clone(),
-                            target_node_id: request.source_node_id.clone(),
-                            action: request.action,
-                            applied: false,
-                            agent_envelope: Some(default_agent_envelope(
-                                &local_node_id,
-                                &request.source_node_id,
-                                "peer.relationship.response",
-                                json!({
-                                    "action": request.action,
-                                    "applied": false,
-                                    "detail": error,
-                                }),
-                            )),
-                            relationship_state: None,
-                            detail: Some(error.clone()),
-                            updated_at: now,
-                        },
-                        NetworkBridgeTick::PeerRelationshipFailed {
-                            peer,
-                            action,
-                            error,
-                        },
-                    )
-                };
-                match self
-                    .runtime
-                    .send_peer_relationship_response(channel, response)
-                {
-                    Ok(()) => Ok(tick),
-                    Err(error)
-                        if error
-                            .to_string()
-                            .contains("peer relationship response channel closed") =>
-                    {
-                        Ok(NetworkBridgeTick::TransportNotice {
-                            detail: format!(
-                                "peer_relationship_response_dropped peer={peer} reason={error}"
-                            ),
-                        })
-                    }
-                    Err(error) => Err(error),
-                }
-            }
-            NetworkRuntimeEvent::PeerRelationshipResponse {
-                peer,
-                request_id,
-                response,
-            } => {
-                let Some(pending) = self.pending_relationship_requests.remove(&request_id) else {
-                    return Ok(NetworkBridgeTick::TransportNotice {
-                        detail: format!(
-                            "peer_relationship_response_without_pending peer={peer} request_id={request_id:?}"
-                        ),
-                    });
-                };
-                let action = pending.action;
-                let expected_action = wire_peer_relationship_action(action);
-                let local_node_id = self.local_peer_id().to_string();
-                if pending.peer != peer {
-                    return Ok(NetworkBridgeTick::PeerRelationshipFailed {
-                        peer,
-                        action,
-                        error: format!(
-                            "peer relationship response peer mismatch: expected={} actual={peer}",
-                            pending.peer
-                        ),
-                    });
-                }
-                if response.source_node_id != pending.remote_node_id
-                    || response.target_node_id != local_node_id
-                    || response.action != expected_action
-                {
-                    return Ok(NetworkBridgeTick::PeerRelationshipFailed {
-                        peer,
-                        action,
-                        error: format!(
-                            "peer relationship response payload mismatch source={} target={} action={:?}",
-                            response.source_node_id, response.target_node_id, response.action
-                        ),
-                    });
-                }
-                if !response.applied {
-                    return Ok(NetworkBridgeTick::PeerRelationshipFailed {
-                        peer,
-                        action,
-                        error: response
-                            .detail
-                            .unwrap_or_else(|| "peer relationship action rejected".to_owned()),
-                    });
-                }
-                let Some(state_dir) = self.state_dir.clone() else {
-                    return Ok(NetworkBridgeTick::PeerRelationshipFailed {
-                        peer,
-                        action,
-                        error:
-                            "peer relationship response received before state_dir was configured"
-                                .to_owned(),
-                    });
-                };
-                let local_state = crate::control::load_peer_relationship_records_state(&state_dir)?
-                    .into_iter()
-                    .find(|record| record.remote_node_id == pending.remote_node_id)
-                    .map(|record| record.relationship_state);
-                match local_state {
-                    Some(relationship_state) => {
-                        if action == crate::control::PeerRelationshipAction::Accept
-                            && relationship_state == crate::control::PeerRelationshipState::Accepted
-                        {
-                            let a2a_protocol = response
-                                .agent_envelope
-                                .as_ref()
-                                .map(|envelope| envelope.protocol.clone())
-                                .unwrap_or_else(|| "google_a2a".to_owned());
-                            self.finalize_dm_session_from_relationship(
-                                &state_dir,
-                                &pending.remote_node_id,
-                                crate::control::PeerDmDirection::Outbound,
-                                &a2a_protocol,
-                                response.updated_at,
-                            )?;
-                        }
-                        Ok(NetworkBridgeTick::PeerRelationshipUpdated {
-                            peer,
-                            action,
-                            relationship_state,
-                            initiated_by: crate::control::PeerRelationshipInitiator::Local,
-                        })
-                    }
-                    None => Ok(NetworkBridgeTick::PeerRelationshipFailed {
-                        peer,
-                        action,
-                        error: "peer relationship response applied without a local state record"
-                            .to_owned(),
-                    }),
-                }
-            }
-            NetworkRuntimeEvent::PeerDirectMessageRequest {
-                peer,
-                request,
-                channel,
-            } => {
-                let Some(state_dir) = self.state_dir.clone() else {
-                    let response = PeerDirectMessageResponse {
-                        source_node_id: self.local_peer_id().to_string(),
-                        target_node_id: request.source_node_id.clone(),
-                        thread_id: request.thread_id,
-                        message_id: request.message_id,
-                        kind: request.kind,
-                        applied: false,
-                        delivery_state: "rejected".to_owned(),
-                        contact_material: None,
-                        detail: Some(
-                            "peer direct message request received before state_dir was configured"
-                                .to_owned(),
-                        ),
-                        updated_at: observed_at_ms(),
-                    };
-                    if let Err(err) = self
-                        .runtime
-                        .send_peer_direct_message_response(channel, response)
-                    {
-                        if err.to_string() == "peer direct message response channel closed" {
-                            return Ok(NetworkBridgeTick::TransportNotice {
-                                detail: format!(
-                                    "peer_direct_message_response_closed peer={peer} phase=state_dir_missing kind={}",
-                                    format!("{:?}", request.kind)
-                                ),
-                            });
-                        }
-                        return Err(err);
-                    }
-                    return Ok(NetworkBridgeTick::PeerDirectMessageFailed {
-                        peer,
-                        kind: crate::control::PeerDmMessageKind::Message,
-                        error:
-                            "peer direct message request received before state_dir was configured"
-                                .to_owned(),
-                    });
-                };
-                if request.source_node_id != peer.to_string()
-                    || request.target_node_id != self.local_peer_id().to_string()
-                {
-                    let response = PeerDirectMessageResponse {
-                        source_node_id: self.local_peer_id().to_string(),
-                        target_node_id: request.source_node_id.clone(),
-                        thread_id: request.thread_id,
-                        message_id: request.message_id,
-                        kind: request.kind,
-                        applied: false,
-                        delivery_state: "rejected".to_owned(),
-                        contact_material: None,
-                        detail: Some("peer direct message payload mismatch".to_owned()),
-                        updated_at: observed_at_ms(),
-                    };
-                    if let Err(err) = self
-                        .runtime
-                        .send_peer_direct_message_response(channel, response)
-                    {
-                        if err.to_string() == "peer direct message response channel closed" {
-                            return Ok(NetworkBridgeTick::TransportNotice {
-                                detail: format!(
-                                    "peer_direct_message_response_closed peer={peer} phase=payload_mismatch kind={}",
-                                    format!("{:?}", request.kind)
-                                ),
-                            });
-                        }
-                        return Err(err);
-                    }
-                    return Ok(NetworkBridgeTick::PeerDirectMessageFailed {
-                        peer,
-                        kind: crate::control::PeerDmMessageKind::Message,
-                        error: "peer direct message payload mismatch".to_owned(),
-                    });
-                }
-                if relationship_state_for(&state_dir, &request.source_node_id)?
-                    != Some(crate::control::PeerRelationshipState::Accepted)
-                {
-                    let response = PeerDirectMessageResponse {
-                        source_node_id: self.local_peer_id().to_string(),
-                        target_node_id: request.source_node_id.clone(),
-                        thread_id: request.thread_id,
-                        message_id: request.message_id,
-                        kind: request.kind,
-                        applied: false,
-                        delivery_state: "rejected".to_owned(),
-                        contact_material: None,
-                        detail: Some(
-                            "peer direct messages require an accepted relationship".to_owned(),
-                        ),
-                        updated_at: observed_at_ms(),
-                    };
-                    if let Err(err) = self
-                        .runtime
-                        .send_peer_direct_message_response(channel, response)
-                    {
-                        if err.to_string() == "peer direct message response channel closed" {
-                            return Ok(NetworkBridgeTick::TransportNotice {
-                                detail: format!(
-                                    "peer_direct_message_response_closed peer={peer} phase=relationship_not_accepted kind={}",
-                                    format!("{:?}", request.kind)
-                                ),
-                            });
-                        }
-                        return Err(err);
-                    }
-                    return Ok(NetworkBridgeTick::PeerDirectMessageFailed {
-                        peer,
-                        kind: match request.kind {
-                            RawPeerDirectMessageKind::RelationshipEstablished => {
-                                crate::control::PeerDmMessageKind::RelationshipEstablished
-                            }
-                            RawPeerDirectMessageKind::SessionInit => {
-                                crate::control::PeerDmMessageKind::SessionInit
-                            }
-                            RawPeerDirectMessageKind::Message => {
-                                crate::control::PeerDmMessageKind::Message
-                            }
-                        },
-                        error: "peer direct messages require an accepted relationship".to_owned(),
-                    });
-                }
-
-                let kind = match request.kind {
-                    RawPeerDirectMessageKind::RelationshipEstablished => {
-                        crate::control::PeerDmMessageKind::RelationshipEstablished
-                    }
-                    RawPeerDirectMessageKind::SessionInit => {
-                        crate::control::PeerDmMessageKind::SessionInit
-                    }
-                    RawPeerDirectMessageKind::Message => crate::control::PeerDmMessageKind::Message,
-                };
-                let now = observed_at_ms();
-                if let Some(agent_envelope) = request.agent_envelope.as_ref() {
-                    verify_agent_envelope_signature(agent_envelope)?;
-                }
-                if let Some(contact_material) = &request.contact_material {
-                    upsert_contact_material_for_peer(
-                        &state_dir,
-                        &request.source_node_id,
-                        contact_material,
-                    )?;
-                }
-                let next_session_state = match request.kind {
-                    RawPeerDirectMessageKind::RelationshipEstablished => {
-                        crate::control::PeerDmSessionState::Ready
-                    }
-                    RawPeerDirectMessageKind::SessionInit => {
-                        crate::control::PeerDmSessionState::Ready
-                    }
-                    RawPeerDirectMessageKind::Message => crate::control::PeerDmSessionState::Ready,
-                };
-                upsert_dm_thread(
-                    &state_dir,
-                    &request.source_node_id,
-                    &request.thread_id,
-                    next_session_state,
-                    if matches!(
-                        request.kind,
-                        RawPeerDirectMessageKind::RelationshipEstablished
-                    ) {
-                        Some(now)
-                    } else {
-                        None
-                    },
-                    Some(now),
-                )?;
-                let a2a_protocol = request
-                    .agent_envelope
-                    .as_ref()
-                    .map(|envelope| envelope.protocol.clone())
-                    .unwrap_or_else(|| "google_a2a".to_owned());
-                let content = match request.kind {
-                    RawPeerDirectMessageKind::Message => {
-                        let content_ref = request
-                            .content_ref
-                            .clone()
-                            .ok_or_else(|| anyhow!("peer direct message content_ref missing"))?;
-                        record_data_plane_status(
-                            &state_dir,
-                            "dm_message",
-                            &request.message_id,
-                            Some(&request.source_node_id),
-                            "libp2p_control",
-                            "control_received",
-                            None,
-                        )?;
-                        match crate::control::fetch_json_content_artifact_via_iroh_with_local_peer_id(
-                            &state_dir,
-                            &self.local_peer_id(),
-                            &request.source_node_id,
-                            wattswarm_artifact_store::ArtifactKind::DirectMessage,
-                            &content_ref,
-                        ) {
-                            Ok(content) => {
-                                record_data_plane_status(
-                                    &state_dir,
-                                    "dm_message",
-                                    &request.message_id,
-                                    Some(&request.source_node_id),
-                                    "iroh_direct",
-                                    "content_hydrated",
-                                    None,
-                                )?;
-                                content
-                            }
-                            Err(err) => {
-                                let _ = record_data_plane_status(
-                                    &state_dir,
-                                    "dm_message",
-                                    &request.message_id,
-                                    Some(&request.source_node_id),
-                                    "iroh_direct",
-                                    "hydrate_failed",
-                                    Some(&err.to_string()),
-                                );
-                                return Err(err);
-                            }
-                        }
-                    }
-                    _ => request
-                        .control_json
-                        .as_deref()
-                        .map(|raw| serde_json::from_str::<Value>(raw).unwrap_or_else(|_| json!({})))
-                        .unwrap_or_else(|| json!({})),
-                };
-                save_dm_message(
-                    &state_dir,
-                    &request.source_node_id,
-                    &request.thread_id,
-                    &request.message_id,
-                    kind,
-                    crate::control::PeerDmDirection::Inbound,
-                    crate::control::PeerDmDeliveryState::Delivered,
-                    &a2a_protocol,
-                    request.agent_envelope.as_ref(),
-                    content,
-                    None,
-                )?;
-                let response_contact_material = if matches!(
-                    request.kind,
-                    RawPeerDirectMessageKind::RelationshipEstablished
-                ) {
-                    Some(build_contact_material(
-                        &state_dir,
-                        &self.local_peer_id().to_string(),
-                    )?)
-                } else {
-                    None
-                };
-                let response = PeerDirectMessageResponse {
-                    source_node_id: self.local_peer_id().to_string(),
-                    target_node_id: request.source_node_id.clone(),
-                    thread_id: request.thread_id.clone(),
-                    message_id: request.message_id.clone(),
-                    kind: request.kind,
-                    applied: true,
-                    delivery_state: "delivered".to_owned(),
-                    contact_material: response_contact_material,
-                    detail: None,
-                    updated_at: now,
-                };
-                if let Err(err) = self
-                    .runtime
-                    .send_peer_direct_message_response(channel, response)
-                {
-                    if err.to_string() == "peer direct message response channel closed" {
-                        return Ok(NetworkBridgeTick::TransportNotice {
-                            detail: format!(
-                                "peer_direct_message_response_closed peer={peer} phase=applied kind={}",
-                                format!("{:?}", request.kind)
-                            ),
-                        });
-                    }
-                    return Err(err);
-                }
-                if matches!(
-                    request.kind,
-                    RawPeerDirectMessageKind::RelationshipEstablished
-                ) {
-                    self.record_dm_session_ready(
-                        &state_dir,
-                        &request.source_node_id,
-                        &request.thread_id,
-                        crate::control::PeerDmDirection::Inbound,
-                        &a2a_protocol,
-                        Some(now),
-                    )?;
-                }
-                Ok(NetworkBridgeTick::PeerDirectMessageUpdated {
-                    peer,
-                    kind,
-                    delivery_state: crate::control::PeerDmDeliveryState::Delivered,
-                })
-            }
-            NetworkRuntimeEvent::PeerDirectMessageResponse {
-                peer,
-                request_id,
-                response,
-            } => {
-                let Some(pending) = self.pending_dm_requests.remove(&request_id) else {
-                    return Ok(NetworkBridgeTick::TransportNotice {
-                        detail: format!(
-                            "peer_direct_message_response_without_pending peer={peer} request_id={request_id:?}"
-                        ),
-                    });
-                };
-                if pending.peer != peer
-                    || response.source_node_id != pending.remote_node_id
-                    || response.target_node_id != self.local_peer_id().to_string()
-                    || response.thread_id != pending.thread_id
-                    || response.message_id != pending.message_id
-                {
-                    return Ok(NetworkBridgeTick::PeerDirectMessageFailed {
-                        peer,
-                        kind: pending.kind,
-                        error: "peer direct message response payload mismatch".to_owned(),
-                    });
-                }
-                let Some(state_dir) = self.state_dir.clone() else {
-                    return Ok(NetworkBridgeTick::PeerDirectMessageFailed {
-                        peer,
-                        kind: pending.kind,
-                        error:
-                            "peer direct message response received before state_dir was configured"
-                                .to_owned(),
-                    });
-                };
-                if !response.applied {
-                    save_dm_message(
-                        &state_dir,
-                        &pending.remote_node_id,
-                        &pending.thread_id,
-                        &pending.message_id,
-                        pending.kind,
-                        crate::control::PeerDmDirection::Outbound,
-                        crate::control::PeerDmDeliveryState::Rejected,
-                        &pending.a2a_protocol,
-                        None,
-                        json!({}),
-                        None,
-                    )?;
-                    return Ok(NetworkBridgeTick::PeerDirectMessageFailed {
-                        peer,
-                        kind: pending.kind,
-                        error: response
-                            .detail
-                            .unwrap_or_else(|| "peer direct message rejected".to_owned()),
-                    });
-                }
-                if let Some(contact_material) = &response.contact_material {
-                    upsert_contact_material_for_peer(
-                        &state_dir,
-                        &pending.remote_node_id,
-                        contact_material,
-                    )?;
-                }
-                record_data_plane_status(
-                    &state_dir,
-                    "dm_message",
-                    &pending.message_id,
-                    Some(&pending.remote_node_id),
-                    "libp2p_control",
-                    "control_acknowledged",
-                    None,
-                )?;
-                save_dm_message(
-                    &state_dir,
-                    &pending.remote_node_id,
-                    &pending.thread_id,
-                    &pending.message_id,
-                    pending.kind,
-                    crate::control::PeerDmDirection::Outbound,
-                    crate::control::PeerDmDeliveryState::Delivered,
-                    &pending.a2a_protocol,
-                    None,
-                    json!({}),
-                    Some(response.updated_at),
-                )?;
-                let session_state = match pending.kind {
-                    crate::control::PeerDmMessageKind::RelationshipEstablished => {
-                        crate::control::PeerDmSessionState::Ready
-                    }
-                    crate::control::PeerDmMessageKind::SessionInit
-                    | crate::control::PeerDmMessageKind::Message => {
-                        crate::control::PeerDmSessionState::Ready
-                    }
-                };
-                upsert_dm_thread(
-                    &state_dir,
-                    &pending.remote_node_id,
-                    &pending.thread_id,
-                    session_state,
-                    if pending.kind == crate::control::PeerDmMessageKind::RelationshipEstablished {
-                        Some(response.updated_at)
-                    } else {
-                        None
-                    },
-                    Some(response.updated_at),
-                )?;
-                if pending.kind == crate::control::PeerDmMessageKind::RelationshipEstablished {
-                    self.record_dm_session_ready(
-                        &state_dir,
-                        &pending.remote_node_id,
-                        &pending.thread_id,
-                        crate::control::PeerDmDirection::Outbound,
-                        &pending.a2a_protocol,
-                        Some(response.updated_at),
-                    )?;
-                }
-                Ok(NetworkBridgeTick::PeerDirectMessageUpdated {
-                    peer,
-                    kind: pending.kind,
-                    delivery_state: crate::control::PeerDmDeliveryState::Delivered,
-                })
-            }
-            NetworkRuntimeEvent::PeerDirectMessageOutboundFailure {
-                peer,
-                request_id,
-                error,
-            } => {
-                let Some(pending) = self.pending_dm_requests.remove(&request_id) else {
-                    return Ok(NetworkBridgeTick::PeerDirectMessageFailed {
-                        peer,
-                        kind: crate::control::PeerDmMessageKind::Message,
-                        error,
-                    });
-                };
-                if let Some(state_dir) = &self.state_dir {
-                    let _ = save_dm_message(
-                        state_dir,
-                        &pending.remote_node_id,
-                        &pending.thread_id,
-                        &pending.message_id,
-                        pending.kind,
-                        crate::control::PeerDmDirection::Outbound,
-                        crate::control::PeerDmDeliveryState::Rejected,
-                        &pending.a2a_protocol,
-                        None,
-                        json!({}),
-                        None,
-                    );
-                }
-                Ok(NetworkBridgeTick::PeerDirectMessageFailed {
-                    peer,
-                    kind: pending.kind,
-                    error,
-                })
-            }
-            NetworkRuntimeEvent::PeerDirectMessageInboundFailure { peer, error } => {
-                if error == "Timeout while receiving request or sending response" {
-                    Ok(NetworkBridgeTick::TransportNotice {
-                        detail: format!("peer_direct_message_inbound_timeout peer={peer}"),
-                    })
-                } else {
-                    Err(anyhow!(
-                        "peer direct message inbound failure from {peer}: {error}"
-                    ))
-                }
-            }
-            NetworkRuntimeEvent::PeerRelationshipOutboundFailure {
-                peer,
-                request_id,
-                error,
-            } => {
-                let action = self
-                    .pending_relationship_requests
-                    .remove(&request_id)
-                    .map(|pending| pending.action)
-                    .unwrap_or(crate::control::PeerRelationshipAction::Request);
-                Ok(NetworkBridgeTick::PeerRelationshipFailed {
-                    peer,
-                    action,
-                    error,
-                })
-            }
-            NetworkRuntimeEvent::PeerRelationshipInboundFailure { peer, error } => Err(anyhow!(
-                "peer relationship inbound failure from {peer}: {error}"
-            ))
-            .or_else(|error| {
-                let error_text = error.to_string();
-                if error_text.contains("peer relationship inbound failure")
-                    && error_text.contains("Timeout while receiving request or sending response")
-                {
-                    Ok(NetworkBridgeTick::TransportNotice {
-                        detail: format!(
-                            "peer_relationship_inbound_timeout peer={peer} reason={error_text}"
-                        ),
-                    })
-                } else {
-                    Err(error)
-                }
-            }),
-        }
-    }
 }
+
 #[derive(Debug, Deserialize, Default)]
 struct StartupBootstrapConfig {
     #[serde(default)]

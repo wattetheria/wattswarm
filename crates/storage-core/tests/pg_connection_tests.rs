@@ -635,6 +635,78 @@ fn local_control_peer_metadata_and_relationship_roundtrip() {
 }
 
 #[test]
+fn local_control_agent_event_and_delivery_roundtrip() {
+    with_test_schema(|| {
+        let store = PgStore::open("agent-event-roundtrip.state").expect("open store");
+        let scope_id = local_control_scope_id(std::path::Path::new("/tmp/wattswarm-state"));
+
+        store
+            .upsert_local_agent_event(
+                &scope_id,
+                &wattswarm_storage_core::storage::LocalAgentEventRow {
+                    event_id: "evt-1".to_owned(),
+                    event_type: "friend_request".to_owned(),
+                    source_kind: "peer_relationship".to_owned(),
+                    source_node_id: Some("peer-a".to_owned()),
+                    target_agent_id: Some("agent-b".to_owned()),
+                    target_executor: Some("core-agent".to_owned()),
+                    payload_json: serde_json::to_string(&serde_json::json!({
+                        "remote_node_id": "peer-a"
+                    }))
+                    .expect("payload_json"),
+                    allowed_actions_json: serde_json::to_string(&vec![
+                        "accept".to_owned(),
+                        "reject".to_owned(),
+                    ])
+                    .expect("allowed_actions_json"),
+                    requires_commit: true,
+                    status: "pending".to_owned(),
+                    dedupe_key: Some("friend_request:peer-a".to_owned()),
+                    correlation_id: Some("corr-1".to_owned()),
+                    created_at: 1_700_000_000_000,
+                    updated_at: 1_700_000_000_000,
+                },
+            )
+            .expect("upsert local agent event");
+
+        store
+            .append_local_agent_event_delivery(
+                &scope_id,
+                &wattswarm_storage_core::storage::LocalAgentEventDeliveryRow {
+                    delivery_id: "delivery-1".to_owned(),
+                    event_id: "evt-1".to_owned(),
+                    attempt_no: 1,
+                    endpoint_url: "http://127.0.0.1:8787/agent-events".to_owned(),
+                    delivery_status: "acked".to_owned(),
+                    response_code: Some(200),
+                    response_body: Some("{\"ok\":true}".to_owned()),
+                    error_text: None,
+                    next_retry_at: None,
+                    created_at: 1_700_000_000_010,
+                },
+            )
+            .expect("append local agent event delivery");
+
+        let event = store
+            .find_local_agent_event_by_dedupe_key(&scope_id, "friend_request:peer-a")
+            .expect("lookup local agent event")
+            .expect("local agent event exists");
+        assert_eq!(event.event_id, "evt-1");
+        assert_eq!(event.status, "pending");
+
+        let conn = open_test_connection();
+        let deliveries = conn
+            .query_row(
+                "SELECT COUNT(*) FROM agent_event_delivery_local WHERE scope_id = $1 AND event_id = $2",
+                wattswarm_storage_core::params![scope_id, "evt-1"],
+                |row| row.get::<usize, i64>(0),
+            )
+            .expect("count deliveries");
+        assert_eq!(deliveries, 1);
+    });
+}
+
+#[test]
 fn to_param_value_handles_option_and_unit_variants() {
     assert!(matches!(
         wattswarm_storage_core::storage::pg::to_param_value(Option::<i64>::None),

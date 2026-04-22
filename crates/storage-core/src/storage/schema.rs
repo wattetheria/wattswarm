@@ -507,6 +507,34 @@ fn migrate_executor_registry_local_metadata_schema(conn: &Connection) -> Result<
             ",
         )?;
     }
+    if !column_exists(conn, "executor_registry_local", "commit_plane_endpoint") {
+        conn.execute_batch(
+            "
+            ALTER TABLE executor_registry_local
+            ADD COLUMN commit_plane_endpoint TEXT;
+            ",
+        )?;
+    }
+    if !column_exists(
+        conn,
+        "executor_registry_local",
+        "agent_event_callback_base_url",
+    ) {
+        conn.execute_batch(
+            "
+            ALTER TABLE executor_registry_local
+            ADD COLUMN agent_event_callback_base_url TEXT;
+            ",
+        )?;
+    }
+    if !column_exists(conn, "executor_registry_local", "commit_plane_token_file") {
+        conn.execute_batch(
+            "
+            ALTER TABLE executor_registry_local
+            ADD COLUMN commit_plane_token_file TEXT;
+            ",
+        )?;
+    }
     Ok(())
 }
 
@@ -630,9 +658,12 @@ impl PgStore {
                 scope_id TEXT NOT NULL DEFAULT '',
                 executor_name TEXT NOT NULL,
                 base_url TEXT NOT NULL,
+                agent_event_callback_base_url TEXT,
                 kind TEXT NOT NULL DEFAULT 'local',
                 target_node_id TEXT,
                 scope_hint TEXT,
+                commit_plane_endpoint TEXT,
+                commit_plane_token_file TEXT,
                 updated_at TIMESTAMPTZ NOT NULL,
                 PRIMARY KEY(scope_id, executor_name)
             );
@@ -732,6 +763,64 @@ impl PgStore {
 
             CREATE INDEX IF NOT EXISTS idx_data_plane_status_local_updated
                 ON data_plane_status_local(scope_id, updated_at DESC, object_kind ASC, object_id ASC);
+
+            CREATE TABLE IF NOT EXISTS agent_payments_local (
+                scope_id TEXT NOT NULL DEFAULT '',
+                payment_id TEXT NOT NULL,
+                remote_node_id TEXT NOT NULL,
+                summary_id TEXT NOT NULL,
+                message_kind TEXT NOT NULL,
+                payment_json TEXT NOT NULL,
+                updated_at TIMESTAMPTZ NOT NULL,
+                PRIMARY KEY(scope_id, payment_id)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_agent_payments_local_updated
+                ON agent_payments_local(scope_id, updated_at DESC, payment_id ASC);
+
+            CREATE TABLE IF NOT EXISTS agent_event_bus_local (
+                scope_id TEXT NOT NULL DEFAULT '',
+                event_id TEXT NOT NULL,
+                event_type TEXT NOT NULL,
+                source_kind TEXT NOT NULL,
+                source_node_id TEXT,
+                target_agent_id TEXT,
+                target_executor TEXT,
+                payload_json TEXT NOT NULL,
+                allowed_actions_json TEXT NOT NULL DEFAULT '[]',
+                requires_commit BOOLEAN NOT NULL DEFAULT FALSE,
+                status TEXT NOT NULL,
+                dedupe_key TEXT,
+                correlation_id TEXT,
+                created_at TIMESTAMPTZ NOT NULL,
+                updated_at TIMESTAMPTZ NOT NULL,
+                PRIMARY KEY(scope_id, event_id)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_agent_event_bus_local_status_updated
+                ON agent_event_bus_local(scope_id, status, updated_at DESC, event_id ASC);
+
+            CREATE INDEX IF NOT EXISTS idx_agent_event_bus_local_dedupe
+                ON agent_event_bus_local(scope_id, dedupe_key)
+                WHERE dedupe_key IS NOT NULL;
+
+            CREATE TABLE IF NOT EXISTS agent_event_delivery_local (
+                scope_id TEXT NOT NULL DEFAULT '',
+                delivery_id TEXT NOT NULL,
+                event_id TEXT NOT NULL,
+                attempt_no BIGINT NOT NULL,
+                endpoint_url TEXT NOT NULL,
+                delivery_status TEXT NOT NULL,
+                response_code BIGINT,
+                response_body TEXT,
+                error_text TEXT,
+                next_retry_at TIMESTAMPTZ,
+                created_at TIMESTAMPTZ NOT NULL,
+                PRIMARY KEY(scope_id, delivery_id)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_agent_event_delivery_local_event_attempt
+                ON agent_event_delivery_local(scope_id, event_id, attempt_no DESC);
 
             CREATE TABLE IF NOT EXISTS remote_task_bridge_registry_local (
                 task_id TEXT NOT NULL,

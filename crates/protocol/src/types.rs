@@ -124,6 +124,98 @@ fn is_zero_u8(value: &u8) -> bool {
     *value == 0
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentEventType {
+    FriendRequest,
+    DmReceived,
+    PaymentRequest,
+    PaymentUpdate,
+    TaskClaimReceived,
+    TaskResultReceived,
+    TopicMessageRequiresReply,
+    ThirdPartyResult,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentEventStatus {
+    Pending,
+    Delivered,
+    Acked,
+    Completed,
+    Failed,
+    Expired,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentEventSourceKind {
+    PeerRelationship,
+    PeerDirectMessage,
+    PaymentSummary,
+    TaskLifecycle,
+    TopicMessage,
+    ServiceNetResult,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentEvent {
+    pub event_id: String,
+    pub event_type: AgentEventType,
+    pub source_kind: AgentEventSourceKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_node_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_agent_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_executor: Option<String>,
+    pub payload: Value,
+    pub requires_commit: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_actions: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub correlation_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dedupe_key: Option<String>,
+    pub created_at: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AgentEventCallbackRequest {
+    pub event: AgentEvent,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentDecisionRoute {
+    Noop,
+    WattetheriaCommit,
+    WattswarmDirect,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AgentDecision {
+    pub decision_id: String,
+    pub action: String,
+    pub route: AgentDecisionRoute,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Value::is_null")]
+    pub payload: Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AgentEventCallbackResponse {
+    pub ok: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acked_at: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decision: Option<AgentDecision>,
+}
+
 impl TransportRoute {
     pub fn from_value(value: &Value) -> Option<Self> {
         serde_json::from_value::<Self>(value.clone())

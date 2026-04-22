@@ -579,6 +579,46 @@ impl PgStore {
         self.list_topic_messages_page(feed_key, scope_hint, None, None, limit)
     }
 
+    pub fn get_topic_message(&self, message_id: &str) -> Result<Option<TopicMessageRow>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
+        let mut stmt = conn.prepare(
+            "SELECT network_id, feed_key, scope_hint, author_node_id, content_ref_json, content_json,
+                    reply_to_message_id, CAST(EXTRACT(EPOCH FROM created_at) * 1000 AS BIGINT),
+                    CASE WHEN content_resolved_at IS NULL THEN NULL ELSE CAST(EXTRACT(EPOCH FROM content_resolved_at) * 1000 AS BIGINT) END
+             FROM topic_messages
+             WHERE org_id = $1 AND message_id = $2",
+        )?;
+        let mut rows = stmt.query_map(params![self.org_id(), message_id], |row| {
+            let content_ref_json: String = row.get(4)?;
+            let content_json: String = row.get(5)?;
+            let scope_hint: String = row.get(2)?;
+            let feed_key: String = row.get(1)?;
+            Ok(TopicMessageRow {
+                message_id: message_id.to_owned(),
+                network_id: row.get(0)?,
+                feed_key,
+                scope_hint,
+                author_node_id: row.get(3)?,
+                content_ref: serde_json::from_str(&content_ref_json).map_err(|error| {
+                    pg::Error::FromSqlConversionFailure(0, pg::types::Type::Text, Box::new(error))
+                })?,
+                content: serde_json::from_str(&content_json).map_err(|error| {
+                    pg::Error::FromSqlConversionFailure(0, pg::types::Type::Text, Box::new(error))
+                })?,
+                content_resolved_at: row.get::<_, Option<i64>>(8)?.map(|value| value as u64),
+                reply_to_message_id: row.get(6)?,
+                created_at: row.get::<_, i64>(7)? as u64,
+            })
+        })?;
+        let Some(row) = rows.next() else {
+            return Ok(None);
+        };
+        Ok(Some(row?))
+    }
+
     pub fn update_topic_message_content(
         &self,
         message_id: &str,

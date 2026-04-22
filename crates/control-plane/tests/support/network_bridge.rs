@@ -162,6 +162,7 @@ fn make_service_with_config_and_state_dir(
 ) -> NetworkBridgeService {
     let config = NetworkP2pConfig { ..config }.apply_protocol_params(params);
     let identity = ensure_seeded_test_dir(state_dir);
+    let db_path = state_dir.join("ui.state");
     let mut service = NetworkBridgeService::new(
         NetworkP2pNode::from_ed25519_secret_bytes(config, identity.secret_bytes())
             .expect("seeded network node"),
@@ -169,7 +170,7 @@ fn make_service_with_config_and_state_dir(
         params,
     )
     .expect("network service");
-    service.set_state_dir(state_dir.to_path_buf());
+    service.set_state_dir(state_dir.to_path_buf(), db_path.to_path_buf());
     service
 }
 

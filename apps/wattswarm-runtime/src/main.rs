@@ -1,9 +1,8 @@
-use anyhow::{Context, Result};
+use anyhow::Result;
+use axum::Json;
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
-use axum::routing::{get, post};
-use axum::{Json, Router};
 use clap::Parser;
 use serde_json::json;
 use std::sync::Arc;
@@ -12,6 +11,7 @@ use wattswarm::policy::PolicyRegistry;
 use wattswarm::runtime::{
     ExecuteRequest, ExecuteResponse, RuntimeCapabilities, VerifyRequest, VerifyResponse,
 };
+use wattswarm::types::{AgentEventCallbackRequest, AgentEventCallbackResponse};
 use wattswarm::types::{ArtifactRef, InlineEvidence, VerificationStatus};
 
 #[derive(Parser, Debug)]
@@ -39,6 +39,10 @@ struct AppState {
 #[cfg(not(test))]
 #[tokio::main]
 async fn main() -> Result<()> {
+    use anyhow::Context;
+    use axum::Router;
+    use axum::routing::{get, post};
+
     let args = Args::parse();
     let capabilities = RuntimeCapabilities {
         task_types: split_csv(&args.task_types),
@@ -54,6 +58,7 @@ async fn main() -> Result<()> {
     let app = Router::new()
         .route("/health", get(health))
         .route("/capabilities", get(capabilities_endpoint))
+        .route("/agent-events", post(agent_events))
         .route("/execute", post(execute))
         .route("/verify", post(verify))
         .with_state(state);
@@ -76,12 +81,30 @@ fn split_csv(raw: &str) -> Vec<String> {
         .collect()
 }
 
+#[allow(dead_code)]
 async fn health() -> impl IntoResponse {
     Json(json!({ "status": "ok" }))
 }
 
+#[allow(dead_code)]
 async fn capabilities_endpoint(State(state): State<AppState>) -> impl IntoResponse {
     Json(state.capabilities)
+}
+
+async fn agent_events(Json(req): Json<AgentEventCallbackRequest>) -> impl IntoResponse {
+    let now = chrono::Utc::now().timestamp_millis().max(0) as u64;
+    Json(AgentEventCallbackResponse {
+        ok: true,
+        acked_at: Some(now),
+        detail: Some(format!(
+            "received {}",
+            serde_json::to_value(&req.event.event_type)
+                .ok()
+                .and_then(|value| value.as_str().map(ToOwned::to_owned))
+                .unwrap_or_else(|| "agent_event".to_owned())
+        )),
+        decision: None,
+    })
 }
 
 async fn execute(
@@ -293,6 +316,35 @@ fn execute_topic_interpretation(
 
 fn contains_any(haystack: &str, needles: &[&str]) -> bool {
     needles.iter().any(|needle| haystack.contains(needle))
+}
+
+#[cfg(test)]
+mod agent_event_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn agent_events_acknowledge_structured_event() {
+        let response = agent_events(Json(AgentEventCallbackRequest {
+            event: wattswarm::types::AgentEvent {
+                event_id: "evt-1".to_owned(),
+                event_type: wattswarm::types::AgentEventType::FriendRequest,
+                source_kind: wattswarm::types::AgentEventSourceKind::PeerRelationship,
+                source_node_id: Some("peer-a".to_owned()),
+                target_agent_id: Some("agent-b".to_owned()),
+                target_executor: Some("core-agent".to_owned()),
+                payload: json!({"hello": "world"}),
+                requires_commit: true,
+                allowed_actions: vec!["accept".to_owned(), "reject".to_owned()],
+                correlation_id: Some("corr-1".to_owned()),
+                dedupe_key: Some("dedupe-1".to_owned()),
+                created_at: 1,
+            },
+        }))
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
 }
 
 async fn verify(

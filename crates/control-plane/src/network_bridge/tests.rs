@@ -4,6 +4,7 @@ use crate::network_p2p::PeerDiscoverySourceKind;
 use crate::node::build_event_for_external;
 use crate::storage::{
     DecisionMemoryHitRow, ImportedTaskOutcomeRow, PgStore, ProjectionScope, ReputationSnapshotRow,
+    local_control_scope_id, local_control_store,
 };
 use crate::types::{Membership, NetworkKind, Role};
 use crate::{node::Node, task_template::sample_contract};
@@ -11,8 +12,9 @@ use serde_json::json;
 use std::collections::HashMap;
 use std::env;
 use std::fs;
+use std::io::{Read, Write};
 use std::path::PathBuf;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use uuid::Uuid;
 
 fn env_test_lock() -> &'static Mutex<()> {
@@ -44,6 +46,539 @@ fn sample_topic_content_ref(digest: &str, producer: &str) -> crate::types::Artif
         created_at: 10,
         producer: producer.to_owned(),
     }
+}
+
+fn read_http_request(stream: &mut std::net::TcpStream) -> String {
+    let mut buffer = Vec::new();
+    let mut header_end = None;
+    loop {
+        let mut chunk = [0_u8; 1024];
+        let read = stream.read(&mut chunk).expect("read request");
+        if read == 0 {
+            break;
+        }
+        buffer.extend_from_slice(&chunk[..read]);
+        if header_end.is_none()
+            && let Some(position) = buffer.windows(4).position(|window| window == b"\r\n\r\n")
+        {
+            header_end = Some(position + 4);
+            break;
+        }
+    }
+
+    let header_end = header_end.expect("header terminator");
+    let header_text = String::from_utf8_lossy(&buffer[..header_end]).to_string();
+    let content_length = header_text
+        .lines()
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            if name.eq_ignore_ascii_case("content-length") {
+                Some(value.trim().parse::<usize>().expect("content length"))
+            } else {
+                None
+            }
+        })
+        .unwrap_or(0);
+    while buffer.len() < header_end + content_length {
+        let mut chunk = vec![0_u8; header_end + content_length - buffer.len()];
+        let read = stream.read(&mut chunk).expect("read request body");
+        if read == 0 {
+            break;
+        }
+        buffer.extend_from_slice(&chunk[..read]);
+    }
+    String::from_utf8(buffer).expect("utf8 request")
+}
+
+#[test]
+fn task_claim_agent_event_uses_expected_schema() {
+    let event = crate::types::Event {
+        event_id: "evt-claim".to_owned(),
+        protocol_version: "1".to_owned(),
+        event_kind: crate::types::EventKind::TaskClaimed,
+        task_id: Some("task-1".to_owned()),
+        epoch: 7,
+        author_node_id: "peer-a".to_owned(),
+        created_at: 55,
+        payload: crate::types::EventPayload::TaskClaimed(crate::types::ClaimPayload {
+            task_id: "task-1".to_owned(),
+            role: crate::types::ClaimRole::Propose,
+            claimer_node_id: "peer-a".to_owned(),
+            execution_id: "exec-1".to_owned(),
+            lease_until: 88,
+        }),
+        signature_hex: "sig".to_owned(),
+    };
+    let crate::types::EventPayload::TaskClaimed(payload) = &event.payload else {
+        panic!("expected claim payload");
+    };
+    let agent_event = task_claim_agent_event(&event, payload);
+    assert_eq!(
+        agent_event.event_type,
+        wattswarm_protocol::types::AgentEventType::TaskClaimReceived
+    );
+    assert_eq!(
+        agent_event.source_kind,
+        wattswarm_protocol::types::AgentEventSourceKind::TaskLifecycle
+    );
+    assert_eq!(agent_event.payload["task_id"].as_str(), Some("task-1"));
+    assert_eq!(agent_event.payload["execution_id"].as_str(), Some("exec-1"));
+}
+
+#[test]
+fn task_result_agent_event_supports_retry_updates() {
+    let event = crate::types::Event {
+        event_id: "evt-retry".to_owned(),
+        protocol_version: "1".to_owned(),
+        event_kind: crate::types::EventKind::TaskRetryScheduled,
+        task_id: Some("task-1".to_owned()),
+        epoch: 7,
+        author_node_id: "peer-a".to_owned(),
+        created_at: 99,
+        payload: crate::types::EventPayload::TaskRetryScheduled(
+            crate::types::TaskRetryScheduledPayload {
+                task_id: "task-1".to_owned(),
+                attempt: 3,
+                run_at: 1234,
+            },
+        ),
+        signature_hex: "sig".to_owned(),
+    };
+    let node = Node::open_in_memory_with_roles(&[Role::Committer]).expect("open node");
+    let agent_event = task_result_agent_event(&node, &event)
+        .expect("build task result event")
+        .expect("task result event");
+    assert_eq!(
+        agent_event.event_type,
+        wattswarm_protocol::types::AgentEventType::TaskResultReceived
+    );
+    assert_eq!(
+        agent_event.payload["event_kind"].as_str(),
+        Some("task_retry_scheduled")
+    );
+    assert_eq!(agent_event.payload["attempt"].as_u64(), Some(3));
+}
+
+#[test]
+fn topic_message_requires_reply_excludes_consensus_kinds() {
+    assert!(topic_message_requires_reply(
+        &json!({"text": "hello world"})
+    ));
+    assert!(!topic_message_requires_reply(&json!({"kind": "proposal"})));
+    assert!(!topic_message_requires_reply(&json!({"kind": "stance"})));
+    assert!(!topic_message_requires_reply(
+        &json!({"kind": "interpreted_stance"})
+    ));
+    assert!(!topic_message_requires_reply(
+        &json!({"kind": "consensus_result"})
+    ));
+}
+
+#[test]
+fn payment_update_allowed_actions_follow_message_kind() {
+    assert_eq!(
+        payment_allowed_actions("payment_request"),
+        vec![
+            "authorize".to_owned(),
+            "reject".to_owned(),
+            "cancel".to_owned()
+        ]
+    );
+    assert_eq!(
+        payment_allowed_actions("payment_authorized"),
+        vec!["submit".to_owned(), "cancel".to_owned()]
+    );
+    assert_eq!(
+        payment_allowed_actions("payment_submitted"),
+        vec!["settle".to_owned()]
+    );
+    assert!(payment_allowed_actions("payment_settled").is_empty());
+    assert!(payment_allowed_actions("payment_rejected").is_empty());
+    assert!(payment_allowed_actions("payment_cancelled").is_empty());
+}
+
+#[test]
+fn deliver_agent_event_routes_decision_to_wattetheria_commit_plane() {
+    let state_dir = temp_startup_dir("agent-commit-route");
+    let db_path = state_dir.join("ui.state");
+    let token_file = state_dir.join("control.token");
+    fs::write(&token_file, "commit-token").expect("write control token");
+
+    let seen_commit_requests: Arc<Mutex<Vec<serde_json::Value>>> = Arc::new(Mutex::new(Vec::new()));
+    let seen_commit_requests_clone = Arc::clone(&seen_commit_requests);
+    let commit_listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind commit listener");
+    let commit_addr = commit_listener.local_addr().expect("commit addr");
+    std::thread::spawn(move || {
+        let (mut stream, _) = commit_listener.accept().expect("accept commit connection");
+        let raw = read_http_request(&mut stream);
+        assert!(
+            raw.to_ascii_lowercase()
+                .contains("authorization: bearer commit-token")
+        );
+        let body = raw.split("\r\n\r\n").nth(1).expect("commit request body");
+        seen_commit_requests_clone
+            .lock()
+            .expect("commit request mutex")
+            .push(serde_json::from_str(body.trim()).expect("parse commit body"));
+        let response = "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 34\r\n\r\n{\"ok\":true,\"status\":\"accepted\"}";
+        stream
+            .write_all(response.as_bytes())
+            .expect("write commit response");
+    });
+
+    let executor_listener =
+        std::net::TcpListener::bind("127.0.0.1:0").expect("bind executor listener");
+    let executor_addr = executor_listener.local_addr().expect("executor addr");
+    std::thread::spawn(move || {
+        let (mut stream, _) = executor_listener
+            .accept()
+            .expect("accept executor connection");
+        let raw = read_http_request(&mut stream);
+        assert!(raw.contains("POST /agent-events "));
+        let body = serde_json::to_string(&wattswarm_protocol::types::AgentEventCallbackResponse {
+            ok: true,
+            acked_at: Some(1),
+            detail: Some("decision ready".to_owned()),
+            decision: Some(wattswarm_protocol::types::AgentDecision {
+                decision_id: "dec-1".to_owned(),
+                action: "block".to_owned(),
+                route: wattswarm_protocol::types::AgentDecisionRoute::WattetheriaCommit,
+                reason: None,
+                payload: json!({}),
+            }),
+        })
+        .expect("serialize executor response");
+        let response = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        stream
+            .write_all(response.as_bytes())
+            .expect("write executor response");
+    });
+
+    crate::control::save_executor_registry_state(
+        &state_dir,
+        &crate::control::ExecutorRegistry {
+            entries: vec![crate::control::ExecutorRegistryEntry {
+                name: crate::control::CORE_AGENT_EXECUTOR_NAME.to_owned(),
+                base_url: "http://127.0.0.1:65535".to_owned(),
+                agent_event_callback_base_url: Some(format!("http://{executor_addr}")),
+                kind: crate::control::ExecutorKind::Local,
+                target_node_id: None,
+                scope_hint: None,
+                commit_plane_endpoint: Some(format!("http://{commit_addr}")),
+                commit_plane_token_file: Some(token_file.display().to_string()),
+            }],
+        },
+    )
+    .expect("save executor registry");
+
+    let event = build_agent_event(
+        wattswarm_protocol::types::AgentEventType::FriendRequest,
+        wattswarm_protocol::types::AgentEventSourceKind::PeerRelationship,
+        Some("peer-a".to_owned()),
+        Some("did:key:agent".to_owned()),
+        json!({
+            "agent_envelope": {
+                "message": {
+                    "source_public_id": "remote-public",
+                    "target_public_id": "local-public"
+                }
+            }
+        }),
+        true,
+        vec!["accept".to_owned(), "reject".to_owned(), "block".to_owned()],
+        Some("friend-request".to_owned()),
+        Some("friend_request:peer-a:1".to_owned()),
+    );
+    deliver_agent_event_to_local_executor(&state_dir, Some(&db_path), &event)
+        .expect("deliver event");
+
+    let scope_id = local_control_scope_id(&state_dir);
+    let rows = local_control_store(&state_dir)
+        .expect("open local control store")
+        .list_local_agent_events(&scope_id)
+        .expect("list local agent events");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].status, "completed");
+
+    let commit_requests = seen_commit_requests.lock().expect("read commit requests");
+    assert_eq!(commit_requests.len(), 1);
+    assert_eq!(
+        commit_requests[0]["event"]["event_type"].as_str(),
+        Some("friend_request")
+    );
+    assert_eq!(
+        commit_requests[0]["decision"]["action"].as_str(),
+        Some("block")
+    );
+}
+
+#[test]
+fn deliver_agent_event_routes_topic_reply_to_wattswarm_store() {
+    let state_dir = temp_startup_dir("topic-direct-route");
+    let db_path = state_dir.join("ui.state");
+    let identity = crate::control::load_local_identity(&state_dir).expect("local identity");
+    let membership = membership_with_roles(&[identity.node_id()]);
+    let mut node = Node::new(
+        identity.clone(),
+        PgStore::open(&db_path).expect("store"),
+        membership,
+    )
+    .expect("node");
+    let network_id = "default".to_owned();
+    let remote_message = crate::control::emit_topic_message_with_content(
+        &mut node,
+        &state_dir,
+        &network_id,
+        "crew.chat",
+        "group:crew-7",
+        json!({"text": "hello crew"}),
+        None,
+        10,
+    )
+    .expect("seed topic message");
+    drop(node);
+
+    let executor_listener =
+        std::net::TcpListener::bind("127.0.0.1:0").expect("bind executor listener");
+    let executor_addr = executor_listener.local_addr().expect("executor addr");
+    std::thread::spawn(move || {
+        let (mut stream, _) = executor_listener
+            .accept()
+            .expect("accept executor connection");
+        let raw = read_http_request(&mut stream);
+        assert!(raw.contains("POST /agent-events "));
+        let body = serde_json::to_string(&wattswarm_protocol::types::AgentEventCallbackResponse {
+            ok: true,
+            acked_at: Some(1),
+            detail: Some("topic reply".to_owned()),
+            decision: Some(wattswarm_protocol::types::AgentDecision {
+                decision_id: "dec-topic-direct".to_owned(),
+                action: "reply".to_owned(),
+                route: wattswarm_protocol::types::AgentDecisionRoute::WattswarmDirect,
+                reason: None,
+                payload: json!({
+                    "content": {
+                        "kind": "message",
+                        "text": "roger that"
+                    }
+                }),
+            }),
+        })
+        .expect("serialize executor response");
+        let response = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        stream
+            .write_all(response.as_bytes())
+            .expect("write executor response");
+    });
+
+    crate::control::save_executor_registry_state(
+        &state_dir,
+        &crate::control::ExecutorRegistry {
+            entries: vec![crate::control::ExecutorRegistryEntry {
+                name: crate::control::CORE_AGENT_EXECUTOR_NAME.to_owned(),
+                base_url: format!("http://{executor_addr}"),
+                agent_event_callback_base_url: None,
+                kind: crate::control::ExecutorKind::Local,
+                target_node_id: None,
+                scope_hint: None,
+                commit_plane_endpoint: None,
+                commit_plane_token_file: None,
+            }],
+        },
+    )
+    .expect("save executor registry");
+
+    let event = build_agent_event(
+        wattswarm_protocol::types::AgentEventType::TopicMessageRequiresReply,
+        wattswarm_protocol::types::AgentEventSourceKind::TopicMessage,
+        Some("peer-a".to_owned()),
+        None,
+        json!({
+            "network_id": network_id,
+            "message_id": remote_message.event_id,
+            "feed_key": "crew.chat",
+            "scope_hint": "group:crew-7",
+            "content": {"text": "hello crew"},
+        }),
+        false,
+        vec!["reply".to_owned(), "ignore".to_owned()],
+        Some("crew.chat".to_owned()),
+        Some(format!("topic_message:{}", remote_message.event_id)),
+    );
+    deliver_agent_event_to_local_executor(&state_dir, Some(&db_path), &event)
+        .expect("deliver topic event");
+    let scope_id = local_control_scope_id(&state_dir);
+    let rows = local_control_store(&state_dir)
+        .expect("open local control store")
+        .list_local_agent_events(&scope_id)
+        .expect("list local agent events");
+    let deliveries = local_control_store(&state_dir)
+        .expect("open local control store")
+        .list_local_agent_event_deliveries(&scope_id, &event.event_id)
+        .expect("list local agent event deliveries");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].status, "completed", "{rows:?} {deliveries:?}");
+
+    let node = crate::control::open_node(&state_dir, &db_path).expect("reopen node");
+    let messages = node
+        .store
+        .list_topic_messages("crew.chat", "group:crew-7", 10)
+        .expect("list topic messages");
+    let reply = messages
+        .iter()
+        .find(|message| {
+            message.reply_to_message_id.as_deref() == Some(remote_message.event_id.as_str())
+                && message.content["text"].as_str() == Some("roger that")
+        })
+        .unwrap_or_else(|| panic!("reply message recorded in wattswarm store: {messages:?}"));
+    assert_eq!(reply.feed_key, "crew.chat");
+}
+
+#[test]
+fn deliver_agent_event_routes_task_result_accept_to_wattswarm_projection() {
+    let state_dir = temp_startup_dir("task-result-direct-route");
+    let db_path = state_dir.join("ui.state");
+    let identity = crate::control::load_local_identity(&state_dir).expect("local identity");
+    let membership = membership_with_roles(&[identity.node_id()]);
+    let mut node = Node::new(
+        identity.clone(),
+        PgStore::open(&db_path).expect("store"),
+        membership,
+    )
+    .expect("node");
+    let policy_hash = node
+        .policy_registry()
+        .binding_for("vp.schema_only.v1", json!({}))
+        .expect("policy binding")
+        .policy_hash;
+    let contract = sample_contract("task-direct-1", policy_hash);
+    node.submit_task(contract, 1, 10).expect("submit task");
+    node.claim_task(
+        "task-direct-1",
+        crate::types::ClaimRole::Propose,
+        "exec-direct-1",
+        50,
+        1,
+        11,
+    )
+    .expect("claim task");
+    let candidate = crate::types::Candidate {
+        candidate_id: "cand-direct-1".to_owned(),
+        execution_id: "exec-direct-1".to_owned(),
+        output_ref: crate::control::materialize_candidate_output_artifact(
+            &state_dir,
+            &identity.node_id(),
+            &json!({"answer": "ok"}),
+            11,
+        )
+        .expect("candidate artifact"),
+        output: json!({"answer": "ok"}),
+        evidence_inline: Vec::new(),
+        evidence_refs: Vec::new(),
+    };
+    node.propose_candidate("task-direct-1", candidate, 1, 12)
+        .expect("propose candidate");
+    drop(node);
+
+    let executor_listener =
+        std::net::TcpListener::bind("127.0.0.1:0").expect("bind executor listener");
+    let executor_addr = executor_listener.local_addr().expect("executor addr");
+    std::thread::spawn(move || {
+        let (mut stream, _) = executor_listener
+            .accept()
+            .expect("accept executor connection");
+        let raw = read_http_request(&mut stream);
+        assert!(raw.contains("POST /agent-events "));
+        let body = serde_json::to_string(&wattswarm_protocol::types::AgentEventCallbackResponse {
+            ok: true,
+            acked_at: Some(1),
+            detail: Some("task accepted".to_owned()),
+            decision: Some(wattswarm_protocol::types::AgentDecision {
+                decision_id: "dec-task-direct".to_owned(),
+                action: "accept_result".to_owned(),
+                route: wattswarm_protocol::types::AgentDecisionRoute::WattswarmDirect,
+                reason: None,
+                payload: json!({}),
+            }),
+        })
+        .expect("serialize executor response");
+        let response = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        stream
+            .write_all(response.as_bytes())
+            .expect("write executor response");
+    });
+
+    crate::control::save_executor_registry_state(
+        &state_dir,
+        &crate::control::ExecutorRegistry {
+            entries: vec![crate::control::ExecutorRegistryEntry {
+                name: crate::control::CORE_AGENT_EXECUTOR_NAME.to_owned(),
+                base_url: format!("http://{executor_addr}"),
+                agent_event_callback_base_url: None,
+                kind: crate::control::ExecutorKind::Local,
+                target_node_id: None,
+                scope_hint: None,
+                commit_plane_endpoint: None,
+                commit_plane_token_file: None,
+            }],
+        },
+    )
+    .expect("save executor registry");
+
+    let event = build_agent_event(
+        wattswarm_protocol::types::AgentEventType::TaskResultReceived,
+        wattswarm_protocol::types::AgentEventSourceKind::TaskLifecycle,
+        Some("peer-a".to_owned()),
+        None,
+        json!({
+            "event_kind": "candidate_proposed",
+            "task_id": "task-direct-1",
+            "candidate_id": "cand-direct-1",
+        }),
+        false,
+        vec!["accept_result".to_owned()],
+        Some("task-direct-1".to_owned()),
+        Some("task_result:task-direct-1:cand-direct-1".to_owned()),
+    );
+    deliver_agent_event_to_local_executor(&state_dir, Some(&db_path), &event)
+        .expect("deliver task result event");
+    let scope_id = local_control_scope_id(&state_dir);
+    let rows = local_control_store(&state_dir)
+        .expect("open local control store")
+        .list_local_agent_events(&scope_id)
+        .expect("list local agent events");
+    let deliveries = local_control_store(&state_dir)
+        .expect("open local control store")
+        .list_local_agent_event_deliveries(&scope_id, &event.event_id)
+        .expect("list local agent event deliveries");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].status, "completed", "{rows:?} {deliveries:?}");
+
+    let node = crate::control::open_node(&state_dir, &db_path).expect("reopen node");
+    let task = node
+        .task_view("task-direct-1")
+        .expect("task view")
+        .expect("task exists");
+    assert_eq!(
+        task.committed_candidate_id.as_deref(),
+        Some("cand-direct-1")
+    );
+    assert_eq!(
+        task.finalized_candidate_id.as_deref(),
+        Some("cand-direct-1")
+    );
 }
 
 fn membership_with_roles(node_ids: &[String]) -> Membership {
@@ -1024,7 +1559,7 @@ fn peer_discovered_event_persists_wan_source_into_local_registry() {
         &NetworkProtocolParams::default(),
     )
     .expect("service");
-    service.set_state_dir(dir.clone());
+    service.set_state_dir(dir.clone(), dir.join("ui.state"));
     let peer = PeerId::random();
     let address = "/ip4/203.0.113.10/tcp/4001"
         .parse::<Multiaddr>()
@@ -1065,7 +1600,7 @@ fn peer_identified_event_persists_peer_metadata_locally() {
         &NetworkProtocolParams::default(),
     )
     .expect("service");
-    service.set_state_dir(dir.clone());
+    service.set_state_dir(dir.clone(), dir.join("ui.state"));
     let peer = PeerId::random();
 
     let tick = service
