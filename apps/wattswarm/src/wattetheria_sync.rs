@@ -6,6 +6,7 @@ use crate::control::{
 };
 use crate::run_control;
 use crate::run_queue::{RunSubmitSpec, RunView};
+use crate::startup_config::{load_startup_config, startup_config_path};
 use crate::storage::storage::{
     LocalRemoteTaskBridgeRow, TaskCandidateRow, TaskProjectionRow, TopicCursorRow, TopicMessageRow,
     VerifierResultRow, VoteRevealRow,
@@ -38,14 +39,19 @@ use proto::{ProjectionFrame, ProjectionStreamRequest};
 
 const DEFAULT_GRPC_LISTEN_ADDR: &str = "127.0.0.1:7791";
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct NetworkProjectionSnapshot {
     pub generated_at: u64,
     pub node_id: String,
+    pub display_name: String,
     pub org_id: String,
     pub network_id: String,
     pub running: bool,
     pub mode: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latitude: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub longitude: Option<f64>,
     pub peer_protocol_distribution: BTreeMap<String, u64>,
     pub peers: Vec<String>,
 }
@@ -466,6 +472,7 @@ pub fn build_network_projection_snapshot(
     db_path: &Path,
 ) -> Result<NetworkProjectionSnapshot> {
     ensure_sync_node_mode_configured(state_dir)?;
+    let startup = load_startup_config(&startup_config_path(state_dir))?;
     let node = open_node(state_dir, db_path)?;
     let (running, mode) = read_node_running(state_dir)?;
     let distribution = node
@@ -475,10 +482,13 @@ pub fn build_network_projection_snapshot(
     Ok(NetworkProjectionSnapshot {
         generated_at: now_ms(),
         node_id: node.node_id(),
+        display_name: startup.display_name,
         org_id: node.store.org_id().to_owned(),
         network_id: resolve_network_id(&node),
         running,
         mode,
+        latitude: startup.latitude,
+        longitude: startup.longitude,
         peer_protocol_distribution: distribution
             .into_iter()
             .map(|(version, count)| (version, u64::from(count)))

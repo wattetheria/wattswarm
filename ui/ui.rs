@@ -215,6 +215,10 @@ struct TopicMessageWriteRequest {
 #[derive(Debug, Deserialize)]
 struct StartupConfigSaveRequest {
     display_name: String,
+    #[serde(default)]
+    latitude: Option<f64>,
+    #[serde(default)]
+    longitude: Option<f64>,
     network_mode: crate::startup_config::NetworkMode,
     #[serde(default)]
     bootstrap_peers: Vec<String>,
@@ -540,6 +544,8 @@ async fn startup_config_save(
             .await?;
     let payload = StartupConfig {
         display_name: req.display_name,
+        latitude: req.latitude.or(existing.latitude),
+        longitude: req.longitude.or(existing.longitude),
         network_mode: req.network_mode,
         bootstrap_peers: req.bootstrap_peers,
         gateway_urls: req.gateway_urls,
@@ -872,6 +878,8 @@ mod tests {
             &startup_config_path(&state_dir),
             &StartupConfig {
                 display_name: "Node Agent".to_owned(),
+                latitude: None,
+                longitude: None,
                 network_mode: NetworkMode::Wan,
                 bootstrap_peers: vec!["/ip4/127.0.0.1/tcp/4001/p2p/12D3KooWBootstrap".to_owned()],
                 gateway_urls: Vec::new(),

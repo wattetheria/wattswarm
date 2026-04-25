@@ -72,10 +72,14 @@ impl Default for CoreAgentConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct StartupConfig {
     #[serde(default = "default_display_name")]
     pub display_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latitude: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub longitude: Option<f64>,
     #[serde(default)]
     pub network_mode: NetworkMode,
     #[serde(default)]
@@ -90,6 +94,8 @@ impl Default for StartupConfig {
     fn default() -> Self {
         Self {
             display_name: default_display_name(),
+            latitude: None,
+            longitude: None,
             network_mode: NetworkMode::default(),
             bootstrap_peers: Vec::new(),
             gateway_urls: Vec::new(),
@@ -113,6 +119,8 @@ fn default_core_agent_base_url() -> String {
 impl StartupConfig {
     pub fn normalized(mut self) -> Self {
         self.display_name = self.display_name.trim().to_owned();
+        self.latitude = normalize_latitude(self.latitude);
+        self.longitude = normalize_longitude(self.longitude);
         self.bootstrap_peers = normalize_bootstrap_peers(&self.bootstrap_peers);
         self.gateway_urls = normalize_gateway_urls(&self.gateway_urls);
         if matches!(self.network_mode, NetworkMode::Local) {
@@ -145,6 +153,16 @@ impl StartupConfig {
     pub fn validate(&self) -> Result<()> {
         if self.display_name.trim().is_empty() {
             bail!("display_name is required");
+        }
+        if let Some(latitude) = self.latitude
+            && !(-90.0..=90.0).contains(&latitude)
+        {
+            bail!("latitude must be between -90 and 90");
+        }
+        if let Some(longitude) = self.longitude
+            && !(-180.0..=180.0).contains(&longitude)
+        {
+            bail!("longitude must be between -180 and 180");
         }
         match self.core_agent.mode {
             CoreAgentMode::LocalUrl | CoreAgentMode::RemoteUrl => {
@@ -190,6 +208,14 @@ fn normalize_gateway_urls(values: &[String]) -> Vec<String> {
         normalized.push(trimmed.to_owned());
     }
     normalized
+}
+
+fn normalize_latitude(value: Option<f64>) -> Option<f64> {
+    value.filter(|latitude| latitude.is_finite() && (-90.0..=90.0).contains(latitude))
+}
+
+fn normalize_longitude(value: Option<f64>) -> Option<f64> {
+    value.filter(|longitude| longitude.is_finite() && (-180.0..=180.0).contains(longitude))
 }
 
 pub fn startup_config_path(state_dir: &Path) -> PathBuf {
@@ -353,5 +379,33 @@ mod tests {
                 "http://gateway.example.com:8080".to_owned(),
             ]
         );
+    }
+
+    #[test]
+    fn normalizes_invalid_geo_coordinates_to_none() {
+        let config = StartupConfig {
+            latitude: Some(91.0),
+            longitude: Some(181.0),
+            ..StartupConfig::default()
+        }
+        .normalized();
+
+        assert_eq!(config.latitude, None);
+        assert_eq!(config.longitude, None);
+    }
+
+    #[test]
+    fn validates_geo_coordinate_ranges() {
+        let invalid_latitude = StartupConfig {
+            latitude: Some(-91.0),
+            ..StartupConfig::default()
+        };
+        assert!(invalid_latitude.validate().is_err());
+
+        let invalid_longitude = StartupConfig {
+            longitude: Some(181.0),
+            ..StartupConfig::default()
+        };
+        assert!(invalid_longitude.validate().is_err());
     }
 }

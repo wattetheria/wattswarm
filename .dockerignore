@@ -4,6 +4,9 @@ target
 **/target
 node_modules
 **/node_modules
+.wattswarm
+data
+dist
 .DS_Store
 .env
 .env.*

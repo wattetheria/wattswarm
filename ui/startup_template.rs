@@ -37,7 +37,7 @@ pub const STARTUP_HTML: &str = r#"<!DOCTYPE html>
       display: grid;
       grid-template-columns: minmax(0, 1fr) 360px;
       gap: 16px;
-      align-items: start;
+      align-items: stretch;
     }
     .panel {
       border: 3px solid var(--line);
@@ -48,7 +48,11 @@ pub const STARTUP_HTML: &str = r#"<!DOCTYPE html>
     .section-grid {
       display: grid;
       grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+      grid-auto-rows: 1fr;
       gap: 14px;
+    }
+    .section-grid > .panel {
+      height: 100%;
     }
     .hero-panel {
       display: grid;
@@ -248,6 +252,9 @@ pub const STARTUP_HTML: &str = r#"<!DOCTYPE html>
       .layout {
         grid-template-columns: minmax(0, 1fr);
       }
+      .section-grid {
+        grid-auto-rows: auto;
+      }
       .monitor {
         position: static;
       }
@@ -311,6 +318,15 @@ pub const STARTUP_HTML: &str = r#"<!DOCTYPE html>
             <label for="displayName">Display Name</label>
             <input id="displayName" placeholder="Captain Aurora" />
           </div>
+          <div class="field">
+            <label for="latitude">Latitude</label>
+            <input id="latitude" type="number" step="0.000001" min="-90" max="90" placeholder="37.7749" />
+          </div>
+          <div class="field">
+            <label for="longitude">Longitude</label>
+            <input id="longitude" type="number" step="0.000001" min="-180" max="180" placeholder="-122.4194" />
+          </div>
+          <div class="hint">Optional. When set, this node will render at the real world-map location in gateway-backed clients.</div>
         </div>
 
         <div class="panel">
@@ -403,12 +419,16 @@ Those stay in CLI, compose, or config files for advanced operators.</pre>
     function syncFormFromConfig(cfg) {
       startupConfig = cfg;
       document.getElementById('displayName').value = cfg.display_name || '';
+      document.getElementById('latitude').value = Number.isFinite(cfg.latitude) ? String(cfg.latitude) : '';
+      document.getElementById('longitude').value = Number.isFinite(cfg.longitude) ? String(cfg.longitude) : '';
       document.getElementById('bootstrapPeers').value = (cfg.bootstrap_peers || []).join('\n');
       document.getElementById('gatewayUrls').value = (cfg.gateway_urls || []).join('\n');
       setNetworkMode(cfg.network_mode || 'local');
     }
 
     function buildPayload() {
+      const latitudeValue = document.getElementById('latitude').value.trim();
+      const longitudeValue = document.getElementById('longitude').value.trim();
       const bootstrapPeers = document.getElementById('bootstrapPeers').value
         .split(/[\n,]+/)
         .map((value) => value.trim())
@@ -420,6 +440,8 @@ Those stay in CLI, compose, or config files for advanced operators.</pre>
       const isLocal = startupConfig.network_mode === 'local';
       return {
         display_name: document.getElementById('displayName').value,
+        latitude: latitudeValue === '' ? null : Number(latitudeValue),
+        longitude: longitudeValue === '' ? null : Number(longitudeValue),
         network_mode: startupConfig.network_mode,
         bootstrap_peers: isLocal ? [] : bootstrapPeers,
         gateway_urls: isLocal ? [] : gatewayUrls
