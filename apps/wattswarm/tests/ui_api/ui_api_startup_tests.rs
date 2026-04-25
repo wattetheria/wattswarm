@@ -41,6 +41,12 @@ fn ui_startup_config_roundtrips_network_settings_without_agent_binding() {
             Some(0)
         );
         assert_eq!(
+            default_json["config"]["gateway_urls"]
+                .as_array()
+                .map(|items| items.len()),
+            Some(0)
+        );
+        assert_eq!(
             default_json["core_agent_executor"].as_str(),
             Some("core-agent")
         );
@@ -58,6 +64,10 @@ fn ui_startup_config_roundtrips_network_settings_without_agent_binding() {
                             "network_mode": "lan",
                             "bootstrap_peers": [
                                 "/ip4/127.0.0.1/tcp/4001/p2p/12D3KooWLanBootstrap"
+                            ],
+                            "gateway_urls": [
+                                " http://gateway.example.com:8080/ ",
+                                "http://gateway.example.com:8080"
                             ]
                         }))
                         .unwrap(),
@@ -92,6 +102,10 @@ fn ui_startup_config_roundtrips_network_settings_without_agent_binding() {
             Some("/ip4/127.0.0.1/tcp/4001/p2p/12D3KooWLanBootstrap")
         );
         assert_eq!(
+            get_saved_json["config"]["gateway_urls"][0].as_str(),
+            Some("http://gateway.example.com:8080")
+        );
+        assert_eq!(
             get_saved_json["config"]["core_agent"]["base_url"].as_str(),
             Some("http://127.0.0.1:8787")
         );
@@ -109,6 +123,9 @@ fn ui_startup_config_roundtrips_network_settings_without_agent_binding() {
                             "network_mode": "local",
                             "bootstrap_peers": [
                                 "/ip4/127.0.0.1/tcp/4001/p2p/12D3KooWShouldBeCleared"
+                            ],
+                            "gateway_urls": [
+                                "https://gw.example.com"
                             ]
                         }))
                         .unwrap(),
@@ -121,6 +138,12 @@ fn ui_startup_config_roundtrips_network_settings_without_agent_binding() {
         let save_local_json = json_from(save_local_res).await;
         assert_eq!(
             save_local_json["config"]["bootstrap_peers"]
+                .as_array()
+                .map(|items| items.len()),
+            Some(0)
+        );
+        assert_eq!(
+            save_local_json["config"]["gateway_urls"]
                 .as_array()
                 .map(|items| items.len()),
             Some(0)
@@ -166,6 +189,12 @@ fn ui_startup_config_roundtrips_network_settings_without_agent_binding() {
         );
         assert_eq!(
             get_local_saved_json["config"]["bootstrap_peers"]
+                .as_array()
+                .map(|items| items.len()),
+            Some(0)
+        );
+        assert_eq!(
+            get_local_saved_json["config"]["gateway_urls"]
                 .as_array()
                 .map(|items| items.len()),
             Some(0)

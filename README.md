@@ -828,7 +828,7 @@ P2P env vars:
 
 Startup UI behavior:
 
-- `Display Name`, `Network Mode`, `Bootstrap Peers`, and `Core Agent` are saved to `startup_config.json`
+- `Display Name`, `Network Mode`, `Bootstrap Peers`, optional `Gateway URLs`, and `Core Agent` are saved to `startup_config.json`
 - `Bootstrap Peers` is shown only for `LAN` / `WAN`
 - saving `Core Agent` also syncs the local executor route into PostgreSQL `executor_registry_local`
 - startup UI does not write network topology into PostgreSQL directly; topology and signed network params are still imported through bootstrap sync or regular node startup flows

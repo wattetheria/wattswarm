@@ -50,6 +50,27 @@ pub const STARTUP_HTML: &str = r#"<!DOCTYPE html>
       grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
       gap: 14px;
     }
+    .hero-panel {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 18px;
+      align-items: end;
+    }
+    .hero-actions {
+      display: grid;
+      gap: 8px;
+      min-width: 310px;
+    }
+    .hero-actions .hint {
+      margin: 0;
+      max-width: 360px;
+    }
+    .action-row {
+      display: flex;
+      flex-wrap: wrap;
+      justify-content: flex-end;
+      gap: 8px;
+    }
     h1 {
       margin: 0;
       font-size: 22px;
@@ -230,6 +251,15 @@ pub const STARTUP_HTML: &str = r#"<!DOCTYPE html>
       .monitor {
         position: static;
       }
+      .hero-panel {
+        grid-template-columns: minmax(0, 1fr);
+      }
+      .hero-actions {
+        min-width: 0;
+      }
+      .action-row {
+        justify-content: flex-start;
+      }
     }
     @media (max-width: 720px) {
       .meta-line {
@@ -246,15 +276,25 @@ pub const STARTUP_HTML: &str = r#"<!DOCTYPE html>
 <body>
   <div id="statusPill" class="pill">idle</div>
   <div class="wrap">
-    <div class="panel">
-      <h1>WattSwarm Startup</h1>
-      <div class="hint">
-        First-run configuration for the local node. Only required startup fields are shown here.
-        Advanced tuning, self-hosted gateway setup, and servicenet deployment stay in CLI or config files.
+    <div class="panel hero-panel">
+      <div>
+        <h1>WattSwarm Startup</h1>
+        <div class="hint">
+          First-run configuration for the local node. Only required startup fields are shown here.
+          Required startup settings stay here. Deeper tuning and gateway deployment still stay in CLI or compose.
+        </div>
+        <div class="links">
+          <a href="/swarm">Open Swarm Dashboard</a>
+          <a href="/console">Open Developer Console</a>
+        </div>
       </div>
-      <div class="links">
-        <a href="/swarm">Open Swarm Dashboard</a>
-        <a href="/console">Open Developer Console</a>
+      <div class="hero-actions">
+        <div class="hint">Saving writes wattswarm startup only. Agent and model configuration lives in Wattetheria.</div>
+        <div class="action-row">
+          <button type="button" onclick="saveStartupConfig()">save startup config</button>
+          <button type="button" class="alt" onclick="refreshStartupConfig()">reload</button>
+          <button type="button" class="ghost" onclick="refreshNodeStatus()">refresh node</button>
+        </div>
       </div>
     </div>
 
@@ -291,18 +331,15 @@ pub const STARTUP_HTML: &str = r#"<!DOCTYPE html>
 /dns4/bootstrap.example/tcp/4001/p2p/12D3KooW..."></textarea>
             <div class="hint">Used for joining an existing LAN or WAN network. Enter one peer per line; comma-separated values are also accepted.</div>
           </div>
-          <div class="hint">Self-hosted gateway and servicenet deployment is intentionally left to CLI, compose, or direct config edits.</div>
+          <div id="gatewayUrlsField" class="field hidden">
+            <label for="gatewayUrls">Gateway URLs</label>
+            <textarea id="gatewayUrls" rows="3" placeholder="http://gateway.example.com:8080
+https://gw.example.com"></textarea>
+            <div class="hint">Optional ingest targets for the paired Wattetheria node. Enter one URL per line; comma-separated values are also accepted.</div>
+          </div>
+          <div class="hint">Gateway deployment itself still stays in CLI, compose, or direct config edits.</div>
         </div>
 
-        <div class="panel">
-          <h2>Save</h2>
-          <div class="hint">Saving this page writes wattswarm node startup only. Agent and model configuration now lives in Wattetheria.</div>
-          <div class="row">
-            <button type="button" onclick="saveStartupConfig()">save startup config</button>
-            <button type="button" class="alt" onclick="refreshStartupConfig()">reload</button>
-            <button type="button" class="ghost" onclick="refreshNodeStatus()">refresh node</button>
-          </div>
-        </div>
       </div>
 
       <div class="panel monitor">
@@ -359,16 +396,15 @@ Those stay in CLI, compose, or config files for advanced operators.</pre>
           ? 'local-area distributed network'
           : 'single-machine startup';
       document.getElementById('networkModeMeaning').textContent = meaning;
-      if (mode === 'local') {
-        document.getElementById('bootstrapPeers').value = '';
-      }
       document.getElementById('bootstrapPeersField').classList.toggle('hidden', mode === 'local');
+      document.getElementById('gatewayUrlsField').classList.toggle('hidden', mode === 'local');
     }
 
     function syncFormFromConfig(cfg) {
       startupConfig = cfg;
       document.getElementById('displayName').value = cfg.display_name || '';
       document.getElementById('bootstrapPeers').value = (cfg.bootstrap_peers || []).join('\n');
+      document.getElementById('gatewayUrls').value = (cfg.gateway_urls || []).join('\n');
       setNetworkMode(cfg.network_mode || 'local');
     }
 
@@ -377,10 +413,16 @@ Those stay in CLI, compose, or config files for advanced operators.</pre>
         .split(/[\n,]+/)
         .map((value) => value.trim())
         .filter(Boolean);
+      const gatewayUrls = document.getElementById('gatewayUrls').value
+        .split(/[\n,]+/)
+        .map((value) => value.trim())
+        .filter(Boolean);
+      const isLocal = startupConfig.network_mode === 'local';
       return {
         display_name: document.getElementById('displayName').value,
         network_mode: startupConfig.network_mode,
-        bootstrap_peers: bootstrapPeers
+        bootstrap_peers: isLocal ? [] : bootstrapPeers,
+        gateway_urls: isLocal ? [] : gatewayUrls
       };
     }
 

@@ -219,6 +219,8 @@ struct StartupConfigSaveRequest {
     #[serde(default)]
     bootstrap_peers: Vec<String>,
     #[serde(default)]
+    gateway_urls: Vec<String>,
+    #[serde(default)]
     core_agent: Option<crate::startup_config::CoreAgentConfig>,
 }
 
@@ -540,6 +542,7 @@ async fn startup_config_save(
         display_name: req.display_name,
         network_mode: req.network_mode,
         bootstrap_peers: req.bootstrap_peers,
+        gateway_urls: req.gateway_urls,
         core_agent: req.core_agent.clone().unwrap_or(existing.core_agent),
     }
     .normalized();
@@ -871,6 +874,7 @@ mod tests {
                 display_name: "Node Agent".to_owned(),
                 network_mode: NetworkMode::Wan,
                 bootstrap_peers: vec!["/ip4/127.0.0.1/tcp/4001/p2p/12D3KooWBootstrap".to_owned()],
+                gateway_urls: Vec::new(),
                 core_agent: CoreAgentConfig::default(),
             },
         )

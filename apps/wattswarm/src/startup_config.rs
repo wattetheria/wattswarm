@@ -81,6 +81,8 @@ pub struct StartupConfig {
     #[serde(default)]
     pub bootstrap_peers: Vec<String>,
     #[serde(default)]
+    pub gateway_urls: Vec<String>,
+    #[serde(default)]
     pub core_agent: CoreAgentConfig,
 }
 
@@ -90,6 +92,7 @@ impl Default for StartupConfig {
             display_name: default_display_name(),
             network_mode: NetworkMode::default(),
             bootstrap_peers: Vec::new(),
+            gateway_urls: Vec::new(),
             core_agent: CoreAgentConfig::default(),
         }
     }
@@ -111,8 +114,10 @@ impl StartupConfig {
     pub fn normalized(mut self) -> Self {
         self.display_name = self.display_name.trim().to_owned();
         self.bootstrap_peers = normalize_bootstrap_peers(&self.bootstrap_peers);
+        self.gateway_urls = normalize_gateway_urls(&self.gateway_urls);
         if matches!(self.network_mode, NetworkMode::Local) {
             self.bootstrap_peers.clear();
+            self.gateway_urls.clear();
         }
         self.core_agent.provider = self.core_agent.provider.trim().to_owned();
         self.core_agent.base_url = self
@@ -167,6 +172,18 @@ fn normalize_bootstrap_peers(values: &[String]) -> Vec<String> {
     let mut normalized = Vec::new();
     for value in values {
         let trimmed = value.trim();
+        if trimmed.is_empty() || normalized.iter().any(|existing| existing == trimmed) {
+            continue;
+        }
+        normalized.push(trimmed.to_owned());
+    }
+    normalized
+}
+
+fn normalize_gateway_urls(values: &[String]) -> Vec<String> {
+    let mut normalized = Vec::new();
+    for value in values {
+        let trimmed = value.trim().trim_end_matches('/');
         if trimmed.is_empty() || normalized.iter().any(|existing| existing == trimmed) {
             continue;
         }
@@ -306,10 +323,35 @@ mod tests {
         let config = StartupConfig {
             network_mode: NetworkMode::Local,
             bootstrap_peers: vec!["/ip4/127.0.0.1/tcp/4001/p2p/peer-a".to_owned()],
+            gateway_urls: vec!["https://gw.example.com".to_owned()],
             ..StartupConfig::default()
         }
         .normalized();
 
         assert!(config.bootstrap_peers.is_empty());
+        assert!(config.gateway_urls.is_empty());
+    }
+
+    #[test]
+    fn normalizes_gateway_urls_trim_and_dedup() {
+        let config = StartupConfig {
+            network_mode: NetworkMode::Wan,
+            gateway_urls: vec![
+                " https://gw.example.com/ ".to_owned(),
+                String::new(),
+                "https://gw.example.com".to_owned(),
+                "http://gateway.example.com:8080/".to_owned(),
+            ],
+            ..StartupConfig::default()
+        }
+        .normalized();
+
+        assert_eq!(
+            config.gateway_urls,
+            vec![
+                "https://gw.example.com".to_owned(),
+                "http://gateway.example.com:8080".to_owned(),
+            ]
+        );
     }
 }
