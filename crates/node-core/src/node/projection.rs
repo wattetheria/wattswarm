@@ -349,6 +349,7 @@ impl Node {
                     &payload.subscriber_node_id,
                     &payload.feed_key,
                     &scope_hint,
+                    &payload.gossip_kinds,
                     payload.active,
                     event.created_at,
                 )?;

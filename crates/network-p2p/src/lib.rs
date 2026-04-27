@@ -12,13 +12,13 @@ use wattswarm_protocol::types::{EventKind, EventPayload};
 
 pub use substrate::{
     BackfillRequestId, BackfillResponseChannel, ContactMaterialRequestId,
-    ContactMaterialResponseChannel, Multiaddr, NetworkRuntimeObservabilitySnapshot,
+    ContactMaterialResponseChannel, GossipKind, Multiaddr, NetworkRuntimeObservabilitySnapshot,
     PeerDirectMessageRequestId, PeerDirectMessageResponseChannel, PeerDiscoverySourceKind,
     PeerHandshakeMetadata, PeerId, PeerIdentificationMetadata, PeerRelationshipRequestId,
     PeerRelationshipResponseChannel, RawAgentEnvelope, RawContactMaterial,
     RawContactMaterialRequest, RawContactMaterialResponse, RawPeerDirectMessageKind,
-    RawPeerRelationshipAction, SwarmScope, TopicCatalog, TopicKind, TopicNamespace,
-    TrafficGuardPeerHealth, relay_reservation_addr, sanitize_segment,
+    RawPeerRelationshipAction, SwarmScope, TopicCatalog, TopicNamespace, TrafficGuardPeerHealth,
+    relay_reservation_addr, sanitize_segment,
 };
 
 pub type BackfillRequest = substrate::RawBackfillRequest;
@@ -145,13 +145,13 @@ pub enum GossipMessage {
 }
 
 impl GossipMessage {
-    pub fn kind(&self) -> TopicKind {
+    pub fn kind(&self) -> GossipKind {
         match self {
-            Self::Event(_) => TopicKind::Events,
-            Self::Chat(_) => TopicKind::Messages,
-            Self::Rule(_) => TopicKind::Rules,
-            Self::Checkpoint(_) => TopicKind::Checkpoints,
-            Self::Summary(_) => TopicKind::Summaries,
+            Self::Event(_) => GossipKind::Events,
+            Self::Chat(_) => GossipKind::Messages,
+            Self::Rule(_) => GossipKind::Rules,
+            Self::Checkpoint(_) => GossipKind::Checkpoints,
+            Self::Summary(_) => GossipKind::Summaries,
         }
     }
 
@@ -493,8 +493,24 @@ impl NetworkRuntime {
         self.inner.subscribe_scope(scope)
     }
 
+    pub fn subscribe_scope_kinds(
+        &mut self,
+        scope: &SwarmScope,
+        kinds: &[GossipKind],
+    ) -> Result<()> {
+        self.inner.subscribe_scope_kinds(scope, kinds)
+    }
+
     pub fn unsubscribe_scope(&mut self, scope: &SwarmScope) -> Result<()> {
         self.inner.unsubscribe_scope(scope)
+    }
+
+    pub fn unsubscribe_scope_kinds(
+        &mut self,
+        scope: &SwarmScope,
+        kinds: &[GossipKind],
+    ) -> Result<()> {
+        self.inner.unsubscribe_scope_kinds(scope, kinds)
     }
 
     pub fn dial(&mut self, addr: Multiaddr) -> Result<()> {
@@ -793,11 +809,11 @@ impl NetworkRuntime {
 fn decode_overlay_gossip(message: RawGossipMessage) -> Result<GossipMessage> {
     let payload = &message.payload;
     match message.kind {
-        TopicKind::Events => Ok(GossipMessage::Event(EventEnvelope::decode_json(payload)?)),
-        TopicKind::Messages => Ok(GossipMessage::Chat(EventEnvelope::decode_json(payload)?)),
-        TopicKind::Rules => Ok(GossipMessage::Rule(serde_json::from_slice(payload)?)),
-        TopicKind::Checkpoints => Ok(GossipMessage::Checkpoint(serde_json::from_slice(payload)?)),
-        TopicKind::Summaries => Ok(GossipMessage::Summary(serde_json::from_slice(payload)?)),
+        GossipKind::Events => Ok(GossipMessage::Event(EventEnvelope::decode_json(payload)?)),
+        GossipKind::Messages => Ok(GossipMessage::Chat(EventEnvelope::decode_json(payload)?)),
+        GossipKind::Rules => Ok(GossipMessage::Rule(serde_json::from_slice(payload)?)),
+        GossipKind::Checkpoints => Ok(GossipMessage::Checkpoint(serde_json::from_slice(payload)?)),
+        GossipKind::Summaries => Ok(GossipMessage::Summary(serde_json::from_slice(payload)?)),
     }
 }
 

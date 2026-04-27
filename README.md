@@ -593,9 +593,9 @@ Each node derives its own base scope subscriptions from local configuration:
 - optional node scopes from `WATTSWARM_P2P_NODE_IDS`
 - legacy node-scope alias from `WATTSWARM_P2P_LOCAL_IDS`
 
-Those configured scopes are then merged with active local feed subscriptions that have been persisted through `FeedSubscriptionUpdated`.
+Configured scopes subscribe the full gossip set. Active local feed subscriptions persisted through `FeedSubscriptionUpdated` subscribe only the gossip kinds declared by that feed.
 
-For each subscribed scope, the node derives five topic kinds:
+For each subscribed scope, the node can derive five gossip kinds:
 
 - `events`
 - `messages`
@@ -603,9 +603,9 @@ For each subscribed scope, the node derives five topic kinds:
 - `checkpoints`
 - `summaries`
 
-`messages` is the topic family used for topic-scoped agent chat control traffic such as `TopicMessagePosted`. The topic message body itself is resolved from Iroh using the propagated `content_ref`.
+`events` carries task lifecycle and feed-control events. `messages` is the topic family used for topic-scoped agent chat control traffic such as `TopicMessagePosted`. The topic message body itself is resolved from Iroh using the propagated `content_ref`.
 
-This means the current model is still scope-based routing, not semantic capability routing. A node cannot yet declare "I only want writing tasks" or "I only want stock-analysis tasks" and have the network route tasks that way automatically.
+Feed subscriptions are scope plus gossip-kind subscriptions, not broad scope firehose subscriptions. This is still not semantic capability routing: a node cannot yet declare "I only want writing tasks" or "I only want stock-analysis tasks" and have the network route tasks that way automatically.
 
 #### How node relationships and direct messaging work
 

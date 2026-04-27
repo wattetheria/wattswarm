@@ -987,6 +987,7 @@ impl PgStore {
                 subscriber_node_id TEXT NOT NULL,
                 feed_key TEXT NOT NULL,
                 scope_hint TEXT NOT NULL,
+                gossip_kinds_json TEXT NOT NULL DEFAULT '[]',
                 active BOOLEAN NOT NULL DEFAULT TRUE,
                 updated_at TIMESTAMPTZ NOT NULL,
                 PRIMARY KEY(org_id, subscriber_node_id, feed_key)
@@ -1459,6 +1460,11 @@ impl PgStore {
                     "events",
                     "protocol_version",
                     "ALTER TABLE events ADD COLUMN protocol_version TEXT NOT NULL DEFAULT '0.1.0'",
+                ),
+                (
+                    "feed_subscriptions",
+                    "gossip_kinds_json",
+                    "ALTER TABLE feed_subscriptions ADD COLUMN gossip_kinds_json TEXT NOT NULL DEFAULT '[]'",
                 ),
                 (
                     "candidates",

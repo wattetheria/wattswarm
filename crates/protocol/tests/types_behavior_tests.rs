@@ -217,6 +217,7 @@ fn scope_hint_parse_and_canonicalization_are_shared() {
             subscriber_node_id: "node-a".to_owned(),
             feed_key: "feed".to_owned(),
             scope_hint: "region:sol-1".to_owned(),
+            gossip_kinds: vec!["events".to_owned()],
             active: true,
         }
         .scope(),

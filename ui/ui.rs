@@ -3,8 +3,9 @@ use crate::control::{
     RealTaskRunRequest, apply_peer_relationship_action_state, load_executor_registry_state,
     load_peer_dm_message_records_state, load_peer_dm_thread_records_state,
     load_peer_metadata_records_state, load_peer_relationship_records_state, local_node_id,
-    local_peer_id, node_state_path, open_configured_node, open_node, require_configured_node_mode,
-    resolve_node_mode, run_real_task_flow, save_executor_registry_state, write_node_state,
+    local_peer_id, materialize_candidate_output_artifact, node_state_path, open_configured_node,
+    open_node, require_configured_node_mode, resolve_node_mode, run_real_task_flow,
+    save_executor_registry_state, write_node_state,
 };
 use crate::egress_agent::{
     EgressAgentConfig, load_egress_agent_config_state, save_egress_agent_config_state,
@@ -24,7 +25,7 @@ use crate::startup_template::STARTUP_HTML;
 use crate::swarm_dashboard_engine::{SwarmDashboardState, build_dashboard_state, tick_real_swarm};
 use crate::swarm_dashboard_template::SWARM_DASHBOARD_HTML;
 use crate::task_template::sample_contract;
-use crate::types::TaskContract;
+use crate::types::{Candidate, ClaimRole, TaskContract};
 use crate::ui_template::INDEX_HTML;
 use crate::wattetheria_sync;
 use anyhow::{Context, Result, anyhow, bail};
@@ -38,6 +39,7 @@ use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
+use uuid::Uuid;
 
 #[derive(Clone)]
 pub struct UiServerState {
@@ -85,6 +87,49 @@ struct SampleQuery {
 struct SubmitTaskRequest {
     contract: Option<TaskContract>,
     file_path: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TaskAnnounceRequest {
+    task_id: String,
+    #[serde(default)]
+    announcement_id: Option<String>,
+    feed_key: String,
+    scope_hint: String,
+    summary: Value,
+    #[serde(default)]
+    detail_ref: Option<crate::types::ArtifactRef>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TaskClaimRequest {
+    task_id: String,
+    #[serde(default)]
+    role: Option<ClaimRole>,
+    #[serde(default)]
+    execution_id: Option<String>,
+    #[serde(default)]
+    lease_ms: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TaskProposeCandidateRequest {
+    task_id: String,
+    output: Value,
+    #[serde(default)]
+    execution_id: Option<String>,
+    #[serde(default)]
+    candidate_id: Option<String>,
+    #[serde(default)]
+    evidence_inline: Vec<crate::types::InlineEvidence>,
+    #[serde(default)]
+    evidence_refs: Vec<crate::types::ArtifactRef>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TaskAcceptResultRequest {
+    task_id: String,
+    candidate_id: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -320,6 +365,10 @@ pub fn build_app(state: UiServerState) -> Router {
         )
         .route("/api/task/sample", get(task_sample))
         .route("/api/task/submit", post(task_submit))
+        .route("/api/task/announce", post(task_announce))
+        .route("/api/task/claim", post(task_claim))
+        .route("/api/task/propose-candidate", post(task_propose_candidate))
+        .route("/api/task/accept-result", post(task_accept_result))
         .route("/api/task/watch/:task_id", get(task_watch))
         .route("/api/task/decision/:task_id", get(task_decision))
         .route(
@@ -1339,6 +1388,187 @@ async fn task_submit(
     Ok(Json(json!({"ok": true, "task_id": task_id})))
 }
 
+async fn task_announce(
+    State(state): State<UiServerState>,
+    Json(req): Json<TaskAnnounceRequest>,
+) -> Result<Json<Value>, ApiError> {
+    let state_clone = state.clone();
+    let response = run_blocking(move || -> Result<Value> {
+        let TaskAnnounceRequest {
+            task_id,
+            announcement_id,
+            feed_key,
+            scope_hint,
+            summary,
+            detail_ref,
+        } = req;
+        let mut node = open_node(&state_clone.state_dir, &state_clone.db_path)?;
+        let task = node
+            .task_view(&task_id)?
+            .ok_or_else(|| anyhow!("task not found: {}", task_id))?;
+        let now = chrono::Utc::now().timestamp_millis().max(0) as u64;
+        let announcement_id = announcement_id.unwrap_or_else(|| format!("ann-{}", Uuid::new_v4()));
+        node.announce_task(
+            &task_id,
+            &announcement_id,
+            &feed_key,
+            &scope_hint,
+            summary,
+            detail_ref,
+            task.epoch,
+            now.saturating_add(1),
+        )?;
+        let network_id = resolve_network_id(&node);
+        node.emit_at(
+            1,
+            crate::types::EventPayload::FeedSubscriptionUpdated(
+                crate::types::FeedSubscriptionUpdatedPayload {
+                    network_id: network_id.clone(),
+                    subscriber_node_id: node.node_id(),
+                    feed_key: feed_key.clone(),
+                    scope_hint: scope_hint.clone(),
+                    gossip_kinds: vec!["events".to_owned()],
+                    active: true,
+                },
+            ),
+            now.saturating_add(2),
+        )?;
+        Ok(json!({
+            "ok": true,
+            "task_id": task_id,
+            "announcement_id": announcement_id,
+            "feed_key": feed_key,
+            "scope_hint": scope_hint,
+            "gossip_kinds": ["events"],
+            "subscribed": true
+        }))
+    })
+    .await?;
+    Ok(Json(response))
+}
+
+async fn task_claim(
+    State(state): State<UiServerState>,
+    Json(req): Json<TaskClaimRequest>,
+) -> Result<Json<Value>, ApiError> {
+    let state_clone = state.clone();
+    let response = run_blocking(move || -> Result<Value> {
+        let mut node = open_node(&state_clone.state_dir, &state_clone.db_path)?;
+        let task = node
+            .task_view(&req.task_id)?
+            .ok_or_else(|| anyhow!("task not found: {}", req.task_id))?;
+        let now = chrono::Utc::now().timestamp_millis().max(0) as u64;
+        let execution_id = req
+            .execution_id
+            .unwrap_or_else(|| format!("exec-p-{}", Uuid::new_v4()));
+        let role = req.role.unwrap_or(ClaimRole::Propose);
+        let lease_ms = req
+            .lease_ms
+            .unwrap_or(task.contract.assignment.claim.lease_ms);
+        let lease_until = now.saturating_add(lease_ms);
+        node.claim_task(
+            &req.task_id,
+            role,
+            &execution_id,
+            lease_until,
+            task.epoch,
+            now,
+        )?;
+        let subscribed = if let Some(announcement) = node
+            .store
+            .get_task_announcement_detail_for_task(&req.task_id)?
+        {
+            let network_id = resolve_network_id(&node);
+            node.emit_at(
+                1,
+                crate::types::EventPayload::FeedSubscriptionUpdated(
+                    crate::types::FeedSubscriptionUpdatedPayload {
+                        network_id: network_id.clone(),
+                        subscriber_node_id: node.node_id(),
+                        feed_key: announcement.announcement.feed_key.clone(),
+                        scope_hint: announcement.announcement.scope_hint.clone(),
+                        gossip_kinds: vec!["events".to_owned()],
+                        active: true,
+                    },
+                ),
+                now.saturating_add(2),
+            )?;
+            true
+        } else {
+            false
+        };
+        Ok(json!({
+            "ok": true,
+            "task_id": req.task_id,
+            "execution_id": execution_id,
+            "lease_until": lease_until,
+            "subscribed": subscribed
+        }))
+    })
+    .await?;
+    Ok(Json(response))
+}
+
+async fn task_propose_candidate(
+    State(state): State<UiServerState>,
+    Json(req): Json<TaskProposeCandidateRequest>,
+) -> Result<Json<Value>, ApiError> {
+    let state_clone = state.clone();
+    let response = run_blocking(move || -> Result<Value> {
+        let TaskProposeCandidateRequest {
+            task_id,
+            output,
+            execution_id,
+            candidate_id,
+            evidence_inline,
+            evidence_refs,
+        } = req;
+        let mut node = open_node(&state_clone.state_dir, &state_clone.db_path)?;
+        let task = node
+            .task_view(&task_id)?
+            .ok_or_else(|| anyhow!("task not found: {}", task_id))?;
+        let now = chrono::Utc::now().timestamp_millis().max(0) as u64;
+        let execution_id = execution_id.unwrap_or_else(|| format!("exec-p-{}", Uuid::new_v4()));
+        let candidate_id = candidate_id.unwrap_or_else(|| format!("cand-{execution_id}"));
+        let output_ref = materialize_candidate_output_artifact(
+            &state_clone.state_dir,
+            &node.node_id(),
+            &output,
+            now,
+        )?;
+        let candidate = Candidate {
+            candidate_id: candidate_id.clone(),
+            execution_id: execution_id.clone(),
+            output_ref,
+            output,
+            evidence_inline,
+            evidence_refs,
+        };
+        node.propose_candidate(&task_id, candidate, task.epoch, now)?;
+        Ok(json!({
+            "ok": true,
+            "task_id": task_id,
+            "execution_id": execution_id,
+            "candidate_id": candidate_id
+        }))
+    })
+    .await?;
+    Ok(Json(response))
+}
+
+async fn task_accept_result(
+    State(state): State<UiServerState>,
+    Json(req): Json<TaskAcceptResultRequest>,
+) -> Result<Json<Value>, ApiError> {
+    let state_clone = state.clone();
+    let response = run_blocking(move || -> Result<Value> {
+        let mut node = open_node(&state_clone.state_dir, &state_clone.db_path)?;
+        crate::control::accept_task_result_locally(&mut node, &req.task_id, &req.candidate_id)
+    })
+    .await?;
+    Ok(Json(response))
+}
+
 async fn task_watch(
     State(state): State<UiServerState>,
     Path(task_id): Path<String>,
@@ -1693,6 +1923,7 @@ async fn topic_subscription_post(
                     subscriber_node_id: subscriber_node_id.clone(),
                     feed_key: feed_key.clone(),
                     scope_hint: scope_hint.clone(),
+                    gossip_kinds: vec!["messages".to_owned()],
                     active,
                 },
             ),
@@ -1705,6 +1936,7 @@ async fn topic_subscription_post(
             "subscriber_node_id": subscriber_node_id,
             "feed_key": feed_key,
             "scope_hint": scope_hint,
+            "gossip_kinds": ["messages"],
             "active": active,
         }))
     })

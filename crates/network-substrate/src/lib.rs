@@ -73,9 +73,9 @@ impl SwarmScope {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum TopicKind {
+pub enum GossipKind {
     Events,
     Messages,
     Rules,
@@ -83,7 +83,15 @@ pub enum TopicKind {
     Summaries,
 }
 
-impl TopicKind {
+impl GossipKind {
+    pub const ALL: [Self; 5] = [
+        Self::Events,
+        Self::Messages,
+        Self::Rules,
+        Self::Checkpoints,
+        Self::Summaries,
+    ];
+
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Events => "events",
@@ -112,7 +120,7 @@ impl Default for TopicNamespace {
 }
 
 impl TopicNamespace {
-    pub fn topic_name(&self, scope: &SwarmScope, kind: TopicKind) -> Result<String> {
+    pub fn topic_name(&self, scope: &SwarmScope, kind: GossipKind) -> Result<String> {
         Ok(format!(
             "{}.{}.{}.{}",
             sanitize_segment(&self.network)?,
@@ -135,22 +143,26 @@ pub struct TopicCatalog {
 impl TopicCatalog {
     pub fn new(namespace: &TopicNamespace, scope: &SwarmScope) -> Result<Self> {
         Ok(Self {
-            events: namespace.topic_name(scope, TopicKind::Events)?,
-            messages: namespace.topic_name(scope, TopicKind::Messages)?,
-            rules: namespace.topic_name(scope, TopicKind::Rules)?,
-            checkpoints: namespace.topic_name(scope, TopicKind::Checkpoints)?,
-            summaries: namespace.topic_name(scope, TopicKind::Summaries)?,
+            events: namespace.topic_name(scope, GossipKind::Events)?,
+            messages: namespace.topic_name(scope, GossipKind::Messages)?,
+            rules: namespace.topic_name(scope, GossipKind::Rules)?,
+            checkpoints: namespace.topic_name(scope, GossipKind::Checkpoints)?,
+            summaries: namespace.topic_name(scope, GossipKind::Summaries)?,
         })
     }
 
+    pub fn ident_topic_for(&self, kind: GossipKind) -> IdentTopic {
+        match kind {
+            GossipKind::Events => IdentTopic::new(self.events.clone()),
+            GossipKind::Messages => IdentTopic::new(self.messages.clone()),
+            GossipKind::Rules => IdentTopic::new(self.rules.clone()),
+            GossipKind::Checkpoints => IdentTopic::new(self.checkpoints.clone()),
+            GossipKind::Summaries => IdentTopic::new(self.summaries.clone()),
+        }
+    }
+
     pub fn as_ident_topics(&self) -> [IdentTopic; 5] {
-        [
-            IdentTopic::new(self.events.clone()),
-            IdentTopic::new(self.messages.clone()),
-            IdentTopic::new(self.rules.clone()),
-            IdentTopic::new(self.checkpoints.clone()),
-            IdentTopic::new(self.summaries.clone()),
-        ]
+        GossipKind::ALL.map(|kind| self.ident_topic_for(kind))
     }
 }
 
@@ -501,7 +513,7 @@ impl RawPeerDirectMessageResponse {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RawGossipMessage {
     pub scope: SwarmScope,
-    pub kind: TopicKind,
+    pub kind: GossipKind,
     pub payload: Vec<u8>,
 }
 
@@ -1460,7 +1472,17 @@ impl SubstrateRuntime {
     }
 
     pub fn subscribe_scope(&mut self, scope: &SwarmScope) -> Result<()> {
-        for topic in self.config.topic_catalog(scope)?.as_ident_topics() {
+        self.subscribe_scope_kinds(scope, &GossipKind::ALL)
+    }
+
+    pub fn subscribe_scope_kinds(
+        &mut self,
+        scope: &SwarmScope,
+        kinds: &[GossipKind],
+    ) -> Result<()> {
+        let catalog = self.config.topic_catalog(scope)?;
+        for kind in kinds {
+            let topic = catalog.ident_topic_for(*kind);
             let topic_name = topic.to_string();
             if self.subscribed_topics.contains(&topic_name) {
                 continue;
@@ -1476,7 +1498,17 @@ impl SubstrateRuntime {
     }
 
     pub fn unsubscribe_scope(&mut self, scope: &SwarmScope) -> Result<()> {
-        for topic in self.config.topic_catalog(scope)?.as_ident_topics() {
+        self.unsubscribe_scope_kinds(scope, &GossipKind::ALL)
+    }
+
+    pub fn unsubscribe_scope_kinds(
+        &mut self,
+        scope: &SwarmScope,
+        kinds: &[GossipKind],
+    ) -> Result<()> {
+        let catalog = self.config.topic_catalog(scope)?;
+        for kind in kinds {
+            let topic = catalog.ident_topic_for(*kind);
             let topic_name = topic.to_string();
             if !self.subscribed_topics.contains(&topic_name) {
                 continue;
@@ -1492,7 +1524,7 @@ impl SubstrateRuntime {
         Ok(())
     }
 
-    pub fn publish(&mut self, scope: &SwarmScope, kind: TopicKind, payload: &[u8]) -> Result<()> {
+    pub fn publish(&mut self, scope: &SwarmScope, kind: GossipKind, payload: &[u8]) -> Result<()> {
         let topic_name = self.config.namespace.topic_name(scope, kind)?;
         if !self
             .traffic_guard
@@ -2329,5 +2361,63 @@ mod tests {
             }
             other => panic!("expected bootstrap peer discovery event, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn subscribe_scope_kinds_tracks_only_requested_gossip_kinds() {
+        let config = SubstrateConfig {
+            listen_addrs: vec!["/ip4/127.0.0.1/tcp/0".to_owned()],
+            enable_mdns: false,
+            ..SubstrateConfig::default()
+        };
+        let namespace = config.namespace.clone();
+        let node = SubstrateNode::generate(config).expect("node");
+        let mut runtime = SubstrateRuntime::new(node).expect("runtime");
+        let scope = SwarmScope::Group("crew-7".to_owned());
+
+        runtime
+            .subscribe_scope_kinds(&scope, &[GossipKind::Events, GossipKind::Messages])
+            .expect("subscribe selected kinds");
+
+        assert!(
+            runtime.subscribed_topics.contains(
+                &namespace
+                    .topic_name(&scope, GossipKind::Events)
+                    .expect("events topic")
+            )
+        );
+        assert!(
+            runtime.subscribed_topics.contains(
+                &namespace
+                    .topic_name(&scope, GossipKind::Messages)
+                    .expect("messages topic")
+            )
+        );
+        assert!(
+            !runtime.subscribed_topics.contains(
+                &namespace
+                    .topic_name(&scope, GossipKind::Rules)
+                    .expect("rules topic")
+            )
+        );
+
+        runtime
+            .unsubscribe_scope_kinds(&scope, &[GossipKind::Messages])
+            .expect("unsubscribe selected kind");
+
+        assert!(
+            runtime.subscribed_topics.contains(
+                &namespace
+                    .topic_name(&scope, GossipKind::Events)
+                    .expect("events topic")
+            )
+        );
+        assert!(
+            !runtime.subscribed_topics.contains(
+                &namespace
+                    .topic_name(&scope, GossipKind::Messages)
+                    .expect("messages topic")
+            )
+        );
     }
 }

@@ -66,10 +66,16 @@ pub fn publish_pending_scoped_updates(
         if let crate::types::EventPayload::FeedSubscriptionUpdated(payload) = &event.payload
             && payload.subscriber_node_id == local_node_id
         {
+            let gossip_kinds = super::feed_subscription_gossip_kinds(&payload.gossip_kinds);
             if payload.active {
-                service.subscribe_scope(&scope)?;
-            } else if !super::node_has_active_subscription_scope(node, local_node_id, &scope)? {
-                service.unsubscribe_scope(&scope)?;
+                service.subscribe_scope_kinds(&scope, &gossip_kinds)?;
+            } else if !super::node_has_active_subscription_scope_kinds(
+                node,
+                local_node_id,
+                &scope,
+                &gossip_kinds,
+            )? {
+                service.unsubscribe_scope_kinds(&scope, &gossip_kinds)?;
             }
         }
         if let crate::types::EventPayload::TopicMessagePosted(payload) = &event.payload {

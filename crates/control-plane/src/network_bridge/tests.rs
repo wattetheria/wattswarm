@@ -91,7 +91,19 @@ fn read_http_request(stream: &mut std::net::TcpStream) -> String {
 }
 
 #[test]
-fn task_claim_agent_event_uses_expected_schema() {
+fn task_claim_agent_event_uses_generic_task_schema() {
+    let mut node = Node::open_in_memory_with_roles(&[Role::Proposer]).expect("node");
+    let policy_hash = node
+        .policy_registry()
+        .binding_for("vp.schema_only.v1", json!({}))
+        .expect("policy")
+        .policy_hash;
+    let mut contract = sample_contract("task-1", policy_hash);
+    contract.inputs = json!({
+        "kind": "generic_task",
+        "agent_did": "agent-a"
+    });
+    node.submit_task(contract, 7, 50).expect("submit task");
     let event = crate::types::Event {
         event_id: "evt-claim".to_owned(),
         protocol_version: "1".to_owned(),
@@ -104,7 +116,7 @@ fn task_claim_agent_event_uses_expected_schema() {
             task_id: "task-1".to_owned(),
             role: crate::types::ClaimRole::Propose,
             claimer_node_id: "peer-a".to_owned(),
-            execution_id: "exec-1".to_owned(),
+            execution_id: "exec-agent-a".to_owned(),
             lease_until: 88,
         }),
         signature_hex: "sig".to_owned(),
@@ -112,7 +124,7 @@ fn task_claim_agent_event_uses_expected_schema() {
     let crate::types::EventPayload::TaskClaimed(payload) = &event.payload else {
         panic!("expected claim payload");
     };
-    let agent_event = task_claim_agent_event(&event, payload);
+    let agent_event = task_claim_agent_event(&node, &event, payload).expect("agent event");
     assert_eq!(
         agent_event.event_type,
         wattswarm_protocol::types::AgentEventType::TaskClaimReceived
@@ -122,7 +134,17 @@ fn task_claim_agent_event_uses_expected_schema() {
         wattswarm_protocol::types::AgentEventSourceKind::TaskLifecycle
     );
     assert_eq!(agent_event.payload["task_id"].as_str(), Some("task-1"));
-    assert_eq!(agent_event.payload["execution_id"].as_str(), Some("exec-1"));
+    assert!(!agent_event.requires_commit);
+    assert!(
+        agent_event
+            .allowed_actions
+            .iter()
+            .any(|action| action == "decide_claim")
+    );
+    assert_eq!(
+        agent_event.payload["execution_id"].as_str(),
+        Some("exec-agent-a")
+    );
 }
 
 #[test]
@@ -157,6 +179,85 @@ fn task_result_agent_event_supports_retry_updates() {
         Some("task_retry_scheduled")
     );
     assert_eq!(agent_event.payload["attempt"].as_u64(), Some(3));
+}
+
+#[test]
+fn task_result_agent_event_uses_generic_task_actions() {
+    let identity = NodeIdentity::random();
+    let node_id = identity.node_id();
+    let membership = membership_with_roles(std::slice::from_ref(&node_id));
+    let store = PgStore::open_in_memory().expect("store");
+    let mut node = Node::new(identity.clone(), store, membership).expect("node");
+    let policy_hash = node
+        .policy_registry()
+        .binding_for("vp.schema_only.v1", json!({}))
+        .expect("policy binding")
+        .policy_hash;
+    let contract = sample_contract("task-result-generic", policy_hash);
+    node.submit_task(contract, 1, 10).expect("submit task");
+
+    let candidate = crate::types::Candidate {
+        candidate_id: "cand-generic".to_owned(),
+        execution_id: "exec-generic".to_owned(),
+        output_ref: crate::types::ArtifactRef {
+            uri: "artifact://reference/cand-generic".to_owned(),
+            digest: "sha256:cand-generic".to_owned(),
+            size_bytes: 64,
+            mime: "application/json".to_owned(),
+            created_at: 12,
+            producer: node_id.clone(),
+        },
+        output: json!({
+            "request_id": "req-generic",
+            "result": {"ok": true}
+        }),
+        evidence_inline: vec![],
+        evidence_refs: vec![],
+    };
+    node.store
+        .put_candidate("task-result-generic", &node_id, &candidate)
+        .expect("put candidate");
+
+    let event = build_event_for_external(
+        &identity,
+        1,
+        20,
+        crate::types::EventPayload::CandidateProposed(crate::types::CandidateProposedPayload {
+            task_id: "task-result-generic".to_owned(),
+            candidate: candidate.clone(),
+        }),
+    )
+    .expect("candidate proposed event");
+
+    let agent_event = task_result_agent_event(&node, &event)
+        .expect("build task result event")
+        .expect("task result event");
+    assert_eq!(
+        agent_event.event_type,
+        wattswarm_protocol::types::AgentEventType::TaskResultReceived
+    );
+    assert!(!agent_event.requires_commit);
+    assert_eq!(
+        agent_event.allowed_actions,
+        vec![
+            "inspect_task".to_owned(),
+            "accept_result".to_owned(),
+            "reject_result".to_owned(),
+            "request_retry".to_owned()
+        ]
+    );
+    assert_eq!(
+        agent_event.payload["candidate_id"].as_str(),
+        Some("cand-generic")
+    );
+    assert_eq!(
+        agent_event.payload["execution_id"].as_str(),
+        Some("exec-generic")
+    );
+    assert!(
+        agent_event.payload.get("mission_id").is_none(),
+        "generic task events must not expose mission-specific fields"
+    );
 }
 
 #[test]
@@ -898,6 +999,7 @@ fn topic_backfill_response_advances_local_cursor() {
                 subscriber_node_id: local.node_id(),
                 feed_key: "crew.chat".to_owned(),
                 scope_hint: "group:crew-7".to_owned(),
+                gossip_kinds: vec!["messages".to_owned()],
                 active: true,
             },
         ),
@@ -1004,6 +1106,7 @@ fn dynamic_subscription_scopes_merge_with_configured_scopes() {
                 subscriber_node_id: node_id.clone(),
                 feed_key: "market.alpha".to_owned(),
                 scope_hint: "region:sol-1".to_owned(),
+                gossip_kinds: vec!["events".to_owned()],
                 active: true,
             },
         ),
@@ -1032,6 +1135,7 @@ fn publish_pending_updates_subscribes_runtime_for_local_feed_subscription() {
                 subscriber_node_id: local_node_id.clone(),
                 feed_key: "market.beta".to_owned(),
                 scope_hint: "node:lab-9".to_owned(),
+                gossip_kinds: vec!["events".to_owned()],
                 active: true,
             },
         ),
@@ -1063,6 +1167,9 @@ fn publish_pending_updates_subscribes_runtime_for_local_feed_subscription() {
             .subscribed_scopes()
             .contains(&SwarmScope::Node("lab-9".to_owned()))
     );
+    let subscribed_kinds = service.subscribed_gossip_kinds(&SwarmScope::Node("lab-9".to_owned()));
+    assert!(subscribed_kinds.contains(&GossipKind::Events));
+    assert!(!subscribed_kinds.contains(&GossipKind::Messages));
 }
 
 #[test]
@@ -1077,6 +1184,7 @@ fn publish_pending_updates_unsubscribes_scope_when_local_subscription_is_disable
                 subscriber_node_id: local_node_id.clone(),
                 feed_key: "market.gamma".to_owned(),
                 scope_hint: "region:sol-8".to_owned(),
+                gossip_kinds: vec!["events".to_owned()],
                 active: true,
             },
         ),
@@ -1091,6 +1199,7 @@ fn publish_pending_updates_unsubscribes_scope_when_local_subscription_is_disable
                 subscriber_node_id: local_node_id.clone(),
                 feed_key: "market.gamma".to_owned(),
                 scope_hint: "region:sol-8".to_owned(),
+                gossip_kinds: vec!["events".to_owned()],
                 active: false,
             },
         ),
@@ -1133,6 +1242,7 @@ fn invalid_scope_hints_are_rejected_for_network_substrate_events() {
                 subscriber_node_id,
                 feed_key: "market.invalid".to_owned(),
                 scope_hint: "bad-scope".to_owned(),
+                gossip_kinds: vec!["events".to_owned()],
                 active: true,
             },
         ),
@@ -1155,6 +1265,7 @@ fn empty_network_id_is_rejected_for_network_substrate_events() {
                 subscriber_node_id,
                 feed_key: "market.invalid".to_owned(),
                 scope_hint: "region:sol-1".to_owned(),
+                gossip_kinds: vec!["events".to_owned()],
                 active: true,
             },
         ),
@@ -1177,6 +1288,7 @@ fn mismatched_network_id_is_rejected_for_network_substrate_events() {
                 subscriber_node_id,
                 feed_key: "market.invalid".to_owned(),
                 scope_hint: "region:sol-1".to_owned(),
+                gossip_kinds: vec!["events".to_owned()],
                 active: true,
             },
         ),
@@ -1199,6 +1311,7 @@ fn network_substrate_projection_canonicalizes_scope_hints() {
                 subscriber_node_id: subscriber_node_id.clone(),
                 feed_key: "market.canonical".to_owned(),
                 scope_hint: " local:lab-9 ".to_owned(),
+                gossip_kinds: vec!["events".to_owned()],
                 active: true,
             },
         ),
@@ -1771,6 +1884,7 @@ fn backfill_response_skips_network_substrate_events_for_other_networks() {
                 subscriber_node_id: node_id,
                 feed_key: "market.alpha".to_owned(),
                 scope_hint: "region:sol-1".to_owned(),
+                gossip_kinds: vec!["events".to_owned()],
                 active: true,
             },
         ),

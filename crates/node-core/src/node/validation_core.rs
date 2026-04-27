@@ -260,6 +260,16 @@ impl Node {
             )
             .into());
         }
+        if payload.gossip_kinds.iter().any(|kind| {
+            !matches!(
+                kind.as_str(),
+                "events" | "messages" | "rules" | "checkpoints" | "summaries"
+            )
+        }) {
+            return Err(
+                SwarmError::InvalidEvent("feed subscription gossip_kinds invalid".into()).into(),
+            );
+        }
         self.validate_network_substrate_scope(
             &payload.network_id,
             payload.scope().as_ref(),

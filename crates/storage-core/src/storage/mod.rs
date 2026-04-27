@@ -179,6 +179,7 @@ pub struct FeedSubscriptionRow {
     pub subscriber_node_id: String,
     pub feed_key: String,
     pub scope_hint: String,
+    pub gossip_kinds: Vec<String>,
     pub active: bool,
     pub updated_at: u64,
 }

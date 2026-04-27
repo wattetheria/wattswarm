@@ -242,12 +242,15 @@ impl NetworkBridgeService {
                         log_run_queue_events_if_applicable(node, state_dir, &ingested_event);
                         match &ingested_event.payload {
                             crate::types::EventPayload::TaskClaimed(payload) => {
-                                let event = task_claim_agent_event(&ingested_event, payload);
-                                let _ = deliver_agent_event_to_local_executor(
-                                    state_dir,
-                                    self.db_path.as_deref(),
-                                    &event,
-                                );
+                                if let Ok(event) =
+                                    task_claim_agent_event(node, &ingested_event, payload)
+                                {
+                                    let _ = deliver_agent_event_to_local_executor(
+                                        state_dir,
+                                        self.db_path.as_deref(),
+                                        &event,
+                                    );
+                                }
                             }
                             crate::types::EventPayload::CandidateProposed(_)
                             | crate::types::EventPayload::DecisionFinalized(_)

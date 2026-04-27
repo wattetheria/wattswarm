@@ -23,6 +23,7 @@ fn ui_exposes_topic_message_history_and_cursor_queries() {
                 subscriber_node_id: subscriber_node_id.clone(),
                 feed_key: "crew.chat".to_owned(),
                 scope_hint: "group:crew-7".to_owned(),
+                gossip_kinds: vec!["messages".to_owned()],
                 active: true,
             }),
             100,
@@ -197,6 +198,11 @@ fn ui_accepts_topic_subscription_and_message_writes() {
             .await
             .unwrap();
         assert_eq!(subscription_res.status(), StatusCode::OK);
+        let subscription_json = json_from(subscription_res).await;
+        assert_eq!(
+            subscription_json["gossip_kinds"][0].as_str(),
+            Some("messages")
+        );
 
         let message_res = app
             .clone()
@@ -267,7 +273,7 @@ fn structured_topic_consensus_bridge_finalizes_and_publishes_result_topic() {
     let node = open_node(&state_dir, &db_path).expect("open node");
     let local_node_id = node.node_id();
     node.store
-        .upsert_feed_subscription(&local_node_id, "crew.chat", "group:crew-7", true, 1)
+        .upsert_feed_subscription(&local_node_id, "crew.chat", "group:crew-7", &[], true, 1)
         .expect("upsert topic subscription");
     drop(node);
 

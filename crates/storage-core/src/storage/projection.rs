@@ -5,6 +5,10 @@ impl PgStore {
         wattswarm_protocol::types::normalized_scope_hint(&raw)
     }
 
+    fn decode_gossip_kinds_json(raw: String) -> Vec<String> {
+        serde_json::from_str(&raw).unwrap_or_default()
+    }
+
     pub fn upsert_task_contract(&self, contract: &TaskContract, epoch: u64) -> Result<()> {
         let contract_json = serde_json::to_string(contract)?;
         let conn = self
@@ -178,18 +182,21 @@ impl PgStore {
         subscriber_node_id: &str,
         feed_key: &str,
         scope_hint: &str,
+        gossip_kinds: &[String],
         active: bool,
         updated_at: u64,
     ) -> Result<()> {
+        let gossip_kinds_json = serde_json::to_string(gossip_kinds)?;
         let conn = self
             .conn
             .lock()
             .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
         conn.execute(
-            "INSERT INTO feed_subscriptions(org_id, subscriber_node_id, feed_key, scope_hint, active, updated_at)
-             VALUES ($1, $2, $3, $4, $5, TIMESTAMPTZ 'epoch' + ($6::bigint * INTERVAL '1 millisecond'))
+            "INSERT INTO feed_subscriptions(org_id, subscriber_node_id, feed_key, scope_hint, gossip_kinds_json, active, updated_at)
+             VALUES ($1, $2, $3, $4, $5, $6, TIMESTAMPTZ 'epoch' + ($7::bigint * INTERVAL '1 millisecond'))
              ON CONFLICT(org_id, subscriber_node_id, feed_key) DO UPDATE SET
                scope_hint = excluded.scope_hint,
+               gossip_kinds_json = excluded.gossip_kinds_json,
                active = excluded.active,
                updated_at = excluded.updated_at",
             params![
@@ -197,6 +204,7 @@ impl PgStore {
                 subscriber_node_id,
                 feed_key,
                 scope_hint,
+                gossip_kinds_json,
                 active,
                 updated_at as i64
             ],
@@ -254,17 +262,18 @@ impl PgStore {
             .lock()
             .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
         conn.query_row(
-            "SELECT scope_hint, active, CAST(EXTRACT(EPOCH FROM updated_at) * 1000 AS BIGINT)
+            "SELECT scope_hint, gossip_kinds_json, active, CAST(EXTRACT(EPOCH FROM updated_at) * 1000 AS BIGINT)
              FROM feed_subscriptions
              WHERE org_id = $1 AND subscriber_node_id = $2 AND feed_key = $3",
             params![self.org_id(), subscriber_node_id, feed_key],
             |r| {
-                let updated_at_ms: i64 = r.get(2)?;
+                let updated_at_ms: i64 = r.get(3)?;
                 Ok(FeedSubscriptionRow {
                     subscriber_node_id: subscriber_node_id.to_owned(),
                     feed_key: feed_key.to_owned(),
                     scope_hint: Self::canonical_scope_hint_or_original(r.get(0)?),
-                    active: r.get(1)?,
+                    gossip_kinds: Self::decode_gossip_kinds_json(r.get(1)?),
+                    active: r.get(2)?,
                     updated_at: updated_at_ms as u64,
                 })
             },
@@ -282,18 +291,19 @@ impl PgStore {
             .lock()
             .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
         let mut stmt = conn.prepare(
-            "SELECT feed_key, scope_hint, active, CAST(EXTRACT(EPOCH FROM updated_at) * 1000 AS BIGINT)
+            "SELECT feed_key, scope_hint, gossip_kinds_json, active, CAST(EXTRACT(EPOCH FROM updated_at) * 1000 AS BIGINT)
              FROM feed_subscriptions
              WHERE org_id = $1 AND subscriber_node_id = $2 AND active = TRUE
              ORDER BY updated_at DESC, feed_key ASC",
         )?;
         let rows = stmt.query_map(params![self.org_id(), subscriber_node_id], |r| {
-            let updated_at_ms: i64 = r.get(3)?;
+            let updated_at_ms: i64 = r.get(4)?;
             Ok(FeedSubscriptionRow {
                 subscriber_node_id: subscriber_node_id.to_owned(),
                 feed_key: r.get(0)?,
                 scope_hint: Self::canonical_scope_hint_or_original(r.get(1)?),
-                active: r.get(2)?,
+                gossip_kinds: Self::decode_gossip_kinds_json(r.get(2)?),
+                active: r.get(3)?,
                 updated_at: updated_at_ms as u64,
             })
         })?;

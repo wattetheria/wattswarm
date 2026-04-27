@@ -14,13 +14,13 @@ use anyhow::{Context, Result, anyhow, bail};
 
 use crate::constants::BACKFILL_BATCH_EVENTS;
 use crate::network_p2p::{
-    BackfillRequest, BackfillRequestId, ContactMaterialRequestId, EventEnvelope, GossipMessage,
-    Multiaddr, NetworkP2pConfig, NetworkP2pNode, NetworkRuntime, NetworkRuntimeEvent,
-    PeerDirectMessageRequest, PeerDirectMessageRequestId, PeerDirectMessageResponse,
-    PeerHandshakeMetadata, PeerId, PeerRelationshipRequest, PeerRelationshipRequestId,
-    PeerRelationshipResponse, RawAgentEnvelope, RawContactMaterial, RawContactMaterialRequest,
-    RawContactMaterialResponse, RawPeerDirectMessageKind, RawPeerRelationshipAction,
-    SummaryAnnouncement, SwarmScope,
+    BackfillRequest, BackfillRequestId, ContactMaterialRequestId, EventEnvelope, GossipKind,
+    GossipMessage, Multiaddr, NetworkP2pConfig, NetworkP2pNode, NetworkRuntime,
+    NetworkRuntimeEvent, PeerDirectMessageRequest, PeerDirectMessageRequestId,
+    PeerDirectMessageResponse, PeerHandshakeMetadata, PeerId, PeerRelationshipRequest,
+    PeerRelationshipRequestId, PeerRelationshipResponse, RawAgentEnvelope, RawContactMaterial,
+    RawContactMaterialRequest, RawContactMaterialResponse, RawPeerDirectMessageKind,
+    RawPeerRelationshipAction, SummaryAnnouncement, SwarmScope,
 };
 use crate::node::Node;
 use serde::{Deserialize, Serialize};
@@ -39,7 +39,6 @@ use wattswarm_network_transport_core::{
     TransferIntent, TransferKind, TransportRoute as DataTransportRoute, TransportRouter,
 };
 use wattswarm_network_transport_iroh::export_local_contact_material;
-use wattswarm_protocol::reason_codes::REASON_SCHEMA_OK;
 use wattswarm_protocol::types::NetworkProtocolParams;
 
 pub use announcements::{apply_checkpoint_announcement, apply_rule_announcement};
@@ -56,8 +55,8 @@ pub use summary::{
 use backfill::{latest_scoped_event_seq, should_publish_summaries, should_sync_event};
 use publish::GlobalPublishRateGuard;
 use scope::{
-    dynamic_subscription_scopes_for_node, event_scope, merge_scopes,
-    node_has_active_subscription_scope,
+    dynamic_subscription_scope_kinds_for_node, event_scope, merge_scopes,
+    node_has_active_subscription_scope_kinds,
 };
 use summary::{
     knowledge_summary_for_event, mirror_summary_controls_to_parent_network,
@@ -191,6 +190,27 @@ fn scope_hint_label(scope: &SwarmScope) -> String {
         SwarmScope::Node(id) => format!("node:{id}"),
         SwarmScope::Group(id) => format!("group:{id}"),
     }
+}
+
+fn feed_subscription_gossip_kinds(raw_kinds: &[String]) -> Vec<GossipKind> {
+    if raw_kinds.is_empty() {
+        return GossipKind::ALL.to_vec();
+    }
+    let mut kinds = Vec::new();
+    for raw in raw_kinds {
+        let kind = match raw.trim() {
+            "events" => GossipKind::Events,
+            "messages" => GossipKind::Messages,
+            "rules" => GossipKind::Rules,
+            "checkpoints" => GossipKind::Checkpoints,
+            "summaries" => GossipKind::Summaries,
+            _ => continue,
+        };
+        if !kinds.contains(&kind) {
+            kinds.push(kind);
+        }
+    }
+    kinds
 }
 
 fn wire_peer_relationship_action(
@@ -670,109 +690,9 @@ fn route_task_result_to_wattswarm(
                     "candidate_id",
                     &event.event_type,
                 )?;
-                let candidate = node
-                    .store
-                    .get_candidate_by_id(&task_id, &candidate_id)?
-                    .ok_or_else(|| {
-                        anyhow!("candidate not found for task_result_received: {candidate_id}")
-                    })?;
-                let candidate_hash = crate::crypto::candidate_hash(&candidate)?;
-                let verify_execution_id = format!("agent-verify-{}", event.event_id);
-                let lease_until = now.saturating_add(task.contract.assignment.claim.lease_ms);
-                node.claim_task(
-                    &task_id,
-                    crate::types::ClaimRole::Verify,
-                    &verify_execution_id,
-                    lease_until,
-                    task.epoch,
-                    now.saturating_add(1),
-                )?;
-                let verifier_result_hash = format!(
-                    "agent-event-approve:{}:{}:{}",
-                    task_id, candidate_id, event.event_id
-                );
-                node.submit_verifier_result(
-                    &task_id,
-                    crate::types::VerifierResult {
-                        candidate_id: candidate_id.clone(),
-                        execution_id: verify_execution_id.clone(),
-                        verification_status: crate::types::VerificationStatus::Passed,
-                        passed: true,
-                        score: 1.0,
-                        reason_codes: vec![REASON_SCHEMA_OK],
-                        verifier_result_hash: verifier_result_hash.clone(),
-                        provider_family: "agent_event_bus".to_owned(),
-                        model_id: "local-agent-approval".to_owned(),
-                        policy_id: task.contract.acceptance.verifier_policy.policy_id.clone(),
-                        policy_version: task
-                            .contract
-                            .acceptance
-                            .verifier_policy
-                            .policy_version
-                            .clone(),
-                        policy_hash: task.contract.acceptance.verifier_policy.policy_hash.clone(),
-                    },
-                    task.epoch,
-                    now.saturating_add(2),
-                )?;
-                let salt = uuid::Uuid::new_v4().to_string();
-                let commit_hash = crate::crypto::vote_commit_hash(
-                    crate::types::VoteChoice::Approve,
-                    &salt,
-                    &verifier_result_hash,
-                );
-                node.submit_vote_commit(
-                    crate::types::VoteCommitPayload {
-                        task_id: task_id.clone(),
-                        candidate_id: candidate_id.clone(),
-                        candidate_hash: candidate_hash.clone(),
-                        execution_id: verify_execution_id.clone(),
-                        verifier_result_hash: verifier_result_hash.clone(),
-                        commit_hash,
-                    },
-                    task.epoch,
-                    now.saturating_add(3),
-                )?;
-                node.submit_vote_reveal(
-                    crate::types::VoteRevealPayload {
-                        task_id: task_id.clone(),
-                        candidate_id: candidate_id.clone(),
-                        candidate_hash,
-                        execution_id: verify_execution_id,
-                        verifier_result_hash,
-                        vote: crate::types::VoteChoice::Approve,
-                        salt,
-                    },
-                    task.epoch,
-                    now.saturating_add(4),
-                )?;
-                node.commit_decision(&task_id, task.epoch, &candidate_id, now.saturating_add(5))?;
-                node.finalize_decision(
-                    &task_id,
-                    task.epoch,
-                    &candidate_id,
-                    crate::types::FinalityProof {
-                        threshold: 1,
-                        signatures: vec![crate::node::finality_sign(
-                            &node.identity,
-                            &task_id,
-                            task.epoch,
-                            &candidate_id,
-                        )],
-                    },
-                    now.saturating_add(6),
-                )?;
-                return Ok((
-                    200,
-                    json!({
-                        "ok": true,
-                        "status": "finalized",
-                        "store": "wattswarm",
-                        "task_id": task_id,
-                        "candidate_id": candidate_id,
-                    })
-                    .to_string(),
-                ));
+                let result =
+                    crate::control::accept_task_result_locally(&mut node, &task_id, &candidate_id)?;
+                return Ok((200, result.to_string()));
             }
             return Ok((
                 200,
@@ -922,10 +842,15 @@ fn topic_message_requires_reply(content: &Value) -> bool {
 }
 
 fn task_claim_agent_event(
+    node: &Node,
     event: &crate::types::Event,
     payload: &crate::types::ClaimPayload,
-) -> wattswarm_protocol::types::AgentEvent {
-    build_agent_event(
+) -> Result<wattswarm_protocol::types::AgentEvent> {
+    let task_inputs = node
+        .task_view(&payload.task_id)?
+        .map(|task| task.contract.inputs)
+        .unwrap_or(Value::Null);
+    Ok(build_agent_event(
         wattswarm_protocol::types::AgentEventType::TaskClaimReceived,
         wattswarm_protocol::types::AgentEventSourceKind::TaskLifecycle,
         Some(event.author_node_id.clone()),
@@ -938,6 +863,7 @@ fn task_claim_agent_event(
             "execution_id": &payload.execution_id,
             "role": payload.role,
             "lease_until": payload.lease_until,
+            "task_inputs": task_inputs,
             "created_at": event.created_at,
         }),
         false,
@@ -947,7 +873,7 @@ fn task_claim_agent_event(
             "task_claim:{}:{}",
             payload.task_id, payload.execution_id
         )),
-    )
+    ))
 }
 
 fn task_result_agent_event(
@@ -2083,11 +2009,8 @@ fn run_background_network_service_with_hook(
     let bootstrap_peers = config.bootstrap_peers.clone();
     let mut node = crate::control::open_configured_node(state_dir, db_path)?;
     let node_id = node.node_id();
-    let scopes = merge_scopes(
-        configured_scopes
-            .into_iter()
-            .chain(dynamic_subscription_scopes_for_node(&node, &node_id)?),
-    );
+    let scopes = merge_scopes(configured_scopes);
+    let dynamic_subscriptions = dynamic_subscription_scope_kinds_for_node(&node, &node_id)?;
     let verified_protocol_params = node.store.load_verified_network_protocol_params()?;
     let protocol_params = verified_protocol_params.params().clone();
     let mut config = config.apply_protocol_params(&protocol_params);
@@ -2107,6 +2030,9 @@ fn run_background_network_service_with_hook(
         &scopes,
         &protocol_params,
     )?;
+    for (scope, gossip_kinds) in dynamic_subscriptions {
+        service.subscribe_scope_kinds(&scope, &gossip_kinds)?;
+    }
     service.set_state_dir(state_dir.to_path_buf(), db_path.to_path_buf());
     store_latest_network_observability_snapshot(state_dir, service.observability_snapshot(&node)?);
     let mut announced_listen = false;
@@ -2344,6 +2270,7 @@ pub struct NetworkBridgeService {
     runtime: NetworkRuntime,
     tokio_runtime: Runtime,
     subscribed_scopes: Vec<SwarmScope>,
+    subscribed_scope_kinds: HashMap<SwarmScope, HashSet<GossipKind>>,
     pinned_scopes: Vec<SwarmScope>,
     peer_sync_state: HashMap<PeerId, PeerSyncState>,
     connected_peers: HashSet<PeerId>,
@@ -2372,21 +2299,26 @@ impl NetworkBridgeService {
         let tokio_runtime = Runtime::new()?;
         let mut runtime = tokio_runtime.block_on(async { NetworkRuntime::new(node) })?;
         let mut subscribed_scopes = Vec::new();
+        let mut subscribed_scope_kinds = HashMap::new();
         for scope in scopes {
             runtime.subscribe_scope(scope)?;
             if !subscribed_scopes.contains(scope) {
                 subscribed_scopes.push(scope.clone());
             }
+            subscribed_scope_kinds.insert(scope.clone(), GossipKind::ALL.into_iter().collect());
         }
         if subscribed_scopes.is_empty() {
             runtime.subscribe_scope(&SwarmScope::Global)?;
             subscribed_scopes.push(SwarmScope::Global);
+            subscribed_scope_kinds
+                .insert(SwarmScope::Global, GossipKind::ALL.into_iter().collect());
         }
         Ok(Self {
             runtime,
             tokio_runtime,
             pinned_scopes: subscribed_scopes.clone(),
             subscribed_scopes,
+            subscribed_scope_kinds,
             peer_sync_state: HashMap::new(),
             connected_peers: HashSet::new(),
             global_publish_rate_guard: GlobalPublishRateGuard::new(Instant::now()),
@@ -2421,25 +2353,66 @@ impl NetworkBridgeService {
         &self.subscribed_scopes
     }
 
+    #[cfg(test)]
+    pub fn subscribed_gossip_kinds(&self, scope: &SwarmScope) -> Vec<GossipKind> {
+        self.subscribed_scope_kinds
+            .get(scope)
+            .map(|kinds| kinds.iter().copied().collect())
+            .unwrap_or_default()
+    }
+
     pub fn subscribe_scope(&mut self, scope: &SwarmScope) -> Result<()> {
+        self.subscribe_scope_kinds(scope, &GossipKind::ALL)
+    }
+
+    pub fn subscribe_scope_kinds(
+        &mut self,
+        scope: &SwarmScope,
+        kinds: &[GossipKind],
+    ) -> Result<()> {
+        if kinds.is_empty() {
+            return Ok(());
+        }
         let _guard = self.tokio_runtime.enter();
-        self.runtime.subscribe_scope(scope)?;
+        self.runtime.subscribe_scope_kinds(scope, kinds)?;
         if !self.subscribed_scopes.contains(scope) {
             self.subscribed_scopes.push(scope.clone());
         }
+        let subscribed = self
+            .subscribed_scope_kinds
+            .entry(scope.clone())
+            .or_default();
+        subscribed.extend(kinds.iter().copied());
         Ok(())
     }
 
     pub fn unsubscribe_scope(&mut self, scope: &SwarmScope) -> Result<()> {
+        self.unsubscribe_scope_kinds(scope, &GossipKind::ALL)
+    }
+
+    pub fn unsubscribe_scope_kinds(
+        &mut self,
+        scope: &SwarmScope,
+        kinds: &[GossipKind],
+    ) -> Result<()> {
         if *scope == SwarmScope::Global
             || self.pinned_scopes.contains(scope)
             || !self.subscribed_scopes.contains(scope)
+            || kinds.is_empty()
         {
             return Ok(());
         }
         let _guard = self.tokio_runtime.enter();
-        self.runtime.unsubscribe_scope(scope)?;
-        self.subscribed_scopes.retain(|existing| existing != scope);
+        self.runtime.unsubscribe_scope_kinds(scope, kinds)?;
+        if let Some(subscribed) = self.subscribed_scope_kinds.get_mut(scope) {
+            for kind in kinds {
+                subscribed.remove(kind);
+            }
+            if subscribed.is_empty() {
+                self.subscribed_scope_kinds.remove(scope);
+                self.subscribed_scopes.retain(|existing| existing != scope);
+            }
+        }
         Ok(())
     }
 

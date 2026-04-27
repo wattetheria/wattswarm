@@ -30,7 +30,7 @@ fn sample_topic_content_ref(digest: &str, producer: &str) -> ArtifactRef {
 fn network_substrate_reads_canonicalize_scope_hints() {
     let store = open_test_store();
     store
-        .upsert_feed_subscription("node-a", "feed-1", " local:lab-9 ", true, 100)
+        .upsert_feed_subscription("node-a", "feed-1", " local:lab-9 ", &[], true, 100)
         .expect("upsert subscription");
 
     let subscription = store
@@ -54,7 +54,7 @@ fn network_substrate_reads_canonicalize_scope_hints() {
     assert_eq!(scopes, vec![ProjectionScope::Node("lab-9".to_owned())]);
 
     store
-        .upsert_feed_subscription("node-a", "feed-group", " group:crew-7 ", true, 101)
+        .upsert_feed_subscription("node-a", "feed-group", " group:crew-7 ", &[], true, 101)
         .expect("upsert group subscription");
     let group_subscription = store
         .get_feed_subscription("node-a", "feed-group")
@@ -421,10 +421,10 @@ fn discoverable_feed_sources_and_domains_capture_active_network_surfaces() {
         .upsert_task_contract(&contract, 1)
         .expect("upsert task contract");
     store
-        .upsert_feed_subscription("node-a", "feed-market", " region:sol-1 ", true, 10)
+        .upsert_feed_subscription("node-a", "feed-market", " region:sol-1 ", &[], true, 10)
         .expect("active feed subscription");
     store
-        .upsert_feed_subscription("node-b", "feed-market", "region:sol-1", true, 11)
+        .upsert_feed_subscription("node-b", "feed-market", "region:sol-1", &[], true, 11)
         .expect("second feed subscription");
     store
         .upsert_execution_set_member(

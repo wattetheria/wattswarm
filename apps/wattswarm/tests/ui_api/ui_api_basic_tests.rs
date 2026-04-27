@@ -138,6 +138,115 @@ fn ui_supports_core_cli_operations() {
             .unwrap();
         assert_eq!(by_task_res.status(), StatusCode::OK);
 
+        let task_contract = serde_json::json!({
+            "protocol_version": contract["protocol_version"].clone(),
+            "task_id": "task-ordinary-e2e",
+            "task_type": "generic.analysis",
+            "inputs": {
+                "request_id": "req-e2e",
+                "domain": "analysis"
+            },
+            "output_schema": contract["output_schema"].clone(),
+            "budget": contract["budget"].clone(),
+            "assignment": contract["assignment"].clone(),
+            "acceptance": contract["acceptance"].clone(),
+            "task_mode": contract["task_mode"].clone(),
+            "expiry_ms": contract["expiry_ms"].clone(),
+            "evidence_policy": contract["evidence_policy"].clone()
+        });
+
+        let task_submit_res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/task/submit")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&serde_json::json!({
+                            "contract": task_contract
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(task_submit_res.status(), StatusCode::OK);
+
+        let announce_res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/task/announce")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&serde_json::json!({
+                            "task_id": "task-ordinary-e2e",
+                            "feed_key": "tasks.public",
+                            "scope_hint": "global",
+                            "summary": {"request_id": "req-e2e"}
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(announce_res.status(), StatusCode::OK);
+        let announce_json = json_from(announce_res).await;
+        assert_eq!(announce_json["ok"].as_bool(), Some(true));
+        assert_eq!(announce_json["subscribed"].as_bool(), Some(true));
+        assert_eq!(announce_json["feed_key"].as_str(), Some("tasks.public"));
+        assert_eq!(announce_json["scope_hint"].as_str(), Some("global"));
+        assert_eq!(announce_json["gossip_kinds"][0].as_str(), Some("events"));
+
+        let claim_res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/task/claim")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"task_id":"task-ordinary-e2e","execution_id":"exec-agent-a"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(claim_res.status(), StatusCode::OK);
+        let claim_json = json_from(claim_res).await;
+        assert_eq!(claim_json["ok"].as_bool(), Some(true));
+        assert_eq!(claim_json["subscribed"].as_bool(), Some(true));
+        assert!(claim_json["execution_id"].as_str().is_some());
+
+        let propose_candidate_res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/task/propose-candidate")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&serde_json::json!({
+                            "task_id": "task-ordinary-e2e",
+                            "execution_id": "exec-agent-a",
+                            "candidate_id": "cand-task-e2e-agent-a",
+                            "output": {
+                                "request_id": "req-e2e",
+                                "result": {"ok": true}
+                            }
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(propose_candidate_res.status(), StatusCode::OK);
+
         let swarm_page_res = app
             .clone()
             .oneshot(

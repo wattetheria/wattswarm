@@ -6,7 +6,8 @@ use crate::task_template::sample_contract;
 use crate::types::{
     Candidate, ClaimRole, EventPayload, ExecutionIntentDeclaredPayload,
     ExecutionSetConfirmedPayload, ExecutionSetMember, FinalityProof, Membership,
-    NetworkBootstrapBundle, Role, TaskContract, VoteChoice, VoteCommitPayload, VoteRevealPayload,
+    NetworkBootstrapBundle, Role, TaskContract, VerificationStatus, VerifierResult, VoteChoice,
+    VoteCommitPayload, VoteRevealPayload,
 };
 use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -822,6 +823,124 @@ fn maybe_fetch_json_artifact_via_transport(
 
 fn observed_at_ms() -> u64 {
     chrono::Utc::now().timestamp_millis().max(0) as u64
+}
+
+pub fn accept_task_result_locally(
+    node: &mut Node,
+    task_id: &str,
+    candidate_id: &str,
+) -> Result<Value> {
+    let task = node
+        .task_view(task_id)?
+        .ok_or_else(|| anyhow!("task not found: {task_id}"))?;
+    if task.terminal_state == crate::types::TaskTerminalState::Finalized {
+        if task.finalized_candidate_id.as_deref() == Some(candidate_id) {
+            return Ok(json!({
+                "ok": true,
+                "status": "finalized",
+                "task_id": task_id,
+                "candidate_id": candidate_id,
+                "already_finalized": true,
+            }));
+        }
+        bail!(
+            "task {task_id} already finalized with different candidate: {:?}",
+            task.finalized_candidate_id
+        );
+    }
+    let candidate = node
+        .store
+        .get_candidate_by_id(task_id, candidate_id)?
+        .ok_or_else(|| anyhow!("candidate not found for task {task_id}: {candidate_id}"))?;
+    let candidate_hash = candidate_hash(&candidate)?;
+    let now = observed_at_ms();
+    let verify_execution_id = format!("verify-{}", Uuid::new_v4());
+    let lease_until = now.saturating_add(task.contract.assignment.claim.lease_ms);
+    node.claim_task(
+        task_id,
+        ClaimRole::Verify,
+        &verify_execution_id,
+        lease_until,
+        task.epoch,
+        now.saturating_add(1),
+    )?;
+    let verifier_result_hash = format!(
+        "accept-result:{}:{}:{}",
+        task_id, candidate_id, verify_execution_id
+    );
+    node.submit_verifier_result(
+        task_id,
+        VerifierResult {
+            candidate_id: candidate_id.to_owned(),
+            execution_id: verify_execution_id.clone(),
+            verification_status: VerificationStatus::Passed,
+            passed: true,
+            score: 1.0,
+            reason_codes: vec![wattswarm_protocol::reason_codes::REASON_SCHEMA_OK],
+            verifier_result_hash: verifier_result_hash.clone(),
+            provider_family: "agent_event_bus".to_owned(),
+            model_id: "local-agent-approval".to_owned(),
+            policy_id: task.contract.acceptance.verifier_policy.policy_id.clone(),
+            policy_version: task
+                .contract
+                .acceptance
+                .verifier_policy
+                .policy_version
+                .clone(),
+            policy_hash: task.contract.acceptance.verifier_policy.policy_hash.clone(),
+        },
+        task.epoch,
+        now.saturating_add(2),
+    )?;
+    let salt = Uuid::new_v4().to_string();
+    let commit_hash = vote_commit_hash(VoteChoice::Approve, &salt, &verifier_result_hash);
+    node.submit_vote_commit(
+        VoteCommitPayload {
+            task_id: task_id.to_owned(),
+            candidate_id: candidate_id.to_owned(),
+            candidate_hash: candidate_hash.clone(),
+            execution_id: verify_execution_id.clone(),
+            verifier_result_hash: verifier_result_hash.clone(),
+            commit_hash,
+        },
+        task.epoch,
+        now.saturating_add(3),
+    )?;
+    node.submit_vote_reveal(
+        VoteRevealPayload {
+            task_id: task_id.to_owned(),
+            candidate_id: candidate_id.to_owned(),
+            candidate_hash,
+            execution_id: verify_execution_id,
+            verifier_result_hash,
+            vote: VoteChoice::Approve,
+            salt,
+        },
+        task.epoch,
+        now.saturating_add(4),
+    )?;
+    node.commit_decision(task_id, task.epoch, candidate_id, now.saturating_add(5))?;
+    node.finalize_decision(
+        task_id,
+        task.epoch,
+        candidate_id,
+        FinalityProof {
+            threshold: 1,
+            signatures: vec![finality_sign(
+                &node.identity,
+                task_id,
+                task.epoch,
+                candidate_id,
+            )],
+        },
+        now.saturating_add(6),
+    )?;
+    Ok(json!({
+        "ok": true,
+        "status": "finalized",
+        "task_id": task_id,
+        "candidate_id": candidate_id,
+    }))
 }
 
 fn current_network_context_id(node: &Node) -> String {
@@ -2276,9 +2395,14 @@ fn load_or_create_identity(seed_file: &Path) -> Result<NodeIdentity> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ENV_NETWORK_BOOTSTRAP_HTTP_URLS, bootstrap_bundle_endpoint_candidates,
-        peer_dm_content_from_envelope, synthesize_peer_dm_envelope,
+        ENV_NETWORK_BOOTSTRAP_HTTP_URLS, accept_task_result_locally,
+        bootstrap_bundle_endpoint_candidates, peer_dm_content_from_envelope,
+        synthesize_peer_dm_envelope,
     };
+    use crate::node::Node;
+    use crate::task_template::sample_contract;
+    use crate::types::{Candidate, Role};
+    use serde_json::json;
     use std::fs;
     use uuid::Uuid;
 
@@ -2362,5 +2486,57 @@ mod tests {
         let envelope = synthesize_peer_dm_envelope("google_a2a", &content);
         assert_eq!(envelope.protocol, "google_a2a");
         assert_eq!(peer_dm_content_from_envelope(&envelope), content);
+    }
+
+    #[test]
+    fn accept_task_result_locally_is_idempotent_for_same_finalized_candidate() {
+        let mut node = Node::open_in_memory_with_roles(&[
+            Role::Proposer,
+            Role::Verifier,
+            Role::Committer,
+            Role::Finalizer,
+        ])
+        .expect("node");
+        let policy_hash = node
+            .policy_registry()
+            .binding_for("vp.schema_only.v1", json!({}))
+            .expect("policy binding")
+            .policy_hash;
+        let contract = sample_contract("task-finalized-idempotent", policy_hash);
+        node.submit_task(contract, 1, 10).expect("submit task");
+
+        let candidate = Candidate {
+            candidate_id: "cand-finalized".to_owned(),
+            execution_id: "exec-finalized".to_owned(),
+            output_ref: crate::types::ArtifactRef {
+                uri: "artifact://reference/cand-finalized".to_owned(),
+                digest: "sha256:cand-finalized".to_owned(),
+                size_bytes: 64,
+                mime: "application/json".to_owned(),
+                created_at: 12,
+                producer: node.node_id(),
+            },
+            output: json!({
+                "answer": "ok",
+                "confidence": 1.0,
+                "check_summary": "accepted"
+            }),
+            evidence_inline: vec![],
+            evidence_refs: vec![],
+        };
+        node.store
+            .put_candidate("task-finalized-idempotent", &node.node_id(), &candidate)
+            .expect("put candidate");
+
+        let first =
+            accept_task_result_locally(&mut node, "task-finalized-idempotent", "cand-finalized")
+                .expect("first finalize");
+        assert_eq!(first["status"].as_str(), Some("finalized"));
+
+        let second =
+            accept_task_result_locally(&mut node, "task-finalized-idempotent", "cand-finalized")
+                .expect("second finalize");
+        assert_eq!(second["status"].as_str(), Some("finalized"));
+        assert_eq!(second["already_finalized"].as_bool(), Some(true));
     }
 }

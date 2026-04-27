@@ -772,6 +772,8 @@ pub struct FeedSubscriptionUpdatedPayload {
     pub subscriber_node_id: String,
     pub feed_key: String,
     pub scope_hint: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub gossip_kinds: Vec<String>,
     pub active: bool,
 }
 

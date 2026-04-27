@@ -29,13 +29,13 @@ pub(super) fn merge_scopes(scopes: impl IntoIterator<Item = SwarmScope>) -> Vec<
     merged
 }
 
+#[cfg(test)]
 pub(super) fn dynamic_subscription_scopes_for_node(
     node: &Node,
     node_id: &str,
 ) -> Result<Vec<SwarmScope>> {
     let mut scopes = Vec::new();
-    for scope in node.store.list_active_feed_subscription_scopes(node_id)? {
-        let scope = scope_from_projection_scope(scope);
+    for (scope, _) in dynamic_subscription_scope_kinds_for_node(node, node_id)? {
         if !scopes.contains(&scope) {
             scopes.push(scope);
         }
@@ -43,14 +43,32 @@ pub(super) fn dynamic_subscription_scopes_for_node(
     Ok(scopes)
 }
 
-pub(super) fn node_has_active_subscription_scope(
+pub(super) fn dynamic_subscription_scope_kinds_for_node(
+    node: &Node,
+    node_id: &str,
+) -> Result<Vec<(SwarmScope, Vec<GossipKind>)>> {
+    let mut subscriptions = Vec::new();
+    for subscription in node.store.list_active_feed_subscriptions(node_id)? {
+        let Some(scope) = parse_scope_hint_string(&subscription.scope_hint) else {
+            continue;
+        };
+        let kinds = super::feed_subscription_gossip_kinds(&subscription.gossip_kinds);
+        subscriptions.push((scope, kinds));
+    }
+    Ok(subscriptions)
+}
+
+pub(super) fn node_has_active_subscription_scope_kinds(
     node: &Node,
     node_id: &str,
     scope: &SwarmScope,
+    kinds: &[GossipKind],
 ) -> Result<bool> {
-    Ok(dynamic_subscription_scopes_for_node(node, node_id)?
+    Ok(dynamic_subscription_scope_kinds_for_node(node, node_id)?
         .into_iter()
-        .any(|candidate| candidate == *scope))
+        .any(|(candidate_scope, candidate_kinds)| {
+            candidate_scope == *scope && candidate_kinds.iter().any(|kind| kinds.contains(kind))
+        }))
 }
 
 pub(super) fn parse_scope_hint_string(raw: &str) -> Option<SwarmScope> {
