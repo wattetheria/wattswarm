@@ -291,8 +291,7 @@ pub const STARTUP_HTML: &str = r#"<!DOCTYPE html>
           Required startup settings stay here. Deeper tuning and gateway deployment still stay in CLI or compose.
         </div>
         <div class="links">
-          <a href="/swarm">Open Swarm Dashboard</a>
-          <a href="/console">Open Developer Console</a>
+          <a href="/diagnostics">Open Network Diagnostics</a>
         </div>
       </div>
       <div class="hero-actions">

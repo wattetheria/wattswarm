@@ -11,8 +11,9 @@ use crate::egress_agent::{
     EgressAgentConfig, load_egress_agent_config_state, save_egress_agent_config_state,
 };
 use crate::network_bridge::{
-    enqueue_agent_payment_command, enqueue_peer_direct_message_command,
-    enqueue_peer_relationship_action_command, network_service_started,
+    DiagnosticFilter, enqueue_agent_payment_command, enqueue_peer_direct_message_command,
+    enqueue_peer_relationship_action_command, latest_network_observability_snapshot,
+    list_network_diagnostics, network_service_started,
 };
 use crate::network_p2p::RawAgentEnvelope;
 use crate::run_control;
@@ -31,7 +32,7 @@ use crate::wattetheria_sync;
 use anyhow::{Context, Result, anyhow, bail};
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
-use axum::response::{Html, IntoResponse, Response};
+use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
@@ -213,6 +214,35 @@ struct RunEventsQuery {
 }
 
 #[derive(Debug, Deserialize)]
+struct DiagnosticsQuery {
+    limit: Option<usize>,
+    level: Option<String>,
+    component: Option<String>,
+    category: Option<String>,
+    phase: Option<String>,
+    event_id: Option<String>,
+    object_id: Option<String>,
+    source_node_id: Option<String>,
+    search: Option<String>,
+}
+
+impl From<DiagnosticsQuery> for DiagnosticFilter {
+    fn from(query: DiagnosticsQuery) -> Self {
+        Self {
+            limit: query.limit,
+            level: query.level,
+            component: query.component,
+            category: query.category,
+            phase: query.phase,
+            event_id: query.event_id,
+            object_id: query.object_id,
+            source_node_id: query.source_node_id,
+            search: query.search,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
 struct KnowledgeExportRequest {
     task_type: Option<String>,
     task_id: Option<String>,
@@ -334,7 +364,8 @@ pub fn run(state_dir: PathBuf, db_path: PathBuf, listen: String) -> Result<()> {
 pub fn build_app(state: UiServerState) -> Router {
     Router::new()
         .route("/", get(index))
-        .route("/console", get(console_page))
+        .route("/diagnostics", get(diagnostics_page))
+        .route("/console", get(legacy_console_redirect))
         .route("/swarm", get(swarm_page))
         .route("/api/node/up", post(node_up))
         .route("/api/node/down", post(node_down))
@@ -353,6 +384,7 @@ pub fn build_app(state: UiServerState) -> Router {
         .route("/api/log/head", get(log_head))
         .route("/api/log/replay", post(log_replay))
         .route("/api/log/verify", post(log_verify))
+        .route("/api/diagnostics", get(diagnostics))
         .route("/api/executors/add", post(executors_add))
         .route("/api/executors/list", get(executors_list))
         .route("/api/executors/check", post(executors_check))
@@ -453,8 +485,12 @@ async fn index() -> Html<&'static str> {
     Html(STARTUP_HTML)
 }
 
-async fn console_page() -> Html<&'static str> {
+async fn diagnostics_page() -> Html<&'static str> {
     Html(INDEX_HTML)
+}
+
+async fn legacy_console_redirect() -> Redirect {
+    Redirect::permanent("/diagnostics")
 }
 
 async fn swarm_page() -> Html<&'static str> {
@@ -1211,6 +1247,27 @@ async fn log_verify(State(state): State<UiServerState>) -> Result<Json<Value>, A
     })
     .await?;
     Ok(Json(json!({"ok": true, "message": "verified"})))
+}
+
+async fn diagnostics(
+    State(state): State<UiServerState>,
+    Query(query): Query<DiagnosticsQuery>,
+) -> Result<Json<Value>, ApiError> {
+    let state_clone = state.clone();
+    let filter = DiagnosticFilter::from(query);
+    let payload = run_blocking(move || -> Result<Value> {
+        let diagnostics = list_network_diagnostics(&state_clone.state_dir, &filter)?;
+        let snapshot = latest_network_observability_snapshot(&state_clone.state_dir);
+        Ok(json!({
+            "ok": true,
+            "generated_at": chrono::Utc::now().to_rfc3339(),
+            "network_service_started": network_service_started(&state_clone.state_dir),
+            "snapshot": snapshot,
+            "diagnostics": diagnostics,
+        }))
+    })
+    .await?;
+    Ok(Json(payload))
 }
 
 async fn executors_add(

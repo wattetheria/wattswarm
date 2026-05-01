@@ -1,5 +1,6 @@
 mod announcements;
 mod backfill;
+mod diagnostics;
 mod publish;
 mod scope;
 mod service_dispatch;
@@ -45,6 +46,9 @@ pub use announcements::{apply_checkpoint_announcement, apply_rule_announcement};
 pub use backfill::{
     backfill_response_for_request, dial_bootstrap_peer_endpoints, dial_discovered_peer_endpoints,
     ingest_backfill_response,
+};
+pub use diagnostics::{
+    DiagnosticEntry, DiagnosticFilter, list_diagnostics as list_network_diagnostics,
 };
 pub use publish::{publish_pending_global_events, publish_pending_scoped_updates};
 pub use summary::{
@@ -142,6 +146,16 @@ pub fn latest_connected_peer_ids(state_dir: &Path) -> Option<Vec<String>> {
     peers.sort();
     peers.dedup();
     Some(peers)
+}
+
+pub fn latest_network_observability_snapshot(
+    state_dir: &Path,
+) -> Option<NetworkBridgeObservabilitySnapshot> {
+    latest_network_observability_snapshots()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(state_dir)
+        .cloned()
 }
 
 pub fn network_service_started(state_dir: &Path) -> bool {
@@ -1056,6 +1070,23 @@ fn deliver_agent_event_to_local_executor(
     if let Some(dedupe_key) = event.dedupe_key.as_deref()
         && crate::control::find_agent_event_record_by_dedupe_key(state_dir, dedupe_key)?.is_some()
     {
+        diagnostics::record_diagnostic(
+            Some(state_dir),
+            diagnostics::DiagnosticEvent::new(
+                "info",
+                "agent_event",
+                "delivery.dedupe",
+                "skipped",
+                format!("agent event dedupe skipped: {:?}", event.event_type),
+            )
+            .event_id(event.event_id.clone())
+            .object("agent_event", event.correlation_id.clone())
+            .source_node_id(event.source_node_id.clone())
+            .details(json!({
+                "event_type": format!("{:?}", event.event_type),
+                "dedupe_key": dedupe_key,
+            })),
+        );
         return Ok(());
     }
 
@@ -1066,6 +1097,29 @@ fn deliver_agent_event_to_local_executor(
         wattswarm_protocol::types::AgentEventStatus::Pending,
         now,
     )?;
+    diagnostics::record_diagnostic(
+        Some(state_dir),
+        diagnostics::DiagnosticEvent::new(
+            "info",
+            "agent_event",
+            "delivery.queued",
+            "pending",
+            format!(
+                "agent event queued for local executor: {:?}",
+                event.event_type
+            ),
+        )
+        .event_id(event.event_id.clone())
+        .object("agent_event", event.correlation_id.clone())
+        .source_node_id(event.source_node_id.clone())
+        .details(json!({
+            "event_type": format!("{:?}", event.event_type),
+            "target_agent_id": event.target_agent_id,
+            "target_executor": event.target_executor,
+            "allowed_actions": event.allowed_actions,
+            "requires_commit": event.requires_commit,
+        })),
+    );
 
     let registry = crate::control::load_executor_registry_state(state_dir)?;
     let Some(entry) = registry
@@ -1094,6 +1148,22 @@ fn deliver_agent_event_to_local_executor(
                 created_at: observed_at_ms(),
             },
         )?;
+        diagnostics::record_diagnostic(
+            Some(state_dir),
+            diagnostics::DiagnosticEvent::new(
+                "error",
+                "agent_event",
+                "delivery.executor",
+                "failed",
+                "core-agent executor is not registered",
+            )
+            .event_id(event.event_id.clone())
+            .object("agent_event", event.correlation_id.clone())
+            .source_node_id(event.source_node_id.clone())
+            .details(json!({
+                "event_type": format!("{:?}", event.event_type),
+            })),
+        );
         return Ok(());
     };
 
@@ -1139,7 +1209,7 @@ fn deliver_agent_event_to_local_executor(
                     delivery_id: Uuid::new_v4().to_string(),
                     event_id: event.event_id.clone(),
                     attempt_no: 1,
-                    endpoint_url,
+                    endpoint_url: endpoint_url.clone(),
                     delivery_status: agent_event_status_label(status),
                     response_code: Some(response_code),
                     response_body: Some(body),
@@ -1148,6 +1218,32 @@ fn deliver_agent_event_to_local_executor(
                     created_at: delivery_started_at,
                 },
             )?;
+            diagnostics::record_diagnostic(
+                Some(state_dir),
+                diagnostics::DiagnosticEvent::new(
+                    if response_code >= 200 && response_code < 300 {
+                        "info"
+                    } else {
+                        "warn"
+                    },
+                    "agent_event",
+                    "delivery.callback",
+                    if response_code >= 200 && response_code < 300 {
+                        "delivered"
+                    } else {
+                        "failed"
+                    },
+                    format!("agent event callback returned {response_code}"),
+                )
+                .event_id(event.event_id.clone())
+                .object("agent_event", event.correlation_id.clone())
+                .source_node_id(event.source_node_id.clone())
+                .details(json!({
+                    "event_type": format!("{:?}", event.event_type),
+                    "endpoint_url": endpoint_url,
+                    "response_code": response_code,
+                })),
+            );
             if let Some(decision) = parsed.and_then(|ack| ack.decision) {
                 match route_agent_decision(state_dir, db_path, event, &decision, &entry) {
                     Ok(commit_result) => {
@@ -1174,6 +1270,25 @@ fn deliver_agent_event_to_local_executor(
                                 },
                             )?;
                         }
+                        diagnostics::record_diagnostic(
+                            Some(state_dir),
+                            diagnostics::DiagnosticEvent::new(
+                                "info",
+                                "agent_event",
+                                "decision.route",
+                                "completed",
+                                format!("agent decision routed: {:?}", decision.route),
+                            )
+                            .event_id(event.event_id.clone())
+                            .object("agent_event", event.correlation_id.clone())
+                            .source_node_id(event.source_node_id.clone())
+                            .details(json!({
+                                "event_type": format!("{:?}", event.event_type),
+                                "decision_id": decision.decision_id,
+                                "action": decision.action,
+                                "route": format!("{:?}", decision.route),
+                            })),
+                        );
                     }
                     Err(error) => {
                         crate::control::save_agent_event_record_state(
@@ -1200,6 +1315,25 @@ fn deliver_agent_event_to_local_executor(
                                 created_at: observed_at_ms(),
                             },
                         )?;
+                        diagnostics::record_diagnostic(
+                            Some(state_dir),
+                            diagnostics::DiagnosticEvent::new(
+                                "error",
+                                "agent_event",
+                                "decision.route",
+                                "failed",
+                                format!("agent decision routing failed: {error}"),
+                            )
+                            .event_id(event.event_id.clone())
+                            .object("agent_event", event.correlation_id.clone())
+                            .source_node_id(event.source_node_id.clone())
+                            .details(json!({
+                                "event_type": format!("{:?}", event.event_type),
+                                "decision_id": decision.decision_id,
+                                "action": decision.action,
+                                "route": format!("{:?}", decision.route),
+                            })),
+                        );
                     }
                 }
             }
@@ -1217,7 +1351,7 @@ fn deliver_agent_event_to_local_executor(
                     delivery_id: Uuid::new_v4().to_string(),
                     event_id: event.event_id.clone(),
                     attempt_no: 1,
-                    endpoint_url,
+                    endpoint_url: endpoint_url.clone(),
                     delivery_status: "failed".to_owned(),
                     response_code: None,
                     response_body: None,
@@ -1226,6 +1360,23 @@ fn deliver_agent_event_to_local_executor(
                     created_at: delivery_started_at,
                 },
             )?;
+            diagnostics::record_diagnostic(
+                Some(state_dir),
+                diagnostics::DiagnosticEvent::new(
+                    "error",
+                    "agent_event",
+                    "delivery.callback",
+                    "failed",
+                    format!("agent event callback failed: {error}"),
+                )
+                .event_id(event.event_id.clone())
+                .object("agent_event", event.correlation_id.clone())
+                .source_node_id(event.source_node_id.clone())
+                .details(json!({
+                    "event_type": format!("{:?}", event.event_type),
+                    "endpoint_url": endpoint_url,
+                })),
+            );
         }
     }
 
@@ -2192,7 +2343,7 @@ pub enum NetworkBridgeTick {
     },
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct ScopeTrafficStats {
     pub published_events: u64,
     pub ingested_events: u64,
@@ -2203,7 +2354,7 @@ pub struct ScopeTrafficStats {
     pub backfill_events_applied: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct NetworkBridgePeerHealth {
     pub peer: String,
     pub connected: bool,
@@ -2219,13 +2370,13 @@ pub struct NetworkBridgePeerHealth {
     pub next_retry_in_ms: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct NetworkBridgeScopeTraffic {
     pub scope: String,
     pub stats: ScopeTrafficStats,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct NetworkBridgeSummaryHealth {
     pub imported_decision_memory_rows: u64,
     pub imported_reputation_rows: u64,
@@ -2233,7 +2384,7 @@ pub struct NetworkBridgeSummaryHealth {
     pub checkpoint_rows: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct NetworkBridgeSubnetSyncHealth {
     pub network_id: String,
     pub network_kind: String,
@@ -2243,13 +2394,13 @@ pub struct NetworkBridgeSubnetSyncHealth {
     pub parent_checkpoint_rows: Option<u64>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct NetworkBridgeExecutionSetHealth {
     pub execution_set_count: u64,
     pub execution_set_member_count: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct NetworkBridgeObservabilitySnapshot {
     pub local_peer_id: String,
     pub listen_addrs: Vec<String>,

@@ -277,7 +277,7 @@ fn ui_supports_core_cli_operations() {
 }
 
 #[test]
-fn ui_root_page_serves_startup_view_and_console_route_keeps_legacy_console() {
+fn ui_root_page_serves_startup_view_and_diagnostics_route_redirects_legacy_console() {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -304,9 +304,32 @@ fn ui_root_page_serves_startup_view_and_console_route_keeps_legacy_console() {
         let root_body = to_bytes(root_res.into_body(), usize::MAX).await.unwrap();
         let root_html = String::from_utf8(root_body.to_vec()).unwrap();
         assert!(root_html.contains("WattSwarm Startup"));
-        assert!(root_html.contains("Open Developer Console"));
+        assert!(root_html.contains("Open Network Diagnostics"));
+        assert!(root_html.contains("href=\"/diagnostics\""));
+        assert!(!root_html.contains("href=\"/console\""));
+        assert!(!root_html.contains("Open Swarm Dashboard"));
 
-        let console_res = app
+        let diagnostics_res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/diagnostics")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(diagnostics_res.status(), StatusCode::OK);
+        let diagnostics_body = to_bytes(diagnostics_res.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let diagnostics_html = String::from_utf8(diagnostics_body.to_vec()).unwrap();
+        assert!(diagnostics_html.contains("WattSwarm Network Diagnostics"));
+        assert!(diagnostics_html.contains("/api/diagnostics"));
+        assert!(!diagnostics_html.contains("Quick Start"));
+
+        let legacy_res = app
             .oneshot(
                 Request::builder()
                     .method("GET")
@@ -316,11 +339,56 @@ fn ui_root_page_serves_startup_view_and_console_route_keeps_legacy_console() {
             )
             .await
             .unwrap();
-        assert_eq!(console_res.status(), StatusCode::OK);
-        let console_body = to_bytes(console_res.into_body(), usize::MAX).await.unwrap();
-        let console_html = String::from_utf8(console_body.to_vec()).unwrap();
-        assert!(console_html.contains("WattSwarm Kernel Console"));
-        assert!(console_html.contains("Quick Start"));
+        assert_eq!(legacy_res.status(), StatusCode::PERMANENT_REDIRECT);
+        assert_eq!(
+            legacy_res
+                .headers()
+                .get("location")
+                .and_then(|v| v.to_str().ok()),
+            Some("/diagnostics")
+        );
+    });
+}
+
+#[test]
+fn ui_diagnostics_api_lists_wattswarm_network_diagnostics() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let dir = tempdir().unwrap();
+        let state_dir = dir.path().join("state");
+        std::fs::create_dir_all(state_dir.join("diagnostics")).unwrap();
+        std::fs::write(
+            state_dir.join("diagnostics/wattswarm_node.jsonl"),
+            r#"{"id":"diag-1","timestamp_ms":123,"level":"info","component":"wattswarm.network_bridge","category":"gossip","phase":"publish.event","status":"ok","message":"published local event","event_id":"event-1","object_kind":"task","object_id":"task-1","source_node_id":"peer-a","scope_hint":"node:peer-b","details":{"topic":"events"}}"#,
+        )
+        .unwrap();
+        let db_path = state_dir.join("ui.state");
+        let app = build_app(UiServerState::new(state_dir, db_path));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/diagnostics?search=task-1&limit=10")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let payload = json_from(response).await;
+        assert_eq!(payload["diagnostics"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            payload["diagnostics"][0]["phase"].as_str(),
+            Some("publish.event")
+        );
+        assert_eq!(
+            payload["network_service_started"].as_bool(),
+            Some(false)
+        );
     });
 }
 

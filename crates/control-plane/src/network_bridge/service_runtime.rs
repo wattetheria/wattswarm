@@ -134,6 +134,21 @@ impl NetworkBridgeService {
                         Some(remote_addr_text.as_str()),
                         "connected",
                     );
+                    diagnostics::record_diagnostic(
+                        Some(state_dir),
+                        diagnostics::DiagnosticEvent::new(
+                            "info",
+                            "transport",
+                            "connection.established",
+                            "ok",
+                            format!("libp2p connection established: {peer}"),
+                        )
+                        .object("peer", Some(peer.to_string()))
+                        .source_node_id(Some(peer.to_string()))
+                        .details(json!({
+                            "remote_addr": remote_addr_text,
+                        })),
+                    );
                 }
                 let _ = self.request_backfill_for_peer(&peer, node)?;
                 if !node.store.is_node_penalized(&node.node_id())? {
@@ -205,6 +220,21 @@ impl NetworkBridgeService {
                         last_identified_at: now,
                     };
                     let _ = crate::control::save_peer_metadata_record_state(state_dir, &record);
+                    diagnostics::record_diagnostic(
+                        Some(state_dir),
+                        diagnostics::DiagnosticEvent::new(
+                            "warn",
+                            "transport",
+                            "handshake.rejected",
+                            "rejected",
+                            format!("peer handshake rejected: {peer}"),
+                        )
+                        .object("peer", Some(peer.to_string()))
+                        .source_node_id(Some(peer.to_string()))
+                        .details(json!({
+                            "detail": detail,
+                        })),
+                    );
                 }
                 Ok(NetworkBridgeTick::TransportNotice {
                     detail: format!("peer_handshake_rejected peer={peer} {detail}"),
@@ -214,6 +244,27 @@ impl NetworkBridgeService {
                 peer,
                 remaining_established,
             } => {
+                if let Some(state_dir) = &self.state_dir {
+                    diagnostics::record_diagnostic(
+                        Some(state_dir),
+                        diagnostics::DiagnosticEvent::new(
+                            "info",
+                            "transport",
+                            "connection.closed",
+                            if remaining_established == 0 {
+                                "closed"
+                            } else {
+                                "remaining"
+                            },
+                            format!("libp2p connection closed: {peer}"),
+                        )
+                        .object("peer", Some(peer.to_string()))
+                        .source_node_id(Some(peer.to_string()))
+                        .details(json!({
+                            "remaining_established": remaining_established,
+                        })),
+                    );
+                }
                 if remaining_established == 0 {
                     self.mark_peer_disconnected(peer);
                     Ok(NetworkBridgeTick::Disconnected { peer })
@@ -232,6 +283,28 @@ impl NetworkBridgeService {
                 GossipMessage::Event(envelope) => {
                     self.record_peer_scope_activity(propagation_source, &envelope.scope);
                     let ingested_event = ingest_event_envelope(node, &envelope)?;
+                    diagnostics::record_diagnostic(
+                        self.state_dir.as_deref(),
+                        diagnostics::DiagnosticEvent::new(
+                            "info",
+                            "gossip",
+                            "event.ingest.live",
+                            "ok",
+                            format!(
+                                "live gossip event ingested: {:?}",
+                                ingested_event.event_kind
+                            ),
+                        )
+                        .event_id(ingested_event.event_id.clone())
+                        .object("task", ingested_event.task_id.clone())
+                        .source_node_id(Some(propagation_source.to_string()))
+                        .scope(&envelope.scope)
+                        .details(json!({
+                            "event_kind": format!("{:?}", ingested_event.event_kind),
+                            "author_node_id": ingested_event.author_node_id,
+                            "created_at": ingested_event.created_at,
+                        })),
+                    );
                     if let Err(err) = self.maybe_sync_candidate_output(node, &ingested_event) {
                         eprintln!(
                             "candidate output sync failed for {}: {err}",
@@ -278,6 +351,25 @@ impl NetworkBridgeService {
                 GossipMessage::Chat(envelope) => {
                     self.record_peer_scope_activity(propagation_source, &envelope.scope);
                     let ingested_event = ingest_event_envelope(node, &envelope)?;
+                    diagnostics::record_diagnostic(
+                        self.state_dir.as_deref(),
+                        diagnostics::DiagnosticEvent::new(
+                            "info",
+                            "gossip",
+                            "chat.ingest.live",
+                            "ok",
+                            format!("live chat event ingested: {:?}", ingested_event.event_kind),
+                        )
+                        .event_id(ingested_event.event_id.clone())
+                        .object("event", Some(ingested_event.event_id.clone()))
+                        .source_node_id(Some(propagation_source.to_string()))
+                        .scope(&envelope.scope)
+                        .details(json!({
+                            "event_kind": format!("{:?}", ingested_event.event_kind),
+                            "author_node_id": ingested_event.author_node_id,
+                            "created_at": ingested_event.created_at,
+                        })),
+                    );
                     if let Err(err) = self.maybe_sync_candidate_output(node, &ingested_event) {
                         eprintln!(
                             "candidate output sync failed for {}: {err}",
@@ -408,7 +500,45 @@ impl NetworkBridgeService {
                 self.record_peer_scope_activity(peer, &response.scope);
                 self.mark_backfill_completed(peer);
                 let events = ingest_backfill_response(node, &response)?;
+                diagnostics::record_diagnostic(
+                    self.state_dir.as_deref(),
+                    diagnostics::DiagnosticEvent::new(
+                        "info",
+                        "backfill",
+                        "response.ingest",
+                        "ok",
+                        format!("backfill response ingested {events} events"),
+                    )
+                    .source_node_id(Some(peer.to_string()))
+                    .scope(&response.scope)
+                    .details(json!({
+                        "request_id": request_id.to_string(),
+                        "events_applied": events,
+                        "events_received": response.events.len(),
+                        "feed_key": response.feed_key,
+                        "next_from_event_seq": response.next_from_event_seq,
+                    })),
+                );
                 for envelope in &response.events {
+                    diagnostics::record_diagnostic(
+                        self.state_dir.as_deref(),
+                        diagnostics::DiagnosticEvent::new(
+                            "info",
+                            "backfill",
+                            "event.ingest.backfill",
+                            "ok",
+                            format!("backfill event observed: {:?}", envelope.event.event_kind),
+                        )
+                        .event_id(envelope.event.event_id.clone())
+                        .object("task", envelope.event.task_id.clone())
+                        .source_node_id(Some(peer.to_string()))
+                        .scope(&response.scope)
+                        .details(json!({
+                            "event_kind": format!("{:?}", envelope.event.event_kind),
+                            "author_node_id": envelope.event.author_node_id,
+                            "created_at": envelope.event.created_at,
+                        })),
+                    );
                     if let Err(err) = self.maybe_sync_candidate_output(node, &envelope.event) {
                         eprintln!(
                             "candidate output sync failed for {}: {err}",

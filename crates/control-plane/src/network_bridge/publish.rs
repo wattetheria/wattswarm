@@ -102,6 +102,26 @@ pub fn publish_pending_scoped_updates(
         };
         match publish_result {
             Ok(()) => {
+                diagnostics::record_diagnostic(
+                    service.state_dir.as_deref(),
+                    diagnostics::DiagnosticEvent::new(
+                        "info",
+                        "gossip",
+                        "publish.event",
+                        "ok",
+                        format!("published local event: {:?}", event.event_kind),
+                    )
+                    .event_id(event.event_id.clone())
+                    .object("task", event.task_id.clone())
+                    .source_node_id(Some(event.author_node_id.clone()))
+                    .scope(&scope)
+                    .details(json!({
+                        "seq": seq,
+                        "event_kind": format!("{:?}", event.event_kind),
+                        "author_node_id": event.author_node_id.clone(),
+                        "payload_kind": format!("{:?}", event.payload.kind()),
+                    })),
+                );
                 service.record_scope_event_published(&scope);
                 last_published_seq = seq;
             }
@@ -109,12 +129,94 @@ pub fn publish_pending_scoped_updates(
                 if err.to_string().contains("NoPeersSubscribedToTopic")
                     && is_local_subscription_control_event =>
             {
+                diagnostics::record_diagnostic(
+                    service.state_dir.as_deref(),
+                    diagnostics::DiagnosticEvent::new(
+                        "warn",
+                        "gossip",
+                        "publish.event",
+                        "skipped",
+                        "local subscription control event had no subscribed peers",
+                    )
+                    .event_id(event.event_id.clone())
+                    .object("task", event.task_id.clone())
+                    .source_node_id(Some(event.author_node_id.clone()))
+                    .scope(&scope)
+                    .details(json!({
+                        "seq": seq,
+                        "event_kind": format!("{:?}", event.event_kind),
+                        "error": err.to_string(),
+                    })),
+                );
                 last_published_seq = seq;
                 continue;
             }
-            Err(err) if err.to_string().contains("NoPeersSubscribedToTopic") => break,
-            Err(err) if err.to_string().contains("GlobalTopicRateLimited") => break,
-            Err(err) if err.to_string().contains("LocalTopicRateLimited") => break,
+            Err(err) if err.to_string().contains("NoPeersSubscribedToTopic") => {
+                diagnostics::record_diagnostic(
+                    service.state_dir.as_deref(),
+                    diagnostics::DiagnosticEvent::new(
+                        "warn",
+                        "gossip",
+                        "publish.event",
+                        "blocked",
+                        "publish stopped because no peers are subscribed to topic",
+                    )
+                    .event_id(event.event_id.clone())
+                    .object("task", event.task_id.clone())
+                    .source_node_id(Some(event.author_node_id.clone()))
+                    .scope(&scope)
+                    .details(json!({
+                        "seq": seq,
+                        "event_kind": format!("{:?}", event.event_kind),
+                        "error": err.to_string(),
+                    })),
+                );
+                break;
+            }
+            Err(err) if err.to_string().contains("GlobalTopicRateLimited") => {
+                diagnostics::record_diagnostic(
+                    service.state_dir.as_deref(),
+                    diagnostics::DiagnosticEvent::new(
+                        "warn",
+                        "gossip",
+                        "publish.event",
+                        "rate_limited",
+                        "publish stopped by global topic rate limit",
+                    )
+                    .event_id(event.event_id.clone())
+                    .object("task", event.task_id.clone())
+                    .source_node_id(Some(event.author_node_id.clone()))
+                    .scope(&scope)
+                    .details(json!({
+                        "seq": seq,
+                        "event_kind": format!("{:?}", event.event_kind),
+                        "error": err.to_string(),
+                    })),
+                );
+                break;
+            }
+            Err(err) if err.to_string().contains("LocalTopicRateLimited") => {
+                diagnostics::record_diagnostic(
+                    service.state_dir.as_deref(),
+                    diagnostics::DiagnosticEvent::new(
+                        "warn",
+                        "gossip",
+                        "publish.event",
+                        "rate_limited",
+                        "publish stopped by local topic rate limit",
+                    )
+                    .event_id(event.event_id.clone())
+                    .object("task", event.task_id.clone())
+                    .source_node_id(Some(event.author_node_id.clone()))
+                    .scope(&scope)
+                    .details(json!({
+                        "seq": seq,
+                        "event_kind": format!("{:?}", event.event_kind),
+                        "error": err.to_string(),
+                    })),
+                );
+                break;
+            }
             Err(err) => return Err(err),
         }
         let _ = super::mirror_summary_controls_to_parent_network(node, &event);

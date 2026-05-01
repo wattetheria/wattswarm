@@ -148,6 +148,32 @@ fn task_claim_agent_event_uses_generic_task_schema() {
 }
 
 #[test]
+fn deliver_agent_event_writes_local_diagnostics() {
+    let state_dir = temp_startup_dir("agent-event-diagnostics");
+    let event = build_agent_event(
+        wattswarm_protocol::types::AgentEventType::TaskClaimReceived,
+        wattswarm_protocol::types::AgentEventSourceKind::TaskLifecycle,
+        Some("peer-a".to_owned()),
+        None,
+        json!({"task_id": "task-1"}),
+        false,
+        vec!["inspect_task".to_owned()],
+        Some("task-1".to_owned()),
+        Some("task_claim:task-1:exec-1".to_owned()),
+    );
+
+    deliver_agent_event_to_local_executor(&state_dir, None, &event)
+        .expect("deliver without executor");
+
+    let raw = fs::read_to_string(state_dir.join("diagnostics/wattswarm_node.jsonl"))
+        .expect("diagnostic log");
+    assert!(raw.contains("\"phase\":\"delivery.queued\""));
+    assert!(raw.contains("\"phase\":\"delivery.executor\""));
+    assert!(raw.contains("\"event_id\""));
+    assert!(raw.contains("\"object_id\":\"task-1\""));
+}
+
+#[test]
 fn task_result_agent_event_supports_retry_updates() {
     let event = crate::types::Event {
         event_id: "evt-retry".to_owned(),

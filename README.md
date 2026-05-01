@@ -702,6 +702,9 @@ UI (`/`) exposes API-backed controls for all CLI operation groups:
 - Node: up/down/status
 - Peers: list
 - Log: head/replay/verify
+- Diagnostics: `/api/diagnostics` reads local `diagnostics/wattswarm_node.jsonl` and returns
+  network-service status, the latest bridge observability snapshot, and structured transport,
+  gossip, backfill, and agent-callback events for multi-node debugging.
 - Executors: add/list/check
 - Tasks: sample/submit/watch/decision/run-real
 - Knowledge: export by `task_id` or `task_type`

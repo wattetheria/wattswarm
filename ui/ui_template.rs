@@ -3,17 +3,20 @@ pub const INDEX_HTML: &str = r#"<!DOCTYPE html>
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>WattSwarm Kernel Console</title>
+  <title>WattSwarm Network Diagnostics</title>
   <style>
     :root {
       --bg: #f0e8d8;
       --ink: #1e1a16;
       --card: #fff6e8;
+      --card-2: #efe2cf;
       --accent: #d46a1f;
-      --accent-2: #1f7fd4;
+      --blue: #1f7fd4;
       --line: #2b2520;
+      --muted: #5f5549;
       --ok: #2b8a3e;
       --warn: #a35b00;
+      --bad: #9f1f1f;
     }
     * { box-sizing: border-box; }
     body {
@@ -31,606 +34,438 @@ pub const INDEX_HTML: &str = r#"<!DOCTYPE html>
       margin: 0 auto;
       padding: 20px;
     }
-    .layout {
-      display: grid;
-      grid-template-columns: minmax(0, 1fr) 420px;
-      gap: 14px;
-      align-items: start;
-    }
-    .head {
+    .head, .panel {
       border: 3px solid var(--line);
       background: var(--card);
       box-shadow: 8px 8px 0 var(--line);
       padding: 16px;
+    }
+    .head {
+      display: flex;
+      justify-content: space-between;
+      gap: 16px;
+      align-items: end;
       margin-bottom: 18px;
     }
     h1 {
       margin: 0;
-      font-size: 22px;
+      font-size: 24px;
       letter-spacing: 1px;
       text-transform: uppercase;
     }
-    .grid {
-      display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(310px, 1fr));
-      gap: 14px;
-    }
-    .card {
-      border: 3px solid var(--line);
-      background: var(--card);
-      box-shadow: 6px 6px 0 var(--line);
-      padding: 12px;
-    }
     h2 {
-      margin: 0 0 8px;
+      margin: 0 0 10px;
       font-size: 14px;
       text-transform: uppercase;
+      letter-spacing: .6px;
       color: var(--accent);
     }
-    .row {
-      display: flex;
-      gap: 8px;
-      margin: 8px 0;
-      flex-wrap: wrap;
+    .hint {
+      color: var(--muted);
+      font-size: 13px;
+      margin-top: 6px;
+      line-height: 1.35;
     }
-    input, textarea {
-      width: 100%;
+    .timestamp {
+      color: var(--muted);
+      font-size: 13px;
+      white-space: nowrap;
+    }
+    .grid {
+      display: grid;
+      gap: 14px;
+      grid-template-columns: repeat(5, minmax(150px, 1fr));
+      margin-bottom: 16px;
+    }
+    .metric {
       border: 2px solid var(--line);
+      background: var(--card-2);
+      padding: 12px;
+      min-width: 0;
+    }
+    .label {
+      color: var(--muted);
+      font-size: 12px;
+      text-transform: uppercase;
+      letter-spacing: .6px;
+      font-weight: 800;
+    }
+    .value {
+      margin-top: 6px;
+      font-size: 18px;
+      font-weight: 900;
+      overflow-wrap: anywhere;
+    }
+    .filters {
+      display: grid;
+      gap: 10px;
+      grid-template-columns: minmax(220px, 1.5fr) repeat(5, minmax(130px, .7fr)) minmax(86px, .35fr) repeat(2, minmax(108px, .35fr));
+      align-items: end;
+      margin-bottom: 14px;
+    }
+    label {
+      display: grid;
+      gap: 5px;
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 800;
+      text-transform: uppercase;
+      letter-spacing: .5px;
+    }
+    input, select, button {
+      font: inherit;
+      min-height: 38px;
+      border-radius: 0;
+      border: 2px solid var(--line);
+    }
+    input, select {
+      width: 100%;
+      padding: 8px;
       background: #fff;
       color: var(--ink);
-      font: inherit;
-      padding: 8px;
-      border-radius: 0;
-    }
-    textarea {
-      min-height: 160px;
-    }
-    select {
-      width: 100%;
-      border: 2px solid var(--line);
-      background: #fff;
-      color: var(--ink);
-      font: inherit;
-      padding: 8px;
-      border-radius: 0;
     }
     button {
-      border: 2px solid var(--line);
+      padding: 8px 10px;
       background: var(--accent);
       color: #fff;
-      font: inherit;
-      padding: 8px 10px;
       cursor: pointer;
       text-transform: uppercase;
       letter-spacing: .4px;
+      font-weight: 800;
     }
-    button.alt { background: var(--accent-2); }
-    button.ghost { background: #efe2cf; color: var(--ink); }
-    pre {
-      margin: 0;
-      white-space: pre-wrap;
-      word-break: break-word;
-      font-size: 12px;
-      max-height: 360px;
-      overflow: auto;
-    }
-    .hint { color: #5f5549; font-size: 12px; margin-top: 6px; }
-    .help-list {
-      margin: 0;
-      padding-left: 18px;
-      line-height: 1.6;
-      font-size: 12px;
-      color: #4d443a;
-    }
-    .help-list b { color: #2b2520; }
-    details {
-      border: 2px solid var(--line);
-      background: #f7eee0;
-      padding: 8px;
-      margin-top: 8px;
-    }
-    summary {
-      cursor: pointer;
-      font-size: 12px;
-      text-transform: uppercase;
-      letter-spacing: .4px;
-      color: #3b342c;
-    }
-    .code-sample {
-      margin-top: 8px;
-      font-size: 11px;
-      max-height: 180px;
-      overflow: auto;
-      background: #fff;
-      border: 1px solid #8c7f71;
-      padding: 8px;
-      white-space: pre-wrap;
-      word-break: break-word;
-    }
-    .status-pill {
-      position: fixed;
-      top: 10px;
-      right: 10px;
-      z-index: 9999;
-      border: 3px solid var(--line);
-      box-shadow: 4px 4px 0 var(--line);
-      background: #efe2cf;
+    button.secondary {
+      background: var(--card-2);
       color: var(--ink);
-      padding: 6px 10px;
-      font-size: 12px;
-      text-transform: uppercase;
     }
-    .status-pill.ok { background: #cfe8d4; color: var(--ok); }
-    .status-pill.warn { background: #efe1cc; color: var(--warn); }
-    .status-pill.err { background: #f5d5d5; color: #9f1f1f; }
-    .status-pill.run { background: #d4e4f7; color: #1f4e8b; }
-    .monitor {
-      position: sticky;
-      top: 50px;
-      max-height: calc(100vh - 70px);
+    .tabs {
       display: flex;
-      flex-direction: column;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-bottom: 14px;
+    }
+    .tab {
+      min-height: 34px;
+      background: var(--card-2);
+      color: var(--ink);
+    }
+    .tab.active {
+      background: var(--blue);
+      color: #fff;
+    }
+    .list {
+      display: grid;
       gap: 10px;
     }
-    .monitor-status {
+    .row {
       border: 2px solid var(--line);
-      background: #f7eee0;
-      padding: 8px;
+      background: #fffdf8;
+      padding: 10px;
       display: grid;
       gap: 6px;
     }
-    .status-row {
+    .row-head {
       display: flex;
       justify-content: space-between;
       gap: 10px;
-      font-size: 12px;
+      align-items: start;
+    }
+    .row-title {
+      font-weight: 900;
+      overflow-wrap: anywhere;
+    }
+    .pills {
+      display: flex;
+      gap: 6px;
+      flex-wrap: wrap;
+      justify-content: end;
+    }
+    .pill {
+      border: 1px solid var(--line);
+      background: var(--card-2);
+      padding: 2px 6px;
+      color: var(--muted);
+      font-size: 11px;
       text-transform: uppercase;
-    }
-    .status-row span {
-      color: #655c52;
-    }
-    .status-row code {
-      font: inherit;
-      background: #fff;
-      border: 1px solid #8c7f71;
-      padding: 0 4px;
-      max-width: 230px;
-      overflow: hidden;
-      text-overflow: ellipsis;
       white-space: nowrap;
     }
-    .monitor-block {
-      border: 2px solid var(--line);
-      background: #fff;
+    .pill.ok { color: var(--ok); }
+    .pill.warn { color: var(--warn); }
+    .pill.error, .pill.failed { color: var(--bad); }
+    .meta {
       display: flex;
-      flex-direction: column;
-      min-height: 0;
+      flex-wrap: wrap;
+      gap: 6px 12px;
+      color: var(--muted);
+      font-size: 12px;
     }
-    .monitor-label {
-      padding: 6px 8px;
-      background: #efe2cf;
-      border-bottom: 2px solid var(--line);
+    details {
+      border-top: 1px solid rgba(43, 37, 32, .25);
+      padding-top: 6px;
+    }
+    summary {
+      cursor: pointer;
+      color: var(--muted);
       font-size: 12px;
       text-transform: uppercase;
-      letter-spacing: .4px;
-      color: #3f3830;
     }
-    .monitor-pre {
-      flex: 1;
-      padding: 8px;
+    pre {
+      margin: 8px 0 0;
+      white-space: pre-wrap;
+      word-break: break-word;
       font-size: 12px;
-      min-height: 180px;
-      max-height: 320px;
+      max-height: 280px;
       overflow: auto;
+    }
+    .empty {
+      border: 2px dashed var(--line);
+      padding: 14px;
+      color: var(--muted);
       background: #fffdf8;
     }
-    .monitor-pre.compact {
-      min-height: 220px;
-      max-height: 420px;
-      background: #fff;
-    }
-    @media (max-width: 1200px) {
-      .layout {
-        grid-template-columns: minmax(0, 1fr);
-      }
-      .monitor {
-        position: static;
-        max-height: none;
-      }
-      .monitor-pre, .monitor-pre.compact {
-        max-height: 280px;
-      }
+    @media (max-width: 1100px) {
+      .head { align-items: start; flex-direction: column; }
+      .grid, .filters { grid-template-columns: 1fr; }
+      .row-head { flex-direction: column; }
+      .pills { justify-content: start; }
     }
   </style>
 </head>
 <body>
-  <div id="statusPill" class="status-pill">idle</div>
   <div class="wrap">
-    <div class="head">
-      <h1>WattSwarm Kernel Console</h1>
-      <div class="hint">2D block control panel for kernel configuration, operations, and monitoring.</div>
-    </div>
-
-    <div class="layout">
-      <div class="grid">
-        <div class="card">
-          <h2>Node</h2>
-          <div class="row">
-            <button onclick="api('POST','/api/node/up')">up</button>
-            <button onclick="api('POST','/api/node/down')" class="ghost">down</button>
-            <button onclick="api('GET','/api/node/status')" class="alt">status</button>
-          </div>
-        </div>
-
-        <div class="card">
-          <h2>Peers + Log</h2>
-          <div class="row">
-            <button onclick="api('GET','/api/peers/list')">peers list</button>
-            <button onclick="api('GET','/api/log/head')" class="alt">log head</button>
-          </div>
-          <div class="row">
-            <button onclick="api('POST','/api/log/replay')">log replay</button>
-            <button onclick="api('POST','/api/log/verify')" class="ghost">log verify</button>
-          </div>
-        </div>
-
-        <div class="card">
-          <h2>Executors</h2>
-          <input id="execName" placeholder="name (e.g. rt)" />
-          <div class="row">
-            <input id="execUrl" placeholder="base_url (e.g. http://127.0.0.1:8787)" />
-          </div>
-          <div class="row">
-            <button onclick="addExecutor()">add</button>
-            <button onclick="api('GET','/api/executors/list')" class="alt">list</button>
-            <button onclick="checkExecutor()" class="ghost">check</button>
-          </div>
-        </div>
-
-        <div class="card">
-          <h2>Egress Agent</h2>
-          <div class="row">
-            <label><input id="egressEnabled" type="checkbox" /> enabled</label>
-            <label><input id="egressPublish" type="checkbox" /> publish</label>
-            <label><input id="egressInbound" type="checkbox" /> inbound</label>
-          </div>
-          <div class="row">
-            <input id="egressAgentId" placeholder="agent_id" value="egress-agent" />
-            <input id="egressDisplayName" placeholder="display name" value="WattSwarm Egress Agent" />
-          </div>
-          <div class="row">
-            <select id="egressMode">
-              <option value="group_representative">group_representative</option>
-              <option value="direct_gateway">direct_gateway</option>
-            </select>
-            <select id="egressProtocol">
-              <option value="google_a2a">google_a2a</option>
-            </select>
-          </div>
-          <div class="row">
-            <input id="egressExecutor" placeholder="target executor (optional)" />
-            <input id="egressProfile" placeholder="profile" value="default"/>
-          </div>
-          <div class="row">
-            <input id="egressPublicBaseUrl" placeholder="public base url (e.g. https://node.example.com)" />
-          </div>
-          <textarea id="egressDescription" placeholder="description">Node-facing gateway agent for external invocation and outbound result publishing.</textarea>
-          <textarea id="egressSkillsJson" placeholder='skills JSON'>[]</textarea>
-          <div class="row">
-            <button onclick="loadEgressAgent()">load</button>
-            <button onclick="saveEgressAgent()" class="alt">save</button>
-            <button onclick="previewGoogleAgentCard()" class="ghost">agent card</button>
-          </div>
-        </div>
-
-        <div class="card">
-          <h2>Task</h2>
-          <div class="row">
-            <input id="sampleTaskId" placeholder="sample task_id" value="task-ui-1"/>
-            <button onclick="loadSample()" class="alt">sample</button>
-          </div>
-          <div class="row">
-            <select id="taskPreset">
-              <option value="swarm">preset: swarm</option>
-              <option value="arbitrage">preset: arbitrage</option>
-              <option value="security">preset: security</option>
-            </select>
-            <button onclick="applyPreset()" class="ghost">apply preset</button>
-          </div>
-          <textarea id="taskJson" placeholder="TaskContract JSON"></textarea>
-          <div class="hint">Required: protocol_version, task_id, task_type, inputs, output_schema, budget, assignment, acceptance, expiry_ms, evidence_policy.</div>
-          <div class="row">
-            <button onclick="submitTask()">submit</button>
-            <input id="taskIdWatch" placeholder="task_id for watch/decision/run-real" value="task-ui-1"/>
-          </div>
-          <div class="row">
-            <button onclick="watchTask()" class="alt">watch</button>
-            <button onclick="decisionTask()" class="ghost">decision</button>
-          </div>
-          <div class="row">
-            <input id="runExecutor" placeholder="executor name" value="core-agent"/>
-            <input id="runProfile" placeholder="profile" value="default"/>
-            <button onclick="runReal()">run-real</button>
-          </div>
-        </div>
-
-        <div class="card">
-          <h2>Knowledge</h2>
-          <div class="row">
-            <input id="knowledgeTaskId" placeholder="task_id"/>
-            <button onclick="knowledgeByTaskId()">export by task_id</button>
-          </div>
-          <div class="row">
-            <input id="knowledgeTaskType" placeholder="task_type"/>
-            <button onclick="knowledgeByTaskType()" class="alt">export by task_type</button>
-          </div>
-        </div>
-
-        <div class="card">
-          <h2>Quick Start</h2>
-          <ol class="help-list">
-            <li><b>Node</b>: click <code>UP</code>.</li>
-            <li><b>Executor</b>: fill <code>name/base_url</code>, click <code>ADD</code>, then <code>CHECK</code>.</li>
-            <li><b>Task</b>: click <code>SAMPLE</code> (or set preset), then <code>SUBMIT</code>.</li>
-            <li><b>Run</b>: click <code>RUN-REAL</code>, then use <code>WATCH</code>/<code>DECISION</code>.</li>
-            <li><b>Knowledge</b>: export by <code>task_id</code> or <code>task_type</code> for replay/audit.</li>
-          </ol>
-          <details>
-            <summary>TaskContract Minimal Reference</summary>
-            <pre class="code-sample">{
-  "protocol_version": "v0.1",
-  "task_id": "task-ui-1",
-  "task_type": "swarm",
-  "inputs": { "prompt": "hello" },
-  "output_schema": { "type": "object", "required": ["answer"] },
-  "budget": { "time_ms": 30000, "max_steps": 10, "cost_units": 1000 },
-  "assignment": { "mode": "CLAIM" },
-  "acceptance": { "quorum_threshold": 1, "vote": { "commit_reveal": true } },
-  "expiry_ms": 1730000000000,
-  "evidence_policy": { "max_inline_evidence_bytes": 65536, "max_inline_media_bytes": 0 }
-}</pre>
-          </details>
-        </div>
+    <header class="head">
+      <div>
+        <h1>WattSwarm Network Diagnostics</h1>
+        <div class="hint">Libp2p transport, gossip publish and ingest, subscribed scopes, backfill, callback delivery, and node network state.</div>
       </div>
+      <div id="generatedAt" class="timestamp">Not refreshed</div>
+    </header>
 
-      <div class="card monitor">
-        <h2>Live Monitor</h2>
-        <div class="monitor-status">
-          <div class="status-row"><span>state</span><code id="monitorState">idle</code></div>
-          <div class="status-row"><span>last op</span><code id="lastOp">none</code></div>
-          <div class="status-row"><span>http</span><code id="lastHttp">-</code></div>
-        </div>
-        <div class="monitor-block">
-          <div class="monitor-label">Latest Response</div>
-          <pre id="responseOut" class="monitor-pre">Ready.</pre>
-        </div>
-        <div class="monitor-block">
-          <div class="monitor-label">Event Stream</div>
-          <pre id="eventOut" class="monitor-pre compact"></pre>
-        </div>
+    <section class="grid" aria-label="Network diagnostic summary">
+      <div class="metric">
+        <div class="label">Service</div>
+        <div id="serviceState" class="value">unknown</div>
       </div>
-    </div>
+      <div class="metric">
+        <div class="label">Local Peer</div>
+        <div id="localPeer" class="value">-</div>
+      </div>
+      <div class="metric">
+        <div class="label">Connected Peers</div>
+        <div id="connectedPeers" class="value">0</div>
+      </div>
+      <div class="metric">
+        <div class="label">Subscribed Scopes</div>
+        <div id="scopeCount" class="value">0</div>
+      </div>
+      <div class="metric">
+        <div class="label">Diagnostics</div>
+        <div id="diagnosticCount" class="value">0</div>
+      </div>
+    </section>
+
+    <section class="panel">
+      <h2>Network Log Stream</h2>
+      <div class="filters">
+        <label>
+          Search
+          <input id="search" placeholder="task id, event id, peer id, scope">
+        </label>
+        <label>
+          Level
+          <select id="level">
+            <option value="">All</option>
+            <option value="debug">Debug</option>
+            <option value="info">Info</option>
+            <option value="warn">Warning</option>
+            <option value="error">Error</option>
+          </select>
+        </label>
+        <label>
+          Component
+          <input id="component" placeholder="all">
+        </label>
+        <label>
+          Category
+          <input id="category" placeholder="transport/gossip">
+        </label>
+        <label>
+          Object ID
+          <input id="objectId" placeholder="task/topic/event">
+        </label>
+        <label>
+          Source Node
+          <input id="sourceNodeId" placeholder="peer id">
+        </label>
+        <label>
+          Lines
+          <input id="limit" type="number" min="10" max="1000" value="200">
+        </label>
+        <button type="button" onclick="refreshDiagnostics()">Refresh</button>
+        <button type="button" class="secondary" onclick="exportDiagnostics()">Export</button>
+      </div>
+      <div class="tabs" aria-label="Diagnostic filters">
+        <button class="tab active" type="button" data-mode="all">All</button>
+        <button class="tab" type="button" data-mode="transport">Transport</button>
+        <button class="tab" type="button" data-mode="gossip">Gossip</button>
+        <button class="tab" type="button" data-mode="backfill">Backfill</button>
+        <button class="tab" type="button" data-mode="callback">Callback</button>
+        <button class="tab" type="button" data-mode="errors">Errors</button>
+      </div>
+      <div id="diagnosticsList" class="list"></div>
+    </section>
   </div>
+
   <script>
-    const responseOut = document.getElementById("responseOut");
-    const eventOut = document.getElementById("eventOut");
-    const statusPill = document.getElementById("statusPill");
-    const monitorState = document.getElementById("monitorState");
-    const lastOp = document.getElementById("lastOp");
-    const lastHttp = document.getElementById("lastHttp");
-    let eventLines = [];
+    let lastPayload = null;
+    let lastRows = [];
+    let activeMode = "all";
 
-    function setStatus(kind, text) {
-      statusPill.className = `status-pill ${kind || ""}`.trim();
-      statusPill.textContent = text;
-      monitorState.textContent = text;
+    function qs(id) {
+      return document.getElementById(id);
     }
-    function pushEvent(line) {
-      const now = new Date().toLocaleTimeString();
-      eventLines.unshift(`[${now}] ${line}`);
-      eventLines = eventLines.slice(0, 80);
-      eventOut.textContent = eventLines.join("\n");
-    }
-    function showResponse(value) {
-      if (typeof value === "string") {
-        responseOut.textContent = value;
-      } else {
-        responseOut.textContent = JSON.stringify(value, null, 2);
-      }
-    }
-    setStatus("", "js-ready");
-    pushEvent("ready");
-    loadEgressAgent();
 
-    async function api(method, url, body) {
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), 12000);
-      setStatus("run", `${method} ${url}`);
-      lastOp.textContent = `${method} ${url}`;
-      lastHttp.textContent = "...";
-      pushEvent(`request -> ${method} ${url}`);
-      try {
-        const res = await fetch(url, {
-          method,
-          headers: { "Content-Type": "application/json" },
-          body: body ? JSON.stringify(body) : undefined,
-          signal: controller.signal
-        });
-        const txt = await res.text();
-        try {
-          showResponse(JSON.parse(txt));
-        } catch (_) {
-          showResponse(txt);
-        }
-        lastHttp.textContent = String(res.status);
-        setStatus("ok", `${res.status} ${method}`);
-        pushEvent(`response <- ${res.status} ${method} ${url}`);
-      } catch (err) {
-        showResponse({
-          ok: false,
-          error: String(err)
-        });
-        lastHttp.textContent = "ERR";
-        setStatus("err", "request-failed");
-        pushEvent(`error -> ${String(err)}`);
-      } finally {
-        clearTimeout(timer);
+    function safeArray(value) {
+      return Array.isArray(value) ? value : [];
+    }
+
+    function escapeHtml(value) {
+      return String(value == null ? "" : value)
+        .replaceAll("&", "&amp;")
+        .replaceAll("<", "&lt;")
+        .replaceAll(">", "&gt;")
+        .replaceAll('"', "&quot;")
+        .replaceAll("'", "&#39;");
+    }
+
+    function compact(value, size = 20) {
+      const text = String(value == null || value === "" ? "-" : value);
+      if (text.length <= size + 8) return text;
+      return `${text.slice(0, size)}...${text.slice(-6)}`;
+    }
+
+    function formatTime(value) {
+      if (value == null || value === "") return "-";
+      if (typeof value === "number") {
+        const milliseconds = value > 100000000000 ? value : value * 1000;
+        return new Date(milliseconds).toLocaleString();
       }
+      const parsed = Date.parse(value);
+      return Number.isNaN(parsed) ? String(value) : new Date(parsed).toLocaleString();
     }
-    async function loadEgressAgent() {
-      try {
-        const res = await fetch("/api/egress-agent");
-        const data = await res.json();
-        if (!res.ok || !data.ok) throw new Error(data.error || `HTTP ${res.status}`);
-        const cfg = data.config || {};
-        document.getElementById("egressEnabled").checked = !!cfg.enabled;
-        document.getElementById("egressPublish").checked = !!cfg.publish_to_network;
-        document.getElementById("egressInbound").checked = !!cfg.accept_inbound_invocations;
-        document.getElementById("egressAgentId").value = cfg.agent_id || "egress-agent";
-        document.getElementById("egressDisplayName").value = cfg.display_name || "WattSwarm Egress Agent";
-        document.getElementById("egressMode").value = cfg.mode || "group_representative";
-        document.getElementById("egressProtocol").value = cfg.protocol || "google_a2a";
-        document.getElementById("egressExecutor").value = cfg.executor || "";
-        document.getElementById("egressProfile").value = cfg.profile || "default";
-        document.getElementById("egressPublicBaseUrl").value = cfg.public_base_url || "";
-        document.getElementById("egressDescription").value = cfg.description || "";
-        document.getElementById("egressSkillsJson").value = JSON.stringify(cfg.skills || [], null, 2);
-      } catch (err) {
-        pushEvent(`error -> ${String(err)}`);
+
+    function queryParams() {
+      const params = new URLSearchParams();
+      const fields = [
+        ["search", "search"],
+        ["level", "level"],
+        ["component", "component"],
+        ["category", "category"],
+        ["objectId", "object_id"],
+        ["sourceNodeId", "source_node_id"],
+      ];
+      params.set("limit", qs("limit").value || "200");
+      for (const [id, key] of fields) {
+        const value = qs(id).value.trim();
+        if (value) params.set(key, value);
       }
+      return params;
     }
-    function buildEgressPayload() {
-      return {
-        enabled: document.getElementById("egressEnabled").checked,
-        publish_to_network: document.getElementById("egressPublish").checked,
-        accept_inbound_invocations: document.getElementById("egressInbound").checked,
-        agent_id: document.getElementById("egressAgentId").value,
-        display_name: document.getElementById("egressDisplayName").value,
-        mode: document.getElementById("egressMode").value,
-        protocol: document.getElementById("egressProtocol").value,
-        executor: document.getElementById("egressExecutor").value || null,
-        profile: document.getElementById("egressProfile").value,
-        public_base_url: document.getElementById("egressPublicBaseUrl").value,
-        description: document.getElementById("egressDescription").value,
-        skills: JSON.parse(document.getElementById("egressSkillsJson").value || "[]")
-      };
-    }
-    function saveEgressAgent() {
-      try {
-        api("POST", "/api/egress-agent", buildEgressPayload());
-      } catch (err) {
-        showResponse({ ok: false, error: String(err) });
-        setStatus("err", "egress-save-failed");
-        pushEvent(`error -> ${String(err)}`);
+
+    async function refreshDiagnostics() {
+      const response = await fetch(`/api/diagnostics?${queryParams().toString()}`);
+      const payload = await response.json();
+      if (!response.ok || payload.ok === false) {
+        throw new Error(payload.error || `HTTP ${response.status}`);
       }
+      lastPayload = payload;
+      lastRows = safeArray(payload.diagnostics);
+      render(payload, lastRows);
     }
-    function previewGoogleAgentCard() {
-      api("GET", "/api/a2a/google/agent-card");
+
+    function isError(row) {
+      const text = `${row.level || ""} ${row.status || ""}`.toLowerCase();
+      return text.includes("error") || text.includes("fail") || text.includes("warn");
     }
-    async function loadSample() {
-      try {
-        setStatus("run", "GET /api/task/sample");
-        const taskId = document.getElementById("sampleTaskId").value;
-        const url = `/api/task/sample?task_id=${encodeURIComponent(taskId)}`;
-        lastOp.textContent = `GET ${url}`;
-        lastHttp.textContent = "...";
-        pushEvent(`request -> GET ${url}`);
-        const res = await fetch(url);
-        const data = await res.json();
-        if (!res.ok || !data.ok) throw new Error(data.error || `HTTP ${res.status}`);
-        document.getElementById("taskJson").value = JSON.stringify(data.contract, null, 2);
-        showResponse(data);
-        document.getElementById("taskIdWatch").value = taskId;
-        lastHttp.textContent = String(res.status);
-        setStatus("ok", "sample-loaded");
-        pushEvent(`response <- ${res.status} GET /api/task/sample`);
-      } catch (err) {
-        showResponse({ ok: false, error: String(err) });
-        lastHttp.textContent = "ERR";
-        setStatus("err", "sample-failed");
-        pushEvent(`error -> ${String(err)}`);
-      }
+
+    function modeMatches(row) {
+      if (activeMode === "all") return true;
+      if (activeMode === "errors") return isError(row);
+      const text = `${row.category || ""} ${row.phase || ""} ${row.component || ""}`.toLowerCase();
+      return text.includes(activeMode);
     }
-    function applyPreset() {
-      const preset = document.getElementById("taskPreset").value;
-      const txt = document.getElementById("taskJson").value.trim();
-      if (!txt) {
-        setStatus("warn", "load sample first");
-        pushEvent("hint -> click SAMPLE before applying preset");
+
+    function render(payload, rows) {
+      const snapshot = payload.snapshot || {};
+      qs("generatedAt").textContent = `Refreshed ${formatTime(payload.generated_at || new Date().toISOString())}`;
+      qs("serviceState").textContent = payload.network_service_started ? "running" : "stopped";
+      qs("localPeer").textContent = compact(snapshot.local_peer_id || "-", 24);
+      qs("connectedPeers").textContent = String(snapshot.connected_peer_count || 0);
+      qs("scopeCount").textContent = String(safeArray(snapshot.subscribed_scopes).length);
+      qs("diagnosticCount").textContent = String(safeArray(rows).length);
+
+      const visible = safeArray(rows).filter(modeMatches);
+      const list = qs("diagnosticsList");
+      if (!visible.length) {
+        list.innerHTML = `<div class="empty">No network diagnostics recorded for the current filters.</div>`;
         return;
       }
-      try {
-        const task = JSON.parse(txt);
-        const taskId = document.getElementById("sampleTaskId").value || task.task_id || "task-ui-1";
-        task.task_id = taskId;
-        if (!task.inputs || typeof task.inputs !== "object") task.inputs = {};
-        if (preset === "arbitrage") {
-          task.task_type = "arbitrage";
-          task.inputs.prompt = "find low-risk arbitrage opportunity";
-          task.inputs.market = "SOL/USDC";
-        } else if (preset === "security") {
-          task.task_type = "security";
-          task.inputs.prompt = "check smart contract risk";
-          task.inputs.contract = "0x1234...abcd";
-        } else {
-          task.task_type = "swarm";
-          task.inputs.prompt = "hello";
-        }
-        document.getElementById("taskJson").value = JSON.stringify(task, null, 2);
-        document.getElementById("taskIdWatch").value = taskId;
-        setStatus("ok", `preset-${preset}`);
-        pushEvent(`preset applied -> ${preset}`);
-      } catch (err) {
-        showResponse({ ok: false, error: String(err) });
-        setStatus("err", "preset-failed");
-        pushEvent(`error -> ${String(err)}`);
-      }
+      list.innerHTML = visible.map((row) => {
+        const meta = [
+          row.component,
+          row.category,
+          row.phase,
+          row.scope_hint ? `scope ${row.scope_hint}` : "",
+          row.object_id ? `object ${row.object_id}` : "",
+          row.event_id ? `event ${compact(row.event_id, 18)}` : "",
+          row.source_node_id ? `from ${compact(row.source_node_id, 18)}` : "",
+        ].filter(Boolean);
+        const status = row.status || row.level || "info";
+        return `
+          <article class="row">
+            <div class="row-head">
+              <div class="row-title">${escapeHtml(row.message || row.phase || "diagnostic")}</div>
+              <div class="pills">
+                <span class="pill ${escapeHtml(String(row.level || "").toLowerCase())}">${escapeHtml(row.level || "info")}</span>
+                <span class="pill ${escapeHtml(String(status).toLowerCase())}">${escapeHtml(status)}</span>
+              </div>
+            </div>
+            <div class="meta"><span>${escapeHtml(formatTime(row.timestamp_ms || row.timestamp))}</span>${meta.map((item) => `<span>${escapeHtml(item)}</span>`).join("")}</div>
+            <details>
+              <summary>Raw JSON</summary>
+              <pre>${escapeHtml(JSON.stringify(row, null, 2))}</pre>
+            </details>
+          </article>
+        `;
+      }).join("");
     }
-    function submitTask() {
-      const txt = document.getElementById("taskJson").value.trim();
-      if (!txt) {
-        setStatus("warn", "task-json-empty");
-        pushEvent("hint -> task json is empty");
-        return;
-      }
-      try {
-        api("POST", "/api/task/submit", { contract: JSON.parse(txt) });
-      } catch (err) {
-        showResponse({ ok: false, error: String(err) });
-        setStatus("err", "task-json-invalid");
-        pushEvent(`error -> invalid task json (${String(err)})`);
-      }
+
+    function exportDiagnostics() {
+      const rows = lastRows.length ? lastRows : [];
+      const body = rows.map((row) => JSON.stringify(row)).join("\n") + (rows.length ? "\n" : "");
+      const blob = new Blob([body], { type: "application/x-ndjson" });
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = `wattswarm-network-diagnostics-${new Date().toISOString().replace(/[:.]/g, "-")}.jsonl`;
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      URL.revokeObjectURL(url);
     }
-    function watchTask() {
-      const taskId = document.getElementById("taskIdWatch").value;
-      api("GET", `/api/task/watch/${encodeURIComponent(taskId)}`);
-    }
-    function decisionTask() {
-      const taskId = document.getElementById("taskIdWatch").value;
-      api("GET", `/api/task/decision/${encodeURIComponent(taskId)}`);
-    }
-    function addExecutor() {
-      api("POST", "/api/executors/add", {
-        name: document.getElementById("execName").value,
-        base_url: document.getElementById("execUrl").value
+
+    document.querySelectorAll("[data-mode]").forEach((button) => {
+      button.addEventListener("click", () => {
+        activeMode = button.dataset.mode || "all";
+        document.querySelectorAll("[data-mode]").forEach((item) => {
+          item.classList.toggle("active", item === button);
+        });
+        render(lastPayload || { diagnostics: [], snapshot: null }, lastRows);
       });
-    }
-    function checkExecutor() {
-      api("POST", "/api/executors/check", { name: document.getElementById("execName").value });
-    }
-    function runReal() {
-      api("POST", "/api/task/run-real", {
-        executor: document.getElementById("runExecutor").value,
-        profile: document.getElementById("runProfile").value,
-        task_id: document.getElementById("taskIdWatch").value
-      });
-    }
-    function knowledgeByTaskId() {
-      api("POST", "/api/knowledge/export", { task_id: document.getElementById("knowledgeTaskId").value });
-    }
-    function knowledgeByTaskType() {
-      api("POST", "/api/knowledge/export", { task_type: document.getElementById("knowledgeTaskType").value });
-    }
+    });
+
+    refreshDiagnostics().catch((error) => {
+      qs("diagnosticsList").innerHTML = `<div class="empty">${escapeHtml(error.message)}</div>`;
+    });
   </script>
 </body>
 </html>"#;
