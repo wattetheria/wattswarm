@@ -180,6 +180,21 @@ impl PeerMetadataRecord {
         })
     }
 
+    pub fn transport_contact_materials(&self) -> Vec<TransportContactMaterial> {
+        let Some(material) = self.contact_material.as_ref() else {
+            return Vec::new();
+        };
+        let Some(transports) = material.get("transports").and_then(Value::as_array) else {
+            return Vec::new();
+        };
+        transports
+            .iter()
+            .filter_map(|entry| {
+                serde_json::from_value::<TransportContactMaterial>(entry.clone()).ok()
+            })
+            .collect()
+    }
+
     pub fn advertised_transports(&self) -> Vec<String> {
         let Some(material) = &self.contact_material else {
             return Vec::new();
@@ -255,6 +270,26 @@ pub struct DataSourceBindingRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_uri: Option<String>,
     pub updated_at: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NetworkPeerSyncStateRecord {
+    pub network_peer_id: String,
+    #[serde(default = "default_json_array_string")]
+    pub known_scopes_json: String,
+    #[serde(default = "default_json_array_string")]
+    pub backfill_cursors_json: String,
+    #[serde(default = "default_json_array_string")]
+    pub remote_heads_json: String,
+    #[serde(default)]
+    pub backfill_successes: u64,
+    #[serde(default)]
+    pub backfill_failures: u64,
+    pub updated_at: u64,
+}
+
+fn default_json_array_string() -> String {
+    "[]".to_owned()
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -1024,6 +1059,45 @@ pub fn save_peer_metadata_record_state(
             contact_material_updated_at: record.contact_material_updated_at,
             first_identified_at: record.first_identified_at,
             last_identified_at: record.last_identified_at,
+        },
+    )
+}
+
+pub fn load_network_peer_sync_state_records_state(
+    state_dir: &Path,
+) -> Result<Vec<NetworkPeerSyncStateRecord>> {
+    let store = local_control_store(state_dir)?;
+    let scope_id = local_control_scope_id(state_dir);
+    Ok(store
+        .list_local_network_peer_sync_states(&scope_id)?
+        .into_iter()
+        .map(|row| NetworkPeerSyncStateRecord {
+            network_peer_id: row.network_peer_id,
+            known_scopes_json: row.known_scopes_json,
+            backfill_cursors_json: row.backfill_cursors_json,
+            remote_heads_json: row.remote_heads_json,
+            backfill_successes: row.backfill_successes,
+            backfill_failures: row.backfill_failures,
+            updated_at: row.updated_at,
+        })
+        .collect())
+}
+
+pub fn save_network_peer_sync_state_record_state(
+    state_dir: &Path,
+    record: &NetworkPeerSyncStateRecord,
+) -> Result<()> {
+    let scope_id = local_control_scope_id(state_dir);
+    local_control_store(state_dir)?.upsert_local_network_peer_sync_state(
+        &scope_id,
+        &crate::storage::LocalNetworkPeerSyncStateRow {
+            network_peer_id: record.network_peer_id.clone(),
+            known_scopes_json: record.known_scopes_json.clone(),
+            backfill_cursors_json: record.backfill_cursors_json.clone(),
+            remote_heads_json: record.remote_heads_json.clone(),
+            backfill_successes: record.backfill_successes,
+            backfill_failures: record.backfill_failures,
+            updated_at: record.updated_at,
         },
     )
 }

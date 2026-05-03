@@ -179,6 +179,7 @@ impl PgStore {
 
     pub fn upsert_feed_subscription(
         &self,
+        network_id: &str,
         subscriber_node_id: &str,
         feed_key: &str,
         scope_hint: &str,
@@ -192,15 +193,16 @@ impl PgStore {
             .lock()
             .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
         conn.execute(
-            "INSERT INTO feed_subscriptions(org_id, subscriber_node_id, feed_key, scope_hint, gossip_kinds_json, active, updated_at)
-             VALUES ($1, $2, $3, $4, $5, $6, TIMESTAMPTZ 'epoch' + ($7::bigint * INTERVAL '1 millisecond'))
-             ON CONFLICT(org_id, subscriber_node_id, feed_key) DO UPDATE SET
+            "INSERT INTO feed_subscriptions(org_id, network_id, subscriber_node_id, feed_key, scope_hint, gossip_kinds_json, active, updated_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, TIMESTAMPTZ 'epoch' + ($8::bigint * INTERVAL '1 millisecond'))
+             ON CONFLICT(org_id, network_id, subscriber_node_id, feed_key) DO UPDATE SET
                scope_hint = excluded.scope_hint,
                gossip_kinds_json = excluded.gossip_kinds_json,
                active = excluded.active,
                updated_at = excluded.updated_at",
             params![
                 self.org_id(),
+                network_id,
                 subscriber_node_id,
                 feed_key,
                 scope_hint,
@@ -214,6 +216,7 @@ impl PgStore {
 
     pub fn list_active_feed_subscription_scope_hints(
         &self,
+        network_id: &str,
         subscriber_node_id: &str,
     ) -> Result<Vec<String>> {
         let conn = self
@@ -223,10 +226,13 @@ impl PgStore {
         let mut stmt = conn.prepare(
             "SELECT scope_hint
              FROM feed_subscriptions
-             WHERE org_id = $1 AND subscriber_node_id = $2 AND active = TRUE
+             WHERE org_id = $1 AND network_id = $2 AND subscriber_node_id = $3 AND active = TRUE
              ORDER BY updated_at DESC, feed_key ASC",
         )?;
-        let rows = stmt.query_map(params![self.org_id(), subscriber_node_id], |r| r.get(0))?;
+        let rows = stmt.query_map(
+            params![self.org_id(), network_id, subscriber_node_id],
+            |r| r.get(0),
+        )?;
         let mut hints = Vec::new();
         for row in rows {
             let hint = Self::canonical_scope_hint_or_original(row?);
@@ -239,10 +245,13 @@ impl PgStore {
 
     pub fn list_active_feed_subscription_scopes(
         &self,
+        network_id: &str,
         subscriber_node_id: &str,
     ) -> Result<Vec<ProjectionScope>> {
         let mut scopes = Vec::new();
-        for hint in self.list_active_feed_subscription_scope_hints(subscriber_node_id)? {
+        for hint in
+            self.list_active_feed_subscription_scope_hints(network_id, subscriber_node_id)?
+        {
             if let Some(scope) = ProjectionScope::parse(&hint)
                 && !scopes.contains(&scope)
             {
@@ -254,6 +263,7 @@ impl PgStore {
 
     pub fn get_feed_subscription(
         &self,
+        network_id: &str,
         subscriber_node_id: &str,
         feed_key: &str,
     ) -> Result<Option<FeedSubscriptionRow>> {
@@ -264,11 +274,12 @@ impl PgStore {
         conn.query_row(
             "SELECT scope_hint, gossip_kinds_json, active, CAST(EXTRACT(EPOCH FROM updated_at) * 1000 AS BIGINT)
              FROM feed_subscriptions
-             WHERE org_id = $1 AND subscriber_node_id = $2 AND feed_key = $3",
-            params![self.org_id(), subscriber_node_id, feed_key],
+             WHERE org_id = $1 AND network_id = $2 AND subscriber_node_id = $3 AND feed_key = $4",
+            params![self.org_id(), network_id, subscriber_node_id, feed_key],
             |r| {
                 let updated_at_ms: i64 = r.get(3)?;
                 Ok(FeedSubscriptionRow {
+                    network_id: network_id.to_owned(),
                     subscriber_node_id: subscriber_node_id.to_owned(),
                     feed_key: feed_key.to_owned(),
                     scope_hint: Self::canonical_scope_hint_or_original(r.get(0)?),
@@ -284,6 +295,7 @@ impl PgStore {
 
     pub fn list_active_feed_subscriptions(
         &self,
+        network_id: &str,
         subscriber_node_id: &str,
     ) -> Result<Vec<FeedSubscriptionRow>> {
         let conn = self
@@ -293,20 +305,24 @@ impl PgStore {
         let mut stmt = conn.prepare(
             "SELECT feed_key, scope_hint, gossip_kinds_json, active, CAST(EXTRACT(EPOCH FROM updated_at) * 1000 AS BIGINT)
              FROM feed_subscriptions
-             WHERE org_id = $1 AND subscriber_node_id = $2 AND active = TRUE
+             WHERE org_id = $1 AND network_id = $2 AND subscriber_node_id = $3 AND active = TRUE
              ORDER BY updated_at DESC, feed_key ASC",
         )?;
-        let rows = stmt.query_map(params![self.org_id(), subscriber_node_id], |r| {
-            let updated_at_ms: i64 = r.get(4)?;
-            Ok(FeedSubscriptionRow {
-                subscriber_node_id: subscriber_node_id.to_owned(),
-                feed_key: r.get(0)?,
-                scope_hint: Self::canonical_scope_hint_or_original(r.get(1)?),
-                gossip_kinds: Self::decode_gossip_kinds_json(r.get(2)?),
-                active: r.get(3)?,
-                updated_at: updated_at_ms as u64,
-            })
-        })?;
+        let rows = stmt.query_map(
+            params![self.org_id(), network_id, subscriber_node_id],
+            |r| {
+                let updated_at_ms: i64 = r.get(4)?;
+                Ok(FeedSubscriptionRow {
+                    network_id: network_id.to_owned(),
+                    subscriber_node_id: subscriber_node_id.to_owned(),
+                    feed_key: r.get(0)?,
+                    scope_hint: Self::canonical_scope_hint_or_original(r.get(1)?),
+                    gossip_kinds: Self::decode_gossip_kinds_json(r.get(2)?),
+                    active: r.get(3)?,
+                    updated_at: updated_at_ms as u64,
+                })
+            },
+        )?;
         let mut out = Vec::new();
         for row in rows {
             out.push(row?);
@@ -510,6 +526,7 @@ impl PgStore {
 
     pub fn list_topic_messages_page(
         &self,
+        network_id: &str,
         feed_key: &str,
         scope_hint: &str,
         before_created_at: Option<u64>,
@@ -528,22 +545,23 @@ impl PgStore {
                     CAST(EXTRACT(EPOCH FROM created_at) * 1000 AS BIGINT),
                     CASE WHEN content_resolved_at IS NULL THEN NULL ELSE CAST(EXTRACT(EPOCH FROM content_resolved_at) * 1000 AS BIGINT) END
              FROM topic_messages
-             WHERE org_id = $1 AND feed_key = $2 AND scope_hint = $3
+             WHERE org_id = $1 AND network_id = $2 AND feed_key = $3 AND scope_hint = $4
                AND (
-                    $4 = FALSE
-                    OR CAST(EXTRACT(EPOCH FROM created_at) * 1000 AS BIGINT) < $5
+                    $5 = FALSE
+                    OR CAST(EXTRACT(EPOCH FROM created_at) * 1000 AS BIGINT) < $6
                     OR (
-                        CAST(EXTRACT(EPOCH FROM created_at) * 1000 AS BIGINT) = $5
-                        AND $6::text IS NOT NULL
-                        AND message_id < $6
+                        CAST(EXTRACT(EPOCH FROM created_at) * 1000 AS BIGINT) = $6
+                        AND $7::text IS NOT NULL
+                        AND message_id < $7
                     )
                )
              ORDER BY created_at DESC, message_id DESC
-             LIMIT $7",
+             LIMIT $8",
         )?;
         let rows = stmt.query_map(
             params![
                 self.org_id(),
+                network_id,
                 feed_key,
                 canonical_scope_hint,
                 has_anchor,
@@ -582,11 +600,12 @@ impl PgStore {
 
     pub fn list_topic_messages(
         &self,
+        network_id: &str,
         feed_key: &str,
         scope_hint: &str,
         limit: usize,
     ) -> Result<Vec<TopicMessageRow>> {
-        self.list_topic_messages_page(feed_key, scope_hint, None, None, limit)
+        self.list_topic_messages_page(network_id, feed_key, scope_hint, None, None, limit)
     }
 
     pub fn get_topic_message(&self, message_id: &str) -> Result<Option<TopicMessageRow>> {
@@ -656,6 +675,7 @@ impl PgStore {
 
     pub fn upsert_topic_cursor(
         &self,
+        network_id: &str,
         subscriber_node_id: &str,
         feed_key: &str,
         scope_hint: &str,
@@ -668,14 +688,15 @@ impl PgStore {
             .lock()
             .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
         conn.execute(
-            "INSERT INTO topic_cursors(org_id, subscriber_node_id, feed_key, scope_hint, last_event_seq, updated_at)
-             VALUES ($1, $2, $3, $4, $5, TIMESTAMPTZ 'epoch' + ($6::bigint * INTERVAL '1 millisecond'))
-             ON CONFLICT(org_id, subscriber_node_id, feed_key) DO UPDATE SET
+            "INSERT INTO topic_cursors(org_id, network_id, subscriber_node_id, feed_key, scope_hint, last_event_seq, updated_at)
+             VALUES ($1, $2, $3, $4, $5, $6, TIMESTAMPTZ 'epoch' + ($7::bigint * INTERVAL '1 millisecond'))
+             ON CONFLICT(org_id, network_id, subscriber_node_id, feed_key) DO UPDATE SET
                scope_hint = excluded.scope_hint,
                last_event_seq = GREATEST(topic_cursors.last_event_seq, excluded.last_event_seq),
                updated_at = excluded.updated_at",
             params![
                 self.org_id(),
+                network_id,
                 subscriber_node_id,
                 feed_key,
                 canonical_scope_hint,
@@ -688,6 +709,7 @@ impl PgStore {
 
     pub fn get_topic_cursor(
         &self,
+        network_id: &str,
         subscriber_node_id: &str,
         feed_key: &str,
     ) -> Result<Option<TopicCursorRow>> {
@@ -698,12 +720,13 @@ impl PgStore {
         conn.query_row(
             "SELECT scope_hint, last_event_seq, CAST(EXTRACT(EPOCH FROM updated_at) * 1000 AS BIGINT)
              FROM topic_cursors
-             WHERE org_id = $1 AND subscriber_node_id = $2 AND feed_key = $3",
-            params![self.org_id(), subscriber_node_id, feed_key],
+             WHERE org_id = $1 AND network_id = $2 AND subscriber_node_id = $3 AND feed_key = $4",
+            params![self.org_id(), network_id, subscriber_node_id, feed_key],
             |r| {
                 let updated_at_ms: i64 = r.get(2)?;
                 let last_event_seq: i64 = r.get(1)?;
                 Ok(TopicCursorRow {
+                    network_id: network_id.to_owned(),
                     subscriber_node_id: subscriber_node_id.to_owned(),
                     feed_key: feed_key.to_owned(),
                     scope_hint: Self::canonical_scope_hint_or_original(r.get(0)?),

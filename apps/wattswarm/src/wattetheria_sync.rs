@@ -175,6 +175,7 @@ pub struct TaskNextRoundTriggerSnapshot {
 pub struct TopicActivitySnapshot {
     pub generated_at: u64,
     pub subscriber_node_id: String,
+    pub network_id: String,
     pub feed_key: String,
     pub scope_hint: String,
     pub messages: Vec<TopicMessageRow>,
@@ -197,6 +198,7 @@ pub struct TaskRunSnapshotQuery {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct TopicActivityQuery {
+    pub network_id: Option<String>,
     pub feed_key: String,
     pub scope_hint: String,
     pub limit: Option<usize>,
@@ -617,6 +619,7 @@ pub fn build_task_facts_snapshot(
 pub fn build_topic_activity_snapshot(
     state_dir: &Path,
     db_path: &Path,
+    network_id: Option<&str>,
     feed_key: &str,
     scope_hint: &str,
     limit: usize,
@@ -632,6 +635,11 @@ pub fn build_topic_activity_snapshot(
     }
     ensure_sync_node_mode_configured(state_dir)?;
     let node = open_configured_node(state_dir, db_path)?;
+    let network_id = network_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| resolve_network_id(&node));
     let subscriber_node_id = subscriber_node_id
         .map(str::trim)
         .filter(|value| !value.is_empty())
@@ -639,16 +647,20 @@ pub fn build_topic_activity_snapshot(
         .or_else(|| local_node_id(state_dir).ok())
         .unwrap_or_else(|| node.node_id());
     let messages = node.store.list_topic_messages_page(
+        &network_id,
         feed_key,
         scope_hint,
         None,
         None,
         limit.clamp(1, 200),
     )?;
-    let cursor = node.store.get_topic_cursor(&subscriber_node_id, feed_key)?;
+    let cursor = node
+        .store
+        .get_topic_cursor(&network_id, &subscriber_node_id, feed_key)?;
     Ok(TopicActivitySnapshot {
         generated_at: now_ms(),
         subscriber_node_id,
+        network_id,
         feed_key: feed_key.to_owned(),
         scope_hint: scope_hint.to_owned(),
         messages,
@@ -705,7 +717,13 @@ pub fn submit_brain_topic_publish(
     ensure_sync_node_mode_configured(state_dir)?;
     let mut node = open_configured_node(state_dir, db_path)?;
     let created_at = now_ms();
-    let network_id = req.network_id.unwrap_or_else(|| resolve_network_id(&node));
+    let network_id = req
+        .network_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .unwrap_or_else(|| resolve_network_id(&node));
     let event = crate::control::emit_topic_message_with_content(
         &mut node,
         state_dir,
@@ -882,6 +900,7 @@ pub(crate) async fn topic_activity_http(
         build_topic_activity_snapshot(
             &state_clone.state_dir,
             &state_clone.db_path,
+            query.network_id.as_deref(),
             &query.feed_key,
             &query.scope_hint,
             query.limit.unwrap_or(50),
@@ -1091,6 +1110,8 @@ impl WattetheriaSyncService for WattetheriaSyncGrpcService {
         let request = request.into_inner();
         let feed_key = request.feed_key.trim().to_owned();
         let scope_hint = request.scope_hint.trim().to_owned();
+        let network_id = request.network_id.trim().to_owned();
+        let network_id = (!network_id.is_empty()).then_some(network_id);
         if feed_key.is_empty() {
             return Err(Status::invalid_argument("feed_key is required"));
         }
@@ -1107,11 +1128,13 @@ impl WattetheriaSyncService for WattetheriaSyncGrpcService {
                 let runtime_clone = runtime.clone();
                 let feed_key_clone = feed_key.clone();
                 let scope_hint_clone = scope_hint.clone();
+                let network_id_clone = network_id.clone();
                 let subscriber_clone = subscriber_node_id.clone();
                 let frame = tokio::task::spawn_blocking(move || -> Result<ProjectionFrame> {
                     build_topic_activity_snapshot(
                         &runtime_clone.state_dir,
                         &runtime_clone.db_path,
+                        network_id_clone.as_deref(),
                         &feed_key_clone,
                         &scope_hint_clone,
                         limit,

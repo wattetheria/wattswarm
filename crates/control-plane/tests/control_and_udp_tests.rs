@@ -803,7 +803,15 @@ fn network_directory_snapshot_lists_networks_feeds_domains_and_sync_endpoints() 
     )
     .expect("save peer metadata");
     node.store
-        .upsert_feed_subscription("node-a", "feed-market", "region:sol-1", &[], true, 10)
+        .upsert_feed_subscription(
+            "default",
+            "node-a",
+            "feed-market",
+            "region:sol-1",
+            &[],
+            true,
+            10,
+        )
         .expect("feed subscription");
     node.store
         .put_task_announcement(

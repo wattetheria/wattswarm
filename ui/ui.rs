@@ -11,9 +11,8 @@ use crate::egress_agent::{
     EgressAgentConfig, load_egress_agent_config_state, save_egress_agent_config_state,
 };
 use crate::network_bridge::{
-    DiagnosticFilter, enqueue_agent_payment_command, enqueue_peer_direct_message_command,
-    enqueue_peer_relationship_action_command, latest_network_observability_snapshot,
-    list_network_diagnostics, network_service_started,
+    DiagnosticFilter, enqueue_agent_payment_command, enqueue_peer_relationship_action_command,
+    latest_network_observability_snapshot, list_network_diagnostics, network_service_started,
 };
 use crate::network_p2p::RawAgentEnvelope;
 use crate::run_control;
@@ -186,6 +185,44 @@ struct PeerDirectMessageQuery {
     thread_id: String,
 }
 
+const PRIVATE_DM_FEED_KEY: &str = "wattswarm.dm";
+
+fn private_dm_pair_digest(local_node_id: &str, remote_node_id: &str) -> String {
+    let mut members = [
+        local_node_id.trim().to_owned(),
+        remote_node_id.trim().to_owned(),
+    ];
+    members.sort();
+    crate::crypto::sha256_hex(format!("dm-v1\0{}\0{}", members[0], members[1]).as_bytes())
+}
+
+fn private_dm_thread_id(local_node_id: &str, remote_node_id: &str) -> String {
+    let digest = private_dm_pair_digest(local_node_id, remote_node_id);
+    format!("dm:{}", &digest[..24])
+}
+
+fn private_dm_scope_hint(local_node_id: &str, remote_node_id: &str) -> String {
+    let digest = private_dm_pair_digest(local_node_id, remote_node_id);
+    format!("group:dm-{}", &digest[..24])
+}
+
+fn raw_agent_envelope_to_interaction(
+    envelope: &RawAgentEnvelope,
+) -> crate::control::AgentInteractionEnvelope {
+    crate::control::AgentInteractionEnvelope {
+        protocol: envelope.protocol.clone(),
+        source_agent_id: envelope.source_agent_id.clone(),
+        target_agent_id: envelope.target_agent_id.clone(),
+        capability: envelope.capability.clone(),
+        message: serde_json::from_str(&envelope.message_json).unwrap_or_else(|_| json!({})),
+        extensions: envelope
+            .extensions_json
+            .as_deref()
+            .and_then(|value| serde_json::from_str(value).ok()),
+        signature: envelope.signature.clone(),
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct RunRealRequest {
     executor: String,
@@ -256,6 +293,7 @@ struct SwarmTickRequest {
 
 #[derive(Debug, Deserialize)]
 struct TopicMessagesQuery {
+    network_id: Option<String>,
     feed_key: String,
     scope_hint: String,
     limit: Option<usize>,
@@ -265,6 +303,7 @@ struct TopicMessagesQuery {
 
 #[derive(Debug, Deserialize)]
 struct TopicCursorQuery {
+    network_id: Option<String>,
     feed_key: String,
     subscriber_node_id: Option<String>,
 }
@@ -760,22 +799,99 @@ async fn peer_dm_messages_send(
 ) -> Result<Json<Value>, ApiError> {
     let state_clone = state.clone();
     let payload = run_blocking(move || {
-        if !network_service_started(&state_clone.state_dir) {
-            bail!("peer direct messages require the background network service to be running");
+        let remote_node_id = req.remote_node_id.trim().to_owned();
+        if remote_node_id.is_empty() {
+            bail!("remote_node_id is required");
         }
-        let agent_envelope = req
-            .agent_envelope
-            .ok_or_else(|| anyhow!("agent_envelope is required for peer direct messages"))?;
-        enqueue_peer_direct_message_command(
+        let agent_envelope = req.agent_envelope.ok_or_else(|| {
+            anyhow!("agent_envelope is required for private group direct messages")
+        })?;
+        agent_envelope.validate()?;
+        let content = req.content;
+        let mut node = open_node(&state_clone.state_dir, &state_clone.db_path)?;
+        let local_node_id = node.node_id();
+        let network_id = resolve_network_id(&node);
+        let scope_hint = private_dm_scope_hint(&local_node_id, &remote_node_id);
+        let thread_id = private_dm_thread_id(&local_node_id, &remote_node_id);
+        let message_id = format!("dm-msg-{}", Uuid::new_v4());
+        let now = chrono::Utc::now().timestamp_millis().max(0) as u64;
+        let control_envelope = raw_agent_envelope_to_interaction(&agent_envelope);
+        let participants = {
+            let mut members = vec![local_node_id.clone(), remote_node_id.clone()];
+            members.sort();
+            members
+        };
+        node.emit_at(
+            1,
+            crate::types::EventPayload::FeedSubscriptionUpdated(
+                crate::types::FeedSubscriptionUpdatedPayload {
+                    network_id: network_id.clone(),
+                    subscriber_node_id: local_node_id.clone(),
+                    feed_key: PRIVATE_DM_FEED_KEY.to_owned(),
+                    scope_hint: scope_hint.clone(),
+                    gossip_kinds: vec!["messages".to_owned()],
+                    active: true,
+                },
+            ),
+            now,
+        )?;
+        let event = crate::control::emit_topic_message_with_content(
+            &mut node,
             &state_clone.state_dir,
-            &req.remote_node_id,
-            agent_envelope,
-            req.content,
+            &network_id,
+            PRIVATE_DM_FEED_KEY,
+            &scope_hint,
+            json!({
+                "kind": "direct_message",
+                "thread_id": thread_id,
+                "message_id": message_id,
+                "participants": participants,
+                "remote_node_id": remote_node_id,
+                "content": content.clone(),
+                "agent_envelope": control_envelope.clone(),
+            }),
+            None,
+            now.saturating_add(1),
+        )?;
+        crate::control::save_peer_dm_thread_record_state(
+            &state_clone.state_dir,
+            &crate::control::PeerDmThreadRecord {
+                remote_node_id: remote_node_id.clone(),
+                thread_id: thread_id.clone(),
+                thread_kind: crate::control::PeerDmThreadKind::Direct,
+                session_state: crate::control::PeerDmSessionState::Ready,
+                relationship_established_at: None,
+                created_at: now,
+                updated_at: now.saturating_add(1),
+                last_message_at: Some(now.saturating_add(1)),
+            },
+        )?;
+        crate::control::save_peer_dm_message_record_state(
+            &state_clone.state_dir,
+            &crate::control::PeerDmMessageRecord {
+                thread_id: thread_id.clone(),
+                message_id: message_id.clone(),
+                remote_node_id: remote_node_id.clone(),
+                message_kind: crate::control::PeerDmMessageKind::Message,
+                direction: crate::control::PeerDmDirection::Outbound,
+                delivery_state: crate::control::PeerDmDeliveryState::Delivered,
+                a2a_protocol: agent_envelope.protocol.clone(),
+                agent_envelope: Some(control_envelope),
+                content,
+                created_at: now.saturating_add(1),
+                acknowledged_at: None,
+            },
         )?;
         Ok::<Value, anyhow::Error>(json!({
             "ok": true,
-            "queued": true,
-            "remote_node_id": req.remote_node_id,
+            "queued": false,
+            "remote_node_id": remote_node_id,
+            "thread_id": thread_id,
+            "message_id": message_id,
+            "event_id": event.event_id,
+            "feed_key": PRIVATE_DM_FEED_KEY,
+            "scope_hint": scope_hint,
+            "gossip_kinds": ["messages"],
         }))
     })
     .await?;
@@ -1904,6 +2020,12 @@ async fn topic_messages(
 ) -> Result<Json<Value>, ApiError> {
     let state_clone = state.clone();
     let limit = clamp_topic_page_limit(query.limit);
+    let network_id = query
+        .network_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned);
     let feed_key = query.feed_key.trim().to_owned();
     let scope_hint = query.scope_hint.trim().to_owned();
     if feed_key.is_empty() {
@@ -1921,7 +2043,9 @@ async fn topic_messages(
         .map(str::to_owned);
     let payload = run_blocking(move || -> Result<Value> {
         let node = open_node(&state_clone.state_dir, &state_clone.db_path)?;
+        let network_id = network_id.unwrap_or_else(|| resolve_network_id(&node));
         let messages = node.store.list_topic_messages_page(
+            &network_id,
             &feed_key,
             &scope_hint,
             before_created_at,
@@ -1936,6 +2060,7 @@ async fn topic_messages(
         });
         Ok(json!({
             "ok": true,
+            "network_id": network_id,
             "feed_key": feed_key,
             "scope_hint": scope_hint,
             "messages": messages,
@@ -1953,7 +2078,12 @@ async fn topic_subscription_post(
     let state_clone = state.clone();
     let feed_key = req.feed_key.trim().to_owned();
     let scope_hint = req.scope_hint.trim().to_owned();
-    let network_id = req.network_id.as_deref().map(str::trim).map(str::to_owned);
+    let network_id = req
+        .network_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned);
     let subscriber_node_id = req
         .subscriber_node_id
         .as_deref()
@@ -2008,7 +2138,12 @@ async fn topic_message_post(
     let state_clone = state.clone();
     let feed_key = req.feed_key.trim().to_owned();
     let scope_hint = req.scope_hint.trim().to_owned();
-    let network_id = req.network_id.as_deref().map(str::trim).map(str::to_owned);
+    let network_id = req
+        .network_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned);
     let reply_to_message_id = req
         .reply_to_message_id
         .as_deref()
@@ -2067,6 +2202,12 @@ async fn topic_cursor(
 ) -> Result<Json<Value>, ApiError> {
     let state_clone = state.clone();
     let feed_key = query.feed_key.trim().to_owned();
+    let network_id = query
+        .network_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned);
     if feed_key.is_empty() {
         return Err(anyhow!("feed_key is required").into());
     }
@@ -2078,11 +2219,13 @@ async fn topic_cursor(
             subscriber_node_id,
         )?;
         let node = open_node(&state_clone.state_dir, &state_clone.db_path)?;
+        let network_id = network_id.unwrap_or_else(|| resolve_network_id(&node));
         let cursor = node
             .store
-            .get_topic_cursor(&subscriber_node_id, &feed_key)?;
+            .get_topic_cursor(&network_id, &subscriber_node_id, &feed_key)?;
         Ok(json!({
             "ok": true,
+            "network_id": network_id,
             "subscriber_node_id": subscriber_node_id,
             "feed_key": feed_key,
             "cursor": cursor,

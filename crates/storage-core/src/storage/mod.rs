@@ -176,6 +176,7 @@ pub struct TaskStageUsageRow {
 
 #[derive(Debug, Clone)]
 pub struct FeedSubscriptionRow {
+    pub network_id: String,
     pub subscriber_node_id: String,
     pub feed_key: String,
     pub scope_hint: String,
@@ -212,6 +213,7 @@ pub struct TopicMessageRow {
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct TopicCursorRow {
+    pub network_id: String,
     pub subscriber_node_id: String,
     pub feed_key: String,
     pub scope_hint: String,
@@ -266,6 +268,17 @@ pub struct LocalPeerMetadataRow {
     pub contact_material_updated_at: Option<u64>,
     pub first_identified_at: u64,
     pub last_identified_at: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalNetworkPeerSyncStateRow {
+    pub network_peer_id: String,
+    pub known_scopes_json: String,
+    pub backfill_cursors_json: String,
+    pub remote_heads_json: String,
+    pub backfill_successes: u64,
+    pub backfill_failures: u64,
+    pub updated_at: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -277,6 +277,143 @@ fn ui_supports_core_cli_operations() {
 }
 
 #[test]
+fn peer_dm_send_uses_private_group_topic_messages() {
+    let _guard = env_lock();
+    let _db_lock = DbTestLock::acquire();
+    let schema = reset_test_schema("test");
+    let _schema_guard = EnvVarGuard::set("WATTSWARM_PG_SCHEMA", &schema);
+    let _mode_guard = EnvVarGuard::set("WATTSWARM_NODE_MODE", "local");
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let dir = tempdir().unwrap();
+        let state_dir = dir.path().join("state");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        let db_path = state_dir.join("ui.state");
+        let app = build_app(UiServerState::new(state_dir, db_path));
+
+        let up_res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/node/up")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(up_res.status(), StatusCode::OK);
+
+        let send_res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/peers/dm/messages")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({
+                            "remote_node_id": "node-beta",
+                            "content": {"text": "hello private group"},
+                            "agent_envelope": {
+                                "protocol": "google_a2a",
+                                "source_agent_id": "agent-alpha",
+                                "target_agent_id": "agent-beta",
+                                "capability": "peer.dm.message",
+                                "message_json": "{\"content\":{\"text\":\"hello private group\"}}"
+                            }
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(send_res.status(), StatusCode::OK);
+        let send_json = json_from(send_res).await;
+        assert_eq!(send_json["ok"].as_bool(), Some(true));
+        assert_eq!(send_json["queued"].as_bool(), Some(false));
+        assert_eq!(send_json["feed_key"].as_str(), Some("wattswarm.dm"));
+        let scope_hint = send_json["scope_hint"].as_str().unwrap();
+        assert!(scope_hint.starts_with("group:dm-"));
+        assert_eq!(send_json["gossip_kinds"][0].as_str(), Some("messages"));
+        let thread_id = send_json["thread_id"].as_str().unwrap();
+
+        let topic_res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(format!(
+                        "/api/topic/messages?feed_key=wattswarm.dm&scope_hint={scope_hint}&limit=5"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(topic_res.status(), StatusCode::OK);
+        let topic_json = json_from(topic_res).await;
+        let network_id = topic_json["network_id"].as_str().unwrap();
+        assert_eq!(topic_json["messages"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            topic_json["messages"][0]["network_id"].as_str(),
+            Some(network_id)
+        );
+        assert_eq!(
+            topic_json["messages"][0]["content"]["kind"].as_str(),
+            Some("direct_message")
+        );
+        assert_eq!(
+            topic_json["messages"][0]["content"]["thread_id"].as_str(),
+            Some(thread_id)
+        );
+
+        let other_network_topic_res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(format!(
+                        "/api/topic/messages?network_id=other-net&feed_key=wattswarm.dm&scope_hint={scope_hint}&limit=5"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(other_network_topic_res.status(), StatusCode::OK);
+        let other_network_topic_json = json_from(other_network_topic_res).await;
+        assert_eq!(
+            other_network_topic_json["messages"].as_array().unwrap().len(),
+            0
+        );
+
+        let dm_res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(format!("/api/peers/dm/messages?thread_id={thread_id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(dm_res.status(), StatusCode::OK);
+        let dm_json = json_from(dm_res).await;
+        assert_eq!(dm_json["messages"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            dm_json["messages"][0]["content"]["text"].as_str(),
+            Some("hello private group")
+        );
+    });
+}
+
+#[test]
 fn ui_root_page_serves_startup_view_and_diagnostics_route_redirects_legacy_console() {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -326,6 +463,13 @@ fn ui_root_page_serves_startup_view_and_diagnostics_route_redirects_legacy_conso
             .unwrap();
         let diagnostics_html = String::from_utf8(diagnostics_body.to_vec()).unwrap();
         assert!(diagnostics_html.contains("WattSwarm Network Diagnostics"));
+        assert!(diagnostics_html.contains("Iroh transport"));
+        assert!(diagnostics_html.contains("Iroh Endpoint"));
+        assert!(diagnostics_html.contains("Known Iroh Contacts"));
+        assert!(!diagnostics_html.contains("Local Peer"));
+        assert!(!diagnostics_html.contains("Connected Peers"));
+        assert!(!diagnostics_html.contains("peer id"));
+        assert!(!diagnostics_html.contains("Libp2p transport"));
         assert!(diagnostics_html.contains("/api/diagnostics"));
         assert!(!diagnostics_html.contains("Quick Start"));
 

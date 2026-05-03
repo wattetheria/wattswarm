@@ -7,6 +7,8 @@ edition = "2024"
 anyhow = { workspace = true }
 hex = { workspace = true }
 iroh = "0.97"
+iroh-blobs = { workspace = true }
+iroh-gossip = { workspace = true }
 libp2p = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -16,4 +18,5 @@ wattswarm-network-transport-core = { workspace = true }
 
 [dev-dependencies]
 wattswarm-crypto = { workspace = true }
+n0-future = { workspace = true }
 tempfile = { workspace = true }

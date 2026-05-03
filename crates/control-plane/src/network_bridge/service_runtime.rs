@@ -279,196 +279,202 @@ impl NetworkBridgeService {
             NetworkRuntimeEvent::Gossip {
                 propagation_source,
                 message,
-            } => match message {
-                GossipMessage::Event(envelope) => {
-                    self.record_peer_scope_activity(propagation_source, &envelope.scope);
-                    let ingested_event = ingest_event_envelope(node, &envelope)?;
-                    diagnostics::record_diagnostic(
-                        self.state_dir.as_deref(),
-                        diagnostics::DiagnosticEvent::new(
-                            "info",
-                            "gossip",
-                            "event.ingest.live",
-                            "ok",
-                            format!(
-                                "live gossip event ingested: {:?}",
-                                ingested_event.event_kind
-                            ),
-                        )
-                        .event_id(ingested_event.event_id.clone())
-                        .object("task", ingested_event.task_id.clone())
-                        .source_node_id(Some(propagation_source.to_string()))
-                        .scope(&envelope.scope)
-                        .details(json!({
-                            "event_kind": format!("{:?}", ingested_event.event_kind),
-                            "author_node_id": ingested_event.author_node_id,
-                            "created_at": ingested_event.created_at,
-                        })),
-                    );
-                    if let Err(err) = self.maybe_sync_candidate_output(node, &ingested_event) {
-                        eprintln!(
-                            "candidate output sync failed for {}: {err}",
-                            ingested_event.event_id
+            } => {
+                self.connected_peers.insert(propagation_source);
+                match message {
+                    GossipMessage::Event(envelope) => {
+                        self.record_peer_scope_activity(propagation_source, &envelope.scope);
+                        let ingested_event = ingest_event_envelope(node, &envelope)?;
+                        diagnostics::record_diagnostic(
+                            self.state_dir.as_deref(),
+                            diagnostics::DiagnosticEvent::new(
+                                "info",
+                                "gossip",
+                                "event.ingest.live",
+                                "ok",
+                                format!(
+                                    "live gossip event ingested: {:?}",
+                                    ingested_event.event_kind
+                                ),
+                            )
+                            .event_id(ingested_event.event_id.clone())
+                            .object("task", ingested_event.task_id.clone())
+                            .source_node_id(Some(propagation_source.to_string()))
+                            .scope(&envelope.scope)
+                            .details(json!({
+                                "event_kind": format!("{:?}", ingested_event.event_kind),
+                                "author_node_id": ingested_event.author_node_id,
+                                "created_at": ingested_event.created_at,
+                            })),
                         );
-                    }
-                    if let Some(state_dir) = &self.state_dir {
-                        log_run_queue_events_if_applicable(node, state_dir, &ingested_event);
-                        match &ingested_event.payload {
-                            crate::types::EventPayload::TaskClaimed(payload) => {
-                                if let Ok(event) =
-                                    task_claim_agent_event(node, &ingested_event, payload)
-                                {
-                                    let _ = deliver_agent_event_to_local_executor(
-                                        state_dir,
-                                        self.db_path.as_deref(),
-                                        &event,
-                                    );
-                                }
-                            }
-                            crate::types::EventPayload::CandidateProposed(_)
-                            | crate::types::EventPayload::DecisionFinalized(_)
-                            | crate::types::EventPayload::TaskError(_)
-                            | crate::types::EventPayload::TaskRetryScheduled(_) => {
-                                if let Ok(Some(event)) =
-                                    task_result_agent_event(node, &ingested_event)
-                                {
-                                    let _ = deliver_agent_event_to_local_executor(
-                                        state_dir,
-                                        self.db_path.as_deref(),
-                                        &event,
-                                    );
-                                }
-                            }
-                            _ => {}
-                        }
-                    }
-                    self.record_scope_event_ingested(&envelope.scope);
-                    Ok(NetworkBridgeTick::EventIngested {
-                        peer: propagation_source,
-                        event_id: ingested_event.event_id.clone(),
-                    })
-                }
-                GossipMessage::Chat(envelope) => {
-                    self.record_peer_scope_activity(propagation_source, &envelope.scope);
-                    let ingested_event = ingest_event_envelope(node, &envelope)?;
-                    diagnostics::record_diagnostic(
-                        self.state_dir.as_deref(),
-                        diagnostics::DiagnosticEvent::new(
-                            "info",
-                            "gossip",
-                            "chat.ingest.live",
-                            "ok",
-                            format!("live chat event ingested: {:?}", ingested_event.event_kind),
-                        )
-                        .event_id(ingested_event.event_id.clone())
-                        .object("event", Some(ingested_event.event_id.clone()))
-                        .source_node_id(Some(propagation_source.to_string()))
-                        .scope(&envelope.scope)
-                        .details(json!({
-                            "event_kind": format!("{:?}", ingested_event.event_kind),
-                            "author_node_id": ingested_event.author_node_id,
-                            "created_at": ingested_event.created_at,
-                        })),
-                    );
-                    if let Err(err) = self.maybe_sync_candidate_output(node, &ingested_event) {
-                        eprintln!(
-                            "candidate output sync failed for {}: {err}",
-                            ingested_event.event_id
-                        );
-                    }
-                    if let Err(err) = self.maybe_sync_topic_message_content(
-                        node,
-                        &ingested_event,
-                        envelope.content_source_node_id.as_deref(),
-                    ) {
-                        eprintln!(
-                            "topic content sync failed for {}: {err}",
-                            ingested_event.event_id
-                        );
-                    }
-                    if let crate::types::EventPayload::TopicMessagePosted(payload) =
-                        &ingested_event.payload
-                    {
-                        maybe_record_topic_cursor_for_event_id(
-                            node,
-                            &node.node_id(),
-                            &payload.feed_key,
-                            &envelope.scope,
-                            &ingested_event.event_id,
-                            ingested_event.created_at,
-                        )?;
-                        if let Some(state_dir) = &self.state_dir
-                            && let Ok(Some(event)) =
-                                topic_message_agent_event(node, &ingested_event, payload)
-                        {
-                            let _ = deliver_agent_event_to_local_executor(
-                                state_dir,
-                                self.db_path.as_deref(),
-                                &event,
+                        if let Err(err) = self.maybe_sync_candidate_output(node, &ingested_event) {
+                            eprintln!(
+                                "candidate output sync failed for {}: {err}",
+                                ingested_event.event_id
                             );
                         }
+                        if let Some(state_dir) = &self.state_dir {
+                            log_run_queue_events_if_applicable(node, state_dir, &ingested_event);
+                            match &ingested_event.payload {
+                                crate::types::EventPayload::TaskClaimed(payload) => {
+                                    if let Ok(event) =
+                                        task_claim_agent_event(node, &ingested_event, payload)
+                                    {
+                                        let _ = deliver_agent_event_to_local_executor(
+                                            state_dir,
+                                            self.db_path.as_deref(),
+                                            &event,
+                                        );
+                                    }
+                                }
+                                crate::types::EventPayload::CandidateProposed(_)
+                                | crate::types::EventPayload::DecisionFinalized(_)
+                                | crate::types::EventPayload::TaskError(_)
+                                | crate::types::EventPayload::TaskRetryScheduled(_) => {
+                                    if let Ok(Some(event)) =
+                                        task_result_agent_event(node, &ingested_event)
+                                    {
+                                        let _ = deliver_agent_event_to_local_executor(
+                                            state_dir,
+                                            self.db_path.as_deref(),
+                                            &event,
+                                        );
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                        self.record_scope_event_ingested(&envelope.scope);
+                        Ok(NetworkBridgeTick::EventIngested {
+                            peer: propagation_source,
+                            event_id: ingested_event.event_id.clone(),
+                        })
                     }
-                    self.record_scope_event_ingested(&envelope.scope);
-                    Ok(NetworkBridgeTick::EventIngested {
-                        peer: propagation_source,
-                        event_id: ingested_event.event_id.clone(),
-                    })
-                }
-                GossipMessage::Summary(summary) => {
-                    self.record_peer_scope_activity(propagation_source, &summary.scope);
-                    apply_summary_announcement(node, &summary)?;
-                    if summary.summary_kind == AGENT_PAYMENT_SUMMARY_KIND
-                        && let Some(state_dir) = &self.state_dir
-                    {
-                        let _ = save_agent_payment_summary(
-                            state_dir,
-                            &summary.source_node_id,
-                            &summary,
+                    GossipMessage::Chat(envelope) => {
+                        self.record_peer_scope_activity(propagation_source, &envelope.scope);
+                        let ingested_event = ingest_event_envelope(node, &envelope)?;
+                        diagnostics::record_diagnostic(
+                            self.state_dir.as_deref(),
+                            diagnostics::DiagnosticEvent::new(
+                                "info",
+                                "gossip",
+                                "chat.ingest.live",
+                                "ok",
+                                format!(
+                                    "live chat event ingested: {:?}",
+                                    ingested_event.event_kind
+                                ),
+                            )
+                            .event_id(ingested_event.event_id.clone())
+                            .object("event", Some(ingested_event.event_id.clone()))
+                            .source_node_id(Some(propagation_source.to_string()))
+                            .scope(&envelope.scope)
+                            .details(json!({
+                                "event_kind": format!("{:?}", ingested_event.event_kind),
+                                "author_node_id": ingested_event.author_node_id,
+                                "created_at": ingested_event.created_at,
+                            })),
                         );
+                        if let Err(err) = self.maybe_sync_candidate_output(node, &ingested_event) {
+                            eprintln!(
+                                "candidate output sync failed for {}: {err}",
+                                ingested_event.event_id
+                            );
+                        }
+                        if let Err(err) = self.maybe_sync_topic_message_content(
+                            node,
+                            &ingested_event,
+                            envelope.content_source_node_id.as_deref(),
+                        ) {
+                            eprintln!(
+                                "topic content sync failed for {}: {err}",
+                                ingested_event.event_id
+                            );
+                        }
+                        if let crate::types::EventPayload::TopicMessagePosted(payload) =
+                            &ingested_event.payload
+                        {
+                            maybe_record_topic_cursor_for_event_id(
+                                node,
+                                &node.node_id(),
+                                &payload.feed_key,
+                                &envelope.scope,
+                                &ingested_event.event_id,
+                                ingested_event.created_at,
+                            )?;
+                            if let Some(state_dir) = &self.state_dir
+                                && let Ok(Some(event)) =
+                                    topic_message_agent_event(node, &ingested_event, payload)
+                            {
+                                let _ = deliver_agent_event_to_local_executor(
+                                    state_dir,
+                                    self.db_path.as_deref(),
+                                    &event,
+                                );
+                            }
+                        }
+                        self.record_scope_event_ingested(&envelope.scope);
+                        Ok(NetworkBridgeTick::EventIngested {
+                            peer: propagation_source,
+                            event_id: ingested_event.event_id.clone(),
+                        })
                     }
-                    self.record_scope_summary_applied(&summary.scope);
-                    Ok(NetworkBridgeTick::SummaryApplied {
-                        peer: propagation_source,
-                        summary_kind: summary.summary_kind,
-                    })
-                }
-                GossipMessage::Rule(rule) => {
-                    self.record_peer_scope_activity(propagation_source, &rule.scope);
-                    apply_rule_announcement(node, &rule)?;
-                    self.record_scope_rule_applied(&rule.scope);
-                    Ok(NetworkBridgeTick::RuleApplied {
-                        peer: propagation_source,
-                        rule_set: rule.rule_set,
-                        rule_version: rule.rule_version,
-                    })
-                }
-                GossipMessage::Checkpoint(checkpoint) => {
-                    self.record_peer_scope_activity(propagation_source, &checkpoint.scope);
-                    apply_checkpoint_announcement(node, &checkpoint)?;
-                    if let Some(state_dir) = &self.state_dir {
-                        let _ = crate::control::save_data_source_binding_record_state(
-                            state_dir,
-                            &crate::control::DataSourceBindingRecord {
-                                binding_kind: crate::control::DataSourceBindingKind::Checkpoint,
-                                binding_scope: Some(checkpoint.scope.label()?),
-                                binding_key: checkpoint.checkpoint_id.clone(),
-                                source_node_id: propagation_source.to_string(),
-                                source_uri: Some(checkpoint.artifact_path.clone()),
-                                updated_at: observed_at_ms(),
-                            },
-                        );
+                    GossipMessage::Summary(summary) => {
+                        self.record_peer_scope_activity(propagation_source, &summary.scope);
+                        apply_summary_announcement(node, &summary)?;
+                        if summary.summary_kind == AGENT_PAYMENT_SUMMARY_KIND
+                            && let Some(state_dir) = &self.state_dir
+                        {
+                            let _ = save_agent_payment_summary(
+                                state_dir,
+                                &summary.source_node_id,
+                                &summary,
+                            );
+                        }
+                        self.record_scope_summary_applied(&summary.scope);
+                        Ok(NetworkBridgeTick::SummaryApplied {
+                            peer: propagation_source,
+                            summary_kind: summary.summary_kind,
+                        })
                     }
-                    self.record_scope_checkpoint_applied(&checkpoint.scope);
-                    Ok(NetworkBridgeTick::CheckpointApplied {
-                        peer: propagation_source,
-                        checkpoint_id: checkpoint.checkpoint_id,
-                    })
+                    GossipMessage::Rule(rule) => {
+                        self.record_peer_scope_activity(propagation_source, &rule.scope);
+                        apply_rule_announcement(node, &rule)?;
+                        self.record_scope_rule_applied(&rule.scope);
+                        Ok(NetworkBridgeTick::RuleApplied {
+                            peer: propagation_source,
+                            rule_set: rule.rule_set,
+                            rule_version: rule.rule_version,
+                        })
+                    }
+                    GossipMessage::Checkpoint(checkpoint) => {
+                        self.record_peer_scope_activity(propagation_source, &checkpoint.scope);
+                        apply_checkpoint_announcement(node, &checkpoint)?;
+                        if let Some(state_dir) = &self.state_dir {
+                            let _ = crate::control::save_data_source_binding_record_state(
+                                state_dir,
+                                &crate::control::DataSourceBindingRecord {
+                                    binding_kind: crate::control::DataSourceBindingKind::Checkpoint,
+                                    binding_scope: Some(checkpoint.scope.label()?),
+                                    binding_key: checkpoint.checkpoint_id.clone(),
+                                    source_node_id: propagation_source.to_string(),
+                                    source_uri: Some(checkpoint.artifact_path.clone()),
+                                    updated_at: observed_at_ms(),
+                                },
+                            );
+                        }
+                        self.record_scope_checkpoint_applied(&checkpoint.scope);
+                        Ok(NetworkBridgeTick::CheckpointApplied {
+                            peer: propagation_source,
+                            checkpoint_id: checkpoint.checkpoint_id,
+                        })
+                    }
                 }
-            },
+            }
             NetworkRuntimeEvent::BackfillRequest {
                 peer,
                 request,
-                channel,
+                request_id,
             } => {
                 let response = backfill_response_for_request(
                     node,
@@ -478,7 +484,7 @@ impl NetworkBridgeService {
                     self.runtime.config().max_backfill_events_hard_limit,
                 )?;
                 let events = response.events.len();
-                match self.runtime.send_backfill_response(channel, response) {
+                match self.runtime.send_backfill_response(request_id, response) {
                     Ok(()) => Ok(NetworkBridgeTick::BackfillServed { peer, events }),
                     Err(error)
                         if error
@@ -499,7 +505,36 @@ impl NetworkBridgeService {
             } => {
                 self.record_peer_scope_activity(peer, &response.scope);
                 self.mark_backfill_completed(peer);
+                self.record_peer_remote_head_event_ids(
+                    peer,
+                    &response.scope,
+                    response.feed_key.as_deref(),
+                    &response.head_event_ids,
+                );
                 let events = ingest_backfill_response(node, &response)?;
+                let mut unknown_empty_head = false;
+                if response.events.is_empty() {
+                    for event_id in &response.head_event_ids {
+                        if node.store.event_seq_for_event_id(event_id)?.is_none() {
+                            unknown_empty_head = true;
+                            break;
+                        }
+                    }
+                }
+                if unknown_empty_head {
+                    self.reset_peer_backfill_cursor(
+                        peer,
+                        &response.scope,
+                        response.feed_key.as_deref(),
+                    );
+                } else {
+                    self.record_peer_backfill_cursor(
+                        peer,
+                        &response.scope,
+                        response.feed_key.as_deref(),
+                        response.next_from_event_seq,
+                    );
+                }
                 diagnostics::record_diagnostic(
                     self.state_dir.as_deref(),
                     diagnostics::DiagnosticEvent::new(
@@ -516,6 +551,8 @@ impl NetworkBridgeService {
                         "events_applied": events,
                         "events_received": response.events.len(),
                         "feed_key": response.feed_key,
+                        "head_event_ids": response.head_event_ids,
+                        "unknown_empty_head": unknown_empty_head,
                         "next_from_event_seq": response.next_from_event_seq,
                     })),
                 );
@@ -589,7 +626,7 @@ impl NetworkBridgeService {
             NetworkRuntimeEvent::ContactMaterialRequest {
                 peer,
                 request,
-                channel,
+                request_id,
             } => {
                 let local_node_id = self.local_peer_id().to_string();
                 let now = observed_at_ms();
@@ -625,7 +662,7 @@ impl NetworkBridgeService {
                     }
                 };
                 self.runtime
-                    .send_contact_material_response(channel, response)?;
+                    .send_contact_material_response(request_id, response)?;
                 Ok(NetworkBridgeTick::TransportNotice {
                     detail: format!("contact_material_served peer={peer}"),
                 })
@@ -697,7 +734,7 @@ impl NetworkBridgeService {
             NetworkRuntimeEvent::PeerRelationshipRequest {
                 peer,
                 request,
-                channel,
+                request_id,
             } => {
                 let action = control_peer_relationship_action(request.action);
                 let local_node_id = self.local_peer_id().to_string();
@@ -927,7 +964,7 @@ impl NetworkBridgeService {
                 };
                 match self
                     .runtime
-                    .send_peer_relationship_response(channel, response)
+                    .send_peer_relationship_response(request_id, response)
                 {
                     Ok(()) => Ok(tick),
                     Err(error)
@@ -1040,7 +1077,7 @@ impl NetworkBridgeService {
             NetworkRuntimeEvent::PeerDirectMessageRequest {
                 peer,
                 request,
-                channel,
+                request_id,
             } => {
                 let Some(state_dir) = self.state_dir.clone() else {
                     let response = PeerDirectMessageResponse {
@@ -1060,7 +1097,7 @@ impl NetworkBridgeService {
                     };
                     if let Err(err) = self
                         .runtime
-                        .send_peer_direct_message_response(channel, response)
+                        .send_peer_direct_message_response(request_id, response)
                     {
                         if err.to_string() == "peer direct message response channel closed" {
                             return Ok(NetworkBridgeTick::TransportNotice {
@@ -1097,7 +1134,7 @@ impl NetworkBridgeService {
                     };
                     if let Err(err) = self
                         .runtime
-                        .send_peer_direct_message_response(channel, response)
+                        .send_peer_direct_message_response(request_id, response)
                     {
                         if err.to_string() == "peer direct message response channel closed" {
                             return Ok(NetworkBridgeTick::TransportNotice {
@@ -1134,7 +1171,7 @@ impl NetworkBridgeService {
                     };
                     if let Err(err) = self
                         .runtime
-                        .send_peer_direct_message_response(channel, response)
+                        .send_peer_direct_message_response(request_id, response)
                     {
                         if err.to_string() == "peer direct message response channel closed" {
                             return Ok(NetworkBridgeTick::TransportNotice {
@@ -1336,7 +1373,7 @@ impl NetworkBridgeService {
                 };
                 if let Err(err) = self
                     .runtime
-                    .send_peer_direct_message_response(channel, response)
+                    .send_peer_direct_message_response(request_id, response)
                 {
                     if err.to_string() == "peer direct message response channel closed" {
                         return Ok(NetworkBridgeTick::TransportNotice {

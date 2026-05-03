@@ -475,8 +475,31 @@ fn local_control_peer_metadata_and_relationship_roundtrip() {
                     last_error: None,
                     contact_material_json: Some(
                         serde_json::to_string(&serde_json::json!({
-                            "peer_id": "peer-a",
-                            "listen_addrs": ["/ip4/203.0.113.10/tcp/4001"]
+                            "node_id": "node-a",
+                            "peer_id": "iroh-node-a",
+                            "listen_addrs": ["127.0.0.1:4001"],
+                            "transports": [{
+                                "transport": "iroh_direct",
+                                "peer_id": "iroh-node-a",
+                                "metadata": {
+                                    "route": "iroh_direct",
+                                    "generated_at": 1_700_000_000_400_u64,
+                                    "endpoint_id": "iroh-node-a",
+                                    "alpn": "/wattswarm/iroh/1",
+                                    "listen_addrs": ["127.0.0.1:4001"],
+                                    "capabilities": {
+                                        "supports_iroh_direct": true,
+                                        "supports_http_gateway": false,
+                                        "max_chunk_bytes": 16777216_u64
+                                    }
+                                },
+                                "extra": {
+                                    "endpoint_id": "iroh-node-a",
+                                    "alpn": "/wattswarm/iroh/1",
+                                    "direct_addrs": ["127.0.0.1:4001"],
+                                    "relay_urls": []
+                                }
+                            }]
                         }))
                         .expect("contact material"),
                     ),
@@ -524,6 +547,20 @@ fn local_control_peer_metadata_and_relationship_roundtrip() {
         assert_eq!(
             metadata[0].contact_material_updated_at,
             Some(1_700_000_000_400)
+        );
+        let contact_material = metadata[0]
+            .contact_material_json
+            .as_deref()
+            .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+            .expect("stored iroh contact material json");
+        assert_eq!(contact_material["peer_id"], "iroh-node-a");
+        assert_eq!(
+            contact_material["transports"][0]["transport"],
+            "iroh_direct"
+        );
+        assert_eq!(
+            contact_material["transports"][0]["metadata"]["endpoint_id"],
+            "iroh-node-a"
         );
 
         let relationships = store
@@ -631,6 +668,102 @@ fn local_control_peer_metadata_and_relationship_roundtrip() {
         assert_eq!(statuses[0].object_id, "msg-1");
         assert_eq!(statuses[0].route, "iroh_direct");
         assert_eq!(statuses[0].status, "content_hydrated");
+    });
+}
+
+#[test]
+fn local_control_network_peer_sync_state_roundtrip() {
+    with_test_schema(|| {
+        let store = PgStore::open("network-peer-sync-state-roundtrip.state").expect("open store");
+        let scope_id = local_control_scope_id(std::path::Path::new("/tmp/wattswarm-state"));
+
+        store
+            .upsert_local_network_peer_sync_state(
+                &scope_id,
+                &wattswarm_storage_core::storage::LocalNetworkPeerSyncStateRow {
+                    network_peer_id: "12D3KooWPeerA".to_owned(),
+                    known_scopes_json: serde_json::json!([
+                        {"kind": "global"},
+                        {"kind": "group", "value": "crew-7"}
+                    ])
+                    .to_string(),
+                    backfill_cursors_json: serde_json::json!([
+                        {
+                            "lane": {
+                                "scope": {"kind": "group", "value": "crew-7"},
+                                "feed_key": "crew.chat"
+                            },
+                            "cursor": 42
+                        }
+                    ])
+                    .to_string(),
+                    remote_heads_json: serde_json::json!([
+                        {
+                            "lane": {
+                                "scope": {"kind": "group", "value": "crew-7"},
+                                "feed_key": "crew.chat"
+                            },
+                            "head_event_ids": ["evt-head"]
+                        }
+                    ])
+                    .to_string(),
+                    backfill_successes: 3,
+                    backfill_failures: 1,
+                    updated_at: 1_700_000_000_000,
+                },
+            )
+            .expect("upsert peer sync state");
+
+        let rows = store
+            .list_local_network_peer_sync_states(&scope_id)
+            .expect("list peer sync state");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].network_peer_id, "12D3KooWPeerA");
+        assert_eq!(rows[0].backfill_successes, 3);
+        assert_eq!(rows[0].backfill_failures, 1);
+        assert_eq!(rows[0].updated_at, 1_700_000_000_000);
+        assert!(rows[0].known_scopes_json.contains("crew-7"));
+        assert!(rows[0].backfill_cursors_json.contains("\"cursor\":42"));
+        assert!(rows[0].remote_heads_json.contains("evt-head"));
+    });
+}
+
+#[test]
+fn local_control_identity_columns_use_network_peer_or_node_naming() {
+    with_test_schema(|| {
+        let _store = PgStore::open("identity-column-audit.state").expect("open store");
+        let conn = open_test_connection();
+        let rows = conn
+            .prepare(
+                "SELECT table_name, column_name
+                 FROM information_schema.columns
+                 WHERE table_schema = current_schema()
+                   AND table_name IN (
+                     'peer_metadata_local',
+                     'discovered_peers_local',
+                     'peer_relationships_local',
+                     'network_peer_sync_state_local',
+                     'peer_dm_threads_local',
+                     'peer_dm_messages_local'
+                   )
+                   AND column_name LIKE '%peer_id%'
+                 ORDER BY table_name, column_name",
+            )
+            .expect("prepare identity column audit")
+            .query_map(wattswarm_storage_core::params![], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .expect("query identity columns")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("collect identity columns");
+
+        assert_eq!(
+            rows,
+            vec![(
+                "network_peer_sync_state_local".to_owned(),
+                "network_peer_id".to_owned()
+            )]
+        );
     });
 }
 

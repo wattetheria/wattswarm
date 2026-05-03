@@ -346,6 +346,7 @@ impl Node {
             EventPayload::FeedSubscriptionUpdated(payload) => {
                 let scope_hint = crate::types::normalized_scope_hint(&payload.scope_hint);
                 self.store.upsert_feed_subscription(
+                    &payload.network_id,
                     &payload.subscriber_node_id,
                     &payload.feed_key,
                     &scope_hint,

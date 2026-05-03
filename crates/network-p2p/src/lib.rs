@@ -2,6 +2,7 @@ use anyhow::{Result, anyhow};
 use libp2p::identify;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::{collections::HashMap, path::PathBuf};
 use wattswarm_network_substrate::{
     self as substrate, RawBackfillResponse, RawGossipMessage, SubstrateConfig, SubstrateNode,
     SubstrateRuntime, SubstrateRuntimeEvent,
@@ -10,15 +11,16 @@ use wattswarm_protocol::types::{Event, NetworkProtocolParams};
 #[cfg(test)]
 use wattswarm_protocol::types::{EventKind, EventPayload};
 
+#[cfg(feature = "iroh-runtime")]
+pub mod iroh_runtime;
+
 pub use substrate::{
-    BackfillRequestId, BackfillResponseChannel, ContactMaterialRequestId,
-    ContactMaterialResponseChannel, GossipKind, Multiaddr, NetworkRuntimeObservabilitySnapshot,
-    PeerDirectMessageRequestId, PeerDirectMessageResponseChannel, PeerDiscoverySourceKind,
-    PeerHandshakeMetadata, PeerId, PeerIdentificationMetadata, PeerRelationshipRequestId,
-    PeerRelationshipResponseChannel, RawAgentEnvelope, RawContactMaterial,
-    RawContactMaterialRequest, RawContactMaterialResponse, RawPeerDirectMessageKind,
-    RawPeerRelationshipAction, SwarmScope, TopicCatalog, TopicNamespace, TrafficGuardPeerHealth,
-    relay_reservation_addr, sanitize_segment,
+    BackfillResponseChannel, ContactMaterialResponseChannel, GossipKind, Multiaddr,
+    NetworkRuntimeObservabilitySnapshot, PeerDirectMessageResponseChannel, PeerDiscoverySourceKind,
+    PeerHandshakeMetadata, PeerId, PeerIdentificationMetadata, PeerRelationshipResponseChannel,
+    RawAgentEnvelope, RawContactMaterial, RawContactMaterialRequest, RawContactMaterialResponse,
+    RawPeerDirectMessageKind, RawPeerRelationshipAction, SwarmScope, TopicCatalog, TopicNamespace,
+    TrafficGuardPeerHealth, relay_reservation_addr, sanitize_segment,
 };
 
 pub type BackfillRequest = substrate::RawBackfillRequest;
@@ -30,6 +32,41 @@ pub type PeerRelationshipRequest = substrate::RawPeerRelationshipRequest;
 pub type PeerRelationshipResponse = substrate::RawPeerRelationshipResponse;
 pub type WattSwarmBehaviour = substrate::SubstrateBehaviour;
 pub type WattSwarmBehaviourEvent = substrate::SubstrateBehaviourEvent;
+
+macro_rules! define_outbound_request_id {
+    ($name:ident) => {
+        #[derive(
+            Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize,
+        )]
+        pub struct $name(u64);
+
+        impl $name {
+            pub(crate) fn new(value: u64) -> Self {
+                Self(value)
+            }
+        }
+
+        impl std::fmt::Display for $name {
+            fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(formatter, "{}", self.0)
+            }
+        }
+    };
+}
+
+define_outbound_request_id!(BackfillRequestId);
+define_outbound_request_id!(ContactMaterialRequestId);
+define_outbound_request_id!(PeerRelationshipRequestId);
+define_outbound_request_id!(PeerDirectMessageRequestId);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct InboundRequestId(u64);
+
+impl std::fmt::Display for InboundRequestId {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}", self.0)
+    }
+}
 
 pub const WATTSWARM_IDENTIFY_AGENT_PREFIX: &str = "wattswarm-network-p2p";
 
@@ -104,6 +141,8 @@ pub struct BackfillResponse {
     pub next_from_event_seq: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub feed_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub head_event_ids: Vec<String>,
     pub events: Vec<EventEnvelope>,
 }
 
@@ -278,12 +317,17 @@ impl NetworkP2pConfig {
 pub struct NetworkP2pNode {
     config: NetworkP2pConfig,
     inner: SubstrateNode,
+    iroh_state_dir: Option<PathBuf>,
 }
 
 impl NetworkP2pNode {
     pub fn new(config: NetworkP2pConfig, local_key: libp2p::identity::Keypair) -> Result<Self> {
         let inner = SubstrateNode::new(config.as_substrate(), local_key)?;
-        Ok(Self { config, inner })
+        Ok(Self {
+            config,
+            inner,
+            iroh_state_dir: None,
+        })
     }
 
     pub fn from_ed25519_secret_bytes(
@@ -295,7 +339,26 @@ impl NetworkP2pNode {
 
     pub fn generate(config: NetworkP2pConfig) -> Result<Self> {
         let inner = SubstrateNode::generate(config.as_substrate())?;
-        Ok(Self { config, inner })
+        Ok(Self {
+            config,
+            inner,
+            iroh_state_dir: None,
+        })
+    }
+
+    #[cfg(feature = "iroh-runtime")]
+    pub fn from_iroh_state_dir(
+        config: NetworkP2pConfig,
+        state_dir: impl Into<PathBuf>,
+        secret_key_32: [u8; 32],
+    ) -> Result<Self> {
+        let mut node = Self::from_ed25519_secret_bytes(config, secret_key_32)?;
+        node.iroh_state_dir = Some(state_dir.into());
+        Ok(node)
+    }
+
+    pub fn is_iroh_backed(&self) -> bool {
+        self.iroh_state_dir.is_some()
     }
 
     pub fn config(&self) -> &NetworkP2pConfig {
@@ -320,6 +383,7 @@ impl NetworkP2pNode {
 }
 
 #[derive(Debug)]
+#[allow(clippy::large_enum_variant)]
 pub enum NetworkRuntimeEvent {
     PeerDiscovered {
         peer: PeerId,
@@ -352,7 +416,7 @@ pub enum NetworkRuntimeEvent {
     BackfillRequest {
         peer: PeerId,
         request: BackfillRequest,
-        channel: BackfillResponseChannel,
+        request_id: InboundRequestId,
     },
     BackfillResponse {
         peer: PeerId,
@@ -371,7 +435,7 @@ pub enum NetworkRuntimeEvent {
     ContactMaterialRequest {
         peer: PeerId,
         request: ContactMaterialRequest,
-        channel: ContactMaterialResponseChannel,
+        request_id: InboundRequestId,
     },
     ContactMaterialResponse {
         peer: PeerId,
@@ -390,7 +454,7 @@ pub enum NetworkRuntimeEvent {
     PeerRelationshipRequest {
         peer: PeerId,
         request: PeerRelationshipRequest,
-        channel: PeerRelationshipResponseChannel,
+        request_id: InboundRequestId,
     },
     PeerRelationshipResponse {
         peer: PeerId,
@@ -409,7 +473,7 @@ pub enum NetworkRuntimeEvent {
     PeerDirectMessageRequest {
         peer: PeerId,
         request: PeerDirectMessageRequest,
-        channel: PeerDirectMessageResponseChannel,
+        request_id: InboundRequestId,
     },
     PeerDirectMessageResponse {
         peer: PeerId,
@@ -452,45 +516,162 @@ pub enum NetworkRuntimeEvent {
 
 pub struct NetworkRuntime {
     config: NetworkP2pConfig,
-    inner: SubstrateRuntime,
+    backend: NetworkRuntimeBackend,
+    local_peer_id: PeerId,
+    iroh_listen_addrs: Vec<Multiaddr>,
+    next_inbound_request_id: u64,
+    next_outbound_request_id: u64,
+    backfill_response_channels: HashMap<InboundRequestId, BackfillResponseChannel>,
+    contact_material_response_channels: HashMap<InboundRequestId, ContactMaterialResponseChannel>,
+    peer_relationship_response_channels: HashMap<InboundRequestId, PeerRelationshipResponseChannel>,
+    peer_direct_message_response_channels:
+        HashMap<InboundRequestId, PeerDirectMessageResponseChannel>,
+    legacy_backfill_request_ids: HashMap<substrate::BackfillRequestId, BackfillRequestId>,
+    legacy_contact_material_request_ids:
+        HashMap<substrate::ContactMaterialRequestId, ContactMaterialRequestId>,
+    legacy_peer_relationship_request_ids:
+        HashMap<substrate::PeerRelationshipRequestId, PeerRelationshipRequestId>,
+    legacy_peer_direct_message_request_ids:
+        HashMap<substrate::PeerDirectMessageRequestId, PeerDirectMessageRequestId>,
+}
+
+#[allow(clippy::large_enum_variant)]
+enum NetworkRuntimeBackend {
+    Legacy(SubstrateRuntime),
+    #[cfg(feature = "iroh-runtime")]
+    Iroh(iroh_runtime::IrohNetworkRuntime),
 }
 
 impl NetworkRuntime {
     pub fn new(node: NetworkP2pNode) -> Result<Self> {
         let config = node.config.clone();
-        let inner = SubstrateRuntime::new(node.inner)?;
-        Ok(Self { config, inner })
+        let local_peer_id = node.local_peer_id();
+        let backend = match node.iroh_state_dir {
+            #[cfg(feature = "iroh-runtime")]
+            Some(state_dir) => {
+                let endpoint_id =
+                    wattswarm_network_transport_iroh::local_endpoint_id_from_state_dir(&state_dir)?
+                        .to_string();
+                NetworkRuntimeBackend::Iroh(iroh_runtime::IrohNetworkRuntime::new(
+                    iroh_runtime::IrohRuntimeConfig {
+                        network_id: config.namespace.network_id.clone(),
+                        state_dir,
+                        local_network_peer_id: endpoint_id,
+                    },
+                )?)
+            }
+            #[cfg(not(feature = "iroh-runtime"))]
+            Some(_) => {
+                return Err(anyhow!(
+                    "iroh-backed NetworkP2pNode requires network-p2p iroh-runtime feature"
+                ));
+            }
+            None => NetworkRuntimeBackend::Legacy(SubstrateRuntime::new(node.inner)?),
+        };
+        Ok(Self {
+            config,
+            backend,
+            local_peer_id,
+            iroh_listen_addrs: Vec::new(),
+            next_inbound_request_id: 1,
+            next_outbound_request_id: 1,
+            backfill_response_channels: HashMap::new(),
+            contact_material_response_channels: HashMap::new(),
+            peer_relationship_response_channels: HashMap::new(),
+            peer_direct_message_response_channels: HashMap::new(),
+            legacy_backfill_request_ids: HashMap::new(),
+            legacy_contact_material_request_ids: HashMap::new(),
+            legacy_peer_relationship_request_ids: HashMap::new(),
+            legacy_peer_direct_message_request_ids: HashMap::new(),
+        })
     }
 
     pub fn local_peer_id(&self) -> PeerId {
-        self.inner.local_peer_id()
+        self.local_peer_id
     }
 
     pub fn config(&self) -> &NetworkP2pConfig {
         &self.config
     }
 
+    pub fn is_iroh_backed(&self) -> bool {
+        #[cfg(feature = "iroh-runtime")]
+        {
+            matches!(self.backend, NetworkRuntimeBackend::Iroh(_))
+        }
+        #[cfg(not(feature = "iroh-runtime"))]
+        {
+            false
+        }
+    }
+
     pub fn listen_addrs(&self) -> &[Multiaddr] {
-        self.inner.listen_addrs()
+        match &self.backend {
+            NetworkRuntimeBackend::Legacy(inner) => inner.listen_addrs(),
+            #[cfg(feature = "iroh-runtime")]
+            NetworkRuntimeBackend::Iroh(_) => &self.iroh_listen_addrs,
+        }
     }
 
     pub fn observability_snapshot(&self) -> NetworkRuntimeObservabilitySnapshot {
-        self.inner.observability_snapshot()
+        match &self.backend {
+            NetworkRuntimeBackend::Legacy(inner) => inner.observability_snapshot(),
+            #[cfg(feature = "iroh-runtime")]
+            NetworkRuntimeBackend::Iroh(inner) => iroh_observability_snapshot(inner),
+        }
+    }
+
+    pub fn known_remote_contact_count(&self) -> usize {
+        match &self.backend {
+            NetworkRuntimeBackend::Legacy(_) => 0,
+            #[cfg(feature = "iroh-runtime")]
+            NetworkRuntimeBackend::Iroh(inner) => {
+                inner.observability_snapshot().known_remote_contacts
+            }
+        }
     }
 
     pub fn allows_outbound_backfill_to(&self, peer: &PeerId) -> bool {
-        self.inner.allows_outbound_backfill_to(peer)
+        match &self.backend {
+            NetworkRuntimeBackend::Legacy(inner) => inner.allows_outbound_backfill_to(peer),
+            #[cfg(feature = "iroh-runtime")]
+            NetworkRuntimeBackend::Iroh(_) => true,
+        }
+    }
+
+    #[cfg(feature = "iroh-runtime")]
+    pub fn upsert_remote_contact_material(
+        &mut self,
+        remote_network_peer_id: impl Into<String>,
+        contact: wattswarm_network_transport_core::TransportContactMaterial,
+    ) -> Result<bool> {
+        match &mut self.backend {
+            NetworkRuntimeBackend::Legacy(_) => Ok(false),
+            NetworkRuntimeBackend::Iroh(inner) => {
+                inner.upsert_remote_contact_material(remote_network_peer_id, contact)
+            }
+        }
     }
 
     pub fn validate_identify_info(
         &self,
         info: &identify::Info,
     ) -> Result<(Vec<Multiaddr>, PeerIdentificationMetadata)> {
-        self.inner.validate_identify_info(info)
+        match &self.backend {
+            NetworkRuntimeBackend::Legacy(inner) => inner.validate_identify_info(info),
+            #[cfg(feature = "iroh-runtime")]
+            NetworkRuntimeBackend::Iroh(_) => {
+                Err(anyhow!("libp2p identify is not active for iroh runtime"))
+            }
+        }
     }
 
     pub fn subscribe_scope(&mut self, scope: &SwarmScope) -> Result<()> {
-        self.inner.subscribe_scope(scope)
+        match &mut self.backend {
+            NetworkRuntimeBackend::Legacy(inner) => inner.subscribe_scope(scope),
+            #[cfg(feature = "iroh-runtime")]
+            NetworkRuntimeBackend::Iroh(inner) => inner.subscribe_scope(scope),
+        }
     }
 
     pub fn subscribe_scope_kinds(
@@ -498,11 +679,19 @@ impl NetworkRuntime {
         scope: &SwarmScope,
         kinds: &[GossipKind],
     ) -> Result<()> {
-        self.inner.subscribe_scope_kinds(scope, kinds)
+        match &mut self.backend {
+            NetworkRuntimeBackend::Legacy(inner) => inner.subscribe_scope_kinds(scope, kinds),
+            #[cfg(feature = "iroh-runtime")]
+            NetworkRuntimeBackend::Iroh(inner) => inner.subscribe_scope_kinds(scope, kinds),
+        }
     }
 
     pub fn unsubscribe_scope(&mut self, scope: &SwarmScope) -> Result<()> {
-        self.inner.unsubscribe_scope(scope)
+        match &mut self.backend {
+            NetworkRuntimeBackend::Legacy(inner) => inner.unsubscribe_scope(scope),
+            #[cfg(feature = "iroh-runtime")]
+            NetworkRuntimeBackend::Iroh(inner) => inner.unsubscribe_scope(scope),
+        }
     }
 
     pub fn unsubscribe_scope_kinds(
@@ -510,19 +699,33 @@ impl NetworkRuntime {
         scope: &SwarmScope,
         kinds: &[GossipKind],
     ) -> Result<()> {
-        self.inner.unsubscribe_scope_kinds(scope, kinds)
+        match &mut self.backend {
+            NetworkRuntimeBackend::Legacy(inner) => inner.unsubscribe_scope_kinds(scope, kinds),
+            #[cfg(feature = "iroh-runtime")]
+            NetworkRuntimeBackend::Iroh(inner) => inner.unsubscribe_scope_kinds(scope, kinds),
+        }
     }
 
     pub fn dial(&mut self, addr: Multiaddr) -> Result<()> {
-        self.inner.dial(addr)
+        match &mut self.backend {
+            NetworkRuntimeBackend::Legacy(inner) => inner.dial(addr),
+            #[cfg(feature = "iroh-runtime")]
+            NetworkRuntimeBackend::Iroh(_) => Err(anyhow!(
+                "libp2p multiaddr dial is not active for iroh runtime; use iroh contact material"
+            )),
+        }
     }
 
     pub fn publish_gossip(&mut self, message: &GossipMessage) -> Result<()> {
-        self.inner.publish(
-            message.scope(),
-            message.kind(),
-            &encode_overlay_payload(message)?,
-        )
+        match &mut self.backend {
+            NetworkRuntimeBackend::Legacy(inner) => inner.publish(
+                message.scope(),
+                message.kind(),
+                &encode_overlay_payload(message)?,
+            ),
+            #[cfg(feature = "iroh-runtime")]
+            NetworkRuntimeBackend::Iroh(inner) => inner.publish_gossip(message),
+        }
     }
 
     pub fn send_backfill_request(
@@ -530,25 +733,53 @@ impl NetworkRuntime {
         peer: &PeerId,
         request: BackfillRequest,
     ) -> Result<BackfillRequestId> {
-        self.inner.send_backfill_request(peer, request)
+        match &mut self.backend {
+            NetworkRuntimeBackend::Legacy(inner) => {
+                let substrate_id = inner.send_backfill_request(peer, request)?;
+                let request_id = self.reserve_backfill_request_id();
+                self.legacy_backfill_request_ids
+                    .insert(substrate_id, request_id);
+                Ok(request_id)
+            }
+            #[cfg(feature = "iroh-runtime")]
+            NetworkRuntimeBackend::Iroh(inner) => {
+                inner.send_backfill_request(&peer.to_string(), request)
+            }
+        }
     }
 
     pub fn send_backfill_response(
         &mut self,
-        channel: BackfillResponseChannel,
+        request_id: InboundRequestId,
         response: BackfillResponse,
     ) -> Result<()> {
+        let NetworkRuntimeBackend::Legacy(inner) = &mut self.backend else {
+            #[cfg(feature = "iroh-runtime")]
+            return match &mut self.backend {
+                NetworkRuntimeBackend::Iroh(inner) => {
+                    inner.send_backfill_response(request_id, response)
+                }
+                NetworkRuntimeBackend::Legacy(_) => unreachable!(),
+            };
+            #[cfg(not(feature = "iroh-runtime"))]
+            unreachable!();
+        };
+        let channel = self
+            .backfill_response_channels
+            .remove(&request_id)
+            .ok_or_else(|| anyhow!("unknown backfill response request id {request_id}"))?;
         let items = response
             .events
             .iter()
             .map(EventEnvelope::encode_json)
             .collect::<Result<Vec<_>>>()?;
-        self.inner.send_backfill_response(
+        inner.send_backfill_response(
             channel,
             RawBackfillResponse {
                 scope: response.scope,
                 next_from_event_seq: response.next_from_event_seq,
                 feed_key: response.feed_key,
+                head_event_ids: response.head_event_ids,
                 items,
             },
         )
@@ -559,15 +790,42 @@ impl NetworkRuntime {
         peer: &PeerId,
         request: ContactMaterialRequest,
     ) -> Result<ContactMaterialRequestId> {
-        self.inner.send_contact_material_request(peer, request)
+        match &mut self.backend {
+            NetworkRuntimeBackend::Legacy(inner) => {
+                let substrate_id = inner.send_contact_material_request(peer, request)?;
+                let request_id = self.reserve_contact_material_request_id();
+                self.legacy_contact_material_request_ids
+                    .insert(substrate_id, request_id);
+                Ok(request_id)
+            }
+            #[cfg(feature = "iroh-runtime")]
+            NetworkRuntimeBackend::Iroh(inner) => {
+                inner.send_contact_material_request(&peer.to_string(), request)
+            }
+        }
     }
 
     pub fn send_contact_material_response(
         &mut self,
-        channel: ContactMaterialResponseChannel,
+        request_id: InboundRequestId,
         response: ContactMaterialResponse,
     ) -> Result<()> {
-        self.inner.send_contact_material_response(channel, response)
+        let NetworkRuntimeBackend::Legacy(inner) = &mut self.backend else {
+            #[cfg(feature = "iroh-runtime")]
+            return match &mut self.backend {
+                NetworkRuntimeBackend::Iroh(inner) => {
+                    inner.send_contact_material_response(request_id, response)
+                }
+                NetworkRuntimeBackend::Legacy(_) => unreachable!(),
+            };
+            #[cfg(not(feature = "iroh-runtime"))]
+            unreachable!();
+        };
+        let channel = self
+            .contact_material_response_channels
+            .remove(&request_id)
+            .ok_or_else(|| anyhow!("unknown contact material response request id {request_id}"))?;
+        inner.send_contact_material_response(channel, response)
     }
 
     pub fn send_peer_relationship_request(
@@ -575,16 +833,42 @@ impl NetworkRuntime {
         peer: &PeerId,
         request: PeerRelationshipRequest,
     ) -> Result<PeerRelationshipRequestId> {
-        self.inner.send_peer_relationship_request(peer, request)
+        match &mut self.backend {
+            NetworkRuntimeBackend::Legacy(inner) => {
+                let substrate_id = inner.send_peer_relationship_request(peer, request)?;
+                let request_id = self.reserve_peer_relationship_request_id();
+                self.legacy_peer_relationship_request_ids
+                    .insert(substrate_id, request_id);
+                Ok(request_id)
+            }
+            #[cfg(feature = "iroh-runtime")]
+            NetworkRuntimeBackend::Iroh(inner) => {
+                inner.send_peer_relationship_request(&peer.to_string(), request)
+            }
+        }
     }
 
     pub fn send_peer_relationship_response(
         &mut self,
-        channel: PeerRelationshipResponseChannel,
+        request_id: InboundRequestId,
         response: PeerRelationshipResponse,
     ) -> Result<()> {
-        self.inner
-            .send_peer_relationship_response(channel, response)
+        let NetworkRuntimeBackend::Legacy(inner) = &mut self.backend else {
+            #[cfg(feature = "iroh-runtime")]
+            return match &mut self.backend {
+                NetworkRuntimeBackend::Iroh(inner) => {
+                    inner.send_peer_relationship_response(request_id, response)
+                }
+                NetworkRuntimeBackend::Legacy(_) => unreachable!(),
+            };
+            #[cfg(not(feature = "iroh-runtime"))]
+            unreachable!();
+        };
+        let channel = self
+            .peer_relationship_response_channels
+            .remove(&request_id)
+            .ok_or_else(|| anyhow!("unknown peer relationship response request id {request_id}"))?;
+        inner.send_peer_relationship_response(channel, response)
     }
 
     pub fn send_peer_direct_message_request(
@@ -592,30 +876,133 @@ impl NetworkRuntime {
         peer: &PeerId,
         request: PeerDirectMessageRequest,
     ) -> Result<PeerDirectMessageRequestId> {
-        self.inner.send_peer_direct_message_request(peer, request)
+        match &mut self.backend {
+            NetworkRuntimeBackend::Legacy(inner) => {
+                let substrate_id = inner.send_peer_direct_message_request(peer, request)?;
+                let request_id = self.reserve_peer_direct_message_request_id();
+                self.legacy_peer_direct_message_request_ids
+                    .insert(substrate_id, request_id);
+                Ok(request_id)
+            }
+            #[cfg(feature = "iroh-runtime")]
+            NetworkRuntimeBackend::Iroh(inner) => {
+                inner.send_peer_direct_message_request(&peer.to_string(), request)
+            }
+        }
     }
 
     pub fn send_peer_direct_message_response(
         &mut self,
-        channel: PeerDirectMessageResponseChannel,
+        request_id: InboundRequestId,
         response: PeerDirectMessageResponse,
     ) -> Result<()> {
-        self.inner
-            .send_peer_direct_message_response(channel, response)
+        let NetworkRuntimeBackend::Legacy(inner) = &mut self.backend else {
+            #[cfg(feature = "iroh-runtime")]
+            return match &mut self.backend {
+                NetworkRuntimeBackend::Iroh(inner) => {
+                    inner.send_peer_direct_message_response(request_id, response)
+                }
+                NetworkRuntimeBackend::Legacy(_) => unreachable!(),
+            };
+            #[cfg(not(feature = "iroh-runtime"))]
+            unreachable!();
+        };
+        let channel = self
+            .peer_direct_message_response_channels
+            .remove(&request_id)
+            .ok_or_else(|| {
+                anyhow!("unknown peer direct message response request id {request_id}")
+            })?;
+        inner.send_peer_direct_message_response(channel, response)
     }
 
     pub async fn next_event(&mut self) -> Result<NetworkRuntimeEvent> {
-        Self::map_runtime_event(self.inner.next_event().await?)
+        match &mut self.backend {
+            NetworkRuntimeBackend::Legacy(inner) => {
+                let event = inner.next_event().await?;
+                self.map_runtime_event(event)
+            }
+            #[cfg(feature = "iroh-runtime")]
+            NetworkRuntimeBackend::Iroh(inner) => inner.next_event().await,
+        }
     }
 
     pub fn try_next_event(&mut self) -> Result<Option<NetworkRuntimeEvent>> {
-        self.inner
-            .try_next_event()?
-            .map(Self::map_runtime_event)
-            .transpose()
+        match &mut self.backend {
+            NetworkRuntimeBackend::Legacy(inner) => match inner.try_next_event()? {
+                Some(event) => Ok(Some(self.map_runtime_event(event)?)),
+                None => Ok(None),
+            },
+            #[cfg(feature = "iroh-runtime")]
+            NetworkRuntimeBackend::Iroh(inner) => inner.try_next_event(),
+        }
     }
 
-    fn map_runtime_event(event: SubstrateRuntimeEvent) -> Result<NetworkRuntimeEvent> {
+    fn reserve_inbound_request_id(&mut self) -> InboundRequestId {
+        let request_id = InboundRequestId(self.next_inbound_request_id);
+        self.next_inbound_request_id = self.next_inbound_request_id.saturating_add(1).max(1);
+        request_id
+    }
+
+    fn reserve_outbound_request_number(&mut self) -> u64 {
+        let request_id = self.next_outbound_request_id;
+        self.next_outbound_request_id = self.next_outbound_request_id.saturating_add(1).max(1);
+        request_id
+    }
+
+    fn reserve_backfill_request_id(&mut self) -> BackfillRequestId {
+        BackfillRequestId::new(self.reserve_outbound_request_number())
+    }
+
+    fn reserve_contact_material_request_id(&mut self) -> ContactMaterialRequestId {
+        ContactMaterialRequestId::new(self.reserve_outbound_request_number())
+    }
+
+    fn reserve_peer_relationship_request_id(&mut self) -> PeerRelationshipRequestId {
+        PeerRelationshipRequestId::new(self.reserve_outbound_request_number())
+    }
+
+    fn reserve_peer_direct_message_request_id(&mut self) -> PeerDirectMessageRequestId {
+        PeerDirectMessageRequestId::new(self.reserve_outbound_request_number())
+    }
+
+    fn backfill_request_id_for(
+        &mut self,
+        substrate_id: substrate::BackfillRequestId,
+    ) -> BackfillRequestId {
+        self.legacy_backfill_request_ids
+            .remove(&substrate_id)
+            .unwrap_or_else(|| self.reserve_backfill_request_id())
+    }
+
+    fn contact_material_request_id_for(
+        &mut self,
+        substrate_id: substrate::ContactMaterialRequestId,
+    ) -> ContactMaterialRequestId {
+        self.legacy_contact_material_request_ids
+            .remove(&substrate_id)
+            .unwrap_or_else(|| self.reserve_contact_material_request_id())
+    }
+
+    fn peer_relationship_request_id_for(
+        &mut self,
+        substrate_id: substrate::PeerRelationshipRequestId,
+    ) -> PeerRelationshipRequestId {
+        self.legacy_peer_relationship_request_ids
+            .remove(&substrate_id)
+            .unwrap_or_else(|| self.reserve_peer_relationship_request_id())
+    }
+
+    fn peer_direct_message_request_id_for(
+        &mut self,
+        substrate_id: substrate::PeerDirectMessageRequestId,
+    ) -> PeerDirectMessageRequestId {
+        self.legacy_peer_direct_message_request_ids
+            .remove(&substrate_id)
+            .unwrap_or_else(|| self.reserve_peer_direct_message_request_id())
+    }
+
+    fn map_runtime_event(&mut self, event: SubstrateRuntimeEvent) -> Result<NetworkRuntimeEvent> {
         Ok(match event {
             SubstrateRuntimeEvent::PeerDiscovered {
                 peer,
@@ -656,18 +1043,22 @@ impl NetworkRuntime {
                 peer,
                 request,
                 channel,
-            } => NetworkRuntimeEvent::BackfillRequest {
-                peer,
-                request,
-                channel,
-            },
+            } => {
+                let request_id = self.reserve_inbound_request_id();
+                self.backfill_response_channels.insert(request_id, channel);
+                NetworkRuntimeEvent::BackfillRequest {
+                    peer,
+                    request,
+                    request_id,
+                }
+            }
             SubstrateRuntimeEvent::BackfillResponse {
                 peer,
                 request_id,
                 response,
             } => NetworkRuntimeEvent::BackfillResponse {
                 peer,
-                request_id,
+                request_id: self.backfill_request_id_for(request_id),
                 response: decode_backfill_response(response)?,
             },
             SubstrateRuntimeEvent::BackfillOutboundFailure {
@@ -676,7 +1067,7 @@ impl NetworkRuntime {
                 error,
             } => NetworkRuntimeEvent::BackfillOutboundFailure {
                 peer,
-                request_id,
+                request_id: self.backfill_request_id_for(request_id),
                 error,
             },
             SubstrateRuntimeEvent::BackfillInboundFailure { peer, error } => {
@@ -686,18 +1077,23 @@ impl NetworkRuntime {
                 peer,
                 request,
                 channel,
-            } => NetworkRuntimeEvent::ContactMaterialRequest {
-                peer,
-                request,
-                channel,
-            },
+            } => {
+                let request_id = self.reserve_inbound_request_id();
+                self.contact_material_response_channels
+                    .insert(request_id, channel);
+                NetworkRuntimeEvent::ContactMaterialRequest {
+                    peer,
+                    request,
+                    request_id,
+                }
+            }
             SubstrateRuntimeEvent::ContactMaterialResponse {
                 peer,
                 request_id,
                 response,
             } => NetworkRuntimeEvent::ContactMaterialResponse {
                 peer,
-                request_id,
+                request_id: self.contact_material_request_id_for(request_id),
                 response,
             },
             SubstrateRuntimeEvent::ContactMaterialOutboundFailure {
@@ -706,7 +1102,7 @@ impl NetworkRuntime {
                 error,
             } => NetworkRuntimeEvent::ContactMaterialOutboundFailure {
                 peer,
-                request_id,
+                request_id: self.contact_material_request_id_for(request_id),
                 error,
             },
             SubstrateRuntimeEvent::ContactMaterialInboundFailure { peer, error } => {
@@ -716,18 +1112,23 @@ impl NetworkRuntime {
                 peer,
                 request,
                 channel,
-            } => NetworkRuntimeEvent::PeerRelationshipRequest {
-                peer,
-                request,
-                channel,
-            },
+            } => {
+                let request_id = self.reserve_inbound_request_id();
+                self.peer_relationship_response_channels
+                    .insert(request_id, channel);
+                NetworkRuntimeEvent::PeerRelationshipRequest {
+                    peer,
+                    request,
+                    request_id,
+                }
+            }
             SubstrateRuntimeEvent::PeerRelationshipResponse {
                 peer,
                 request_id,
                 response,
             } => NetworkRuntimeEvent::PeerRelationshipResponse {
                 peer,
-                request_id,
+                request_id: self.peer_relationship_request_id_for(request_id),
                 response,
             },
             SubstrateRuntimeEvent::PeerRelationshipOutboundFailure {
@@ -736,7 +1137,7 @@ impl NetworkRuntime {
                 error,
             } => NetworkRuntimeEvent::PeerRelationshipOutboundFailure {
                 peer,
-                request_id,
+                request_id: self.peer_relationship_request_id_for(request_id),
                 error,
             },
             SubstrateRuntimeEvent::PeerRelationshipInboundFailure { peer, error } => {
@@ -746,18 +1147,23 @@ impl NetworkRuntime {
                 peer,
                 request,
                 channel,
-            } => NetworkRuntimeEvent::PeerDirectMessageRequest {
-                peer,
-                request,
-                channel,
-            },
+            } => {
+                let request_id = self.reserve_inbound_request_id();
+                self.peer_direct_message_response_channels
+                    .insert(request_id, channel);
+                NetworkRuntimeEvent::PeerDirectMessageRequest {
+                    peer,
+                    request,
+                    request_id,
+                }
+            }
             SubstrateRuntimeEvent::PeerDirectMessageResponse {
                 peer,
                 request_id,
                 response,
             } => NetworkRuntimeEvent::PeerDirectMessageResponse {
                 peer,
-                request_id,
+                request_id: self.peer_direct_message_request_id_for(request_id),
                 response,
             },
             SubstrateRuntimeEvent::PeerDirectMessageOutboundFailure {
@@ -766,7 +1172,7 @@ impl NetworkRuntime {
                 error,
             } => NetworkRuntimeEvent::PeerDirectMessageOutboundFailure {
                 peer,
-                request_id,
+                request_id: self.peer_direct_message_request_id_for(request_id),
                 error,
             },
             SubstrateRuntimeEvent::PeerDirectMessageInboundFailure { peer, error } => {
@@ -806,7 +1212,7 @@ impl NetworkRuntime {
     }
 }
 
-fn decode_overlay_gossip(message: RawGossipMessage) -> Result<GossipMessage> {
+pub(crate) fn decode_overlay_gossip(message: RawGossipMessage) -> Result<GossipMessage> {
     let payload = &message.payload;
     match message.kind {
         GossipKind::Events => Ok(GossipMessage::Event(EventEnvelope::decode_json(payload)?)),
@@ -817,7 +1223,7 @@ fn decode_overlay_gossip(message: RawGossipMessage) -> Result<GossipMessage> {
     }
 }
 
-fn encode_overlay_payload(message: &GossipMessage) -> Result<Vec<u8>> {
+pub(crate) fn encode_overlay_payload(message: &GossipMessage) -> Result<Vec<u8>> {
     match message {
         GossipMessage::Event(envelope) | GossipMessage::Chat(envelope) => envelope.encode_json(),
         GossipMessage::Rule(rule) => Ok(serde_json::to_vec(rule)?),
@@ -836,8 +1242,63 @@ fn decode_backfill_response(response: RawBackfillResponse) -> Result<BackfillRes
         scope: response.scope,
         next_from_event_seq: response.next_from_event_seq,
         feed_key: response.feed_key,
+        head_event_ids: response.head_event_ids,
         events,
     })
+}
+
+#[cfg(feature = "iroh-runtime")]
+fn iroh_observability_snapshot(
+    runtime: &iroh_runtime::IrohNetworkRuntime,
+) -> NetworkRuntimeObservabilitySnapshot {
+    let snapshot = runtime.observability_snapshot();
+    let subscribed_iroh_gossip_topics = snapshot
+        .subscribed_topics
+        .iter()
+        .map(|subscription| {
+            format!(
+                "{:?}:{}:{}",
+                subscription.scope,
+                subscription.kind.as_str(),
+                subscription.topic_id_hex
+            )
+        })
+        .collect();
+    let peer_health = snapshot
+        .peer_quality
+        .iter()
+        .map(|entry| {
+            let score = -i64::from(entry.consecutive_failures);
+            let throttled = entry.retry_after_ms.is_some();
+            TrafficGuardPeerHealth {
+                peer: entry.network_peer_id.clone(),
+                score,
+                blacklisted: false,
+                reputation_tier: if throttled { "backoff" } else { "healthy" }.to_owned(),
+                quarantined: throttled,
+                quarantine_remaining_ms: entry.retry_after_ms.unwrap_or_default(),
+                ban_remaining_ms: 0,
+                throttle_factor_percent: if throttled { 0 } else { 100 },
+            }
+        })
+        .collect();
+    NetworkRuntimeObservabilitySnapshot {
+        p2p_foundation: "iroh".to_owned(),
+        local_iroh_endpoint_id: Some(snapshot.local_endpoint_id),
+        subscribed_iroh_gossip_topics,
+        known_iroh_contacts: snapshot.known_remote_contacts,
+        legacy_libp2p_active: false,
+        nat_status: "iroh-direct".to_owned(),
+        nat_public_address: None,
+        nat_confidence: 0,
+        relay_reservations: Vec::new(),
+        peer_health,
+        dropped_malformed_gossip: snapshot.counters.malformed_gossip_notifications,
+        invalid_control_payloads: snapshot.counters.invalid_control_payloads,
+        dial_failures: snapshot.counters.stream_request_failures,
+        response_validation_failures: 0,
+        retry_suppressed_dials: snapshot.counters.retry_suppressed_connects,
+    }
 }
 
 #[cfg(test)]
@@ -925,10 +1386,28 @@ mod tests {
             scope: SwarmScope::Global,
             next_from_event_seq: 2,
             feed_key: None,
+            head_event_ids: Vec::new(),
             items: vec![envelope.encode_json().unwrap()],
         })
         .unwrap();
         assert_eq!(response.events, vec![envelope]);
+    }
+
+    #[test]
+    fn inbound_response_request_ids_are_runtime_local_and_monotonic() {
+        let tokio_runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
+        let _guard = tokio_runtime.enter();
+        let node = NetworkP2pNode::generate(NetworkP2pConfig {
+            listen_addrs: vec!["/ip4/127.0.0.1/tcp/0".to_owned()],
+            enable_mdns: false,
+            ..NetworkP2pConfig::default()
+        })
+        .expect("network node");
+        let mut runtime = NetworkRuntime::new(node).expect("network runtime");
+
+        assert_eq!(runtime.reserve_inbound_request_id(), InboundRequestId(1));
+        assert_eq!(runtime.reserve_inbound_request_id(), InboundRequestId(2));
+        assert_eq!(runtime.reserve_inbound_request_id().to_string(), "3");
     }
 
     #[test]
@@ -941,5 +1420,28 @@ mod tests {
             .public()
             .to_peer_id();
         assert_eq!(node.local_peer_id(), expected);
+    }
+
+    #[cfg(feature = "iroh-runtime")]
+    #[test]
+    fn state_dir_node_starts_iroh_runtime_backend_without_libp2p_listener() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let secret = [77u8; 32];
+        std::fs::write(dir.path().join("node_seed.hex"), hex::encode(secret))
+            .expect("write node seed");
+        let node = NetworkP2pNode::from_iroh_state_dir(
+            NetworkP2pConfig::default(),
+            dir.path().to_path_buf(),
+            secret,
+        )
+        .expect("iroh node");
+        assert!(node.is_iroh_backed());
+
+        let runtime = NetworkRuntime::new(node).expect("iroh runtime");
+        assert!(runtime.is_iroh_backed());
+        assert!(runtime.listen_addrs().is_empty());
+        assert_eq!(runtime.observability_snapshot().nat_status, "iroh-direct");
+
+        wattswarm_network_transport_iroh::shutdown_local_iroh_data_plane(dir.path());
     }
 }

@@ -276,11 +276,13 @@ fn list_all_topic_messages(
     scope_hint: &str,
     max_messages: usize,
 ) -> Result<Vec<TopicMessageRow>> {
+    let network_id = resolve_network_id(node);
     let mut out = Vec::new();
     let mut before_created_at = None;
     let mut before_message_id = None;
     while out.len() < max_messages {
         let page = node.store.list_topic_messages_page(
+            &network_id,
             feed_key,
             scope_hint,
             before_created_at,
@@ -652,7 +654,10 @@ pub fn process_structured_topic_consensus(
     node: &mut Node,
     state_dir: &std::path::Path,
 ) -> Result<usize> {
-    let subscriptions = node.store.list_active_feed_subscriptions(&node.node_id())?;
+    let network_id = resolve_network_id(node);
+    let subscriptions = node
+        .store
+        .list_active_feed_subscriptions(&network_id, &node.node_id())?;
     let mut processed = 0_usize;
     for subscription in subscriptions {
         processed = processed.saturating_add(process_structured_topic_consensus_for_topic(

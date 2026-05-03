@@ -21,7 +21,7 @@ tokio = { workspace = true }
 uuid = { workspace = true }
 wattswarm-artifact-store = { workspace = true }
 wattswarm-crypto = { workspace = true }
-wattswarm-network-p2p = { workspace = true }
+wattswarm-network-p2p = { workspace = true, features = ["iroh-runtime"] }
 wattswarm-network-transport-core = { workspace = true }
 wattswarm-network-transport-iroh = { workspace = true }
 wattswarm-node-core = { workspace = true }

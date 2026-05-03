@@ -3,7 +3,7 @@
 WattSwarm is an open-source swarm coordination kernel for agent networks.
 This repository now contains a Rust-first v0.1 implementation of:
 
-- Hybrid network architecture with `libp2p` control-plane sync primitives and `Iroh` data-plane transport
+- Iroh-first P2P cutover in progress: state-dir startup now uses an Iroh-backed runtime, `iroh-gossip` is the notification foundation, Iroh QUIC streams carry direct control/backfill, and PostgreSQL-backed local state remains the source of truth
 - SEL append-only event log on PostgreSQL + replayable projections
 - Node-local artifact/object storage for references, topic/direct-message bodies, task outputs, evidence, checkpoints, snapshots, event batches, and availability manifests
 - PostgreSQL-backed run queue for multi-agent orchestration (`runs`, `run_steps`, `run_events`)
@@ -122,26 +122,26 @@ The workspace now includes dedicated crates and a control-plane bridge for node-
   - defines typed backfill request/response messages
   - defines typed peer-relationship request/response messages for node-to-node relationship execution
   - defines typed peer direct-message request/response messages for accepted node relationships
-  - builds the minimal libp2p behaviour set used by WattSwarm networking:
-    - gossipsub
-    - identify
-    - Kademlia
-    - relay client
-    - AutoNAT
-    - DCUtR
-    - request-response (CBOR backfill + peer relationship control + peer direct messaging)
-    - mDNS
-  - exposes a pollable network runtime for listen/dial/publish/backfill/relationship-control flows
+  - contains the feature-gated Iroh runtime surface used by the state-dir startup path
+  - derives deterministic Iroh gossip topic ids from Wattswarm network id + scope + gossip kind
+  - wraps Iroh control streams for typed backfill and contact-material request/response flows
+  - tracks Iroh peer quality with per-peer inflight limits, stream failures, retry backoff, invalid payload penalties, and retry-suppression counters
+  - exposes a pollable network runtime facade for subscribe/publish/backfill/contact/relationship-control flows
+  - keeps the existing libp2p behaviour set only as an explicit legacy/generated-node compatibility path; normal state-dir startup does not start a libp2p swarm
 - `crates/network-transport-core`
   - owns the shared data-plane transport abstraction used across WattSwarm-family projects
   - defines transport capabilities, protected contact material, transfer intents, and route selection
-  - keeps `libp2p` as the control plane while moving business-content payloads onto a separate data plane
 - `crates/network-transport-iroh`
-  - provides the shared Iroh-based direct data-plane implementation
-  - exports `iroh_direct` transport capabilities/contact material for remote peers
+  - provides the shared Iroh endpoint, direct data-plane implementation, gossip runtime dependency, and QUIC control stream ALPN
+  - exports `iroh_direct` transport capabilities/contact material for remote network peers
+  - reuses `iroh-gossip` and `iroh-blobs` capabilities first where they fit instead of adding custom equivalents
+  - registers the official `iroh-blobs` protocol on the shared Iroh endpoint for BLAKE3-addressed large payload transfer
   - serves topic message bodies, direct-message bodies, task outputs, and reference/blob recovery selected by the shared transport router
+  - supports contact-material and typed-control request/response over Iroh streams without requiring libp2p identify
 - `crates/control-plane/src/network_bridge/mod.rs`
-  - bridges libp2p gossip events into `node-core::ingest_remote`
+  - starts an Iroh-backed `NetworkRuntime` from the node `state_dir` on the main Wattswarm/Wattetheria path
+  - still supports the legacy generated-node libp2p runtime in tests and compatibility paths
+  - bridges runtime gossip events into `node-core::ingest_remote`
   - serves scope-aware backfill requests from the local event log
   - applies backfill responses into the local node projection pipeline
   - auto-requests backfill for every configured scope when a peer connection is established
@@ -151,14 +151,15 @@ The workspace now includes dedicated crates and a control-plane bridge for node-
   - propagates append-only revoke/penalty events so malicious event effects can be rolled back without deleting the event log
   - suppresses summary fanout while local publish backlog is high, keeping event catch-up ahead of summary traffic
   - can dial peer listen addresses discovered through the local PostgreSQL peer cache (`discovered_peers_local`)
+  - persists peer sync state in the local control database (`network_peer_sync_state_local`) so known scopes, backfill cursors, remote lane heads, and peer backfill quality survive reconnects and restarts
   - persists identify/handshake metadata into `peer_metadata_local`
   - executes node-to-node relationship requests over request-response and persists local relationship state into `peer_relationships_local`
   - supports DIAP-inspired (`Decentralized Intelligent Agent Protocol`) secure relationship execution by exchanging protected contact material after relationship acceptance and persisting it into `peer_metadata_local`
   - emits a point-to-point `relationship_established` confirmation after `accept`
   - persists direct-message threads into `peer_dm_threads_local`
   - persists direct-message payloads and delivery state into `peer_dm_messages_local`
-  - keeps direct-message control on `libp2p` while resolving direct-message content bodies over Iroh
-  - keeps topic/task control propagation on `libp2p` while resolving topic bodies and candidate/task output bodies over Iroh
+  - keeps legacy direct-message control isolated while resolving direct-message content bodies over Iroh
+  - keeps legacy topic/task control compatibility while resolving topic bodies and candidate/task output bodies over Iroh
   - records source-peer/data-source bindings for missing artifacts, evidence, checkpoints, and snapshots so direct fetch requests know which remote node to target
   - executes Iroh-backed direct fetch requests for artifact/evidence/checkpoint/snapshot recovery when remote contact material is available
 - `crates/artifact-store`
@@ -169,24 +170,26 @@ Current coverage in tests:
 
 - unit tests for artifact storage paths/IO
 - unit tests for network topic/backfill/runtime primitives
+- unit tests for Iroh gossip notifications, Iroh QUIC control-stream backfill/contact refresh, and `iroh-blobs` BLAKE3-addressed transfer over the shared endpoint
 - unit tests for bridge ingest and backfill helpers
+- unit tests for malformed gossip handling, control payload validation, all-control backpressure, persistent sync cursors, and remote-head tracking
 - integration tests for two-node global gossip sync and request-response backfill sync
 - integration tests for region/node scoped sync and summary import
 - integration tests for event revoke rollback and summary revoke cleanup across nodes
-- integration tests for two-node peer relationship request/accept and request/block flows over libp2p
-- integration tests for two-node relationship-established handshake, protected contact material exchange, and accepted-only direct messaging with `libp2p` control plus Iroh content fetch
+- legacy integration tests for two-node peer relationship request/accept and request/block flows over the generated-node compatibility path
+- legacy integration tests for two-node relationship-established handshake, protected contact material exchange, and accepted-only direct messaging with compatibility control plus Iroh content fetch
 - integration tests for periodic anti-entropy catch-up and reconnect recovery after a partition-like disconnect
 - integration tests for Iroh-backed direct fetch of task/evidence/checkpoint/snapshot data when remote contact material is available
-- integration tests for topic-message body sync and DM body sync over Iroh after libp2p control delivery
+- integration tests for topic-message body sync and DM body sync over Iroh after compatibility control delivery
 
 Runtime toggles:
 
 - `WATTSWARM_P2P_ENABLED=true` by default
 - set `WATTSWARM_P2P_ENABLED=false` to run WattSwarm in local-only mode
-- `WATTSWARM_P2P_MDNS=true` by default
-- `WATTSWARM_P2P_PORT=4001` by default
-- `WATTSWARM_P2P_LISTEN_ADDRS` can override the default listen multiaddr list
-- `WATTSWARM_P2P_BOOTSTRAP_PEERS=/ip4/203.0.113.10/tcp/4001/p2p/<peer-id>` seeds WAN bootstrap dialing and Kademlia discovery
+- `WATTSWARM_P2P_MDNS=true` by default for the legacy libp2p compatibility path
+- `WATTSWARM_P2P_PORT=4001` is the legacy libp2p compatibility listen port
+- `WATTSWARM_P2P_LISTEN_ADDRS` can override the legacy libp2p multiaddr list
+- `WATTSWARM_P2P_BOOTSTRAP_PEERS=/ip4/203.0.113.10/tcp/4001/p2p/<peer-id>` remains accepted as legacy bootstrap material while Iroh contact-material bootstrap is completed
 - `WATTSWARM_P2P_REGION_IDS=sol-1,sol-2` subscribes the node to those region scopes
 - `WATTSWARM_P2P_NODE_IDS=lab-a` subscribes the node to matching node scopes
 - `WATTSWARM_P2P_LOCAL_IDS=lab-a` is still accepted as a legacy alias for node scopes
@@ -194,7 +197,7 @@ Runtime toggles:
 Network-mode bootstrap behavior:
 
 - `WATTSWARM_NODE_MODE=network` tells the node to join an existing shared network instead of creating `local:` or `lan:` topology.
-- a joining node must know at least one bootstrap peer multiaddr; in product UI this is saved as `bootstrap_peers` inside `startup_config.json`
+- a joining node must know at least one bootstrap contact. Legacy libp2p multiaddrs remain accepted during compatibility, while Iroh contact material is the active direction for runtime sync.
 - if local PostgreSQL is missing `network_registry / org_registry / network_params`, the node now attempts an automatic bootstrap sync:
   - derives one or more bootstrap HTTP endpoints from configured peers (or explicit `WATTSWARM_NETWORK_BOOTSTRAP_HTTP_URLS`)
   - fetches the remote signed `NetworkBootstrapBundle`
@@ -206,29 +209,31 @@ Network-mode bootstrap behavior:
 
 WattSwarm's current decentralized networking model is:
 
-- `libp2p` control-plane publish/subscribe for events, summaries, references, routes, and scope metadata
-- `Iroh` data-plane transfer for business-content payloads such as topic bodies, DM bodies, task outputs, and artifact recovery
-- bootstrap-peer and Kademlia-assisted peer discovery
-- relay-assisted WAN reachability with DCUtR upgrade attempts
-- AutoNAT reachability probing against known peers
+- main state-dir startup path: Iroh-backed runtime
+- transition path: existing libp2p control-plane publish/subscribe remains available for explicit legacy/generated-node compatibility while the launch path moves to Iroh
+- Iroh notification/control/data transfer for gossip notifications, backfill/contact streams, topic bodies, DM bodies, task outputs, and artifact recovery
+- legacy bootstrap-peer and Kademlia-assisted peer discovery for libp2p compatibility paths
+- legacy relay-assisted WAN reachability with DCUtR upgrade attempts
+- legacy AutoNAT reachability probing against known peers
 - inbound dedupe and per-peer/topic traffic guards
 - topic/message/task control dissemination for scoped coordination traffic
 - persisted topic history with cursor/backfill recovery plus content rehydration by reference
 - request/response backfill for missed control-plane history
 - eventual consistency by replaying events into each node's local store
 
-This means nodes do not replicate PostgreSQL state directly. Instead, they exchange control-plane metadata over `libp2p`, resolve content bodies over `Iroh`, and then each node re-applies the resulting state into its own local event log, projections, and artifact/object store.
+This means nodes do not replicate PostgreSQL state directly. Instead, they exchange notifications and sync metadata over the active P2P runtime, resolve content bodies over Iroh, and then each node re-applies the resulting state into its own local event log, projections, and artifact/object store.
+
+Topic message reads are partitioned by `network_id + feed_key + scope_hint`. The public topic message API and the Wattetheria topic activity HTTP/gRPC projection accept `network_id`; if it is omitted, Wattswarm resolves the current node network id and uses that value for the storage query. This prevents identical feed/scope names on different networks from sharing topic history.
 
 ### Shared Control Plane vs Shared Data Plane
 
-WattSwarm now treats networking as two coordinated layers:
+WattSwarm is moving from a libp2p-control/Iroh-data split to an Iroh-first network foundation:
 
-- `libp2p` remains the shared control plane for:
-  - peer discovery
-  - gossip/topic propagation
-  - identify/Kademlia/relay-assisted reachability
-  - relationship control messages
-  - smaller request-response control flows
+- Iroh is the target foundation for:
+  - endpoint identity (`NodeId` / neutral `network_peer_id` naming)
+  - gossip notifications through `iroh-gossip`
+  - typed control streams for backfill and contact-material refresh
+  - direct data fetch and large content transfer
 - the shared transport/data-plane layer handles:
   - source-aware backfill payload recovery
   - artifact/evidence/blob transfer
@@ -237,12 +242,12 @@ WattSwarm now treats networking as two coordinated layers:
   - topic message bodies
   - candidate/task output bodies
   - future direct session/data exchange
-- `Iroh` is the first shared direct data-plane implementation behind that transport layer
+- libp2p remains a transition/legacy runtime path for explicit generated-node tests and compatibility while the Iroh event/request facade is completed
 
 This split keeps WattSwarm's decentralized network organization intact while enforcing a cleaner semantic boundary:
 
-- `libp2p` transports network control semantics
-- `Iroh` transports business-content payloads
+- P2P transport moves bytes, notifications, and catch-up requests
+- product-layer task/topic/hive semantics stay above the transport runtime
 
 The separation is by role and protocol meaning, not by payload size.
 
@@ -263,11 +268,11 @@ This means the longer-term deployment model is:
 
 ```mermaid
 flowchart TD
-    A["Node joins network"] --> B["Peer discovery<br/>mDNS / UDP announce / bootstrap peers / Kademlia"]
-    B --> C["P2P connections established<br/>direct, or via relay when needed"]
+    A["Node joins network"] --> B["Load bootstrap/contact material<br/>PostgreSQL + startup config"]
+    B --> C["Iroh endpoint online<br/>QUIC direct / relay urls where available"]
     C --> D["Node subscribes to configured scopes"]
     D --> E["Local topic set is derived<br/>namespace + scope + kind"]
-    C --> C1["AutoNAT probes reachability<br/>DCUtR attempts direct upgrade on relayed links"]
+    C --> C1["Iroh address lookup<br/>direct addrs + relay urls"]
 
     F["Local task/event/summary is produced"] --> G["Network bridge resolves scope"]
     G --> H["Publish to topic over gossip"]
@@ -403,10 +408,10 @@ flowchart LR
 Coordinator node + local Wattswarm store"]
 
     subgraph N["Decentralized Network Overlay"]
-        N1["LAN
-mDNS / UDP announce"]
-        N2["WAN
-bootstrap / Kademlia / AutoNAT / relay / DCUtR"]
+        N1["LAN / WAN
+Iroh contact material"]
+        N2["Iroh endpoint
+QUIC direct + relay urls"]
         N3["Sync + Repair
 gossip / backfill / anti-entropy"]
         N4["Scoped dissemination
@@ -520,12 +525,10 @@ specialization / faster closure / more stable network-level behavior"]
   - `node_id`
   - listen address hints for LAN dialing
 - bootstrap peer multiaddrs:
-  - static `/p2p/<peer-id>` addresses supplied at startup for WAN bootstrapping
+  - legacy static `/p2p/<peer-id>` addresses supplied at startup for compatibility bootstrapping
 - transport reachability signals:
-  - AutoNAT public/private status transitions
-  - relay reservation acceptance
-  - relay circuit establishment
-  - DCUtR upgrade success/failure notices
+  - Iroh endpoint id, direct addrs, relay urls, and contact-material freshness
+  - legacy AutoNAT/relay/DCUtR signals only for generated-node compatibility runs
 
 #### What does not propagate today
 
@@ -542,45 +545,61 @@ specialization / faster closure / more stable network-level behavior"]
 #### Broadcast vs pull
 
 - Broadcast today:
-  - `Event` gossip on the resolved scope topic
-  - `Summary` gossip on the resolved scope topic
-  - LAN peer discovery via mDNS / UDP announce
+  - `Event` notifications on the resolved Iroh gossip topic
+  - `Summary` notifications on the resolved Iroh gossip topic
+  - LAN peer discovery via UDP announce where enabled; mDNS remains legacy compatibility
 - Pull today:
-  - missing historical events through request/response backfill
-  - topic message bodies, direct-message bodies, candidate outputs, and reference artifacts through Iroh using content/reference pointers carried by the control plane
+  - missing historical events through Iroh control-stream backfill
+  - topic message bodies, direct-message bodies, candidate outputs, reference artifacts, and BLAKE3-addressed blobs through Iroh using content/reference pointers carried by the control plane
 - WAN discovery today:
-  - direct dialing of configured bootstrap peers
-  - identify and mDNS addresses are inserted into Kademlia
-  - Kademlia bootstrap and closest-peer queries are used to widen discovery
-  - bootstrap peers are also used as initial AutoNAT probe servers
-  - relay reservations are attempted through configured bootstrap peers so relayed paths exist before direct punch-through
-  - discovered WAN peers are persisted into local PostgreSQL `discovered_peers_local` with source kinds such as `bootstrap`, `identify`, and `kademlia`
-  - identify metadata is persisted separately into `peer_metadata_local`
+  - configured bootstrap/contact material is loaded from startup config and local PostgreSQL
+  - `iroh_direct` contact material is persisted in `peer_metadata_local`
+  - discovered compatibility peers are still persisted into local PostgreSQL `discovered_peers_local` with source kinds such as `bootstrap`, `identify`, and `kademlia`
+  - compatibility identify metadata is persisted separately into `peer_metadata_local`
 - Node relationship execution today:
   - node-to-node relationship actions are point-to-point request/response messages, not gossip subscriptions
   - supported actions are `request`, `accept`, `reject`, `cancel`, `remove`, `block`, and `unblock`
   - relationship requests and responses can carry an A2A-style agent envelope so agent-level intent/capability context travels with the node-level action
   - local relationship state is persisted into `peer_relationships_local`
 - Direct messaging today:
-  - direct-message control is point-to-point request/response, not gossip topics
-  - only `accepted` relationships may open a DM thread
-  - `accept` triggers an explicit `relationship_established` message so both sides have a concrete “relationship is live” event
-  - `relationship_established` exchanges DIAP-inspired (`Decentralized Intelligent Agent Protocol`) protected contact material and moves the thread into a ready session state
-  - subsequent direct messages send control metadata over `libp2p` and resolve the message body over Iroh via `content_ref`
-  - persisted direct-message records still land in:
+  - the public Wattswarm DM send API maps a 1-to-1 conversation onto a deterministic private scoped group:
+    - `feed_key = wattswarm.dm`
+    - `scope_hint = group:dm-<stable-pair-digest>`
+    - `gossip_kinds = ["messages"]`
+  - sent DM content is appended as a `TopicMessagePosted` event so normal scoped message sync, gossip notification, and backfill/catch-up can carry it
+  - the compatibility DM read model is still maintained in:
     - `peer_dm_threads_local`
     - `peer_dm_messages_local`
-  - current transport security comes from the Iroh/QUIC encrypted channel; WattSwarm does not currently apply a separate application-layer DM content encryption envelope
-  - current scope is execution-layer DM only; there is no product-layer chat UI or agent decision UX yet
+  - legacy peer-direct-message request/response code remains in-tree for old compatibility paths, but it is not the active public DM send path
+- Relationship control today:
+  - only `accepted` relationships should open user-visible DM threads at the product layer
+  - `accept` triggers an explicit `relationship_established` message so both sides have a concrete “relationship is live” event
+  - `relationship_established` exchanges DIAP-inspired (`Decentralized Intelligent Agent Protocol`) protected contact material and moves the thread into a ready session state
+  - current scope is still execution-layer transport/control; Wattetheria owns product-layer agent decisions, UI, access policy, and whether to project the private group into a visible conversation
 - Traffic protection today:
   - duplicate gossip payloads are dropped
-  - per-peer gossip and per-peer backfill request windows are rate-limited
+  - malformed gossip is dropped and counted without failing the runtime loop
+  - invalid request-response payloads are rejected before bridge/product logic
+  - per-peer gossip, per-peer backfill, and per-control-type request windows are rate-limited
+  - pending inbound/outbound control request maps are bounded
   - local per-topic publish windows are rate-limited
+  - dial attempts use per-peer/per-address retry backoff to avoid stale-address dial storms
+  - backfill responses are capped by item count and encoded byte size
+  - backfill peer selection now considers peer health plus previous backfill success/failure quality
+  - peer sync state persists known scopes, lane cursors, remote head ids, and backfill quality across reconnect/restart
+- Diagnose / observability today:
+  - active snapshots expose `p2p_foundation = iroh`, `local_iroh_endpoint_id`, joined Iroh gossip topic ids, known Iroh contact count, and `legacy_libp2p_active = false` on the state-dir startup path
+  - old NAT/relay/dial field names remain in the JSON shape for Wattetheria UI compatibility, but they are compatibility fields and should not be interpreted as active libp2p runtime state when `p2p_foundation` is `iroh`
+- PostgreSQL identity compatibility:
+  - durable sync identity uses `network_peer_id` in `network_peer_sync_state_local`; this value is a neutral network endpoint identity and can be an Iroh endpoint id
+  - `peer_metadata_local.node_id`, `discovered_peers_local.node_id`, `peer_relationships_local.remote_node_id`, and DM `remote_node_id` fields are node/business identities, not libp2p `PeerId` requirements
+  - `peer_metadata_local.contact_material_json` may still contain a JSON key named `peer_id` for compatibility with existing transport payloads; for `iroh_direct`, the authoritative endpoint is `metadata.endpoint_id` / `extra.endpoint_id`
+  - storage tests audit the local-control schema so main-path tables do not reintroduce libp2p-only `peer_id` identity columns
 - Not yet fully active end-to-end:
   - `RuleAnnouncement`
   - `CheckpointAnnouncement`
 
-`RuleAnnouncement` and `CheckpointAnnouncement` exist in the protocol model, but the current bridge logic does not yet apply them as first-class synchronized state transitions.
+`RuleAnnouncement` and `CheckpointAnnouncement` exist in the protocol model, but product-level rule/checkpoint semantics are still limited to bridge/projection plumbing and are not treated as complete synchronized product workflows.
 
 #### How nodes subscribe
 
@@ -618,28 +637,30 @@ WattSwarm now separates three node-local peer layers:
 - `peer_relationships_local`
   - local relationship state machine (`requested`, `accepted`, `rejected`, `blocked`, etc.)
 
-Relationship execution is point-to-point:
+Relationship execution currently remains point-to-point on the transition runtime:
 
-1. a node sends a structured relationship request over libp2p request-response
+1. a node sends a structured relationship request over the runtime request/response facade
 2. the remote node applies the request to its local relationship state
 3. the remote node returns a structured response
 4. if the relationship transitions to `accepted`, the accepting side immediately sends `relationship_established`
 5. `relationship_established` exchanges DIAP-inspired (`Decentralized Intelligent Agent Protocol`) protected contact material and creates a ready DM thread on both nodes
 
-Direct messaging is also point-to-point:
+Direct messaging currently remains point-to-point on the transition runtime:
 
-1. the sender must already have `accepted` relationship state for the remote node
-2. the DM thread must be in `ready` session state
-3. the sender materializes the DM body into a local `DirectMessage` artifact and emits a structured direct-message control request with `content_ref` plus optional A2A-style agent envelope
-4. the receiver resolves the referenced DM body over Iroh, persists the inbound message, and returns delivery acknowledgement
-5. the sender updates local delivery state when the acknowledgement arrives
+1. Wattetheria decides whether the sender is allowed to initiate or continue the conversation
+2. the Wattswarm send API derives `group:dm-<stable-pair-digest>` from the local and remote node ids
+3. the sender subscribes the local node to `wattswarm.dm` / that private group with `gossip_kinds = ["messages"]`
+4. Wattswarm emits a `TopicMessagePosted` event with the DM content and optional A2A-style agent envelope
+5. the compatibility DM read model is updated so existing Wattetheria DM projections can continue reading thread/message rows
 
 This DM path is execution-layer only. Product-layer agent decisions about whether to request, accept, reject, or initiate a DM still belong above WattSwarm.
 
+Wattetheria still owns the product-layer projection: if a private DM group should be visible as a conversation, member-gated, or attached to identity/friend policy, that belongs in Wattetheria.
+
 Topic chat and task candidate propagation now follow the same principle:
 
-1. `libp2p` carries control metadata such as scope, route, references, cursors, and task/candidate state
-2. `Iroh` carries the corresponding message body or task output content
+1. the active P2P runtime carries control metadata such as scope, route, references, cursors, and task/candidate state
+2. Iroh carries the corresponding message body or task output content
 3. each receiving node rehydrates content locally before updating its final local projection view
 
 #### How propagation actually spreads
@@ -668,7 +689,7 @@ The local source of truth remains local. The shared network layer is the exchang
 
 To keep `global` from becoming a high-frequency firehose, the bridge now rate-limits high-frequency task-lifecycle traffic on the global scope. Fast-moving task coordination should use region or node scopes.
 
-Anti-entropy is also scope-aware now: once a peer is observed carrying a given scope, recovery prefers routing that scope's backfill through that peer instead of blindly asking every connected peer for every scope on every round.
+Anti-entropy is also scope-aware now: once a peer is observed carrying a given scope, recovery prefers routing that scope's backfill through that peer instead of blindly asking every connected peer for every scope on every round. Backfill is lane-aware (`peer + scope + optional feed lane`), records remote head hints, resets a lane when an empty response advertises unseen heads, and persists sync state so reconnects and restarts do not lose cursor knowledge.
 
 Task scope hints:
 
@@ -788,7 +809,7 @@ Kernel container startup behavior:
 - runs `run init` automatically (queue schema bootstrap)
 - auto-registers executor `rt -> http://runtime:8787`
 - starts UI server on `0.0.0.0:7788`
-- starts the background libp2p network bridge by default
+- starts the background Iroh-backed network bridge by default
 
 Worker container startup behavior:
 
@@ -821,10 +842,10 @@ Worker tuning env vars:
 P2P env vars:
 
 - `WATTSWARM_P2P_ENABLED=true` by default
-- `WATTSWARM_P2P_MDNS=true` by default
-- `WATTSWARM_P2P_PORT=4001`
-- `WATTSWARM_P2P_LISTEN_ADDRS` optional comma-separated multiaddr override
-- `WATTSWARM_P2P_BOOTSTRAP_PEERS` optional comma-separated `/p2p/<peer-id>` bootstrap multiaddr list
+- `WATTSWARM_P2P_MDNS=true` is retained for the legacy generated-node compatibility path
+- `WATTSWARM_P2P_PORT=4001` is retained as the legacy compatibility listen port
+- `WATTSWARM_P2P_LISTEN_ADDRS` is an optional legacy compatibility multiaddr override
+- `WATTSWARM_P2P_BOOTSTRAP_PEERS` still accepts legacy `/p2p/<peer-id>` bootstrap multiaddr material during the Iroh contact-material cutover
 - `WATTSWARM_P2P_REGION_IDS` optional comma-separated region scope subscription list
 - `WATTSWARM_P2P_NODE_IDS` optional comma-separated node scope subscription list
 - `WATTSWARM_P2P_LOCAL_IDS` optional legacy alias for node scope subscription list
@@ -844,7 +865,7 @@ Optional UDP announce switch (default off):
 - `WATTSWARM_UDP_ANNOUNCE_PORT=37931`
 - with switch enabled, startup emits announce payload and UI process listens on the same port and records discovered peer IDs into PostgreSQL `discovered_peers_local`
 - the same local peer registry also stores WAN discoveries; `source_kind` distinguishes `udp`, `mdns`, `bootstrap`, `identify`, and `kademlia`
-- when a peer advertise includes a libp2p listen address, that address is also recorded and used by the background network bridge for automatic LAN dialing
+- when a peer advertise includes legacy listen material, that address is recorded for compatibility; active Iroh sync uses persisted `iroh_direct` contact material when available
 - `peers list` and `/api/peers/list` include the discovered peers loaded from that local PostgreSQL cache
 
 Examples:

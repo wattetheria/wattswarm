@@ -46,12 +46,23 @@ const PER_PEER_MSGS_PER_WINDOW: usize = 1_200;
 const PER_PEER_TOPIC_MSGS_PER_WINDOW: usize = 600;
 const PER_TOPIC_PUBLISHES_PER_WINDOW: usize = 600;
 const PER_PEER_BACKFILL_REQUESTS_PER_WINDOW: usize = 60;
+const PER_PEER_CONTROL_REQUESTS_PER_WINDOW: usize = 180;
+const MAX_PENDING_OUTBOUND_CONTROL_REQUESTS: usize = 512;
+const MAX_PENDING_INBOUND_CONTROL_REQUESTS: usize = 512;
 const TRAFFIC_THROTTLED_SCORE: i64 = -4;
 const TRAFFIC_QUARANTINE_SCORE: i64 = -8;
 const TRAFFIC_BAN_SCORE: i64 = -16;
 const TRAFFIC_QUARANTINE_DURATION: Duration = Duration::from_secs(90);
 const TRAFFIC_BAN_DURATION: Duration = Duration::from_secs(5 * 60);
 const TRAFFIC_FAILURE_PENALTY: i64 = 2;
+const MAX_BACKFILL_KNOWN_EVENT_IDS: usize = 256;
+const MAX_BACKFILL_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+const MAX_AGENT_ENVELOPE_JSON_BYTES: usize = 64 * 1024;
+const MAX_CONTACT_MATERIAL_JSON_BYTES: usize = 64 * 1024;
+const MAX_CONTROL_JSON_BYTES: usize = 64 * 1024;
+const MAX_CONTROL_DETAIL_BYTES: usize = 8 * 1024;
+const MAX_DIAL_BACKOFF: Duration = Duration::from_secs(60);
+const INITIAL_DIAL_BACKOFF: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -254,6 +265,8 @@ pub struct RawBackfillRequest {
     pub limit: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub feed_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub known_event_ids: Vec<String>,
 }
 
 impl RawBackfillRequest {
@@ -272,6 +285,16 @@ impl RawBackfillRequest {
         {
             bail!("backfill feed_key must not be empty");
         }
+        if self.known_event_ids.len() > MAX_BACKFILL_KNOWN_EVENT_IDS {
+            bail!("backfill known_event_ids exceeds configured max");
+        }
+        if self
+            .known_event_ids
+            .iter()
+            .any(|event_id| event_id.trim().is_empty())
+        {
+            bail!("backfill known_event_ids must not contain empty event ids");
+        }
         Ok(())
     }
 }
@@ -282,7 +305,44 @@ pub struct RawBackfillResponse {
     pub next_from_event_seq: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub feed_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub head_event_ids: Vec<String>,
     pub items: Vec<Vec<u8>>,
+}
+
+impl RawBackfillResponse {
+    pub fn validate(&self, max_limit: usize, hard_limit: usize) -> Result<()> {
+        if self.items.len() > max_limit {
+            bail!("backfill response items exceeds configured max");
+        }
+        if self.items.len() > hard_limit {
+            bail!("backfill response items exceeds hard safety limit");
+        }
+        let response_bytes = self
+            .items
+            .iter()
+            .try_fold(0usize, |total, item| total.checked_add(item.len()))
+            .ok_or_else(|| anyhow!("backfill response byte count overflow"))?;
+        if response_bytes > MAX_BACKFILL_RESPONSE_BYTES {
+            bail!("backfill response bytes exceeds configured max");
+        }
+        if let Some(feed_key) = &self.feed_key
+            && feed_key.trim().is_empty()
+        {
+            bail!("backfill response feed_key must not be empty");
+        }
+        if self.head_event_ids.len() > MAX_BACKFILL_KNOWN_EVENT_IDS {
+            bail!("backfill response head_event_ids exceeds configured max");
+        }
+        if self
+            .head_event_ids
+            .iter()
+            .any(|event_id| event_id.trim().is_empty())
+        {
+            bail!("backfill response head_event_ids must not contain empty event ids");
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -314,6 +374,9 @@ impl RawPeerRelationshipRequest {
         if self.target_node_id.trim().is_empty() {
             bail!("peer relationship request target_node_id is required");
         }
+        if let Some(envelope) = &self.agent_envelope {
+            envelope.validate()?;
+        }
         Ok(())
     }
 }
@@ -341,6 +404,16 @@ impl RawPeerRelationshipResponse {
         if self.target_node_id.trim().is_empty() {
             bail!("peer relationship response target_node_id is required");
         }
+        if let Some(envelope) = &self.agent_envelope {
+            envelope.validate()?;
+        }
+        if let Some(detail) = &self.detail {
+            validate_max_bytes(
+                "peer relationship response detail",
+                detail,
+                MAX_CONTROL_DETAIL_BYTES,
+            )?;
+        }
         Ok(())
     }
 }
@@ -362,12 +435,47 @@ pub struct RawAgentEnvelope {
     pub signature: Option<String>,
 }
 
+impl RawAgentEnvelope {
+    pub fn validate(&self) -> Result<()> {
+        if self.protocol.trim().is_empty() {
+            bail!("agent envelope protocol is required");
+        }
+        validate_max_bytes(
+            "agent envelope message_json",
+            &self.message_json,
+            MAX_AGENT_ENVELOPE_JSON_BYTES,
+        )?;
+        if let Some(extensions_json) = &self.extensions_json {
+            validate_max_bytes(
+                "agent envelope extensions_json",
+                extensions_json,
+                MAX_AGENT_ENVELOPE_JSON_BYTES,
+            )?;
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RawContactMaterial {
     pub material_json: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signature: Option<String>,
     pub generated_at: u64,
+}
+
+impl RawContactMaterial {
+    pub fn validate(&self) -> Result<()> {
+        validate_max_bytes(
+            "contact material",
+            &self.material_json,
+            MAX_CONTACT_MATERIAL_JSON_BYTES,
+        )?;
+        if self.generated_at == 0 {
+            bail!("contact material generated_at is required");
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -407,6 +515,16 @@ impl RawContactMaterialResponse {
         }
         if self.target_node_id.trim().is_empty() {
             bail!("contact material response target_node_id is required");
+        }
+        if let Some(material) = &self.contact_material {
+            material.validate()?;
+        }
+        if let Some(detail) = &self.detail {
+            validate_max_bytes(
+                "contact material response detail",
+                detail,
+                MAX_CONTROL_DETAIL_BYTES,
+            )?;
         }
         Ok(())
     }
@@ -451,6 +569,12 @@ impl RawPeerDirectMessageRequest {
         if self.message_id.trim().is_empty() {
             bail!("peer direct message message_id is required");
         }
+        if let Some(envelope) = &self.agent_envelope {
+            envelope.validate()?;
+        }
+        if let Some(material) = &self.contact_material {
+            material.validate()?;
+        }
         match self.kind {
             RawPeerDirectMessageKind::Message => {
                 let Some(content_ref) = &self.content_ref else {
@@ -467,9 +591,15 @@ impl RawPeerDirectMessageRequest {
             }
             RawPeerDirectMessageKind::RelationshipEstablished
             | RawPeerDirectMessageKind::SessionInit => {
-                if self.control_json.as_deref().unwrap_or("").trim().is_empty() {
+                let control_json = self.control_json.as_deref().unwrap_or("");
+                if control_json.trim().is_empty() {
                     bail!("peer direct message control_json is required for control kinds");
                 }
+                validate_max_bytes(
+                    "peer direct message control_json",
+                    control_json,
+                    MAX_CONTROL_JSON_BYTES,
+                )?;
             }
         }
         Ok(())
@@ -505,6 +635,19 @@ impl RawPeerDirectMessageResponse {
         }
         if self.message_id.trim().is_empty() {
             bail!("peer direct message response message_id is required");
+        }
+        if self.delivery_state.trim().is_empty() {
+            bail!("peer direct message response delivery_state is required");
+        }
+        if let Some(material) = &self.contact_material {
+            material.validate()?;
+        }
+        if let Some(detail) = &self.detail {
+            validate_max_bytes(
+                "peer direct message response detail",
+                detail,
+                MAX_CONTROL_DETAIL_BYTES,
+            )?;
         }
         Ok(())
     }
@@ -633,11 +776,23 @@ impl SubstrateConfig {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[allow(clippy::large_enum_variant)]
 pub enum RawControlRequest {
     Backfill(RawBackfillRequest),
     ContactMaterial(RawContactMaterialRequest),
     PeerRelationship(RawPeerRelationshipRequest),
     PeerDirectMessage(RawPeerDirectMessageRequest),
+}
+
+impl RawControlRequest {
+    pub fn validate(&self, max_backfill_events: usize, backfill_hard_limit: usize) -> Result<()> {
+        match self {
+            Self::Backfill(request) => request.validate(max_backfill_events, backfill_hard_limit),
+            Self::ContactMaterial(request) => request.validate(),
+            Self::PeerRelationship(request) => request.validate(),
+            Self::PeerDirectMessage(request) => request.validate(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -646,6 +801,17 @@ pub enum RawControlResponse {
     ContactMaterial(RawContactMaterialResponse),
     PeerRelationship(RawPeerRelationshipResponse),
     PeerDirectMessage(RawPeerDirectMessageResponse),
+}
+
+impl RawControlResponse {
+    pub fn validate(&self, max_backfill_events: usize, backfill_hard_limit: usize) -> Result<()> {
+        match self {
+            Self::Backfill(response) => response.validate(max_backfill_events, backfill_hard_limit),
+            Self::ContactMaterial(response) => response.validate(),
+            Self::PeerRelationship(response) => response.validate(),
+            Self::PeerDirectMessage(response) => response.validate(),
+        }
+    }
 }
 
 pub type BackfillRequestId = request_response::OutboundRequestId;
@@ -1070,11 +1236,40 @@ pub struct TrafficGuardPeerHealth {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NetworkRuntimeObservabilitySnapshot {
+    pub p2p_foundation: String,
+    pub local_iroh_endpoint_id: Option<String>,
+    pub subscribed_iroh_gossip_topics: Vec<String>,
+    pub known_iroh_contacts: usize,
+    pub legacy_libp2p_active: bool,
     pub nat_status: String,
     pub nat_public_address: Option<String>,
     pub nat_confidence: u32,
     pub relay_reservations: Vec<String>,
     pub peer_health: Vec<TrafficGuardPeerHealth>,
+    pub dropped_malformed_gossip: u64,
+    pub invalid_control_payloads: u64,
+    pub dial_failures: u64,
+    pub response_validation_failures: u64,
+    pub retry_suppressed_dials: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum ControlRequestKind {
+    Backfill,
+    ContactMaterial,
+    PeerRelationship,
+    PeerDirectMessage,
+}
+
+impl ControlRequestKind {
+    fn from_request(request: &RawControlRequest) -> Self {
+        match request {
+            RawControlRequest::Backfill(_) => Self::Backfill,
+            RawControlRequest::ContactMaterial(_) => Self::ContactMaterial,
+            RawControlRequest::PeerRelationship(_) => Self::PeerRelationship,
+            RawControlRequest::PeerDirectMessage(_) => Self::PeerDirectMessage,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -1084,9 +1279,12 @@ struct TrafficGuard {
     peer_topic_windows: HashMap<(PeerId, String), Vec<Instant>>,
     local_publish_windows: HashMap<String, Vec<Instant>>,
     backfill_request_windows: HashMap<PeerId, Vec<Instant>>,
+    control_request_windows: HashMap<(PeerId, ControlRequestKind), Vec<Instant>>,
     peer_scores: HashMap<PeerId, i64>,
     quarantined_peers: HashMap<PeerId, Instant>,
     banned_peers: HashMap<PeerId, Instant>,
+    dropped_malformed_gossip: u64,
+    invalid_control_payloads: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1124,9 +1322,12 @@ impl TrafficGuard {
             peer_topic_windows: HashMap::new(),
             local_publish_windows: HashMap::new(),
             backfill_request_windows: HashMap::new(),
+            control_request_windows: HashMap::new(),
             peer_scores: HashMap::new(),
             quarantined_peers: HashMap::new(),
             banned_peers: HashMap::new(),
+            dropped_malformed_gossip: 0,
+            invalid_control_payloads: 0,
         }
     }
 
@@ -1216,6 +1417,37 @@ impl TrafficGuard {
         true
     }
 
+    fn allow_control_request(
+        &mut self,
+        peer: PeerId,
+        kind: ControlRequestKind,
+        now: Instant,
+    ) -> bool {
+        if matches!(kind, ControlRequestKind::Backfill) {
+            return self.allow_backfill_request(peer, now);
+        }
+        self.gc_peer_actions(now);
+        let policy = self.policy_for_peer(peer, now);
+        if matches!(
+            policy,
+            TrafficPolicyTier::Quarantined | TrafficPolicyTier::Banned
+        ) {
+            return false;
+        }
+        let limit = throttled_limit(PER_PEER_CONTROL_REQUESTS_PER_WINDOW, policy);
+        let window = self
+            .control_request_windows
+            .entry((peer, kind))
+            .or_default();
+        prune_window(window, now, TRAFFIC_WINDOW);
+        if window.len() >= limit {
+            self.penalize(peer, 2, now);
+            return false;
+        }
+        window.push(now);
+        true
+    }
+
     fn penalize(&mut self, peer: PeerId, amount: i64, now: Instant) {
         let score = self.peer_scores.entry(peer).or_insert(0);
         *score -= amount;
@@ -1295,6 +1527,16 @@ impl TrafficGuard {
         self.penalize(peer, TRAFFIC_FAILURE_PENALTY, now);
     }
 
+    fn note_invalid_control_message(&mut self, peer: PeerId, now: Instant) {
+        self.invalid_control_payloads = self.invalid_control_payloads.saturating_add(1);
+        self.penalize(peer, TRAFFIC_FAILURE_PENALTY, now);
+    }
+
+    fn note_invalid_gossip_message(&mut self, peer: PeerId, now: Instant) {
+        self.dropped_malformed_gossip = self.dropped_malformed_gossip.saturating_add(1);
+        self.penalize(peer, TRAFFIC_FAILURE_PENALTY, now);
+    }
+
     fn note_handshake_rejection(&mut self, peer: PeerId, now: Instant) {
         self.penalize(peer, TRAFFIC_QUARANTINE_SCORE.abs(), now);
     }
@@ -1324,6 +1566,25 @@ pub struct SubstrateRuntime {
     nat_status: String,
     nat_public_address: Option<Multiaddr>,
     nat_confidence: u32,
+    dial_attempts: HashMap<String, DialAttemptState>,
+    dial_failures: u64,
+    retry_suppressed_dials: u64,
+    response_validation_failures: u64,
+}
+
+#[derive(Debug, Clone)]
+struct DialAttemptState {
+    failures: u32,
+    next_attempt_at: Instant,
+}
+
+impl DialAttemptState {
+    fn new(now: Instant) -> Self {
+        Self {
+            failures: 0,
+            next_attempt_at: now,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1332,6 +1593,17 @@ enum PendingRequestKind {
     ContactMaterial,
     PeerRelationship,
     PeerDirectMessage,
+}
+
+impl PendingRequestKind {
+    fn for_request(request: &RawControlRequest) -> Self {
+        match request {
+            RawControlRequest::Backfill(_) => Self::Backfill,
+            RawControlRequest::ContactMaterial(_) => Self::ContactMaterial,
+            RawControlRequest::PeerRelationship(_) => Self::PeerRelationship,
+            RawControlRequest::PeerDirectMessage(_) => Self::PeerDirectMessage,
+        }
+    }
 }
 
 impl SubstrateRuntime {
@@ -1357,6 +1629,10 @@ impl SubstrateRuntime {
             nat_status: "unknown".to_owned(),
             nat_public_address: None,
             nat_confidence: 0,
+            dial_attempts: HashMap::new(),
+            dial_failures: 0,
+            retry_suppressed_dials: 0,
+            response_validation_failures: 0,
         };
         this.listen_on_configured_addrs()?;
         this.seed_bootstrap_peers()?;
@@ -1401,11 +1677,21 @@ impl SubstrateRuntime {
         relay_reservations.sort();
 
         NetworkRuntimeObservabilitySnapshot {
+            p2p_foundation: "legacy-libp2p".to_owned(),
+            local_iroh_endpoint_id: None,
+            subscribed_iroh_gossip_topics: Vec::new(),
+            known_iroh_contacts: 0,
+            legacy_libp2p_active: true,
             nat_status: self.nat_status.clone(),
             nat_public_address: self.nat_public_address.as_ref().map(ToString::to_string),
             nat_confidence: self.nat_confidence,
             relay_reservations,
             peer_health,
+            dropped_malformed_gossip: self.traffic_guard.dropped_malformed_gossip,
+            invalid_control_payloads: self.traffic_guard.invalid_control_payloads,
+            dial_failures: self.dial_failures,
+            response_validation_failures: self.response_validation_failures,
+            retry_suppressed_dials: self.retry_suppressed_dials,
         }
     }
 
@@ -1524,6 +1810,66 @@ impl SubstrateRuntime {
         Ok(())
     }
 
+    fn dial_key(peer: PeerId, addr: &Multiaddr) -> String {
+        format!("{peer}|{addr}")
+    }
+
+    fn dial_backoff_for_failures(failures: u32) -> Duration {
+        let multiplier = 1_u32.checked_shl(failures.min(6)).unwrap_or(64);
+        INITIAL_DIAL_BACKOFF
+            .saturating_mul(multiplier)
+            .min(MAX_DIAL_BACKOFF)
+    }
+
+    fn dial_peer_with_backoff(&mut self, peer: PeerId, addr: Multiaddr) -> Result<bool> {
+        let now = Instant::now();
+        let key = Self::dial_key(peer, &addr);
+        let next_attempt_at = self
+            .dial_attempts
+            .get(&key)
+            .map(|state| state.next_attempt_at)
+            .unwrap_or(now);
+        if next_attempt_at > now {
+            self.retry_suppressed_dials = self.retry_suppressed_dials.saturating_add(1);
+            return Ok(false);
+        }
+        match self.swarm.dial(addr) {
+            Ok(()) => {
+                let state = self
+                    .dial_attempts
+                    .entry(key)
+                    .or_insert_with(|| DialAttemptState::new(now));
+                state.failures = 0;
+                state.next_attempt_at = now + INITIAL_DIAL_BACKOFF;
+                Ok(true)
+            }
+            Err(err)
+                if err
+                    .to_string()
+                    .to_ascii_lowercase()
+                    .contains("duplicate connection") =>
+            {
+                let state = self
+                    .dial_attempts
+                    .entry(key)
+                    .or_insert_with(|| DialAttemptState::new(now));
+                state.failures = 0;
+                state.next_attempt_at = now + INITIAL_DIAL_BACKOFF;
+                Ok(false)
+            }
+            Err(err) => {
+                self.dial_failures = self.dial_failures.saturating_add(1);
+                let state = self
+                    .dial_attempts
+                    .entry(key)
+                    .or_insert_with(|| DialAttemptState::new(now));
+                state.failures = state.failures.saturating_add(1);
+                state.next_attempt_at = now + Self::dial_backoff_for_failures(state.failures);
+                Err(anyhow!(err))
+            }
+        }
+    }
+
     pub fn publish(&mut self, scope: &SwarmScope, kind: GossipKind, payload: &[u8]) -> Result<()> {
         let topic_name = self.config.namespace.topic_name(scope, kind)?;
         if !self
@@ -1551,6 +1897,7 @@ impl SubstrateRuntime {
         peer: &PeerId,
         request: RawBackfillRequest,
     ) -> Result<BackfillRequestId> {
+        self.ensure_outbound_request_capacity()?;
         request.validate(
             self.config.max_backfill_events,
             self.config.max_backfill_events_hard_limit,
@@ -1570,6 +1917,10 @@ impl SubstrateRuntime {
         channel: BackfillResponseChannel,
         response: RawBackfillResponse,
     ) -> Result<()> {
+        response.validate(
+            self.config.max_backfill_events,
+            self.config.max_backfill_events_hard_limit,
+        )?;
         self.swarm
             .behaviour_mut()
             .request_response
@@ -1583,6 +1934,7 @@ impl SubstrateRuntime {
         peer: &PeerId,
         request: RawContactMaterialRequest,
     ) -> Result<ContactMaterialRequestId> {
+        self.ensure_outbound_request_capacity()?;
         request.validate()?;
         let request_id = self
             .swarm
@@ -1613,6 +1965,7 @@ impl SubstrateRuntime {
         peer: &PeerId,
         request: RawPeerRelationshipRequest,
     ) -> Result<PeerRelationshipRequestId> {
+        self.ensure_outbound_request_capacity()?;
         request.validate()?;
         let request_id = self
             .swarm
@@ -1643,6 +1996,7 @@ impl SubstrateRuntime {
         peer: &PeerId,
         request: RawPeerDirectMessageRequest,
     ) -> Result<PeerDirectMessageRequestId> {
+        self.ensure_outbound_request_capacity()?;
         request.validate()?;
         let request_id = self
             .swarm
@@ -1665,6 +2019,20 @@ impl SubstrateRuntime {
             .request_response
             .send_response(channel, RawControlResponse::PeerDirectMessage(response))
             .map_err(|_| anyhow!("peer direct message response channel closed"))?;
+        Ok(())
+    }
+
+    fn ensure_outbound_request_capacity(&self) -> Result<()> {
+        if self.pending_outbound_request_kinds.len() >= MAX_PENDING_OUTBOUND_CONTROL_REQUESTS {
+            bail!("outbound control request queue is full");
+        }
+        Ok(())
+    }
+
+    fn ensure_inbound_request_capacity(&self) -> Result<()> {
+        if self.pending_inbound_request_kinds.len() >= MAX_PENDING_INBOUND_CONTROL_REQUESTS {
+            bail!("inbound control request queue is full");
+        }
         Ok(())
     }
 
@@ -1704,15 +2072,7 @@ impl SubstrateRuntime {
     fn seed_bootstrap_peers(&mut self) -> Result<()> {
         for (peer, addr) in self.config.parse_bootstrap_peers()? {
             self.register_peer_address(peer, addr.clone(), PeerDiscoverySourceKind::Bootstrap);
-            match self.swarm.dial(addr.clone()) {
-                Ok(()) => {}
-                Err(err)
-                    if err
-                        .to_string()
-                        .to_ascii_lowercase()
-                        .contains("duplicate connection") => {}
-                Err(err) => return Err(anyhow!(err)),
-            }
+            let _ = self.dial_peer_with_backoff(peer, addr.clone())?;
             self.ensure_relay_reservation(peer, addr)?;
         }
         self.trigger_kademlia_refresh();
@@ -1772,15 +2132,7 @@ impl SubstrateRuntime {
             return;
         }
         self.register_peer_address(peer, addr.clone(), source);
-        match self.swarm.dial(addr) {
-            Ok(()) => {}
-            Err(err)
-                if err
-                    .to_string()
-                    .to_ascii_lowercase()
-                    .contains("duplicate connection") => {}
-            Err(_) => {}
-        }
+        let _ = self.dial_peer_with_backoff(peer, addr);
     }
 
     fn trigger_kademlia_refresh(&mut self) {
@@ -1837,9 +2189,17 @@ impl SubstrateRuntime {
                 ) {
                     return Ok(None);
                 }
+                let message = match RawGossipMessage::decode_json(&message.data) {
+                    Ok(message) => message,
+                    Err(_) => {
+                        self.traffic_guard
+                            .note_invalid_gossip_message(propagation_source, Instant::now());
+                        return Ok(None);
+                    }
+                };
                 Ok(Some(SubstrateRuntimeEvent::Gossip {
                     propagation_source,
-                    message: RawGossipMessage::decode_json(&message.data)?,
+                    message,
                 }))
             }
             SwarmEvent::Behaviour(SubstrateBehaviourEvent::RequestResponse(
@@ -1849,87 +2209,148 @@ impl SubstrateRuntime {
                     request_id,
                     request,
                     channel,
-                } => match request {
-                    RawControlRequest::Backfill(request) => {
-                        if !self
-                            .traffic_guard
-                            .allow_backfill_request(peer, Instant::now())
-                        {
-                            return Ok(None);
+                } => {
+                    if self.ensure_inbound_request_capacity().is_err() {
+                        self.traffic_guard
+                            .note_invalid_control_message(peer, Instant::now());
+                        return Ok(None);
+                    }
+                    if let Err(_err) = request.validate(
+                        self.config.max_backfill_events,
+                        self.config.max_backfill_events_hard_limit,
+                    ) {
+                        self.traffic_guard
+                            .note_invalid_control_message(peer, Instant::now());
+                        return Ok(None);
+                    }
+                    let control_kind = ControlRequestKind::from_request(&request);
+                    if !self
+                        .traffic_guard
+                        .allow_control_request(peer, control_kind, Instant::now())
+                    {
+                        return Ok(None);
+                    }
+                    let request_kind = PendingRequestKind::for_request(&request);
+                    match request {
+                        RawControlRequest::Backfill(request) => {
+                            self.pending_inbound_request_kinds
+                                .insert(request_id, request_kind);
+                            Ok(Some(SubstrateRuntimeEvent::BackfillRequest {
+                                peer,
+                                request,
+                                channel,
+                            }))
                         }
-                        self.pending_inbound_request_kinds
-                            .insert(request_id, PendingRequestKind::Backfill);
-                        Ok(Some(SubstrateRuntimeEvent::BackfillRequest {
-                            peer,
-                            request,
-                            channel,
-                        }))
+                        RawControlRequest::ContactMaterial(request) => {
+                            self.pending_inbound_request_kinds
+                                .insert(request_id, request_kind);
+                            Ok(Some(SubstrateRuntimeEvent::ContactMaterialRequest {
+                                peer,
+                                request,
+                                channel,
+                            }))
+                        }
+                        RawControlRequest::PeerRelationship(request) => {
+                            self.pending_inbound_request_kinds
+                                .insert(request_id, request_kind);
+                            Ok(Some(SubstrateRuntimeEvent::PeerRelationshipRequest {
+                                peer,
+                                request,
+                                channel,
+                            }))
+                        }
+                        RawControlRequest::PeerDirectMessage(request) => {
+                            self.pending_inbound_request_kinds
+                                .insert(request_id, request_kind);
+                            Ok(Some(SubstrateRuntimeEvent::PeerDirectMessageRequest {
+                                peer,
+                                request,
+                                channel,
+                            }))
+                        }
                     }
-                    RawControlRequest::ContactMaterial(request) => {
-                        self.pending_inbound_request_kinds
-                            .insert(request_id, PendingRequestKind::ContactMaterial);
-                        Ok(Some(SubstrateRuntimeEvent::ContactMaterialRequest {
-                            peer,
-                            request,
-                            channel,
-                        }))
-                    }
-                    RawControlRequest::PeerRelationship(request) => {
-                        self.pending_inbound_request_kinds
-                            .insert(request_id, PendingRequestKind::PeerRelationship);
-                        Ok(Some(SubstrateRuntimeEvent::PeerRelationshipRequest {
-                            peer,
-                            request,
-                            channel,
-                        }))
-                    }
-                    RawControlRequest::PeerDirectMessage(request) => {
-                        self.pending_inbound_request_kinds
-                            .insert(request_id, PendingRequestKind::PeerDirectMessage);
-                        Ok(Some(SubstrateRuntimeEvent::PeerDirectMessageRequest {
-                            peer,
-                            request,
-                            channel,
-                        }))
-                    }
-                },
+                }
                 RequestResponseMessage::Response {
                     request_id,
                     response,
-                } => match response {
-                    RawControlResponse::Backfill(response) => {
-                        self.pending_outbound_request_kinds.remove(&request_id);
-                        Ok(Some(SubstrateRuntimeEvent::BackfillResponse {
-                            peer,
-                            request_id,
-                            response,
-                        }))
+                } => {
+                    if let Err(err) = response.validate(
+                        self.config.max_backfill_events,
+                        self.config.max_backfill_events_hard_limit,
+                    ) {
+                        self.response_validation_failures =
+                            self.response_validation_failures.saturating_add(1);
+                        self.traffic_guard
+                            .note_invalid_control_message(peer, Instant::now());
+                        let error = format!("invalid control response: {err}");
+                        return Ok(
+                            match self.pending_outbound_request_kinds.remove(&request_id) {
+                                Some(PendingRequestKind::Backfill) | None => {
+                                    Some(SubstrateRuntimeEvent::BackfillOutboundFailure {
+                                        peer,
+                                        request_id,
+                                        error,
+                                    })
+                                }
+                                Some(PendingRequestKind::ContactMaterial) => {
+                                    Some(SubstrateRuntimeEvent::ContactMaterialOutboundFailure {
+                                        peer,
+                                        request_id,
+                                        error,
+                                    })
+                                }
+                                Some(PendingRequestKind::PeerRelationship) => {
+                                    Some(SubstrateRuntimeEvent::PeerRelationshipOutboundFailure {
+                                        peer,
+                                        request_id,
+                                        error,
+                                    })
+                                }
+                                Some(PendingRequestKind::PeerDirectMessage) => {
+                                    Some(SubstrateRuntimeEvent::PeerDirectMessageOutboundFailure {
+                                        peer,
+                                        request_id,
+                                        error,
+                                    })
+                                }
+                            },
+                        );
                     }
-                    RawControlResponse::ContactMaterial(response) => {
-                        self.pending_outbound_request_kinds.remove(&request_id);
-                        Ok(Some(SubstrateRuntimeEvent::ContactMaterialResponse {
-                            peer,
-                            request_id,
-                            response,
-                        }))
+                    match response {
+                        RawControlResponse::Backfill(response) => {
+                            self.pending_outbound_request_kinds.remove(&request_id);
+                            Ok(Some(SubstrateRuntimeEvent::BackfillResponse {
+                                peer,
+                                request_id,
+                                response,
+                            }))
+                        }
+                        RawControlResponse::ContactMaterial(response) => {
+                            self.pending_outbound_request_kinds.remove(&request_id);
+                            Ok(Some(SubstrateRuntimeEvent::ContactMaterialResponse {
+                                peer,
+                                request_id,
+                                response,
+                            }))
+                        }
+                        RawControlResponse::PeerRelationship(response) => {
+                            self.pending_outbound_request_kinds.remove(&request_id);
+                            Ok(Some(SubstrateRuntimeEvent::PeerRelationshipResponse {
+                                peer,
+                                request_id,
+                                response,
+                            }))
+                        }
+                        RawControlResponse::PeerDirectMessage(response) => {
+                            self.pending_outbound_request_kinds.remove(&request_id);
+                            Ok(Some(SubstrateRuntimeEvent::PeerDirectMessageResponse {
+                                peer,
+                                request_id,
+                                response,
+                            }))
+                        }
                     }
-                    RawControlResponse::PeerRelationship(response) => {
-                        self.pending_outbound_request_kinds.remove(&request_id);
-                        Ok(Some(SubstrateRuntimeEvent::PeerRelationshipResponse {
-                            peer,
-                            request_id,
-                            response,
-                        }))
-                    }
-                    RawControlResponse::PeerDirectMessage(response) => {
-                        self.pending_outbound_request_kinds.remove(&request_id);
-                        Ok(Some(SubstrateRuntimeEvent::PeerDirectMessageResponse {
-                            peer,
-                            request_id,
-                            response,
-                        }))
-                    }
-                },
+                }
             },
             SwarmEvent::Behaviour(SubstrateBehaviourEvent::RequestResponse(
                 request_response::Event::OutboundFailure {
@@ -2164,6 +2585,13 @@ fn throttled_limit(base: usize, policy: TrafficPolicyTier) -> usize {
     ((base.saturating_mul(factor)).max(100)) / 100
 }
 
+fn validate_max_bytes(label: &str, value: &str, max_bytes: usize) -> Result<()> {
+    if value.len() > max_bytes {
+        bail!("{label} exceeds configured max bytes");
+    }
+    Ok(())
+}
+
 fn nat_status_label(status: &autonat::NatStatus) -> String {
     match status {
         autonat::NatStatus::Public(_) => "public".to_owned(),
@@ -2229,6 +2657,7 @@ mod tests {
             from_event_seq: 10,
             limit: 5,
             feed_key: Some("feed".to_owned()),
+            known_event_ids: Vec::new(),
         };
         req.validate(10, 20).unwrap();
         assert!(
@@ -2240,10 +2669,112 @@ mod tests {
             .is_err()
         );
         assert!(
-            RawBackfillRequest { limit: 25, ..req }
-                .validate(10, 20)
-                .is_err()
+            RawBackfillRequest {
+                limit: 25,
+                ..req.clone()
+            }
+            .validate(10, 20)
+            .is_err()
         );
+        assert!(
+            RawBackfillRequest {
+                limit: 5,
+                known_event_ids: vec!["event".to_owned(); MAX_BACKFILL_KNOWN_EVENT_IDS + 1],
+                ..req
+            }
+            .validate(10, 20)
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn backfill_response_validate_enforces_bounds() {
+        let response = RawBackfillResponse {
+            scope: SwarmScope::Global,
+            next_from_event_seq: 10,
+            feed_key: Some("feed".to_owned()),
+            head_event_ids: vec!["evt-1".to_owned()],
+            items: vec![b"event".to_vec()],
+        };
+        response.validate(10, 20).unwrap();
+        assert!(
+            RawBackfillResponse {
+                items: vec![b"event".to_vec(); 25],
+                ..response.clone()
+            }
+            .validate(10, 20)
+            .is_err()
+        );
+        assert!(
+            RawBackfillResponse {
+                items: vec![vec![b'x'; MAX_BACKFILL_RESPONSE_BYTES + 1]],
+                ..response.clone()
+            }
+            .validate(10, 20)
+            .is_err()
+        );
+        assert!(
+            RawBackfillResponse {
+                head_event_ids: vec!["event".to_owned(); MAX_BACKFILL_KNOWN_EVENT_IDS + 1],
+                ..response.clone()
+            }
+            .validate(10, 20)
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn raw_control_request_and_response_validate_payloads() {
+        let invalid_request = RawControlRequest::PeerDirectMessage(RawPeerDirectMessageRequest {
+            source_node_id: "node-a".to_owned(),
+            target_node_id: "node-b".to_owned(),
+            thread_id: "thread-1".to_owned(),
+            message_id: "message-1".to_owned(),
+            kind: RawPeerDirectMessageKind::Message,
+            agent_envelope: None,
+            contact_material: None,
+            content_ref: None,
+            control_json: None,
+        });
+        assert!(invalid_request.validate(10, 20).is_err());
+
+        let invalid_response = RawControlResponse::Backfill(RawBackfillResponse {
+            scope: SwarmScope::Global,
+            next_from_event_seq: 1,
+            feed_key: None,
+            head_event_ids: Vec::new(),
+            items: vec![b"event".to_vec(); 25],
+        });
+        assert!(invalid_response.validate(10, 20).is_err());
+    }
+
+    #[test]
+    fn control_payload_validation_rejects_oversized_json() {
+        let oversized = "x".repeat(MAX_CONTROL_JSON_BYTES + 1);
+        let request = RawPeerDirectMessageRequest {
+            source_node_id: "node-a".to_owned(),
+            target_node_id: "node-b".to_owned(),
+            thread_id: "thread-1".to_owned(),
+            message_id: "message-1".to_owned(),
+            kind: RawPeerDirectMessageKind::SessionInit,
+            agent_envelope: None,
+            contact_material: None,
+            content_ref: None,
+            control_json: Some(oversized),
+        };
+        assert!(request.validate().is_err());
+    }
+
+    #[test]
+    fn traffic_guard_limits_non_backfill_control_requests() {
+        let peer = PeerId::random();
+        let mut guard = TrafficGuard::new();
+        let now = Instant::now();
+
+        for _ in 0..PER_PEER_CONTROL_REQUESTS_PER_WINDOW {
+            assert!(guard.allow_control_request(peer, ControlRequestKind::PeerDirectMessage, now));
+        }
+        assert!(!guard.allow_control_request(peer, ControlRequestKind::PeerDirectMessage, now));
     }
 
     #[test]
@@ -2361,6 +2892,41 @@ mod tests {
             }
             other => panic!("expected bootstrap peer discovery event, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn malformed_gossip_is_dropped_without_runtime_error() {
+        let config = SubstrateConfig {
+            listen_addrs: vec!["/ip4/127.0.0.1/tcp/0".to_owned()],
+            enable_mdns: false,
+            ..SubstrateConfig::default()
+        };
+        let node = SubstrateNode::generate(config).expect("node");
+        let mut runtime = SubstrateRuntime::new(node).expect("runtime");
+        let peer = identity::Keypair::generate_ed25519().public().to_peer_id();
+        let event = SwarmEvent::Behaviour(SubstrateBehaviourEvent::Gossipsub(
+            GossipsubEvent::Message {
+                propagation_source: peer,
+                message_id: libp2p::gossipsub::MessageId(vec![1]),
+                message: libp2p::gossipsub::Message {
+                    source: Some(peer),
+                    data: b"{not-json".to_vec(),
+                    sequence_number: Some(1),
+                    topic: libp2p::gossipsub::TopicHash::from_raw("bad.topic"),
+                },
+            },
+        ));
+
+        assert!(
+            runtime
+                .handle_swarm_event(event)
+                .expect("malformed gossip should not fail runtime")
+                .is_none()
+        );
+        let health = runtime.observability_snapshot().peer_health;
+        assert_eq!(health.len(), 1);
+        assert_eq!(health[0].peer, peer.to_string());
+        assert!(health[0].score < 0);
     }
 
     #[tokio::test]

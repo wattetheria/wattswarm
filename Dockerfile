@@ -65,8 +65,8 @@ RUN cargo chef prepare --recipe-path recipe.json
 FROM chef AS cacher
 
 COPY --from=planner /app/recipe.json /app/recipe.json
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,target=/usr/local/cargo/git \
+RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
     cargo chef cook --release --recipe-path recipe.json \
     -p wattswarm --bin wattswarm --bin wattswarm-runtime
 
@@ -75,8 +75,8 @@ FROM chef AS builder
 COPY . .
 COPY --from=cacher /app/target /app/target
 
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,target=/usr/local/cargo/git \
+RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
     cargo build --release -p wattswarm --bin wattswarm --bin wattswarm-runtime
 
 FROM debian:bookworm-slim

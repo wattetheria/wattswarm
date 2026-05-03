@@ -8,6 +8,7 @@ message ProjectionStreamRequest {
   string feed_key = 3;
   string scope_hint = 4;
   string subscriber_node_id = 5;
+  string network_id = 6;
 }
 
 message ProjectionFrame {

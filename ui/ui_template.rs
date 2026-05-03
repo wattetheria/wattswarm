@@ -235,7 +235,7 @@ pub const INDEX_HTML: &str = r#"<!DOCTYPE html>
     <header class="head">
       <div>
         <h1>WattSwarm Network Diagnostics</h1>
-        <div class="hint">Libp2p transport, gossip publish and ingest, subscribed scopes, backfill, callback delivery, and node network state.</div>
+        <div class="hint">Iroh transport, gossip publish and ingest, subscribed scopes, backfill, callback delivery, and node network state.</div>
       </div>
       <div id="generatedAt" class="timestamp">Not refreshed</div>
     </header>
@@ -246,12 +246,12 @@ pub const INDEX_HTML: &str = r#"<!DOCTYPE html>
         <div id="serviceState" class="value">unknown</div>
       </div>
       <div class="metric">
-        <div class="label">Local Peer</div>
-        <div id="localPeer" class="value">-</div>
+        <div class="label">Iroh Endpoint</div>
+        <div id="irohEndpoint" class="value">-</div>
       </div>
       <div class="metric">
-        <div class="label">Connected Peers</div>
-        <div id="connectedPeers" class="value">0</div>
+        <div class="label">Known Iroh Contacts</div>
+        <div id="knownIrohContacts" class="value">0</div>
       </div>
       <div class="metric">
         <div class="label">Subscribed Scopes</div>
@@ -268,7 +268,7 @@ pub const INDEX_HTML: &str = r#"<!DOCTYPE html>
       <div class="filters">
         <label>
           Search
-          <input id="search" placeholder="task id, event id, peer id, scope">
+          <input id="search" placeholder="task id, event id, node id, scope">
         </label>
         <label>
           Level
@@ -294,7 +294,7 @@ pub const INDEX_HTML: &str = r#"<!DOCTYPE html>
         </label>
         <label>
           Source Node
-          <input id="sourceNodeId" placeholder="peer id">
+          <input id="sourceNodeId" placeholder="node id">
         </label>
         <label>
           Lines
@@ -398,8 +398,8 @@ pub const INDEX_HTML: &str = r#"<!DOCTYPE html>
       const snapshot = payload.snapshot || {};
       qs("generatedAt").textContent = `Refreshed ${formatTime(payload.generated_at || new Date().toISOString())}`;
       qs("serviceState").textContent = payload.network_service_started ? "running" : "stopped";
-      qs("localPeer").textContent = compact(snapshot.local_peer_id || "-", 24);
-      qs("connectedPeers").textContent = String(snapshot.connected_peer_count || 0);
+      qs("irohEndpoint").textContent = compact(snapshot.local_iroh_endpoint_id || "-", 24);
+      qs("knownIrohContacts").textContent = String(snapshot.known_iroh_contacts || 0);
       qs("scopeCount").textContent = String(safeArray(snapshot.subscribed_scopes).length);
       qs("diagnosticCount").textContent = String(safeArray(rows).length);
 

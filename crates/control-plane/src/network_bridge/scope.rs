@@ -48,7 +48,11 @@ pub(super) fn dynamic_subscription_scope_kinds_for_node(
     node_id: &str,
 ) -> Result<Vec<(SwarmScope, Vec<GossipKind>)>> {
     let mut subscriptions = Vec::new();
-    for subscription in node.store.list_active_feed_subscriptions(node_id)? {
+    let network_id = super::current_network_context_id(node);
+    for subscription in node
+        .store
+        .list_active_feed_subscriptions(&network_id, node_id)?
+    {
         let Some(scope) = parse_scope_hint_string(&subscription.scope_hint) else {
             continue;
         };

@@ -707,6 +707,92 @@ impl PgStore {
         Ok(())
     }
 
+    pub fn list_local_network_peer_sync_states(
+        &self,
+        scope_id: &str,
+    ) -> Result<Vec<LocalNetworkPeerSyncStateRow>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
+        let mut stmt = conn.prepare(
+            "SELECT network_peer_id,
+                    known_scopes_json,
+                    backfill_cursors_json,
+                    remote_heads_json,
+                    backfill_successes,
+                    backfill_failures,
+                    (EXTRACT(EPOCH FROM updated_at) * 1000)::BIGINT AS updated_at_ms
+             FROM network_peer_sync_state_local
+             WHERE scope_id = $1
+             ORDER BY network_peer_id ASC",
+        )?;
+        let rows = stmt.query_map(params![scope_id], |r| {
+            Ok(LocalNetworkPeerSyncStateRow {
+                network_peer_id: r.get(0)?,
+                known_scopes_json: r.get(1)?,
+                backfill_cursors_json: r.get(2)?,
+                remote_heads_json: r.get(3)?,
+                backfill_successes: r.get::<_, i64>(4)? as u64,
+                backfill_failures: r.get::<_, i64>(5)? as u64,
+                updated_at: r.get::<_, i64>(6)? as u64,
+            })
+        })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
+    pub fn upsert_local_network_peer_sync_state(
+        &self,
+        scope_id: &str,
+        row: &LocalNetworkPeerSyncStateRow,
+    ) -> Result<()> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
+        conn.execute(
+            "INSERT INTO network_peer_sync_state_local(
+                scope_id,
+                network_peer_id,
+                known_scopes_json,
+                backfill_cursors_json,
+                remote_heads_json,
+                backfill_successes,
+                backfill_failures,
+                updated_at
+             )
+             VALUES (
+                $1,
+                $2,
+                $3,
+                $4,
+                $5,
+                $6,
+                $7,
+                TIMESTAMPTZ 'epoch' + ($8::bigint * INTERVAL '1 millisecond')
+             )
+             ON CONFLICT(scope_id, network_peer_id) DO UPDATE SET
+                known_scopes_json = excluded.known_scopes_json,
+                backfill_cursors_json = excluded.backfill_cursors_json,
+                remote_heads_json = excluded.remote_heads_json,
+                backfill_successes = excluded.backfill_successes,
+                backfill_failures = excluded.backfill_failures,
+                updated_at = excluded.updated_at",
+            params![
+                scope_id,
+                &row.network_peer_id,
+                &row.known_scopes_json,
+                &row.backfill_cursors_json,
+                &row.remote_heads_json,
+                row.backfill_successes as i64,
+                row.backfill_failures as i64,
+                row.updated_at as i64
+            ],
+        )?;
+        Ok(())
+    }
+
     pub fn list_local_peer_relationships(
         &self,
         scope_id: &str,

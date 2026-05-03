@@ -455,7 +455,11 @@ fn deliver_agent_event_routes_topic_reply_to_wattswarm_store() {
         membership,
     )
     .expect("node");
-    let network_id = "default".to_owned();
+    let network_id = node
+        .store
+        .load_verified_network_protocol_params()
+        .map(|verified| verified.network_id)
+        .unwrap_or_else(|_| DEFAULT_NETWORK_CONTEXT_ID.to_owned());
     let remote_message = crate::control::emit_topic_message_with_content(
         &mut node,
         &state_dir,
@@ -555,9 +559,10 @@ fn deliver_agent_event_routes_topic_reply_to_wattswarm_store() {
     assert_eq!(rows[0].status, "completed", "{rows:?} {deliveries:?}");
 
     let node = crate::control::open_node(&state_dir, &db_path).expect("reopen node");
+    let reply_network_id = current_network_context_id(&node);
     let messages = node
         .store
-        .list_topic_messages("crew.chat", "group:crew-7", 10)
+        .list_topic_messages(&reply_network_id, "crew.chat", "group:crew-7", 10)
         .expect("list topic messages");
     let reply = messages
         .iter()
@@ -864,7 +869,7 @@ fn ingest_chat_gossip_applies_remote_topic_message_to_local_store() {
     ));
     let messages = node
         .store
-        .list_topic_messages("crew.chat", "group:crew-7", 10)
+        .list_topic_messages("default", "crew.chat", "group:crew-7", 10)
         .expect("list topic messages");
     assert_eq!(messages.len(), 1);
     assert_eq!(messages[0].message_id, remote_event.event_id);
@@ -915,6 +920,7 @@ fn backfill_response_for_request_wraps_global_events() {
             from_event_seq: 0,
             limit: 8,
             feed_key: None,
+            known_event_ids: Vec::new(),
         },
         32,
         64,
@@ -927,12 +933,185 @@ fn backfill_response_for_request_wraps_global_events() {
 }
 
 #[test]
+fn iroh_backfill_stream_repairs_missed_global_event_and_ingest_is_idempotent() {
+    #[derive(serde::Deserialize, serde::Serialize)]
+    struct TestIrohBackfillStreamRequest {
+        request: BackfillRequest,
+    }
+
+    #[derive(serde::Deserialize, serde::Serialize)]
+    struct TestIrohBackfillStreamResponse {
+        response: crate::network_p2p::BackfillResponse,
+    }
+
+    const IROH_CONTROL_KIND_BACKFILL: &str = "backfill.v1";
+
+    let dir_a = temp_startup_dir("iroh-backfill-a");
+    let dir_b = temp_startup_dir("iroh-backfill-b");
+    crate::control::local_node_id(&dir_a).expect("seed node a");
+    crate::control::local_node_id(&dir_b).expect("seed node b");
+    let peer_a = wattswarm_network_transport_iroh::local_endpoint_id_from_state_dir(&dir_a)
+        .expect("endpoint a")
+        .to_string();
+    let peer_b = wattswarm_network_transport_iroh::local_endpoint_id_from_state_dir(&dir_b)
+        .expect("endpoint b")
+        .to_string();
+
+    let subscriber_identity = NodeIdentity::random();
+    let publisher_identity = NodeIdentity::random();
+    let membership =
+        membership_with_roles(&[subscriber_identity.node_id(), publisher_identity.node_id()]);
+    let mut subscriber = Node::new(
+        subscriber_identity,
+        PgStore::open_in_memory().expect("subscriber store"),
+        membership.clone(),
+    )
+    .expect("subscriber node");
+    let mut publisher = Node::new(
+        publisher_identity,
+        PgStore::open_in_memory().expect("publisher store"),
+        membership,
+    )
+    .expect("publisher node");
+    let policy_hash = publisher
+        .policy_registry()
+        .binding_for("vp.schema_only.v1", json!({}))
+        .expect("policy binding")
+        .policy_hash;
+    let mut contract = sample_contract("task-iroh-backfill-1", policy_hash);
+    contract.inputs = json!({"prompt":"repair me over iroh"});
+    publisher
+        .submit_task(contract, 1, 100)
+        .expect("publisher submits task");
+
+    wattswarm_network_transport_iroh::export_local_contact_material_for_network_peer_id(
+        &dir_a, &peer_a, 1,
+    )
+    .expect("contact a");
+    let contact_b =
+        wattswarm_network_transport_iroh::export_local_contact_material_for_network_peer_id(
+            &dir_b, &peer_b, 1,
+        )
+        .expect("contact b");
+
+    let bridge_response = backfill_response_for_request(
+        &publisher,
+        &peer_b,
+        &BackfillRequest {
+            scope: SwarmScope::Global,
+            from_event_seq: 0,
+            limit: 8,
+            feed_key: None,
+            known_event_ids: Vec::new(),
+        },
+        32,
+        64,
+    )
+    .expect("bridge backfill response");
+    let bridge_response_payload = serde_json::to_vec(&TestIrohBackfillStreamResponse {
+        response: bridge_response,
+    })
+    .expect("encode bridge response");
+    wattswarm_network_transport_iroh::set_local_control_stream_handler_for_network_peer_id(
+        &dir_b,
+        &peer_b,
+        IROH_CONTROL_KIND_BACKFILL,
+        Some(
+            move |request: wattswarm_network_transport_iroh::IrohControlStreamRequest| {
+                if request.kind != IROH_CONTROL_KIND_BACKFILL {
+                    return wattswarm_network_transport_iroh::IrohControlStreamResponse {
+                        ok: false,
+                        error: Some(format!("unexpected control kind {}", request.kind)),
+                        payload: Vec::new(),
+                    };
+                }
+                let decoded =
+                    match serde_json::from_slice::<TestIrohBackfillStreamRequest>(&request.payload)
+                    {
+                        Ok(decoded) => decoded,
+                        Err(err) => {
+                            return wattswarm_network_transport_iroh::IrohControlStreamResponse {
+                                ok: false,
+                                error: Some(err.to_string()),
+                                payload: Vec::new(),
+                            };
+                        }
+                    };
+                if decoded.request.scope != SwarmScope::Global {
+                    return wattswarm_network_transport_iroh::IrohControlStreamResponse {
+                        ok: false,
+                        error: Some("unexpected scope".to_owned()),
+                        payload: Vec::new(),
+                    };
+                }
+                wattswarm_network_transport_iroh::IrohControlStreamResponse {
+                    ok: true,
+                    error: None,
+                    payload: bridge_response_payload.clone(),
+                }
+            },
+        ),
+    )
+    .expect("install backfill handler");
+
+    wattswarm_network_transport_iroh::register_remote_contact_material_for_network_peer_id(
+        &dir_a, &peer_a, &contact_b,
+    )
+    .expect("register remote contact material");
+
+    let response =
+        wattswarm_network_transport_iroh::send_control_stream_request_for_network_peer_id(
+            &dir_a,
+            &peer_a,
+            &contact_b,
+            &wattswarm_network_transport_iroh::IrohControlStreamRequest {
+                kind: IROH_CONTROL_KIND_BACKFILL.to_owned(),
+                payload: serde_json::to_vec(&TestIrohBackfillStreamRequest {
+                    request: BackfillRequest {
+                        scope: SwarmScope::Global,
+                        from_event_seq: 0,
+                        limit: 8,
+                        feed_key: None,
+                        known_event_ids: Vec::new(),
+                    },
+                })
+                .expect("encode backfill request"),
+            },
+        )
+        .expect("request iroh backfill page");
+    assert!(response.ok, "{:?}", response.error);
+    let response = serde_json::from_slice::<TestIrohBackfillStreamResponse>(&response.payload)
+        .expect("decode backfill response")
+        .response;
+    assert_eq!(response.events.len(), 1);
+
+    let applied = ingest_backfill_response(&mut subscriber, &response).expect("ingest response");
+    let duplicate_applied =
+        ingest_backfill_response(&mut subscriber, &response).expect("ingest duplicate response");
+    assert_eq!(applied, 1);
+    assert_eq!(duplicate_applied, 0);
+    assert!(
+        subscriber
+            .store
+            .task_projection("task-iroh-backfill-1")
+            .expect("load task projection")
+            .is_some()
+    );
+
+    wattswarm_network_transport_iroh::shutdown_local_iroh_data_plane(&dir_a);
+    wattswarm_network_transport_iroh::shutdown_local_iroh_data_plane(&dir_b);
+    std::fs::remove_dir_all(dir_a).expect("cleanup a");
+    std::fs::remove_dir_all(dir_b).expect("cleanup b");
+}
+
+#[test]
 fn ingest_backfill_response_rejects_scope_mismatch() {
     let mut node = Node::open_in_memory_with_roles(&[Role::Proposer]).expect("node");
     let response = crate::network_p2p::BackfillResponse {
         scope: SwarmScope::Global,
         next_from_event_seq: 1,
         feed_key: None,
+        head_event_ids: Vec::new(),
         events: vec![EventEnvelope {
             scope: SwarmScope::Region("sol".to_owned()),
             event: build_event_for_external(
@@ -992,6 +1171,7 @@ fn topic_backfill_response_filters_by_feed_key() {
             from_event_seq: 0,
             limit: 8,
             feed_key: Some("crew.chat".to_owned()),
+            known_event_ids: Vec::new(),
         },
         32,
         64,
@@ -1051,6 +1231,7 @@ fn topic_backfill_response_advances_local_cursor() {
         scope: SwarmScope::Group("crew-7".to_owned()),
         next_from_event_seq: 7,
         feed_key: Some("crew.chat".to_owned()),
+        head_event_ids: Vec::new(),
         events: vec![EventEnvelope {
             scope: SwarmScope::Group("crew-7".to_owned()),
             event: remote_event,
@@ -1064,10 +1245,10 @@ fn topic_backfill_response_advances_local_cursor() {
 
     let cursor = node
         .store
-        .get_topic_cursor(&local.node_id(), "crew.chat")
+        .get_topic_cursor("default", &local.node_id(), "crew.chat")
         .expect("get topic cursor")
         .expect("cursor exists");
-    assert_eq!(cursor.last_event_seq, 7);
+    assert_eq!(cursor.last_event_seq, 2);
     assert_eq!(cursor.scope_hint, "group:crew-7");
 }
 
@@ -1347,7 +1528,7 @@ fn network_substrate_projection_canonicalizes_scope_hints() {
 
     let row = node
         .store
-        .get_feed_subscription(&subscriber_node_id, "market.canonical")
+        .get_feed_subscription("default", &subscriber_node_id, "market.canonical")
         .expect("load subscription")
         .expect("subscription exists");
     assert_eq!(row.scope_hint, "node:lab-9");
@@ -1629,6 +1810,128 @@ fn smarter_backfill_prefers_peer_with_known_scope_activity() {
 }
 
 #[test]
+fn peer_backfill_cursor_is_tracked_per_scope_and_feed() {
+    let scope = SwarmScope::Group("crew-7".to_owned());
+    let mut state = PeerSyncState::new(Instant::now());
+
+    assert_eq!(state.backfill_cursor(&scope, None), 0);
+    assert_eq!(state.backfill_cursor(&scope, Some("crew.chat")), 0);
+
+    state.record_backfill_cursor(&scope, None, 5);
+    state.record_backfill_cursor(&scope, Some("crew.chat"), 9);
+    state.record_backfill_cursor(&scope, None, 3);
+    state.reset_backfill_cursor(&scope, Some("market.chat"));
+
+    assert_eq!(state.backfill_cursor(&scope, None), 5);
+    assert_eq!(state.backfill_cursor(&scope, Some("crew.chat")), 9);
+    assert_eq!(state.backfill_cursor(&scope, Some("market.chat")), 0);
+}
+
+#[test]
+fn peer_sync_state_persists_scope_cursor_and_remote_heads() {
+    let dir = temp_startup_dir("peer-sync-state-persist");
+    let peer = PeerId::random();
+    let scope = SwarmScope::Group("crew-7".to_owned());
+    let mut service = NetworkBridgeService::new(
+        NetworkP2pNode::generate(NetworkP2pConfig::default()).expect("node"),
+        &[SwarmScope::Global],
+        &NetworkProtocolParams::default(),
+    )
+    .expect("service");
+    service.set_state_dir(dir.clone(), dir.join("store.state"));
+
+    service.record_peer_scope_activity(peer, &scope);
+    service.record_peer_backfill_cursor(peer, &scope, Some("crew.chat"), 42);
+    service.record_peer_remote_head_event_ids(
+        peer,
+        &scope,
+        Some("crew.chat"),
+        &["evt-head".to_owned()],
+    );
+
+    let mut reloaded = NetworkBridgeService::new(
+        NetworkP2pNode::generate(NetworkP2pConfig::default()).expect("node"),
+        &[SwarmScope::Global],
+        &NetworkProtocolParams::default(),
+    )
+    .expect("service");
+    reloaded.set_state_dir(dir.clone(), dir.join("store.state"));
+    let state = reloaded
+        .peer_sync_state
+        .get(&peer)
+        .expect("reloaded peer sync state");
+
+    assert!(state.known_scopes.contains(&scope));
+    assert_eq!(state.backfill_cursor(&scope, Some("crew.chat")), 42);
+    assert_eq!(
+        state
+            .remote_head_event_ids
+            .get(&BackfillLaneKey::new(&scope, Some("crew.chat"))),
+        Some(&vec!["evt-head".to_owned()])
+    );
+    assert!(!dir.join("network_peer_sync_state.json").exists());
+    let persisted = crate::control::load_network_peer_sync_state_records_state(&dir)
+        .expect("load peer sync DB rows");
+    assert_eq!(persisted.len(), 1);
+    assert_eq!(persisted[0].network_peer_id, peer.to_string());
+    assert_eq!(
+        serde_json::from_str::<Vec<SwarmScope>>(&persisted[0].known_scopes_json)
+            .expect("known scopes JSON"),
+        vec![scope]
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn peer_sync_state_migrates_legacy_json_to_db() {
+    let dir = temp_startup_dir("peer-sync-state-legacy-migrate");
+    let peer = PeerId::random();
+    let scope = SwarmScope::Group("crew-7".to_owned());
+    std::fs::write(
+        legacy_peer_sync_state_path(&dir),
+        serde_json::to_vec_pretty(&vec![LegacyPeerSyncStateRecord {
+            peer_id: peer.to_string(),
+            known_scopes: vec![scope.clone()],
+            backfill_cursors: vec![PersistedBackfillCursorRecord {
+                lane: BackfillLaneKey::new(&scope, Some("crew.chat")),
+                cursor: 51,
+            }],
+            remote_heads: vec![PersistedBackfillRemoteHeadRecord {
+                lane: BackfillLaneKey::new(&scope, Some("crew.chat")),
+                head_event_ids: vec!["evt-head".to_owned()],
+            }],
+            backfill_successes: 2,
+            backfill_failures: 1,
+        }])
+        .expect("legacy peer sync JSON"),
+    )
+    .expect("write legacy peer sync JSON");
+
+    let mut service = NetworkBridgeService::new(
+        NetworkP2pNode::generate(NetworkP2pConfig::default()).expect("node"),
+        &[SwarmScope::Global],
+        &NetworkProtocolParams::default(),
+    )
+    .expect("service");
+    service.set_state_dir(dir.clone(), dir.join("store.state"));
+
+    assert!(!legacy_peer_sync_state_path(&dir).exists());
+    let state = service
+        .peer_sync_state
+        .get(&peer)
+        .expect("migrated peer sync state");
+    assert!(state.known_scopes.contains(&scope));
+    assert_eq!(state.backfill_cursor(&scope, Some("crew.chat")), 51);
+    assert_eq!(state.backfill_successes, 2);
+    assert_eq!(state.backfill_failures, 1);
+    let persisted = crate::control::load_network_peer_sync_state_records_state(&dir)
+        .expect("load migrated peer sync DB rows");
+    assert_eq!(persisted.len(), 1);
+    assert_eq!(persisted[0].network_peer_id, peer.to_string());
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
 fn connection_closed_with_remaining_established_keeps_peer_state() {
     let peer = PeerId::random();
     let mut node = Node::open_in_memory_with_roles(&[Role::Proposer]).expect("node");
@@ -1659,7 +1962,7 @@ fn connection_closed_with_remaining_established_keeps_peer_state() {
 }
 
 #[test]
-fn connection_closed_with_zero_remaining_removes_peer_state() {
+fn connection_closed_with_zero_remaining_preserves_peer_sync_state() {
     let peer = PeerId::random();
     let mut node = Node::open_in_memory_with_roles(&[Role::Proposer]).expect("node");
     let mut service = NetworkBridgeService::new(
@@ -1685,7 +1988,8 @@ fn connection_closed_with_zero_remaining_removes_peer_state() {
 
     assert!(matches!(tick, NetworkBridgeTick::Disconnected { peer: seen } if seen == peer));
     assert!(!service.connected_peers.contains(&peer));
-    assert!(!service.peer_sync_state.contains_key(&peer));
+    assert!(service.peer_sync_state.contains_key(&peer));
+    assert_eq!(service.peer_sync_state[&peer].inflight_backfills, 0);
 }
 
 #[test]
@@ -1775,6 +2079,102 @@ fn peer_identified_event_persists_peer_metadata_locally() {
     assert_eq!(rows[0].protocols, vec!["/meshsub/1.1.0"]);
 
     std::fs::remove_dir_all(dir).expect("cleanup");
+}
+
+#[test]
+fn build_contact_material_accepts_iroh_endpoint_network_peer_id() {
+    let dir = temp_startup_dir("iroh-contact-material");
+    crate::control::local_node_id(&dir).expect("create local identity");
+    let endpoint_id = wattswarm_network_transport_iroh::local_endpoint_id_from_state_dir(&dir)
+        .expect("endpoint id")
+        .to_string();
+
+    let contact = build_contact_material(&dir, &endpoint_id).expect("contact material");
+    let material: serde_json::Value =
+        serde_json::from_str(&contact.material_json).expect("contact material json");
+
+    assert_eq!(material["peer_id"], endpoint_id);
+    assert_eq!(material["transports"][0]["transport"], "iroh_direct");
+    assert_eq!(
+        material["transports"][0]["metadata"]["endpoint_id"],
+        endpoint_id
+    );
+    assert_eq!(
+        material["recommended_routes"]["topic_sync"],
+        serde_json::json!("iroh_direct")
+    );
+
+    wattswarm_network_transport_iroh::shutdown_local_iroh_data_plane(&dir);
+    std::fs::remove_dir_all(dir).expect("cleanup");
+}
+
+#[test]
+fn set_state_dir_loads_persisted_iroh_contact_material_into_runtime() {
+    let local_dir = temp_startup_dir("iroh-contact-load-local");
+    let remote_dir = temp_startup_dir("iroh-contact-load-remote");
+    let local_seed = [81u8; 32];
+    let remote_seed = [82u8; 32];
+    std::fs::write(local_dir.join("node_seed.hex"), hex::encode(local_seed))
+        .expect("write local seed");
+    std::fs::write(remote_dir.join("node_seed.hex"), hex::encode(remote_seed))
+        .expect("write remote seed");
+    let remote_endpoint =
+        wattswarm_network_transport_iroh::local_endpoint_id_from_state_dir(&remote_dir)
+            .expect("remote endpoint")
+            .to_string();
+    let remote_contact = export_local_contact_material_for_network_peer_id(
+        &remote_dir,
+        &remote_endpoint,
+        observed_at_ms(),
+    )
+    .expect("remote contact");
+    crate::control::save_peer_metadata_record_state(
+        &local_dir,
+        &crate::control::PeerMetadataRecord {
+            node_id: remote_endpoint.clone(),
+            network_id: Some("mainnet".to_owned()),
+            params_version: Some(1),
+            params_hash: Some("params".to_owned()),
+            agent_version_raw: None,
+            agent_version_prefix: None,
+            protocol_version: None,
+            observed_addr: None,
+            listen_addrs: Vec::new(),
+            protocols: Vec::new(),
+            handshake_status: "contact_material".to_owned(),
+            last_error: None,
+            contact_material: Some(json!({
+                "node_id": remote_endpoint,
+                "peer_id": remote_contact.peer_id,
+                "transports": [remote_contact],
+            })),
+            contact_material_signature: None,
+            contact_material_updated_at: Some(observed_at_ms()),
+            first_identified_at: observed_at_ms(),
+            last_identified_at: observed_at_ms(),
+        },
+    )
+    .expect("save peer metadata");
+
+    let mut service = NetworkBridgeService::new(
+        NetworkP2pNode::from_iroh_state_dir(
+            NetworkP2pConfig::default(),
+            local_dir.clone(),
+            local_seed,
+        )
+        .expect("iroh node"),
+        &[SwarmScope::Global],
+        &NetworkProtocolParams::default(),
+    )
+    .expect("service");
+    service.set_state_dir(local_dir.clone(), local_dir.join("ui.state"));
+
+    assert_eq!(service.known_remote_contact_count(), 1);
+
+    wattswarm_network_transport_iroh::shutdown_local_iroh_data_plane(&local_dir);
+    wattswarm_network_transport_iroh::shutdown_local_iroh_data_plane(&remote_dir);
+    std::fs::remove_dir_all(local_dir).expect("cleanup local");
+    std::fs::remove_dir_all(remote_dir).expect("cleanup remote");
 }
 
 #[test]
@@ -1871,6 +2271,7 @@ fn backfill_response_filters_by_scope() {
             from_event_seq: 0,
             limit: 8,
             feed_key: None,
+            known_event_ids: Vec::new(),
         },
         32,
         64,
@@ -1928,6 +2329,7 @@ fn backfill_response_skips_network_substrate_events_for_other_networks() {
             from_event_seq: 0,
             limit: 8,
             feed_key: None,
+            known_event_ids: Vec::new(),
         },
         32,
         64,
@@ -1966,6 +2368,7 @@ fn global_backfill_skips_task_process_layer_events() {
             from_event_seq: 0,
             limit: 16,
             feed_key: None,
+            known_event_ids: Vec::new(),
         },
         32,
         64,
@@ -2645,6 +3048,11 @@ fn observability_snapshot_reports_network_and_sync_health() {
         .expect("observability snapshot");
 
     assert_eq!(snapshot.connected_peer_count, 1);
+    assert_eq!(snapshot.p2p_foundation, "legacy-libp2p");
+    assert_eq!(snapshot.local_iroh_endpoint_id, None);
+    assert!(snapshot.subscribed_iroh_gossip_topics.is_empty());
+    assert_eq!(snapshot.known_iroh_contacts, 0);
+    assert!(snapshot.legacy_libp2p_active);
     assert_eq!(snapshot.nat_status, "unknown");
     assert_eq!(snapshot.nat_public_address, None);
     assert_eq!(snapshot.nat_confidence, 0);
@@ -3030,8 +3438,13 @@ fn latest_connected_peer_ids_uses_runtime_observability_snapshot() {
     store_latest_network_observability_snapshot(
         &dir,
         NetworkBridgeObservabilitySnapshot {
-            local_peer_id: "local-peer".to_owned(),
-            listen_addrs: vec!["/ip4/127.0.0.1/tcp/4001".to_owned()],
+            local_network_peer_id: "local-peer".to_owned(),
+            local_endpoint_addrs: vec!["/ip4/127.0.0.1/tcp/4001".to_owned()],
+            p2p_foundation: "iroh".to_owned(),
+            local_iroh_endpoint_id: Some("iroh-endpoint".to_owned()),
+            subscribed_iroh_gossip_topics: vec!["global:task:abc123".to_owned()],
+            known_iroh_contacts: 1,
+            legacy_libp2p_active: false,
             subscribed_scopes: vec!["global".to_owned()],
             connected_peer_count: 1,
             nat_status: "unknown".to_owned(),
@@ -3040,7 +3453,7 @@ fn latest_connected_peer_ids_uses_runtime_observability_snapshot() {
             relay_reservations: Vec::new(),
             peer_health: vec![
                 NetworkBridgePeerHealth {
-                    peer: "peer-connected".to_owned(),
+                    network_peer_id: "peer-connected".to_owned(),
                     connected: true,
                     score: 0,
                     blacklisted: false,
@@ -3054,7 +3467,7 @@ fn latest_connected_peer_ids_uses_runtime_observability_snapshot() {
                     next_retry_in_ms: 0,
                 },
                 NetworkBridgePeerHealth {
-                    peer: "peer-disconnected".to_owned(),
+                    network_peer_id: "peer-disconnected".to_owned(),
                     connected: false,
                     score: 0,
                     blacklisted: false,
@@ -3069,6 +3482,11 @@ fn latest_connected_peer_ids_uses_runtime_observability_snapshot() {
                 },
             ],
             scope_traffic: Vec::new(),
+            dropped_malformed_gossip: 0,
+            invalid_control_payloads: 0,
+            dial_failures: 0,
+            response_validation_failures: 0,
+            retry_suppressed_dials: 0,
             summary_health: NetworkBridgeSummaryHealth {
                 imported_decision_memory_rows: 0,
                 imported_reputation_rows: 0,

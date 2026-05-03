@@ -131,11 +131,13 @@ fn list_all_topic_messages(
     scope_hint: &str,
     max_messages: usize,
 ) -> Result<Vec<TopicMessageRow>> {
+    let network_id = resolve_network_id(node);
     let mut out = Vec::new();
     let mut before_created_at = None;
     let mut before_message_id = None;
     while out.len() < max_messages {
         let page = node.store.list_topic_messages_page(
+            &network_id,
             feed_key,
             scope_hint,
             before_created_at,
@@ -403,6 +405,7 @@ fn load_prior_deliberations(
     scope_hint: &str,
     proposals: &[StructuredProposal],
 ) -> Result<Vec<Value>> {
+    let network_id = resolve_network_id(node);
     let excluded_proposal_message_ids = proposals
         .iter()
         .map(|proposal| proposal.source_message_id.clone())
@@ -415,7 +418,7 @@ fn load_prior_deliberations(
     for result_feed_key in result_feeds {
         prior.extend(
             node.store
-                .list_topic_messages(&result_feed_key, scope_hint, 64)?
+                .list_topic_messages(&network_id, &result_feed_key, scope_hint, 64)?
                 .into_iter()
                 .filter_map(|message| {
                     parse_prior_deliberation_message(&message, &excluded_proposal_message_ids)
@@ -629,7 +632,10 @@ pub fn process_topic_interpretation_for_topic(
 }
 
 pub fn process_topic_interpretation(node: &mut Node, state_dir: &std::path::Path) -> Result<usize> {
-    let subscriptions = node.store.list_active_feed_subscriptions(&node.node_id())?;
+    let network_id = resolve_network_id(node);
+    let subscriptions = node
+        .store
+        .list_active_feed_subscriptions(&network_id, &node.node_id())?;
     let mut processed = 0_usize;
     for subscription in subscriptions {
         processed = processed.saturating_add(process_topic_interpretation_for_topic(

@@ -39,7 +39,7 @@ use uuid::Uuid;
 use wattswarm_network_transport_core::{
     TransferIntent, TransferKind, TransportRoute as DataTransportRoute, TransportRouter,
 };
-use wattswarm_network_transport_iroh::export_local_contact_material;
+use wattswarm_network_transport_iroh::export_local_contact_material_for_network_peer_id;
 use wattswarm_protocol::types::NetworkProtocolParams;
 
 pub use announcements::{apply_checkpoint_announcement, apply_rule_announcement};
@@ -56,7 +56,10 @@ pub use summary::{
     build_reputation_summary_for_runtime,
 };
 
-use backfill::{latest_scoped_event_seq, should_publish_summaries, should_sync_event};
+use backfill::{
+    BACKFILL_KNOWN_EVENT_IDS_LIMIT, recent_backfill_lane_event_ids, should_publish_summaries,
+    should_sync_event,
+};
 use publish::GlobalPublishRateGuard;
 use scope::{
     dynamic_subscription_scope_kinds_for_node, event_scope, merge_scopes,
@@ -141,7 +144,7 @@ pub fn latest_connected_peer_ids(state_dir: &Path) -> Option<Vec<String>> {
         .peer_health
         .iter()
         .filter(|entry| entry.connected)
-        .map(|entry| entry.peer.clone())
+        .map(|entry| entry.network_peer_id.clone())
         .collect::<Vec<_>>();
     peers.sort();
     peers.dedup();
@@ -263,9 +266,10 @@ fn maybe_record_topic_cursor(
     last_event_seq: u64,
     updated_at: u64,
 ) -> Result<()> {
-    let Some(subscription) = node
-        .store
-        .get_feed_subscription(subscriber_node_id, feed_key)?
+    let network_id = current_network_context_id(node);
+    let Some(subscription) =
+        node.store
+            .get_feed_subscription(&network_id, subscriber_node_id, feed_key)?
     else {
         return Ok(());
     };
@@ -273,6 +277,7 @@ fn maybe_record_topic_cursor(
         return Ok(());
     }
     node.store.upsert_topic_cursor(
+        &network_id,
         subscriber_node_id,
         feed_key,
         &subscription.scope_hint,
@@ -311,12 +316,31 @@ fn maybe_record_topic_cursor_for_response(
     let Some(feed_key) = &response.feed_key else {
         return Ok(());
     };
+    let Some(last_event_id) = response
+        .events
+        .iter()
+        .rev()
+        .find(|envelope| {
+            envelope.scope == response.scope
+                && matches!(
+                    &envelope.event.payload,
+                    crate::types::EventPayload::TopicMessagePosted(payload)
+                        if payload.feed_key == *feed_key
+                )
+        })
+        .map(|envelope| envelope.event.event_id.as_str())
+    else {
+        return Ok(());
+    };
+    let Some(last_event_seq) = node.store.event_seq_for_event_id(last_event_id)? else {
+        return Ok(());
+    };
     maybe_record_topic_cursor(
         node,
         subscriber_node_id,
         feed_key,
         &response.scope,
-        response.next_from_event_seq,
+        last_event_seq,
         updated_at,
     )
 }
@@ -346,12 +370,31 @@ pub(super) fn parent_uplink_store(node: &Node) -> Result<Option<crate::storage::
     Ok(Some(node.store.for_org(parent_topology.org.org_id)))
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+struct BackfillLaneKey {
+    scope: SwarmScope,
+    feed_key: Option<String>,
+}
+
+impl BackfillLaneKey {
+    fn new(scope: &SwarmScope, feed_key: Option<&str>) -> Self {
+        Self {
+            scope: scope.clone(),
+            feed_key: feed_key.map(ToOwned::to_owned),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct PeerSyncState {
     inflight_backfills: usize,
     last_backfill_request_at: Option<Instant>,
     next_retry_at: Instant,
     known_scopes: HashSet<SwarmScope>,
+    backfill_cursors: HashMap<BackfillLaneKey, u64>,
+    remote_head_event_ids: HashMap<BackfillLaneKey, Vec<String>>,
+    backfill_successes: u64,
+    backfill_failures: u64,
 }
 
 impl PeerSyncState {
@@ -361,8 +404,78 @@ impl PeerSyncState {
             last_backfill_request_at: None,
             next_retry_at: now,
             known_scopes: HashSet::new(),
+            backfill_cursors: HashMap::new(),
+            remote_head_event_ids: HashMap::new(),
+            backfill_successes: 0,
+            backfill_failures: 0,
         }
     }
+
+    fn backfill_cursor(&self, scope: &SwarmScope, feed_key: Option<&str>) -> u64 {
+        self.backfill_cursors
+            .get(&BackfillLaneKey::new(scope, feed_key))
+            .copied()
+            .unwrap_or(0)
+    }
+
+    fn record_backfill_cursor(
+        &mut self,
+        scope: &SwarmScope,
+        feed_key: Option<&str>,
+        next_from_event_seq: u64,
+    ) {
+        let key = BackfillLaneKey::new(scope, feed_key);
+        let cursor = self.backfill_cursors.entry(key).or_insert(0);
+        *cursor = (*cursor).max(next_from_event_seq);
+    }
+
+    fn reset_backfill_cursor(&mut self, scope: &SwarmScope, feed_key: Option<&str>) {
+        self.backfill_cursors
+            .insert(BackfillLaneKey::new(scope, feed_key), 0);
+    }
+
+    fn record_remote_head_event_ids(
+        &mut self,
+        scope: &SwarmScope,
+        feed_key: Option<&str>,
+        head_event_ids: &[String],
+    ) {
+        self.remote_head_event_ids.insert(
+            BackfillLaneKey::new(scope, feed_key),
+            head_event_ids.to_vec(),
+        );
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PersistedBackfillCursorRecord {
+    lane: BackfillLaneKey,
+    cursor: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PersistedBackfillRemoteHeadRecord {
+    lane: BackfillLaneKey,
+    head_event_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct LegacyPeerSyncStateRecord {
+    peer_id: String,
+    #[serde(default)]
+    known_scopes: Vec<SwarmScope>,
+    #[serde(default)]
+    backfill_cursors: Vec<PersistedBackfillCursorRecord>,
+    #[serde(default)]
+    remote_heads: Vec<PersistedBackfillRemoteHeadRecord>,
+    #[serde(default)]
+    backfill_successes: u64,
+    #[serde(default)]
+    backfill_failures: u64,
+}
+
+fn legacy_peer_sync_state_path(state_dir: &Path) -> PathBuf {
+    state_dir.join("network_peer_sync_state.json")
 }
 
 #[derive(Debug, Clone)]
@@ -638,11 +751,16 @@ fn route_topic_message_reply_to_wattswarm(
         });
 
     let mut node = crate::control::open_node(state_dir, db_path)?;
-    let network_id = node
-        .store
-        .load_verified_network_protocol_params()
-        .map(|verified| verified.network_id)
-        .unwrap_or_else(|_| DEFAULT_NETWORK_CONTEXT_ID.to_owned());
+    let current_network_id = current_network_context_id(&node);
+    let network_id = event
+        .payload
+        .get("network_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .filter(|value| *value == current_network_id)
+        .map(ToOwned::to_owned)
+        .unwrap_or(current_network_id);
     let created_at = observed_at_ms();
     let emitted = crate::control::emit_topic_message_with_content(
         &mut node,
@@ -1467,10 +1585,8 @@ fn peer_dm_thread_id(local_node_id: &str, remote_node_id: &str) -> String {
 fn build_contact_material(state_dir: &Path, local_peer_id: &str) -> Result<RawContactMaterial> {
     let generated_at = observed_at_ms();
     let identity = crate::control::load_local_identity(state_dir)?;
-    let peer_id = local_peer_id
-        .parse::<PeerId>()
-        .map_err(|err| anyhow!("parse local_peer_id as peer id: {err}"))?;
-    let iroh_contact = export_local_contact_material(state_dir, &peer_id, generated_at)?;
+    let iroh_contact =
+        export_local_contact_material_for_network_peer_id(state_dir, local_peer_id, generated_at)?;
     let material = json!({
         "node_id": identity.node_id(),
         "peer_id": local_peer_id,
@@ -2085,7 +2201,7 @@ fn network_node_from_state_dir(
     config: NetworkP2pConfig,
 ) -> Result<NetworkP2pNode> {
     let identity = crate::control::load_local_identity(state_dir)?;
-    NetworkP2pNode::from_ed25519_secret_bytes(config, identity.secret_bytes())
+    NetworkP2pNode::from_iroh_state_dir(config, state_dir.to_path_buf(), identity.secret_bytes())
 }
 
 pub fn maybe_start_background_network_service(
@@ -2356,7 +2472,7 @@ pub struct ScopeTrafficStats {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct NetworkBridgePeerHealth {
-    pub peer: String,
+    pub network_peer_id: String,
     pub connected: bool,
     pub score: i64,
     pub blacklisted: bool,
@@ -2402,8 +2518,13 @@ pub struct NetworkBridgeExecutionSetHealth {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct NetworkBridgeObservabilitySnapshot {
-    pub local_peer_id: String,
-    pub listen_addrs: Vec<String>,
+    pub local_network_peer_id: String,
+    pub local_endpoint_addrs: Vec<String>,
+    pub p2p_foundation: String,
+    pub local_iroh_endpoint_id: Option<String>,
+    pub subscribed_iroh_gossip_topics: Vec<String>,
+    pub known_iroh_contacts: usize,
+    pub legacy_libp2p_active: bool,
     pub subscribed_scopes: Vec<String>,
     pub connected_peer_count: usize,
     pub nat_status: String,
@@ -2412,6 +2533,11 @@ pub struct NetworkBridgeObservabilitySnapshot {
     pub relay_reservations: Vec<String>,
     pub peer_health: Vec<NetworkBridgePeerHealth>,
     pub scope_traffic: Vec<NetworkBridgeScopeTraffic>,
+    pub dropped_malformed_gossip: u64,
+    pub invalid_control_payloads: u64,
+    pub dial_failures: u64,
+    pub response_validation_failures: u64,
+    pub retry_suppressed_dials: u64,
     pub summary_health: NetworkBridgeSummaryHealth,
     pub subnet_sync_health: NetworkBridgeSubnetSyncHealth,
     pub execution_set_health: NetworkBridgeExecutionSetHealth,
@@ -2488,8 +2614,95 @@ impl NetworkBridgeService {
 
     /// Set the local persistence paths for run-queue and agent-event hooks.
     pub fn set_state_dir(&mut self, state_dir: PathBuf, db_path: PathBuf) {
+        if let Err(err) = self.load_peer_sync_state(&state_dir) {
+            eprintln!(
+                "peer sync state load failed for {}: {err}",
+                state_dir.display()
+            );
+        }
+        if let Err(err) = self.load_iroh_contact_material(&state_dir) {
+            eprintln!(
+                "iroh contact material load failed for {}: {err}",
+                state_dir.display()
+            );
+        }
         self.state_dir = Some(state_dir);
         self.db_path = Some(db_path);
+    }
+
+    fn load_iroh_contact_material(&mut self, state_dir: &Path) -> Result<()> {
+        for record in crate::control::load_peer_metadata_records_state(state_dir)? {
+            for contact in record.transport_contact_materials() {
+                if contact.transport == DataTransportRoute::IrohDirect.as_str() {
+                    let _ = self
+                        .runtime
+                        .upsert_remote_contact_material(contact.peer_id.clone(), contact)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn load_peer_sync_state(&mut self, state_dir: &Path) -> Result<()> {
+        let mut records = crate::control::load_network_peer_sync_state_records_state(state_dir)?;
+        if records.is_empty() {
+            records = migrate_legacy_peer_sync_state_records(state_dir)?;
+        }
+        let now = Instant::now();
+        for record in records {
+            let peer = match record.network_peer_id.parse::<PeerId>() {
+                Ok(peer) => peer,
+                Err(_) => continue,
+            };
+            let mut state = PeerSyncState::new(now);
+            state.known_scopes = serde_json::from_str::<Vec<SwarmScope>>(&record.known_scopes_json)
+                .unwrap_or_default()
+                .into_iter()
+                .collect();
+            for cursor in serde_json::from_str::<Vec<PersistedBackfillCursorRecord>>(
+                &record.backfill_cursors_json,
+            )
+            .unwrap_or_default()
+            {
+                state.backfill_cursors.insert(cursor.lane, cursor.cursor);
+            }
+            for head in serde_json::from_str::<Vec<PersistedBackfillRemoteHeadRecord>>(
+                &record.remote_heads_json,
+            )
+            .unwrap_or_default()
+            {
+                state
+                    .remote_head_event_ids
+                    .insert(head.lane, head.head_event_ids);
+            }
+            state.backfill_successes = record.backfill_successes;
+            state.backfill_failures = record.backfill_failures;
+            self.peer_sync_state.insert(peer, state);
+        }
+        Ok(())
+    }
+
+    fn persist_peer_sync_state(&self) {
+        let Some(state_dir) = &self.state_dir else {
+            return;
+        };
+        let updated_at = chrono::Utc::now().timestamp_millis().max(0) as u64;
+        let mut records = self
+            .peer_sync_state
+            .iter()
+            .filter_map(|(peer, state)| peer_sync_state_record(peer, state, updated_at))
+            .collect::<Vec<_>>();
+        records.sort_by(|left, right| left.network_peer_id.cmp(&right.network_peer_id));
+        for record in records {
+            if let Err(err) =
+                crate::control::save_network_peer_sync_state_record_state(state_dir, &record)
+            {
+                eprintln!(
+                    "peer sync state DB write failed for {}: {err}",
+                    record.network_peer_id
+                );
+            }
+        }
     }
 
     pub fn local_peer_id(&self) -> PeerId {
@@ -2510,6 +2723,11 @@ impl NetworkBridgeService {
             .get(scope)
             .map(|kinds| kinds.iter().copied().collect())
             .unwrap_or_default()
+    }
+
+    #[cfg(test)]
+    pub fn known_remote_contact_count(&self) -> usize {
+        self.runtime.known_remote_contact_count()
     }
 
     pub fn subscribe_scope(&mut self, scope: &SwarmScope) -> Result<()> {
@@ -2571,6 +2789,118 @@ impl NetworkBridgeService {
         let _guard = self.tokio_runtime.enter();
         self.runtime.dial(addr)
     }
+}
+
+fn peer_sync_state_record(
+    peer: &PeerId,
+    state: &PeerSyncState,
+    updated_at: u64,
+) -> Option<crate::control::NetworkPeerSyncStateRecord> {
+    let mut known_scopes = state.known_scopes.iter().cloned().collect::<Vec<_>>();
+    known_scopes.sort_by_key(scope_hint_label);
+    let mut backfill_cursors = state
+        .backfill_cursors
+        .iter()
+        .map(|(lane, cursor)| PersistedBackfillCursorRecord {
+            lane: lane.clone(),
+            cursor: *cursor,
+        })
+        .collect::<Vec<_>>();
+    backfill_cursors.sort_by_key(|entry| {
+        (
+            scope_hint_label(&entry.lane.scope),
+            entry.lane.feed_key.clone(),
+        )
+    });
+    let mut remote_heads = state
+        .remote_head_event_ids
+        .iter()
+        .map(|(lane, head_event_ids)| PersistedBackfillRemoteHeadRecord {
+            lane: lane.clone(),
+            head_event_ids: head_event_ids.clone(),
+        })
+        .collect::<Vec<_>>();
+    remote_heads.sort_by_key(|entry| {
+        (
+            scope_hint_label(&entry.lane.scope),
+            entry.lane.feed_key.clone(),
+        )
+    });
+    let known_scopes_json = match serde_json::to_string(&known_scopes) {
+        Ok(value) => value,
+        Err(err) => {
+            eprintln!("peer sync known scopes encode failed for {peer}: {err}");
+            return None;
+        }
+    };
+    let backfill_cursors_json = match serde_json::to_string(&backfill_cursors) {
+        Ok(value) => value,
+        Err(err) => {
+            eprintln!("peer sync cursors encode failed for {peer}: {err}");
+            return None;
+        }
+    };
+    let remote_heads_json = match serde_json::to_string(&remote_heads) {
+        Ok(value) => value,
+        Err(err) => {
+            eprintln!("peer sync remote heads encode failed for {peer}: {err}");
+            return None;
+        }
+    };
+    Some(crate::control::NetworkPeerSyncStateRecord {
+        network_peer_id: peer.to_string(),
+        known_scopes_json,
+        backfill_cursors_json,
+        remote_heads_json,
+        backfill_successes: state.backfill_successes,
+        backfill_failures: state.backfill_failures,
+        updated_at,
+    })
+}
+
+fn migrate_legacy_peer_sync_state_records(
+    state_dir: &Path,
+) -> Result<Vec<crate::control::NetworkPeerSyncStateRecord>> {
+    let path = legacy_peer_sync_state_path(state_dir);
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let raw = fs::read_to_string(&path)
+        .with_context(|| format!("read legacy peer sync state from {}", path.display()))?;
+    if raw.trim().is_empty() {
+        let _ = fs::remove_file(&path);
+        return Ok(Vec::new());
+    }
+    let legacy: Vec<LegacyPeerSyncStateRecord> = serde_json::from_str(&raw)
+        .with_context(|| format!("parse legacy peer sync state from {}", path.display()))?;
+    let updated_at = chrono::Utc::now().timestamp_millis().max(0) as u64;
+    let mut migrated = Vec::new();
+    for record in legacy {
+        let Ok(peer) = record.peer_id.parse::<PeerId>() else {
+            continue;
+        };
+        let mut state = PeerSyncState::new(Instant::now());
+        state.known_scopes = record.known_scopes.into_iter().collect();
+        for cursor in record.backfill_cursors {
+            state.backfill_cursors.insert(cursor.lane, cursor.cursor);
+        }
+        for head in record.remote_heads {
+            state
+                .remote_head_event_ids
+                .insert(head.lane, head.head_event_ids);
+        }
+        state.backfill_successes = record.backfill_successes;
+        state.backfill_failures = record.backfill_failures;
+        let Some(row) = peer_sync_state_record(&peer, &state, updated_at) else {
+            continue;
+        };
+        crate::control::save_network_peer_sync_state_record_state(state_dir, &row)?;
+        migrated.push(row);
+    }
+    if !migrated.is_empty() {
+        let _ = fs::remove_file(&path);
+    }
+    Ok(migrated)
 }
 
 #[derive(Debug, Deserialize, Default)]

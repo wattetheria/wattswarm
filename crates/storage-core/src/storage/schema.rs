@@ -241,6 +241,62 @@ fn migrate_peer_metadata_local_contact_material_schema(conn: &Connection) -> Res
     Ok(())
 }
 
+fn migrate_network_peer_sync_state_identity_schema(conn: &Connection) -> Result<()> {
+    if column_exists(conn, "network_peer_sync_state_local", "network_peer_id") {
+        return Ok(());
+    }
+    if !column_exists(conn, "network_peer_sync_state_local", "peer_id") {
+        return Ok(());
+    }
+    conn.execute_batch(
+        "
+        ALTER TABLE network_peer_sync_state_local
+        DROP CONSTRAINT IF EXISTS network_peer_sync_state_local_pkey;
+        ALTER TABLE network_peer_sync_state_local
+        RENAME COLUMN peer_id TO network_peer_id;
+        ALTER TABLE network_peer_sync_state_local
+        ADD CONSTRAINT network_peer_sync_state_local_pkey PRIMARY KEY (scope_id, network_peer_id);
+        ",
+    )?;
+    Ok(())
+}
+
+fn migrate_feed_subscription_network_id_schema(conn: &Connection) -> Result<()> {
+    if !column_exists(conn, "feed_subscriptions", "network_id") {
+        conn.execute_batch(
+            "ALTER TABLE feed_subscriptions ADD COLUMN network_id TEXT NOT NULL DEFAULT ''",
+        )?;
+    }
+    conn.execute_batch(
+        "
+        ALTER TABLE feed_subscriptions
+        DROP CONSTRAINT IF EXISTS feed_subscriptions_pkey;
+        ALTER TABLE feed_subscriptions
+        ADD CONSTRAINT feed_subscriptions_pkey
+        PRIMARY KEY (org_id, network_id, subscriber_node_id, feed_key);
+        ",
+    )?;
+    Ok(())
+}
+
+fn migrate_topic_cursor_network_id_schema(conn: &Connection) -> Result<()> {
+    if !column_exists(conn, "topic_cursors", "network_id") {
+        conn.execute_batch(
+            "ALTER TABLE topic_cursors ADD COLUMN network_id TEXT NOT NULL DEFAULT ''",
+        )?;
+    }
+    conn.execute_batch(
+        "
+        ALTER TABLE topic_cursors
+        DROP CONSTRAINT IF EXISTS topic_cursors_pkey;
+        ALTER TABLE topic_cursors
+        ADD CONSTRAINT topic_cursors_pkey
+        PRIMARY KEY (org_id, network_id, subscriber_node_id, feed_key);
+        ",
+    )?;
+    Ok(())
+}
+
 fn migrate_peer_relationships_local_trim_signature_column(conn: &Connection) -> Result<()> {
     if column_exists(conn, "peer_relationships_local", "agent_signature") {
         conn.execute_batch(
@@ -700,6 +756,18 @@ impl PgStore {
                 PRIMARY KEY(scope_id, node_id)
             );
 
+            CREATE TABLE IF NOT EXISTS network_peer_sync_state_local (
+                scope_id TEXT NOT NULL DEFAULT '',
+                network_peer_id TEXT NOT NULL,
+                known_scopes_json TEXT NOT NULL DEFAULT '[]',
+                backfill_cursors_json TEXT NOT NULL DEFAULT '[]',
+                remote_heads_json TEXT NOT NULL DEFAULT '[]',
+                backfill_successes BIGINT NOT NULL DEFAULT 0,
+                backfill_failures BIGINT NOT NULL DEFAULT 0,
+                updated_at TIMESTAMPTZ NOT NULL,
+                PRIMARY KEY(scope_id, network_peer_id)
+            );
+
             CREATE TABLE IF NOT EXISTS peer_relationships_local (
                 scope_id TEXT NOT NULL DEFAULT '',
                 remote_node_id TEXT NOT NULL,
@@ -984,13 +1052,14 @@ impl PgStore {
 
             CREATE TABLE IF NOT EXISTS feed_subscriptions (
                 org_id TEXT NOT NULL DEFAULT '__unset_org__',
+                network_id TEXT NOT NULL DEFAULT '',
                 subscriber_node_id TEXT NOT NULL,
                 feed_key TEXT NOT NULL,
                 scope_hint TEXT NOT NULL,
                 gossip_kinds_json TEXT NOT NULL DEFAULT '[]',
                 active BOOLEAN NOT NULL DEFAULT TRUE,
                 updated_at TIMESTAMPTZ NOT NULL,
-                PRIMARY KEY(org_id, subscriber_node_id, feed_key)
+                PRIMARY KEY(org_id, network_id, subscriber_node_id, feed_key)
             );
 
             CREATE TABLE IF NOT EXISTS task_announcements (
@@ -1022,15 +1091,18 @@ impl PgStore {
             );
             CREATE INDEX IF NOT EXISTS idx_topic_messages_feed_scope_created
                 ON topic_messages(org_id, feed_key, scope_hint, created_at DESC, message_id DESC);
+            CREATE INDEX IF NOT EXISTS idx_topic_messages_network_feed_scope_created
+                ON topic_messages(org_id, network_id, feed_key, scope_hint, created_at DESC, message_id DESC);
 
             CREATE TABLE IF NOT EXISTS topic_cursors (
                 org_id TEXT NOT NULL DEFAULT '__unset_org__',
+                network_id TEXT NOT NULL DEFAULT '',
                 subscriber_node_id TEXT NOT NULL,
                 feed_key TEXT NOT NULL,
                 scope_hint TEXT NOT NULL,
                 last_event_seq BIGINT NOT NULL DEFAULT 0,
                 updated_at TIMESTAMPTZ NOT NULL,
-                PRIMARY KEY(org_id, subscriber_node_id, feed_key)
+                PRIMARY KEY(org_id, network_id, subscriber_node_id, feed_key)
             );
             CREATE INDEX IF NOT EXISTS idx_topic_cursors_scope_updated
                 ON topic_cursors(org_id, scope_hint, updated_at DESC);
@@ -1822,6 +1894,9 @@ impl PgStore {
             migrate_discovered_peers_local_scope_schema(&conn)?;
             migrate_discovered_peers_local_source_kind_schema(&conn)?;
             migrate_peer_metadata_local_contact_material_schema(&conn)?;
+            migrate_network_peer_sync_state_identity_schema(&conn)?;
+            migrate_feed_subscription_network_id_schema(&conn)?;
+            migrate_topic_cursor_network_id_schema(&conn)?;
             migrate_peer_relationships_local_trim_signature_column(&conn)?;
             migrate_peer_dm_messages_local_trim_product_columns(&conn)?;
             migrate_topic_messages_content_ref_schema(&conn)?;

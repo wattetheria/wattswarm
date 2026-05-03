@@ -30,34 +30,51 @@ fn sample_topic_content_ref(digest: &str, producer: &str) -> ArtifactRef {
 fn network_substrate_reads_canonicalize_scope_hints() {
     let store = open_test_store();
     store
-        .upsert_feed_subscription("node-a", "feed-1", " local:lab-9 ", &[], true, 100)
+        .upsert_feed_subscription(
+            "default",
+            "node-a",
+            "feed-1",
+            " local:lab-9 ",
+            &[],
+            true,
+            100,
+        )
         .expect("upsert subscription");
 
     let subscription = store
-        .get_feed_subscription("node-a", "feed-1")
+        .get_feed_subscription("default", "node-a", "feed-1")
         .expect("load subscription")
         .expect("subscription exists");
     assert_eq!(subscription.scope_hint, "node:lab-9");
+    assert_eq!(subscription.network_id, "default");
     assert_eq!(
         subscription.scope(),
         Some(ProjectionScope::Node("lab-9".to_owned()))
     );
 
     let hints = store
-        .list_active_feed_subscription_scope_hints("node-a")
+        .list_active_feed_subscription_scope_hints("default", "node-a")
         .expect("load hints");
     assert_eq!(hints, vec!["node:lab-9".to_owned()]);
 
     let scopes = store
-        .list_active_feed_subscription_scopes("node-a")
+        .list_active_feed_subscription_scopes("default", "node-a")
         .expect("load scopes");
     assert_eq!(scopes, vec![ProjectionScope::Node("lab-9".to_owned())]);
 
     store
-        .upsert_feed_subscription("node-a", "feed-group", " group:crew-7 ", &[], true, 101)
+        .upsert_feed_subscription(
+            "default",
+            "node-a",
+            "feed-group",
+            " group:crew-7 ",
+            &[],
+            true,
+            101,
+        )
         .expect("upsert group subscription");
     let group_subscription = store
-        .get_feed_subscription("node-a", "feed-group")
+        .get_feed_subscription("default", "node-a", "feed-group")
         .expect("load group subscription")
         .expect("group subscription exists");
     assert_eq!(group_subscription.scope_hint, "group:crew-7");
@@ -65,6 +82,45 @@ fn network_substrate_reads_canonicalize_scope_hints() {
         group_subscription.scope(),
         Some(ProjectionScope::Group("crew-7".to_owned()))
     );
+}
+
+#[test]
+fn feed_subscriptions_are_partitioned_by_network_id() {
+    let store = open_test_store();
+    store
+        .upsert_feed_subscription(
+            "mainnet",
+            "node-a",
+            "crew.chat",
+            "group:main",
+            &[],
+            true,
+            100,
+        )
+        .expect("upsert mainnet subscription");
+    store
+        .upsert_feed_subscription(
+            "subnet:alpha",
+            "node-a",
+            "crew.chat",
+            "group:subnet",
+            &[],
+            true,
+            101,
+        )
+        .expect("upsert subnet subscription");
+
+    let mainnet = store
+        .get_feed_subscription("mainnet", "node-a", "crew.chat")
+        .expect("load mainnet subscription")
+        .expect("mainnet subscription exists");
+    assert_eq!(mainnet.scope_hint, "group:main");
+
+    let subnet = store
+        .get_feed_subscription("subnet:alpha", "node-a", "crew.chat")
+        .expect("load subnet subscription")
+        .expect("subnet subscription exists");
+    assert_eq!(subnet.scope_hint, "group:subnet");
 }
 
 #[test]
@@ -145,7 +201,7 @@ fn topic_message_roundtrip_reads_scope_and_content() {
         .expect("put reply topic message");
 
     let messages = store
-        .list_topic_messages("crew.chat", " group:crew-7 ", 10)
+        .list_topic_messages("default", "crew.chat", " group:crew-7 ", 10)
         .expect("list topic messages");
     assert_eq!(messages.len(), 2);
     assert_eq!(messages[0].message_id, "msg-2");
@@ -155,6 +211,51 @@ fn topic_message_roundtrip_reads_scope_and_content() {
         Some(ProjectionScope::Group("crew-7".to_owned()))
     );
     assert_eq!(messages[1].content["text"], serde_json::json!("hello crew"));
+}
+
+#[test]
+fn topic_message_reads_are_partitioned_by_network_id() {
+    let store = open_test_store();
+    store
+        .put_topic_message(
+            "msg-main",
+            "mainnet",
+            "crew.chat",
+            "group:crew-7",
+            "node-a",
+            &sample_topic_content_ref("sha256:msg-main", "node-a"),
+            Some(&serde_json::json!({"text":"mainnet"})),
+            None,
+            123,
+        )
+        .expect("put mainnet message");
+    store
+        .put_topic_message(
+            "msg-subnet",
+            "subnet:alpha",
+            "crew.chat",
+            "group:crew-7",
+            "node-b",
+            &sample_topic_content_ref("sha256:msg-subnet", "node-b"),
+            Some(&serde_json::json!({"text":"subnet"})),
+            None,
+            124,
+        )
+        .expect("put subnet message");
+
+    let mainnet_messages = store
+        .list_topic_messages("mainnet", "crew.chat", "group:crew-7", 10)
+        .expect("list mainnet topic messages");
+    assert_eq!(mainnet_messages.len(), 1);
+    assert_eq!(mainnet_messages[0].message_id, "msg-main");
+    assert_eq!(mainnet_messages[0].network_id, "mainnet");
+
+    let subnet_messages = store
+        .list_topic_messages("subnet:alpha", "crew.chat", "group:crew-7", 10)
+        .expect("list subnet topic messages");
+    assert_eq!(subnet_messages.len(), 1);
+    assert_eq!(subnet_messages[0].message_id, "msg-subnet");
+    assert_eq!(subnet_messages[0].network_id, "subnet:alpha");
 }
 
 #[test]
@@ -190,21 +291,54 @@ fn checkpoint_announcement_lookup_escapes_task_id_like_wildcards() {
 fn topic_cursor_roundtrip_advances_only_forward() {
     let store = open_test_store();
     store
-        .upsert_topic_cursor("node-a", "crew.chat", " group:crew-7 ", 11, 200)
+        .upsert_topic_cursor("default", "node-a", "crew.chat", " group:crew-7 ", 11, 200)
         .expect("put topic cursor");
     store
-        .upsert_topic_cursor("node-a", "crew.chat", "group:crew-7", 7, 201)
+        .upsert_topic_cursor("default", "node-a", "crew.chat", "group:crew-7", 7, 201)
         .expect("attempt backwards cursor");
 
     let cursor = store
-        .get_topic_cursor("node-a", "crew.chat")
+        .get_topic_cursor("default", "node-a", "crew.chat")
         .expect("get topic cursor")
         .expect("cursor exists");
     assert_eq!(cursor.last_event_seq, 11);
+    assert_eq!(cursor.network_id, "default");
     assert_eq!(
         cursor.scope(),
         Some(ProjectionScope::Group("crew-7".to_owned()))
     );
+}
+
+#[test]
+fn topic_cursors_are_partitioned_by_network_id() {
+    let store = open_test_store();
+    store
+        .upsert_topic_cursor("mainnet", "node-a", "crew.chat", "group:main", 10, 200)
+        .expect("put mainnet cursor");
+    store
+        .upsert_topic_cursor(
+            "subnet:alpha",
+            "node-a",
+            "crew.chat",
+            "group:subnet",
+            20,
+            201,
+        )
+        .expect("put subnet cursor");
+
+    let mainnet = store
+        .get_topic_cursor("mainnet", "node-a", "crew.chat")
+        .expect("load mainnet cursor")
+        .expect("mainnet cursor exists");
+    assert_eq!(mainnet.scope_hint, "group:main");
+    assert_eq!(mainnet.last_event_seq, 10);
+
+    let subnet = store
+        .get_topic_cursor("subnet:alpha", "node-a", "crew.chat")
+        .expect("load subnet cursor")
+        .expect("subnet cursor exists");
+    assert_eq!(subnet.scope_hint, "group:subnet");
+    assert_eq!(subnet.last_event_seq, 20);
 }
 
 #[test]
@@ -251,14 +385,28 @@ fn topic_message_pagination_uses_created_at_and_message_id_anchor() {
         .expect("put third topic message");
 
     let page = store
-        .list_topic_messages_page("crew.chat", "group:crew-7", Some(125), Some("msg-3"), 10)
+        .list_topic_messages_page(
+            "default",
+            "crew.chat",
+            "group:crew-7",
+            Some(125),
+            Some("msg-3"),
+            10,
+        )
         .expect("load paged topic messages");
     assert_eq!(page.len(), 2);
     assert_eq!(page[0].message_id, "msg-2");
     assert_eq!(page[1].message_id, "msg-1");
 
     let tie_page = store
-        .list_topic_messages_page("crew.chat", "group:crew-7", Some(124), Some("msg-2"), 10)
+        .list_topic_messages_page(
+            "default",
+            "crew.chat",
+            "group:crew-7",
+            Some(124),
+            Some("msg-2"),
+            10,
+        )
         .expect("load tie-broken topic messages");
     assert_eq!(tie_page.len(), 1);
     assert_eq!(tie_page[0].message_id, "msg-1");
@@ -421,10 +569,26 @@ fn discoverable_feed_sources_and_domains_capture_active_network_surfaces() {
         .upsert_task_contract(&contract, 1)
         .expect("upsert task contract");
     store
-        .upsert_feed_subscription("node-a", "feed-market", " region:sol-1 ", &[], true, 10)
+        .upsert_feed_subscription(
+            "default",
+            "node-a",
+            "feed-market",
+            " region:sol-1 ",
+            &[],
+            true,
+            10,
+        )
         .expect("active feed subscription");
     store
-        .upsert_feed_subscription("node-b", "feed-market", "region:sol-1", &[], true, 11)
+        .upsert_feed_subscription(
+            "default",
+            "node-b",
+            "feed-market",
+            "region:sol-1",
+            &[],
+            true,
+            11,
+        )
         .expect("second feed subscription");
     store
         .upsert_execution_set_member(

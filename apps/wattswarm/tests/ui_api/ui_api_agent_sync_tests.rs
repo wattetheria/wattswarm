@@ -724,11 +724,34 @@ fn ui_exposes_wattetheria_sync_http_boundaries() {
             .unwrap();
         assert_eq!(topic_activity_res.status(), StatusCode::OK);
         let topic_activity = json_from(topic_activity_res).await;
+        let network_id = topic_activity["network_id"].as_str().unwrap();
         assert_eq!(
             topic_activity["messages"][0]["content"]["text"].as_str(),
             Some("hello from wattetheria brain")
         );
+        assert_eq!(
+            topic_activity["messages"][0]["network_id"].as_str(),
+            Some(network_id)
+        );
         assert_eq!(topic_activity["feed_key"].as_str(), Some("crew.chat"));
+
+        let other_network_topic_activity_res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/wattetheria/topic/activity?network_id=other-net&feed_key=crew.chat&scope_hint=group:crew-7&limit=5")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(other_network_topic_activity_res.status(), StatusCode::OK);
+        let other_network_topic_activity = json_from(other_network_topic_activity_res).await;
+        assert_eq!(
+            other_network_topic_activity["messages"].as_array().unwrap().len(),
+            0
+        );
 
         let run_id = "run-wattetheria-http";
         let submit_run_res = app
@@ -1093,6 +1116,7 @@ fn ui_exposes_wattetheria_sync_grpc_streams() {
                     feed_key: String::new(),
                     scope_hint: String::new(),
                     subscriber_node_id: String::new(),
+                    network_id: String::new(),
                 }))
                 .await
                 .unwrap()
@@ -1116,6 +1140,7 @@ fn ui_exposes_wattetheria_sync_grpc_streams() {
                     feed_key: "crew.chat".to_owned(),
                     scope_hint: "group:crew-stream".to_owned(),
                     subscriber_node_id: String::new(),
+                    network_id: String::new(),
                 }))
                 .await
                 .unwrap()
@@ -1142,6 +1167,7 @@ fn ui_exposes_wattetheria_sync_grpc_streams() {
                     feed_key: String::new(),
                     scope_hint: String::new(),
                     subscriber_node_id: String::new(),
+                    network_id: String::new(),
                 }))
                 .await
                 .unwrap()
@@ -1166,6 +1192,7 @@ fn ui_exposes_wattetheria_sync_grpc_streams() {
                     feed_key: String::new(),
                     scope_hint: String::new(),
                     subscriber_node_id: String::new(),
+                    network_id: String::new(),
                 }))
                 .await
                 .unwrap()

@@ -1048,7 +1048,7 @@ pub fn two_nodes_sync_topic_message_content_over_iroh() {
         }
         node_b
             .store
-            .list_topic_messages("crew.chat", "group:crew-7", 10)
+            .list_topic_messages("default", "crew.chat", "group:crew-7", 10)
             .expect("list topic messages")
             .into_iter()
             .any(|message| {

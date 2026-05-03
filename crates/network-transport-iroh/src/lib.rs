@@ -1,6 +1,16 @@
 use anyhow::{Context, Result, anyhow, bail};
 use hex::decode;
-use iroh::{Endpoint, EndpointAddr, EndpointId, SecretKey, TransportAddr, endpoint::presets};
+use iroh::{
+    Endpoint, EndpointAddr, EndpointId, SecretKey, TransportAddr,
+    address_lookup::memory::MemoryLookup,
+    endpoint::{Connection, presets},
+    protocol::{AcceptError, ProtocolHandler, Router},
+};
+use iroh_blobs::{
+    BlobFormat, BlobsProtocol, Hash as IrohBlobHash, HashAndFormat, store::fs::FsStore,
+};
+use iroh_gossip::Gossip;
+use iroh_gossip::TopicId as IrohGossipTopicId;
 use libp2p::PeerId;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -11,6 +21,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::runtime::{Builder as RuntimeBuilder, Runtime, RuntimeFlavor};
 use wattswarm_artifact_store::{ArtifactKind, ArtifactStore};
 use wattswarm_network_transport_core::{
@@ -20,8 +31,57 @@ use wattswarm_network_transport_core::{
 };
 
 pub const DEFAULT_IROH_ALPN: &str = "/wattswarm/iroh/1";
+pub const DEFAULT_IROH_CONTROL_ALPN: &str = "/wattswarm/iroh-control/1";
+pub const IROH_CONTROL_KIND_CONTACT_MATERIAL: &str = "contact_material.v1";
+pub const WATTSWARM_IROH_GOSSIP_TOPIC_PREFIX: &str = "wattswarm:iroh-gossip-topic:v1";
 const MAX_FETCH_REQUEST_BYTES: usize = 64 * 1024;
 const MAX_FETCH_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
+const MAX_CONTROL_REQUEST_BYTES: usize = 1024 * 1024;
+const MAX_CONTROL_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
+
+pub fn derive_gossip_topic_id(
+    network_id: &str,
+    scope_hint: &str,
+    gossip_kind: &str,
+) -> IrohGossipTopicId {
+    let material = format!(
+        "{WATTSWARM_IROH_GOSSIP_TOPIC_PREFIX}\0{}\0{}\0{}",
+        network_id.trim(),
+        scope_hint.trim(),
+        gossip_kind.trim()
+    );
+    IrohGossipTopicId::from_bytes(*IrohBlobHash::new(material).as_bytes())
+}
+
+pub fn blob_hash_for_bytes(bytes: impl AsRef<[u8]>) -> IrohBlobHash {
+    IrohBlobHash::new(bytes)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IrohBlobReference {
+    pub hash: String,
+    pub format: String,
+    pub size: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IrohControlStreamRequest {
+    pub kind: String,
+    pub payload: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IrohControlStreamResponse {
+    pub ok: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub payload: Vec<u8>,
+}
+
+type ControlStreamHandler =
+    Arc<dyn Fn(IrohControlStreamRequest) -> IrohControlStreamResponse + Send + Sync>;
+type ControlStreamHandlers = Arc<Mutex<HashMap<String, ControlStreamHandler>>>;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IrohTransportConfig {
@@ -48,7 +108,7 @@ pub struct IrohTransportMaterial {
 
 #[derive(Debug, Clone)]
 pub struct IrohTransportAdapter {
-    local_peer_id: PeerId,
+    network_peer_id: String,
     endpoint_id: EndpointId,
     config: IrohTransportConfig,
     capabilities: PeerTransportCapabilities,
@@ -58,12 +118,30 @@ impl IrohTransportAdapter {
     pub fn from_local_peer_id(peer_id: &PeerId) -> Result<Self> {
         let endpoint_id = peer_id_to_endpoint_id(peer_id)
             .ok_or_else(|| anyhow!("peer id is not ed25519-backed"))?;
-        Ok(Self {
-            local_peer_id: *peer_id,
+        Ok(Self::from_endpoint_id(endpoint_id, peer_id.to_string()))
+    }
+
+    pub fn from_seed_bytes(secret_key_32: [u8; 32]) -> Result<Self> {
+        let secret_key = SecretKey::from_bytes(&secret_key_32);
+        Ok(Self::from_secret_key(&secret_key))
+    }
+
+    pub fn from_secret_key(secret_key: &SecretKey) -> Self {
+        let endpoint_id = endpoint_id_from_secret_key(secret_key);
+        Self::from_endpoint_id(endpoint_id, endpoint_id.to_string())
+    }
+
+    pub fn from_endpoint_id(endpoint_id: EndpointId, network_peer_id: impl Into<String>) -> Self {
+        Self {
+            network_peer_id: network_peer_id.into(),
             endpoint_id,
             config: IrohTransportConfig::default(),
             capabilities: PeerTransportCapabilities::iroh_direct_default(),
-        })
+        }
+    }
+
+    pub fn network_peer_id(&self) -> &str {
+        &self.network_peer_id
     }
 
     pub fn endpoint_id(&self) -> EndpointId {
@@ -78,7 +156,7 @@ impl IrohTransportAdapter {
     ) -> TransportContactMaterial {
         TransportContactMaterial {
             transport: TransportRoute::IrohDirect.as_str().to_owned(),
-            peer_id: self.local_peer_id.to_string(),
+            peer_id: self.network_peer_id.clone(),
             metadata: TransportMetadata {
                 route: TransportRoute::IrohDirect,
                 generated_at,
@@ -115,13 +193,47 @@ impl DirectDataTransportAdapter for IrohTransportAdapter {
     }
 }
 
-#[derive(Debug)]
 struct IrohDataPlaneService {
-    state_dir: PathBuf,
     runtime: Runtime,
     endpoint: Endpoint,
+    router: Router,
+    gossip: Gossip,
+    blob_store: FsStore,
     adapter: IrohTransportAdapter,
+    control_handlers: ControlStreamHandlers,
     op_lock: Mutex<()>,
+}
+
+#[derive(Debug, Clone)]
+struct DirectFetchProtocol {
+    state_dir: PathBuf,
+}
+
+impl ProtocolHandler for DirectFetchProtocol {
+    async fn accept(&self, connection: Connection) -> std::result::Result<(), AcceptError> {
+        serve_incoming_fetch_request(self.state_dir.clone(), connection)
+            .await
+            .map_err(|err| AcceptError::from_boxed(err.into()))
+    }
+}
+
+#[derive(Clone)]
+struct ControlStreamProtocol {
+    handlers: ControlStreamHandlers,
+}
+
+impl std::fmt::Debug for ControlStreamProtocol {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_struct("ControlStreamProtocol").finish()
+    }
+}
+
+impl ProtocolHandler for ControlStreamProtocol {
+    async fn accept(&self, connection: Connection) -> std::result::Result<(), AcceptError> {
+        serve_incoming_control_stream_request(self.handlers.clone(), connection)
+            .await
+            .map_err(|err| AcceptError::from_boxed(err.into()))
+    }
 }
 
 static LOCAL_IROH_DATA_PLANES: OnceLock<Mutex<HashMap<PathBuf, Arc<IrohDataPlaneService>>>> =
@@ -133,6 +245,10 @@ fn local_iroh_data_planes() -> &'static Mutex<HashMap<PathBuf, Arc<IrohDataPlane
 
 fn artifact_store_path(state_dir: &Path) -> PathBuf {
     state_dir.join("artifacts")
+}
+
+fn iroh_blob_store_path(state_dir: &Path) -> PathBuf {
+    state_dir.join("iroh-blobs")
 }
 
 fn open_artifact_store(state_dir: &Path) -> Result<ArtifactStore> {
@@ -152,8 +268,15 @@ fn load_secret_key_from_state_dir(state_dir: &Path) -> Result<SecretKey> {
     Ok(SecretKey::from_bytes(&arr))
 }
 
-async fn handle_incoming_request(state_dir: PathBuf, connection: iroh::endpoint::Connection) {
-    let response = match async {
+fn unix_timestamp_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or_default()
+}
+
+async fn serve_incoming_fetch_request(state_dir: PathBuf, connection: Connection) -> Result<()> {
+    async {
         let (mut send, mut recv) = connection.accept_bi().await?;
         let request_bytes = recv.read_to_end(MAX_FETCH_REQUEST_BYTES).await?;
         let request: DirectDataFetchRequest = serde_json::from_slice(&request_bytes)?;
@@ -180,16 +303,44 @@ async fn handle_incoming_request(state_dir: PathBuf, connection: iroh::endpoint:
         Result::<(), anyhow::Error>::Ok(())
     }
     .await
-    {
-        Ok(()) => None,
-        Err(err) => Some(err),
-    };
-    if let Some(err) = response {
-        eprintln!(
-            "iroh data fetch handler failed for {}: {err}",
-            state_dir.display()
-        );
+    .with_context(|| format!("iroh data fetch handler failed for {}", state_dir.display()))
+}
+
+async fn serve_incoming_control_stream_request(
+    handlers: ControlStreamHandlers,
+    connection: Connection,
+) -> Result<()> {
+    async {
+        let (mut send, mut recv) = connection.accept_bi().await?;
+        let request_bytes = recv.read_to_end(MAX_CONTROL_REQUEST_BYTES).await?;
+        let request: IrohControlStreamRequest = serde_json::from_slice(&request_bytes)?;
+        let request_kind = request.kind.clone();
+        let response = match handlers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&request_kind)
+            .cloned()
+        {
+            Some(handler) => handler(request),
+            None => IrohControlStreamResponse {
+                ok: false,
+                error: Some(format!(
+                    "no iroh control stream handler registered for {request_kind}"
+                )),
+                payload: Vec::new(),
+            },
+        };
+        let response_bytes = serde_json::to_vec(&response)?;
+        if response_bytes.len() > MAX_CONTROL_RESPONSE_BYTES {
+            bail!("iroh control stream response exceeds max response bytes");
+        }
+        send.write_all(&response_bytes).await?;
+        send.finish()?;
+        connection.closed().await;
+        Result::<(), anyhow::Error>::Ok(())
     }
+    .await
+    .context("serve iroh control stream request")
 }
 
 #[derive(Debug)]
@@ -280,9 +431,15 @@ fn serve_fetch_request(
 }
 
 impl IrohDataPlaneService {
-    fn new(state_dir: &Path, local_peer_id: &PeerId) -> Result<Arc<Self>> {
-        let adapter = IrohTransportAdapter::from_local_peer_id(local_peer_id)?;
+    fn new(state_dir: &Path, network_peer_id: &str) -> Result<Arc<Self>> {
         let secret_key = load_secret_key_from_state_dir(state_dir)?;
+        let endpoint_id = endpoint_id_from_secret_key(&secret_key);
+        if !network_peer_id_matches_endpoint_id(network_peer_id, endpoint_id) {
+            bail!(
+                "iroh network peer id {network_peer_id} does not match node seed endpoint id {endpoint_id}"
+            );
+        }
+        let adapter = IrohTransportAdapter::from_endpoint_id(endpoint_id, network_peer_id);
         let runtime = RuntimeBuilder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
@@ -290,7 +447,6 @@ impl IrohDataPlaneService {
         let endpoint_future = || async {
             Endpoint::builder(presets::N0)
                 .secret_key(secret_key)
-                .alpns(vec![adapter.config.alpn.as_bytes().to_vec()])
                 .bind()
                 .await
         };
@@ -306,31 +462,51 @@ impl IrohDataPlaneService {
             })?,
             Err(_) => runtime.block_on(endpoint_future())?,
         };
-        let service = Arc::new(Self {
-            state_dir: state_dir.to_path_buf(),
+        let control_handlers = Arc::new(Mutex::new(HashMap::new()));
+        let router_future = || async {
+            let blob_store = FsStore::load(iroh_blob_store_path(state_dir)).await?;
+            let blobs = BlobsProtocol::new(&blob_store, None);
+            let gossip = Gossip::builder().spawn(endpoint.clone());
+            let router = Router::builder(endpoint.clone())
+                .accept(
+                    adapter.config.alpn.as_bytes(),
+                    DirectFetchProtocol {
+                        state_dir: state_dir.to_path_buf(),
+                    },
+                )
+                .accept(
+                    DEFAULT_IROH_CONTROL_ALPN.as_bytes(),
+                    ControlStreamProtocol {
+                        handlers: control_handlers.clone(),
+                    },
+                )
+                .accept(iroh_gossip::ALPN, gossip.clone())
+                .accept(iroh_blobs::ALPN, blobs)
+                .spawn();
+            Result::<(Gossip, FsStore, Router)>::Ok((gossip, blob_store, router))
+        };
+        let (gossip, blob_store, router) = match tokio::runtime::Handle::try_current() {
+            Ok(handle) if handle.runtime_flavor() == RuntimeFlavor::MultiThread => {
+                tokio::task::block_in_place(|| runtime.block_on(router_future()))?
+            }
+            Ok(_) => std::thread::scope(|scope| {
+                scope
+                    .spawn(|| runtime.block_on(router_future()))
+                    .join()
+                    .expect("join iroh router init thread")
+            })?,
+            Err(_) => runtime.block_on(router_future())?,
+        };
+        Ok(Arc::new(Self {
             runtime,
             endpoint,
+            router,
+            gossip,
+            blob_store,
             adapter,
+            control_handlers,
             op_lock: Mutex::new(()),
-        });
-        service.spawn_accept_loop();
-        Ok(service)
-    }
-
-    fn spawn_accept_loop(self: &Arc<Self>) {
-        let endpoint = self.endpoint.clone();
-        let state_dir = self.state_dir.clone();
-        self.runtime.spawn(async move {
-            while let Some(incoming) = endpoint.accept().await {
-                let state_dir = state_dir.clone();
-                tokio::spawn(async move {
-                    match incoming.await {
-                        Ok(connection) => handle_incoming_request(state_dir, connection).await,
-                        Err(err) => eprintln!("iroh accept connection failed: {err}"),
-                    }
-                });
-            }
-        });
+        }))
     }
 
     fn block_on<T>(&self, future: impl Future<Output = T>) -> T {
@@ -401,9 +577,148 @@ impl IrohDataPlaneService {
         })
     }
 
-    fn shutdown(&self) {
-        self.block_on(self.endpoint.close());
+    fn send_control_stream_request(
+        &self,
+        remote: &TransportContactMaterial,
+        request: &IrohControlStreamRequest,
+    ) -> Result<IrohControlStreamResponse> {
+        let _guard = self
+            .op_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let endpoint_addr = endpoint_addr_from_contact_material(remote)?;
+        let request_bytes = serde_json::to_vec(request)?;
+        if request_bytes.len() > MAX_CONTROL_REQUEST_BYTES {
+            bail!("iroh control stream request exceeds max request bytes");
+        }
+        self.block_on(async {
+            let connection = self
+                .endpoint
+                .connect(endpoint_addr, DEFAULT_IROH_CONTROL_ALPN.as_bytes())
+                .await
+                .context("connect iroh control stream endpoint")?;
+            let (mut send, mut recv) = connection
+                .open_bi()
+                .await
+                .context("open iroh control stream")?;
+            send.write_all(&request_bytes)
+                .await
+                .context("write iroh control stream request")?;
+            send.finish().context("finish control stream request")?;
+            let response_bytes = recv
+                .read_to_end(MAX_CONTROL_RESPONSE_BYTES)
+                .await
+                .context("read iroh control stream response")?;
+            let response: IrohControlStreamResponse = serde_json::from_slice(&response_bytes)
+                .context("decode iroh control stream response")?;
+            Ok(response)
+        })
     }
+
+    fn set_control_stream_handler(&self, kind: &str, handler: Option<ControlStreamHandler>) {
+        let mut handlers = self
+            .control_handlers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match handler {
+            Some(handler) => {
+                handlers.insert(kind.to_owned(), handler);
+            }
+            None => {
+                handlers.remove(kind);
+            }
+        }
+    }
+
+    fn put_blob_bytes(&self, bytes: Vec<u8>) -> Result<IrohBlobReference> {
+        let size = bytes.len() as u64;
+        let info = self
+            .block_on(async { self.blob_store.add_slice(bytes).await })
+            .context("store bytes in iroh-blobs")?;
+        Ok(IrohBlobReference {
+            hash: info.hash.to_hex(),
+            format: iroh_blob_format_label(info.format).to_owned(),
+            size,
+        })
+    }
+
+    fn read_blob_bytes(&self, reference: &IrohBlobReference) -> Result<Vec<u8>> {
+        let hash = parse_iroh_blob_hash(&reference.hash)?;
+        let bytes = self
+            .block_on(self.blob_store.get_bytes(hash))
+            .context("read bytes from iroh-blobs")?
+            .to_vec();
+        validate_iroh_blob_bytes(reference, &bytes)?;
+        Ok(bytes)
+    }
+
+    fn fetch_blob_bytes(
+        &self,
+        remote: &TransportContactMaterial,
+        reference: &IrohBlobReference,
+    ) -> Result<Vec<u8>> {
+        let endpoint_addr = endpoint_addr_from_contact_material(remote)?;
+        let lookup = MemoryLookup::new();
+        lookup.add_endpoint_info(endpoint_addr.clone());
+        self.endpoint
+            .address_lookup()
+            .context("load local iroh address lookup")?
+            .add(lookup);
+        let hash = parse_iroh_blob_hash(&reference.hash)?;
+        let format = parse_iroh_blob_format(&reference.format)?;
+        let request = HashAndFormat::new(hash, format);
+        self.block_on(async {
+            self.blob_store
+                .downloader(&self.endpoint)
+                .download(request, vec![endpoint_addr.id])
+                .await
+        })
+        .context("download iroh blob from remote")?;
+        self.read_blob_bytes(reference)
+    }
+
+    fn shutdown(&self) {
+        let _ = self.block_on(self.router.shutdown());
+    }
+}
+
+fn iroh_blob_format_label(format: BlobFormat) -> &'static str {
+    match format {
+        BlobFormat::Raw => "raw",
+        BlobFormat::HashSeq => "hash_seq",
+    }
+}
+
+fn parse_iroh_blob_format(raw: &str) -> Result<BlobFormat> {
+    match raw {
+        "raw" => Ok(BlobFormat::Raw),
+        "hash_seq" => Ok(BlobFormat::HashSeq),
+        other => bail!("unsupported iroh blob format {other}"),
+    }
+}
+
+fn parse_iroh_blob_hash(raw: &str) -> Result<IrohBlobHash> {
+    IrohBlobHash::from_str(raw).with_context(|| format!("parse iroh blob hash {raw}"))
+}
+
+fn validate_iroh_blob_bytes(reference: &IrohBlobReference, bytes: &[u8]) -> Result<()> {
+    if bytes.len() as u64 != reference.size {
+        bail!(
+            "iroh blob size mismatch for {}: expected {}, got {}",
+            reference.hash,
+            reference.size,
+            bytes.len()
+        );
+    }
+    let actual = blob_hash_for_bytes(bytes).to_hex();
+    if actual != reference.hash {
+        bail!(
+            "iroh blob hash mismatch: expected {}, got {}",
+            reference.hash,
+            actual
+        );
+    }
+    Ok(())
 }
 
 fn endpoint_addr_from_contact_material(contact: &TransportContactMaterial) -> Result<EndpointAddr> {
@@ -435,19 +750,26 @@ fn ensure_local_iroh_data_plane(
     state_dir: &Path,
     local_peer_id: &PeerId,
 ) -> Result<Arc<IrohDataPlaneService>> {
+    ensure_local_iroh_data_plane_for_network_peer_id(state_dir, &local_peer_id.to_string())
+}
+
+fn ensure_local_iroh_data_plane_for_network_peer_id(
+    state_dir: &Path,
+    network_peer_id: &str,
+) -> Result<Arc<IrohDataPlaneService>> {
     let mut services = local_iroh_data_planes()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     if let Some(existing) = services.get(state_dir) {
-        if existing.adapter.local_peer_id != *local_peer_id {
+        if existing.adapter.network_peer_id() != network_peer_id {
             bail!(
-                "iroh data plane already exists for {} with a different local peer id",
+                "iroh data plane already exists for {} with a different network peer id",
                 state_dir.display()
             );
         }
         return Ok(existing.clone());
     }
-    let service = IrohDataPlaneService::new(state_dir, local_peer_id)?;
+    let service = IrohDataPlaneService::new(state_dir, network_peer_id)?;
     services.insert(state_dir.to_path_buf(), service.clone());
     Ok(service)
 }
@@ -460,6 +782,15 @@ pub fn export_local_contact_material(
     ensure_local_iroh_data_plane(state_dir, local_peer_id)?.export_contact_material(generated_at)
 }
 
+pub fn export_local_contact_material_for_network_peer_id(
+    state_dir: &Path,
+    network_peer_id: &str,
+    generated_at: u64,
+) -> Result<TransportContactMaterial> {
+    ensure_local_iroh_data_plane_for_network_peer_id(state_dir, network_peer_id)?
+        .export_contact_material(generated_at)
+}
+
 pub fn fetch_direct_data(
     state_dir: &Path,
     local_peer_id: &PeerId,
@@ -467,6 +798,160 @@ pub fn fetch_direct_data(
     request: &DirectDataFetchRequest,
 ) -> Result<DirectDataFetchResponse> {
     ensure_local_iroh_data_plane(state_dir, local_peer_id)?.fetch(remote_contact, request)
+}
+
+pub fn fetch_direct_data_for_network_peer_id(
+    state_dir: &Path,
+    network_peer_id: &str,
+    remote_contact: &TransportContactMaterial,
+    request: &DirectDataFetchRequest,
+) -> Result<DirectDataFetchResponse> {
+    ensure_local_iroh_data_plane_for_network_peer_id(state_dir, network_peer_id)?
+        .fetch(remote_contact, request)
+}
+
+pub fn send_control_stream_request_for_network_peer_id(
+    state_dir: &Path,
+    network_peer_id: &str,
+    remote_contact: &TransportContactMaterial,
+    request: &IrohControlStreamRequest,
+) -> Result<IrohControlStreamResponse> {
+    ensure_local_iroh_data_plane_for_network_peer_id(state_dir, network_peer_id)?
+        .send_control_stream_request(remote_contact, request)
+}
+
+pub fn set_local_control_stream_handler_for_network_peer_id<H>(
+    state_dir: &Path,
+    network_peer_id: &str,
+    kind: &str,
+    handler: Option<H>,
+) -> Result<()>
+where
+    H: Fn(IrohControlStreamRequest) -> IrohControlStreamResponse + Send + Sync + 'static,
+{
+    let handler = handler.map(|handler| Arc::new(handler) as ControlStreamHandler);
+    ensure_local_iroh_data_plane_for_network_peer_id(state_dir, network_peer_id)?
+        .set_control_stream_handler(kind, handler);
+    Ok(())
+}
+
+pub fn install_local_contact_material_control_handler_for_network_peer_id(
+    state_dir: &Path,
+    network_peer_id: &str,
+) -> Result<()> {
+    let state_dir = state_dir.to_path_buf();
+    let network_peer_id = network_peer_id.to_owned();
+    set_local_control_stream_handler_for_network_peer_id(
+        &state_dir.clone(),
+        &network_peer_id.clone(),
+        IROH_CONTROL_KIND_CONTACT_MATERIAL,
+        Some(
+            move |request: IrohControlStreamRequest| match request.kind.as_str() {
+                IROH_CONTROL_KIND_CONTACT_MATERIAL => {
+                    match export_local_contact_material_for_network_peer_id(
+                        &state_dir,
+                        &network_peer_id,
+                        unix_timestamp_secs(),
+                    )
+                    .and_then(|material| Ok(serde_json::to_vec(&material)?))
+                    {
+                        Ok(payload) => IrohControlStreamResponse {
+                            ok: true,
+                            error: None,
+                            payload,
+                        },
+                        Err(err) => IrohControlStreamResponse {
+                            ok: false,
+                            error: Some(err.to_string()),
+                            payload: Vec::new(),
+                        },
+                    }
+                }
+                _ => IrohControlStreamResponse {
+                    ok: false,
+                    error: Some(format!("unsupported iroh control kind {}", request.kind)),
+                    payload: Vec::new(),
+                },
+            },
+        ),
+    )
+}
+
+pub fn request_contact_material_for_network_peer_id(
+    state_dir: &Path,
+    network_peer_id: &str,
+    remote_contact: &TransportContactMaterial,
+) -> Result<TransportContactMaterial> {
+    let response = send_control_stream_request_for_network_peer_id(
+        state_dir,
+        network_peer_id,
+        remote_contact,
+        &IrohControlStreamRequest {
+            kind: IROH_CONTROL_KIND_CONTACT_MATERIAL.to_owned(),
+            payload: Vec::new(),
+        },
+    )?;
+    if !response.ok {
+        bail!(
+            "{}",
+            response
+                .error
+                .unwrap_or_else(|| "remote contact material request failed".to_owned())
+        );
+    }
+    Ok(serde_json::from_slice(&response.payload)?)
+}
+
+pub fn local_gossip_for_network_peer_id(state_dir: &Path, network_peer_id: &str) -> Result<Gossip> {
+    Ok(
+        ensure_local_iroh_data_plane_for_network_peer_id(state_dir, network_peer_id)?
+            .gossip
+            .clone(),
+    )
+}
+
+pub fn register_remote_contact_material_for_network_peer_id(
+    state_dir: &Path,
+    network_peer_id: &str,
+    remote_contact: &TransportContactMaterial,
+) -> Result<()> {
+    let endpoint_addr = endpoint_addr_from_contact_material(remote_contact)?;
+    let lookup = MemoryLookup::new();
+    lookup.add_endpoint_info(endpoint_addr);
+    ensure_local_iroh_data_plane_for_network_peer_id(state_dir, network_peer_id)?
+        .endpoint
+        .address_lookup()
+        .context("load local iroh address lookup")?
+        .add(lookup);
+    Ok(())
+}
+
+pub fn put_local_blob_bytes_for_network_peer_id(
+    state_dir: &Path,
+    network_peer_id: &str,
+    bytes: impl Into<Vec<u8>>,
+) -> Result<IrohBlobReference> {
+    ensure_local_iroh_data_plane_for_network_peer_id(state_dir, network_peer_id)?
+        .put_blob_bytes(bytes.into())
+}
+
+pub fn read_local_blob_bytes_for_network_peer_id(
+    state_dir: &Path,
+    network_peer_id: &str,
+    reference: &IrohBlobReference,
+) -> Result<Vec<u8>> {
+    ensure_local_iroh_data_plane_for_network_peer_id(state_dir, network_peer_id)?
+        .read_blob_bytes(reference)
+}
+
+pub fn fetch_remote_blob_bytes_for_network_peer_id(
+    state_dir: &Path,
+    network_peer_id: &str,
+    remote_contact: &TransportContactMaterial,
+    reference: &IrohBlobReference,
+) -> Result<Vec<u8>> {
+    ensure_local_iroh_data_plane_for_network_peer_id(state_dir, network_peer_id)?
+        .fetch_blob_bytes(remote_contact, reference)
 }
 
 pub fn shutdown_local_iroh_data_plane(state_dir: &Path) {
@@ -509,11 +994,36 @@ pub fn peer_id_to_endpoint_id(peer_id: &PeerId) -> Option<EndpointId> {
     EndpointId::from_bytes(&byte_array).ok()
 }
 
+pub fn endpoint_id_from_secret_key(secret_key: &SecretKey) -> EndpointId {
+    EndpointId::from_bytes(secret_key.public().as_bytes())
+        .expect("iroh secret public key must be a valid endpoint id")
+}
+
+pub fn local_endpoint_id_from_state_dir(state_dir: &Path) -> Result<EndpointId> {
+    Ok(endpoint_id_from_secret_key(
+        &load_secret_key_from_state_dir(state_dir)?,
+    ))
+}
+
+fn network_peer_id_matches_endpoint_id(network_peer_id: &str, endpoint_id: EndpointId) -> bool {
+    if network_peer_id == endpoint_id.to_string() {
+        return true;
+    }
+    network_peer_id
+        .parse::<PeerId>()
+        .ok()
+        .and_then(|peer_id| peer_id_to_endpoint_id(&peer_id))
+        .is_some_and(|legacy_endpoint_id| legacy_endpoint_id == endpoint_id)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use iroh_gossip::api::Event;
     use libp2p::identity::Keypair;
+    use n0_future::StreamExt;
     use tempfile::tempdir;
+    use tokio::time::{Duration, timeout};
 
     fn seed_state_dir(dir: &Path, seed: [u8; 32]) {
         fs::write(dir.join("node_seed.hex"), hex::encode(seed)).expect("write node seed");
@@ -545,6 +1055,272 @@ mod tests {
         let extra: IrohTransportMaterial =
             serde_json::from_value(material.extra.clone()).expect("extra");
         assert_eq!(extra.direct_addrs, vec!["127.0.0.1:7777".to_owned()]);
+    }
+
+    #[test]
+    fn exports_contact_material_with_iroh_endpoint_identity() {
+        let dir = tempdir().expect("tempdir");
+        seed_state_dir(dir.path(), [11u8; 32]);
+        let endpoint_id = local_endpoint_id_from_state_dir(dir.path()).expect("endpoint id");
+        let endpoint_peer_id = endpoint_id.to_string();
+
+        let first =
+            export_local_contact_material_for_network_peer_id(dir.path(), &endpoint_peer_id, 100)
+                .expect("first contact material");
+        let second =
+            export_local_contact_material_for_network_peer_id(dir.path(), &endpoint_peer_id, 101)
+                .expect("second contact material");
+
+        assert_eq!(first.peer_id, endpoint_peer_id);
+        assert_eq!(second.peer_id, endpoint_peer_id);
+        assert_eq!(first.metadata.endpoint_id, Some(endpoint_id.to_string()));
+        assert_eq!(second.metadata.endpoint_id, Some(endpoint_id.to_string()));
+
+        shutdown_local_iroh_data_plane(dir.path());
+    }
+
+    #[test]
+    fn existing_iroh_endpoint_rejects_different_network_peer_id() {
+        let dir = tempdir().expect("tempdir");
+        seed_state_dir(dir.path(), [13u8; 32]);
+        let endpoint_id = local_endpoint_id_from_state_dir(dir.path()).expect("endpoint id");
+        export_local_contact_material_for_network_peer_id(dir.path(), &endpoint_id.to_string(), 1)
+            .expect("contact material");
+
+        let err = export_local_contact_material_for_network_peer_id(dir.path(), "other-peer", 2)
+            .expect_err("different peer id should fail");
+        assert!(
+            err.to_string().contains("different network peer id"),
+            "{err}"
+        );
+
+        shutdown_local_iroh_data_plane(dir.path());
+    }
+
+    #[test]
+    fn gossip_topic_id_derivation_is_stable_and_scoped() {
+        let first = derive_gossip_topic_id("mainnet", "group:alpha", "messages");
+        let second = derive_gossip_topic_id("mainnet", "group:alpha", "messages");
+        let different_scope = derive_gossip_topic_id("mainnet", "group:beta", "messages");
+        let different_kind = derive_gossip_topic_id("mainnet", "group:alpha", "events");
+
+        assert_eq!(first, second);
+        assert_ne!(first, different_scope);
+        assert_ne!(first, different_kind);
+        assert_eq!(first.as_bytes().len(), 32);
+    }
+
+    #[test]
+    fn blob_hash_for_bytes_uses_iroh_blobs_hashing() {
+        let hash = blob_hash_for_bytes(b"wattswarm artifact");
+        assert_eq!(hash, IrohBlobHash::new(b"wattswarm artifact"));
+        assert_eq!(hash.as_bytes().len(), 32);
+    }
+
+    #[test]
+    fn local_iroh_blob_store_validates_hash_and_size() {
+        let dir = tempdir().expect("tempdir");
+        seed_state_dir(dir.path(), [17u8; 32]);
+        let endpoint_id = local_endpoint_id_from_state_dir(dir.path()).expect("endpoint id");
+        let peer_id = endpoint_id.to_string();
+
+        let reference =
+            put_local_blob_bytes_for_network_peer_id(dir.path(), &peer_id, b"content-addressed")
+                .expect("put blob");
+        assert_eq!(reference.format, "raw");
+        assert_eq!(reference.size, 17);
+        assert_eq!(
+            reference.hash,
+            blob_hash_for_bytes(b"content-addressed").to_hex()
+        );
+
+        let bytes = read_local_blob_bytes_for_network_peer_id(dir.path(), &peer_id, &reference)
+            .expect("read blob");
+        assert_eq!(bytes, b"content-addressed");
+
+        let mut wrong_size = reference.clone();
+        wrong_size.size += 1;
+        let err = read_local_blob_bytes_for_network_peer_id(dir.path(), &peer_id, &wrong_size)
+            .expect_err("wrong size should fail");
+        assert!(err.to_string().contains("size mismatch"), "{err}");
+
+        shutdown_local_iroh_data_plane(dir.path());
+    }
+
+    #[test]
+    fn two_nodes_fetch_blob_over_iroh_blobs_protocol() {
+        let dir_a = tempdir().expect("node a tempdir");
+        let dir_b = tempdir().expect("node b tempdir");
+        seed_state_dir(dir_a.path(), [18u8; 32]);
+        seed_state_dir(dir_b.path(), [19u8; 32]);
+        let endpoint_a = local_endpoint_id_from_state_dir(dir_a.path()).expect("endpoint a");
+        let endpoint_b = local_endpoint_id_from_state_dir(dir_b.path()).expect("endpoint b");
+        let peer_a = endpoint_a.to_string();
+        let peer_b = endpoint_b.to_string();
+        export_local_contact_material_for_network_peer_id(dir_a.path(), &peer_a, 1)
+            .expect("contact a");
+        let contact_b = export_local_contact_material_for_network_peer_id(dir_b.path(), &peer_b, 1)
+            .expect("contact b");
+        let reference =
+            put_local_blob_bytes_for_network_peer_id(dir_b.path(), &peer_b, b"remote blob")
+                .expect("put remote blob");
+
+        let bytes = fetch_remote_blob_bytes_for_network_peer_id(
+            dir_a.path(),
+            &peer_a,
+            &contact_b,
+            &reference,
+        )
+        .expect("fetch remote blob");
+        assert_eq!(bytes, b"remote blob");
+
+        shutdown_local_iroh_data_plane(dir_a.path());
+        shutdown_local_iroh_data_plane(dir_b.path());
+    }
+
+    #[test]
+    fn two_nodes_exchange_iroh_gossip_notification_on_shared_topic() {
+        let dir_a = tempdir().expect("node a tempdir");
+        let dir_b = tempdir().expect("node b tempdir");
+        seed_state_dir(dir_a.path(), [21u8; 32]);
+        seed_state_dir(dir_b.path(), [22u8; 32]);
+        let endpoint_a = local_endpoint_id_from_state_dir(dir_a.path()).expect("endpoint a");
+        let endpoint_b = local_endpoint_id_from_state_dir(dir_b.path()).expect("endpoint b");
+        let peer_a = endpoint_a.to_string();
+        let peer_b = endpoint_b.to_string();
+        let contact_a = export_local_contact_material_for_network_peer_id(dir_a.path(), &peer_a, 1)
+            .expect("contact a");
+        let contact_b = export_local_contact_material_for_network_peer_id(dir_b.path(), &peer_b, 1)
+            .expect("contact b");
+        register_remote_contact_material_for_network_peer_id(dir_a.path(), &peer_a, &contact_b)
+            .expect("node a learns node b");
+        register_remote_contact_material_for_network_peer_id(dir_b.path(), &peer_b, &contact_a)
+            .expect("node b learns node a");
+
+        let gossip_a = local_gossip_for_network_peer_id(dir_a.path(), &peer_a).expect("gossip a");
+        let gossip_b = local_gossip_for_network_peer_id(dir_b.path(), &peer_b).expect("gossip b");
+        let topic_id = derive_gossip_topic_id("mainnet", "group.alpha", "messages");
+        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
+
+        runtime
+            .block_on(async {
+                let mut topic_a = gossip_a.subscribe(topic_id, vec![]).await?;
+                let mut topic_b = gossip_b.subscribe(topic_id, vec![endpoint_a]).await?;
+                timeout(Duration::from_secs(5), topic_a.joined())
+                    .await
+                    .context("wait node a gossip join")??;
+                timeout(Duration::from_secs(5), topic_b.joined())
+                    .await
+                    .context("wait node b gossip join")??;
+
+                topic_b
+                    .broadcast(b"hello wattswarm".to_vec().into())
+                    .await?;
+                let received = timeout(Duration::from_secs(5), async {
+                    loop {
+                        let event = topic_a
+                            .next()
+                            .await
+                            .ok_or_else(|| anyhow!("node a gossip stream closed"))??;
+                        if let Event::Received(message) = event {
+                            return Result::<Vec<u8>>::Ok(message.content.to_vec());
+                        }
+                    }
+                })
+                .await
+                .context("wait gossip notification")??;
+                assert_eq!(received, b"hello wattswarm");
+                Result::<()>::Ok(())
+            })
+            .expect("exchange gossip notification");
+
+        shutdown_local_iroh_data_plane(dir_a.path());
+        shutdown_local_iroh_data_plane(dir_b.path());
+    }
+
+    #[test]
+    fn two_nodes_exchange_iroh_control_stream_request_response() {
+        let dir_a = tempdir().expect("node a tempdir");
+        let dir_b = tempdir().expect("node b tempdir");
+        seed_state_dir(dir_a.path(), [31u8; 32]);
+        seed_state_dir(dir_b.path(), [32u8; 32]);
+        let endpoint_a = local_endpoint_id_from_state_dir(dir_a.path()).expect("endpoint a");
+        let endpoint_b = local_endpoint_id_from_state_dir(dir_b.path()).expect("endpoint b");
+        let peer_a = endpoint_a.to_string();
+        let peer_b = endpoint_b.to_string();
+        export_local_contact_material_for_network_peer_id(dir_a.path(), &peer_a, 1)
+            .expect("contact a");
+        let contact_b = export_local_contact_material_for_network_peer_id(dir_b.path(), &peer_b, 1)
+            .expect("contact b");
+        set_local_control_stream_handler_for_network_peer_id(
+            dir_b.path(),
+            &peer_b,
+            "echo.v1",
+            Some(
+                |request: IrohControlStreamRequest| IrohControlStreamResponse {
+                    ok: true,
+                    error: None,
+                    payload: format!("{}:", request.kind)
+                        .into_bytes()
+                        .into_iter()
+                        .chain(request.payload)
+                        .collect(),
+                },
+            ),
+        )
+        .expect("set control handler");
+
+        let response = send_control_stream_request_for_network_peer_id(
+            dir_a.path(),
+            &peer_a,
+            &contact_b,
+            &IrohControlStreamRequest {
+                kind: "echo.v1".to_owned(),
+                payload: b"page-1".to_vec(),
+            },
+        )
+        .expect("control stream response");
+
+        assert!(response.ok);
+        assert_eq!(response.payload, b"echo.v1:page-1");
+
+        shutdown_local_iroh_data_plane(dir_a.path());
+        shutdown_local_iroh_data_plane(dir_b.path());
+    }
+
+    #[test]
+    fn two_nodes_request_contact_material_over_iroh_control_stream() {
+        let dir_a = tempdir().expect("node a tempdir");
+        let dir_b = tempdir().expect("node b tempdir");
+        seed_state_dir(dir_a.path(), [41u8; 32]);
+        seed_state_dir(dir_b.path(), [42u8; 32]);
+        let endpoint_a = local_endpoint_id_from_state_dir(dir_a.path()).expect("endpoint a");
+        let endpoint_b = local_endpoint_id_from_state_dir(dir_b.path()).expect("endpoint b");
+        let peer_a = endpoint_a.to_string();
+        let peer_b = endpoint_b.to_string();
+        export_local_contact_material_for_network_peer_id(dir_a.path(), &peer_a, 1)
+            .expect("contact a");
+        let bootstrap_contact_b =
+            export_local_contact_material_for_network_peer_id(dir_b.path(), &peer_b, 1)
+                .expect("bootstrap contact b");
+        install_local_contact_material_control_handler_for_network_peer_id(dir_b.path(), &peer_b)
+            .expect("install contact handler");
+
+        let requested_contact = request_contact_material_for_network_peer_id(
+            dir_a.path(),
+            &peer_a,
+            &bootstrap_contact_b,
+        )
+        .expect("requested contact material");
+
+        assert_eq!(requested_contact.peer_id, peer_b);
+        assert_eq!(
+            requested_contact.metadata.endpoint_id,
+            Some(endpoint_b.to_string())
+        );
+
+        shutdown_local_iroh_data_plane(dir_a.path());
+        shutdown_local_iroh_data_plane(dir_b.path());
     }
 
     #[test]

@@ -3,6 +3,56 @@ use crate::control::load_discovered_peer_records_state;
 use crate::network_p2p::BackfillResponse;
 
 const DISCOVERY_DIAL_RETRY_AFTER: Duration = Duration::from_secs(3);
+const BACKFILL_HEAD_EVENT_IDS_LIMIT: usize = 8;
+pub(super) const BACKFILL_KNOWN_EVENT_IDS_LIMIT: usize = 64;
+
+fn event_matches_backfill_lane(
+    node: &Node,
+    event: &crate::types::Event,
+    scope: &SwarmScope,
+    feed_key: Option<&str>,
+) -> Result<bool> {
+    if let Some(feed_key) = feed_key {
+        let crate::types::EventPayload::TopicMessagePosted(payload) = &event.payload else {
+            return Ok(false);
+        };
+        if payload.feed_key != feed_key {
+            return Ok(false);
+        }
+    }
+    if event_scope(node, event)? != *scope {
+        return Ok(false);
+    }
+    if *scope == SwarmScope::Global && !event.payload.allows_global_dissemination() {
+        return Ok(false);
+    }
+    Ok(true)
+}
+
+pub(super) fn recent_backfill_lane_event_ids(
+    node: &Node,
+    scope: &SwarmScope,
+    feed_key: Option<&str>,
+    limit: usize,
+) -> Result<Vec<String>> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    let mut event_ids = Vec::new();
+    for (_, event) in node.store.load_all_events()?.into_iter().rev() {
+        if !should_sync_event(node, &event)? {
+            continue;
+        }
+        if !event_matches_backfill_lane(node, &event, scope, feed_key)? {
+            continue;
+        }
+        event_ids.push(event.event_id);
+        if event_ids.len() >= limit {
+            break;
+        }
+    }
+    Ok(event_ids)
+}
 
 pub fn backfill_response_for_request(
     node: &Node,
@@ -15,6 +65,17 @@ pub fn backfill_response_for_request(
     let mut next_from_event_seq = request.from_event_seq;
     let mut from_event_seq = request.from_event_seq;
     let mut envelopes = Vec::new();
+    let known_event_ids = request
+        .known_event_ids
+        .iter()
+        .map(String::as_str)
+        .collect::<HashSet<_>>();
+    let head_event_ids = recent_backfill_lane_event_ids(
+        node,
+        &request.scope,
+        request.feed_key.as_deref(),
+        BACKFILL_HEAD_EVENT_IDS_LIMIT,
+    )?;
 
     while envelopes.len() < request.limit {
         let rows = node.store.load_events_page(
@@ -30,18 +91,15 @@ pub fn backfill_response_for_request(
             if !should_sync_event(node, &event)? {
                 continue;
             }
-            if let Some(feed_key) = &request.feed_key {
-                let crate::types::EventPayload::TopicMessagePosted(payload) = &event.payload else {
-                    continue;
-                };
-                if payload.feed_key != *feed_key {
-                    continue;
-                }
-            }
-            if event_scope(node, &event)? != request.scope {
+            if known_event_ids.contains(event.event_id.as_str()) {
                 continue;
             }
-            if request.scope == SwarmScope::Global && !event.payload.allows_global_dissemination() {
+            if !event_matches_backfill_lane(
+                node,
+                &event,
+                &request.scope,
+                request.feed_key.as_deref(),
+            )? {
                 continue;
             }
             envelopes.push(EventEnvelope {
@@ -59,6 +117,7 @@ pub fn backfill_response_for_request(
         scope: request.scope.clone(),
         next_from_event_seq,
         feed_key: request.feed_key.clone(),
+        head_event_ids,
         events: envelopes,
     })
 }
@@ -87,19 +146,6 @@ pub fn ingest_backfill_response(node: &mut Node, response: &BackfillResponse) ->
 
 pub(super) fn should_publish_summaries(head_seq: u64, from_event_seq: u64) -> bool {
     head_seq.saturating_sub(from_event_seq) <= SUMMARY_BACKPRESSURE_HIGH_WATERMARK
-}
-
-pub(super) fn latest_scoped_event_seq(node: &Node, scope: &SwarmScope) -> Result<u64> {
-    let mut latest = 0u64;
-    for (seq, event) in node.store.load_all_events()? {
-        if !should_sync_event(node, &event)? {
-            continue;
-        }
-        if event_scope(node, &event)? == *scope {
-            latest = seq;
-        }
-    }
-    Ok(latest)
 }
 
 pub(super) fn should_sync_event(node: &Node, event: &crate::types::Event) -> Result<bool> {

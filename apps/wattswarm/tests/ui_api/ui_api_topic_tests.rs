@@ -45,7 +45,7 @@ fn ui_exposes_topic_message_history_and_cursor_queries() {
         node.emit_at(
             1,
             EventPayload::TopicMessagePosted(TopicMessagePostedPayload {
-                network_id,
+                network_id: network_id.clone(),
                 feed_key: "crew.chat".to_owned(),
                 scope_hint: "group:crew-7".to_owned(),
                 content_ref: topic_content_ref("second-ping", &subscriber_node_id, 120),
@@ -56,7 +56,14 @@ fn ui_exposes_topic_message_history_and_cursor_queries() {
         )
         .expect("emit second topic message");
         node.store
-            .upsert_topic_cursor(&subscriber_node_id, "crew.chat", "group:crew-7", 22, 130)
+            .upsert_topic_cursor(
+                &network_id,
+                &subscriber_node_id,
+                "crew.chat",
+                "group:crew-7",
+                22,
+                130,
+            )
             .expect("upsert topic cursor");
         subscriber_node_id
     };
@@ -272,8 +279,17 @@ fn structured_topic_consensus_bridge_finalizes_and_publishes_result_topic() {
     let app = build_app(UiServerState::new(state_dir.clone(), db_path.clone()));
     let node = open_node(&state_dir, &db_path).expect("open node");
     let local_node_id = node.node_id();
+    let network_id = format!("local:{local_node_id}");
     node.store
-        .upsert_feed_subscription(&local_node_id, "crew.chat", "group:crew-7", &[], true, 1)
+        .upsert_feed_subscription(
+            &network_id,
+            &local_node_id,
+            "crew.chat",
+            "group:crew-7",
+            &[],
+            true,
+            1,
+        )
         .expect("upsert topic subscription");
     drop(node);
 
@@ -361,7 +377,7 @@ fn structured_topic_consensus_bridge_finalizes_and_publishes_result_topic() {
 
     let result_messages = node
         .store
-        .list_topic_messages("crew.result", "group:crew-7", 10)
+        .list_topic_messages(&network_id, "crew.result", "group:crew-7", 10)
         .expect("list result messages");
     assert!(result_messages.iter().any(|message| {
         message.content["kind"].as_str() == Some("consensus_result")
@@ -780,7 +796,7 @@ fn structured_topic_consensus_timeout_opens_next_round() {
         1,
         20,
         EventPayload::TopicMessagePosted(TopicMessagePostedPayload {
-            network_id,
+            network_id: network_id.clone(),
             feed_key: "crew.chat".to_owned(),
             scope_hint: "group:crew-7".to_owned(),
             content_ref: topic_content_ref("proposal-timeout-support", &remote_a.node_id(), 20),
@@ -805,7 +821,7 @@ fn structured_topic_consensus_timeout_opens_next_round() {
 
     let messages = node
         .store
-        .list_topic_messages("crew.chat", "group:crew-7", 10)
+        .list_topic_messages(&network_id, "crew.chat", "group:crew-7", 10)
         .expect("list topic messages");
     assert!(messages.iter().any(|message| {
         message.content["kind"].as_str() == Some("proposal")
@@ -816,7 +832,7 @@ fn structured_topic_consensus_timeout_opens_next_round() {
     }));
     let result_messages = node
         .store
-        .list_topic_messages("crew.result", "group:crew-7", 10)
+        .list_topic_messages(&network_id, "crew.result", "group:crew-7", 10)
         .expect("list result messages");
     assert!(result_messages.is_empty());
 }
@@ -1019,7 +1035,7 @@ fn structured_topic_consensus_fallback_finalizes_after_max_rounds() {
         1,
         20,
         EventPayload::TopicMessagePosted(TopicMessagePostedPayload {
-            network_id,
+            network_id: network_id.clone(),
             feed_key: "crew.chat".to_owned(),
             scope_hint: "group:crew-7".to_owned(),
             content_ref: topic_content_ref("proposal-fallback-support", &remote_a.node_id(), 20),
@@ -1044,7 +1060,7 @@ fn structured_topic_consensus_fallback_finalizes_after_max_rounds() {
 
     let result_messages = node
         .store
-        .list_topic_messages("crew.result", "group:crew-7", 10)
+        .list_topic_messages(&network_id, "crew.result", "group:crew-7", 10)
         .expect("list result messages");
     assert!(result_messages.iter().any(|message| {
         message.content["kind"].as_str() == Some("consensus_result")
@@ -1175,7 +1191,7 @@ fn structured_topic_consensus_bridge_ignores_non_participant_stances() {
 
     let result_messages = node
         .store
-        .list_topic_messages("crew.result", "group:crew-7", 10)
+        .list_topic_messages(&network_id, "crew.result", "group:crew-7", 10)
         .expect("list result messages");
     assert!(result_messages.is_empty());
     assert!(
@@ -1342,9 +1358,10 @@ fn free_chat_is_interpreted_then_sedimented_into_topic_consensus() {
 
     let node = open_node(&state_dir, &db_path).expect("open node");
     let local_node_id = node.node_id();
+    let network_id = format!("local:{local_node_id}");
     let chat_messages = node
         .store
-        .list_topic_messages("crew.chat", "group:crew-7", 20)
+        .list_topic_messages(&network_id, "crew.chat", "group:crew-7", 20)
         .expect("list topic messages");
     let proposal_message_id = chat_messages
         .iter()
@@ -1361,7 +1378,7 @@ fn free_chat_is_interpreted_then_sedimented_into_topic_consensus() {
 
     let result_messages = node
         .store
-        .list_topic_messages("crew.result", "group:crew-7", 10)
+        .list_topic_messages(&network_id, "crew.result", "group:crew-7", 10)
         .expect("list result messages");
     assert!(
         result_messages.iter().any(|message| {
@@ -1549,7 +1566,7 @@ fn topic_consensus_scopes_stances_to_proposal_rounds() {
         1,
         30,
         EventPayload::TopicMessagePosted(TopicMessagePostedPayload {
-            network_id,
+            network_id: network_id.clone(),
             feed_key: "crew.chat".to_owned(),
             scope_hint: "group:crew-7".to_owned(),
             content_ref: topic_content_ref(
@@ -1579,7 +1596,7 @@ fn topic_consensus_scopes_stances_to_proposal_rounds() {
 
     let result_messages = node
         .store
-        .list_topic_messages("crew.result", "group:crew-7", 10)
+        .list_topic_messages(&network_id, "crew.result", "group:crew-7", 10)
         .expect("list result messages");
     assert!(result_messages.is_empty());
 }
