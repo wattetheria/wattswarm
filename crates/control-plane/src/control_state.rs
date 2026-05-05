@@ -811,13 +811,15 @@ fn open_node_for_topology(
     store
         .ensure_bootstrap_signed_network_protocol_params(&topology.network.network_id, &identity)?;
     let mut membership = Membership::new();
-    for role in [
-        Role::Proposer,
-        Role::Verifier,
-        Role::Committer,
-        Role::Finalizer,
-    ] {
-        membership.grant(&identity.node_id(), role);
+    if topology.network.network_kind == crate::types::NetworkKind::Local {
+        for role in [
+            Role::Proposer,
+            Role::Verifier,
+            Role::Committer,
+            Role::Finalizer,
+        ] {
+            membership.grant(&identity.node_id(), role);
+        }
     }
 
     let self_node_id = identity.node_id();

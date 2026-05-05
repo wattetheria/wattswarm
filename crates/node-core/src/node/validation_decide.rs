@@ -166,15 +166,11 @@ impl Node {
             return Err(SwarmError::InvalidEvent("insufficient finality signatures".into()).into());
         }
 
-        let membership = self.load_membership()?;
         let message = finality_message(&payload.task_id, payload.epoch, &payload.candidate_id);
         let mut seen = HashSet::new();
         let mut valid_count = 0u32;
         for sig in &payload.finality_proof.signatures {
             if !seen.insert(sig.signer_node_id.clone()) {
-                continue;
-            }
-            if !membership.has_role(&sig.signer_node_id, Role::Finalizer) {
                 continue;
             }
             if verify_signature(&sig.signer_node_id, message.as_bytes(), &sig.signature_hex).is_ok()
@@ -236,6 +232,7 @@ impl Node {
 
     pub(crate) fn validate_membership_update(
         &self,
+        event: &Event,
         payload: &MembershipUpdatedPayload,
     ) -> Result<()> {
         if payload.quorum_signatures.len() < payload.quorum_threshold as usize {
@@ -245,16 +242,23 @@ impl Node {
             .into());
         }
 
-        let current = self.load_membership()?;
-        let message = serde_json::to_vec(&payload.new_membership)?;
+        let mainnet_genesis_node_id = mainnet_genesis_node_id_for_store(&self.store)?;
+        let current = if mainnet_genesis_node_id.as_deref() == Some(event.author_node_id.as_str()) {
+            None
+        } else {
+            Some(self.load_membership()?)
+        };
+        let message = membership_update_message(&payload.new_membership)?;
         let mut unique = HashSet::new();
         let mut valid = 0u32;
         for sig in &payload.quorum_signatures {
             if !unique.insert(sig.signer_node_id.clone()) {
                 continue;
             }
-            if !current.has_role(&sig.signer_node_id, Role::Finalizer) {
-                continue;
+            match (&mainnet_genesis_node_id, &current) {
+                (Some(genesis_node_id), None) if sig.signer_node_id == *genesis_node_id => {}
+                (_, Some(current)) if current.has_role(&sig.signer_node_id, Role::Finalizer) => {}
+                _ => continue,
             }
             if verify_signature(&sig.signer_node_id, &message, &sig.signature_hex).is_ok() {
                 valid += 1;

@@ -6,7 +6,9 @@ use crate::control::{
 use crate::run_control;
 use crate::run_queue::{RunSubmitSpec, WorkerOptions};
 pub use crate::task_template::{sample_artifact_ref, sample_contract};
-use crate::types::TaskContract;
+use crate::types::{
+    Event, EventPayload, Membership, MembershipUpdatedPayload, NetworkKind, TaskContract,
+};
 use anyhow::{Context, Result, anyhow};
 use clap::{Args, Parser, Subcommand};
 use std::fs;
@@ -36,6 +38,7 @@ enum RootCommand {
     Task(TaskCommand),
     Run(RunCommand),
     Knowledge(KnowledgeCommand),
+    Governance(GovernanceCommand),
     Ui(UiCommand),
 }
 
@@ -192,6 +195,53 @@ struct KnowledgeCommand {
 }
 
 #[derive(Args, Debug)]
+struct GovernanceCommand {
+    #[command(subcommand)]
+    action: GovernanceAction,
+}
+
+#[derive(Subcommand, Debug)]
+enum GovernanceAction {
+    MembershipUpdate {
+        file: PathBuf,
+        #[arg(long, default_value_t = 1)]
+        epoch: u64,
+        #[arg(long = "quorum-threshold", default_value_t = 1)]
+        quorum_threshold: u32,
+    },
+    RevokeEvent {
+        #[arg(long = "event-id")]
+        event_id: String,
+        #[arg(long)]
+        reason: String,
+        #[arg(long, default_value_t = 1)]
+        epoch: u64,
+    },
+    RevokeSummary {
+        #[arg(long = "summary-id")]
+        summary_id: String,
+        #[arg(long = "kind")]
+        summary_kind: String,
+        #[arg(long)]
+        reason: String,
+        #[arg(long, default_value_t = 1)]
+        epoch: u64,
+    },
+    PenalizeNode {
+        #[arg(long = "node-id")]
+        node_id: String,
+        #[arg(long)]
+        reason: String,
+        #[arg(long = "revoke-event")]
+        revoked_event_ids: Vec<String>,
+        #[arg(long = "revoke-summary")]
+        revoked_summary_ids: Vec<String>,
+        #[arg(long, default_value_t = 1)]
+        epoch: u64,
+    },
+}
+
+#[derive(Args, Debug)]
 struct UiCommand {
     #[arg(long, default_value = "127.0.0.1:7788")]
     listen: String,
@@ -227,6 +277,7 @@ pub fn run() -> Result<()> {
         RootCommand::Task(cmd) => handle_task(cmd, &cli.state_dir, &store_path),
         RootCommand::Run(cmd) => handle_run(cmd, &cli.state_dir, &store_path),
         RootCommand::Knowledge(cmd) => handle_knowledge(cmd, &cli.state_dir, &store_path),
+        RootCommand::Governance(cmd) => handle_governance(cmd, &cli.state_dir, &store_path),
         RootCommand::Ui(cmd) => crate::ui::run(cli.state_dir, store_path, cmd.listen),
     }
 }
@@ -516,5 +567,102 @@ fn handle_knowledge(cmd: KnowledgeCommand, state_dir: &Path, db_path: &Path) -> 
             println!("exported {}", out.display());
         }
     }
+    Ok(())
+}
+
+fn handle_governance(cmd: GovernanceCommand, state_dir: &Path, db_path: &Path) -> Result<()> {
+    let mut node = open_node(state_dir, db_path)?;
+    ensure_mainnet_genesis_node(&node)?;
+    let now = chrono::Utc::now().timestamp_millis().max(0) as u64;
+    let (action, event) = match cmd.action {
+        GovernanceAction::MembershipUpdate {
+            file,
+            epoch,
+            quorum_threshold,
+        } => {
+            let raw = fs::read(&file)?;
+            let new_membership: Membership = serde_json::from_slice(&raw)
+                .with_context(|| format!("parse membership from {}", file.display()))?;
+            let signature = crate::node::sign_membership_quorum(&node.identity, &new_membership)?;
+            let event = node.emit_at(
+                epoch,
+                EventPayload::MembershipUpdated(MembershipUpdatedPayload {
+                    new_membership,
+                    quorum_threshold,
+                    quorum_signatures: vec![signature],
+                }),
+                now,
+            )?;
+            ("membership_update", event)
+        }
+        GovernanceAction::RevokeEvent {
+            event_id,
+            reason,
+            epoch,
+        } => (
+            "revoke_event",
+            node.revoke_event(&event_id, &reason, epoch, now)?,
+        ),
+        GovernanceAction::RevokeSummary {
+            summary_id,
+            summary_kind,
+            reason,
+            epoch,
+        } => (
+            "revoke_summary",
+            node.revoke_summary(&summary_id, &summary_kind, &reason, epoch, now)?,
+        ),
+        GovernanceAction::PenalizeNode {
+            node_id,
+            reason,
+            revoked_event_ids,
+            revoked_summary_ids,
+            epoch,
+        } => (
+            "penalize_node",
+            node.penalize_node(
+                &node_id,
+                &reason,
+                revoked_event_ids,
+                revoked_summary_ids,
+                epoch,
+                now,
+            )?,
+        ),
+    };
+    print_governance_event(action, &event)
+}
+
+fn ensure_mainnet_genesis_node(node: &crate::node::Node) -> Result<()> {
+    let topology = node
+        .store
+        .load_network_topology_for_org(node.store.org_id())?;
+    if topology.network.network_kind != NetworkKind::Mainnet {
+        return Err(anyhow!("governance command requires a mainnet node"));
+    }
+    let local_node_id = node.node_id();
+    if local_node_id != topology.network.genesis_node_id {
+        return Err(anyhow!(
+            "governance command requires mainnet genesis node; local_node_id={} genesis_node_id={}",
+            local_node_id,
+            topology.network.genesis_node_id
+        ));
+    }
+    Ok(())
+}
+
+fn print_governance_event(action: &str, event: &Event) -> Result<()> {
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({
+            "ok": true,
+            "action": action,
+            "event_id": event.event_id,
+            "event_kind": format!("{:?}", event.event_kind),
+            "author_node_id": event.author_node_id,
+            "epoch": event.epoch,
+            "created_at": event.created_at,
+        }))?
+    );
     Ok(())
 }

@@ -199,9 +199,11 @@ pub(super) fn task_outcome_summary_for_event(
     else {
         return Ok(None);
     };
-    let checkpoint =
+    let Some(checkpoint) =
         super::announcements::checkpoint_announcement_for_event(node, event, scope)?
-            .ok_or_else(|| anyhow::anyhow!("checkpoint announcement missing for finalized task"))?;
+    else {
+        return Ok(None);
+    };
     let output_digest = crate::crypto::sha256_hex(&serde_json::to_vec(&candidate.output)?);
     let evidence_digest_count = candidate
         .evidence_refs

@@ -143,7 +143,9 @@ impl Node {
             EventPayload::TopicMessagePosted(payload) => {
                 self.validate_topic_message_posted(payload)
             }
-            EventPayload::MembershipUpdated(payload) => self.validate_membership_update(payload),
+            EventPayload::MembershipUpdated(payload) => {
+                self.validate_membership_update(event, payload)
+            }
             EventPayload::PolicyTuned(payload) => self.validate_policy_tuned(payload),
             EventPayload::AdvisoryCreated(payload) => self.validate_advisory_created(payload),
             EventPayload::AdvisoryApproved(payload) => {
@@ -163,44 +165,36 @@ impl Node {
     }
 
     pub(crate) fn validate_role_permission(&self, event: &Event) -> Result<()> {
-        let membership = self.load_membership()?;
+        if self.validate_mainnet_genesis_governance_authority(event)? {
+            return Ok(());
+        }
+
         let (required_role, check_author_match): (Option<Role>, Option<&str>) = match &event.payload
         {
-            EventPayload::TaskCreated(_) => (Some(Role::Proposer), None),
-            EventPayload::TaskClaimed(p) => (
-                Some(claim_role_to_permission(p.role)),
-                Some(&p.claimer_node_id),
-            ),
-            EventPayload::TaskClaimRenewed(p) => (
-                Some(claim_role_to_permission(p.role)),
-                Some(&p.claimer_node_id),
-            ),
-            EventPayload::TaskClaimReleased(p) => (
-                Some(claim_role_to_permission(p.role)),
-                Some(&p.claimer_node_id),
-            ),
-            EventPayload::CandidateProposed(_) => (Some(Role::Proposer), None),
-            EventPayload::EvidenceAdded(_) => (Some(Role::Proposer), None),
-            EventPayload::EvidenceAvailable(_) => (Some(Role::Verifier), None),
-            EventPayload::VerifierResultSubmitted(_) => (Some(Role::Verifier), None),
-            EventPayload::VoteCommit(_) => (Some(Role::Verifier), None),
-            EventPayload::VoteReveal(_) => (Some(Role::Verifier), None),
-            EventPayload::DecisionCommitted(_) => (Some(Role::Finalizer), None),
-            EventPayload::DecisionFinalized(_) => (Some(Role::Finalizer), None),
+            EventPayload::TaskCreated(_) => (None, None),
+            EventPayload::TaskClaimed(p) => (None, Some(&p.claimer_node_id)),
+            EventPayload::TaskClaimRenewed(p) => (None, Some(&p.claimer_node_id)),
+            EventPayload::TaskClaimReleased(p) => (None, Some(&p.claimer_node_id)),
+            EventPayload::CandidateProposed(_) => (None, None),
+            EventPayload::EvidenceAdded(_) => (None, None),
+            EventPayload::EvidenceAvailable(_) => (None, None),
+            EventPayload::VerifierResultSubmitted(_) => (None, None),
+            EventPayload::VoteCommit(_) => (None, None),
+            EventPayload::VoteReveal(_) => (None, None),
+            EventPayload::DecisionCommitted(_) => (None, None),
+            EventPayload::DecisionFinalized(_) => (None, None),
             EventPayload::TaskError(_) => (None, None),
             EventPayload::TaskRetryScheduled(_) => (Some(Role::Committer), None),
-            EventPayload::TaskExpired(_) => (Some(Role::Finalizer), None),
+            EventPayload::TaskExpired(_) => (None, None),
             EventPayload::EpochEnded(_) => (Some(Role::Finalizer), None),
             EventPayload::TaskStopped(_) => (Some(Role::Finalizer), None),
             EventPayload::TaskSuspended(_) => (Some(Role::Finalizer), None),
             EventPayload::TaskKilled(_) => (Some(Role::Finalizer), None),
-            EventPayload::CheckpointCreated(_) => (Some(Role::Committer), None),
+            EventPayload::CheckpointCreated(_) => (None, None),
             EventPayload::FeedSubscriptionUpdated(p) => (None, Some(&p.subscriber_node_id)),
-            EventPayload::TaskAnnounced(_) => (Some(Role::Proposer), None),
+            EventPayload::TaskAnnounced(_) => (None, None),
             EventPayload::ExecutionIntentDeclared(p) => (None, Some(&p.participant_node_id)),
-            EventPayload::ExecutionSetConfirmed(p) => {
-                (Some(Role::Committer), Some(&p.confirmed_by_node_id))
-            }
+            EventPayload::ExecutionSetConfirmed(p) => (None, Some(&p.confirmed_by_node_id)),
             EventPayload::TopicMessagePosted(_) => (None, None),
             EventPayload::MembershipUpdated(_) => (Some(Role::Finalizer), None),
             EventPayload::PolicyTuned(_) => (Some(Role::Finalizer), None),
@@ -208,7 +202,7 @@ impl Node {
             EventPayload::AdvisoryApproved(_) => (Some(Role::Finalizer), None),
             EventPayload::AdvisoryApplied(_) => (Some(Role::Committer), None),
             EventPayload::TaskFeedbackReported(_) => (None, None),
-            EventPayload::ReuseRejectRecorded(_) => (Some(Role::Committer), None),
+            EventPayload::ReuseRejectRecorded(_) => (None, None),
             EventPayload::EventRevoked(_) => (Some(Role::Finalizer), None),
             EventPayload::SummaryRevoked(_) => (Some(Role::Finalizer), None),
             EventPayload::NodePenalized(_) => (Some(Role::Finalizer), None),
@@ -220,24 +214,39 @@ impl Node {
             return Err(SwarmError::Unauthorized("claimer author mismatch".into()).into());
         }
 
-        if let Some(required_role) = required_role
-            && !membership.has_role(&event.author_node_id, required_role)
-        {
-            return Err(
-                SwarmError::Unauthorized(format!("author lacks role {:?}", required_role)).into(),
-            );
+        if let Some(required_role) = required_role {
+            let membership = self.load_membership()?;
+            if !membership.has_role(&event.author_node_id, required_role) {
+                return Err(SwarmError::Unauthorized(format!(
+                    "author lacks role {:?}",
+                    required_role
+                ))
+                .into());
+            }
         }
-        if matches!(event.payload, EventPayload::TaskError(_))
-            && !membership.has_role(&event.author_node_id, Role::Proposer)
-            && !membership.has_role(&event.author_node_id, Role::Verifier)
-            && !membership.has_role(&event.author_node_id, Role::Committer)
-        {
+        Ok(())
+    }
+
+    fn validate_mainnet_genesis_governance_authority(&self, event: &Event) -> Result<bool> {
+        if !matches!(
+            event.payload,
+            EventPayload::MembershipUpdated(_)
+                | EventPayload::EventRevoked(_)
+                | EventPayload::SummaryRevoked(_)
+                | EventPayload::NodePenalized(_)
+        ) {
+            return Ok(false);
+        }
+        let Some(genesis_node_id) = mainnet_genesis_node_id_for_store(&self.store)? else {
+            return Ok(false);
+        };
+        if event.author_node_id != genesis_node_id {
             return Err(SwarmError::Unauthorized(
-                "task_error author lacks proposer/verifier/committer role".into(),
+                "mainnet governance event author must be genesis node".into(),
             )
             .into());
         }
-        Ok(())
+        Ok(true)
     }
 
     fn validate_feed_subscription_updated(

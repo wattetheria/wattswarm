@@ -1,18 +1,46 @@
 use assert_cmd::prelude::*;
 use predicates::prelude::*;
 use std::process::Stdio;
+use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::Duration;
 use tempfile::tempdir;
 use uuid::Uuid;
 use wattswarm::cli::sample_contract;
+use wattswarm::crypto::NodeIdentity;
 use wattswarm::policy::PolicyRegistry;
+use wattswarm::types::{Membership, Role};
+use wattswarm::{control::NodeMode, storage::PgStore};
 use wattswarm_storage_core::storage::pg::Connection;
 
 fn cmd(schema: &str) -> std::process::Command {
     let mut cmd = std::process::Command::new(assert_cmd::cargo::cargo_bin!("wattswarm"));
     cmd.env("WATTSWARM_PG_SCHEMA", schema);
     cmd
+}
+
+fn env_test_lock() -> &'static Mutex<()> {
+    static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    ENV_LOCK.get_or_init(|| Mutex::new(()))
+}
+
+fn with_pg_schema<T>(schema: &str, f: impl FnOnce() -> T) -> T {
+    let _lock = env_test_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let prev = std::env::var("WATTSWARM_PG_SCHEMA").ok();
+    unsafe {
+        std::env::set_var("WATTSWARM_PG_SCHEMA", schema);
+    }
+    let out = f();
+    unsafe {
+        if let Some(prev) = prev {
+            std::env::set_var("WATTSWARM_PG_SCHEMA", prev);
+        } else {
+            std::env::remove_var("WATTSWARM_PG_SCHEMA");
+        }
+    }
+    out
 }
 
 struct ChildGuard(std::process::Child);
@@ -74,6 +102,41 @@ impl Drop for CliSchemaGuard {
     fn drop(&mut self) {
         drop_test_schema(&self.name);
     }
+}
+
+fn write_identity_seed(state_dir: &std::path::Path, identity: &NodeIdentity) {
+    std::fs::create_dir_all(state_dir).unwrap();
+    let seed_hex = identity
+        .secret_bytes()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    std::fs::write(state_dir.join("node_seed.hex"), seed_hex).unwrap();
+}
+
+fn setup_mainnet_cli_state(
+    state_dir: &std::path::Path,
+    store: &str,
+    schema: &str,
+    identity: &NodeIdentity,
+    genesis_node_id: &str,
+    network_id: &str,
+) {
+    write_identity_seed(state_dir, identity);
+    let db_path = state_dir.join(store);
+    with_pg_schema(schema, || {
+        let store = PgStore::open(&db_path).unwrap();
+        store
+            .ensure_mainnet_bootstrap_network_topology(
+                network_id,
+                "CLI Governance Mainnet",
+                genesis_node_id,
+                genesis_node_id,
+                100,
+            )
+            .unwrap();
+    });
+    wattswarm::control::write_node_state(state_dir, true, NodeMode::Network).unwrap();
 }
 
 #[test]
@@ -380,6 +443,141 @@ fn cli_knowledge_export_requires_exactly_one_selector() {
         .failure()
         .stderr(predicate::str::contains(
             "knowledge export requires exactly one of --task_type or --task_id",
+        ));
+}
+
+#[test]
+fn cli_governance_commands_require_mainnet_genesis_and_emit_events() {
+    let dir = tempdir().unwrap();
+    let state_dir = dir.path().join("genesis-state");
+    let store = "test.state";
+    let schema = CliSchemaGuard::new();
+    let genesis = NodeIdentity::from_seed([7_u8; 32]);
+    let genesis_node_id = genesis.node_id();
+    let network_id = format!("mainnet-cli-{}", Uuid::new_v4().simple());
+    setup_mainnet_cli_state(
+        &state_dir,
+        store,
+        schema.as_str(),
+        &genesis,
+        &genesis_node_id,
+        &network_id,
+    );
+
+    let mut membership = Membership::new();
+    membership.grant(&genesis_node_id, Role::Finalizer);
+    let membership_file = dir.path().join("membership.json");
+    std::fs::write(
+        &membership_file,
+        serde_json::to_vec_pretty(&membership).unwrap(),
+    )
+    .unwrap();
+
+    cmd(schema.as_str())
+        .args([
+            "--state-dir",
+            state_dir.to_str().unwrap(),
+            "--store",
+            store,
+            "governance",
+            "membership-update",
+            membership_file.to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "\"action\": \"membership_update\"",
+        ))
+        .stdout(predicate::str::contains(
+            "\"event_kind\": \"MembershipUpdated\"",
+        ));
+
+    cmd(schema.as_str())
+        .args([
+            "--state-dir",
+            state_dir.to_str().unwrap(),
+            "--store",
+            store,
+            "governance",
+            "revoke-event",
+            "--event-id",
+            "event-bad",
+            "--reason",
+            "bad event",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"action\": \"revoke_event\""))
+        .stdout(predicate::str::contains("\"event_kind\": \"EventRevoked\""));
+
+    cmd(schema.as_str())
+        .args([
+            "--state-dir",
+            state_dir.to_str().unwrap(),
+            "--store",
+            store,
+            "governance",
+            "revoke-summary",
+            "--summary-id",
+            "summary-bad",
+            "--kind",
+            "knowledge_task_type_v1",
+            "--reason",
+            "bad summary",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"action\": \"revoke_summary\""))
+        .stdout(predicate::str::contains(
+            "\"event_kind\": \"SummaryRevoked\"",
+        ));
+
+    cmd(schema.as_str())
+        .args([
+            "--state-dir",
+            state_dir.to_str().unwrap(),
+            "--store",
+            store,
+            "governance",
+            "penalize-node",
+            "--node-id",
+            "node-bad",
+            "--reason",
+            "bad node",
+            "--revoke-event",
+            "event-bad",
+            "--revoke-summary",
+            "summary-bad",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"action\": \"penalize_node\""))
+        .stdout(predicate::str::contains(
+            "\"event_kind\": \"NodePenalized\"",
+        ));
+
+    let non_genesis_dir = dir.path().join("non-genesis-state");
+    let non_genesis = NodeIdentity::from_seed([8_u8; 32]);
+    let non_genesis_store = "non-genesis.state";
+    write_identity_seed(&non_genesis_dir, &non_genesis);
+    wattswarm::control::write_node_state(&non_genesis_dir, true, NodeMode::Network).unwrap();
+    cmd(schema.as_str())
+        .args([
+            "--state-dir",
+            non_genesis_dir.to_str().unwrap(),
+            "--store",
+            non_genesis_store,
+            "governance",
+            "revoke-event",
+            "--event-id",
+            "event-bad",
+            "--reason",
+            "bad event",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "governance command requires mainnet genesis node",
         ));
 }
 

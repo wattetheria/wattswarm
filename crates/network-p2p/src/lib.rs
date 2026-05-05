@@ -152,6 +152,10 @@ pub struct RuleAnnouncement {
     pub rule_set: String,
     pub rule_version: u64,
     pub activation_epoch: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authority_signer_node_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authority_signature_hex: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -159,6 +163,10 @@ pub struct CheckpointAnnouncement {
     pub scope: SwarmScope,
     pub checkpoint_id: String,
     pub artifact_path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authority_signer_node_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authority_signature_hex: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

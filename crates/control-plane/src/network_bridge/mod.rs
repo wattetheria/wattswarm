@@ -42,7 +42,9 @@ use wattswarm_network_transport_core::{
 use wattswarm_network_transport_iroh::export_local_contact_material_for_network_peer_id;
 use wattswarm_protocol::types::NetworkProtocolParams;
 
-pub use announcements::{apply_checkpoint_announcement, apply_rule_announcement};
+pub use announcements::{
+    apply_checkpoint_announcement, apply_rule_announcement, sign_rule_announcement,
+};
 pub use backfill::{
     backfill_response_for_request, dial_bootstrap_peer_endpoints, dial_discovered_peer_endpoints,
     ingest_backfill_response,

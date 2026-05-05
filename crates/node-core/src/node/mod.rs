@@ -55,13 +55,6 @@ fn claim_role_str(role: ClaimRole) -> &'static str {
     }
 }
 
-fn claim_role_to_permission(role: ClaimRole) -> Role {
-    match role {
-        ClaimRole::Propose => Role::Proposer,
-        ClaimRole::Verify => Role::Verifier,
-    }
-}
-
 pub fn finality_message(task_id: &str, epoch: u64, candidate_id: &str) -> String {
     format!("{task_id}:{epoch}:{candidate_id}")
 }
@@ -81,6 +74,17 @@ pub fn finality_sign(
 
 pub fn membership_update_message(payload: &Membership) -> Result<Vec<u8>> {
     Ok(serde_json::to_vec(payload)?)
+}
+
+fn mainnet_genesis_node_id_for_store(store: &PgStore) -> Result<Option<String>> {
+    let Ok(topology) = store.load_network_topology_for_org(store.org_id()) else {
+        return Ok(None);
+    };
+    if topology.network.network_kind == crate::types::NetworkKind::Mainnet {
+        Ok(Some(topology.network.genesis_node_id))
+    } else {
+        Ok(None)
+    }
 }
 
 pub fn feedback_message(
