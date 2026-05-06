@@ -558,7 +558,7 @@ fn configured_node_mode_requires_explicit_selection() {
         serde_json::to_vec(&json!({
             "display_name": "Node Agent",
             "network_mode": "wan",
-            "bootstrap_peers": [],
+            "bootstrap_contacts": [],
             "core_agent": {
                 "mode": "local_url",
                 "base_url": "http://127.0.0.1:8787",

@@ -5,6 +5,9 @@ use crate::control::{
 };
 use crate::run_control;
 use crate::run_queue::{RunSubmitSpec, WorkerOptions};
+use crate::startup_config::{
+    NetworkMode, load_startup_config, save_startup_config, startup_config_path,
+};
 pub use crate::task_template::{sample_artifact_ref, sample_contract};
 use crate::types::{
     Event, EventPayload, Membership, MembershipUpdatedPayload, NetworkKind, TaskContract,
@@ -50,6 +53,16 @@ enum NodeAction {
     },
     Down,
     Status,
+    ExportContact {
+        #[arg(long)]
+        json: bool,
+    },
+    AddBootstrapContact {
+        contact: String,
+        #[arg(long, default_value = "wan")]
+        mode: String,
+    },
+    BootstrapContacts,
 }
 
 #[derive(Args, Debug)]
@@ -326,8 +339,46 @@ fn handle_node(cmd: NodeCommand, state_dir: &Path, db_path: &Path) -> Result<()>
                 }))?
             );
         }
+        NodeAction::ExportContact { json } => {
+            let contact = if json {
+                crate::network_bridge::export_local_bootstrap_contact_json(state_dir)?
+            } else {
+                crate::network_bridge::export_local_bootstrap_contact(state_dir)?
+            };
+            println!("{contact}");
+        }
+        NodeAction::AddBootstrapContact { contact, mode } => {
+            let trimmed = contact.trim();
+            if trimmed.is_empty() {
+                return Err(anyhow!("bootstrap contact is required"));
+            }
+            crate::network_bridge::validate_bootstrap_contact(trimmed)
+                .context("bootstrap contact must be exported by node export-contact")?;
+            let network_mode = parse_bootstrap_contact_mode(&mode)?;
+            let path = startup_config_path(state_dir);
+            let mut config = load_startup_config(&path)?;
+            config.network_mode = network_mode;
+            config.bootstrap_contacts.push(trimmed.to_owned());
+            save_startup_config(&path, &config)?;
+            println!("bootstrap contact added");
+        }
+        NodeAction::BootstrapContacts => {
+            let config = load_startup_config(&startup_config_path(state_dir))?;
+            for contact in config.bootstrap_contacts {
+                println!("{contact}");
+            }
+        }
     }
     Ok(())
+}
+
+fn parse_bootstrap_contact_mode(mode: &str) -> Result<NetworkMode> {
+    match mode.trim().to_ascii_lowercase().as_str() {
+        "lan" => Ok(NetworkMode::Lan),
+        "wan" | "network" => Ok(NetworkMode::Wan),
+        "local" => Err(anyhow!("bootstrap contacts require lan or wan mode")),
+        other => Err(anyhow!("unsupported bootstrap contact mode: {other}")),
+    }
 }
 
 fn handle_peers(cmd: PeersCommand, state_dir: &Path, db_path: &Path) -> Result<()> {

@@ -443,6 +443,12 @@ fn ui_root_page_serves_startup_view_and_diagnostics_route_redirects_legacy_conso
         assert!(root_html.contains("WattSwarm Startup"));
         assert!(root_html.contains("Open Network Diagnostics"));
         assert!(root_html.contains("href=\"/diagnostics\""));
+        assert!(root_html.contains("Bootstrap Contacts"));
+        assert!(root_html.contains("node export-contact"));
+        assert!(root_html.contains("&lt;node-id&gt;@&lt;host:port&gt;"));
+        assert!(root_html.contains("Paste one short Iroh bootstrap contact per line"));
+        assert!(!root_html.contains("<genesis-node-id>"));
+        assert!(!root_html.contains("\"metadata\":{\"route\":\"iroh_direct\""));
         assert!(!root_html.contains("href=\"/console\""));
         assert!(!root_html.contains("Open Swarm Dashboard"));
 

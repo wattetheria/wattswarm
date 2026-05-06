@@ -330,7 +330,7 @@ pub const STARTUP_HTML: &str = r#"<!DOCTYPE html>
 
         <div class="panel">
           <h2>Network Mode</h2>
-          <div class="hint">Choose where this node should live. Deeper libp2p and peer settings stay out of the startup page.</div>
+          <div class="hint">Choose where this node should live. Deeper Iroh transport and contact settings stay out of the startup page.</div>
           <div class="mode-buttons">
             <button id="networkLocal" class="mode" type="button" onclick="setNetworkMode('local')">Local</button>
             <button id="networkLan" class="mode" type="button" onclick="setNetworkMode('lan')">LAN</button>
@@ -340,11 +340,13 @@ pub const STARTUP_HTML: &str = r#"<!DOCTYPE html>
             <div class="meta-line"><span>Selected</span><code id="networkModeLabel">local</code></div>
             <div class="meta-line"><span>Meaning</span><code id="networkModeMeaning">single-machine startup</code></div>
           </div>
-          <div id="bootstrapPeersField" class="field hidden">
-            <label for="bootstrapPeers">Bootstrap Peers</label>
-            <textarea id="bootstrapPeers" rows="4" placeholder="/ip4/203.0.113.10/tcp/4001/p2p/12D3KooW...
-/dns4/bootstrap.example/tcp/4001/p2p/12D3KooW..."></textarea>
-            <div class="hint">Used for joining an existing LAN or WAN network. Enter one peer per line; comma-separated values are also accepted.</div>
+          <div id="bootstrapContactsField" class="field hidden">
+            <label for="bootstrapContacts">Bootstrap Contacts</label>
+            <textarea id="bootstrapContacts" rows="4" placeholder="paste output from:
+wattswarm --state-dir &lt;genesis-state-dir&gt; node export-contact
+
+format: &lt;node-id&gt;@&lt;host:port&gt;"></textarea>
+            <div class="hint">Required for joining LAN/WAN. Paste one short Iroh bootstrap contact per line.</div>
           </div>
           <div id="gatewayUrlsField" class="field hidden">
             <label for="gatewayUrls">Gateway URLs</label>
@@ -411,7 +413,7 @@ Those stay in CLI, compose, or config files for advanced operators.</pre>
           ? 'local-area distributed network'
           : 'single-machine startup';
       document.getElementById('networkModeMeaning').textContent = meaning;
-      document.getElementById('bootstrapPeersField').classList.toggle('hidden', mode === 'local');
+      document.getElementById('bootstrapContactsField').classList.toggle('hidden', mode === 'local');
       document.getElementById('gatewayUrlsField').classList.toggle('hidden', mode === 'local');
     }
 
@@ -420,7 +422,7 @@ Those stay in CLI, compose, or config files for advanced operators.</pre>
       document.getElementById('displayName').value = cfg.display_name || '';
       document.getElementById('latitude').value = Number.isFinite(cfg.latitude) ? String(cfg.latitude) : '';
       document.getElementById('longitude').value = Number.isFinite(cfg.longitude) ? String(cfg.longitude) : '';
-      document.getElementById('bootstrapPeers').value = (cfg.bootstrap_peers || []).join('\n');
+      document.getElementById('bootstrapContacts').value = (cfg.bootstrap_contacts || []).join('\n');
       document.getElementById('gatewayUrls').value = (cfg.gateway_urls || []).join('\n');
       setNetworkMode(cfg.network_mode || 'local');
     }
@@ -428,8 +430,8 @@ Those stay in CLI, compose, or config files for advanced operators.</pre>
     function buildPayload() {
       const latitudeValue = document.getElementById('latitude').value.trim();
       const longitudeValue = document.getElementById('longitude').value.trim();
-      const bootstrapPeers = document.getElementById('bootstrapPeers').value
-        .split(/[\n,]+/)
+      const bootstrapContacts = document.getElementById('bootstrapContacts').value
+        .split(/\n+/)
         .map((value) => value.trim())
         .filter(Boolean);
       const gatewayUrls = document.getElementById('gatewayUrls').value
@@ -442,7 +444,7 @@ Those stay in CLI, compose, or config files for advanced operators.</pre>
         latitude: latitudeValue === '' ? null : Number(latitudeValue),
         longitude: longitudeValue === '' ? null : Number(longitudeValue),
         network_mode: startupConfig.network_mode,
-        bootstrap_peers: isLocal ? [] : bootstrapPeers,
+        bootstrap_contacts: isLocal ? [] : bootstrapContacts,
         gateway_urls: isLocal ? [] : gatewayUrls
       };
     }

@@ -1263,7 +1263,7 @@ fn free_chat_is_interpreted_then_sedimented_into_topic_consensus() {
                         serde_json::to_vec(&json!({
                             "display_name": "Captain Aurora",
                             "network_mode": "local",
-                            "bootstrap_peers": [],
+                            "bootstrap_contacts": [],
                             "core_agent": {
                                 "mode": "remote_url",
                                 "base_url": stub.base_url(),
@@ -1658,7 +1658,7 @@ fn topic_interpretation_receives_prior_deliberations_from_topic_consensus_histor
                         serde_json::to_vec(&json!({
                             "display_name": "Captain Aurora",
                             "network_mode": "local",
-                            "bootstrap_peers": [],
+                            "bootstrap_contacts": [],
                             "core_agent": {
                                 "mode": "remote_url",
                                 "base_url": stub.base_url(),

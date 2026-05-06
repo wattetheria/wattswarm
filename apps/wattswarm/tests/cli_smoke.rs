@@ -234,6 +234,97 @@ fn cli_node_up_accepts_lan_mode() {
 }
 
 #[test]
+fn cli_node_exports_and_stores_bootstrap_contacts() {
+    let dir = tempdir().unwrap();
+    let genesis_state_dir = dir.path().join("genesis");
+    let joining_state_dir = dir.path().join("joining");
+    let schema = CliSchemaGuard::new();
+
+    let output = cmd(schema.as_str())
+        .args([
+            "--state-dir",
+            genesis_state_dir.to_str().unwrap(),
+            "node",
+            "export-contact",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let contact = String::from_utf8(output).unwrap();
+    let contact = contact.trim();
+    let (node_id, addr) = contact.split_once('@').unwrap();
+    assert!(!node_id.is_empty());
+    assert!(addr.parse::<std::net::SocketAddr>().is_ok());
+
+    let json_output = cmd(schema.as_str())
+        .args([
+            "--state-dir",
+            genesis_state_dir.to_str().unwrap(),
+            "node",
+            "export-contact",
+            "--json",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let contact_json: serde_json::Value =
+        serde_json::from_str(String::from_utf8(json_output).unwrap().trim()).unwrap();
+    assert_eq!(contact_json["transports"][0]["transport"], "iroh_direct");
+    assert_eq!(
+        contact_json["transports"][0]["metadata"]["endpoint_id"],
+        node_id
+    );
+
+    cmd(schema.as_str())
+        .args([
+            "--state-dir",
+            joining_state_dir.to_str().unwrap(),
+            "node",
+            "add-bootstrap-contact",
+            contact,
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("bootstrap contact added"));
+
+    cmd(schema.as_str())
+        .args([
+            "--state-dir",
+            joining_state_dir.to_str().unwrap(),
+            "node",
+            "bootstrap-contacts",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(contact));
+
+    let saved: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(joining_state_dir.join("startup_config.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(saved["network_mode"], "wan");
+    assert_eq!(saved["bootstrap_contacts"][0], contact);
+
+    cmd(schema.as_str())
+        .args([
+            "--state-dir",
+            joining_state_dir.to_str().unwrap(),
+            "node",
+            "add-bootstrap-contact",
+            r#"{"not":"a contact"}"#,
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "bootstrap contact must be exported by node export-contact",
+        ));
+}
+
+#[test]
 fn cli_submit_watch_and_decision() {
     let dir = tempdir().unwrap();
     let state_dir = dir.path().join("state");

@@ -335,7 +335,7 @@ struct StartupConfigSaveRequest {
     longitude: Option<f64>,
     network_mode: crate::startup_config::NetworkMode,
     #[serde(default)]
-    bootstrap_peers: Vec<String>,
+    bootstrap_contacts: Vec<String>,
     #[serde(default)]
     gateway_urls: Vec<String>,
     #[serde(default)]
@@ -671,7 +671,7 @@ async fn startup_config_save(
         latitude: req.latitude.or(existing.latitude),
         longitude: req.longitude.or(existing.longitude),
         network_mode: req.network_mode,
-        bootstrap_peers: req.bootstrap_peers,
+        bootstrap_contacts: req.bootstrap_contacts,
         gateway_urls: req.gateway_urls,
         core_agent: req.core_agent.clone().unwrap_or(existing.core_agent),
     }
@@ -1082,7 +1082,7 @@ mod tests {
                 latitude: None,
                 longitude: None,
                 network_mode: NetworkMode::Wan,
-                bootstrap_peers: vec!["/ip4/127.0.0.1/tcp/4001/p2p/12D3KooWBootstrap".to_owned()],
+                bootstrap_contacts: vec!["iroh-bootstrap-contact".to_owned()],
                 gateway_urls: Vec::new(),
                 core_agent: CoreAgentConfig::default(),
             },

@@ -2445,7 +2445,7 @@ mod tests {
     }
 
     #[test]
-    fn bootstrap_bundle_candidates_read_startup_config_peers_when_env_missing() {
+    fn bootstrap_bundle_candidates_do_not_treat_startup_contacts_as_http_sources() {
         let state_dir = temp_test_dir("bootstrap-candidates");
         let startup_config_path = state_dir.join("startup_config.json");
         fs::write(
@@ -2453,8 +2453,8 @@ mod tests {
             serde_json::to_vec(&serde_json::json!({
                 "display_name": "Node Agent",
                 "network_mode": "wan",
-                "bootstrap_peers": [
-                    "/ip4/13.55.201.222/tcp/4001/p2p/12D3KooWJecC4QsgJDf8ptXhdwBKkD43KiP8JBY79aDTHXSegJLV"
+                "bootstrap_contacts": [
+                    "{\"transport\":\"iroh_direct\",\"peer_id\":\"node-a\",\"metadata\":{\"route\":\"iroh_direct\",\"generated_at\":1,\"endpoint_id\":\"node-a\",\"alpn\":\"/wattswarm/iroh/1\",\"listen_addrs\":[\"13.55.201.222:4001\"],\"capabilities\":{\"supports_iroh_direct\":true,\"supports_streaming\":true,\"max_recommended_inline_bytes\":16384,\"preferred_data_route\":\"iroh_direct\"}},\"extra\":{\"endpoint_id\":\"node-a\",\"alpn\":\"/wattswarm/iroh/1\",\"direct_addrs\":[\"13.55.201.222:4001\"],\"relay_urls\":[]}}"
                 ],
                 "core_agent": {
                     "mode": "local_url",
@@ -2473,10 +2473,7 @@ mod tests {
 
         let endpoints =
             bootstrap_bundle_endpoint_candidates(&state_dir).expect("load bootstrap candidates");
-        assert_eq!(
-            endpoints,
-            vec!["http://13.55.201.222:7788/api/network/bootstrap".to_owned()]
-        );
+        assert!(endpoints.is_empty());
         let _ = fs::remove_dir_all(state_dir);
     }
 

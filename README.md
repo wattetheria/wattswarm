@@ -189,7 +189,6 @@ Runtime toggles:
 - `WATTSWARM_P2P_MDNS=true` by default for the legacy libp2p compatibility path
 - `WATTSWARM_P2P_PORT=4001` is the legacy libp2p compatibility listen port
 - `WATTSWARM_P2P_LISTEN_ADDRS` can override the legacy libp2p multiaddr list
-- `WATTSWARM_P2P_BOOTSTRAP_PEERS=/ip4/203.0.113.10/tcp/4001/p2p/<peer-id>` remains accepted as legacy bootstrap material while Iroh contact-material bootstrap is completed
 - `WATTSWARM_P2P_REGION_IDS=sol-1,sol-2` subscribes the node to those region scopes
 - `WATTSWARM_P2P_NODE_IDS=lab-a` subscribes the node to matching node scopes
 - `WATTSWARM_P2P_LOCAL_IDS=lab-a` is still accepted as a legacy alias for node scopes
@@ -197,7 +196,11 @@ Runtime toggles:
 Network-mode bootstrap behavior:
 
 - `WATTSWARM_NODE_MODE=network` tells the node to join an existing shared network instead of creating `local:` or `lan:` topology.
-- a joining node must know at least one bootstrap contact. Legacy libp2p multiaddrs remain accepted during compatibility, while Iroh contact material is the active direction for runtime sync.
+- a joining node must know at least one Iroh bootstrap contact exported by the genesis or bootstrap node:
+  - export on the genesis/bootstrap node with `wattswarm --state-dir <genesis-state-dir> node export-contact`
+  - the default export is a short `<node-id>@<host:port>` contact string
+  - paste the output into startup `Bootstrap Contacts`, or add it from CLI with `wattswarm --state-dir <joining-state-dir> node add-bootstrap-contact '<node-id>@<host:port>'`
+  - `wattswarm --state-dir <genesis-state-dir> node export-contact --json` is available for internal debugging only
 - if local PostgreSQL is missing `network_registry / org_registry / network_params`, the node now attempts an automatic bootstrap sync:
   - derives one or more bootstrap HTTP endpoints from configured peers (or explicit `WATTSWARM_NETWORK_BOOTSTRAP_HTTP_URLS`)
   - fetches the remote signed `NetworkBootstrapBundle`
@@ -524,8 +527,9 @@ specialization / faster closure / more stable network-level behavior"]
 - peer discovery payloads:
   - `node_id`
   - listen address hints for LAN dialing
-- bootstrap peer multiaddrs:
-  - legacy static `/p2p/<peer-id>` addresses supplied at startup for compatibility bootstrapping
+- bootstrap Iroh contacts:
+  - startup-supplied short `<node-id>@<host:port>` contacts for genesis or other bootstrap nodes
+  - short contacts are normalized into internal Iroh contact material before runtime registration
 - transport reachability signals:
   - Iroh endpoint id, direct addrs, relay urls, and contact-material freshness
   - legacy AutoNAT/relay/DCUtR signals only for generated-node compatibility runs
@@ -845,15 +849,15 @@ P2P env vars:
 - `WATTSWARM_P2P_MDNS=true` is retained for the legacy generated-node compatibility path
 - `WATTSWARM_P2P_PORT=4001` is retained as the legacy compatibility listen port
 - `WATTSWARM_P2P_LISTEN_ADDRS` is an optional legacy compatibility multiaddr override
-- `WATTSWARM_P2P_BOOTSTRAP_PEERS` still accepts legacy `/p2p/<peer-id>` bootstrap multiaddr material during the Iroh contact-material cutover
 - `WATTSWARM_P2P_REGION_IDS` optional comma-separated region scope subscription list
 - `WATTSWARM_P2P_NODE_IDS` optional comma-separated node scope subscription list
 - `WATTSWARM_P2P_LOCAL_IDS` optional legacy alias for node scope subscription list
 
 Startup UI behavior:
 
-- `Display Name`, `Network Mode`, `Bootstrap Peers`, optional `Gateway URLs`, and `Core Agent` are saved to `startup_config.json`
-- `Bootstrap Peers` is shown only for `LAN` / `WAN`
+- `Display Name`, `Network Mode`, `Bootstrap Contacts`, optional `Gateway URLs`, and `Core Agent` are saved to `startup_config.json`
+- `Bootstrap Contacts` is shown only for `LAN` / `WAN` and accepts short Iroh contact strings in `<node-id>@<host:port>` format, not libp2p `/p2p/<peer-id>` multiaddrs
+- genesis/bootstrap nodes can export a paste-ready contact with `wattswarm --state-dir <state-dir> node export-contact`
 - saving `Core Agent` also syncs the local executor route into PostgreSQL `executor_registry_local`
 - startup UI does not write network topology into PostgreSQL directly; topology and signed network params are still imported through bootstrap sync or regular node startup flows
 

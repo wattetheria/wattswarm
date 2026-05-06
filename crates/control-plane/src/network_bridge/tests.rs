@@ -2215,15 +2215,15 @@ fn network_config_reads_bootstrap_peers_from_env() {
 }
 
 #[test]
-fn network_config_reads_bootstrap_peers_from_startup_config_when_env_missing() {
+fn network_config_does_not_read_bootstrap_contacts_as_legacy_peers() {
     let _lock = lock_env_test_mutex();
     let _bootstrap = EnvVarGuard::set(ENV_P2P_BOOTSTRAP_PEERS, None);
     let dir = temp_startup_dir("startup-bootstrap");
     fs::write(
         dir.join("startup_config.json"),
         serde_json::to_vec(&json!({
-            "bootstrap_peers": [
-                "/ip4/127.0.0.1/tcp/4002/p2p/12D3KooWStartupBootstrap"
+            "bootstrap_contacts": [
+                "{\"transport\":\"iroh_direct\",\"peer_id\":\"node-a\",\"metadata\":{\"route\":\"iroh_direct\",\"generated_at\":1,\"endpoint_id\":\"node-a\",\"alpn\":\"/wattswarm/iroh/1\",\"listen_addrs\":[\"127.0.0.1:4002\"],\"capabilities\":{\"supports_iroh_direct\":true,\"supports_streaming\":true,\"max_recommended_inline_bytes\":16384,\"preferred_data_route\":\"iroh_direct\"}},\"extra\":{\"endpoint_id\":\"node-a\",\"alpn\":\"/wattswarm/iroh/1\",\"direct_addrs\":[\"127.0.0.1:4002\"],\"relay_urls\":[]}}"
             ]
         }))
         .expect("startup config json"),
@@ -2231,11 +2231,7 @@ fn network_config_reads_bootstrap_peers_from_startup_config_when_env_missing() {
     .expect("write startup config");
 
     let config = network_config_from_state_dir(&dir);
-    assert_eq!(config.bootstrap_peers.len(), 1);
-    assert_eq!(
-        config.bootstrap_peers[0],
-        "/ip4/127.0.0.1/tcp/4002/p2p/12D3KooWStartupBootstrap"
-    );
+    assert!(config.bootstrap_peers.is_empty());
 
     let _ = fs::remove_dir_all(dir);
 }
@@ -2655,6 +2651,62 @@ fn set_state_dir_loads_persisted_iroh_contact_material_into_runtime() {
     service.set_state_dir(local_dir.clone(), local_dir.join("ui.state"));
 
     assert_eq!(service.known_remote_contact_count(), 1);
+
+    wattswarm_network_transport_iroh::shutdown_local_iroh_data_plane(&local_dir);
+    wattswarm_network_transport_iroh::shutdown_local_iroh_data_plane(&remote_dir);
+    std::fs::remove_dir_all(local_dir).expect("cleanup local");
+    std::fs::remove_dir_all(remote_dir).expect("cleanup remote");
+}
+
+#[test]
+fn set_state_dir_loads_startup_iroh_bootstrap_contacts_into_runtime() {
+    let local_dir = temp_startup_dir("iroh-startup-contact-local");
+    let remote_dir = temp_startup_dir("iroh-startup-contact-remote");
+    let local_seed = [91u8; 32];
+    let remote_seed = [92u8; 32];
+    std::fs::write(local_dir.join("node_seed.hex"), hex::encode(local_seed))
+        .expect("write local seed");
+    std::fs::write(remote_dir.join("node_seed.hex"), hex::encode(remote_seed))
+        .expect("write remote seed");
+    let remote_endpoint =
+        wattswarm_network_transport_iroh::local_endpoint_id_from_state_dir(&remote_dir)
+            .expect("remote endpoint")
+            .to_string();
+    let remote_contact = export_local_contact_material_for_network_peer_id(
+        &remote_dir,
+        &remote_endpoint,
+        observed_at_ms(),
+    )
+    .expect("remote contact");
+    std::fs::write(
+        local_dir.join("startup_config.json"),
+        serde_json::to_vec(&json!({
+            "network_mode": "wan",
+            "bootstrap_contacts": [serde_json::to_string(&remote_contact).expect("contact json")]
+        }))
+        .expect("startup config json"),
+    )
+    .expect("write startup config");
+
+    let mut service = NetworkBridgeService::new(
+        NetworkP2pNode::from_iroh_state_dir(
+            NetworkP2pConfig::default(),
+            local_dir.clone(),
+            local_seed,
+        )
+        .expect("iroh node"),
+        &[SwarmScope::Global],
+        &NetworkProtocolParams::default(),
+    )
+    .expect("service");
+    service.set_state_dir(local_dir.clone(), local_dir.join("ui.state"));
+
+    assert_eq!(service.known_remote_contact_count(), 1);
+    let rows =
+        crate::control::load_peer_metadata_records_state(&local_dir).expect("peer metadata rows");
+    assert!(rows.iter().any(|row| {
+        row.node_id == remote_endpoint && row.handshake_status == "startup_contact"
+    }));
 
     wattswarm_network_transport_iroh::shutdown_local_iroh_data_plane(&local_dir);
     wattswarm_network_transport_iroh::shutdown_local_iroh_data_plane(&remote_dir);

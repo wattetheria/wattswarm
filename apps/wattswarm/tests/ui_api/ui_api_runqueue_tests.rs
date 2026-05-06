@@ -222,7 +222,7 @@ fn ui_rejects_lan_run_submit_when_only_local_executors_are_available() {
                         serde_json::to_vec(&json!({
                             "display_name": "Captain Aurora",
                             "network_mode": "lan",
-                            "bootstrap_peers": []
+                            "bootstrap_contacts": []
                         }))
                         .unwrap(),
                     ))

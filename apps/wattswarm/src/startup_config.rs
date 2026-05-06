@@ -83,7 +83,7 @@ pub struct StartupConfig {
     #[serde(default)]
     pub network_mode: NetworkMode,
     #[serde(default)]
-    pub bootstrap_peers: Vec<String>,
+    pub bootstrap_contacts: Vec<String>,
     #[serde(default)]
     pub gateway_urls: Vec<String>,
     #[serde(default)]
@@ -97,7 +97,7 @@ impl Default for StartupConfig {
             latitude: None,
             longitude: None,
             network_mode: NetworkMode::default(),
-            bootstrap_peers: Vec::new(),
+            bootstrap_contacts: Vec::new(),
             gateway_urls: Vec::new(),
             core_agent: CoreAgentConfig::default(),
         }
@@ -121,10 +121,10 @@ impl StartupConfig {
         self.display_name = self.display_name.trim().to_owned();
         self.latitude = normalize_latitude(self.latitude);
         self.longitude = normalize_longitude(self.longitude);
-        self.bootstrap_peers = normalize_bootstrap_peers(&self.bootstrap_peers);
+        self.bootstrap_contacts = normalize_bootstrap_contacts(&self.bootstrap_contacts);
         self.gateway_urls = normalize_gateway_urls(&self.gateway_urls);
         if matches!(self.network_mode, NetworkMode::Local) {
-            self.bootstrap_peers.clear();
+            self.bootstrap_contacts.clear();
             self.gateway_urls.clear();
         }
         self.core_agent.provider = self.core_agent.provider.trim().to_owned();
@@ -186,7 +186,7 @@ impl StartupConfig {
     }
 }
 
-fn normalize_bootstrap_peers(values: &[String]) -> Vec<String> {
+fn normalize_bootstrap_contacts(values: &[String]) -> Vec<String> {
     let mut normalized = Vec::new();
     for value in values {
         let trimmed = value.trim();
@@ -322,39 +322,39 @@ mod tests {
     }
 
     #[test]
-    fn normalizes_bootstrap_peers_trim_and_dedup() {
+    fn normalizes_bootstrap_contacts_trim_and_dedup() {
         let config = StartupConfig {
             network_mode: NetworkMode::Lan,
-            bootstrap_peers: vec![
-                " /ip4/127.0.0.1/tcp/4001/p2p/peer-a ".to_owned(),
+            bootstrap_contacts: vec![
+                r#" {"transport":"iroh_direct","peer_id":"node-a","metadata":{"route":"iroh_direct","generated_at":1,"endpoint_id":"node-a","alpn":"/wattswarm/iroh/1","listen_addrs":["127.0.0.1:4001"],"capabilities":{"supports_iroh_direct":true,"supports_streaming":true,"max_recommended_inline_bytes":16384,"preferred_data_route":"iroh_direct"}},"extra":{"endpoint_id":"node-a","alpn":"/wattswarm/iroh/1","direct_addrs":["127.0.0.1:4001"],"relay_urls":[]}} "#.to_owned(),
                 String::new(),
-                "/ip4/127.0.0.1/tcp/4001/p2p/peer-a".to_owned(),
-                "/ip4/127.0.0.1/tcp/4002/p2p/peer-b".to_owned(),
+                r#"{"transport":"iroh_direct","peer_id":"node-a","metadata":{"route":"iroh_direct","generated_at":1,"endpoint_id":"node-a","alpn":"/wattswarm/iroh/1","listen_addrs":["127.0.0.1:4001"],"capabilities":{"supports_iroh_direct":true,"supports_streaming":true,"max_recommended_inline_bytes":16384,"preferred_data_route":"iroh_direct"}},"extra":{"endpoint_id":"node-a","alpn":"/wattswarm/iroh/1","direct_addrs":["127.0.0.1:4001"],"relay_urls":[]}}"#.to_owned(),
+                r#"{"transport":"iroh_direct","peer_id":"node-b","metadata":{"route":"iroh_direct","generated_at":2,"endpoint_id":"node-b","alpn":"/wattswarm/iroh/1","listen_addrs":["127.0.0.1:4002"],"capabilities":{"supports_iroh_direct":true,"supports_streaming":true,"max_recommended_inline_bytes":16384,"preferred_data_route":"iroh_direct"}},"extra":{"endpoint_id":"node-b","alpn":"/wattswarm/iroh/1","direct_addrs":["127.0.0.1:4002"],"relay_urls":[]}}"#.to_owned(),
             ],
             ..StartupConfig::default()
         }
         .normalized();
 
         assert_eq!(
-            config.bootstrap_peers,
+            config.bootstrap_contacts,
             vec![
-                "/ip4/127.0.0.1/tcp/4001/p2p/peer-a".to_owned(),
-                "/ip4/127.0.0.1/tcp/4002/p2p/peer-b".to_owned()
+                r#"{"transport":"iroh_direct","peer_id":"node-a","metadata":{"route":"iroh_direct","generated_at":1,"endpoint_id":"node-a","alpn":"/wattswarm/iroh/1","listen_addrs":["127.0.0.1:4001"],"capabilities":{"supports_iroh_direct":true,"supports_streaming":true,"max_recommended_inline_bytes":16384,"preferred_data_route":"iroh_direct"}},"extra":{"endpoint_id":"node-a","alpn":"/wattswarm/iroh/1","direct_addrs":["127.0.0.1:4001"],"relay_urls":[]}}"#.to_owned(),
+                r#"{"transport":"iroh_direct","peer_id":"node-b","metadata":{"route":"iroh_direct","generated_at":2,"endpoint_id":"node-b","alpn":"/wattswarm/iroh/1","listen_addrs":["127.0.0.1:4002"],"capabilities":{"supports_iroh_direct":true,"supports_streaming":true,"max_recommended_inline_bytes":16384,"preferred_data_route":"iroh_direct"}},"extra":{"endpoint_id":"node-b","alpn":"/wattswarm/iroh/1","direct_addrs":["127.0.0.1:4002"],"relay_urls":[]}}"#.to_owned(),
             ]
         );
     }
 
     #[test]
-    fn clears_bootstrap_peers_for_local_mode() {
+    fn clears_bootstrap_contacts_for_local_mode() {
         let config = StartupConfig {
             network_mode: NetworkMode::Local,
-            bootstrap_peers: vec!["/ip4/127.0.0.1/tcp/4001/p2p/peer-a".to_owned()],
+            bootstrap_contacts: vec!["iroh-contact-a".to_owned()],
             gateway_urls: vec!["https://gw.example.com".to_owned()],
             ..StartupConfig::default()
         }
         .normalized();
 
-        assert!(config.bootstrap_peers.is_empty());
+        assert!(config.bootstrap_contacts.is_empty());
         assert!(config.gateway_urls.is_empty());
     }
 

@@ -30,6 +30,7 @@ use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
 use std::io::Write;
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::thread;
@@ -37,9 +38,12 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::runtime::Runtime;
 use uuid::Uuid;
 use wattswarm_network_transport_core::{
-    TransferIntent, TransferKind, TransportRoute as DataTransportRoute, TransportRouter,
+    PeerTransportCapabilities, TransferIntent, TransferKind, TransportContactMaterial,
+    TransportMetadata, TransportRoute as DataTransportRoute, TransportRouter,
 };
-use wattswarm_network_transport_iroh::export_local_contact_material_for_network_peer_id;
+use wattswarm_network_transport_iroh::{
+    export_local_contact_material_for_network_peer_id, local_endpoint_id_from_state_dir,
+};
 use wattswarm_protocol::types::NetworkProtocolParams;
 
 pub use announcements::{
@@ -1605,6 +1609,37 @@ fn build_contact_material(state_dir: &Path, local_peer_id: &str) -> Result<RawCo
     })
 }
 
+pub fn export_local_bootstrap_contact(state_dir: &Path) -> Result<String> {
+    let material = export_local_bootstrap_contact_material(state_dir)?;
+    let endpoint_id = material
+        .metadata
+        .endpoint_id
+        .as_deref()
+        .unwrap_or(&material.peer_id);
+    let addr = material
+        .metadata
+        .listen_addrs
+        .first()
+        .ok_or_else(|| anyhow!("local Iroh endpoint has no direct bootstrap address yet"))?;
+    Ok(format!("{endpoint_id}@{addr}"))
+}
+
+pub fn export_local_bootstrap_contact_json(state_dir: &Path) -> Result<String> {
+    let _ = crate::control::local_node_id(state_dir)?;
+    let endpoint_id = local_endpoint_id_from_state_dir(state_dir)?.to_string();
+    Ok(build_contact_material(state_dir, &endpoint_id)?.material_json)
+}
+
+fn export_local_bootstrap_contact_material(state_dir: &Path) -> Result<TransportContactMaterial> {
+    let _ = crate::control::local_node_id(state_dir)?;
+    let endpoint_id = local_endpoint_id_from_state_dir(state_dir)?.to_string();
+    export_local_contact_material_for_network_peer_id(state_dir, &endpoint_id, observed_at_ms())
+}
+
+pub fn validate_bootstrap_contact(raw_contact: &str) -> Result<()> {
+    parse_startup_bootstrap_contact(raw_contact).map(|_| ())
+}
+
 fn upsert_contact_material_for_peer(
     state_dir: &Path,
     remote_node_id: &str,
@@ -2190,12 +2225,8 @@ pub fn network_config_from_env() -> NetworkP2pConfig {
     }
 }
 
-pub fn network_config_from_state_dir(state_dir: &Path) -> NetworkP2pConfig {
-    let mut config = network_config_from_env();
-    if config.bootstrap_peers.is_empty() {
-        config.bootstrap_peers = load_bootstrap_peers_from_startup_config(state_dir);
-    }
-    config
+pub fn network_config_from_state_dir(_state_dir: &Path) -> NetworkP2pConfig {
+    network_config_from_env()
 }
 
 fn network_node_from_state_dir(
@@ -2622,6 +2653,12 @@ impl NetworkBridgeService {
                 state_dir.display()
             );
         }
+        if let Err(err) = self.load_startup_bootstrap_contacts(&state_dir) {
+            eprintln!(
+                "startup bootstrap contact load failed for {}: {err:#}",
+                state_dir.display()
+            );
+        }
         if let Err(err) = self.load_iroh_contact_material(&state_dir) {
             eprintln!(
                 "iroh contact material load failed for {}: {err}",
@@ -2630,6 +2667,35 @@ impl NetworkBridgeService {
         }
         self.state_dir = Some(state_dir);
         self.db_path = Some(db_path);
+    }
+
+    fn load_startup_bootstrap_contacts(&mut self, state_dir: &Path) -> Result<()> {
+        for raw_contact in load_bootstrap_contacts_from_startup_config(state_dir) {
+            let (remote_node_id, material, contacts) =
+                match parse_startup_bootstrap_contact(&raw_contact) {
+                    Ok(parsed) => parsed,
+                    Err(error) => {
+                        eprintln!("skip invalid startup Iroh bootstrap contact: {error}");
+                        continue;
+                    }
+                };
+            upsert_startup_bootstrap_contact_material(state_dir, &remote_node_id, material)
+                .with_context(|| {
+                    format!("persist startup bootstrap contact material for {remote_node_id}")
+                })?;
+            for contact in contacts {
+                if contact.transport == DataTransportRoute::IrohDirect.as_str() {
+                    self.runtime
+                        .upsert_remote_contact_material(contact.peer_id.clone(), contact)
+                        .with_context(|| {
+                            format!(
+                                "register startup bootstrap contact material for {remote_node_id}"
+                            )
+                        })?;
+                }
+            }
+        }
+        Ok(())
     }
 
     fn load_iroh_contact_material(&mut self, state_dir: &Path) -> Result<()> {
@@ -2908,27 +2974,188 @@ fn migrate_legacy_peer_sync_state_records(
 #[derive(Debug, Deserialize, Default)]
 struct StartupBootstrapConfig {
     #[serde(default)]
-    bootstrap_peers: Vec<String>,
+    bootstrap_contacts: Vec<String>,
 }
 
-fn load_bootstrap_peers_from_startup_config(state_dir: &Path) -> Vec<String> {
+fn load_bootstrap_contacts_from_startup_config(state_dir: &Path) -> Vec<String> {
     let path = state_dir.join(STARTUP_CONFIG_FILE);
     let Ok(bytes) = fs::read(&path) else {
         return Vec::new();
     };
     match serde_json::from_slice::<StartupBootstrapConfig>(&bytes) {
         Ok(config) => config
-            .bootstrap_peers
+            .bootstrap_contacts
             .into_iter()
             .map(|value| value.trim().to_owned())
             .filter(|value| !value.is_empty())
             .collect(),
         Err(error) => {
             eprintln!(
-                "failed to parse startup bootstrap peers from {}: {error}",
+                "failed to parse startup bootstrap contacts from {}: {error}",
                 path.display()
             );
             Vec::new()
         }
     }
+}
+
+fn parse_startup_bootstrap_contact(
+    raw_contact: &str,
+) -> Result<(String, Value, Vec<TransportContactMaterial>)> {
+    let raw_contact = raw_contact.trim();
+    if !raw_contact.starts_with('{') {
+        let contact = transport_contact_from_short_bootstrap_contact(raw_contact)?;
+        return Ok((
+            contact.peer_id.clone(),
+            startup_contact_material_from_transport(contact.clone()),
+            vec![contact],
+        ));
+    }
+    let raw_value: Value = serde_json::from_str(raw_contact)
+        .context("startup bootstrap contact must be JSON contact material")?;
+    let material = if raw_value.get("transports").is_some() {
+        raw_value
+    } else {
+        let contact: TransportContactMaterial =
+            serde_json::from_value(raw_value).context("decode Iroh transport contact material")?;
+        startup_contact_material_from_transport(contact)
+    };
+    let transports = material
+        .get("transports")
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow!("bootstrap contact missing transports"))?
+        .iter()
+        .map(|entry| {
+            serde_json::from_value::<TransportContactMaterial>(entry.clone())
+                .context("decode bootstrap transport contact")
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let node_id = material
+        .get("node_id")
+        .and_then(Value::as_str)
+        .or_else(|| material.get("peer_id").and_then(Value::as_str))
+        .or_else(|| transports.first().map(|contact| contact.peer_id.as_str()))
+        .ok_or_else(|| anyhow!("bootstrap contact missing node_id or peer_id"))?
+        .trim()
+        .to_owned();
+    if node_id.is_empty() {
+        bail!("bootstrap contact node_id is empty");
+    }
+    Ok((node_id, material, transports))
+}
+
+fn transport_contact_from_short_bootstrap_contact(
+    raw_contact: &str,
+) -> Result<TransportContactMaterial> {
+    let (node_id, raw_addr) = raw_contact
+        .rsplit_once('@')
+        .ok_or_else(|| anyhow!("bootstrap contact must be <node-id>@<host:port>"))?;
+    let node_id = node_id.trim();
+    if node_id.is_empty() {
+        bail!("bootstrap contact node id is empty");
+    }
+    let raw_addr = raw_addr.trim();
+    if raw_addr.is_empty() {
+        bail!("bootstrap contact address is empty");
+    }
+    let _: SocketAddr = raw_addr
+        .parse()
+        .with_context(|| format!("parse bootstrap contact address {raw_addr}"))?;
+    let generated_at = observed_at_ms();
+    let capabilities = PeerTransportCapabilities::iroh_direct_default();
+    Ok(TransportContactMaterial {
+        transport: DataTransportRoute::IrohDirect.as_str().to_owned(),
+        peer_id: node_id.to_owned(),
+        metadata: TransportMetadata {
+            route: DataTransportRoute::IrohDirect,
+            generated_at,
+            endpoint_id: Some(node_id.to_owned()),
+            alpn: Some(wattswarm_network_transport_iroh::DEFAULT_IROH_ALPN.to_owned()),
+            listen_addrs: vec![raw_addr.to_owned()],
+            capabilities,
+        },
+        extra: json!({
+            "endpoint_id": node_id,
+            "alpn": wattswarm_network_transport_iroh::DEFAULT_IROH_ALPN,
+            "direct_addrs": [raw_addr],
+            "relay_urls": []
+        }),
+    })
+}
+
+fn startup_contact_material_from_transport(contact: TransportContactMaterial) -> Value {
+    json!({
+        "node_id": contact.peer_id.clone(),
+        "peer_id": contact.peer_id.clone(),
+        "listen_addrs": contact.metadata.listen_addrs.clone(),
+        "generated_at": contact.metadata.generated_at,
+        "transports": [contact.clone()],
+        "recommended_routes": crate::control::recommended_data_routes(Some(&contact.metadata.capabilities)),
+    })
+}
+
+fn upsert_startup_bootstrap_contact_material(
+    state_dir: &Path,
+    remote_node_id: &str,
+    material: Value,
+) -> Result<()> {
+    let now = observed_at_ms();
+    let existing = crate::control::load_peer_metadata_records_state(state_dir)?
+        .into_iter()
+        .find(|record| record.node_id == remote_node_id);
+    let listen_addrs = material
+        .get("listen_addrs")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_else(|| {
+            existing
+                .as_ref()
+                .map_or_else(Vec::new, |record| record.listen_addrs.clone())
+        });
+    let record = crate::control::PeerMetadataRecord {
+        node_id: remote_node_id.to_owned(),
+        network_id: material
+            .get("network_id")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .or_else(|| existing.as_ref().and_then(|entry| entry.network_id.clone())),
+        params_version: existing.as_ref().and_then(|entry| entry.params_version),
+        params_hash: existing
+            .as_ref()
+            .and_then(|entry| entry.params_hash.clone()),
+        agent_version_raw: existing
+            .as_ref()
+            .and_then(|entry| entry.agent_version_raw.clone()),
+        agent_version_prefix: existing
+            .as_ref()
+            .and_then(|entry| entry.agent_version_prefix.clone()),
+        protocol_version: existing
+            .as_ref()
+            .and_then(|entry| entry.protocol_version.clone()),
+        observed_addr: existing
+            .as_ref()
+            .and_then(|entry| entry.observed_addr.clone()),
+        listen_addrs,
+        protocols: existing
+            .as_ref()
+            .map_or_else(Vec::new, |entry| entry.protocols.clone()),
+        handshake_status: "startup_contact".to_owned(),
+        last_error: None,
+        contact_material: Some(material),
+        contact_material_signature: existing
+            .as_ref()
+            .and_then(|entry| entry.contact_material_signature.clone()),
+        contact_material_updated_at: Some(now),
+        first_identified_at: existing
+            .as_ref()
+            .map_or(now, |entry| entry.first_identified_at),
+        last_identified_at: now,
+    };
+    crate::control::save_peer_metadata_record_state(state_dir, &record)
 }

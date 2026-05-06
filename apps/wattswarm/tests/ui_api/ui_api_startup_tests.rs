@@ -35,7 +35,7 @@ fn ui_startup_config_roundtrips_network_settings_without_agent_binding() {
             Some("local")
         );
         assert_eq!(
-            default_json["config"]["bootstrap_peers"]
+            default_json["config"]["bootstrap_contacts"]
                 .as_array()
                 .map(|items| items.len()),
             Some(0)
@@ -62,8 +62,8 @@ fn ui_startup_config_roundtrips_network_settings_without_agent_binding() {
                         serde_json::to_vec(&json!({
                             "display_name": "Captain Aurora",
                             "network_mode": "lan",
-                            "bootstrap_peers": [
-                                "/ip4/127.0.0.1/tcp/4001/p2p/12D3KooWLanBootstrap"
+                            "bootstrap_contacts": [
+                                "{\"transport\":\"iroh_direct\",\"peer_id\":\"node-lan\",\"metadata\":{\"route\":\"iroh_direct\",\"generated_at\":1,\"endpoint_id\":\"node-lan\",\"alpn\":\"/wattswarm/iroh/1\",\"listen_addrs\":[\"127.0.0.1:4001\"],\"capabilities\":{\"supports_iroh_direct\":true,\"supports_streaming\":true,\"max_recommended_inline_bytes\":16384,\"preferred_data_route\":\"iroh_direct\"}},\"extra\":{\"endpoint_id\":\"node-lan\",\"alpn\":\"/wattswarm/iroh/1\",\"direct_addrs\":[\"127.0.0.1:4001\"],\"relay_urls\":[]}}"
                             ],
                             "gateway_urls": [
                                 " http://gateway.example.com:8080/ ",
@@ -98,8 +98,8 @@ fn ui_startup_config_roundtrips_network_settings_without_agent_binding() {
             Some("Captain Aurora")
         );
         assert_eq!(
-            get_saved_json["config"]["bootstrap_peers"][0].as_str(),
-            Some("/ip4/127.0.0.1/tcp/4001/p2p/12D3KooWLanBootstrap")
+            get_saved_json["config"]["bootstrap_contacts"][0].as_str(),
+            Some("{\"transport\":\"iroh_direct\",\"peer_id\":\"node-lan\",\"metadata\":{\"route\":\"iroh_direct\",\"generated_at\":1,\"endpoint_id\":\"node-lan\",\"alpn\":\"/wattswarm/iroh/1\",\"listen_addrs\":[\"127.0.0.1:4001\"],\"capabilities\":{\"supports_iroh_direct\":true,\"supports_streaming\":true,\"max_recommended_inline_bytes\":16384,\"preferred_data_route\":\"iroh_direct\"}},\"extra\":{\"endpoint_id\":\"node-lan\",\"alpn\":\"/wattswarm/iroh/1\",\"direct_addrs\":[\"127.0.0.1:4001\"],\"relay_urls\":[]}}")
         );
         assert_eq!(
             get_saved_json["config"]["gateway_urls"][0].as_str(),
@@ -121,8 +121,8 @@ fn ui_startup_config_roundtrips_network_settings_without_agent_binding() {
                         serde_json::to_vec(&json!({
                             "display_name": "Captain Aurora",
                             "network_mode": "local",
-                            "bootstrap_peers": [
-                                "/ip4/127.0.0.1/tcp/4001/p2p/12D3KooWShouldBeCleared"
+                            "bootstrap_contacts": [
+                                "iroh-contact-should-be-cleared"
                             ],
                             "gateway_urls": [
                                 "https://gw.example.com"
@@ -137,7 +137,7 @@ fn ui_startup_config_roundtrips_network_settings_without_agent_binding() {
         assert_eq!(save_local_res.status(), StatusCode::OK);
         let save_local_json = json_from(save_local_res).await;
         assert_eq!(
-            save_local_json["config"]["bootstrap_peers"]
+            save_local_json["config"]["bootstrap_contacts"]
                 .as_array()
                 .map(|items| items.len()),
             Some(0)
@@ -188,7 +188,7 @@ fn ui_startup_config_roundtrips_network_settings_without_agent_binding() {
             Some("local")
         );
         assert_eq!(
-            get_local_saved_json["config"]["bootstrap_peers"]
+            get_local_saved_json["config"]["bootstrap_contacts"]
                 .as_array()
                 .map(|items| items.len()),
             Some(0)
@@ -276,7 +276,7 @@ fn ui_startup_config_save_updates_existing_runtime_node_mode() {
                         serde_json::to_vec(&json!({
                             "display_name": "Captain Aurora",
                             "network_mode": "local",
-                            "bootstrap_peers": []
+                            "bootstrap_contacts": []
                         }))
                         .unwrap(),
                     ))
@@ -336,7 +336,7 @@ fn ui_startup_config_still_accepts_legacy_core_agent_binding_payload() {
                         serde_json::to_vec(&json!({
                             "display_name": "Legacy Node",
                             "network_mode": "local",
-                            "bootstrap_peers": [],
+                            "bootstrap_contacts": [],
                             "core_agent": {
                                 "mode": "remote_url",
                                 "base_url": "http://127.0.0.1:9999",
