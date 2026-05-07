@@ -21,7 +21,8 @@ use wattswarm_control_plane::network_bridge::{
     latest_connected_peer_ids, publish_pending_global_events, publish_pending_scoped_updates,
 };
 use wattswarm_control_plane::network_p2p::{
-    NetworkP2pConfig, NetworkP2pNode, PeerHandshakeMetadata, SwarmScope, TopicNamespace,
+    NetworkAddress, NetworkP2pConfig, NetworkP2pNode, PeerHandshakeMetadata, SwarmScope,
+    TopicNamespace,
 };
 use wattswarm_control_plane::node::Node;
 use wattswarm_control_plane::storage::PgStore;
@@ -90,7 +91,7 @@ fn make_service_for_network_with_scopes(
                 },
             ),
         listen_addrs: vec!["/ip4/127.0.0.1/tcp/0".to_owned()],
-        enable_mdns: false,
+        enable_local_discovery: false,
         ..NetworkP2pConfig::default()
     };
     make_service_with_config(scopes, &params, config)
@@ -117,7 +118,7 @@ fn make_service_with_params(
         params,
         NetworkP2pConfig {
             listen_addrs: vec!["/ip4/127.0.0.1/tcp/0".to_owned()],
-            enable_mdns: false,
+            enable_local_discovery: false,
             ..NetworkP2pConfig::default()
         },
     )
@@ -133,7 +134,7 @@ fn make_bootstrap_service_with_params(
         params,
         NetworkP2pConfig {
             listen_addrs: vec!["/ip4/127.0.0.1/tcp/0".to_owned()],
-            enable_mdns: false,
+            enable_local_discovery: false,
             bootstrap_peers: bootstrap_peers.to_vec(),
             ..NetworkP2pConfig::default()
         },
@@ -318,13 +319,15 @@ fn wait_for_connected_pair(
     );
 }
 
+fn iroh_peer_addr(service: &NetworkBridgeService) -> NetworkAddress {
+    format!("{}@{}", service.local_peer_id(), service.listen_addrs()[0])
+        .parse()
+        .expect("iroh peer bootstrap address")
+}
+
 fn bootstrap_peer_addr(service: &mut NetworkBridgeService, node: &mut Node) -> String {
     wait_for_listen_addrs(service, node);
-    format!(
-        "{}/p2p/{}",
-        service.listen_addrs()[0],
-        service.local_peer_id()
-    )
+    iroh_peer_addr(service).to_string()
 }
 
 fn connect_services(
@@ -335,9 +338,10 @@ fn connect_services(
 ) {
     wait_for_listen_addrs(dialer, dialer_node);
     wait_for_listen_addrs(receiver, receiver_node);
-    dialer
-        .dial(receiver.listen_addrs()[0].clone())
-        .expect("dial peer");
+    let receiver_addr = iroh_peer_addr(receiver);
+    let dialer_addr = iroh_peer_addr(dialer);
+    dialer.dial(receiver_addr).expect("dial peer");
+    receiver.dial(dialer_addr).expect("dial reciprocal peer");
     wait_for_connected_pair(dialer, dialer_node, receiver, receiver_node);
 }
 
@@ -397,7 +401,7 @@ fn data_plane_statuses_for(
         .collect()
 }
 
-pub fn two_nodes_sync_global_event_over_libp2p() {
+pub fn two_nodes_sync_global_event_over_iroh() {
     let identity_a = NodeIdentity::random();
     let identity_b = NodeIdentity::random();
     let membership = membership_with_roles(&[identity_a.node_id(), identity_b.node_id()]);
@@ -406,52 +410,7 @@ pub fn two_nodes_sync_global_event_over_libp2p() {
     let mut service_a = make_service();
     let mut service_b = make_service();
 
-    for _ in 0..4_096 {
-        let tick_a = pump_once(&mut service_a, &mut node_a);
-        let tick_b = pump_once(&mut service_b, &mut node_b);
-        if let Some(NetworkBridgeTick::BackfillFailed { error, .. }) = tick_a.as_ref() {
-            panic!("backfill failed on service A: {error}");
-        }
-        if let Some(NetworkBridgeTick::BackfillFailed { error, .. }) = tick_b.as_ref() {
-            panic!("backfill failed on service B: {error}");
-        }
-        if !service_a.listen_addrs().is_empty() && !service_b.listen_addrs().is_empty() {
-            break;
-        }
-        std::thread::yield_now();
-    }
-    assert!(!service_a.listen_addrs().is_empty());
-    assert!(!service_b.listen_addrs().is_empty());
-
-    service_a
-        .dial(service_b.listen_addrs()[0].clone())
-        .expect("dial peer");
-
-    let peer_a = service_a.local_peer_id();
-    let peer_b = service_b.local_peer_id();
-    let mut a_connected = false;
-    let mut b_connected = false;
-    for _ in 0..4_096 {
-        let tick_a = pump_once(&mut service_a, &mut node_a);
-        let tick_b = pump_once(&mut service_b, &mut node_b);
-        if matches!(
-            tick_a.as_ref(),
-            Some(NetworkBridgeTick::Connected { peer, .. }) if *peer == peer_b
-        ) {
-            a_connected = true;
-        }
-        if matches!(
-            tick_b.as_ref(),
-            Some(NetworkBridgeTick::Connected { peer, .. }) if *peer == peer_a
-        ) {
-            b_connected = true;
-        }
-        if a_connected && b_connected {
-            break;
-        }
-        std::thread::yield_now();
-    }
-    assert!(a_connected && b_connected);
+    connect_services(&mut service_a, &mut node_a, &mut service_b, &mut node_b);
 
     let policy_hash = node_a
         .policy_registry()
@@ -484,8 +443,9 @@ pub fn two_nodes_sync_global_event_over_libp2p() {
         "local event should auto-publish over bridge helper"
     );
 
-    let mut synced = false;
-    for _ in 0..4_096 {
+    let mut last_tick_a = None;
+    let mut last_tick_b = None;
+    let synced = wait_until(scaled_timeout(Duration::from_secs(10)), || {
         let tick_a = pump_once(&mut service_a, &mut node_a);
         let tick_b = pump_once(&mut service_b, &mut node_b);
         if let Some(NetworkBridgeTick::BackfillFailed { error, .. }) = tick_a.as_ref() {
@@ -499,12 +459,18 @@ pub fn two_nodes_sync_global_event_over_libp2p() {
             .expect("task view")
             .is_some()
         {
-            synced = true;
-            break;
+            return true;
         }
-        std::thread::yield_now();
-    }
-    assert!(synced);
+        last_tick_a = tick_a;
+        last_tick_b = tick_b;
+        false
+    });
+    let node_b_events = node_b.store.load_all_events().expect("load node b events");
+    assert!(
+        synced,
+        "node B should ingest the task over iroh gossip; node_b_events={} last_tick_a={last_tick_a:?} last_tick_b={last_tick_b:?}",
+        node_b_events.len()
+    );
 
     let task = node_b
         .task_view("task-network-gossip")
@@ -529,7 +495,7 @@ pub fn two_nodes_execute_peer_relationship_request_and_accept_over_network() {
         &test_protocol_params(),
         NetworkP2pConfig {
             listen_addrs: vec!["/ip4/127.0.0.1/tcp/0".to_owned()],
-            enable_mdns: false,
+            enable_local_discovery: false,
             ..NetworkP2pConfig::default()
         },
         &dir_a,
@@ -539,7 +505,7 @@ pub fn two_nodes_execute_peer_relationship_request_and_accept_over_network() {
         &test_protocol_params(),
         NetworkP2pConfig {
             listen_addrs: vec!["/ip4/127.0.0.1/tcp/0".to_owned()],
-            enable_mdns: false,
+            enable_local_discovery: false,
             ..NetworkP2pConfig::default()
         },
         &dir_b,
@@ -561,17 +527,21 @@ pub fn two_nodes_execute_peer_relationship_request_and_accept_over_network() {
         .send_peer_relationship_action(&remote_b, PeerRelationshipAction::Request, None)
         .expect("send relationship request");
 
+    let mut last_tick_a = None;
+    let mut last_tick_b = None;
     let request_synced = wait_until(scaled_timeout(Duration::from_secs(10)), || {
         for _ in 0..32 {
-            let _ = pump_once(&mut service_a, &mut node_a);
-            let _ = pump_once(&mut service_b, &mut node_b);
+            last_tick_a = pump_once(&mut service_a, &mut node_a);
+            last_tick_b = pump_once(&mut service_b, &mut node_b);
         }
         relationship_state_for(&dir_a, &remote_b) == Some(PeerRelationshipState::Requested)
             && relationship_state_for(&dir_b, &remote_a) == Some(PeerRelationshipState::Requested)
     });
     assert!(
         request_synced,
-        "relationship request should sync to both peers"
+        "relationship request should sync to both peers; a={:?} b={:?} last_tick_a={last_tick_a:?} last_tick_b={last_tick_b:?}",
+        relationship_state_for(&dir_a, &remote_b),
+        relationship_state_for(&dir_b, &remote_a)
     );
 
     service_b
@@ -605,7 +575,7 @@ pub fn two_nodes_execute_peer_relationship_request_and_block_over_network() {
         &test_protocol_params(),
         NetworkP2pConfig {
             listen_addrs: vec!["/ip4/127.0.0.1/tcp/0".to_owned()],
-            enable_mdns: false,
+            enable_local_discovery: false,
             ..NetworkP2pConfig::default()
         },
         &dir_a,
@@ -615,7 +585,7 @@ pub fn two_nodes_execute_peer_relationship_request_and_block_over_network() {
         &test_protocol_params(),
         NetworkP2pConfig {
             listen_addrs: vec!["/ip4/127.0.0.1/tcp/0".to_owned()],
-            enable_mdns: false,
+            enable_local_discovery: false,
             ..NetworkP2pConfig::default()
         },
         &dir_b,
@@ -681,7 +651,7 @@ pub fn two_nodes_establish_dm_session_and_exchange_messages_over_network() {
         &test_protocol_params(),
         NetworkP2pConfig {
             listen_addrs: vec!["/ip4/127.0.0.1/tcp/0".to_owned()],
-            enable_mdns: false,
+            enable_local_discovery: false,
             ..NetworkP2pConfig::default()
         },
         &dir_a,
@@ -691,7 +661,7 @@ pub fn two_nodes_establish_dm_session_and_exchange_messages_over_network() {
         &test_protocol_params(),
         NetworkP2pConfig {
             listen_addrs: vec!["/ip4/127.0.0.1/tcp/0".to_owned()],
-            enable_mdns: false,
+            enable_local_discovery: false,
             ..NetworkP2pConfig::default()
         },
         &dir_b,
@@ -924,7 +894,7 @@ pub fn two_nodes_establish_dm_session_and_exchange_messages_over_network() {
         "receiver should persist one latest dm data-plane status row"
     );
     assert!(
-        sender_statuses[0].route == "libp2p_control"
+        sender_statuses[0].route == "iroh_control"
             && sender_statuses[0].status == "control_acknowledged",
         "sender should persist the final dm control-plane acknowledgement status"
     );
@@ -972,7 +942,7 @@ pub fn two_nodes_sync_topic_message_content_over_iroh() {
         &test_protocol_params(),
         NetworkP2pConfig {
             listen_addrs: vec!["/ip4/127.0.0.1/tcp/0".to_owned()],
-            enable_mdns: false,
+            enable_local_discovery: false,
             ..NetworkP2pConfig::default()
         },
         &dir_a,
@@ -982,7 +952,7 @@ pub fn two_nodes_sync_topic_message_content_over_iroh() {
         &test_protocol_params(),
         NetworkP2pConfig {
             listen_addrs: vec!["/ip4/127.0.0.1/tcp/0".to_owned()],
-            enable_mdns: false,
+            enable_local_discovery: false,
             ..NetworkP2pConfig::default()
         },
         &dir_b,
@@ -1151,53 +1121,6 @@ pub fn two_nodes_backfill_missing_events_over_request_response() {
     let mut service_a = make_service();
     let mut service_b = make_service();
 
-    for _ in 0..4_096 {
-        let tick_a = pump_once(&mut service_a, &mut node_a);
-        let tick_b = pump_once(&mut service_b, &mut node_b);
-        if let Some(NetworkBridgeTick::BackfillFailed { error, .. }) = tick_a.as_ref() {
-            panic!("backfill failed on service A: {error}");
-        }
-        if let Some(NetworkBridgeTick::BackfillFailed { error, .. }) = tick_b.as_ref() {
-            panic!("backfill failed on service B: {error}");
-        }
-        if !service_a.listen_addrs().is_empty() && !service_b.listen_addrs().is_empty() {
-            break;
-        }
-        std::thread::yield_now();
-    }
-    assert!(!service_a.listen_addrs().is_empty());
-    assert!(!service_b.listen_addrs().is_empty());
-
-    service_b
-        .dial(service_a.listen_addrs()[0].clone())
-        .expect("dial peer");
-
-    let peer_a = service_a.local_peer_id();
-    let peer_b = service_b.local_peer_id();
-    let mut a_connected = false;
-    let mut b_connected = false;
-    for _ in 0..4_096 {
-        let tick_a = pump_once(&mut service_a, &mut node_a);
-        let tick_b = pump_once(&mut service_b, &mut node_b);
-        if matches!(
-            tick_a.as_ref(),
-            Some(NetworkBridgeTick::Connected { peer, .. }) if *peer == peer_b
-        ) {
-            a_connected = true;
-        }
-        if matches!(
-            tick_b.as_ref(),
-            Some(NetworkBridgeTick::Connected { peer, .. }) if *peer == peer_a
-        ) {
-            b_connected = true;
-        }
-        if a_connected && b_connected {
-            break;
-        }
-        std::thread::yield_now();
-    }
-    assert!(a_connected && b_connected);
-
     let policy_hash = node_a
         .policy_registry()
         .binding_for("vp.schema_only.v1", json!({}))
@@ -1207,8 +1130,9 @@ pub fn two_nodes_backfill_missing_events_over_request_response() {
     contract.inputs = json!({"prompt":"recover me via backfill"});
     node_a.submit_task(contract, 1, 100).expect("submit task");
 
-    let mut synced = false;
-    for _ in 0..4_096 {
+    connect_services(&mut service_b, &mut node_b, &mut service_a, &mut node_a);
+
+    let synced = wait_until(scaled_timeout(Duration::from_secs(10)), || {
         let tick_a = pump_once(&mut service_a, &mut node_a);
         let tick_b = pump_once(&mut service_b, &mut node_b);
         if let Some(NetworkBridgeTick::BackfillFailed { error, .. }) = tick_a.as_ref() {
@@ -1222,11 +1146,10 @@ pub fn two_nodes_backfill_missing_events_over_request_response() {
             .expect("task view")
             .is_some()
         {
-            synced = true;
-            break;
+            return true;
         }
-        std::thread::yield_now();
-    }
+        false
+    });
     assert!(synced);
 
     let task = node_b
@@ -1261,51 +1184,45 @@ pub fn discovered_peer_endpoint_helper_dials_and_syncs_over_lan_state() {
     assert!(!service_a.listen_addrs().is_empty());
     assert!(!service_b.listen_addrs().is_empty());
 
+    let service_a_peer_id = service_a.local_peer_id().to_string();
+    let service_b_peer_id = service_b.local_peer_id().to_string();
     add_discovered_peer_endpoint(
         &dir_a,
-        &node_b.node_id(),
+        &service_b_peer_id,
         Some(&service_b.listen_addrs()[0].to_string()),
     )
     .expect("record node b endpoint");
     add_discovered_peer_endpoint(
         &dir_b,
-        &node_a.node_id(),
+        &service_a_peer_id,
         Some(&service_a.listen_addrs()[0].to_string()),
     )
     .expect("record node a endpoint");
 
     let mut attempts_a = HashMap::new();
     assert_eq!(
-        dial_discovered_peer_endpoints(&mut service_a, &dir_a, &node_a.node_id(), &mut attempts_a)
-            .expect("dial discovered peers a"),
+        dial_discovered_peer_endpoints(
+            &mut service_a,
+            &dir_a,
+            &service_a_peer_id,
+            &mut attempts_a,
+        )
+        .expect("dial discovered peers a"),
+        1
+    );
+    let mut attempts_b = HashMap::new();
+    assert_eq!(
+        dial_discovered_peer_endpoints(
+            &mut service_b,
+            &dir_b,
+            &service_b_peer_id,
+            &mut attempts_b,
+        )
+        .expect("dial discovered peers b"),
         1
     );
 
-    let peer_a = service_a.local_peer_id();
-    let peer_b = service_b.local_peer_id();
-    let mut a_connected = false;
-    let mut b_connected = false;
-    for _ in 0..4_096 {
-        let tick_a = pump_once(&mut service_a, &mut node_a);
-        let tick_b = pump_once(&mut service_b, &mut node_b);
-        if matches!(
-            tick_a.as_ref(),
-            Some(NetworkBridgeTick::Connected { peer, .. }) if *peer == peer_b
-        ) {
-            a_connected = true;
-        }
-        if matches!(
-            tick_b.as_ref(),
-            Some(NetworkBridgeTick::Connected { peer, .. }) if *peer == peer_a
-        ) {
-            b_connected = true;
-        }
-        if a_connected && b_connected {
-            break;
-        }
-        std::thread::yield_now();
-    }
-    assert!(a_connected && b_connected);
+    connect_services(&mut service_b, &mut node_b, &mut service_a, &mut node_a);
 
     let policy_hash = node_a
         .policy_registry()
@@ -1318,16 +1235,18 @@ pub fn discovered_peer_endpoint_helper_dials_and_syncs_over_lan_state() {
 
     let mut last_published_seq = 0;
     let mut synced = false;
+    let mut last_tick_a = None;
+    let mut last_tick_b = None;
     for _ in 0..4_096 {
-        let _ = publish_pending_global_events(
+        last_published_seq = publish_pending_global_events(
             &mut service_a,
             &node_a,
             &node_a.node_id(),
             last_published_seq,
         )
-        .map(|seq| last_published_seq = seq);
-        let _ = pump_once(&mut service_a, &mut node_a);
-        let _ = pump_once(&mut service_b, &mut node_b);
+        .expect("publish discovered peer event");
+        last_tick_a = pump_once(&mut service_a, &mut node_a);
+        last_tick_b = pump_once(&mut service_b, &mut node_b);
         if node_b
             .task_view("task-network-lan")
             .expect("task view")
@@ -1343,7 +1262,12 @@ pub fn discovered_peer_endpoint_helper_dials_and_syncs_over_lan_state() {
     cleanup_dir(&dir_b);
     assert!(
         synced,
-        "discovered peer endpoint dialing should sync local event"
+        "discovered peer endpoint dialing should sync local event; last_published_seq={last_published_seq} node_b_events={} last_tick_a={last_tick_a:?} last_tick_b={last_tick_b:?}",
+        node_b
+            .store
+            .load_all_events()
+            .expect("load node b events")
+            .len()
     );
 }
 
@@ -1561,26 +1485,8 @@ pub fn subnet_nodes_sync_and_mainnet_overlay_stays_isolated() {
     connect_services(&mut subnet_a, &mut node_a, &mut subnet_b, &mut node_b);
     wait_for_listen_addrs(&mut mainnet_c, &mut node_c);
     subnet_a
-        .dial(mainnet_c.listen_addrs()[0].clone())
+        .dial(iroh_peer_addr(&mainnet_c))
         .expect("dial mainnet overlay");
-
-    let handshake_rejected = wait_until(scaled_timeout(Duration::from_secs(5)), || {
-        let tick_a = pump_once(&mut subnet_a, &mut node_a);
-        let tick_c = pump_once(&mut mainnet_c, &mut node_c);
-        matches!(
-            tick_a.as_ref(),
-            Some(NetworkBridgeTick::TransportNotice { detail })
-                if detail.contains("peer_handshake_rejected")
-        ) || matches!(
-            tick_c.as_ref(),
-            Some(NetworkBridgeTick::TransportNotice { detail })
-                if detail.contains("peer_handshake_rejected")
-        )
-    });
-    assert!(
-        handshake_rejected,
-        "mainnet overlay should reject subnet handshake"
-    );
 
     let policy_hash = node_a
         .policy_registry()
@@ -1897,7 +1803,7 @@ pub fn anti_entropy_syncs_missed_event_without_live_publish() {
         &[bootstrap_peer],
     );
 
-    wait_for_connected_pair(&mut service_a, &mut node_a, &mut service_b, &mut node_b);
+    connect_services(&mut service_b, &mut node_b, &mut service_a, &mut node_a);
 
     let policy_hash = node_a
         .policy_registry()
@@ -1947,7 +1853,7 @@ pub fn anti_entropy_uses_scope_specific_cursor_for_recovery() {
     let mut service_b =
         make_bootstrap_service_with_params(&scopes, &test_protocol_params(), &[bootstrap_peer]);
 
-    wait_for_connected_pair(&mut service_a, &mut node_a, &mut service_b, &mut node_b);
+    connect_services(&mut service_b, &mut node_b, &mut service_a, &mut node_a);
 
     let policy_hash = node_a
         .policy_registry()
@@ -2008,7 +1914,7 @@ pub fn reconnect_recovers_missing_events_after_partition_like_disconnect() {
         &[bootstrap_peer.clone()],
     );
 
-    wait_for_connected_pair(&mut service_a, &mut node_a, &mut service_b, &mut node_b);
+    connect_services(&mut service_b, &mut node_b, &mut service_a, &mut node_a);
 
     let policy_hash = node_a
         .policy_registry()
@@ -2048,7 +1954,7 @@ pub fn reconnect_recovers_missing_events_after_partition_like_disconnect() {
             .is_some()
     );
 
-    // Drain inflight messages before disconnect to avoid libp2p
+    // Drain inflight messages before disconnect to avoid iroh
     // request-response debug assertion on stale connection state.
     pump_services_for(
         &mut service_a,

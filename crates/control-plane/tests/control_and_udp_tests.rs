@@ -40,7 +40,7 @@ use wattswarm_control_plane::types::{
 use wattswarm_control_plane::udp_announce::{announce_startup, maybe_start_listener};
 use wattswarm_network_transport_core::{TransferIntent, TransferKind, TransportRoute};
 use wattswarm_network_transport_iroh::{
-    export_local_contact_material, shutdown_local_iroh_data_plane,
+    export_local_contact_material_for_network_peer_id, shutdown_local_iroh_data_plane,
 };
 
 static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -93,7 +93,51 @@ fn candidate_output_ref(
     }
 }
 
-fn save_iroh_peer_metadata(state_dir: &Path, node_id: &str, peer_id: &str, updated_at: u64) {
+fn test_iroh_endpoint_id(seed: u8) -> String {
+    wattswarm_control_plane::network_p2p::network_peer_id_from_ed25519_public_key(
+        NodeIdentity::from_seed([seed; 32])
+            .verifying_key()
+            .to_bytes(),
+    )
+    .expect("valid test iroh endpoint id")
+    .to_string()
+}
+
+fn test_iroh_contact_material(
+    endpoint_id: &str,
+    generated_at: u64,
+    listen_addrs: &[&str],
+) -> serde_json::Value {
+    json!({
+        "peer_id": endpoint_id,
+        "transports": [{
+            "transport": "iroh_direct",
+            "peer_id": endpoint_id,
+            "metadata": {
+                "route": "iroh_direct",
+                "generated_at": generated_at,
+                "endpoint_id": endpoint_id,
+                "alpn": "/wattswarm/iroh/1",
+                "listen_addrs": listen_addrs,
+                "capabilities": {
+                    "supports_iroh_direct": true,
+                    "supports_streaming": true,
+                    "max_recommended_inline_bytes": 16384,
+                    "preferred_data_route": "iroh_direct"
+                }
+            },
+            "extra": {
+                "endpoint_id": endpoint_id,
+                "alpn": "/wattswarm/iroh/1",
+                "direct_addrs": listen_addrs,
+                "relay_urls": []
+            }
+        }]
+    })
+}
+
+fn save_iroh_peer_metadata(state_dir: &Path, node_id: &str, updated_at: u64) {
+    let peer_id = test_iroh_endpoint_id(updated_at as u8);
     save_peer_metadata_record_state(
         state_dir,
         &PeerMetadataRecord {
@@ -104,35 +148,16 @@ fn save_iroh_peer_metadata(state_dir: &Path, node_id: &str, peer_id: &str, updat
             agent_version_raw: Some("wattswarm-network-p2p|wan|7|params-iroh".to_owned()),
             agent_version_prefix: Some("wattswarm-network-p2p".to_owned()),
             protocol_version: Some("wattswarm/1.0.0".to_owned()),
-            observed_addr: Some(format!("/p2p/{peer_id}")),
-            listen_addrs: vec![format!("/p2p/{peer_id}")],
+            observed_addr: Some(format!("{peer_id}@127.0.0.1:4001")),
+            listen_addrs: vec!["127.0.0.1:4001".to_owned()],
             protocols: vec![],
             handshake_status: "contact_material".to_owned(),
             last_error: None,
-            contact_material: Some(json!({
-                "peer_id": peer_id,
-                "transports": [{
-                    "transport": "iroh_direct",
-                    "peer_id": peer_id,
-                    "metadata": {
-                        "route": "iroh_direct",
-                        "generated_at": updated_at,
-                        "endpoint_id": format!("endpoint-{node_id}"),
-                        "alpn": "/wattswarm/iroh/1",
-                        "listen_addrs": [format!("/p2p/{peer_id}")],
-                        "capabilities": {
-                            "supports_iroh_direct": true,
-                            "supports_streaming": true,
-                            "max_recommended_inline_bytes": 16384,
-                            "preferred_data_route": "iroh_direct"
-                        }
-                    },
-                    "extra": {
-                        "endpoint_id": format!("endpoint-{node_id}"),
-                        "alpn": "/wattswarm/iroh/1"
-                    }
-                }]
-            })),
+            contact_material: Some(test_iroh_contact_material(
+                &peer_id,
+                updated_at,
+                &["127.0.0.1:4001"],
+            )),
             contact_material_signature: Some(format!("sig-{node_id}")),
             contact_material_updated_at: Some(updated_at),
             first_identified_at: updated_at,
@@ -149,9 +174,12 @@ fn save_real_iroh_peer_metadata(
     updated_at: u64,
 ) {
     let remote_peer_id = local_peer_id(remote_state_dir).expect("remote peer id");
-    let remote_peer_id = remote_peer_id.parse().expect("parse remote peer id");
-    let transport = export_local_contact_material(remote_state_dir, &remote_peer_id, updated_at)
-        .expect("export remote iroh contact material");
+    let transport = export_local_contact_material_for_network_peer_id(
+        remote_state_dir,
+        &remote_peer_id,
+        updated_at,
+    )
+    .expect("export remote iroh contact material");
     save_peer_metadata_record_state(
         state_dir,
         &PeerMetadataRecord {
@@ -162,7 +190,7 @@ fn save_real_iroh_peer_metadata(
             agent_version_raw: Some("wattswarm-network-p2p|wan|7|params-iroh".to_owned()),
             agent_version_prefix: Some("wattswarm-network-p2p".to_owned()),
             protocol_version: Some("wattswarm/1.0.0".to_owned()),
-            observed_addr: Some(format!("/p2p/{}", transport.peer_id)),
+            observed_addr: transport.metadata.listen_addrs.first().cloned(),
             listen_addrs: transport.metadata.listen_addrs.clone(),
             protocols: vec![],
             handshake_status: "contact_material".to_owned(),
@@ -372,7 +400,7 @@ impl BootstrapBundleStub {
     }
 
     fn bootstrap_peer_addr(&self, peer_id: &str) -> String {
-        format!("/ip4/127.0.0.1/tcp/{}/p2p/{peer_id}", self.addr.port())
+        format!("{peer_id}@127.0.0.1:{}", self.addr.port())
     }
 }
 
@@ -737,9 +765,10 @@ fn network_directory_snapshot_lists_networks_feeds_domains_and_sync_endpoints() 
     let schema = format!("test_{}", Uuid::new_v4().simple());
     reset_test_schema(&schema);
     let _schema_guard = EnvVarGuard::set("WATTSWARM_PG_SCHEMA", &schema);
+    let bootstrap_peer = test_iroh_endpoint_id(101);
     let _bootstrap_guard = EnvVarGuard::set(
         "WATTSWARM_P2P_BOOTSTRAP_PEERS",
-        "/ip4/127.0.0.1/tcp/4001/p2p/12D3KooWJ5r1D8N8QYp8JDs7u9mM4rY2kQ6xXK7Z6A6V4t7N3sQX",
+        &format!("{bootstrap_peer}@127.0.0.1:4001"),
     );
     let dir = temp_test_dir("network-directory-snapshot");
     let state_dir = dir.join("state");
@@ -747,12 +776,9 @@ fn network_directory_snapshot_lists_networks_feeds_domains_and_sync_endpoints() 
     let db_path = state_dir.join("test.state");
 
     let node = open_node(&state_dir, &db_path).expect("open node");
-    add_discovered_peer_endpoint(
-        &state_dir,
-        "peer-udp",
-        Some("/ip4/127.0.0.1/tcp/4999/p2p/12D3KooWJ5r1D8N8QYp8JDs7u9mM4rY2kQ6xXK7Z6A6V4t7N3sQX"),
-    )
-    .expect("save discovered peer");
+    let udp_endpoint = test_iroh_endpoint_id(102);
+    add_discovered_peer_endpoint(&state_dir, "peer-udp", Some("127.0.0.1:4999"))
+        .expect("save discovered peer");
     save_peer_metadata_record_state(
         &state_dir,
         &PeerMetadataRecord {
@@ -763,38 +789,16 @@ fn network_directory_snapshot_lists_networks_feeds_domains_and_sync_endpoints() 
             agent_version_raw: Some("wattswarm-network-p2p|local|1|params-local".to_owned()),
             agent_version_prefix: Some("wattswarm-network-p2p".to_owned()),
             protocol_version: Some("wattswarm/1.0.0".to_owned()),
-            observed_addr: Some(
-                "/ip4/127.0.0.1/tcp/4999/p2p/12D3KooWJ5r1D8N8QYp8JDs7u9mM4rY2kQ6xXK7Z6A6V4t7N3sQX"
-                    .to_owned(),
-            ),
-            listen_addrs: vec!["/ip4/127.0.0.1/tcp/4999/p2p/12D3KooWJ5r1D8N8QYp8JDs7u9mM4rY2kQ6xXK7Z6A6V4t7N3sQX".to_owned()],
+            observed_addr: Some("127.0.0.1:4999".to_owned()),
+            listen_addrs: vec!["127.0.0.1:4999".to_owned()],
             protocols: vec![],
             handshake_status: "contact_material".to_owned(),
             last_error: None,
-            contact_material: Some(json!({
-                "peer_id": "12D3KooWJ5r1D8N8QYp8JDs7u9mM4rY2kQ6xXK7Z6A6V4t7N3sQX",
-                "transports": [{
-                    "transport": "iroh_direct",
-                    "peer_id": "12D3KooWJ5r1D8N8QYp8JDs7u9mM4rY2kQ6xXK7Z6A6V4t7N3sQX",
-                    "metadata": {
-                        "route": "iroh_direct",
-                        "generated_at": 42,
-                        "endpoint_id": "peer-udp-endpoint",
-                        "alpn": "/wattswarm/iroh/1",
-                        "listen_addrs": ["/p2p/12D3KooWJ5r1D8N8QYp8JDs7u9mM4rY2kQ6xXK7Z6A6V4t7N3sQX"],
-                        "capabilities": {
-                            "supports_iroh_direct": true,
-                            "supports_streaming": true,
-                            "max_recommended_inline_bytes": 16384,
-                            "preferred_data_route": "iroh_direct"
-                        }
-                    },
-                    "extra": {
-                        "endpoint_id": "peer-udp-endpoint",
-                        "alpn": "/wattswarm/iroh/1"
-                    }
-                }]
-            })),
+            contact_material: Some(test_iroh_contact_material(
+                &udp_endpoint,
+                42,
+                &["127.0.0.1:4999"],
+            )),
             contact_material_signature: Some("sig-peer-udp".to_owned()),
             contact_material_updated_at: Some(42),
             first_identified_at: 42,
@@ -909,6 +913,7 @@ fn recommended_transfer_route_uses_peer_contact_material_capabilities() {
     let dir = temp_test_dir("recommended-transfer-route");
     let state_dir = dir.join("state");
     fs::create_dir_all(&state_dir).expect("create state dir");
+    let iroh_endpoint = test_iroh_endpoint_id(103);
     save_peer_metadata_record_state(
         &state_dir,
         &PeerMetadataRecord {
@@ -924,27 +929,11 @@ fn recommended_transfer_route_uses_peer_contact_material_capabilities() {
             protocols: vec![],
             handshake_status: "contact_material".to_owned(),
             last_error: None,
-            contact_material: Some(json!({
-                "peer_id": "peer-iroh-id",
-                "transports": [{
-                    "transport": "iroh_direct",
-                    "peer_id": "peer-iroh-id",
-                    "metadata": {
-                        "route": "iroh_direct",
-                        "generated_at": 7,
-                        "endpoint_id": "endpoint-7",
-                        "alpn": "/wattswarm/iroh/1",
-                        "listen_addrs": [],
-                        "capabilities": {
-                            "supports_iroh_direct": true,
-                            "supports_streaming": true,
-                            "max_recommended_inline_bytes": 16384,
-                            "preferred_data_route": "iroh_direct"
-                        }
-                    },
-                    "extra": {}
-                }]
-            })),
+            contact_material: Some(test_iroh_contact_material(
+                &iroh_endpoint,
+                7,
+                &["127.0.0.1:4997"],
+            )),
             contact_material_signature: None,
             contact_material_updated_at: Some(7),
             first_identified_at: 7,
@@ -1401,10 +1390,11 @@ fn open_node_network_mode_auto_syncs_signed_bootstrap_bundle_from_remote() {
         bundle
     };
 
-    let remote_peer_id = wattswarm_control_plane::network_p2p::peer_id_from_ed25519_public_key(
-        remote_identity.verifying_key().to_bytes(),
-    )
-    .expect("derive remote peer id");
+    let remote_peer_id =
+        wattswarm_control_plane::network_p2p::network_peer_id_from_ed25519_public_key(
+            remote_identity.verifying_key().to_bytes(),
+        )
+        .expect("derive remote peer id");
     let bootstrap_stub = BootstrapBundleStub::start(bundle.clone());
     let _local_schema_guard = EnvVarGuard::set("WATTSWARM_PG_SCHEMA", &local_schema);
     let _mode_guard = EnvVarGuard::set("WATTSWARM_NODE_MODE", "network");
@@ -1830,7 +1820,7 @@ fn missing_task_and_evidence_artifacts_record_remote_source_route() {
     contract.inputs = json!({"prompt":"remote artifact"});
     node.submit_task(contract, 1, 39).expect("submit task");
 
-    save_iroh_peer_metadata(&state_dir, "node-remote", "12D3KooWRemoteSourceRoute", 40);
+    save_iroh_peer_metadata(&state_dir, "node-remote", 40);
 
     let detail_bytes = br#"{"detail":"remote"}"#;
     let detail_digest = format!("sha256:{}", sha256_hex(detail_bytes));
@@ -2076,7 +2066,7 @@ fn missing_checkpoint_and_snapshot_artifacts_use_saved_source_binding_for_route(
     let db_path = state_dir.join("test.state");
     let node = open_node(&state_dir, &db_path).expect("open node");
 
-    save_iroh_peer_metadata(&state_dir, "node-sync", "12D3KooWSyncSourceRoute", 50);
+    save_iroh_peer_metadata(&state_dir, "node-sync", 50);
     save_data_source_binding_record_state(
         &state_dir,
         &DataSourceBindingRecord {

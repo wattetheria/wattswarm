@@ -15,8 +15,8 @@ impl NetworkBridgeService {
             bail!("remote_node_id is required");
         }
         let peer = remote_node_id
-            .parse::<PeerId>()
-            .map_err(|err| anyhow!("parse remote_node_id as peer id: {err}"))?;
+            .parse::<NetworkNodeId>()
+            .map_err(|err| anyhow!("parse remote_node_id as iroh node id: {err}"))?;
         if !self.connected_peers.contains(&peer) {
             bail!("peer relationship actions require a connected peer");
         }
@@ -59,7 +59,6 @@ impl NetworkBridgeService {
                 relationship_record.updated_at,
             )?;
         }
-        let _guard = self.tokio_runtime.enter();
         let request_id = self.runtime.send_peer_relationship_request(
             &peer,
             PeerRelationshipRequest {
@@ -88,8 +87,8 @@ impl NetworkBridgeService {
             bail!("contact material requests require state_dir to be configured");
         };
         let peer = remote_node_id
-            .parse::<PeerId>()
-            .map_err(|err| anyhow!("parse remote_node_id as peer id: {err}"))?;
+            .parse::<NetworkNodeId>()
+            .map_err(|err| anyhow!("parse remote_node_id as iroh node id: {err}"))?;
         self.ensure_peer_connected(&state_dir, &peer, remote_node_id)?;
         if !self.connected_peers.contains(&peer) {
             bail!("contact material requests require a connected peer");
@@ -131,8 +130,8 @@ impl NetworkBridgeService {
             bail!("remote_node_id is required");
         }
         let peer = remote_node_id
-            .parse::<PeerId>()
-            .map_err(|err| anyhow!("parse remote_node_id as peer id: {err}"))?;
+            .parse::<NetworkNodeId>()
+            .map_err(|err| anyhow!("parse remote_node_id as iroh node id: {err}"))?;
         if !self.connected_peers.contains(&peer) {
             self.ensure_peer_connected(&state_dir, &peer, remote_node_id)?;
         }
@@ -187,7 +186,6 @@ impl NetworkBridgeService {
             "content_materialized",
             None,
         )?;
-        let _guard = self.tokio_runtime.enter();
         let request_id = self.runtime.send_peer_direct_message_request(
             &peer,
             PeerDirectMessageRequest {
@@ -207,7 +205,7 @@ impl NetworkBridgeService {
             "dm_message",
             &message_id,
             Some(remote_node_id),
-            "libp2p_control",
+            "iroh_control",
             "control_sent",
             None,
         )?;
@@ -243,7 +241,7 @@ impl NetworkBridgeService {
             "topic_message",
             &event.event_id,
             Some(remote_node_id),
-            "libp2p_control",
+            "iroh_control",
             "control_received",
             None,
         )?;
@@ -306,7 +304,7 @@ impl NetworkBridgeService {
             "candidate_output",
             &payload.candidate.candidate_id,
             Some(&payload.candidate.output_ref.producer),
-            "libp2p_control",
+            "iroh_control",
             "control_received",
             None,
         )?;
@@ -428,7 +426,7 @@ impl NetworkBridgeService {
     pub(crate) fn ensure_peer_connected(
         &mut self,
         state_dir: &Path,
-        peer: &PeerId,
+        peer: &NetworkNodeId,
         remote_node_id: &str,
     ) -> Result<()> {
         if self.connected_peers.contains(peer) {

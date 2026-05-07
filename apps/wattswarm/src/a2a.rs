@@ -204,7 +204,7 @@ impl InvocationAdapter for GoogleA2aAdapter {
                 "schemes": ["did_signature", "wallet_proof"],
             },
             "security": {
-                "transport": "libp2p_tunnel_or_https",
+                "transport": "iroh_tunnel_or_https",
                 "signing": "node_identity",
             },
             "skills": skills,

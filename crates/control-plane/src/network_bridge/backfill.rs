@@ -181,7 +181,11 @@ pub fn dial_discovered_peer_endpoints(
         let Some(raw_addr) = record.listen_addr.as_deref() else {
             continue;
         };
-        let addr = match raw_addr.parse::<Multiaddr>() {
+        let addr = match raw_addr.parse::<NetworkAddress>() {
+            Ok(addr) => addr,
+            Err(_) => continue,
+        };
+        let dial_addr = match NetworkAddress::new(format!("{}@{}", record.node_id, addr.as_str())) {
             Ok(addr) => addr,
             Err(_) => continue,
         };
@@ -192,7 +196,7 @@ pub fn dial_discovered_peer_endpoints(
             continue;
         }
         next_attempt_at.insert(raw_addr.to_owned(), now + DISCOVERY_DIAL_RETRY_AFTER);
-        match service.dial(addr) {
+        match service.dial(dial_addr) {
             Ok(()) => dialed += 1,
             Err(err)
                 if err
@@ -219,7 +223,7 @@ pub fn dial_bootstrap_peer_endpoints(
         {
             continue;
         }
-        let addr = match raw_addr.parse::<Multiaddr>() {
+        let addr = match raw_addr.parse::<NetworkAddress>() {
             Ok(addr) => addr,
             Err(_) => continue,
         };

@@ -16,6 +16,7 @@ fn ui_startup_config_roundtrips_network_settings_without_agent_binding() {
         .unwrap();
     runtime.block_on(async {
         let app = build_app(UiServerState::new(state_dir.clone(), db_path.clone()));
+        let lan_contact = "iroh-contact-a";
 
         let default_res = app
             .clone()
@@ -63,7 +64,7 @@ fn ui_startup_config_roundtrips_network_settings_without_agent_binding() {
                             "display_name": "Captain Aurora",
                             "network_mode": "lan",
                             "bootstrap_contacts": [
-                                "{\"transport\":\"iroh_direct\",\"peer_id\":\"node-lan\",\"metadata\":{\"route\":\"iroh_direct\",\"generated_at\":1,\"endpoint_id\":\"node-lan\",\"alpn\":\"/wattswarm/iroh/1\",\"listen_addrs\":[\"127.0.0.1:4001\"],\"capabilities\":{\"supports_iroh_direct\":true,\"supports_streaming\":true,\"max_recommended_inline_bytes\":16384,\"preferred_data_route\":\"iroh_direct\"}},\"extra\":{\"endpoint_id\":\"node-lan\",\"alpn\":\"/wattswarm/iroh/1\",\"direct_addrs\":[\"127.0.0.1:4001\"],\"relay_urls\":[]}}"
+                                lan_contact
                             ],
                             "gateway_urls": [
                                 " http://gateway.example.com:8080/ ",
@@ -99,7 +100,7 @@ fn ui_startup_config_roundtrips_network_settings_without_agent_binding() {
         );
         assert_eq!(
             get_saved_json["config"]["bootstrap_contacts"][0].as_str(),
-            Some("{\"transport\":\"iroh_direct\",\"peer_id\":\"node-lan\",\"metadata\":{\"route\":\"iroh_direct\",\"generated_at\":1,\"endpoint_id\":\"node-lan\",\"alpn\":\"/wattswarm/iroh/1\",\"listen_addrs\":[\"127.0.0.1:4001\"],\"capabilities\":{\"supports_iroh_direct\":true,\"supports_streaming\":true,\"max_recommended_inline_bytes\":16384,\"preferred_data_route\":\"iroh_direct\"}},\"extra\":{\"endpoint_id\":\"node-lan\",\"alpn\":\"/wattswarm/iroh/1\",\"direct_addrs\":[\"127.0.0.1:4001\"],\"relay_urls\":[]}}")
+            Some(lan_contact)
         );
         assert_eq!(
             get_saved_json["config"]["gateway_urls"][0].as_str(),

@@ -105,7 +105,7 @@ impl NetworkBridgeService {
             local_iroh_endpoint_id: runtime.local_iroh_endpoint_id,
             subscribed_iroh_gossip_topics: runtime.subscribed_iroh_gossip_topics,
             known_iroh_contacts: runtime.known_iroh_contacts,
-            legacy_libp2p_active: runtime.legacy_libp2p_active,
+            legacy_transport_active: runtime.legacy_transport_active,
             subscribed_scopes: self
                 .subscribed_scopes
                 .iter()
@@ -146,11 +146,10 @@ impl NetworkBridgeService {
 
     pub fn request_global_backfill(
         &mut self,
-        peer: &PeerId,
+        peer: &NetworkNodeId,
         from_event_seq: u64,
         limit: usize,
     ) -> Result<BackfillRequestId> {
-        let _guard = self.tokio_runtime.enter();
         self.runtime.send_backfill_request(
             peer,
             BackfillRequest {
@@ -168,21 +167,25 @@ impl NetworkBridgeService {
         self.handle_runtime_event(node, event)
     }
 
-    pub(crate) fn request_backfill_for_peer(&mut self, peer: &PeerId, node: &Node) -> Result<bool> {
+    pub(crate) fn request_backfill_for_peer(
+        &mut self,
+        peer: &NetworkNodeId,
+        node: &Node,
+    ) -> Result<bool> {
         let scopes = self.scopes_to_request_for_peer(peer);
         self.request_backfill_scopes_for_peer(peer, node, &scopes)
     }
 
     pub(crate) fn request_backfill_scopes_for_peer(
         &mut self,
-        peer: &PeerId,
+        peer: &NetworkNodeId,
         node: &Node,
         scopes: &[SwarmScope],
     ) -> Result<bool> {
         let now = Instant::now();
         let state = self
             .peer_sync_state
-            .entry(*peer)
+            .entry(peer.clone())
             .or_insert_with(|| PeerSyncState::new(now));
         if state.inflight_backfills >= MAX_INFLIGHT_BACKFILLS_PER_PEER || state.next_retry_at > now
         {
@@ -202,7 +205,7 @@ impl NetworkBridgeService {
             .as_ref()
             .map(|state_dir| recommended_backfill_route_for_peer(state_dir, peer))
             .transpose()?
-            .unwrap_or(DataTransportRoute::Libp2pControl);
+            .unwrap_or(DataTransportRoute::IrohControl);
         if let Some(state_dir) = &self.state_dir {
             append_jsonl(
                 state_dir,
@@ -221,7 +224,6 @@ impl NetworkBridgeService {
             let from_event_seq = state.backfill_cursor(&scope, None);
             let known_event_ids =
                 recent_backfill_lane_event_ids(node, &scope, None, BACKFILL_KNOWN_EVENT_IDS_LIMIT)?;
-            let _guard = self.tokio_runtime.enter();
             let _ = self.runtime.send_backfill_request(
                 peer,
                 BackfillRequest {
@@ -269,7 +271,7 @@ impl NetworkBridgeService {
         let mut requested = 0usize;
         let mut scopes = self.subscribed_scopes.clone();
         scopes.sort_by_key(|scope| matches!(scope, SwarmScope::Global));
-        let mut requests_by_peer: HashMap<PeerId, Vec<SwarmScope>> = HashMap::new();
+        let mut requests_by_peer: HashMap<NetworkNodeId, Vec<SwarmScope>> = HashMap::new();
         for scope in scopes {
             let Some(peer) = self.preferred_backfill_peer_for_scope(&scope, now) else {
                 continue;
@@ -284,7 +286,7 @@ impl NetworkBridgeService {
         Ok(requested)
     }
 
-    pub(crate) fn scopes_to_request_for_peer(&self, peer: &PeerId) -> Vec<SwarmScope> {
+    pub(crate) fn scopes_to_request_for_peer(&self, peer: &NetworkNodeId) -> Vec<SwarmScope> {
         let Some(state) = self.peer_sync_state.get(peer) else {
             return self.subscribed_scopes.clone();
         };
@@ -302,9 +304,9 @@ impl NetworkBridgeService {
         &self,
         scope: &SwarmScope,
         now: Instant,
-    ) -> Option<PeerId> {
-        let peers = self.connected_peers.iter().copied().collect::<Vec<_>>();
-        self.best_peer_for_scope(peers.iter().copied(), scope, now, true)
+    ) -> Option<NetworkNodeId> {
+        let peers = self.connected_peers.iter().cloned().collect::<Vec<_>>();
+        self.best_peer_for_scope(peers.iter().cloned(), scope, now, true)
             .or_else(|| self.best_peer_for_scope(peers.into_iter(), scope, now, false))
     }
 
@@ -314,9 +316,9 @@ impl NetworkBridgeService {
         scope: &SwarmScope,
         now: Instant,
         require_known_scope: bool,
-    ) -> Option<PeerId>
+    ) -> Option<NetworkNodeId>
     where
-        I: Iterator<Item = PeerId>,
+        I: Iterator<Item = NetworkNodeId>,
     {
         let runtime = self.runtime.observability_snapshot();
         let peer_scores = runtime
@@ -362,7 +364,7 @@ impl NetworkBridgeService {
 
     pub(crate) fn peer_is_eligible_for_scope(
         &self,
-        peer: &PeerId,
+        peer: &NetworkNodeId,
         scope: &SwarmScope,
         now: Instant,
         require_known_scope: bool,
@@ -385,7 +387,7 @@ impl NetworkBridgeService {
         }
     }
 
-    pub(crate) fn record_peer_scope_activity(&mut self, peer: PeerId, scope: &SwarmScope) {
+    pub(crate) fn record_peer_scope_activity(&mut self, peer: NetworkNodeId, scope: &SwarmScope) {
         self.peer_sync_state
             .entry(peer)
             .or_insert_with(|| PeerSyncState::new(Instant::now()))
@@ -424,15 +426,16 @@ impl NetworkBridgeService {
         stats.backfill_events_applied += events as u64;
     }
 
-    pub(crate) fn mark_peer_connected(&mut self, peer: PeerId) {
-        self.connected_peers.insert(peer);
+    pub(crate) fn mark_peer_connected(&mut self, peer: NetworkNodeId) -> bool {
+        let inserted = self.connected_peers.insert(peer.clone());
         self.peer_sync_state
             .entry(peer)
             .or_insert_with(|| PeerSyncState::new(Instant::now()));
         self.persist_peer_sync_state();
+        inserted
     }
 
-    pub(crate) fn mark_peer_disconnected(&mut self, peer: PeerId) {
+    pub(crate) fn mark_peer_disconnected(&mut self, peer: NetworkNodeId) {
         self.connected_peers.remove(&peer);
         if let Some(state) = self.peer_sync_state.get_mut(&peer) {
             state.inflight_backfills = 0;
@@ -444,7 +447,7 @@ impl NetworkBridgeService {
         self.persist_peer_sync_state();
     }
 
-    pub(crate) fn mark_backfill_completed(&mut self, peer: PeerId) {
+    pub(crate) fn mark_backfill_completed(&mut self, peer: NetworkNodeId) {
         if let Some(state) = self.peer_sync_state.get_mut(&peer) {
             state.inflight_backfills = state.inflight_backfills.saturating_sub(1);
             state.next_retry_at = Instant::now() + self.anti_entropy_interval;
@@ -455,7 +458,7 @@ impl NetworkBridgeService {
 
     pub(crate) fn record_peer_remote_head_event_ids(
         &mut self,
-        peer: PeerId,
+        peer: NetworkNodeId,
         scope: &SwarmScope,
         feed_key: Option<&str>,
         head_event_ids: &[String],
@@ -469,7 +472,7 @@ impl NetworkBridgeService {
 
     pub(crate) fn record_peer_backfill_cursor(
         &mut self,
-        peer: PeerId,
+        peer: NetworkNodeId,
         scope: &SwarmScope,
         feed_key: Option<&str>,
         next_from_event_seq: u64,
@@ -483,7 +486,7 @@ impl NetworkBridgeService {
 
     pub(crate) fn reset_peer_backfill_cursor(
         &mut self,
-        peer: PeerId,
+        peer: NetworkNodeId,
         scope: &SwarmScope,
         feed_key: Option<&str>,
     ) {
@@ -494,7 +497,7 @@ impl NetworkBridgeService {
         self.persist_peer_sync_state();
     }
 
-    pub(crate) fn mark_backfill_failed(&mut self, peer: PeerId) {
+    pub(crate) fn mark_backfill_failed(&mut self, peer: NetworkNodeId) {
         if let Some(state) = self.peer_sync_state.get_mut(&peer) {
             state.inflight_backfills = state.inflight_backfills.saturating_sub(1);
             state.next_retry_at = Instant::now() + self.backfill_retry_after;
@@ -504,10 +507,7 @@ impl NetworkBridgeService {
     }
 
     pub fn try_tick(&mut self, node: &mut Node) -> Result<Option<NetworkBridgeTick>> {
-        let event = {
-            let _guard = self.tokio_runtime.enter();
-            self.runtime.try_next_event()?
-        };
+        let event = self.runtime.try_next_event()?;
         let Some(event) = event else {
             return Ok(None);
         };

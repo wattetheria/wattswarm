@@ -1,68 +1,157 @@
-use anyhow::{Result, anyhow, bail};
-use libp2p::connection_limits;
-use libp2p::futures::{FutureExt, StreamExt};
-use libp2p::gossipsub::{
-    Behaviour as Gossipsub, ConfigBuilder as GossipsubConfigBuilder, Event as GossipsubEvent,
-};
-use libp2p::gossipsub::{IdentTopic, MessageAuthenticity, ValidationMode};
-use libp2p::identify;
-use libp2p::kad::{self, store::MemoryStore};
-use libp2p::mdns;
-use libp2p::multiaddr::Protocol;
-use libp2p::request_response::{self, Message as RequestResponseMessage, ProtocolSupport};
-use libp2p::swarm::{NetworkBehaviour, SwarmEvent, behaviour::toggle::Toggle};
-pub use libp2p::{Multiaddr, PeerId};
-use libp2p::{
-    StreamProtocol, Swarm, SwarmBuilder, autonat, dcutr, identity, noise, relay, tcp, yamux,
-};
+use anyhow::{Context, Result, anyhow, bail};
+use iroh::EndpointId;
+use iroh_gossip::api::{Event as IrohGossipEvent, GossipSender};
+use n0_future::StreamExt;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet, VecDeque};
-use std::hash::{DefaultHasher, Hash, Hasher};
-use std::time::{Duration, Instant};
+use std::{
+    collections::{HashMap, HashSet, VecDeque},
+    fmt,
+    future::Future,
+    path::{Path, PathBuf},
+    str::FromStr,
+    sync::mpsc::{self, Receiver, Sender},
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
+use tokio::runtime::{Runtime, RuntimeFlavor};
+use wattswarm_network_transport_core::{
+    PeerTransportCapabilities, TransportContactMaterial, TransportMetadata, TransportRoute,
+};
+use wattswarm_network_transport_iroh::{
+    DEFAULT_IROH_CONTROL_ALPN, IrohControlStreamRequest, IrohControlStreamResponse,
+    derive_gossip_topic_id, export_local_contact_material_for_network_peer_id,
+    install_local_contact_material_control_handler_for_network_peer_id,
+    local_endpoint_id_from_state_dir, local_gossip_for_network_peer_id,
+    register_remote_contact_material_for_network_peer_id,
+    send_control_stream_request_for_network_peer_id,
+    set_local_control_stream_handler_for_network_peer_id, shutdown_local_iroh_data_plane,
+};
 use wattswarm_protocol::types::ArtifactRef;
 
 const DEFAULT_NAMESPACE: &str = "wattswarm";
-const DEFAULT_PROTOCOL_VERSION: &str = "/wattswarm/0.1.0";
 const DEFAULT_IDENTIFY_AGENT_NAME: &str = "wattswarm-network-substrate";
-const DEFAULT_MAX_BACKFILL_EVENTS_FALLBACK: usize = 512;
-const MAX_BACKFILL_EVENTS_HARD_LIMIT_FALLBACK: usize = 8_192;
-const BACKFILL_PROTOCOL: StreamProtocol = StreamProtocol::new("/wattswarm/backfill/1");
-const KADEMLIA_PROTOCOL: StreamProtocol = StreamProtocol::new("/wattswarm/kad/1");
-
-const MAX_ESTABLISHED_INCOMING: u32 = 512;
-const MAX_ESTABLISHED_OUTGOING: u32 = 256;
-const MAX_ESTABLISHED_PER_PEER_FALLBACK: u32 = 2;
-const MAX_PENDING_INCOMING: u32 = 64;
-const MAX_PENDING_OUTGOING: u32 = 64;
-
-const GOSSIPSUB_D_FALLBACK: usize = 6;
-const GOSSIPSUB_D_LOW_FALLBACK: usize = 4;
-const GOSSIPSUB_D_HIGH_FALLBACK: usize = 12;
-const GOSSIPSUB_HEARTBEAT_MS_FALLBACK: u64 = 1_000;
-const GOSSIPSUB_MAX_TRANSMIT_SIZE_FALLBACK: usize = 512 * 1024;
-const TRAFFIC_WINDOW: Duration = Duration::from_secs(60);
-const TRAFFIC_DEDUPE_TTL: Duration = Duration::from_secs(120);
-const PER_PEER_MSGS_PER_WINDOW: usize = 1_200;
-const PER_PEER_TOPIC_MSGS_PER_WINDOW: usize = 600;
-const PER_TOPIC_PUBLISHES_PER_WINDOW: usize = 600;
-const PER_PEER_BACKFILL_REQUESTS_PER_WINDOW: usize = 60;
-const PER_PEER_CONTROL_REQUESTS_PER_WINDOW: usize = 180;
-const MAX_PENDING_OUTBOUND_CONTROL_REQUESTS: usize = 512;
-const MAX_PENDING_INBOUND_CONTROL_REQUESTS: usize = 512;
-const TRAFFIC_THROTTLED_SCORE: i64 = -4;
-const TRAFFIC_QUARANTINE_SCORE: i64 = -8;
-const TRAFFIC_BAN_SCORE: i64 = -16;
-const TRAFFIC_QUARANTINE_DURATION: Duration = Duration::from_secs(90);
-const TRAFFIC_BAN_DURATION: Duration = Duration::from_secs(5 * 60);
-const TRAFFIC_FAILURE_PENALTY: i64 = 2;
 const MAX_BACKFILL_KNOWN_EVENT_IDS: usize = 256;
 const MAX_BACKFILL_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_AGENT_ENVELOPE_JSON_BYTES: usize = 64 * 1024;
 const MAX_CONTACT_MATERIAL_JSON_BYTES: usize = 64 * 1024;
 const MAX_CONTROL_JSON_BYTES: usize = 64 * 1024;
 const MAX_CONTROL_DETAIL_BYTES: usize = 8 * 1024;
-const MAX_DIAL_BACKOFF: Duration = Duration::from_secs(60);
-const INITIAL_DIAL_BACKOFF: Duration = Duration::from_secs(1);
+const DEFAULT_SUBSTRATE_CONTROL_REQUEST_TIMEOUT_MS: u64 = 30_000;
+const IROH_CONTROL_KIND_BACKFILL: &str = "backfill.v1";
+const IROH_CONTROL_KIND_CONTACT_MATERIAL: &str = "contact_material.v1";
+const IROH_CONTROL_KIND_PEER_RELATIONSHIP: &str = "peer_relationship.v1";
+const IROH_CONTROL_KIND_PEER_DIRECT_MESSAGE: &str = "peer_direct_message.v1";
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct NetworkNodeId(String);
+
+impl NetworkNodeId {
+    pub fn new(raw: impl Into<String>) -> Result<Self> {
+        Ok(Self(parse_iroh_endpoint_id_string(raw, "network node id")?))
+    }
+
+    pub fn from_endpoint_id(endpoint_id: EndpointId) -> Self {
+        Self(endpoint_id.to_string())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    #[cfg(test)]
+    pub fn random() -> Self {
+        static NEXT_TEST_NODE_ID: std::sync::atomic::AtomicU64 =
+            std::sync::atomic::AtomicU64::new(1);
+        let now = unix_timestamp_millis();
+        let sequence = NEXT_TEST_NODE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mut seed = [0_u8; 32];
+        seed[..8].copy_from_slice(&now.to_le_bytes());
+        seed[8..16].copy_from_slice(&u64::from(std::process::id()).to_le_bytes());
+        seed[16..24].copy_from_slice(&sequence.to_le_bytes());
+        let secret_key = iroh::SecretKey::from_bytes(&seed);
+        let endpoint_id = EndpointId::from_bytes(secret_key.public().as_bytes())
+            .expect("iroh secret public key must be a valid endpoint id");
+        Self::from_endpoint_id(endpoint_id)
+    }
+}
+
+impl fmt::Display for NetworkNodeId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl FromStr for NetworkNodeId {
+    type Err = anyhow::Error;
+
+    fn from_str(raw: &str) -> Result<Self> {
+        Self::new(raw.to_owned())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct NetworkAddress(String);
+
+impl NetworkAddress {
+    pub fn new(raw: impl Into<String>) -> Result<Self> {
+        let raw = raw.into();
+        if raw.trim().is_empty() {
+            bail!("network address cannot be empty");
+        }
+        if raw.chars().any(char::is_whitespace) {
+            bail!("network address cannot contain whitespace");
+        }
+        Ok(Self(raw))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for NetworkAddress {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl FromStr for NetworkAddress {
+    type Err = anyhow::Error;
+
+    fn from_str(raw: &str) -> Result<Self> {
+        Self::new(raw.to_owned())
+    }
+}
+
+macro_rules! define_request_id {
+    ($name:ident) => {
+        #[derive(
+            Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize,
+        )]
+        pub struct $name(u64);
+
+        impl $name {
+            pub fn new(value: u64) -> Self {
+                Self(value)
+            }
+        }
+
+        impl fmt::Display for $name {
+            fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                write!(formatter, "{}", self.0)
+            }
+        }
+    };
+}
+
+define_request_id!(BackfillRequestId);
+define_request_id!(ContactMaterialRequestId);
+define_request_id!(PeerRelationshipRequestId);
+define_request_id!(PeerDirectMessageRequestId);
+
+pub type BackfillResponseChannel = Sender<RawBackfillResponse>;
+pub type ContactMaterialResponseChannel = Sender<RawContactMaterialResponse>;
+pub type PeerRelationshipResponseChannel = Sender<RawPeerRelationshipResponse>;
+pub type PeerDirectMessageResponseChannel = Sender<RawPeerDirectMessageResponse>;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -161,19 +250,124 @@ impl TopicCatalog {
             summaries: namespace.topic_name(scope, GossipKind::Summaries)?,
         })
     }
+}
 
-    pub fn ident_topic_for(&self, kind: GossipKind) -> IdentTopic {
-        match kind {
-            GossipKind::Events => IdentTopic::new(self.events.clone()),
-            GossipKind::Messages => IdentTopic::new(self.messages.clone()),
-            GossipKind::Rules => IdentTopic::new(self.rules.clone()),
-            GossipKind::Checkpoints => IdentTopic::new(self.checkpoints.clone()),
-            GossipKind::Summaries => IdentTopic::new(self.summaries.clone()),
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SubstrateConfig {
+    pub namespace: TopicNamespace,
+    pub protocol_version: String,
+    #[serde(default)]
+    pub listen_addrs: Vec<String>,
+    #[serde(default)]
+    pub bootstrap_peers: Vec<String>,
+    pub max_backfill_events: usize,
+    pub max_backfill_events_hard_limit: usize,
+    pub control_request_timeout_ms: u64,
+}
+
+impl Default for SubstrateConfig {
+    fn default() -> Self {
+        Self {
+            namespace: TopicNamespace::default(),
+            protocol_version: "wattswarm/iroh/1".to_owned(),
+            listen_addrs: Vec::new(),
+            bootstrap_peers: Vec::new(),
+            max_backfill_events: 512,
+            max_backfill_events_hard_limit: 8192,
+            control_request_timeout_ms: DEFAULT_SUBSTRATE_CONTROL_REQUEST_TIMEOUT_MS,
         }
     }
+}
 
-    pub fn as_ident_topics(&self) -> [IdentTopic; 5] {
-        GossipKind::ALL.map(|kind| self.ident_topic_for(kind))
+impl SubstrateConfig {
+    pub fn validate(&self) -> Result<()> {
+        if self.protocol_version.trim().is_empty() {
+            bail!("network protocol version cannot be empty");
+        }
+        if self.max_backfill_events == 0 {
+            bail!("max_backfill_events must be > 0");
+        }
+        if self.max_backfill_events > self.max_backfill_events_hard_limit {
+            bail!("max_backfill_events exceeds hard limit");
+        }
+        for addr in &self.listen_addrs {
+            NetworkAddress::new(addr.clone())?;
+        }
+        for peer in &self.bootstrap_peers {
+            Self::parse_bootstrap_peer(peer)?;
+        }
+        Ok(())
+    }
+
+    pub fn parse_listen_addrs(&self) -> Result<Vec<NetworkAddress>> {
+        self.listen_addrs
+            .iter()
+            .map(|addr| NetworkAddress::new(addr.clone()))
+            .collect()
+    }
+
+    pub fn parse_bootstrap_peers(&self) -> Result<Vec<(NetworkNodeId, NetworkAddress)>> {
+        self.bootstrap_peers
+            .iter()
+            .map(|peer| Self::parse_bootstrap_peer(peer))
+            .collect()
+    }
+
+    pub fn topic_catalog(&self, scope: &SwarmScope) -> Result<TopicCatalog> {
+        TopicCatalog::new(&self.namespace, scope)
+    }
+
+    fn parse_bootstrap_peer(raw: &str) -> Result<(NetworkNodeId, NetworkAddress)> {
+        let (peer, addr) = raw
+            .split_once('@')
+            .ok_or_else(|| anyhow!("bootstrap peer must use <iroh_node_id>@<address>"))?;
+        Ok((
+            NetworkNodeId::new(peer.to_owned())?,
+            NetworkAddress::new(addr.to_owned())?,
+        ))
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct SubstrateNode {
+    config: SubstrateConfig,
+    local_peer_id: NetworkNodeId,
+    state_dir: PathBuf,
+}
+
+impl SubstrateNode {
+    pub fn from_state_dir(config: SubstrateConfig, state_dir: impl Into<PathBuf>) -> Result<Self> {
+        config.validate()?;
+        let state_dir = state_dir.into();
+        let endpoint_id = local_endpoint_id_from_state_dir(&state_dir)?;
+        Ok(Self {
+            config,
+            local_peer_id: NetworkNodeId::from_endpoint_id(endpoint_id),
+            state_dir,
+        })
+    }
+
+    pub fn from_seed_bytes(
+        config: SubstrateConfig,
+        state_dir: impl Into<PathBuf>,
+        secret_key_32: [u8; 32],
+    ) -> Result<Self> {
+        let state_dir = state_dir.into();
+        std::fs::create_dir_all(&state_dir)?;
+        std::fs::write(state_dir.join("node_seed.hex"), hex::encode(secret_key_32))?;
+        Self::from_state_dir(config, state_dir)
+    }
+
+    pub fn local_peer_id(&self) -> NetworkNodeId {
+        self.local_peer_id.clone()
+    }
+
+    pub fn state_dir(&self) -> &Path {
+        &self.state_dir
+    }
+
+    pub fn config(&self) -> &SubstrateConfig {
+        &self.config
     }
 }
 
@@ -246,7 +440,7 @@ impl PeerHandshakeMetadata {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PeerIdentificationMetadata {
+pub struct PeerMetadata {
     pub network_id: String,
     pub params_version: u64,
     pub params_hash: String,
@@ -296,6 +490,16 @@ impl RawBackfillRequest {
             bail!("backfill known_event_ids must not contain empty event ids");
         }
         Ok(())
+    }
+}
+
+trait InboundControlPeer {
+    fn inbound_peer(&self, fallback: &NetworkNodeId) -> Result<NetworkNodeId>;
+}
+
+impl InboundControlPeer for RawBackfillRequest {
+    fn inbound_peer(&self, fallback: &NetworkNodeId) -> Result<NetworkNodeId> {
+        Ok(fallback.clone())
     }
 }
 
@@ -378,6 +582,12 @@ impl RawPeerRelationshipRequest {
             envelope.validate()?;
         }
         Ok(())
+    }
+}
+
+impl InboundControlPeer for RawPeerRelationshipRequest {
+    fn inbound_peer(&self, _fallback: &NetworkNodeId) -> Result<NetworkNodeId> {
+        NetworkNodeId::new(self.source_node_id.clone())
     }
 }
 
@@ -496,6 +706,12 @@ impl RawContactMaterialRequest {
     }
 }
 
+impl InboundControlPeer for RawContactMaterialRequest {
+    fn inbound_peer(&self, _fallback: &NetworkNodeId) -> Result<NetworkNodeId> {
+        NetworkNodeId::new(self.source_node_id.clone())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RawContactMaterialResponse {
     pub source_node_id: String,
@@ -606,6 +822,12 @@ impl RawPeerDirectMessageRequest {
     }
 }
 
+impl InboundControlPeer for RawPeerDirectMessageRequest {
+    fn inbound_peer(&self, _fallback: &NetworkNodeId) -> Result<NetworkNodeId> {
+        NetworkNodeId::new(self.source_node_id.clone())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RawPeerDirectMessageResponse {
     pub source_node_id: String,
@@ -671,111 +893,6 @@ impl RawGossipMessage {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SubstrateConfig {
-    pub namespace: TopicNamespace,
-    pub protocol_version: String,
-    pub identify_agent_version: String,
-    pub listen_addrs: Vec<String>,
-    pub bootstrap_peers: Vec<String>,
-    pub enable_mdns: bool,
-    pub max_established_per_peer: u32,
-    pub gossipsub_d: usize,
-    pub gossipsub_d_low: usize,
-    pub gossipsub_d_high: usize,
-    pub gossipsub_heartbeat_ms: u64,
-    pub gossipsub_max_transmit_size: usize,
-    pub max_backfill_events: usize,
-    pub max_backfill_events_hard_limit: usize,
-}
-
-impl Default for SubstrateConfig {
-    fn default() -> Self {
-        Self {
-            namespace: TopicNamespace::default(),
-            protocol_version: DEFAULT_PROTOCOL_VERSION.to_owned(),
-            identify_agent_version: PeerHandshakeMetadata::default().encode_agent_version(),
-            listen_addrs: vec!["/ip4/0.0.0.0/tcp/0".to_owned()],
-            bootstrap_peers: Vec::new(),
-            enable_mdns: true,
-            max_established_per_peer: MAX_ESTABLISHED_PER_PEER_FALLBACK,
-            gossipsub_d: GOSSIPSUB_D_FALLBACK,
-            gossipsub_d_low: GOSSIPSUB_D_LOW_FALLBACK,
-            gossipsub_d_high: GOSSIPSUB_D_HIGH_FALLBACK,
-            gossipsub_heartbeat_ms: GOSSIPSUB_HEARTBEAT_MS_FALLBACK,
-            gossipsub_max_transmit_size: GOSSIPSUB_MAX_TRANSMIT_SIZE_FALLBACK,
-            max_backfill_events: DEFAULT_MAX_BACKFILL_EVENTS_FALLBACK,
-            max_backfill_events_hard_limit: MAX_BACKFILL_EVENTS_HARD_LIMIT_FALLBACK,
-        }
-    }
-}
-
-impl SubstrateConfig {
-    pub fn validate(&self) -> Result<()> {
-        if self.listen_addrs.is_empty() {
-            bail!("at least one listen address is required");
-        }
-        if self.namespace.network.trim().is_empty() {
-            bail!("namespace network is required");
-        }
-        if self.namespace.network_id.trim().is_empty() {
-            bail!("namespace network_id is required");
-        }
-        if self.protocol_version.trim().is_empty() {
-            bail!("protocol_version is required");
-        }
-        if self.identify_agent_version.trim().is_empty() {
-            bail!("identify_agent_version is required");
-        }
-        if self.max_established_per_peer == 0 {
-            bail!("max_established_per_peer must be > 0");
-        }
-        if self.gossipsub_d == 0 || self.gossipsub_d_low == 0 || self.gossipsub_d_high == 0 {
-            bail!("gossipsub mesh parameters must be > 0");
-        }
-        if self.gossipsub_d_low > self.gossipsub_d || self.gossipsub_d > self.gossipsub_d_high {
-            bail!("gossipsub mesh parameters must satisfy d_low <= d <= d_high");
-        }
-        if self.gossipsub_heartbeat_ms == 0 {
-            bail!("gossipsub heartbeat must be > 0");
-        }
-        if self.gossipsub_max_transmit_size == 0 {
-            bail!("gossipsub max transmit size must be > 0");
-        }
-        if self.max_backfill_events == 0 {
-            bail!("max_backfill_events must be > 0");
-        }
-        if self.max_backfill_events_hard_limit == 0 {
-            bail!("max_backfill_events_hard_limit must be > 0");
-        }
-        if self.max_backfill_events > self.max_backfill_events_hard_limit {
-            bail!("max_backfill_events exceeds hard safety limit");
-        }
-        Ok(())
-    }
-
-    pub fn parse_listen_addrs(&self) -> Result<Vec<Multiaddr>> {
-        self.listen_addrs
-            .iter()
-            .map(|addr| {
-                addr.parse::<Multiaddr>()
-                    .map_err(|err| anyhow!("invalid listen address '{}': {err}", addr))
-            })
-            .collect()
-    }
-
-    pub fn parse_bootstrap_peers(&self) -> Result<Vec<(PeerId, Multiaddr)>> {
-        self.bootstrap_peers
-            .iter()
-            .map(|addr| parse_peer_multiaddr(addr))
-            .collect()
-    }
-
-    pub fn topic_catalog(&self, scope: &SwarmScope) -> Result<TopicCatalog> {
-        TopicCatalog::new(&self.namespace, scope)
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[allow(clippy::large_enum_variant)]
 pub enum RawControlRequest {
     Backfill(RawBackfillRequest),
@@ -814,25 +931,1191 @@ impl RawControlResponse {
     }
 }
 
-pub type BackfillRequestId = request_response::OutboundRequestId;
-pub type BackfillResponseChannel = request_response::ResponseChannel<RawControlResponse>;
-pub type ContactMaterialRequestId = request_response::OutboundRequestId;
-pub type ContactMaterialResponseChannel = request_response::ResponseChannel<RawControlResponse>;
-pub type PeerRelationshipRequestId = request_response::OutboundRequestId;
-pub type PeerRelationshipResponseChannel = request_response::ResponseChannel<RawControlResponse>;
-pub type PeerDirectMessageRequestId = request_response::OutboundRequestId;
-pub type PeerDirectMessageResponseChannel = request_response::ResponseChannel<RawControlResponse>;
+#[derive(Debug)]
+#[allow(clippy::large_enum_variant)]
+pub enum SubstrateRuntimeEvent {
+    PeerDiscovered {
+        peer: NetworkNodeId,
+        address: NetworkAddress,
+        source: PeerDiscoverySourceKind,
+    },
+    PeerMetadataObserved {
+        peer: NetworkNodeId,
+        metadata: PeerMetadata,
+    },
+    NewListenAddr {
+        address: NetworkAddress,
+    },
+    ConnectionEstablished {
+        peer: NetworkNodeId,
+        remote_addr: NetworkAddress,
+    },
+    ConnectionClosed {
+        peer: NetworkNodeId,
+        remaining_established: u32,
+    },
+    PeerHandshakeRejected {
+        peer: NetworkNodeId,
+        detail: String,
+    },
+    Gossip {
+        propagation_source: NetworkNodeId,
+        message: RawGossipMessage,
+    },
+    BackfillRequest {
+        peer: NetworkNodeId,
+        request: RawBackfillRequest,
+        channel: BackfillResponseChannel,
+    },
+    BackfillResponse {
+        peer: NetworkNodeId,
+        request_id: BackfillRequestId,
+        response: RawBackfillResponse,
+    },
+    BackfillOutboundFailure {
+        peer: NetworkNodeId,
+        request_id: BackfillRequestId,
+        error: String,
+    },
+    BackfillInboundFailure {
+        peer: NetworkNodeId,
+        error: String,
+    },
+    ContactMaterialRequest {
+        peer: NetworkNodeId,
+        request: RawContactMaterialRequest,
+        channel: ContactMaterialResponseChannel,
+    },
+    ContactMaterialResponse {
+        peer: NetworkNodeId,
+        request_id: ContactMaterialRequestId,
+        response: RawContactMaterialResponse,
+    },
+    ContactMaterialOutboundFailure {
+        peer: NetworkNodeId,
+        request_id: ContactMaterialRequestId,
+        error: String,
+    },
+    ContactMaterialInboundFailure {
+        peer: NetworkNodeId,
+        error: String,
+    },
+    PeerRelationshipRequest {
+        peer: NetworkNodeId,
+        request: RawPeerRelationshipRequest,
+        channel: PeerRelationshipResponseChannel,
+    },
+    PeerRelationshipResponse {
+        peer: NetworkNodeId,
+        request_id: PeerRelationshipRequestId,
+        response: RawPeerRelationshipResponse,
+    },
+    PeerRelationshipOutboundFailure {
+        peer: NetworkNodeId,
+        request_id: PeerRelationshipRequestId,
+        error: String,
+    },
+    PeerRelationshipInboundFailure {
+        peer: NetworkNodeId,
+        error: String,
+    },
+    PeerDirectMessageRequest {
+        peer: NetworkNodeId,
+        request: RawPeerDirectMessageRequest,
+        channel: PeerDirectMessageResponseChannel,
+    },
+    PeerDirectMessageResponse {
+        peer: NetworkNodeId,
+        request_id: PeerDirectMessageRequestId,
+        response: RawPeerDirectMessageResponse,
+    },
+    PeerDirectMessageOutboundFailure {
+        peer: NetworkNodeId,
+        request_id: PeerDirectMessageRequestId,
+        error: String,
+    },
+    PeerDirectMessageInboundFailure {
+        peer: NetworkNodeId,
+        error: String,
+    },
+}
 
-const BACKFILL_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct IrohGossipSubscription {
+    pub scope: SwarmScope,
+    pub kind: GossipKind,
+    pub topic_id_hex: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IrohRuntimeCounters {
+    pub malformed_gossip_notifications: u64,
+    pub scope_kind_mismatch_drops: u64,
+    pub stale_contact_material_drops: u64,
+    pub invalid_control_payloads: u64,
+    pub stream_request_attempts: u64,
+    pub stream_request_successes: u64,
+    pub stream_request_failures: u64,
+    pub retry_suppressed_connects: u64,
+    pub request_limit_drops: u64,
+}
+
+struct IrohGossipTopicHandle {
+    sender: GossipSender,
+    task: tokio::task::JoinHandle<()>,
+}
+
+#[derive(Debug)]
+enum IrohGossipInbound {
+    Message {
+        subscription: IrohGossipSubscription,
+        delivered_from: String,
+        bytes: Vec<u8>,
+    },
+    NeighborUp {
+        peer: String,
+    },
+    NeighborDown {
+        peer: String,
+    },
+    Malformed {
+        remote_network_peer_id: String,
+        error: String,
+    },
+    Lagged,
+}
+
+pub struct SubstrateRuntime {
+    config: SubstrateConfig,
+    runtime: Option<Runtime>,
+    state_dir: PathBuf,
+    local_peer_id: NetworkNodeId,
+    local_endpoint_id: String,
+    local_listen_addrs: Vec<NetworkAddress>,
+    subscriptions: HashSet<IrohGossipSubscription>,
+    gossip_topics: HashMap<IrohGossipSubscription, IrohGossipTopicHandle>,
+    gossip_tx: Sender<IrohGossipInbound>,
+    gossip_rx: Receiver<IrohGossipInbound>,
+    control_tx: Sender<SubstrateRuntimeEvent>,
+    control_rx: Receiver<SubstrateRuntimeEvent>,
+    pending_events: VecDeque<SubstrateRuntimeEvent>,
+    remote_contacts: HashMap<String, TransportContactMaterial>,
+    counters: IrohRuntimeCounters,
+    next_request_id: u64,
+}
+
+impl SubstrateRuntime {
+    pub fn new(node: SubstrateNode) -> Result<Self> {
+        let local_contact = export_local_contact_material_for_network_peer_id(
+            node.state_dir(),
+            node.local_peer_id.as_str(),
+            unix_timestamp_millis() / 1000,
+        )?;
+        install_local_contact_material_control_handler_for_network_peer_id(
+            node.state_dir(),
+            node.local_peer_id.as_str(),
+        )?;
+        let runtime = Runtime::new()?;
+        let (gossip_tx, gossip_rx) = mpsc::channel();
+        let (control_tx, control_rx) = mpsc::channel();
+        let mut this = Self {
+            local_endpoint_id: local_endpoint_id_from_state_dir(node.state_dir())?.to_string(),
+            local_listen_addrs: local_contact
+                .metadata
+                .listen_addrs
+                .iter()
+                .filter_map(|addr| NetworkAddress::new(addr.clone()).ok())
+                .collect(),
+            config: node.config,
+            runtime: Some(runtime),
+            state_dir: node.state_dir,
+            local_peer_id: node.local_peer_id,
+            subscriptions: HashSet::new(),
+            gossip_topics: HashMap::new(),
+            gossip_tx,
+            gossip_rx,
+            control_tx,
+            control_rx,
+            pending_events: VecDeque::new(),
+            remote_contacts: HashMap::new(),
+            counters: IrohRuntimeCounters::default(),
+            next_request_id: 1,
+        };
+        this.install_control_handlers()?;
+        for (peer, address) in this.config.parse_bootstrap_peers()? {
+            let dial_address = NetworkAddress::new(format!("{peer}@{address}"))?;
+            this.dial(dial_address)?;
+        }
+        Ok(this)
+    }
+
+    pub fn local_peer_id(&self) -> NetworkNodeId {
+        self.local_peer_id.clone()
+    }
+
+    pub fn listen_addrs(&self) -> &[NetworkAddress] {
+        &self.local_listen_addrs
+    }
+
+    fn runtime(&self) -> &Runtime {
+        self.runtime
+            .as_ref()
+            .expect("substrate runtime must be available until drop")
+    }
+
+    fn block_on<T: Send>(&self, future: impl Future<Output = T> + Send) -> T {
+        let runtime = self.runtime();
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) if handle.runtime_flavor() == RuntimeFlavor::MultiThread => {
+                tokio::task::block_in_place(|| runtime.block_on(future))
+            }
+            Ok(_) => std::thread::scope(|scope| {
+                scope
+                    .spawn(move || runtime.block_on(future))
+                    .join()
+                    .expect("join substrate runtime blocking operation")
+            }),
+            Err(_) => runtime.block_on(future),
+        }
+    }
+
+    pub fn observability_snapshot(&self) -> NetworkRuntimeObservabilitySnapshot {
+        let mut subscribed_iroh_gossip_topics = self
+            .subscriptions
+            .iter()
+            .map(|subscription| {
+                format!(
+                    "{:?}:{}:{}",
+                    subscription.scope,
+                    subscription.kind.as_str(),
+                    subscription.topic_id_hex
+                )
+            })
+            .collect::<Vec<_>>();
+        subscribed_iroh_gossip_topics.sort();
+        NetworkRuntimeObservabilitySnapshot {
+            p2p_foundation: "iroh".to_owned(),
+            local_iroh_endpoint_id: Some(self.local_endpoint_id.clone()),
+            subscribed_iroh_gossip_topics,
+            known_iroh_contacts: self.remote_contacts.len(),
+            legacy_transport_active: false,
+            nat_status: "iroh-direct".to_owned(),
+            nat_public_address: None,
+            nat_confidence: 0,
+            relay_reservations: Vec::new(),
+            peer_health: Vec::new(),
+            dropped_malformed_gossip: self.counters.malformed_gossip_notifications,
+            invalid_control_payloads: self.counters.invalid_control_payloads,
+            dial_failures: self.counters.stream_request_failures,
+            response_validation_failures: 0,
+            retry_suppressed_dials: self.counters.retry_suppressed_connects,
+        }
+    }
+
+    pub fn upsert_remote_contact_material(
+        &mut self,
+        remote_network_peer_id: impl Into<String>,
+        mut contact: TransportContactMaterial,
+    ) -> Result<bool> {
+        let remote_network_peer_id = NetworkNodeId::new(remote_network_peer_id.into())?.to_string();
+        let contact_endpoint = contact_endpoint_id(&contact)?;
+        let contact_endpoint = contact_endpoint.to_string();
+        if contact.peer_id != contact_endpoint {
+            bail!(
+                "iroh contact material peer_id {} must match endpoint_id {}",
+                contact.peer_id,
+                contact_endpoint
+            );
+        }
+        if remote_network_peer_id != contact_endpoint {
+            bail!(
+                "remote network node id {remote_network_peer_id} must match iroh endpoint_id {contact_endpoint}"
+            );
+        }
+        contact.metadata.endpoint_id = Some(contact_endpoint.clone());
+        if self
+            .remote_contacts
+            .get(&remote_network_peer_id)
+            .is_some_and(|existing| existing.metadata.generated_at > contact.metadata.generated_at)
+        {
+            self.counters.stale_contact_material_drops =
+                self.counters.stale_contact_material_drops.saturating_add(1);
+            return Ok(false);
+        }
+        register_remote_contact_material_for_network_peer_id(
+            &self.state_dir,
+            self.local_peer_id.as_str(),
+            &contact,
+        )?;
+        self.remote_contacts.insert(remote_network_peer_id, contact);
+        self.join_gossip_topics_with_bootstrap_contacts()?;
+        Ok(true)
+    }
+
+    pub fn allows_outbound_backfill_to(&self, peer: &NetworkNodeId) -> bool {
+        self.remote_contacts.contains_key(peer.as_str())
+    }
+
+    pub fn subscribe_scope(&mut self, scope: &SwarmScope) -> Result<()> {
+        self.subscribe_scope_kinds(scope, &GossipKind::ALL)
+    }
+
+    pub fn subscribe_scope_kinds(
+        &mut self,
+        scope: &SwarmScope,
+        kinds: &[GossipKind],
+    ) -> Result<()> {
+        for kind in kinds {
+            let subscription = self.subscription_for(scope, *kind)?;
+            self.ensure_gossip_topic(subscription)?;
+        }
+        Ok(())
+    }
+
+    pub fn unsubscribe_scope(&mut self, scope: &SwarmScope) -> Result<()> {
+        self.unsubscribe_scope_kinds(scope, &GossipKind::ALL)
+    }
+
+    pub fn unsubscribe_scope_kinds(
+        &mut self,
+        scope: &SwarmScope,
+        kinds: &[GossipKind],
+    ) -> Result<()> {
+        for kind in kinds {
+            let subscription = self.subscription_for(scope, *kind)?;
+            self.subscriptions.remove(&subscription);
+            if let Some(handle) = self.gossip_topics.remove(&subscription) {
+                handle.task.abort();
+            }
+        }
+        Ok(())
+    }
+
+    pub fn publish(&mut self, scope: &SwarmScope, kind: GossipKind, payload: &[u8]) -> Result<()> {
+        let message = RawGossipMessage {
+            scope: scope.clone(),
+            kind,
+            payload: payload.to_vec(),
+        };
+        let bytes = message.encode_json()?;
+        let subscription = self.subscription_for(scope, kind)?;
+        self.ensure_gossip_topic(subscription.clone())?;
+        let topic = self
+            .gossip_topics
+            .get(&subscription)
+            .ok_or_else(|| anyhow!("missing iroh gossip topic {}", subscription.topic_id_hex))?;
+        self.block_on(topic.sender.broadcast(bytes.into()))
+            .map_err(|err| anyhow!("publish iroh gossip notification: {err}"))?;
+        Ok(())
+    }
+
+    pub fn dial(&mut self, addr: NetworkAddress) -> Result<()> {
+        let Some((raw_peer, raw_direct_addr)) = addr.as_str().split_once('@') else {
+            return Ok(());
+        };
+        let peer = NetworkNodeId::new(raw_peer.to_owned())?;
+        EndpointId::from_str(raw_peer).context("parse iroh endpoint id from dial target")?;
+        let direct_addr = NetworkAddress::new(raw_direct_addr.to_owned())?;
+        let contact = TransportContactMaterial {
+            transport: TransportRoute::IrohDirect.as_str().to_owned(),
+            peer_id: peer.to_string(),
+            metadata: TransportMetadata {
+                route: TransportRoute::IrohDirect,
+                generated_at: unix_timestamp_millis(),
+                endpoint_id: Some(peer.to_string()),
+                alpn: Some(DEFAULT_IROH_CONTROL_ALPN.to_owned()),
+                listen_addrs: vec![direct_addr.to_string()],
+                capabilities: PeerTransportCapabilities::iroh_direct_default(),
+            },
+            extra: serde_json::json!({
+                "endpoint_id": peer.to_string(),
+                "alpn": DEFAULT_IROH_CONTROL_ALPN,
+                "direct_addrs": [direct_addr.to_string()],
+                "relay_urls": [],
+            }),
+        };
+        self.upsert_remote_contact_material(peer.to_string(), contact)?;
+        self.pending_events
+            .push_back(SubstrateRuntimeEvent::PeerDiscovered {
+                peer: peer.clone(),
+                address: direct_addr.clone(),
+                source: PeerDiscoverySourceKind::Bootstrap,
+            });
+        Ok(())
+    }
+
+    fn join_gossip_topics_with_bootstrap_contacts(&self) -> Result<()> {
+        if self.gossip_topics.is_empty() {
+            return Ok(());
+        }
+        let bootstrap = self
+            .remote_contacts
+            .values()
+            .map(contact_endpoint_id)
+            .collect::<Result<Vec<_>>>()?;
+        if bootstrap.is_empty() {
+            return Ok(());
+        }
+        for topic in self.gossip_topics.values() {
+            self.block_on(topic.sender.join_peers(bootstrap.clone()))
+                .map_err(|err| anyhow!("join iroh gossip peers: {err}"))?;
+        }
+        Ok(())
+    }
+
+    pub fn send_backfill_request(
+        &mut self,
+        peer: &NetworkNodeId,
+        request: RawBackfillRequest,
+    ) -> Result<BackfillRequestId> {
+        let request_id = BackfillRequestId::new(self.reserve_request_number());
+        let (kind, payload) = match encode_raw_control_request(RawControlRequest::Backfill(request))
+            .and_then(|(kind, payload)| {
+                RawControlRequest::Backfill(serde_json::from_slice(&payload)?).validate(
+                    self.config.max_backfill_events,
+                    self.config.max_backfill_events_hard_limit,
+                )?;
+                Ok((kind, payload))
+            }) {
+            Ok(encoded) => encoded,
+            Err(err) => {
+                self.pending_events
+                    .push_back(SubstrateRuntimeEvent::BackfillOutboundFailure {
+                        peer: peer.clone(),
+                        request_id,
+                        error: err.to_string(),
+                    });
+                return Ok(request_id);
+            }
+        };
+        let Some(remote_contact) = self.remote_contacts.get(peer.as_str()).cloned() else {
+            self.pending_events
+                .push_back(SubstrateRuntimeEvent::BackfillOutboundFailure {
+                    peer: peer.clone(),
+                    request_id,
+                    error: format!("missing iroh contact material for {peer}"),
+                });
+            return Ok(request_id);
+        };
+        self.counters.stream_request_attempts =
+            self.counters.stream_request_attempts.saturating_add(1);
+        self.spawn_control_request(
+            peer,
+            kind,
+            payload,
+            remote_contact,
+            move |peer, response| match response {
+                Ok(RawControlResponse::Backfill(response)) => {
+                    SubstrateRuntimeEvent::BackfillResponse {
+                        peer,
+                        request_id,
+                        response,
+                    }
+                }
+                Ok(_) => SubstrateRuntimeEvent::BackfillOutboundFailure {
+                    peer,
+                    request_id,
+                    error: "unexpected backfill control response kind".to_owned(),
+                },
+                Err(err) => SubstrateRuntimeEvent::BackfillOutboundFailure {
+                    peer,
+                    request_id,
+                    error: err.to_string(),
+                },
+            },
+        );
+        Ok(request_id)
+    }
+
+    pub fn send_backfill_response(
+        &mut self,
+        channel: BackfillResponseChannel,
+        response: RawBackfillResponse,
+    ) -> Result<()> {
+        channel
+            .send(response)
+            .map_err(|_| anyhow!("backfill response channel closed"))
+    }
+
+    pub fn send_contact_material_request(
+        &mut self,
+        peer: &NetworkNodeId,
+        request: RawContactMaterialRequest,
+    ) -> Result<ContactMaterialRequestId> {
+        let request_id = ContactMaterialRequestId::new(self.reserve_request_number());
+        let (kind, payload) =
+            match encode_raw_control_request(RawControlRequest::ContactMaterial(request)) {
+                Ok(encoded) => encoded,
+                Err(err) => {
+                    self.pending_events.push_back(
+                        SubstrateRuntimeEvent::ContactMaterialOutboundFailure {
+                            peer: peer.clone(),
+                            request_id,
+                            error: err.to_string(),
+                        },
+                    );
+                    return Ok(request_id);
+                }
+            };
+        let Some(remote_contact) = self.remote_contacts.get(peer.as_str()).cloned() else {
+            self.pending_events
+                .push_back(SubstrateRuntimeEvent::ContactMaterialOutboundFailure {
+                    peer: peer.clone(),
+                    request_id,
+                    error: format!("missing iroh contact material for {peer}"),
+                });
+            return Ok(request_id);
+        };
+        self.counters.stream_request_attempts =
+            self.counters.stream_request_attempts.saturating_add(1);
+        self.spawn_control_request(
+            peer,
+            kind,
+            payload,
+            remote_contact,
+            move |peer, response| match response {
+                Ok(RawControlResponse::ContactMaterial(response)) => {
+                    SubstrateRuntimeEvent::ContactMaterialResponse {
+                        peer,
+                        request_id,
+                        response,
+                    }
+                }
+                Ok(_) => SubstrateRuntimeEvent::ContactMaterialOutboundFailure {
+                    peer,
+                    request_id,
+                    error: "unexpected contact material control response kind".to_owned(),
+                },
+                Err(err) => SubstrateRuntimeEvent::ContactMaterialOutboundFailure {
+                    peer,
+                    request_id,
+                    error: err.to_string(),
+                },
+            },
+        );
+        Ok(request_id)
+    }
+
+    pub fn send_contact_material_response(
+        &mut self,
+        channel: ContactMaterialResponseChannel,
+        response: RawContactMaterialResponse,
+    ) -> Result<()> {
+        channel
+            .send(response)
+            .map_err(|_| anyhow!("contact material response channel closed"))
+    }
+
+    pub fn send_peer_relationship_request(
+        &mut self,
+        peer: &NetworkNodeId,
+        request: RawPeerRelationshipRequest,
+    ) -> Result<PeerRelationshipRequestId> {
+        let request_id = PeerRelationshipRequestId::new(self.reserve_request_number());
+        let (kind, payload) =
+            match encode_raw_control_request(RawControlRequest::PeerRelationship(request)) {
+                Ok(encoded) => encoded,
+                Err(err) => {
+                    self.pending_events.push_back(
+                        SubstrateRuntimeEvent::PeerRelationshipOutboundFailure {
+                            peer: peer.clone(),
+                            request_id,
+                            error: err.to_string(),
+                        },
+                    );
+                    return Ok(request_id);
+                }
+            };
+        let Some(remote_contact) = self.remote_contacts.get(peer.as_str()).cloned() else {
+            self.pending_events
+                .push_back(SubstrateRuntimeEvent::PeerRelationshipOutboundFailure {
+                    peer: peer.clone(),
+                    request_id,
+                    error: format!("missing iroh contact material for {peer}"),
+                });
+            return Ok(request_id);
+        };
+        self.counters.stream_request_attempts =
+            self.counters.stream_request_attempts.saturating_add(1);
+        self.spawn_control_request(
+            peer,
+            kind,
+            payload,
+            remote_contact,
+            move |peer, response| match response {
+                Ok(RawControlResponse::PeerRelationship(response)) => {
+                    SubstrateRuntimeEvent::PeerRelationshipResponse {
+                        peer,
+                        request_id,
+                        response,
+                    }
+                }
+                Ok(_) => SubstrateRuntimeEvent::PeerRelationshipOutboundFailure {
+                    peer,
+                    request_id,
+                    error: "unexpected peer relationship control response kind".to_owned(),
+                },
+                Err(err) => SubstrateRuntimeEvent::PeerRelationshipOutboundFailure {
+                    peer,
+                    request_id,
+                    error: err.to_string(),
+                },
+            },
+        );
+        Ok(request_id)
+    }
+
+    pub fn send_peer_relationship_response(
+        &mut self,
+        channel: PeerRelationshipResponseChannel,
+        response: RawPeerRelationshipResponse,
+    ) -> Result<()> {
+        channel
+            .send(response)
+            .map_err(|_| anyhow!("peer relationship response channel closed"))
+    }
+
+    pub fn send_peer_direct_message_request(
+        &mut self,
+        peer: &NetworkNodeId,
+        request: RawPeerDirectMessageRequest,
+    ) -> Result<PeerDirectMessageRequestId> {
+        let request_id = PeerDirectMessageRequestId::new(self.reserve_request_number());
+        let (kind, payload) =
+            match encode_raw_control_request(RawControlRequest::PeerDirectMessage(request)) {
+                Ok(encoded) => encoded,
+                Err(err) => {
+                    self.pending_events.push_back(
+                        SubstrateRuntimeEvent::PeerDirectMessageOutboundFailure {
+                            peer: peer.clone(),
+                            request_id,
+                            error: err.to_string(),
+                        },
+                    );
+                    return Ok(request_id);
+                }
+            };
+        let Some(remote_contact) = self.remote_contacts.get(peer.as_str()).cloned() else {
+            self.pending_events.push_back(
+                SubstrateRuntimeEvent::PeerDirectMessageOutboundFailure {
+                    peer: peer.clone(),
+                    request_id,
+                    error: format!("missing iroh contact material for {peer}"),
+                },
+            );
+            return Ok(request_id);
+        };
+        self.counters.stream_request_attempts =
+            self.counters.stream_request_attempts.saturating_add(1);
+        self.spawn_control_request(
+            peer,
+            kind,
+            payload,
+            remote_contact,
+            move |peer, response| match response {
+                Ok(RawControlResponse::PeerDirectMessage(response)) => {
+                    SubstrateRuntimeEvent::PeerDirectMessageResponse {
+                        peer,
+                        request_id,
+                        response,
+                    }
+                }
+                Ok(_) => SubstrateRuntimeEvent::PeerDirectMessageOutboundFailure {
+                    peer,
+                    request_id,
+                    error: "unexpected peer direct message control response kind".to_owned(),
+                },
+                Err(err) => SubstrateRuntimeEvent::PeerDirectMessageOutboundFailure {
+                    peer,
+                    request_id,
+                    error: err.to_string(),
+                },
+            },
+        );
+        Ok(request_id)
+    }
+
+    fn spawn_control_request(
+        &self,
+        peer: &NetworkNodeId,
+        kind: String,
+        payload: Vec<u8>,
+        remote_contact: TransportContactMaterial,
+        build_event: impl FnOnce(
+            NetworkNodeId,
+            std::result::Result<RawControlResponse, anyhow::Error>,
+        ) -> SubstrateRuntimeEvent
+        + Send
+        + 'static,
+    ) {
+        let state_dir = self.state_dir.clone();
+        let local_peer_id = self.local_peer_id.clone();
+        let peer = peer.clone();
+        let control_tx = self.control_tx.clone();
+        std::thread::spawn(move || {
+            let response = send_control_stream_request_for_network_peer_id(
+                &state_dir,
+                local_peer_id.as_str(),
+                &remote_contact,
+                &IrohControlStreamRequest {
+                    kind: kind.clone(),
+                    payload,
+                },
+            )
+            .and_then(|response| decode_raw_control_response(&kind, response));
+            let _ = control_tx.send(build_event(peer, response));
+        });
+    }
+
+    pub fn send_peer_direct_message_response(
+        &mut self,
+        channel: PeerDirectMessageResponseChannel,
+        response: RawPeerDirectMessageResponse,
+    ) -> Result<()> {
+        channel
+            .send(response)
+            .map_err(|_| anyhow!("peer direct message response channel closed"))
+    }
+
+    pub async fn next_event(&mut self) -> Result<SubstrateRuntimeEvent> {
+        loop {
+            if let Some(event) = self.try_next_event()? {
+                return Ok(event);
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
+    pub fn try_next_event(&mut self) -> Result<Option<SubstrateRuntimeEvent>> {
+        if let Some(event) = self.pending_events.pop_front() {
+            return Ok(Some(event));
+        }
+        while let Ok(event) = self.control_rx.try_recv() {
+            self.pending_events.push_back(event);
+            if let Some(event) = self.pending_events.pop_front() {
+                return Ok(Some(event));
+            }
+        }
+        while let Ok(inbound) = self.gossip_rx.try_recv() {
+            match inbound {
+                IrohGossipInbound::Message {
+                    subscription,
+                    delivered_from,
+                    bytes,
+                } => {
+                    let message = RawGossipMessage::decode_json(&bytes)?;
+                    if message.scope != subscription.scope || message.kind != subscription.kind {
+                        self.counters.scope_kind_mismatch_drops =
+                            self.counters.scope_kind_mismatch_drops.saturating_add(1);
+                        continue;
+                    }
+                    self.pending_events
+                        .push_back(SubstrateRuntimeEvent::Gossip {
+                            propagation_source: NetworkNodeId::new(delivered_from)?,
+                            message,
+                        });
+                }
+                IrohGossipInbound::NeighborUp { peer } => {
+                    let remote_addr = self
+                        .remote_contacts
+                        .get(peer.as_str())
+                        .and_then(|contact| contact.metadata.listen_addrs.first())
+                        .and_then(|addr| NetworkAddress::new(addr.clone()).ok())
+                        .unwrap_or_else(|| {
+                            NetworkAddress::new(peer.clone())
+                                .expect("iroh node id is a network address")
+                        });
+                    self.pending_events
+                        .push_back(SubstrateRuntimeEvent::ConnectionEstablished {
+                            peer: NetworkNodeId::new(peer)?,
+                            remote_addr,
+                        });
+                }
+                IrohGossipInbound::NeighborDown { peer } => {
+                    self.pending_events
+                        .push_back(SubstrateRuntimeEvent::ConnectionClosed {
+                            peer: NetworkNodeId::new(peer)?,
+                            remaining_established: 0,
+                        });
+                }
+                IrohGossipInbound::Malformed {
+                    remote_network_peer_id,
+                    error,
+                } => {
+                    self.counters.invalid_control_payloads =
+                        self.counters.invalid_control_payloads.saturating_add(1);
+                    self.pending_events
+                        .push_back(SubstrateRuntimeEvent::PeerHandshakeRejected {
+                            peer: NetworkNodeId::new(remote_network_peer_id)?,
+                            detail: error,
+                        });
+                }
+                IrohGossipInbound::Lagged => {
+                    self.counters.malformed_gossip_notifications = self
+                        .counters
+                        .malformed_gossip_notifications
+                        .saturating_add(1);
+                }
+            }
+            if let Some(event) = self.pending_events.pop_front() {
+                return Ok(Some(event));
+            }
+        }
+        Ok(None)
+    }
+
+    fn install_control_handlers(&mut self) -> Result<()> {
+        self.install_typed_control_handler::<RawBackfillRequest, RawBackfillResponse>(
+            IROH_CONTROL_KIND_BACKFILL,
+            |peer, request, channel| SubstrateRuntimeEvent::BackfillRequest {
+                peer,
+                request,
+                channel,
+            },
+        )?;
+        self.install_typed_control_handler::<RawContactMaterialRequest, RawContactMaterialResponse>(
+            IROH_CONTROL_KIND_CONTACT_MATERIAL,
+            |peer, request, channel| SubstrateRuntimeEvent::ContactMaterialRequest {
+                peer,
+                request,
+                channel,
+            },
+        )?;
+        self.install_typed_control_handler::<RawPeerRelationshipRequest, RawPeerRelationshipResponse>(
+            IROH_CONTROL_KIND_PEER_RELATIONSHIP,
+            |peer, request, channel| SubstrateRuntimeEvent::PeerRelationshipRequest {
+                peer,
+                request,
+                channel,
+            },
+        )?;
+        self.install_typed_control_handler::<RawPeerDirectMessageRequest, RawPeerDirectMessageResponse>(
+            IROH_CONTROL_KIND_PEER_DIRECT_MESSAGE,
+            |peer, request, channel| SubstrateRuntimeEvent::PeerDirectMessageRequest {
+                peer,
+                request,
+                channel,
+            },
+        )?;
+        Ok(())
+    }
+
+    fn install_typed_control_handler<Req, Resp>(
+        &self,
+        kind: &'static str,
+        build_event: impl Fn(NetworkNodeId, Req, Sender<Resp>) -> SubstrateRuntimeEvent
+        + Send
+        + Sync
+        + 'static,
+    ) -> Result<()>
+    where
+        Req: for<'de> Deserialize<'de> + Send + 'static,
+        Resp: Serialize + Send + 'static,
+        Req: InboundControlPeer,
+    {
+        let pending_tx = self.control_tx.clone();
+        let local_peer_id = self.local_peer_id.clone();
+        let timeout = Duration::from_millis(self.config.control_request_timeout_ms);
+        set_local_control_stream_handler_for_network_peer_id(
+            &self.state_dir,
+            self.local_peer_id.as_str(),
+            kind,
+            Some(move |request: IrohControlStreamRequest| {
+                if request.kind != kind {
+                    return IrohControlStreamResponse {
+                        ok: false,
+                        error: Some(format!(
+                            "unexpected iroh control request kind {}",
+                            request.kind
+                        )),
+                        payload: Vec::new(),
+                    };
+                }
+                let decoded = match serde_json::from_slice::<Req>(&request.payload) {
+                    Ok(decoded) => decoded,
+                    Err(err) => {
+                        return IrohControlStreamResponse {
+                            ok: false,
+                            error: Some(format!("decode iroh control request: {err}")),
+                            payload: Vec::new(),
+                        };
+                    }
+                };
+                let peer = match decoded.inbound_peer(&local_peer_id) {
+                    Ok(peer) => peer,
+                    Err(err) => {
+                        return IrohControlStreamResponse {
+                            ok: false,
+                            error: Some(format!("resolve iroh control peer: {err}")),
+                            payload: Vec::new(),
+                        };
+                    }
+                };
+                let (response_tx, response_rx) = mpsc::channel::<Resp>();
+                let event = build_event(peer, decoded, response_tx);
+                if pending_tx.send(event).is_err() {
+                    return IrohControlStreamResponse {
+                        ok: false,
+                        error: Some("control dispatch channel unavailable".to_owned()),
+                        payload: Vec::new(),
+                    };
+                }
+                match response_rx.recv_timeout(timeout) {
+                    Ok(response) => match serde_json::to_vec(&response) {
+                        Ok(payload) => IrohControlStreamResponse {
+                            ok: true,
+                            error: None,
+                            payload,
+                        },
+                        Err(err) => IrohControlStreamResponse {
+                            ok: false,
+                            error: Some(format!("encode iroh control response: {err}")),
+                            payload: Vec::new(),
+                        },
+                    },
+                    Err(err) => IrohControlStreamResponse {
+                        ok: false,
+                        error: Some(format!("wait for iroh control response: {err}")),
+                        payload: Vec::new(),
+                    },
+                }
+            }),
+        )
+    }
+
+    fn subscription_for(
+        &self,
+        scope: &SwarmScope,
+        kind: GossipKind,
+    ) -> Result<IrohGossipSubscription> {
+        let scope_hint = scope.label()?;
+        let topic_id = derive_gossip_topic_id(
+            &self.config.namespace.network_id,
+            &scope_hint,
+            kind.as_str(),
+        );
+        Ok(IrohGossipSubscription {
+            scope: scope.clone(),
+            kind,
+            topic_id_hex: hex::encode(topic_id.as_bytes()),
+        })
+    }
+
+    fn ensure_gossip_topic(&mut self, subscription: IrohGossipSubscription) -> Result<()> {
+        self.subscriptions.insert(subscription.clone());
+        if self.gossip_topics.contains_key(&subscription) {
+            return Ok(());
+        }
+        let topic_id_bytes =
+            hex::decode(&subscription.topic_id_hex).map_err(|err| anyhow!("{err}"))?;
+        let topic_id_bytes: [u8; 32] = topic_id_bytes
+            .try_into()
+            .map_err(|_| anyhow!("iroh gossip topic id must be 32 bytes"))?;
+        let topic_id = iroh_gossip::TopicId::from_bytes(topic_id_bytes);
+        let bootstrap = self
+            .remote_contacts
+            .values()
+            .map(contact_endpoint_id)
+            .collect::<Result<Vec<_>>>()?;
+        let gossip =
+            local_gossip_for_network_peer_id(&self.state_dir, self.local_peer_id.as_str())?;
+        let topic = self
+            .block_on(gossip.subscribe(topic_id, bootstrap))
+            .map_err(|err| anyhow!("subscribe iroh gossip topic: {err}"))?;
+        let (sender, mut receiver) = topic.split();
+        let inbound_tx = self.gossip_tx.clone();
+        let task_subscription = subscription.clone();
+        let task = self.runtime().spawn(async move {
+            while let Some(event) = receiver.next().await {
+                match event {
+                    Ok(IrohGossipEvent::Received(message)) => {
+                        let delivered_from = message.delivered_from.to_string();
+                        if inbound_tx
+                            .send(IrohGossipInbound::Message {
+                                subscription: task_subscription.clone(),
+                                delivered_from,
+                                bytes: message.content.to_vec(),
+                            })
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                    Ok(IrohGossipEvent::Lagged) => {
+                        if inbound_tx.send(IrohGossipInbound::Lagged).is_err() {
+                            break;
+                        }
+                    }
+                    Ok(IrohGossipEvent::NeighborUp(peer)) => {
+                        if inbound_tx
+                            .send(IrohGossipInbound::NeighborUp {
+                                peer: peer.to_string(),
+                            })
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                    Ok(IrohGossipEvent::NeighborDown(peer)) => {
+                        if inbound_tx
+                            .send(IrohGossipInbound::NeighborDown {
+                                peer: peer.to_string(),
+                            })
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                    Err(err) => {
+                        let _ = inbound_tx.send(IrohGossipInbound::Malformed {
+                            remote_network_peer_id: task_subscription.topic_id_hex.clone(),
+                            error: err.to_string(),
+                        });
+                        break;
+                    }
+                }
+            }
+        });
+        self.gossip_topics
+            .insert(subscription, IrohGossipTopicHandle { sender, task });
+        Ok(())
+    }
+
+    fn reserve_request_number(&mut self) -> u64 {
+        let request_id = self.next_request_id;
+        self.next_request_id = self.next_request_id.saturating_add(1).max(1);
+        request_id
+    }
+}
+
+impl Drop for SubstrateRuntime {
+    fn drop(&mut self) {
+        for (_, topic) in self.gossip_topics.drain() {
+            topic.task.abort();
+        }
+        shutdown_local_iroh_data_plane(&self.state_dir);
+        let Some(runtime) = self.runtime.take() else {
+            return;
+        };
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) if handle.runtime_flavor() == RuntimeFlavor::MultiThread => {
+                tokio::task::block_in_place(|| drop(runtime));
+            }
+            Ok(_) => {
+                std::thread::scope(|scope| {
+                    scope
+                        .spawn(move || drop(runtime))
+                        .join()
+                        .expect("join substrate runtime drop thread");
+                });
+            }
+            Err(_) => drop(runtime),
+        }
+    }
+}
+
+fn contact_endpoint_id(contact: &TransportContactMaterial) -> Result<EndpointId> {
+    let metadata_endpoint = contact.metadata.endpoint_id.as_deref().map(str::trim);
+    let extra_endpoint = contact
+        .extra
+        .get("endpoint_id")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim);
+    let endpoint_id = extra_endpoint
+        .or(metadata_endpoint)
+        .unwrap_or(contact.peer_id.as_str())
+        .trim();
+    if endpoint_id.is_empty() {
+        bail!("iroh contact material endpoint_id cannot be empty");
+    }
+    if let Some(metadata_endpoint) = metadata_endpoint
+        && metadata_endpoint != endpoint_id
+    {
+        bail!(
+            "iroh contact metadata endpoint_id {metadata_endpoint} does not match endpoint_id {endpoint_id}"
+        );
+    }
+    EndpointId::from_str(endpoint_id).with_context(|| {
+        format!("parse iroh endpoint id from contact material endpoint_id {endpoint_id}")
+    })
+}
+
+fn parse_iroh_endpoint_id_string(raw: impl Into<String>, label: &str) -> Result<String> {
+    let raw = raw.into();
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        bail!("{label} cannot be empty");
+    }
+    EndpointId::from_str(trimmed)
+        .with_context(|| format!("{label} must be an iroh NodeId / EndpointId"))?;
+    Ok(trimmed.to_owned())
+}
+
+fn unix_timestamp_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)
+        .unwrap_or_default()
+}
+
+fn encode_raw_control_request(request: RawControlRequest) -> Result<(String, Vec<u8>)> {
+    match request {
+        RawControlRequest::Backfill(request) => Ok((
+            IROH_CONTROL_KIND_BACKFILL.to_owned(),
+            serde_json::to_vec(&request)?,
+        )),
+        RawControlRequest::ContactMaterial(request) => Ok((
+            IROH_CONTROL_KIND_CONTACT_MATERIAL.to_owned(),
+            serde_json::to_vec(&request)?,
+        )),
+        RawControlRequest::PeerRelationship(request) => Ok((
+            IROH_CONTROL_KIND_PEER_RELATIONSHIP.to_owned(),
+            serde_json::to_vec(&request)?,
+        )),
+        RawControlRequest::PeerDirectMessage(request) => Ok((
+            IROH_CONTROL_KIND_PEER_DIRECT_MESSAGE.to_owned(),
+            serde_json::to_vec(&request)?,
+        )),
+    }
+}
+
+fn decode_raw_control_response(
+    kind: &str,
+    response: IrohControlStreamResponse,
+) -> Result<RawControlResponse> {
+    if !response.ok {
+        bail!(
+            "{}",
+            response
+                .error
+                .unwrap_or_else(|| "remote iroh control request failed".to_owned())
+        );
+    }
+    Ok(match kind {
+        IROH_CONTROL_KIND_BACKFILL => {
+            RawControlResponse::Backfill(serde_json::from_slice(&response.payload)?)
+        }
+        IROH_CONTROL_KIND_CONTACT_MATERIAL => {
+            RawControlResponse::ContactMaterial(serde_json::from_slice(&response.payload)?)
+        }
+        IROH_CONTROL_KIND_PEER_RELATIONSHIP => {
+            RawControlResponse::PeerRelationship(serde_json::from_slice(&response.payload)?)
+        }
+        IROH_CONTROL_KIND_PEER_DIRECT_MESSAGE => {
+            RawControlResponse::PeerDirectMessage(serde_json::from_slice(&response.payload)?)
+        }
+        other => bail!("unexpected iroh control response kind {other}"),
+    })
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PeerDiscoverySourceKind {
     Udp,
-    Mdns,
+    LocalDiscovery,
     Bootstrap,
     Identify,
-    Kademlia,
+    BootstrapIndex,
     Unknown,
 }
 
@@ -840,385 +2123,12 @@ impl PeerDiscoverySourceKind {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Udp => "udp",
-            Self::Mdns => "mdns",
+            Self::LocalDiscovery => "local_discovery",
             Self::Bootstrap => "bootstrap",
             Self::Identify => "identify",
-            Self::Kademlia => "kademlia",
+            Self::BootstrapIndex => "bootstrap_index",
             Self::Unknown => "unknown",
         }
-    }
-}
-
-#[derive(Debug)]
-pub enum SubstrateBehaviourEvent {
-    Gossipsub(GossipsubEvent),
-    Identify(identify::Event),
-    Kademlia(kad::Event),
-    Relay(relay::client::Event),
-    Autonat(autonat::Event),
-    Dcutr(dcutr::Event),
-    RequestResponse(request_response::Event<RawControlRequest, RawControlResponse>),
-    Mdns(mdns::Event),
-}
-
-impl From<GossipsubEvent> for SubstrateBehaviourEvent {
-    fn from(value: GossipsubEvent) -> Self {
-        Self::Gossipsub(value)
-    }
-}
-
-impl From<identify::Event> for SubstrateBehaviourEvent {
-    fn from(value: identify::Event) -> Self {
-        Self::Identify(value)
-    }
-}
-
-impl From<kad::Event> for SubstrateBehaviourEvent {
-    fn from(value: kad::Event) -> Self {
-        Self::Kademlia(value)
-    }
-}
-
-impl From<relay::client::Event> for SubstrateBehaviourEvent {
-    fn from(value: relay::client::Event) -> Self {
-        Self::Relay(value)
-    }
-}
-
-impl From<autonat::Event> for SubstrateBehaviourEvent {
-    fn from(value: autonat::Event) -> Self {
-        Self::Autonat(value)
-    }
-}
-
-impl From<dcutr::Event> for SubstrateBehaviourEvent {
-    fn from(value: dcutr::Event) -> Self {
-        Self::Dcutr(value)
-    }
-}
-
-impl From<request_response::Event<RawControlRequest, RawControlResponse>>
-    for SubstrateBehaviourEvent
-{
-    fn from(value: request_response::Event<RawControlRequest, RawControlResponse>) -> Self {
-        Self::RequestResponse(value)
-    }
-}
-
-impl From<mdns::Event> for SubstrateBehaviourEvent {
-    fn from(value: mdns::Event) -> Self {
-        Self::Mdns(value)
-    }
-}
-
-impl From<std::convert::Infallible> for SubstrateBehaviourEvent {
-    fn from(v: std::convert::Infallible) -> Self {
-        match v {}
-    }
-}
-
-#[derive(NetworkBehaviour)]
-#[behaviour(to_swarm = "SubstrateBehaviourEvent")]
-pub struct SubstrateBehaviour {
-    pub connection_limits: connection_limits::Behaviour,
-    pub gossipsub: Gossipsub,
-    pub identify: identify::Behaviour,
-    pub kademlia: kad::Behaviour<MemoryStore>,
-    pub relay_client: relay::client::Behaviour,
-    pub autonat: autonat::Behaviour,
-    pub dcutr: dcutr::Behaviour,
-    pub request_response: request_response::cbor::Behaviour<RawControlRequest, RawControlResponse>,
-    pub mdns: Toggle<mdns::tokio::Behaviour>,
-}
-
-#[derive(Debug)]
-pub enum SubstrateRuntimeEvent {
-    PeerDiscovered {
-        peer: PeerId,
-        address: Multiaddr,
-        source: PeerDiscoverySourceKind,
-    },
-    PeerIdentified {
-        peer: PeerId,
-        metadata: PeerIdentificationMetadata,
-    },
-    NewListenAddr {
-        address: Multiaddr,
-    },
-    ConnectionEstablished {
-        peer: PeerId,
-        remote_addr: Multiaddr,
-    },
-    ConnectionClosed {
-        peer: PeerId,
-        remaining_established: u32,
-    },
-    PeerHandshakeRejected {
-        peer: PeerId,
-        detail: String,
-    },
-    Gossip {
-        propagation_source: PeerId,
-        message: RawGossipMessage,
-    },
-    BackfillRequest {
-        peer: PeerId,
-        request: RawBackfillRequest,
-        channel: BackfillResponseChannel,
-    },
-    BackfillResponse {
-        peer: PeerId,
-        request_id: BackfillRequestId,
-        response: RawBackfillResponse,
-    },
-    BackfillOutboundFailure {
-        peer: PeerId,
-        request_id: BackfillRequestId,
-        error: String,
-    },
-    BackfillInboundFailure {
-        peer: PeerId,
-        error: String,
-    },
-    ContactMaterialRequest {
-        peer: PeerId,
-        request: RawContactMaterialRequest,
-        channel: ContactMaterialResponseChannel,
-    },
-    ContactMaterialResponse {
-        peer: PeerId,
-        request_id: ContactMaterialRequestId,
-        response: RawContactMaterialResponse,
-    },
-    ContactMaterialOutboundFailure {
-        peer: PeerId,
-        request_id: ContactMaterialRequestId,
-        error: String,
-    },
-    ContactMaterialInboundFailure {
-        peer: PeerId,
-        error: String,
-    },
-    PeerRelationshipRequest {
-        peer: PeerId,
-        request: RawPeerRelationshipRequest,
-        channel: PeerRelationshipResponseChannel,
-    },
-    PeerRelationshipResponse {
-        peer: PeerId,
-        request_id: PeerRelationshipRequestId,
-        response: RawPeerRelationshipResponse,
-    },
-    PeerRelationshipOutboundFailure {
-        peer: PeerId,
-        request_id: PeerRelationshipRequestId,
-        error: String,
-    },
-    PeerRelationshipInboundFailure {
-        peer: PeerId,
-        error: String,
-    },
-    PeerDirectMessageRequest {
-        peer: PeerId,
-        request: RawPeerDirectMessageRequest,
-        channel: PeerDirectMessageResponseChannel,
-    },
-    PeerDirectMessageResponse {
-        peer: PeerId,
-        request_id: PeerDirectMessageRequestId,
-        response: RawPeerDirectMessageResponse,
-    },
-    PeerDirectMessageOutboundFailure {
-        peer: PeerId,
-        request_id: PeerDirectMessageRequestId,
-        error: String,
-    },
-    PeerDirectMessageInboundFailure {
-        peer: PeerId,
-        error: String,
-    },
-    NatStatusChanged {
-        old: String,
-        new: String,
-        public_address: Option<Multiaddr>,
-        confidence: usize,
-    },
-    RelayReservationAccepted {
-        relay_peer: PeerId,
-        renewal: bool,
-    },
-    RelayCircuitEstablished {
-        relay_peer: PeerId,
-    },
-    RelayInboundCircuitEstablished {
-        source_peer: PeerId,
-    },
-    DcutrConnectionUpgradeSucceeded {
-        remote_peer: PeerId,
-    },
-    DcutrConnectionUpgradeFailed {
-        remote_peer: PeerId,
-        error: String,
-    },
-}
-
-pub struct SubstrateNode {
-    config: SubstrateConfig,
-    local_key: identity::Keypair,
-    local_peer_id: PeerId,
-}
-
-struct BehaviourSeedParts {
-    gossipsub: Gossipsub,
-    identify: identify::Behaviour,
-    kademlia: kad::Behaviour<MemoryStore>,
-    autonat: autonat::Behaviour,
-    request_response: request_response::cbor::Behaviour<RawControlRequest, RawControlResponse>,
-    mdns: Toggle<mdns::tokio::Behaviour>,
-    connection_limits: connection_limits::Behaviour,
-}
-
-fn backfill_request_response_config() -> request_response::Config {
-    request_response::Config::default().with_request_timeout(BACKFILL_REQUEST_TIMEOUT)
-}
-
-impl SubstrateNode {
-    pub fn new(config: SubstrateConfig, local_key: identity::Keypair) -> Result<Self> {
-        config.validate()?;
-        let local_peer_id = local_key.public().to_peer_id();
-        Ok(Self {
-            config,
-            local_key,
-            local_peer_id,
-        })
-    }
-
-    pub fn generate(config: SubstrateConfig) -> Result<Self> {
-        Self::new(config, identity::Keypair::generate_ed25519())
-    }
-
-    pub fn config(&self) -> &SubstrateConfig {
-        &self.config
-    }
-
-    pub fn local_peer_id(&self) -> PeerId {
-        self.local_peer_id
-    }
-
-    pub fn parse_listen_addrs(&self) -> Result<Vec<Multiaddr>> {
-        self.config.parse_listen_addrs()
-    }
-
-    fn build_behaviour_seed_parts(
-        config: &SubstrateConfig,
-        local_key: &identity::Keypair,
-        local_peer_id: PeerId,
-    ) -> Result<BehaviourSeedParts> {
-        let gossipsub_config = GossipsubConfigBuilder::default()
-            .validation_mode(ValidationMode::Strict)
-            .mesh_n(config.gossipsub_d)
-            .mesh_n_low(config.gossipsub_d_low)
-            .mesh_n_high(config.gossipsub_d_high)
-            .heartbeat_interval(Duration::from_millis(config.gossipsub_heartbeat_ms))
-            .max_transmit_size(config.gossipsub_max_transmit_size)
-            .build()
-            .map_err(|err| anyhow!(err))?;
-        let gossipsub = Gossipsub::new(
-            MessageAuthenticity::Signed(local_key.clone()),
-            gossipsub_config,
-        )
-        .map_err(|err| anyhow!(err))?;
-
-        let identify = identify::Behaviour::new(
-            identify::Config::new(config.protocol_version.clone(), local_key.public())
-                .with_agent_version(config.identify_agent_version.clone()),
-        );
-
-        let request_response = request_response::cbor::Behaviour::new(
-            [(BACKFILL_PROTOCOL, ProtocolSupport::Full)],
-            backfill_request_response_config(),
-        );
-
-        let mut kad_config = kad::Config::new(KADEMLIA_PROTOCOL);
-        kad_config.set_periodic_bootstrap_interval(Some(Duration::from_secs(300)));
-        let mut kademlia =
-            kad::Behaviour::with_config(local_peer_id, MemoryStore::new(local_peer_id), kad_config);
-        let mut autonat = autonat::Behaviour::new(local_peer_id, autonat::Config::default());
-        for (peer, addr) in config.parse_bootstrap_peers()? {
-            kademlia.add_address(&peer, addr.clone());
-            autonat.add_server(peer, Some(addr));
-        }
-
-        let mdns = Toggle::from(if config.enable_mdns {
-            Some(mdns::tokio::Behaviour::new(
-                mdns::Config::default(),
-                local_peer_id,
-            )?)
-        } else {
-            None
-        });
-
-        let connection_limits = connection_limits::Behaviour::new(
-            connection_limits::ConnectionLimits::default()
-                .with_max_established_incoming(Some(MAX_ESTABLISHED_INCOMING))
-                .with_max_established_outgoing(Some(MAX_ESTABLISHED_OUTGOING))
-                .with_max_established_per_peer(Some(config.max_established_per_peer))
-                .with_max_pending_incoming(Some(MAX_PENDING_INCOMING))
-                .with_max_pending_outgoing(Some(MAX_PENDING_OUTGOING)),
-        );
-
-        Ok(BehaviourSeedParts {
-            gossipsub,
-            identify,
-            kademlia,
-            autonat,
-            request_response,
-            mdns,
-            connection_limits,
-        })
-    }
-
-    pub fn build_behaviour(&self) -> Result<SubstrateBehaviour> {
-        let (_, relay_client) = relay::client::new(self.local_peer_id);
-        let parts =
-            Self::build_behaviour_seed_parts(&self.config, &self.local_key, self.local_peer_id)?;
-        Ok(SubstrateBehaviour {
-            gossipsub: parts.gossipsub,
-            identify: parts.identify,
-            kademlia: parts.kademlia,
-            relay_client,
-            autonat: parts.autonat,
-            dcutr: dcutr::Behaviour::new(self.local_peer_id),
-            request_response: parts.request_response,
-            mdns: parts.mdns,
-            connection_limits: parts.connection_limits,
-        })
-    }
-
-    pub fn build_swarm(&self) -> Result<Swarm<SubstrateBehaviour>> {
-        let config = self.config.clone();
-        let local_peer_id = self.local_peer_id;
-        let parts = Self::build_behaviour_seed_parts(&config, &self.local_key, local_peer_id)?;
-        Ok(SwarmBuilder::with_existing_identity(self.local_key.clone())
-            .with_tokio()
-            .with_tcp(
-                tcp::Config::default(),
-                noise::Config::new,
-                yamux::Config::default,
-            )?
-            .with_relay_client(noise::Config::new, yamux::Config::default)?
-            .with_behaviour(move |_, relay_client| SubstrateBehaviour {
-                connection_limits: parts.connection_limits,
-                gossipsub: parts.gossipsub,
-                identify: parts.identify,
-                kademlia: parts.kademlia,
-                relay_client,
-                autonat: parts.autonat,
-                dcutr: dcutr::Behaviour::new(local_peer_id),
-                request_response: parts.request_response,
-                mdns: parts.mdns,
-            })?
-            .build())
     }
 }
 
@@ -1240,7 +2150,7 @@ pub struct NetworkRuntimeObservabilitySnapshot {
     pub local_iroh_endpoint_id: Option<String>,
     pub subscribed_iroh_gossip_topics: Vec<String>,
     pub known_iroh_contacts: usize,
-    pub legacy_libp2p_active: bool,
+    pub legacy_transport_active: bool,
     pub nat_status: String,
     pub nat_public_address: Option<String>,
     pub nat_confidence: u32,
@@ -1253,1358 +2163,11 @@ pub struct NetworkRuntimeObservabilitySnapshot {
     pub retry_suppressed_dials: u64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-enum ControlRequestKind {
-    Backfill,
-    ContactMaterial,
-    PeerRelationship,
-    PeerDirectMessage,
-}
-
-impl ControlRequestKind {
-    fn from_request(request: &RawControlRequest) -> Self {
-        match request {
-            RawControlRequest::Backfill(_) => Self::Backfill,
-            RawControlRequest::ContactMaterial(_) => Self::ContactMaterial,
-            RawControlRequest::PeerRelationship(_) => Self::PeerRelationship,
-            RawControlRequest::PeerDirectMessage(_) => Self::PeerDirectMessage,
-        }
-    }
-}
-
-#[derive(Debug)]
-struct TrafficGuard {
-    seen_messages: HashMap<u64, Instant>,
-    peer_windows: HashMap<PeerId, Vec<Instant>>,
-    peer_topic_windows: HashMap<(PeerId, String), Vec<Instant>>,
-    local_publish_windows: HashMap<String, Vec<Instant>>,
-    backfill_request_windows: HashMap<PeerId, Vec<Instant>>,
-    control_request_windows: HashMap<(PeerId, ControlRequestKind), Vec<Instant>>,
-    peer_scores: HashMap<PeerId, i64>,
-    quarantined_peers: HashMap<PeerId, Instant>,
-    banned_peers: HashMap<PeerId, Instant>,
-    dropped_malformed_gossip: u64,
-    invalid_control_payloads: u64,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TrafficPolicyTier {
-    Healthy,
-    Throttled,
-    Quarantined,
-    Banned,
-}
-
-impl TrafficPolicyTier {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Healthy => "healthy",
-            Self::Throttled => "throttled",
-            Self::Quarantined => "quarantined",
-            Self::Banned => "banned",
-        }
-    }
-
-    fn throttle_factor_percent(self) -> u32 {
-        match self {
-            Self::Healthy => 100,
-            Self::Throttled => 50,
-            Self::Quarantined | Self::Banned => 0,
-        }
-    }
-}
-
-impl TrafficGuard {
-    fn new() -> Self {
-        Self {
-            seen_messages: HashMap::new(),
-            peer_windows: HashMap::new(),
-            peer_topic_windows: HashMap::new(),
-            local_publish_windows: HashMap::new(),
-            backfill_request_windows: HashMap::new(),
-            control_request_windows: HashMap::new(),
-            peer_scores: HashMap::new(),
-            quarantined_peers: HashMap::new(),
-            banned_peers: HashMap::new(),
-            dropped_malformed_gossip: 0,
-            invalid_control_payloads: 0,
-        }
-    }
-
-    fn allow_local_publish(&mut self, topic: &str, now: Instant) -> bool {
-        let window = self
-            .local_publish_windows
-            .entry(topic.to_owned())
-            .or_default();
-        prune_window(window, now, TRAFFIC_WINDOW);
-        if window.len() >= PER_TOPIC_PUBLISHES_PER_WINDOW {
-            return false;
-        }
-        window.push(now);
-        true
-    }
-
-    fn allow_inbound_gossip(
-        &mut self,
-        source_peer: PeerId,
-        topic: &str,
-        data: &[u8],
-        now: Instant,
-    ) -> bool {
-        self.gc_peer_actions(now);
-        let policy = self.policy_for_peer(source_peer, now);
-        if matches!(
-            policy,
-            TrafficPolicyTier::Quarantined | TrafficPolicyTier::Banned
-        ) {
-            return false;
-        }
-
-        let digest = traffic_digest(data);
-        self.gc_seen(now);
-        if self
-            .seen_messages
-            .get(&digest)
-            .is_some_and(|seen_at| now.duration_since(*seen_at) <= TRAFFIC_DEDUPE_TTL)
-        {
-            self.penalize(source_peer, 1, now);
-            return false;
-        }
-        self.seen_messages.insert(digest, now);
-
-        let peer_limit = throttled_limit(PER_PEER_MSGS_PER_WINDOW, policy);
-        let peer_window = self.peer_windows.entry(source_peer).or_default();
-        prune_window(peer_window, now, TRAFFIC_WINDOW);
-        if peer_window.len() >= peer_limit {
-            self.penalize(source_peer, 3, now);
-            return false;
-        }
-        peer_window.push(now);
-
-        let topic_limit = throttled_limit(PER_PEER_TOPIC_MSGS_PER_WINDOW, policy);
-        let topic_window = self
-            .peer_topic_windows
-            .entry((source_peer, topic.to_owned()))
-            .or_default();
-        prune_window(topic_window, now, TRAFFIC_WINDOW);
-        if topic_window.len() >= topic_limit {
-            self.penalize(source_peer, 2, now);
-            return false;
-        }
-        topic_window.push(now);
-
-        self.reward(source_peer, 1, now);
-        true
-    }
-
-    fn allow_backfill_request(&mut self, peer: PeerId, now: Instant) -> bool {
-        self.gc_peer_actions(now);
-        let policy = self.policy_for_peer(peer, now);
-        if matches!(
-            policy,
-            TrafficPolicyTier::Quarantined | TrafficPolicyTier::Banned
-        ) {
-            return false;
-        }
-        let backfill_limit = throttled_limit(PER_PEER_BACKFILL_REQUESTS_PER_WINDOW, policy);
-        let window = self.backfill_request_windows.entry(peer).or_default();
-        prune_window(window, now, TRAFFIC_WINDOW);
-        if window.len() >= backfill_limit {
-            self.penalize(peer, 2, now);
-            return false;
-        }
-        window.push(now);
-        true
-    }
-
-    fn allow_control_request(
-        &mut self,
-        peer: PeerId,
-        kind: ControlRequestKind,
-        now: Instant,
-    ) -> bool {
-        if matches!(kind, ControlRequestKind::Backfill) {
-            return self.allow_backfill_request(peer, now);
-        }
-        self.gc_peer_actions(now);
-        let policy = self.policy_for_peer(peer, now);
-        if matches!(
-            policy,
-            TrafficPolicyTier::Quarantined | TrafficPolicyTier::Banned
-        ) {
-            return false;
-        }
-        let limit = throttled_limit(PER_PEER_CONTROL_REQUESTS_PER_WINDOW, policy);
-        let window = self
-            .control_request_windows
-            .entry((peer, kind))
-            .or_default();
-        prune_window(window, now, TRAFFIC_WINDOW);
-        if window.len() >= limit {
-            self.penalize(peer, 2, now);
-            return false;
-        }
-        window.push(now);
-        true
-    }
-
-    fn penalize(&mut self, peer: PeerId, amount: i64, now: Instant) {
-        let score = self.peer_scores.entry(peer).or_insert(0);
-        *score -= amount;
-        if *score <= TRAFFIC_BAN_SCORE {
-            self.banned_peers.insert(peer, now + TRAFFIC_BAN_DURATION);
-            self.quarantined_peers.remove(&peer);
-        } else if *score <= TRAFFIC_QUARANTINE_SCORE {
-            let until = now + TRAFFIC_QUARANTINE_DURATION;
-            self.quarantined_peers
-                .entry(peer)
-                .and_modify(|existing| {
-                    if *existing < until {
-                        *existing = until;
-                    }
-                })
-                .or_insert(until);
-        }
-    }
-
-    fn reward(&mut self, peer: PeerId, amount: i64, now: Instant) {
-        self.gc_peer_actions(now);
-        let score = self.peer_scores.entry(peer).or_insert(0);
-        *score = (*score + amount).min(100);
-        if *score > TRAFFIC_QUARANTINE_SCORE {
-            self.quarantined_peers.remove(&peer);
-        }
-    }
-
-    fn gc_seen(&mut self, now: Instant) {
-        self.seen_messages
-            .retain(|_, seen_at| now.duration_since(*seen_at) <= TRAFFIC_DEDUPE_TTL);
-    }
-
-    fn gc_peer_actions(&mut self, now: Instant) {
-        self.quarantined_peers.retain(|_, until| *until > now);
-        self.banned_peers.retain(|_, until| *until > now);
-    }
-
-    fn policy_for_peer(&self, peer: PeerId, now: Instant) -> TrafficPolicyTier {
-        if self
-            .banned_peers
-            .get(&peer)
-            .is_some_and(|until| *until > now)
-        {
-            return TrafficPolicyTier::Banned;
-        }
-        if self
-            .quarantined_peers
-            .get(&peer)
-            .is_some_and(|until| *until > now)
-        {
-            return TrafficPolicyTier::Quarantined;
-        }
-        let score = self.peer_scores.get(&peer).copied().unwrap_or(0);
-        if score <= TRAFFIC_THROTTLED_SCORE {
-            TrafficPolicyTier::Throttled
-        } else {
-            TrafficPolicyTier::Healthy
-        }
-    }
-
-    fn quarantine_remaining_ms(&self, peer: PeerId, now: Instant) -> u64 {
-        self.quarantined_peers
-            .get(&peer)
-            .map(|until| until.saturating_duration_since(now).as_millis() as u64)
-            .unwrap_or(0)
-    }
-
-    fn ban_remaining_ms(&self, peer: PeerId, now: Instant) -> u64 {
-        self.banned_peers
-            .get(&peer)
-            .map(|until| until.saturating_duration_since(now).as_millis() as u64)
-            .unwrap_or(0)
-    }
-
-    fn note_backfill_failure(&mut self, peer: PeerId, now: Instant) {
-        self.penalize(peer, TRAFFIC_FAILURE_PENALTY, now);
-    }
-
-    fn note_invalid_control_message(&mut self, peer: PeerId, now: Instant) {
-        self.invalid_control_payloads = self.invalid_control_payloads.saturating_add(1);
-        self.penalize(peer, TRAFFIC_FAILURE_PENALTY, now);
-    }
-
-    fn note_invalid_gossip_message(&mut self, peer: PeerId, now: Instant) {
-        self.dropped_malformed_gossip = self.dropped_malformed_gossip.saturating_add(1);
-        self.penalize(peer, TRAFFIC_FAILURE_PENALTY, now);
-    }
-
-    fn note_handshake_rejection(&mut self, peer: PeerId, now: Instant) {
-        self.penalize(peer, TRAFFIC_QUARANTINE_SCORE.abs(), now);
-    }
-
-    fn allows_outbound_backfill(&self, peer: PeerId, now: Instant) -> bool {
-        !matches!(
-            self.policy_for_peer(peer, now),
-            TrafficPolicyTier::Quarantined | TrafficPolicyTier::Banned
-        )
-    }
-}
-
-pub struct SubstrateRuntime {
-    config: SubstrateConfig,
-    local_peer_id: PeerId,
-    swarm: Swarm<SubstrateBehaviour>,
-    listen_addrs: Vec<Multiaddr>,
-    subscribed_topics: HashSet<String>,
-    pending_events: VecDeque<SubstrateRuntimeEvent>,
-    pending_outbound_request_kinds:
-        HashMap<request_response::OutboundRequestId, PendingRequestKind>,
-    pending_inbound_request_kinds: HashMap<request_response::InboundRequestId, PendingRequestKind>,
-    traffic_guard: TrafficGuard,
-    relay_reservations: HashSet<String>,
-    expected_agent_version_prefix: String,
-    expected_peer_handshake: PeerHandshakeMetadata,
-    nat_status: String,
-    nat_public_address: Option<Multiaddr>,
-    nat_confidence: u32,
-    dial_attempts: HashMap<String, DialAttemptState>,
-    dial_failures: u64,
-    retry_suppressed_dials: u64,
-    response_validation_failures: u64,
-}
-
-#[derive(Debug, Clone)]
-struct DialAttemptState {
-    failures: u32,
-    next_attempt_at: Instant,
-}
-
-impl DialAttemptState {
-    fn new(now: Instant) -> Self {
-        Self {
-            failures: 0,
-            next_attempt_at: now,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PendingRequestKind {
-    Backfill,
-    ContactMaterial,
-    PeerRelationship,
-    PeerDirectMessage,
-}
-
-impl PendingRequestKind {
-    fn for_request(request: &RawControlRequest) -> Self {
-        match request {
-            RawControlRequest::Backfill(_) => Self::Backfill,
-            RawControlRequest::ContactMaterial(_) => Self::ContactMaterial,
-            RawControlRequest::PeerRelationship(_) => Self::PeerRelationship,
-            RawControlRequest::PeerDirectMessage(_) => Self::PeerDirectMessage,
-        }
-    }
-}
-
-impl SubstrateRuntime {
-    pub fn new(node: SubstrateNode) -> Result<Self> {
-        let local_peer_id = node.local_peer_id();
-        let config = node.config.clone();
-        let (expected_agent_version_prefix, expected_peer_handshake) =
-            PeerHandshakeMetadata::decode_agent_version_parts(&config.identify_agent_version)?;
-        let swarm = node.build_swarm()?;
-        let mut this = Self {
-            config,
-            local_peer_id,
-            swarm,
-            listen_addrs: Vec::new(),
-            subscribed_topics: HashSet::new(),
-            pending_events: VecDeque::new(),
-            pending_outbound_request_kinds: HashMap::new(),
-            pending_inbound_request_kinds: HashMap::new(),
-            traffic_guard: TrafficGuard::new(),
-            relay_reservations: HashSet::new(),
-            expected_agent_version_prefix,
-            expected_peer_handshake,
-            nat_status: "unknown".to_owned(),
-            nat_public_address: None,
-            nat_confidence: 0,
-            dial_attempts: HashMap::new(),
-            dial_failures: 0,
-            retry_suppressed_dials: 0,
-            response_validation_failures: 0,
-        };
-        this.listen_on_configured_addrs()?;
-        this.seed_bootstrap_peers()?;
-        Ok(this)
-    }
-
-    pub fn local_peer_id(&self) -> PeerId {
-        self.local_peer_id
-    }
-
-    pub fn config(&self) -> &SubstrateConfig {
-        &self.config
-    }
-
-    pub fn listen_addrs(&self) -> &[Multiaddr] {
-        &self.listen_addrs
-    }
-
-    pub fn observability_snapshot(&self) -> NetworkRuntimeObservabilitySnapshot {
-        let now = Instant::now();
-        let mut peer_health = self
-            .traffic_guard
-            .peer_scores
-            .iter()
-            .map(|(peer, score)| {
-                let policy = self.traffic_guard.policy_for_peer(*peer, now);
-                TrafficGuardPeerHealth {
-                    peer: peer.to_string(),
-                    score: *score,
-                    blacklisted: matches!(policy, TrafficPolicyTier::Banned),
-                    reputation_tier: policy.as_str().to_owned(),
-                    quarantined: matches!(policy, TrafficPolicyTier::Quarantined),
-                    quarantine_remaining_ms: self.traffic_guard.quarantine_remaining_ms(*peer, now),
-                    ban_remaining_ms: self.traffic_guard.ban_remaining_ms(*peer, now),
-                    throttle_factor_percent: policy.throttle_factor_percent(),
-                }
-            })
-            .collect::<Vec<_>>();
-        peer_health.sort_by(|left, right| left.peer.cmp(&right.peer));
-
-        let mut relay_reservations = self.relay_reservations.iter().cloned().collect::<Vec<_>>();
-        relay_reservations.sort();
-
-        NetworkRuntimeObservabilitySnapshot {
-            p2p_foundation: "legacy-libp2p".to_owned(),
-            local_iroh_endpoint_id: None,
-            subscribed_iroh_gossip_topics: Vec::new(),
-            known_iroh_contacts: 0,
-            legacy_libp2p_active: true,
-            nat_status: self.nat_status.clone(),
-            nat_public_address: self.nat_public_address.as_ref().map(ToString::to_string),
-            nat_confidence: self.nat_confidence,
-            relay_reservations,
-            peer_health,
-            dropped_malformed_gossip: self.traffic_guard.dropped_malformed_gossip,
-            invalid_control_payloads: self.traffic_guard.invalid_control_payloads,
-            dial_failures: self.dial_failures,
-            response_validation_failures: self.response_validation_failures,
-            retry_suppressed_dials: self.retry_suppressed_dials,
-        }
-    }
-
-    pub fn allows_outbound_backfill_to(&self, peer: &PeerId) -> bool {
-        self.traffic_guard
-            .allows_outbound_backfill(*peer, Instant::now())
-    }
-
-    pub fn validate_identify_info(
-        &self,
-        info: &identify::Info,
-    ) -> Result<(Vec<Multiaddr>, PeerIdentificationMetadata)> {
-        if info.protocol_version != self.config.protocol_version {
-            bail!(
-                "identify protocol_version mismatch expected={} got={}",
-                self.config.protocol_version,
-                info.protocol_version
-            );
-        }
-        let (remote_prefix, remote) =
-            PeerHandshakeMetadata::decode_agent_version_parts(&info.agent_version)?;
-        if remote_prefix != self.expected_agent_version_prefix {
-            bail!(
-                "identify agent prefix mismatch expected={} got={}",
-                self.expected_agent_version_prefix,
-                remote_prefix
-            );
-        }
-        if remote.network_id != self.expected_peer_handshake.network_id {
-            bail!(
-                "identify network_id mismatch expected={} got={}",
-                self.expected_peer_handshake.network_id,
-                remote.network_id
-            );
-        }
-        if remote.params_version != self.expected_peer_handshake.params_version {
-            bail!(
-                "identify params_version mismatch expected={} got={}",
-                self.expected_peer_handshake.params_version,
-                remote.params_version
-            );
-        }
-        if remote.params_hash != self.expected_peer_handshake.params_hash {
-            bail!(
-                "identify params_hash mismatch expected={} got={}",
-                self.expected_peer_handshake.params_hash,
-                remote.params_hash
-            );
-        }
-        Ok((
-            info.listen_addrs.clone(),
-            PeerIdentificationMetadata {
-                network_id: remote.network_id,
-                params_version: remote.params_version,
-                params_hash: remote.params_hash,
-                agent_version_raw: info.agent_version.clone(),
-                agent_version_prefix: remote_prefix,
-                protocol_version: info.protocol_version.clone(),
-                observed_addr: info.observed_addr.to_string(),
-                listen_addrs: info.listen_addrs.iter().map(ToString::to_string).collect(),
-                protocols: info.protocols.iter().map(ToString::to_string).collect(),
-            },
-        ))
-    }
-
-    pub fn subscribe_scope(&mut self, scope: &SwarmScope) -> Result<()> {
-        self.subscribe_scope_kinds(scope, &GossipKind::ALL)
-    }
-
-    pub fn subscribe_scope_kinds(
-        &mut self,
-        scope: &SwarmScope,
-        kinds: &[GossipKind],
-    ) -> Result<()> {
-        let catalog = self.config.topic_catalog(scope)?;
-        for kind in kinds {
-            let topic = catalog.ident_topic_for(*kind);
-            let topic_name = topic.to_string();
-            if self.subscribed_topics.contains(&topic_name) {
-                continue;
-            }
-            self.swarm
-                .behaviour_mut()
-                .gossipsub
-                .subscribe(&topic)
-                .map_err(|err| anyhow!(err))?;
-            self.subscribed_topics.insert(topic_name);
-        }
-        Ok(())
-    }
-
-    pub fn unsubscribe_scope(&mut self, scope: &SwarmScope) -> Result<()> {
-        self.unsubscribe_scope_kinds(scope, &GossipKind::ALL)
-    }
-
-    pub fn unsubscribe_scope_kinds(
-        &mut self,
-        scope: &SwarmScope,
-        kinds: &[GossipKind],
-    ) -> Result<()> {
-        let catalog = self.config.topic_catalog(scope)?;
-        for kind in kinds {
-            let topic = catalog.ident_topic_for(*kind);
-            let topic_name = topic.to_string();
-            if !self.subscribed_topics.contains(&topic_name) {
-                continue;
-            }
-            let _ = self.swarm.behaviour_mut().gossipsub.unsubscribe(&topic);
-            self.subscribed_topics.remove(&topic_name);
-        }
-        Ok(())
-    }
-
-    pub fn dial(&mut self, addr: Multiaddr) -> Result<()> {
-        self.swarm.dial(addr).map_err(|err| anyhow!(err))?;
-        Ok(())
-    }
-
-    fn dial_key(peer: PeerId, addr: &Multiaddr) -> String {
-        format!("{peer}|{addr}")
-    }
-
-    fn dial_backoff_for_failures(failures: u32) -> Duration {
-        let multiplier = 1_u32.checked_shl(failures.min(6)).unwrap_or(64);
-        INITIAL_DIAL_BACKOFF
-            .saturating_mul(multiplier)
-            .min(MAX_DIAL_BACKOFF)
-    }
-
-    fn dial_peer_with_backoff(&mut self, peer: PeerId, addr: Multiaddr) -> Result<bool> {
-        let now = Instant::now();
-        let key = Self::dial_key(peer, &addr);
-        let next_attempt_at = self
-            .dial_attempts
-            .get(&key)
-            .map(|state| state.next_attempt_at)
-            .unwrap_or(now);
-        if next_attempt_at > now {
-            self.retry_suppressed_dials = self.retry_suppressed_dials.saturating_add(1);
-            return Ok(false);
-        }
-        match self.swarm.dial(addr) {
-            Ok(()) => {
-                let state = self
-                    .dial_attempts
-                    .entry(key)
-                    .or_insert_with(|| DialAttemptState::new(now));
-                state.failures = 0;
-                state.next_attempt_at = now + INITIAL_DIAL_BACKOFF;
-                Ok(true)
-            }
-            Err(err)
-                if err
-                    .to_string()
-                    .to_ascii_lowercase()
-                    .contains("duplicate connection") =>
-            {
-                let state = self
-                    .dial_attempts
-                    .entry(key)
-                    .or_insert_with(|| DialAttemptState::new(now));
-                state.failures = 0;
-                state.next_attempt_at = now + INITIAL_DIAL_BACKOFF;
-                Ok(false)
-            }
-            Err(err) => {
-                self.dial_failures = self.dial_failures.saturating_add(1);
-                let state = self
-                    .dial_attempts
-                    .entry(key)
-                    .or_insert_with(|| DialAttemptState::new(now));
-                state.failures = state.failures.saturating_add(1);
-                state.next_attempt_at = now + Self::dial_backoff_for_failures(state.failures);
-                Err(anyhow!(err))
-            }
-        }
-    }
-
-    pub fn publish(&mut self, scope: &SwarmScope, kind: GossipKind, payload: &[u8]) -> Result<()> {
-        let topic_name = self.config.namespace.topic_name(scope, kind)?;
-        if !self
-            .traffic_guard
-            .allow_local_publish(&topic_name, Instant::now())
-        {
-            bail!("LocalTopicRateLimited");
-        }
-        let topic = IdentTopic::new(topic_name);
-        let envelope = RawGossipMessage {
-            scope: scope.clone(),
-            kind,
-            payload: payload.to_vec(),
-        };
-        self.swarm
-            .behaviour_mut()
-            .gossipsub
-            .publish(topic, envelope.encode_json()?)
-            .map_err(|err| anyhow!(err))?;
-        Ok(())
-    }
-
-    pub fn send_backfill_request(
-        &mut self,
-        peer: &PeerId,
-        request: RawBackfillRequest,
-    ) -> Result<BackfillRequestId> {
-        self.ensure_outbound_request_capacity()?;
-        request.validate(
-            self.config.max_backfill_events,
-            self.config.max_backfill_events_hard_limit,
-        )?;
-        let request_id = self
-            .swarm
-            .behaviour_mut()
-            .request_response
-            .send_request(peer, RawControlRequest::Backfill(request));
-        self.pending_outbound_request_kinds
-            .insert(request_id, PendingRequestKind::Backfill);
-        Ok(request_id)
-    }
-
-    pub fn send_backfill_response(
-        &mut self,
-        channel: BackfillResponseChannel,
-        response: RawBackfillResponse,
-    ) -> Result<()> {
-        response.validate(
-            self.config.max_backfill_events,
-            self.config.max_backfill_events_hard_limit,
-        )?;
-        self.swarm
-            .behaviour_mut()
-            .request_response
-            .send_response(channel, RawControlResponse::Backfill(response))
-            .map_err(|_| anyhow!("backfill response channel closed"))?;
-        Ok(())
-    }
-
-    pub fn send_contact_material_request(
-        &mut self,
-        peer: &PeerId,
-        request: RawContactMaterialRequest,
-    ) -> Result<ContactMaterialRequestId> {
-        self.ensure_outbound_request_capacity()?;
-        request.validate()?;
-        let request_id = self
-            .swarm
-            .behaviour_mut()
-            .request_response
-            .send_request(peer, RawControlRequest::ContactMaterial(request));
-        self.pending_outbound_request_kinds
-            .insert(request_id, PendingRequestKind::ContactMaterial);
-        Ok(request_id)
-    }
-
-    pub fn send_contact_material_response(
-        &mut self,
-        channel: ContactMaterialResponseChannel,
-        response: RawContactMaterialResponse,
-    ) -> Result<()> {
-        response.validate()?;
-        self.swarm
-            .behaviour_mut()
-            .request_response
-            .send_response(channel, RawControlResponse::ContactMaterial(response))
-            .map_err(|_| anyhow!("contact material response channel closed"))?;
-        Ok(())
-    }
-
-    pub fn send_peer_relationship_request(
-        &mut self,
-        peer: &PeerId,
-        request: RawPeerRelationshipRequest,
-    ) -> Result<PeerRelationshipRequestId> {
-        self.ensure_outbound_request_capacity()?;
-        request.validate()?;
-        let request_id = self
-            .swarm
-            .behaviour_mut()
-            .request_response
-            .send_request(peer, RawControlRequest::PeerRelationship(request));
-        self.pending_outbound_request_kinds
-            .insert(request_id, PendingRequestKind::PeerRelationship);
-        Ok(request_id)
-    }
-
-    pub fn send_peer_relationship_response(
-        &mut self,
-        channel: PeerRelationshipResponseChannel,
-        response: RawPeerRelationshipResponse,
-    ) -> Result<()> {
-        response.validate()?;
-        self.swarm
-            .behaviour_mut()
-            .request_response
-            .send_response(channel, RawControlResponse::PeerRelationship(response))
-            .map_err(|_| anyhow!("peer relationship response channel closed"))?;
-        Ok(())
-    }
-
-    pub fn send_peer_direct_message_request(
-        &mut self,
-        peer: &PeerId,
-        request: RawPeerDirectMessageRequest,
-    ) -> Result<PeerDirectMessageRequestId> {
-        self.ensure_outbound_request_capacity()?;
-        request.validate()?;
-        let request_id = self
-            .swarm
-            .behaviour_mut()
-            .request_response
-            .send_request(peer, RawControlRequest::PeerDirectMessage(request));
-        self.pending_outbound_request_kinds
-            .insert(request_id, PendingRequestKind::PeerDirectMessage);
-        Ok(request_id)
-    }
-
-    pub fn send_peer_direct_message_response(
-        &mut self,
-        channel: PeerDirectMessageResponseChannel,
-        response: RawPeerDirectMessageResponse,
-    ) -> Result<()> {
-        response.validate()?;
-        self.swarm
-            .behaviour_mut()
-            .request_response
-            .send_response(channel, RawControlResponse::PeerDirectMessage(response))
-            .map_err(|_| anyhow!("peer direct message response channel closed"))?;
-        Ok(())
-    }
-
-    fn ensure_outbound_request_capacity(&self) -> Result<()> {
-        if self.pending_outbound_request_kinds.len() >= MAX_PENDING_OUTBOUND_CONTROL_REQUESTS {
-            bail!("outbound control request queue is full");
-        }
-        Ok(())
-    }
-
-    fn ensure_inbound_request_capacity(&self) -> Result<()> {
-        if self.pending_inbound_request_kinds.len() >= MAX_PENDING_INBOUND_CONTROL_REQUESTS {
-            bail!("inbound control request queue is full");
-        }
-        Ok(())
-    }
-
-    pub async fn next_event(&mut self) -> Result<SubstrateRuntimeEvent> {
-        if let Some(event) = self.pending_events.pop_front() {
-            return Ok(event);
-        }
-        loop {
-            let swarm_event = self.swarm.select_next_some().await;
-            if let Some(event) = self.handle_swarm_event(swarm_event)? {
-                return Ok(event);
-            }
-        }
-    }
-
-    pub fn try_next_event(&mut self) -> Result<Option<SubstrateRuntimeEvent>> {
-        if let Some(event) = self.pending_events.pop_front() {
-            return Ok(Some(event));
-        }
-        loop {
-            let Some(event) = self.swarm.select_next_some().now_or_never() else {
-                return Ok(None);
-            };
-            if let Some(runtime_event) = self.handle_swarm_event(event)? {
-                return Ok(Some(runtime_event));
-            }
-        }
-    }
-
-    fn listen_on_configured_addrs(&mut self) -> Result<()> {
-        for addr in self.config.parse_listen_addrs()? {
-            self.swarm.listen_on(addr).map_err(|err| anyhow!(err))?;
-        }
-        Ok(())
-    }
-
-    fn seed_bootstrap_peers(&mut self) -> Result<()> {
-        for (peer, addr) in self.config.parse_bootstrap_peers()? {
-            self.register_peer_address(peer, addr.clone(), PeerDiscoverySourceKind::Bootstrap);
-            let _ = self.dial_peer_with_backoff(peer, addr.clone())?;
-            self.ensure_relay_reservation(peer, addr)?;
-        }
-        self.trigger_kademlia_refresh();
-        Ok(())
-    }
-
-    fn register_peer_address(
-        &mut self,
-        peer: PeerId,
-        addr: Multiaddr,
-        source: PeerDiscoverySourceKind,
-    ) {
-        self.swarm.add_peer_address(peer, addr.clone());
-        self.swarm
-            .behaviour_mut()
-            .gossipsub
-            .add_explicit_peer(&peer);
-        self.swarm
-            .behaviour_mut()
-            .kademlia
-            .add_address(&peer, addr.clone());
-        self.swarm
-            .behaviour_mut()
-            .autonat
-            .add_server(peer, Some(addr.clone()));
-        self.pending_events
-            .push_back(SubstrateRuntimeEvent::PeerDiscovered {
-                peer,
-                address: addr,
-                source,
-            });
-    }
-
-    fn ensure_relay_reservation(
-        &mut self,
-        relay_peer: PeerId,
-        relay_addr: Multiaddr,
-    ) -> Result<()> {
-        let listen_addr = relay_reservation_addr(relay_peer, &relay_addr);
-        let key = listen_addr.to_string();
-        if self.relay_reservations.contains(&key) {
-            return Ok(());
-        }
-        self.swarm
-            .listen_on(listen_addr)
-            .map_err(|err| anyhow!(err))?;
-        self.relay_reservations.insert(key);
-        Ok(())
-    }
-
-    fn maybe_dial_peer(&mut self, peer: PeerId, addr: Multiaddr, source: PeerDiscoverySourceKind) {
-        if peer == self.local_peer_id {
-            return;
-        }
-        if self.swarm.is_connected(&peer) {
-            self.register_peer_address(peer, addr, source);
-            return;
-        }
-        self.register_peer_address(peer, addr.clone(), source);
-        let _ = self.dial_peer_with_backoff(peer, addr);
-    }
-
-    fn trigger_kademlia_refresh(&mut self) {
-        let _ = self.swarm.behaviour_mut().kademlia.bootstrap();
-        let _ = self
-            .swarm
-            .behaviour_mut()
-            .kademlia
-            .get_closest_peers(self.local_peer_id);
-    }
-
-    fn handle_swarm_event(
-        &mut self,
-        event: SwarmEvent<SubstrateBehaviourEvent>,
-    ) -> Result<Option<SubstrateRuntimeEvent>> {
-        match event {
-            SwarmEvent::NewListenAddr { address, .. } => {
-                if !self.listen_addrs.iter().any(|seen| seen == &address) {
-                    self.listen_addrs.push(address.clone());
-                }
-                Ok(Some(SubstrateRuntimeEvent::NewListenAddr { address }))
-            }
-            SwarmEvent::ConnectionEstablished {
-                peer_id, endpoint, ..
-            } => {
-                self.trigger_kademlia_refresh();
-                let remote_addr = endpoint.get_remote_address().clone();
-                Ok(Some(SubstrateRuntimeEvent::ConnectionEstablished {
-                    peer: peer_id,
-                    remote_addr,
-                }))
-            }
-            SwarmEvent::ConnectionClosed {
-                peer_id,
-                num_established,
-                ..
-            } => Ok(Some(SubstrateRuntimeEvent::ConnectionClosed {
-                peer: peer_id,
-                remaining_established: num_established,
-            })),
-            SwarmEvent::Behaviour(SubstrateBehaviourEvent::Gossipsub(
-                GossipsubEvent::Message {
-                    propagation_source,
-                    message,
-                    ..
-                },
-            )) => {
-                let topic = message.topic.to_string();
-                if !self.traffic_guard.allow_inbound_gossip(
-                    propagation_source,
-                    &topic,
-                    &message.data,
-                    Instant::now(),
-                ) {
-                    return Ok(None);
-                }
-                let message = match RawGossipMessage::decode_json(&message.data) {
-                    Ok(message) => message,
-                    Err(_) => {
-                        self.traffic_guard
-                            .note_invalid_gossip_message(propagation_source, Instant::now());
-                        return Ok(None);
-                    }
-                };
-                Ok(Some(SubstrateRuntimeEvent::Gossip {
-                    propagation_source,
-                    message,
-                }))
-            }
-            SwarmEvent::Behaviour(SubstrateBehaviourEvent::RequestResponse(
-                request_response::Event::Message { peer, message, .. },
-            )) => match message {
-                RequestResponseMessage::Request {
-                    request_id,
-                    request,
-                    channel,
-                } => {
-                    if self.ensure_inbound_request_capacity().is_err() {
-                        self.traffic_guard
-                            .note_invalid_control_message(peer, Instant::now());
-                        return Ok(None);
-                    }
-                    if let Err(_err) = request.validate(
-                        self.config.max_backfill_events,
-                        self.config.max_backfill_events_hard_limit,
-                    ) {
-                        self.traffic_guard
-                            .note_invalid_control_message(peer, Instant::now());
-                        return Ok(None);
-                    }
-                    let control_kind = ControlRequestKind::from_request(&request);
-                    if !self
-                        .traffic_guard
-                        .allow_control_request(peer, control_kind, Instant::now())
-                    {
-                        return Ok(None);
-                    }
-                    let request_kind = PendingRequestKind::for_request(&request);
-                    match request {
-                        RawControlRequest::Backfill(request) => {
-                            self.pending_inbound_request_kinds
-                                .insert(request_id, request_kind);
-                            Ok(Some(SubstrateRuntimeEvent::BackfillRequest {
-                                peer,
-                                request,
-                                channel,
-                            }))
-                        }
-                        RawControlRequest::ContactMaterial(request) => {
-                            self.pending_inbound_request_kinds
-                                .insert(request_id, request_kind);
-                            Ok(Some(SubstrateRuntimeEvent::ContactMaterialRequest {
-                                peer,
-                                request,
-                                channel,
-                            }))
-                        }
-                        RawControlRequest::PeerRelationship(request) => {
-                            self.pending_inbound_request_kinds
-                                .insert(request_id, request_kind);
-                            Ok(Some(SubstrateRuntimeEvent::PeerRelationshipRequest {
-                                peer,
-                                request,
-                                channel,
-                            }))
-                        }
-                        RawControlRequest::PeerDirectMessage(request) => {
-                            self.pending_inbound_request_kinds
-                                .insert(request_id, request_kind);
-                            Ok(Some(SubstrateRuntimeEvent::PeerDirectMessageRequest {
-                                peer,
-                                request,
-                                channel,
-                            }))
-                        }
-                    }
-                }
-                RequestResponseMessage::Response {
-                    request_id,
-                    response,
-                } => {
-                    if let Err(err) = response.validate(
-                        self.config.max_backfill_events,
-                        self.config.max_backfill_events_hard_limit,
-                    ) {
-                        self.response_validation_failures =
-                            self.response_validation_failures.saturating_add(1);
-                        self.traffic_guard
-                            .note_invalid_control_message(peer, Instant::now());
-                        let error = format!("invalid control response: {err}");
-                        return Ok(
-                            match self.pending_outbound_request_kinds.remove(&request_id) {
-                                Some(PendingRequestKind::Backfill) | None => {
-                                    Some(SubstrateRuntimeEvent::BackfillOutboundFailure {
-                                        peer,
-                                        request_id,
-                                        error,
-                                    })
-                                }
-                                Some(PendingRequestKind::ContactMaterial) => {
-                                    Some(SubstrateRuntimeEvent::ContactMaterialOutboundFailure {
-                                        peer,
-                                        request_id,
-                                        error,
-                                    })
-                                }
-                                Some(PendingRequestKind::PeerRelationship) => {
-                                    Some(SubstrateRuntimeEvent::PeerRelationshipOutboundFailure {
-                                        peer,
-                                        request_id,
-                                        error,
-                                    })
-                                }
-                                Some(PendingRequestKind::PeerDirectMessage) => {
-                                    Some(SubstrateRuntimeEvent::PeerDirectMessageOutboundFailure {
-                                        peer,
-                                        request_id,
-                                        error,
-                                    })
-                                }
-                            },
-                        );
-                    }
-                    match response {
-                        RawControlResponse::Backfill(response) => {
-                            self.pending_outbound_request_kinds.remove(&request_id);
-                            Ok(Some(SubstrateRuntimeEvent::BackfillResponse {
-                                peer,
-                                request_id,
-                                response,
-                            }))
-                        }
-                        RawControlResponse::ContactMaterial(response) => {
-                            self.pending_outbound_request_kinds.remove(&request_id);
-                            Ok(Some(SubstrateRuntimeEvent::ContactMaterialResponse {
-                                peer,
-                                request_id,
-                                response,
-                            }))
-                        }
-                        RawControlResponse::PeerRelationship(response) => {
-                            self.pending_outbound_request_kinds.remove(&request_id);
-                            Ok(Some(SubstrateRuntimeEvent::PeerRelationshipResponse {
-                                peer,
-                                request_id,
-                                response,
-                            }))
-                        }
-                        RawControlResponse::PeerDirectMessage(response) => {
-                            self.pending_outbound_request_kinds.remove(&request_id);
-                            Ok(Some(SubstrateRuntimeEvent::PeerDirectMessageResponse {
-                                peer,
-                                request_id,
-                                response,
-                            }))
-                        }
-                    }
-                }
-            },
-            SwarmEvent::Behaviour(SubstrateBehaviourEvent::RequestResponse(
-                request_response::Event::OutboundFailure {
-                    peer,
-                    request_id,
-                    error,
-                    ..
-                },
-            )) => match self.pending_outbound_request_kinds.remove(&request_id) {
-                Some(PendingRequestKind::Backfill) | None => {
-                    self.traffic_guard
-                        .note_backfill_failure(peer, Instant::now());
-                    Ok(Some(SubstrateRuntimeEvent::BackfillOutboundFailure {
-                        peer,
-                        request_id,
-                        error: error.to_string(),
-                    }))
-                }
-                Some(PendingRequestKind::ContactMaterial) => Ok(Some(
-                    SubstrateRuntimeEvent::ContactMaterialOutboundFailure {
-                        peer,
-                        request_id,
-                        error: error.to_string(),
-                    },
-                )),
-                Some(PendingRequestKind::PeerRelationship) => Ok(Some(
-                    SubstrateRuntimeEvent::PeerRelationshipOutboundFailure {
-                        peer,
-                        request_id,
-                        error: error.to_string(),
-                    },
-                )),
-                Some(PendingRequestKind::PeerDirectMessage) => Ok(Some(
-                    SubstrateRuntimeEvent::PeerDirectMessageOutboundFailure {
-                        peer,
-                        request_id,
-                        error: error.to_string(),
-                    },
-                )),
-            },
-            SwarmEvent::Behaviour(SubstrateBehaviourEvent::RequestResponse(
-                request_response::Event::InboundFailure {
-                    peer,
-                    request_id,
-                    error,
-                    ..
-                },
-            )) => match self.pending_inbound_request_kinds.remove(&request_id) {
-                Some(PendingRequestKind::Backfill) | None => {
-                    self.traffic_guard
-                        .note_backfill_failure(peer, Instant::now());
-                    Ok(Some(SubstrateRuntimeEvent::BackfillInboundFailure {
-                        peer,
-                        error: error.to_string(),
-                    }))
-                }
-                Some(PendingRequestKind::ContactMaterial) => {
-                    Ok(Some(SubstrateRuntimeEvent::ContactMaterialInboundFailure {
-                        peer,
-                        error: error.to_string(),
-                    }))
-                }
-                Some(PendingRequestKind::PeerRelationship) => Ok(Some(
-                    SubstrateRuntimeEvent::PeerRelationshipInboundFailure {
-                        peer,
-                        error: error.to_string(),
-                    },
-                )),
-                Some(PendingRequestKind::PeerDirectMessage) => Ok(Some(
-                    SubstrateRuntimeEvent::PeerDirectMessageInboundFailure {
-                        peer,
-                        error: error.to_string(),
-                    },
-                )),
-            },
-            SwarmEvent::Behaviour(SubstrateBehaviourEvent::RequestResponse(
-                request_response::Event::ResponseSent { request_id, .. },
-            )) => {
-                self.pending_inbound_request_kinds.remove(&request_id);
-                Ok(None)
-            }
-            SwarmEvent::Behaviour(SubstrateBehaviourEvent::Mdns(mdns::Event::Discovered(
-                discovered,
-            ))) => {
-                for (peer, addr) in discovered {
-                    self.maybe_dial_peer(peer, addr, PeerDiscoverySourceKind::Mdns);
-                }
-                Ok(None)
-            }
-            SwarmEvent::Behaviour(SubstrateBehaviourEvent::Mdns(mdns::Event::Expired(expired))) => {
-                for (peer, _) in expired {
-                    self.swarm
-                        .behaviour_mut()
-                        .gossipsub
-                        .remove_explicit_peer(&peer);
-                }
-                Ok(None)
-            }
-            SwarmEvent::Behaviour(SubstrateBehaviourEvent::Identify(
-                identify::Event::Received { peer_id, info, .. },
-            )) => match self.validate_identify_info(&info) {
-                Ok((listen_addrs, metadata)) => {
-                    for addr in listen_addrs {
-                        self.register_peer_address(
-                            peer_id,
-                            addr,
-                            PeerDiscoverySourceKind::Identify,
-                        );
-                    }
-                    self.pending_events
-                        .push_back(SubstrateRuntimeEvent::PeerIdentified {
-                            peer: peer_id,
-                            metadata,
-                        });
-                    self.trigger_kademlia_refresh();
-                    Ok(None)
-                }
-                Err(err) => {
-                    self.traffic_guard
-                        .note_handshake_rejection(peer_id, Instant::now());
-                    let detail = err.to_string();
-                    let _ = self.swarm.disconnect_peer_id(peer_id);
-                    Ok(Some(SubstrateRuntimeEvent::PeerHandshakeRejected {
-                        peer: peer_id,
-                        detail,
-                    }))
-                }
-            },
-            SwarmEvent::Behaviour(SubstrateBehaviourEvent::Relay(
-                relay::client::Event::ReservationReqAccepted {
-                    relay_peer_id,
-                    renewal,
-                    ..
-                },
-            )) => Ok(Some(SubstrateRuntimeEvent::RelayReservationAccepted {
-                relay_peer: relay_peer_id,
-                renewal,
-            })),
-            SwarmEvent::Behaviour(SubstrateBehaviourEvent::Relay(
-                relay::client::Event::OutboundCircuitEstablished { relay_peer_id, .. },
-            )) => Ok(Some(SubstrateRuntimeEvent::RelayCircuitEstablished {
-                relay_peer: relay_peer_id,
-            })),
-            SwarmEvent::Behaviour(SubstrateBehaviourEvent::Relay(
-                relay::client::Event::InboundCircuitEstablished { src_peer_id, .. },
-            )) => Ok(Some(
-                SubstrateRuntimeEvent::RelayInboundCircuitEstablished {
-                    source_peer: src_peer_id,
-                },
-            )),
-            SwarmEvent::Behaviour(SubstrateBehaviourEvent::Autonat(
-                autonat::Event::StatusChanged { old, new },
-            )) => {
-                let old_label = nat_status_label(&old);
-                let new_label = nat_status_label(&new);
-                let public_address = self.swarm.behaviour().autonat.public_address().cloned();
-                let confidence = self.swarm.behaviour().autonat.confidence();
-                self.nat_status = new_label.clone();
-                self.nat_public_address = public_address.clone();
-                self.nat_confidence = confidence as u32;
-                Ok(Some(SubstrateRuntimeEvent::NatStatusChanged {
-                    old: old_label,
-                    new: new_label,
-                    public_address,
-                    confidence,
-                }))
-            }
-            SwarmEvent::Behaviour(SubstrateBehaviourEvent::Dcutr(dcutr::Event {
-                remote_peer_id,
-                result,
-            })) => match result {
-                Ok(_) => Ok(Some(
-                    SubstrateRuntimeEvent::DcutrConnectionUpgradeSucceeded {
-                        remote_peer: remote_peer_id,
-                    },
-                )),
-                Err(err) => Ok(Some(SubstrateRuntimeEvent::DcutrConnectionUpgradeFailed {
-                    remote_peer: remote_peer_id,
-                    error: err.to_string(),
-                })),
-            },
-            SwarmEvent::Behaviour(SubstrateBehaviourEvent::Kademlia(
-                kad::Event::RoutingUpdated {
-                    peer, addresses, ..
-                },
-            )) => {
-                for addr in addresses.into_vec() {
-                    self.maybe_dial_peer(peer, addr, PeerDiscoverySourceKind::Kademlia);
-                }
-                Ok(None)
-            }
-            SwarmEvent::Behaviour(SubstrateBehaviourEvent::Kademlia(
-                kad::Event::OutboundQueryProgressed {
-                    result: kad::QueryResult::GetClosestPeers(Ok(ok)),
-                    ..
-                },
-            )) => {
-                for peer in ok.peers {
-                    for addr in peer.addrs {
-                        self.maybe_dial_peer(peer.peer_id, addr, PeerDiscoverySourceKind::Kademlia);
-                    }
-                }
-                Ok(None)
-            }
-            _ => Ok(None),
-        }
-    }
-}
-
-fn parse_peer_multiaddr(raw: &str) -> Result<(PeerId, Multiaddr)> {
-    let mut addr = raw
-        .parse::<Multiaddr>()
-        .map_err(|err| anyhow!("invalid bootstrap peer address '{}': {err}", raw))?;
-    let Some(Protocol::P2p(peer)) = addr.pop() else {
-        bail!("bootstrap peer address must end with /p2p/<peer_id>: {raw}");
-    };
-    Ok((peer, addr))
-}
-
-fn prune_window(entries: &mut Vec<Instant>, now: Instant, window: Duration) {
-    entries.retain(|ts| now.duration_since(*ts) <= window);
-}
-
-fn traffic_digest(data: &[u8]) -> u64 {
-    let mut hasher = DefaultHasher::new();
-    data.hash(&mut hasher);
-    hasher.finish()
-}
-
-fn throttled_limit(base: usize, policy: TrafficPolicyTier) -> usize {
-    let factor = policy.throttle_factor_percent() as usize;
-    ((base.saturating_mul(factor)).max(100)) / 100
-}
-
 fn validate_max_bytes(label: &str, value: &str, max_bytes: usize) -> Result<()> {
     if value.len() > max_bytes {
         bail!("{label} exceeds configured max bytes");
     }
     Ok(())
-}
-
-fn nat_status_label(status: &autonat::NatStatus) -> String {
-    match status {
-        autonat::NatStatus::Public(_) => "public".to_owned(),
-        autonat::NatStatus::Private => "private".to_owned(),
-        autonat::NatStatus::Unknown => "unknown".to_owned(),
-    }
-}
-
-pub fn relay_reservation_addr(relay_peer: PeerId, relay_addr: &Multiaddr) -> Multiaddr {
-    relay_addr
-        .clone()
-        .with(Protocol::P2p(relay_peer))
-        .with(Protocol::P2pCircuit)
 }
 
 pub fn sanitize_segment(raw: &str) -> Result<String> {
@@ -2766,18 +2329,6 @@ mod tests {
     }
 
     #[test]
-    fn traffic_guard_limits_non_backfill_control_requests() {
-        let peer = PeerId::random();
-        let mut guard = TrafficGuard::new();
-        let now = Instant::now();
-
-        for _ in 0..PER_PEER_CONTROL_REQUESTS_PER_WINDOW {
-            assert!(guard.allow_control_request(peer, ControlRequestKind::PeerDirectMessage, now));
-        }
-        assert!(!guard.allow_control_request(peer, ControlRequestKind::PeerDirectMessage, now));
-    }
-
-    #[test]
     fn peer_handshake_roundtrip() {
         let handshake = PeerHandshakeMetadata {
             network_id: "mainnet".to_owned(),
@@ -2787,30 +2338,6 @@ mod tests {
         let encoded = handshake.encode_agent_version();
         let decoded = PeerHandshakeMetadata::decode_agent_version(&encoded).unwrap();
         assert_eq!(decoded, handshake);
-    }
-
-    #[test]
-    fn config_parses_multiaddrs() {
-        let config = SubstrateConfig {
-            listen_addrs: vec!["/ip4/127.0.0.1/tcp/4101".to_owned()],
-            bootstrap_peers: vec![
-                "/ip4/127.0.0.1/tcp/4102/p2p/12D3KooWLUtmMxdKgf6D9A7feN4zkRgZNpmjQe7YQDdyCjTiMQuH"
-                    .to_owned(),
-            ],
-            ..SubstrateConfig::default()
-        };
-        assert_eq!(config.parse_listen_addrs().unwrap().len(), 1);
-        assert_eq!(config.parse_bootstrap_peers().unwrap().len(), 1);
-    }
-
-    #[test]
-    fn backfill_request_response_config_uses_extended_timeout() {
-        let config = backfill_request_response_config();
-        let rendered = format!("{config:?}");
-        assert!(
-            rendered.contains("30s"),
-            "request-response config should use 30s timeout, got: {rendered}"
-        );
     }
 
     #[test]
@@ -2859,131 +2386,6 @@ mod tests {
                 .as_ref()
                 .and_then(|entry| entry.capability.as_deref()),
             Some("peer.relationship.request")
-        );
-    }
-
-    #[tokio::test]
-    async fn bootstrap_peers_emit_discovery_events() {
-        let bootstrap_key = identity::Keypair::generate_ed25519();
-        let bootstrap_peer = bootstrap_key.public().to_peer_id();
-        let config = SubstrateConfig {
-            listen_addrs: vec!["/ip4/127.0.0.1/tcp/0".to_owned()],
-            bootstrap_peers: vec![format!("/ip4/127.0.0.1/tcp/4102/p2p/{bootstrap_peer}")],
-            enable_mdns: false,
-            ..SubstrateConfig::default()
-        };
-
-        let node = SubstrateNode::generate(config).expect("node");
-        let mut runtime = SubstrateRuntime::new(node).expect("runtime");
-        let event = runtime
-            .try_next_event()
-            .expect("runtime event poll")
-            .expect("bootstrap discovery event");
-
-        match event {
-            SubstrateRuntimeEvent::PeerDiscovered {
-                peer,
-                address,
-                source,
-            } => {
-                assert_eq!(peer, bootstrap_peer);
-                assert_eq!(address.to_string(), "/ip4/127.0.0.1/tcp/4102");
-                assert_eq!(source, PeerDiscoverySourceKind::Bootstrap);
-            }
-            other => panic!("expected bootstrap peer discovery event, got {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn malformed_gossip_is_dropped_without_runtime_error() {
-        let config = SubstrateConfig {
-            listen_addrs: vec!["/ip4/127.0.0.1/tcp/0".to_owned()],
-            enable_mdns: false,
-            ..SubstrateConfig::default()
-        };
-        let node = SubstrateNode::generate(config).expect("node");
-        let mut runtime = SubstrateRuntime::new(node).expect("runtime");
-        let peer = identity::Keypair::generate_ed25519().public().to_peer_id();
-        let event = SwarmEvent::Behaviour(SubstrateBehaviourEvent::Gossipsub(
-            GossipsubEvent::Message {
-                propagation_source: peer,
-                message_id: libp2p::gossipsub::MessageId(vec![1]),
-                message: libp2p::gossipsub::Message {
-                    source: Some(peer),
-                    data: b"{not-json".to_vec(),
-                    sequence_number: Some(1),
-                    topic: libp2p::gossipsub::TopicHash::from_raw("bad.topic"),
-                },
-            },
-        ));
-
-        assert!(
-            runtime
-                .handle_swarm_event(event)
-                .expect("malformed gossip should not fail runtime")
-                .is_none()
-        );
-        let health = runtime.observability_snapshot().peer_health;
-        assert_eq!(health.len(), 1);
-        assert_eq!(health[0].peer, peer.to_string());
-        assert!(health[0].score < 0);
-    }
-
-    #[tokio::test]
-    async fn subscribe_scope_kinds_tracks_only_requested_gossip_kinds() {
-        let config = SubstrateConfig {
-            listen_addrs: vec!["/ip4/127.0.0.1/tcp/0".to_owned()],
-            enable_mdns: false,
-            ..SubstrateConfig::default()
-        };
-        let namespace = config.namespace.clone();
-        let node = SubstrateNode::generate(config).expect("node");
-        let mut runtime = SubstrateRuntime::new(node).expect("runtime");
-        let scope = SwarmScope::Group("crew-7".to_owned());
-
-        runtime
-            .subscribe_scope_kinds(&scope, &[GossipKind::Events, GossipKind::Messages])
-            .expect("subscribe selected kinds");
-
-        assert!(
-            runtime.subscribed_topics.contains(
-                &namespace
-                    .topic_name(&scope, GossipKind::Events)
-                    .expect("events topic")
-            )
-        );
-        assert!(
-            runtime.subscribed_topics.contains(
-                &namespace
-                    .topic_name(&scope, GossipKind::Messages)
-                    .expect("messages topic")
-            )
-        );
-        assert!(
-            !runtime.subscribed_topics.contains(
-                &namespace
-                    .topic_name(&scope, GossipKind::Rules)
-                    .expect("rules topic")
-            )
-        );
-
-        runtime
-            .unsubscribe_scope_kinds(&scope, &[GossipKind::Messages])
-            .expect("unsubscribe selected kind");
-
-        assert!(
-            runtime.subscribed_topics.contains(
-                &namespace
-                    .topic_name(&scope, GossipKind::Events)
-                    .expect("events topic")
-            )
-        );
-        assert!(
-            !runtime.subscribed_topics.contains(
-                &namespace
-                    .topic_name(&scope, GossipKind::Messages)
-                    .expect("messages topic")
-            )
         );
     }
 }

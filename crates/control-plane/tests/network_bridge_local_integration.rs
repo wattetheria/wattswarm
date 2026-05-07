@@ -11,9 +11,9 @@ fn network_bridge_local_test_guard() -> MutexGuard<'static, ()> {
 }
 
 #[test]
-fn two_nodes_sync_global_event_over_libp2p() {
+fn two_nodes_sync_global_event_over_iroh() {
     let _guard = network_bridge_local_test_guard();
-    support::network_bridge::two_nodes_sync_global_event_over_libp2p();
+    support::network_bridge::two_nodes_sync_global_event_over_iroh();
 }
 
 #[test]

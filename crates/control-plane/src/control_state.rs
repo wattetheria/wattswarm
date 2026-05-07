@@ -727,10 +727,10 @@ pub fn local_peer_id(state_dir: &Path) -> Result<String> {
         .try_into()
         .map_err(|_| anyhow!("seed must be 32 bytes"))?;
     let identity = NodeIdentity::from_seed(arr);
-    Ok(
-        crate::network_p2p::peer_id_from_ed25519_public_key(identity.verifying_key().to_bytes())?
-            .to_string(),
-    )
+    Ok(crate::network_p2p::network_peer_id_from_ed25519_public_key(
+        identity.verifying_key().to_bytes(),
+    )?
+    .to_string())
 }
 
 pub fn resolve_node_mode(state_dir: &Path) -> Result<NodeMode> {

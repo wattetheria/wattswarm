@@ -27,7 +27,7 @@ impl NetworkBridgeService {
                     ),
                 })
             }
-            NetworkRuntimeEvent::PeerIdentified { peer, metadata } => {
+            NetworkRuntimeEvent::PeerMetadataObserved { peer, metadata } => {
                 let mut missing_contact_material = false;
                 if let Some(state_dir) = &self.state_dir {
                     let now = chrono::Utc::now().timestamp_millis().max(0) as u64;
@@ -114,18 +114,20 @@ impl NetworkBridgeService {
                     detail: format!("relay_inbound_circuit_established source_peer={source_peer}"),
                 })
             }
-            NetworkRuntimeEvent::DcutrConnectionUpgradeSucceeded { remote_peer } => {
+            NetworkRuntimeEvent::DirectUpgradeConnectionUpgradeSucceeded { remote_peer } => {
                 Ok(NetworkBridgeTick::TransportNotice {
-                    detail: format!("dcutr_upgrade_succeeded remote_peer={remote_peer}"),
+                    detail: format!("direct_upgrade_upgrade_succeeded remote_peer={remote_peer}"),
                 })
             }
-            NetworkRuntimeEvent::DcutrConnectionUpgradeFailed { remote_peer, error } => {
+            NetworkRuntimeEvent::DirectUpgradeConnectionUpgradeFailed { remote_peer, error } => {
                 Ok(NetworkBridgeTick::TransportNotice {
-                    detail: format!("dcutr_upgrade_failed remote_peer={remote_peer} error={error}"),
+                    detail: format!(
+                        "direct_upgrade_upgrade_failed remote_peer={remote_peer} error={error}"
+                    ),
                 })
             }
             NetworkRuntimeEvent::ConnectionEstablished { peer, remote_addr } => {
-                self.mark_peer_connected(peer);
+                let newly_connected = self.mark_peer_connected(peer.clone());
                 if let Some(state_dir) = &self.state_dir {
                     let remote_addr_text = remote_addr.to_string();
                     let _ = crate::control::add_discovered_peer_endpoint_with_source(
@@ -141,7 +143,7 @@ impl NetworkBridgeService {
                             "transport",
                             "connection.established",
                             "ok",
-                            format!("libp2p connection established: {peer}"),
+                            format!("iroh connection established: {peer}"),
                         )
                         .object("peer", Some(peer.to_string()))
                         .source_node_id(Some(peer.to_string()))
@@ -149,6 +151,16 @@ impl NetworkBridgeService {
                             "remote_addr": remote_addr_text,
                         })),
                     );
+                }
+                if !newly_connected {
+                    return Ok(NetworkBridgeTick::TransportNotice {
+                        detail: format!("iroh topic neighbor already connected: {peer}"),
+                    });
+                }
+                if self.state_dir.is_some()
+                    && let Err(err) = self.request_peer_contact_material(&peer.to_string())
+                {
+                    eprintln!("contact material request failed for {peer}: {err}");
                 }
                 let _ = self.request_backfill_for_peer(&peer, node)?;
                 if !node.store.is_node_penalized(&node.node_id())? {
@@ -168,7 +180,7 @@ impl NetworkBridgeService {
                 Ok(NetworkBridgeTick::Connected { peer })
             }
             NetworkRuntimeEvent::PeerHandshakeRejected { peer, detail } => {
-                self.mark_peer_disconnected(peer);
+                self.mark_peer_disconnected(peer.clone());
                 if let Some(state_dir) = &self.state_dir {
                     let now = chrono::Utc::now().timestamp_millis().max(0) as u64;
                     let existing = crate::control::load_peer_metadata_records_state(state_dir)
@@ -256,7 +268,7 @@ impl NetworkBridgeService {
                             } else {
                                 "remaining"
                             },
-                            format!("libp2p connection closed: {peer}"),
+                            format!("iroh connection closed: {peer}"),
                         )
                         .object("peer", Some(peer.to_string()))
                         .source_node_id(Some(peer.to_string()))
@@ -266,7 +278,7 @@ impl NetworkBridgeService {
                     );
                 }
                 if remaining_established == 0 {
-                    self.mark_peer_disconnected(peer);
+                    self.mark_peer_disconnected(peer.clone());
                     Ok(NetworkBridgeTick::Disconnected { peer })
                 } else {
                     Ok(NetworkBridgeTick::TransportNotice {
@@ -280,10 +292,13 @@ impl NetworkBridgeService {
                 propagation_source,
                 message,
             } => {
-                self.connected_peers.insert(propagation_source);
+                self.connected_peers.insert(propagation_source.clone());
                 match message {
                     GossipMessage::Event(envelope) => {
-                        self.record_peer_scope_activity(propagation_source, &envelope.scope);
+                        self.record_peer_scope_activity(
+                            propagation_source.clone(),
+                            &envelope.scope,
+                        );
                         let ingested_event = ingest_event_envelope(node, &envelope)?;
                         diagnostics::record_diagnostic(
                             self.state_dir.as_deref(),
@@ -351,7 +366,10 @@ impl NetworkBridgeService {
                         })
                     }
                     GossipMessage::Chat(envelope) => {
-                        self.record_peer_scope_activity(propagation_source, &envelope.scope);
+                        self.record_peer_scope_activity(
+                            propagation_source.clone(),
+                            &envelope.scope,
+                        );
                         let ingested_event = ingest_event_envelope(node, &envelope)?;
                         diagnostics::record_diagnostic(
                             self.state_dir.as_deref(),
@@ -420,7 +438,7 @@ impl NetworkBridgeService {
                         })
                     }
                     GossipMessage::Summary(summary) => {
-                        self.record_peer_scope_activity(propagation_source, &summary.scope);
+                        self.record_peer_scope_activity(propagation_source.clone(), &summary.scope);
                         apply_summary_announcement(node, &summary)?;
                         if summary.summary_kind == AGENT_PAYMENT_SUMMARY_KIND
                             && let Some(state_dir) = &self.state_dir
@@ -438,7 +456,7 @@ impl NetworkBridgeService {
                         })
                     }
                     GossipMessage::Rule(rule) => {
-                        self.record_peer_scope_activity(propagation_source, &rule.scope);
+                        self.record_peer_scope_activity(propagation_source.clone(), &rule.scope);
                         apply_rule_announcement(node, &rule)?;
                         self.record_scope_rule_applied(&rule.scope);
                         Ok(NetworkBridgeTick::RuleApplied {
@@ -448,7 +466,10 @@ impl NetworkBridgeService {
                         })
                     }
                     GossipMessage::Checkpoint(checkpoint) => {
-                        self.record_peer_scope_activity(propagation_source, &checkpoint.scope);
+                        self.record_peer_scope_activity(
+                            propagation_source.clone(),
+                            &checkpoint.scope,
+                        );
                         apply_checkpoint_announcement(node, &checkpoint)?;
                         if let Some(state_dir) = &self.state_dir {
                             let _ = crate::control::save_data_source_binding_record_state(
@@ -503,10 +524,10 @@ impl NetworkBridgeService {
                 request_id,
                 response,
             } => {
-                self.record_peer_scope_activity(peer, &response.scope);
-                self.mark_backfill_completed(peer);
+                self.record_peer_scope_activity(peer.clone(), &response.scope);
+                self.mark_backfill_completed(peer.clone());
                 self.record_peer_remote_head_event_ids(
-                    peer,
+                    peer.clone(),
                     &response.scope,
                     response.feed_key.as_deref(),
                     &response.head_event_ids,
@@ -523,13 +544,13 @@ impl NetworkBridgeService {
                 }
                 if unknown_empty_head {
                     self.reset_peer_backfill_cursor(
-                        peer,
+                        peer.clone(),
                         &response.scope,
                         response.feed_key.as_deref(),
                     );
                 } else {
                     self.record_peer_backfill_cursor(
-                        peer,
+                        peer.clone(),
                         &response.scope,
                         response.feed_key.as_deref(),
                         response.next_from_event_seq,
@@ -611,7 +632,7 @@ impl NetworkBridgeService {
                 request_id,
                 error,
             } => {
-                self.mark_backfill_failed(peer);
+                self.mark_backfill_failed(peer.clone());
                 Ok(NetworkBridgeTick::BackfillFailed {
                     peer,
                     request_id,
@@ -765,7 +786,7 @@ impl NetworkBridgeService {
                             updated_at: now,
                         },
                         NetworkBridgeTick::PeerRelationshipFailed {
-                            peer,
+                            peer: peer.clone(),
                             action,
                             error,
                         },
@@ -796,7 +817,7 @@ impl NetworkBridgeService {
                             updated_at: now,
                         },
                         NetworkBridgeTick::PeerRelationshipFailed {
-                            peer,
+                            peer: peer.clone(),
                             action,
                             error,
                         },
@@ -894,7 +915,7 @@ impl NetworkBridgeService {
                                     updated_at: record.updated_at,
                                 },
                                 NetworkBridgeTick::PeerRelationshipUpdated {
-                                    peer,
+                                    peer: peer.clone(),
                                     action,
                                     relationship_state: record.relationship_state,
                                     initiated_by: crate::control::PeerRelationshipInitiator::Remote,
@@ -924,7 +945,7 @@ impl NetworkBridgeService {
                                     updated_at: now,
                                 },
                                 NetworkBridgeTick::PeerRelationshipFailed {
-                                    peer,
+                                    peer: peer.clone(),
                                     action,
                                     error,
                                 },
@@ -956,7 +977,7 @@ impl NetworkBridgeService {
                             updated_at: now,
                         },
                         NetworkBridgeTick::PeerRelationshipFailed {
-                            peer,
+                            peer: peer.clone(),
                             action,
                             error,
                         },
@@ -998,7 +1019,7 @@ impl NetworkBridgeService {
                 let local_node_id = self.local_peer_id().to_string();
                 if pending.peer != peer {
                     return Ok(NetworkBridgeTick::PeerRelationshipFailed {
-                        peer,
+                        peer: peer.clone(),
                         action,
                         error: format!(
                             "peer relationship response peer mismatch: expected={} actual={peer}",
@@ -1260,7 +1281,7 @@ impl NetworkBridgeService {
                             "dm_message",
                             &request.message_id,
                             Some(&request.source_node_id),
-                            "libp2p_control",
+                            "iroh_control",
                             "control_received",
                             None,
                         )?;
@@ -1471,7 +1492,7 @@ impl NetworkBridgeService {
                     "dm_message",
                     &pending.message_id,
                     Some(&pending.remote_node_id),
-                    "libp2p_control",
+                    "iroh_control",
                     "control_acknowledged",
                     None,
                 )?;

@@ -475,7 +475,6 @@ fn ui_root_page_serves_startup_view_and_diagnostics_route_redirects_legacy_conso
         assert!(!diagnostics_html.contains("Local Peer"));
         assert!(!diagnostics_html.contains("Connected Peers"));
         assert!(!diagnostics_html.contains("peer id"));
-        assert!(!diagnostics_html.contains("Libp2p transport"));
         assert!(diagnostics_html.contains("/api/diagnostics"));
         assert!(!diagnostics_html.contains("Quick Start"));
 

@@ -8,16 +8,16 @@ impl TransportRouter {
         remote_capabilities: Option<&PeerTransportCapabilities>,
     ) -> TransportRoute {
         let Some(capabilities) = remote_capabilities else {
-            return TransportRoute::Libp2pControl;
+            return TransportRoute::IrohControl;
         };
 
         if !capabilities.supports_iroh_direct {
-            return TransportRoute::Libp2pControl;
+            return TransportRoute::IrohControl;
         }
 
         match intent.kind {
             TransferKind::ControlMessage | TransferKind::RelationshipControl => {
-                TransportRoute::Libp2pControl
+                TransportRoute::IrohControl
             }
             TransferKind::DirectMessage
             | TransferKind::TopicSync
@@ -32,7 +32,7 @@ impl TransportRouter {
                 {
                     TransportRoute::IrohDirect
                 } else {
-                    TransportRoute::Libp2pControl
+                    TransportRoute::IrohControl
                 }
             }
         }
@@ -44,7 +44,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn control_messages_stay_on_libp2p_control_plane() {
+    fn control_messages_stay_on_iroh_control_plane() {
         let remote = PeerTransportCapabilities::iroh_direct_default();
         let route = TransportRouter::select(
             &TransferIntent {
@@ -54,7 +54,7 @@ mod tests {
             },
             Some(&remote),
         );
-        assert_eq!(route, TransportRoute::Libp2pControl);
+        assert_eq!(route, TransportRoute::IrohControl);
     }
 
     #[test]
@@ -72,7 +72,7 @@ mod tests {
     }
 
     #[test]
-    fn missing_remote_capability_falls_back_to_libp2p() {
+    fn missing_remote_capability_falls_back_to_iroh_control() {
         let route = TransportRouter::select(
             &TransferIntent {
                 kind: TransferKind::DirectMessage,
@@ -81,6 +81,6 @@ mod tests {
             },
             None,
         );
-        assert_eq!(route, TransportRoute::Libp2pControl);
+        assert_eq!(route, TransportRoute::IrohControl);
     }
 }

@@ -16,9 +16,9 @@ use anyhow::{Context, Result, anyhow, bail};
 use crate::constants::BACKFILL_BATCH_EVENTS;
 use crate::network_p2p::{
     BackfillRequest, BackfillRequestId, ContactMaterialRequestId, EventEnvelope, GossipKind,
-    GossipMessage, Multiaddr, NetworkP2pConfig, NetworkP2pNode, NetworkRuntime,
+    GossipMessage, NetworkAddress, NetworkNodeId, NetworkP2pConfig, NetworkP2pNode, NetworkRuntime,
     NetworkRuntimeEvent, PeerDirectMessageRequest, PeerDirectMessageRequestId,
-    PeerDirectMessageResponse, PeerHandshakeMetadata, PeerId, PeerRelationshipRequest,
+    PeerDirectMessageResponse, PeerHandshakeMetadata, PeerRelationshipRequest,
     PeerRelationshipRequestId, PeerRelationshipResponse, RawAgentEnvelope, RawContactMaterial,
     RawContactMaterialRequest, RawContactMaterialResponse, RawPeerDirectMessageKind,
     RawPeerRelationshipAction, SummaryAnnouncement, SwarmScope,
@@ -90,7 +90,7 @@ const IDLE_NETWORK_SLEEP: Duration = Duration::from_millis(50);
 const ANNOUNCED_PEER_TTL: Duration = Duration::from_secs(60 * 60);
 
 const ENV_P2P_ENABLED: &str = "WATTSWARM_P2P_ENABLED";
-const ENV_P2P_MDNS: &str = "WATTSWARM_P2P_MDNS";
+const ENV_P2P_LOCAL_DISCOVERY: &str = "WATTSWARM_P2P_MDNS";
 const ENV_P2P_PORT: &str = "WATTSWARM_P2P_PORT";
 const ENV_P2P_LISTEN_ADDRS: &str = "WATTSWARM_P2P_LISTEN_ADDRS";
 const ENV_P2P_BOOTSTRAP_PEERS: &str = "WATTSWARM_P2P_BOOTSTRAP_PEERS";
@@ -486,14 +486,14 @@ fn legacy_peer_sync_state_path(state_dir: &Path) -> PathBuf {
 
 #[derive(Debug, Clone)]
 struct PendingPeerRelationshipRequest {
-    peer: PeerId,
+    peer: NetworkNodeId,
     remote_node_id: String,
     action: crate::control::PeerRelationshipAction,
 }
 
 #[derive(Debug, Clone)]
 struct PendingPeerDirectMessageRequest {
-    peer: PeerId,
+    peer: NetworkNodeId,
     remote_node_id: String,
     thread_id: String,
     message_id: String,
@@ -503,7 +503,7 @@ struct PendingPeerDirectMessageRequest {
 
 #[derive(Debug, Clone)]
 struct PendingContactMaterialRequest {
-    peer: PeerId,
+    peer: NetworkNodeId,
     remote_node_id: String,
 }
 
@@ -1706,7 +1706,7 @@ fn relationship_state_for(
 
 fn recommended_backfill_route_for_peer(
     state_dir: &Path,
-    peer: &PeerId,
+    peer: &NetworkNodeId,
 ) -> Result<DataTransportRoute> {
     let peer_id = peer.to_string();
     let record =
@@ -1724,7 +1724,7 @@ fn recommended_backfill_route_for_peer(
     ))
 }
 
-fn candidate_peer_addrs(state_dir: &Path, remote_node_id: &str) -> Result<Vec<Multiaddr>> {
+fn candidate_peer_addrs(state_dir: &Path, remote_node_id: &str) -> Result<Vec<NetworkAddress>> {
     let mut addrs = Vec::new();
     for record in crate::control::load_discovered_peer_records_state(state_dir)? {
         if record.node_id != remote_node_id {
@@ -1733,7 +1733,7 @@ fn candidate_peer_addrs(state_dir: &Path, remote_node_id: &str) -> Result<Vec<Mu
         let Some(listen_addr) = record.listen_addr else {
             continue;
         };
-        if let Ok(addr) = listen_addr.parse::<Multiaddr>() {
+        if let Ok(addr) = listen_addr.parse::<NetworkAddress>() {
             addrs.push(addr);
         }
     }
@@ -1742,12 +1742,12 @@ fn candidate_peer_addrs(state_dir: &Path, remote_node_id: &str) -> Result<Vec<Mu
             continue;
         }
         if let Some(observed_addr) = record.observed_addr
-            && let Ok(addr) = observed_addr.parse::<Multiaddr>()
+            && let Ok(addr) = observed_addr.parse::<NetworkAddress>()
         {
             addrs.push(addr);
         }
         for listen_addr in record.listen_addrs {
-            if let Ok(addr) = listen_addr.parse::<Multiaddr>() {
+            if let Ok(addr) = listen_addr.parse::<NetworkAddress>() {
                 addrs.push(addr);
             }
         }
@@ -2220,7 +2220,7 @@ pub fn network_config_from_env() -> NetworkP2pConfig {
     NetworkP2pConfig {
         listen_addrs,
         bootstrap_peers,
-        enable_mdns: parse_bool_env_with_default(ENV_P2P_MDNS, true),
+        enable_local_discovery: parse_bool_env_with_default(ENV_P2P_LOCAL_DISCOVERY, true),
         ..NetworkP2pConfig::default()
     }
 }
@@ -2423,70 +2423,70 @@ fn run_background_network_service_with_hook(
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NetworkBridgeTick {
     Listening {
-        address: Multiaddr,
+        address: NetworkAddress,
     },
     TransportNotice {
         detail: String,
     },
     Connected {
-        peer: PeerId,
+        peer: NetworkNodeId,
     },
     Disconnected {
-        peer: PeerId,
+        peer: NetworkNodeId,
     },
     EventIngested {
-        peer: PeerId,
+        peer: NetworkNodeId,
         event_id: String,
     },
     SummaryApplied {
-        peer: PeerId,
+        peer: NetworkNodeId,
         summary_kind: String,
     },
     RuleApplied {
-        peer: PeerId,
+        peer: NetworkNodeId,
         rule_set: String,
         rule_version: u64,
     },
     CheckpointApplied {
-        peer: PeerId,
+        peer: NetworkNodeId,
         checkpoint_id: String,
     },
     GossipIgnored {
-        peer: PeerId,
+        peer: NetworkNodeId,
         message_kind: String,
     },
     BackfillServed {
-        peer: PeerId,
+        peer: NetworkNodeId,
         events: usize,
     },
     BackfillApplied {
-        peer: PeerId,
+        peer: NetworkNodeId,
         request_id: BackfillRequestId,
         events: usize,
     },
     BackfillFailed {
-        peer: PeerId,
+        peer: NetworkNodeId,
         request_id: BackfillRequestId,
         error: String,
     },
     PeerRelationshipUpdated {
-        peer: PeerId,
+        peer: NetworkNodeId,
         action: crate::control::PeerRelationshipAction,
         relationship_state: crate::control::PeerRelationshipState,
         initiated_by: crate::control::PeerRelationshipInitiator,
     },
     PeerRelationshipFailed {
-        peer: PeerId,
+        peer: NetworkNodeId,
         action: crate::control::PeerRelationshipAction,
         error: String,
     },
     PeerDirectMessageUpdated {
-        peer: PeerId,
+        peer: NetworkNodeId,
         kind: crate::control::PeerDmMessageKind,
         delivery_state: crate::control::PeerDmDeliveryState,
     },
     PeerDirectMessageFailed {
-        peer: PeerId,
+        peer: NetworkNodeId,
         kind: crate::control::PeerDmMessageKind,
         error: String,
     },
@@ -2557,7 +2557,7 @@ pub struct NetworkBridgeObservabilitySnapshot {
     pub local_iroh_endpoint_id: Option<String>,
     pub subscribed_iroh_gossip_topics: Vec<String>,
     pub known_iroh_contacts: usize,
-    pub legacy_libp2p_active: bool,
+    pub legacy_transport_active: bool,
     pub subscribed_scopes: Vec<String>,
     pub connected_peer_count: usize,
     pub nat_status: String,
@@ -2582,8 +2582,8 @@ pub struct NetworkBridgeService {
     subscribed_scopes: Vec<SwarmScope>,
     subscribed_scope_kinds: HashMap<SwarmScope, HashSet<GossipKind>>,
     pinned_scopes: Vec<SwarmScope>,
-    peer_sync_state: HashMap<PeerId, PeerSyncState>,
-    connected_peers: HashSet<PeerId>,
+    peer_sync_state: HashMap<NetworkNodeId, PeerSyncState>,
+    connected_peers: HashSet<NetworkNodeId>,
     global_publish_rate_guard: GlobalPublishRateGuard,
     anti_entropy_interval: Duration,
     backfill_retry_after: Duration,
@@ -2606,8 +2606,7 @@ impl NetworkBridgeService {
         scopes: &[SwarmScope],
         protocol_params: &NetworkProtocolParams,
     ) -> Result<Self> {
-        let tokio_runtime = Runtime::new()?;
-        let mut runtime = tokio_runtime.block_on(async { NetworkRuntime::new(node) })?;
+        let mut runtime = NetworkRuntime::new(node)?;
         let mut subscribed_scopes = Vec::new();
         let mut subscribed_scope_kinds = HashMap::new();
         for scope in scopes {
@@ -2623,6 +2622,7 @@ impl NetworkBridgeService {
             subscribed_scope_kinds
                 .insert(SwarmScope::Global, GossipKind::ALL.into_iter().collect());
         }
+        let tokio_runtime = Runtime::new()?;
         Ok(Self {
             runtime,
             tokio_runtime,
@@ -2685,8 +2685,9 @@ impl NetworkBridgeService {
                 })?;
             for contact in contacts {
                 if contact.transport == DataTransportRoute::IrohDirect.as_str() {
+                    let remote_network_peer_id = iroh_contact_network_peer_id(&contact)?;
                     self.runtime
-                        .upsert_remote_contact_material(contact.peer_id.clone(), contact)
+                        .upsert_remote_contact_material(remote_network_peer_id, contact)
                         .with_context(|| {
                             format!(
                                 "register startup bootstrap contact material for {remote_node_id}"
@@ -2702,9 +2703,19 @@ impl NetworkBridgeService {
         for record in crate::control::load_peer_metadata_records_state(state_dir)? {
             for contact in record.transport_contact_materials() {
                 if contact.transport == DataTransportRoute::IrohDirect.as_str() {
+                    let remote_network_peer_id = match iroh_contact_network_peer_id(&contact) {
+                        Ok(peer) => peer,
+                        Err(error) => {
+                            eprintln!(
+                                "skip invalid persisted Iroh contact material for {}: {error:#}",
+                                record.node_id
+                            );
+                            continue;
+                        }
+                    };
                     let _ = self
                         .runtime
-                        .upsert_remote_contact_material(contact.peer_id.clone(), contact)?;
+                        .upsert_remote_contact_material(remote_network_peer_id, contact)?;
                 }
             }
         }
@@ -2718,7 +2729,7 @@ impl NetworkBridgeService {
         }
         let now = Instant::now();
         for record in records {
-            let peer = match record.network_peer_id.parse::<PeerId>() {
+            let peer = match record.network_peer_id.parse::<NetworkNodeId>() {
                 Ok(peer) => peer,
                 Err(_) => continue,
             };
@@ -2773,11 +2784,11 @@ impl NetworkBridgeService {
         }
     }
 
-    pub fn local_peer_id(&self) -> PeerId {
+    pub fn local_peer_id(&self) -> NetworkNodeId {
         self.runtime.local_peer_id()
     }
 
-    pub fn listen_addrs(&self) -> &[Multiaddr] {
+    pub fn listen_addrs(&self) -> &[NetworkAddress] {
         self.runtime.listen_addrs()
     }
 
@@ -2810,7 +2821,6 @@ impl NetworkBridgeService {
         if kinds.is_empty() {
             return Ok(());
         }
-        let _guard = self.tokio_runtime.enter();
         self.runtime.subscribe_scope_kinds(scope, kinds)?;
         if !self.subscribed_scopes.contains(scope) {
             self.subscribed_scopes.push(scope.clone());
@@ -2839,7 +2849,6 @@ impl NetworkBridgeService {
         {
             return Ok(());
         }
-        let _guard = self.tokio_runtime.enter();
         self.runtime.unsubscribe_scope_kinds(scope, kinds)?;
         if let Some(subscribed) = self.subscribed_scope_kinds.get_mut(scope) {
             for kind in kinds {
@@ -2853,14 +2862,13 @@ impl NetworkBridgeService {
         Ok(())
     }
 
-    pub fn dial(&mut self, addr: Multiaddr) -> Result<()> {
-        let _guard = self.tokio_runtime.enter();
+    pub fn dial(&mut self, addr: NetworkAddress) -> Result<()> {
         self.runtime.dial(addr)
     }
 }
 
 fn peer_sync_state_record(
-    peer: &PeerId,
+    peer: &NetworkNodeId,
     state: &PeerSyncState,
     updated_at: u64,
 ) -> Option<crate::control::NetworkPeerSyncStateRecord> {
@@ -2944,7 +2952,7 @@ fn migrate_legacy_peer_sync_state_records(
     let updated_at = chrono::Utc::now().timestamp_millis().max(0) as u64;
     let mut migrated = Vec::new();
     for record in legacy {
-        let Ok(peer) = record.peer_id.parse::<PeerId>() else {
+        let Ok(peer) = record.peer_id.parse::<NetworkNodeId>() else {
             continue;
         };
         let mut state = PeerSyncState::new(Instant::now());
@@ -3005,8 +3013,9 @@ fn parse_startup_bootstrap_contact(
     let raw_contact = raw_contact.trim();
     if !raw_contact.starts_with('{') {
         let contact = transport_contact_from_short_bootstrap_contact(raw_contact)?;
+        let remote_network_peer_id = iroh_contact_network_peer_id(&contact)?;
         return Ok((
-            contact.peer_id.clone(),
+            remote_network_peer_id,
             startup_contact_material_from_transport(contact.clone()),
             vec![contact],
         ));
@@ -3030,30 +3039,35 @@ fn parse_startup_bootstrap_contact(
                 .context("decode bootstrap transport contact")
         })
         .collect::<Result<Vec<_>>>()?;
-    let node_id = material
-        .get("node_id")
-        .and_then(Value::as_str)
-        .or_else(|| material.get("peer_id").and_then(Value::as_str))
-        .or_else(|| transports.first().map(|contact| contact.peer_id.as_str()))
-        .ok_or_else(|| anyhow!("bootstrap contact missing node_id or peer_id"))?
-        .trim()
-        .to_owned();
-    if node_id.is_empty() {
-        bail!("bootstrap contact node_id is empty");
+    let mut remote_network_peer_id = None;
+    for contact in &transports {
+        if contact.transport != DataTransportRoute::IrohDirect.as_str() {
+            continue;
+        }
+        let contact_peer = iroh_contact_network_peer_id(contact)?;
+        if let Some(existing) = &remote_network_peer_id
+            && existing != &contact_peer
+        {
+            bail!(
+                "bootstrap contact has multiple Iroh endpoint ids: {existing} and {contact_peer}"
+            );
+        }
+        remote_network_peer_id = Some(contact_peer);
     }
-    Ok((node_id, material, transports))
+    let remote_network_peer_id = remote_network_peer_id
+        .ok_or_else(|| anyhow!("bootstrap contact missing Iroh transport"))?;
+    Ok((remote_network_peer_id, material, transports))
 }
 
 fn transport_contact_from_short_bootstrap_contact(
     raw_contact: &str,
 ) -> Result<TransportContactMaterial> {
-    let (node_id, raw_addr) = raw_contact
+    let (endpoint_id, raw_addr) = raw_contact
         .rsplit_once('@')
-        .ok_or_else(|| anyhow!("bootstrap contact must be <node-id>@<host:port>"))?;
-    let node_id = node_id.trim();
-    if node_id.is_empty() {
-        bail!("bootstrap contact node id is empty");
-    }
+        .ok_or_else(|| anyhow!("bootstrap contact must be <iroh-node-id>@<host:port>"))?;
+    let endpoint_id = NetworkNodeId::new(endpoint_id.to_owned())
+        .context("bootstrap contact peer must be an iroh NodeId / EndpointId")?
+        .to_string();
     let raw_addr = raw_addr.trim();
     if raw_addr.is_empty() {
         bail!("bootstrap contact address is empty");
@@ -3065,17 +3079,17 @@ fn transport_contact_from_short_bootstrap_contact(
     let capabilities = PeerTransportCapabilities::iroh_direct_default();
     Ok(TransportContactMaterial {
         transport: DataTransportRoute::IrohDirect.as_str().to_owned(),
-        peer_id: node_id.to_owned(),
+        peer_id: endpoint_id.clone(),
         metadata: TransportMetadata {
             route: DataTransportRoute::IrohDirect,
             generated_at,
-            endpoint_id: Some(node_id.to_owned()),
+            endpoint_id: Some(endpoint_id.clone()),
             alpn: Some(wattswarm_network_transport_iroh::DEFAULT_IROH_ALPN.to_owned()),
             listen_addrs: vec![raw_addr.to_owned()],
             capabilities,
         },
         extra: json!({
-            "endpoint_id": node_id,
+            "endpoint_id": endpoint_id,
             "alpn": wattswarm_network_transport_iroh::DEFAULT_IROH_ALPN,
             "direct_addrs": [raw_addr],
             "relay_urls": []
@@ -3092,6 +3106,40 @@ fn startup_contact_material_from_transport(contact: TransportContactMaterial) ->
         "transports": [contact.clone()],
         "recommended_routes": crate::control::recommended_data_routes(Some(&contact.metadata.capabilities)),
     })
+}
+
+fn iroh_contact_network_peer_id(contact: &TransportContactMaterial) -> Result<String> {
+    if contact.transport != DataTransportRoute::IrohDirect.as_str() {
+        bail!("transport contact is not iroh_direct");
+    }
+    let metadata_endpoint = contact.metadata.endpoint_id.as_deref().map(str::trim);
+    let extra_endpoint = contact
+        .extra
+        .get("endpoint_id")
+        .and_then(Value::as_str)
+        .map(str::trim);
+    let endpoint_id = extra_endpoint
+        .or(metadata_endpoint)
+        .unwrap_or(contact.peer_id.as_str())
+        .trim();
+    let endpoint_id = NetworkNodeId::new(endpoint_id.to_owned())
+        .context("iroh contact endpoint_id must be an iroh NodeId / EndpointId")?
+        .to_string();
+    if let Some(metadata_endpoint) = metadata_endpoint
+        && metadata_endpoint != endpoint_id
+    {
+        bail!(
+            "iroh contact metadata endpoint_id {metadata_endpoint} does not match endpoint_id {endpoint_id}"
+        );
+    }
+    if contact.peer_id != endpoint_id {
+        bail!(
+            "iroh contact peer_id {} must match endpoint_id {}",
+            contact.peer_id,
+            endpoint_id
+        );
+    }
+    Ok(endpoint_id)
 }
 
 fn upsert_startup_bootstrap_contact_material(

@@ -5,10 +5,15 @@ edition = "2024"
 
 [dependencies]
 anyhow = { workspace = true }
-libp2p = { workspace = true }
+hex = { workspace = true }
+iroh = "0.97"
+iroh-gossip = { workspace = true }
+n0-future = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
+wattswarm-network-transport-core = { workspace = true }
+wattswarm-network-transport-iroh = { workspace = true }
 wattswarm-protocol = { path = "../protocol" }
 
 [dev-dependencies]

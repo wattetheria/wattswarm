@@ -1415,7 +1415,7 @@ pub struct NetworkProtocolParams {
     #[serde(default = "default_namespace_network")]
     pub namespace_network: String,
 
-    /// Shared libp2p identify protocol version for this network.
+    /// Shared iroh identify protocol version for this network.
     #[serde(default = "default_network_protocol_version")]
     pub protocol_version: String,
 
@@ -1434,26 +1434,26 @@ pub struct NetworkProtocolParams {
     #[serde(default = "default_backfill_retry_after_secs")]
     pub backfill_retry_after_secs: u64,
 
-    // ── Gossipsub mesh ───────────────────────────────────────────────
+    // ── GossipMesh mesh ───────────────────────────────────────────────
     /// Target number of mesh peers per topic.
-    #[serde(default = "default_gossipsub_d")]
-    pub gossipsub_d: usize,
+    #[serde(default = "default_gossip_mesh_d")]
+    pub gossip_mesh_d: usize,
 
     /// Minimum mesh peers before attempting to graft more.
-    #[serde(default = "default_gossipsub_d_low")]
-    pub gossipsub_d_low: usize,
+    #[serde(default = "default_gossip_mesh_d_low")]
+    pub gossip_mesh_d_low: usize,
 
     /// Maximum mesh peers before pruning excess.
-    #[serde(default = "default_gossipsub_d_high")]
-    pub gossipsub_d_high: usize,
+    #[serde(default = "default_gossip_mesh_d_high")]
+    pub gossip_mesh_d_high: usize,
 
-    /// Gossipsub heartbeat interval in milliseconds.
-    #[serde(default = "default_gossipsub_heartbeat_ms")]
-    pub gossipsub_heartbeat_ms: u64,
+    /// GossipMesh heartbeat interval in milliseconds.
+    #[serde(default = "default_gossip_mesh_heartbeat_ms")]
+    pub gossip_mesh_heartbeat_ms: u64,
 
     /// Maximum single gossip message size in bytes.
-    #[serde(default = "default_gossipsub_max_transmit_size")]
-    pub gossipsub_max_transmit_size: usize,
+    #[serde(default = "default_gossip_mesh_max_transmit_size")]
+    pub gossip_mesh_max_transmit_size: usize,
 
     // ── Backfill protocol ────────────────────────────────────────────
     /// Default number of events returned per backfill response.
@@ -1571,19 +1571,19 @@ fn default_anti_entropy_interval_secs() -> u64 {
 fn default_backfill_retry_after_secs() -> u64 {
     5
 }
-fn default_gossipsub_d() -> usize {
+fn default_gossip_mesh_d() -> usize {
     6
 }
-fn default_gossipsub_d_low() -> usize {
+fn default_gossip_mesh_d_low() -> usize {
     4
 }
-fn default_gossipsub_d_high() -> usize {
+fn default_gossip_mesh_d_high() -> usize {
     12
 }
-fn default_gossipsub_heartbeat_ms() -> u64 {
+fn default_gossip_mesh_heartbeat_ms() -> u64 {
     1_000
 }
-fn default_gossipsub_max_transmit_size() -> usize {
+fn default_gossip_mesh_max_transmit_size() -> usize {
     512 * 1024
 }
 fn default_max_backfill_events() -> usize {
@@ -1607,11 +1607,11 @@ impl Default for NetworkProtocolParams {
             max_established_per_peer: default_max_established_per_peer(),
             anti_entropy_interval_secs: default_anti_entropy_interval_secs(),
             backfill_retry_after_secs: default_backfill_retry_after_secs(),
-            gossipsub_d: default_gossipsub_d(),
-            gossipsub_d_low: default_gossipsub_d_low(),
-            gossipsub_d_high: default_gossipsub_d_high(),
-            gossipsub_heartbeat_ms: default_gossipsub_heartbeat_ms(),
-            gossipsub_max_transmit_size: default_gossipsub_max_transmit_size(),
+            gossip_mesh_d: default_gossip_mesh_d(),
+            gossip_mesh_d_low: default_gossip_mesh_d_low(),
+            gossip_mesh_d_high: default_gossip_mesh_d_high(),
+            gossip_mesh_heartbeat_ms: default_gossip_mesh_heartbeat_ms(),
+            gossip_mesh_max_transmit_size: default_gossip_mesh_max_transmit_size(),
             default_max_backfill_events: default_max_backfill_events(),
             max_backfill_events_hard_limit: default_max_backfill_events_hard_limit(),
             summary_reputation_limit: default_summary_reputation_limit(),

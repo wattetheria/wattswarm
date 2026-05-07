@@ -4,14 +4,14 @@ use serde_json::Value;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TransportRoute {
-    Libp2pControl,
+    IrohControl,
     IrohDirect,
 }
 
 impl TransportRoute {
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::Libp2pControl => "libp2p_control",
+            Self::IrohControl => "iroh_control",
             Self::IrohDirect => "iroh_direct",
         }
     }
@@ -99,12 +99,12 @@ pub struct PeerTransportCapabilities {
 }
 
 impl PeerTransportCapabilities {
-    pub fn libp2p_control_default() -> Self {
+    pub fn iroh_control_default() -> Self {
         Self {
             supports_iroh_direct: false,
             supports_streaming: false,
             max_recommended_inline_bytes: 16 * 1024,
-            preferred_data_route: TransportRoute::Libp2pControl,
+            preferred_data_route: TransportRoute::IrohControl,
         }
     }
 

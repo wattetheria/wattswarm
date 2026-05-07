@@ -606,7 +606,7 @@ fn ui_exposes_wattetheria_sync_http_boundaries() {
             wattswarm::control::save_peer_relationship_record_state(
                 &seed_state_dir,
                 &wattswarm::control::PeerRelationshipRecord {
-                    remote_node_id: "12D3KooSyncPeer".to_string(),
+                    remote_node_id: "node-sync-peer".to_string(),
                     relationship_state: wattswarm::control::PeerRelationshipState::Accepted,
                     last_action: wattswarm::control::PeerRelationshipAction::Accept,
                     initiated_by: wattswarm::control::PeerRelationshipInitiator::Remote,
@@ -622,8 +622,8 @@ fn ui_exposes_wattetheria_sync_http_boundaries() {
             wattswarm::control::save_peer_dm_thread_record_state(
                 &seed_state_dir,
                 &wattswarm::control::PeerDmThreadRecord {
-                    remote_node_id: "12D3KooSyncPeer".to_string(),
-                    thread_id: "dm:12D3KooSyncPeer".to_string(),
+                    remote_node_id: "node-sync-peer".to_string(),
+                    thread_id: "dm:node-sync-peer".to_string(),
                     thread_kind: wattswarm::control::PeerDmThreadKind::Direct,
                     session_state: wattswarm::control::PeerDmSessionState::Ready,
                     relationship_established_at: Some(2),
@@ -636,9 +636,9 @@ fn ui_exposes_wattetheria_sync_http_boundaries() {
             wattswarm::control::save_peer_dm_message_record_state(
                 &seed_state_dir,
                 &wattswarm::control::PeerDmMessageRecord {
-                    thread_id: "dm:12D3KooSyncPeer".to_string(),
+                    thread_id: "dm:node-sync-peer".to_string(),
                     message_id: "sync-dm-1".to_string(),
-                    remote_node_id: "12D3KooSyncPeer".to_string(),
+                    remote_node_id: "node-sync-peer".to_string(),
                     message_kind: wattswarm::control::PeerDmMessageKind::Message,
                     direction: wattswarm::control::PeerDmDirection::Inbound,
                     delivery_state: wattswarm::control::PeerDmDeliveryState::Delivered,
@@ -654,7 +654,7 @@ fn ui_exposes_wattetheria_sync_http_boundaries() {
                 &seed_state_dir,
                 &wattswarm::control::AgentPaymentRecord {
                     payment_id: "payment-sync-1".to_string(),
-                    remote_node_id: "12D3KooSyncPeer".to_string(),
+                    remote_node_id: "node-sync-peer".to_string(),
                     summary_id: "summary-payment-sync-1".to_string(),
                     message_kind: "payment_request".to_string(),
                     payment: json!({
@@ -663,7 +663,7 @@ fn ui_exposes_wattetheria_sync_http_boundaries() {
                         "recipient_did": "did:key:local",
                         "sender_public_id": "remote-public",
                         "recipient_public_id": "local-public",
-                        "remote_node_id": "12D3KooSyncPeer",
+                        "remote_node_id": "node-sync-peer",
                         "amount": "42",
                         "currency": "USDT",
                         "rail": "x402",
@@ -1019,7 +1019,7 @@ fn ui_exposes_wattetheria_sync_grpc_streams() {
             wattswarm::control::save_peer_relationship_record_state(
                 &seed_state_dir,
                 &wattswarm::control::PeerRelationshipRecord {
-                    remote_node_id: "12D3KooSyncPeer".to_string(),
+                    remote_node_id: "node-sync-peer".to_string(),
                     relationship_state: wattswarm::control::PeerRelationshipState::Accepted,
                     last_action: wattswarm::control::PeerRelationshipAction::Accept,
                     initiated_by: wattswarm::control::PeerRelationshipInitiator::Remote,
@@ -1035,8 +1035,8 @@ fn ui_exposes_wattetheria_sync_grpc_streams() {
             wattswarm::control::save_peer_dm_thread_record_state(
                 &seed_state_dir,
                 &wattswarm::control::PeerDmThreadRecord {
-                    remote_node_id: "12D3KooSyncPeer".to_string(),
-                    thread_id: "dm:12D3KooSyncPeer".to_string(),
+                    remote_node_id: "node-sync-peer".to_string(),
+                    thread_id: "dm:node-sync-peer".to_string(),
                     thread_kind: wattswarm::control::PeerDmThreadKind::Direct,
                     session_state: wattswarm::control::PeerDmSessionState::Ready,
                     relationship_established_at: Some(2),
@@ -1049,9 +1049,9 @@ fn ui_exposes_wattetheria_sync_grpc_streams() {
             wattswarm::control::save_peer_dm_message_record_state(
                 &seed_state_dir,
                 &wattswarm::control::PeerDmMessageRecord {
-                    thread_id: "dm:12D3KooSyncPeer".to_string(),
+                    thread_id: "dm:node-sync-peer".to_string(),
                     message_id: "sync-dm-1".to_string(),
-                    remote_node_id: "12D3KooSyncPeer".to_string(),
+                    remote_node_id: "node-sync-peer".to_string(),
                     message_kind: wattswarm::control::PeerDmMessageKind::Message,
                     direction: wattswarm::control::PeerDmDirection::Inbound,
                     delivery_state: wattswarm::control::PeerDmDeliveryState::Delivered,
@@ -1067,7 +1067,7 @@ fn ui_exposes_wattetheria_sync_grpc_streams() {
                 &seed_state_dir,
                 &wattswarm::control::AgentPaymentRecord {
                     payment_id: "payment-sync-1".to_string(),
-                    remote_node_id: "12D3KooSyncPeer".to_string(),
+                    remote_node_id: "node-sync-peer".to_string(),
                     summary_id: "summary-payment-sync-1".to_string(),
                     message_kind: "payment_request".to_string(),
                     payment: json!({
@@ -1076,7 +1076,7 @@ fn ui_exposes_wattetheria_sync_grpc_streams() {
                         "recipient_did": "did:key:local",
                         "sender_public_id": "remote-public",
                         "recipient_public_id": "local-public",
-                        "remote_node_id": "12D3KooSyncPeer",
+                        "remote_node_id": "node-sync-peer",
                         "amount": "42",
                         "currency": "USDT",
                         "rail": "x402",
@@ -1211,7 +1211,7 @@ fn ui_exposes_wattetheria_sync_grpc_streams() {
             social_relationships
                 .iter()
                 .any(|relationship| relationship["remote_node_id"].as_str()
-                    == Some("12D3KooSyncPeer"))
+                    == Some("node-sync-peer"))
         );
         let social_messages = social_json["messages"].as_array().unwrap();
         assert!(social_messages.iter().any(|message| {

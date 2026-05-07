@@ -27,7 +27,7 @@ use wattswarm_network_transport_core::{
     DirectDataFetchRequest, DirectDataObjectKind, PeerTransportCapabilities, TransferIntent,
     TransferKind, TransportContactMaterial, TransportRoute as DataTransportRoute, TransportRouter,
 };
-use wattswarm_network_transport_iroh::fetch_direct_data;
+use wattswarm_network_transport_iroh::fetch_direct_data_for_network_peer_id;
 
 #[path = "control_state.rs"]
 mod control_state;
@@ -123,7 +123,7 @@ pub fn fetch_json_content_artifact_via_iroh(
     kind: ArtifactKind,
     reference: &crate::types::ArtifactRef,
 ) -> Result<Value> {
-    let local_peer_id = local_peer_id(state_dir)?
+    let local_peer_id: crate::network_p2p::NetworkNodeId = local_peer_id(state_dir)?
         .parse()
         .map_err(|err| anyhow!("parse local peer id: {err}"))?;
     fetch_json_content_artifact_via_iroh_with_local_peer_id(
@@ -137,7 +137,7 @@ pub fn fetch_json_content_artifact_via_iroh(
 
 pub fn fetch_json_content_artifact_via_iroh_with_local_peer_id(
     state_dir: &Path,
-    local_peer_id: &crate::network_p2p::PeerId,
+    local_peer_id: &crate::network_p2p::NetworkNodeId,
     remote_node_id: &str,
     kind: ArtifactKind,
     reference: &crate::types::ArtifactRef,
@@ -158,9 +158,9 @@ pub fn fetch_json_content_artifact_via_iroh_with_local_peer_id(
     let contact = metadata
         .transport_contact_material(DataTransportRoute::IrohDirect)
         .ok_or_else(|| anyhow!("missing iroh_direct contact material for {remote_node_id}"))?;
-    let bytes = fetch_direct_data(
+    let bytes = fetch_direct_data_for_network_peer_id(
         state_dir,
-        local_peer_id,
+        local_peer_id.as_str(),
         &contact,
         &DirectDataFetchRequest {
             object_kind,
@@ -687,7 +687,7 @@ fn resolve_route_for_binding(
     intent: &TransferIntent,
 ) -> Result<DataTransportRoute> {
     let Some(binding) = binding else {
-        return Ok(DataTransportRoute::Libp2pControl);
+        return Ok(DataTransportRoute::IrohControl);
     };
     recommended_transfer_route_for_remote_node(state_dir, &binding.source_node_id, intent)
 }
@@ -702,10 +702,15 @@ fn fetch_via_iroh_route(
     let contact = metadata
         .transport_contact_material(DataTransportRoute::IrohDirect)
         .ok_or_else(|| anyhow!("missing iroh_direct contact material for {remote_node_id}"))?;
-    let local_peer_id = local_peer_id(state_dir)?
+    let local_peer_id: crate::network_p2p::NetworkNodeId = local_peer_id(state_dir)?
         .parse()
         .map_err(|err| anyhow!("parse local peer id: {err}"))?;
-    let response = fetch_direct_data(state_dir, &local_peer_id, &contact, request)?;
+    let response = fetch_direct_data_for_network_peer_id(
+        state_dir,
+        local_peer_id.as_str(),
+        &contact,
+        request,
+    )?;
     Ok(response.bytes)
 }
 
@@ -1033,7 +1038,7 @@ pub fn load_network_directory_snapshot(
     }
     let config = crate::network_bridge::network_config_from_env();
     for raw_addr in config.bootstrap_peers {
-        let Some((listen_addr, node_id)) = raw_addr.rsplit_once("/p2p/") else {
+        let Some((node_id, listen_addr)) = raw_addr.split_once('@') else {
             continue;
         };
         if listen_addr.trim().is_empty() || node_id.trim().is_empty() {

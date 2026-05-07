@@ -5,29 +5,21 @@ edition = "2024"
 
 [features]
 default = []
-iroh-runtime = [
-    "dep:iroh",
-    "dep:iroh-gossip",
-    "dep:n0-future",
-    "dep:wattswarm-network-transport-core",
-    "dep:wattswarm-network-transport-iroh",
-]
+iroh-runtime = []
 
 [dependencies]
 anyhow = { workspace = true }
 hex = { workspace = true }
-iroh = { version = "0.97", optional = true }
-iroh-gossip = { workspace = true, optional = true }
-libp2p = { workspace = true }
-n0-future = { workspace = true, optional = true }
+iroh = "0.97"
+rand = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
-wattswarm-network-transport-core = { workspace = true, optional = true }
-wattswarm-network-transport-iroh = { workspace = true, optional = true }
+wattswarm-network-transport-core = { workspace = true }
 wattswarm-network-substrate = { workspace = true }
 wattswarm-protocol = { workspace = true }
 
 [dev-dependencies]
 serde_json = { workspace = true }
 tempfile = { workspace = true }
+wattswarm-network-transport-iroh = { workspace = true }

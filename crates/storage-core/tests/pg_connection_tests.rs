@@ -1,5 +1,6 @@
 use std::sync::{Mutex, OnceLock};
 
+use wattswarm_crypto::NodeIdentity;
 use wattswarm_storage_core::storage::pg::ErrorCode;
 use wattswarm_storage_core::storage::pg::{
     Connection, Error, OptionalExtension, ParamValue, types::ValueRef,
@@ -15,6 +16,40 @@ fn env_lock() -> std::sync::MutexGuard<'static, ()> {
         .get_or_init(|| Mutex::new(()))
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn test_iroh_endpoint_id(seed: u8) -> String {
+    NodeIdentity::from_seed([seed; 32]).node_id()
+}
+
+fn test_iroh_contact_material(endpoint_id: &str, generated_at: u64) -> serde_json::Value {
+    serde_json::json!({
+        "node_id": "node-a",
+        "peer_id": endpoint_id,
+        "listen_addrs": ["127.0.0.1:4001"],
+        "transports": [{
+            "transport": "iroh_direct",
+            "peer_id": endpoint_id,
+            "metadata": {
+                "route": "iroh_direct",
+                "generated_at": generated_at,
+                "endpoint_id": endpoint_id,
+                "alpn": "/wattswarm/iroh/1",
+                "listen_addrs": ["127.0.0.1:4001"],
+                "capabilities": {
+                    "supports_iroh_direct": true,
+                    "supports_http_gateway": false,
+                    "max_chunk_bytes": 16777216_u64
+                }
+            },
+            "extra": {
+                "endpoint_id": endpoint_id,
+                "alpn": "/wattswarm/iroh/1",
+                "direct_addrs": ["127.0.0.1:4001"],
+                "relay_urls": []
+            }
+        }]
+    })
 }
 
 struct EnvVarGuard {
@@ -450,6 +485,7 @@ fn local_control_peer_metadata_and_relationship_roundtrip() {
         let store =
             PgStore::open("peer-metadata-relationship-roundtrip.state").expect("open store");
         let scope_id = local_control_scope_id(std::path::Path::new("/tmp/wattswarm-state"));
+        let iroh_endpoint_id = test_iroh_endpoint_id(41);
 
         store
             .upsert_local_peer_metadata(
@@ -474,33 +510,10 @@ fn local_control_peer_metadata_and_relationship_roundtrip() {
                     handshake_status: "identified".to_owned(),
                     last_error: None,
                     contact_material_json: Some(
-                        serde_json::to_string(&serde_json::json!({
-                            "node_id": "node-a",
-                            "peer_id": "iroh-node-a",
-                            "listen_addrs": ["127.0.0.1:4001"],
-                            "transports": [{
-                                "transport": "iroh_direct",
-                                "peer_id": "iroh-node-a",
-                                "metadata": {
-                                    "route": "iroh_direct",
-                                    "generated_at": 1_700_000_000_400_u64,
-                                    "endpoint_id": "iroh-node-a",
-                                    "alpn": "/wattswarm/iroh/1",
-                                    "listen_addrs": ["127.0.0.1:4001"],
-                                    "capabilities": {
-                                        "supports_iroh_direct": true,
-                                        "supports_http_gateway": false,
-                                        "max_chunk_bytes": 16777216_u64
-                                    }
-                                },
-                                "extra": {
-                                    "endpoint_id": "iroh-node-a",
-                                    "alpn": "/wattswarm/iroh/1",
-                                    "direct_addrs": ["127.0.0.1:4001"],
-                                    "relay_urls": []
-                                }
-                            }]
-                        }))
+                        serde_json::to_string(&test_iroh_contact_material(
+                            &iroh_endpoint_id,
+                            1_700_000_000_400,
+                        ))
                         .expect("contact material"),
                     ),
                     contact_material_signature: Some("sig-peer-a".to_owned()),
@@ -553,14 +566,14 @@ fn local_control_peer_metadata_and_relationship_roundtrip() {
             .as_deref()
             .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
             .expect("stored iroh contact material json");
-        assert_eq!(contact_material["peer_id"], "iroh-node-a");
+        assert_eq!(contact_material["peer_id"], iroh_endpoint_id);
         assert_eq!(
             contact_material["transports"][0]["transport"],
             "iroh_direct"
         );
         assert_eq!(
             contact_material["transports"][0]["metadata"]["endpoint_id"],
-            "iroh-node-a"
+            iroh_endpoint_id
         );
 
         let relationships = store
@@ -676,12 +689,11 @@ fn local_control_network_peer_sync_state_roundtrip() {
     with_test_schema(|| {
         let store = PgStore::open("network-peer-sync-state-roundtrip.state").expect("open store");
         let scope_id = local_control_scope_id(std::path::Path::new("/tmp/wattswarm-state"));
-
         store
             .upsert_local_network_peer_sync_state(
                 &scope_id,
                 &wattswarm_storage_core::storage::LocalNetworkPeerSyncStateRow {
-                    network_peer_id: "12D3KooWPeerA".to_owned(),
+                    network_peer_id: test_iroh_endpoint_id(42),
                     known_scopes_json: serde_json::json!([
                         {"kind": "global"},
                         {"kind": "group", "value": "crew-7"}
@@ -718,7 +730,7 @@ fn local_control_network_peer_sync_state_roundtrip() {
             .list_local_network_peer_sync_states(&scope_id)
             .expect("list peer sync state");
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].network_peer_id, "12D3KooWPeerA");
+        assert_eq!(rows[0].network_peer_id, test_iroh_endpoint_id(42));
         assert_eq!(rows[0].backfill_successes, 3);
         assert_eq!(rows[0].backfill_failures, 1);
         assert_eq!(rows[0].updated_at, 1_700_000_000_000);

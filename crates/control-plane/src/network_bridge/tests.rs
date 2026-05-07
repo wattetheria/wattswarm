@@ -40,6 +40,17 @@ fn temp_startup_dir(prefix: &str) -> PathBuf {
     dir
 }
 
+fn random_network_node_id() -> NetworkNodeId {
+    let uuid = Uuid::new_v4();
+    let mut bytes = [0_u8; 32];
+    bytes[..16].copy_from_slice(uuid.as_bytes());
+    bytes[16..].copy_from_slice(uuid.as_bytes());
+    crate::network_p2p::network_peer_id_from_ed25519_public_key(
+        NodeIdentity::from_seed(bytes).verifying_key().to_bytes(),
+    )
+    .expect("valid test network node id")
+}
+
 fn sample_topic_content_ref(digest: &str, producer: &str) -> crate::types::ArtifactRef {
     crate::types::ArtifactRef {
         uri: format!("artifact://topic-message/{digest}"),
@@ -865,11 +876,8 @@ fn ingest_chat_gossip_applies_remote_topic_message_to_local_store() {
     let mut service = NetworkBridgeService::new(
         NetworkP2pNode::generate(NetworkP2pConfig {
             listen_addrs: vec!["/ip4/127.0.0.1/tcp/0".to_owned()],
-            bootstrap_peers: vec![
-                "/ip4/127.0.0.1/tcp/4001/p2p/12D3KooWJ5r1D8N8QYp8JDs7u9mM4rY2kQ6xXK7Z6A6V4t7N3sQX"
-                    .to_owned(),
-            ],
-            enable_mdns: false,
+            bootstrap_peers: Vec::new(),
+            enable_local_discovery: false,
             ..NetworkP2pConfig::default()
         })
         .expect("network node"),
@@ -882,7 +890,7 @@ fn ingest_chat_gossip_applies_remote_topic_message_to_local_store() {
         .handle_runtime_event(
             &mut node,
             Ok(NetworkRuntimeEvent::Gossip {
-                propagation_source: PeerId::random(),
+                propagation_source: random_network_node_id(),
                 message: GossipMessage::Chat(EventEnvelope {
                     scope: SwarmScope::Group("crew-7".to_owned()),
                     event: remote_event.clone(),
@@ -1285,13 +1293,13 @@ fn topic_backfill_response_advances_local_cursor() {
 fn network_config_defaults_to_enabled_with_fixed_tcp_port() {
     let _lock = lock_env_test_mutex();
     let _enabled = EnvVarGuard::set(ENV_P2P_ENABLED, None);
-    let _mdns = EnvVarGuard::set(ENV_P2P_MDNS, None);
+    let _local_discovery = EnvVarGuard::set(ENV_P2P_LOCAL_DISCOVERY, None);
     let _port = EnvVarGuard::set(ENV_P2P_PORT, None);
     let _listen = EnvVarGuard::set(ENV_P2P_LISTEN_ADDRS, None);
     let _bootstrap = EnvVarGuard::set(ENV_P2P_BOOTSTRAP_PEERS, None);
     assert!(network_enabled_from_env());
     let config = network_config_from_env();
-    assert!(config.enable_mdns);
+    assert!(config.enable_local_discovery);
     assert_eq!(config.listen_addrs, vec!["/ip4/0.0.0.0/tcp/4001"]);
     assert!(config.bootstrap_peers.is_empty());
 }
@@ -1382,11 +1390,8 @@ fn publish_pending_updates_subscribes_runtime_for_local_feed_subscription() {
     let mut service = NetworkBridgeService::new(
         NetworkP2pNode::generate(NetworkP2pConfig {
             listen_addrs: vec!["/ip4/127.0.0.1/tcp/0".to_owned()],
-            bootstrap_peers: vec![
-                "/ip4/127.0.0.1/tcp/4001/p2p/12D3KooWJ5r1D8N8QYp8JDs7u9mM4rY2kQ6xXK7Z6A6V4t7N3sQX"
-                    .to_owned(),
-            ],
-            enable_mdns: false,
+            bootstrap_peers: Vec::new(),
+            enable_local_discovery: false,
             ..NetworkP2pConfig::default()
         })
         .expect("network node"),
@@ -1446,7 +1451,7 @@ fn publish_pending_updates_unsubscribes_scope_when_local_subscription_is_disable
     let mut service = NetworkBridgeService::new(
         NetworkP2pNode::generate(NetworkP2pConfig {
             listen_addrs: vec!["/ip4/127.0.0.1/tcp/0".to_owned()],
-            enable_mdns: false,
+            enable_local_discovery: false,
             ..NetworkP2pConfig::default()
         })
         .expect("network node"),
@@ -2202,16 +2207,10 @@ fn lan_open_does_not_seed_default_protocol_roles() {
 #[test]
 fn network_config_reads_bootstrap_peers_from_env() {
     let _lock = lock_env_test_mutex();
-    let _bootstrap = EnvVarGuard::set(
-        ENV_P2P_BOOTSTRAP_PEERS,
-        Some("/ip4/127.0.0.1/tcp/4001/p2p/12D3KooWJ5r1D8N8QYp8JDs7u9mM4rY2kQ6xXK7Z6A6V4t7N3sQX"),
-    );
+    let _bootstrap = EnvVarGuard::set(ENV_P2P_BOOTSTRAP_PEERS, Some("node-a@127.0.0.1:4001"));
     let config = network_config_from_env();
     assert_eq!(config.bootstrap_peers.len(), 1);
-    assert_eq!(
-        config.bootstrap_peers[0],
-        "/ip4/127.0.0.1/tcp/4001/p2p/12D3KooWJ5r1D8N8QYp8JDs7u9mM4rY2kQ6xXK7Z6A6V4t7N3sQX"
-    );
+    assert_eq!(config.bootstrap_peers[0], "node-a@127.0.0.1:4001");
 }
 
 #[test]
@@ -2262,8 +2261,22 @@ fn global_publish_rate_guard_limits_only_high_frequency_global_events() {
 
 #[test]
 fn smarter_backfill_prefers_peer_with_known_scope_activity() {
-    let node_a = PeerId::random();
-    let node_b = PeerId::random();
+    let dir_a = temp_startup_dir("backfill-peer-a");
+    let dir_b = temp_startup_dir("backfill-peer-b");
+    std::fs::write(dir_a.join("node_seed.hex"), hex::encode([41_u8; 32])).expect("write seed a");
+    std::fs::write(dir_b.join("node_seed.hex"), hex::encode([42_u8; 32])).expect("write seed b");
+    let node_a = NetworkNodeId::new(
+        wattswarm_network_transport_iroh::local_endpoint_id_from_state_dir(&dir_a)
+            .expect("node a endpoint")
+            .to_string(),
+    )
+    .expect("node a id");
+    let node_b = NetworkNodeId::new(
+        wattswarm_network_transport_iroh::local_endpoint_id_from_state_dir(&dir_b)
+            .expect("node b endpoint")
+            .to_string(),
+    )
+    .expect("node b id");
     let target_scope = SwarmScope::Region("sol-1".to_owned());
     let other_scope = SwarmScope::Node("lab-2".to_owned());
     let now = Instant::now();
@@ -2274,20 +2287,44 @@ fn smarter_backfill_prefers_peer_with_known_scope_activity() {
         &NetworkProtocolParams::default(),
     )
     .expect("service");
-    service.connected_peers.insert(node_a);
-    service.connected_peers.insert(node_b);
+    let contact_a = export_local_contact_material_for_network_peer_id(
+        &dir_a,
+        node_a.as_str(),
+        observed_at_ms(),
+    )
+    .expect("contact a");
+    let contact_b = export_local_contact_material_for_network_peer_id(
+        &dir_b,
+        node_b.as_str(),
+        observed_at_ms(),
+    )
+    .expect("contact b");
+    service
+        .runtime
+        .upsert_remote_contact_material(node_a.to_string(), contact_a)
+        .expect("upsert contact a");
+    service
+        .runtime
+        .upsert_remote_contact_material(node_b.to_string(), contact_b)
+        .expect("upsert contact b");
+    service.connected_peers.insert(node_a.clone());
+    service.connected_peers.insert(node_b.clone());
 
     let mut state_a = PeerSyncState::new(now - Duration::from_secs(30));
     state_a.known_scopes.insert(other_scope);
     let mut state_b = PeerSyncState::new(now - Duration::from_secs(30));
     state_b.known_scopes.insert(target_scope.clone());
     service.peer_sync_state.insert(node_a, state_a);
-    service.peer_sync_state.insert(node_b, state_b);
+    service.peer_sync_state.insert(node_b.clone(), state_b);
 
     assert_eq!(
         service.preferred_backfill_peer_for_scope(&target_scope, now),
         Some(node_b)
     );
+    wattswarm_network_transport_iroh::shutdown_local_iroh_data_plane(&dir_a);
+    wattswarm_network_transport_iroh::shutdown_local_iroh_data_plane(&dir_b);
+    let _ = std::fs::remove_dir_all(dir_a);
+    let _ = std::fs::remove_dir_all(dir_b);
 }
 
 #[test]
@@ -2311,7 +2348,7 @@ fn peer_backfill_cursor_is_tracked_per_scope_and_feed() {
 #[test]
 fn peer_sync_state_persists_scope_cursor_and_remote_heads() {
     let dir = temp_startup_dir("peer-sync-state-persist");
-    let peer = PeerId::random();
+    let peer = random_network_node_id();
     let scope = SwarmScope::Group("crew-7".to_owned());
     let mut service = NetworkBridgeService::new(
         NetworkP2pNode::generate(NetworkP2pConfig::default()).expect("node"),
@@ -2321,10 +2358,10 @@ fn peer_sync_state_persists_scope_cursor_and_remote_heads() {
     .expect("service");
     service.set_state_dir(dir.clone(), dir.join("store.state"));
 
-    service.record_peer_scope_activity(peer, &scope);
-    service.record_peer_backfill_cursor(peer, &scope, Some("crew.chat"), 42);
+    service.record_peer_scope_activity(peer.clone(), &scope);
+    service.record_peer_backfill_cursor(peer.clone(), &scope, Some("crew.chat"), 42);
     service.record_peer_remote_head_event_ids(
-        peer,
+        peer.clone(),
         &scope,
         Some("crew.chat"),
         &["evt-head".to_owned()],
@@ -2366,7 +2403,7 @@ fn peer_sync_state_persists_scope_cursor_and_remote_heads() {
 #[test]
 fn peer_sync_state_migrates_legacy_json_to_db() {
     let dir = temp_startup_dir("peer-sync-state-legacy-migrate");
-    let peer = PeerId::random();
+    let peer = random_network_node_id();
     let scope = SwarmScope::Group("crew-7".to_owned());
     std::fs::write(
         legacy_peer_sync_state_path(&dir),
@@ -2414,7 +2451,7 @@ fn peer_sync_state_migrates_legacy_json_to_db() {
 
 #[test]
 fn connection_closed_with_remaining_established_keeps_peer_state() {
-    let peer = PeerId::random();
+    let peer = random_network_node_id();
     let mut node = Node::open_in_memory_with_roles(&[Role::Proposer]).expect("node");
     let mut service = NetworkBridgeService::new(
         NetworkP2pNode::generate(NetworkP2pConfig::default()).expect("node"),
@@ -2422,16 +2459,16 @@ fn connection_closed_with_remaining_established_keeps_peer_state() {
         &NetworkProtocolParams::default(),
     )
     .expect("service");
-    service.connected_peers.insert(peer);
+    service.connected_peers.insert(peer.clone());
     service
         .peer_sync_state
-        .insert(peer, PeerSyncState::new(Instant::now()));
+        .insert(peer.clone(), PeerSyncState::new(Instant::now()));
 
     let tick = service
         .process_runtime_event(
             &mut node,
             NetworkRuntimeEvent::ConnectionClosed {
-                peer,
+                peer: peer.clone(),
                 remaining_established: 1,
             },
         )
@@ -2444,7 +2481,7 @@ fn connection_closed_with_remaining_established_keeps_peer_state() {
 
 #[test]
 fn connection_closed_with_zero_remaining_preserves_peer_sync_state() {
-    let peer = PeerId::random();
+    let peer = random_network_node_id();
     let mut node = Node::open_in_memory_with_roles(&[Role::Proposer]).expect("node");
     let mut service = NetworkBridgeService::new(
         NetworkP2pNode::generate(NetworkP2pConfig::default()).expect("node"),
@@ -2452,16 +2489,16 @@ fn connection_closed_with_zero_remaining_preserves_peer_sync_state() {
         &NetworkProtocolParams::default(),
     )
     .expect("service");
-    service.connected_peers.insert(peer);
+    service.connected_peers.insert(peer.clone());
     service
         .peer_sync_state
-        .insert(peer, PeerSyncState::new(Instant::now()));
+        .insert(peer.clone(), PeerSyncState::new(Instant::now()));
 
     let tick = service
         .process_runtime_event(
             &mut node,
             NetworkRuntimeEvent::ConnectionClosed {
-                peer,
+                peer: peer.clone(),
                 remaining_established: 0,
             },
         )
@@ -2484,16 +2521,16 @@ fn peer_discovered_event_persists_wan_source_into_local_registry() {
     )
     .expect("service");
     service.set_state_dir(dir.clone(), dir.join("ui.state"));
-    let peer = PeerId::random();
+    let peer = random_network_node_id();
     let address = "/ip4/203.0.113.10/tcp/4001"
-        .parse::<Multiaddr>()
+        .parse::<NetworkAddress>()
         .expect("addr");
 
     let tick = service
         .process_runtime_event(
             &mut node,
             NetworkRuntimeEvent::PeerDiscovered {
-                peer,
+                peer: peer.clone(),
                 address: address.clone(),
                 source: PeerDiscoverySourceKind::Bootstrap,
             },
@@ -2525,14 +2562,14 @@ fn peer_identified_event_persists_peer_metadata_locally() {
     )
     .expect("service");
     service.set_state_dir(dir.clone(), dir.join("ui.state"));
-    let peer = PeerId::random();
+    let peer = random_network_node_id();
 
     let tick = service
         .process_runtime_event(
             &mut node,
-            NetworkRuntimeEvent::PeerIdentified {
-                peer,
-                metadata: crate::network_p2p::PeerIdentificationMetadata {
+            NetworkRuntimeEvent::PeerMetadataObserved {
+                peer: peer.clone(),
+                metadata: crate::network_p2p::PeerMetadata {
                     network_id: "mainnet:watt-galaxy".to_owned(),
                     params_version: 7,
                     params_hash: "params-abc".to_owned(),
@@ -2716,7 +2753,7 @@ fn set_state_dir_loads_startup_iroh_bootstrap_contacts_into_runtime() {
 
 #[test]
 fn scopes_to_request_for_peer_falls_back_to_all_scopes_until_peer_is_profiled() {
-    let peer = PeerId::random();
+    let peer = random_network_node_id();
     let target_scope = SwarmScope::Region("sol-1".to_owned());
     let service = NetworkBridgeService::new(
         NetworkP2pNode::generate(NetworkP2pConfig::default()).expect("node"),
@@ -3548,7 +3585,7 @@ fn observability_snapshot_reports_network_and_sync_health() {
     let mut service = NetworkBridgeService::new(
         NetworkP2pNode::generate(NetworkP2pConfig {
             listen_addrs: vec!["/ip4/127.0.0.1/tcp/0".to_owned()],
-            enable_mdns: false,
+            enable_local_discovery: false,
             ..NetworkP2pConfig::default()
         })
         .expect("network node"),
@@ -3557,8 +3594,8 @@ fn observability_snapshot_reports_network_and_sync_health() {
     )
     .expect("service");
 
-    let peer = PeerId::random();
-    service.connected_peers.insert(peer);
+    let peer = random_network_node_id();
+    service.connected_peers.insert(peer.clone());
     let mut peer_state = PeerSyncState::new(Instant::now());
     peer_state.known_scopes.insert(SwarmScope::Global);
     peer_state
@@ -3585,12 +3622,12 @@ fn observability_snapshot_reports_network_and_sync_health() {
         .expect("observability snapshot");
 
     assert_eq!(snapshot.connected_peer_count, 1);
-    assert_eq!(snapshot.p2p_foundation, "legacy-libp2p");
-    assert_eq!(snapshot.local_iroh_endpoint_id, None);
-    assert!(snapshot.subscribed_iroh_gossip_topics.is_empty());
+    assert_eq!(snapshot.p2p_foundation, "iroh");
+    assert!(snapshot.local_iroh_endpoint_id.is_some());
+    assert!(!snapshot.subscribed_iroh_gossip_topics.is_empty());
     assert_eq!(snapshot.known_iroh_contacts, 0);
-    assert!(snapshot.legacy_libp2p_active);
-    assert_eq!(snapshot.nat_status, "unknown");
+    assert!(!snapshot.legacy_transport_active);
+    assert_eq!(snapshot.nat_status, "iroh-direct");
     assert_eq!(snapshot.nat_public_address, None);
     assert_eq!(snapshot.nat_confidence, 0);
     assert!(snapshot.relay_reservations.is_empty());
@@ -3848,7 +3885,7 @@ fn publish_pending_global_events_publishes_local_rows_and_skips_remote_rows() {
     let mut service = NetworkBridgeService::new(
         NetworkP2pNode::generate(NetworkP2pConfig {
             listen_addrs: vec!["/ip4/127.0.0.1/tcp/0".to_owned()],
-            enable_mdns: false,
+            enable_local_discovery: false,
             ..NetworkP2pConfig::default()
         })
         .expect("network node"),
@@ -3860,7 +3897,7 @@ fn publish_pending_global_events_publishes_local_rows_and_skips_remote_rows() {
     let mut peer_service = NetworkBridgeService::new(
         NetworkP2pNode::generate(NetworkP2pConfig {
             listen_addrs: vec!["/ip4/127.0.0.1/tcp/0".to_owned()],
-            enable_mdns: false,
+            enable_local_discovery: false,
             ..NetworkP2pConfig::default()
         })
         .expect("peer network node"),
@@ -3869,7 +3906,8 @@ fn publish_pending_global_events_publishes_local_rows_and_skips_remote_rows() {
     )
     .expect("peer network service");
 
-    for _ in 0..4_096 {
+    let listen_deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < listen_deadline {
         let _ = service.try_tick(&mut node).expect("service tick");
         let _ = peer_service
             .try_tick(&mut peer_node)
@@ -3877,30 +3915,50 @@ fn publish_pending_global_events_publishes_local_rows_and_skips_remote_rows() {
         if !service.listen_addrs().is_empty() && !peer_service.listen_addrs().is_empty() {
             break;
         }
-        std::thread::yield_now();
+        std::thread::sleep(Duration::from_millis(1));
     }
-    service
-        .dial(peer_service.listen_addrs()[0].clone())
-        .expect("dial peer");
-    let mut connected = false;
-    for _ in 0..4_096 {
-        if let Some(NetworkBridgeTick::Connected { .. }) =
-            service.try_tick(&mut node).expect("service tick")
-        {
-            connected = true;
+    assert!(!service.listen_addrs().is_empty());
+    assert!(!peer_service.listen_addrs().is_empty());
+    let peer_addr = NetworkAddress::new(format!(
+        "{}@{}",
+        peer_service.local_peer_id(),
+        peer_service.listen_addrs()[0]
+    ))
+    .expect("peer dial addr");
+    let service_addr = NetworkAddress::new(format!(
+        "{}@{}",
+        service.local_peer_id(),
+        service.listen_addrs()[0]
+    ))
+    .expect("service dial addr");
+    service.dial(peer_addr).expect("dial peer");
+    peer_service
+        .dial(service_addr)
+        .expect("dial reciprocal peer");
+    let mut service_connected = false;
+    let mut peer_connected = false;
+    let connect_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < connect_deadline {
+        let tick = service.try_tick(&mut node).expect("service tick");
+        if matches!(tick, Some(NetworkBridgeTick::Connected { .. })) {
+            service_connected = true;
         }
-        let _ = peer_service
+        let peer_tick = peer_service
             .try_tick(&mut peer_node)
             .expect("peer service tick");
-        if connected {
+        if matches!(peer_tick, Some(NetworkBridgeTick::Connected { .. })) {
+            peer_connected = true;
+        }
+        if service_connected && peer_connected {
             break;
         }
-        std::thread::yield_now();
+        std::thread::sleep(Duration::from_millis(1));
     }
-    assert!(connected);
+    assert!(service_connected && peer_connected);
 
     let mut last = 0;
-    for _ in 0..4_096 {
+    let publish_deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < publish_deadline {
         last = publish_pending_global_events(&mut service, &node, &local_node_id, 0)
             .expect("publish pending");
         if last == 2 {
@@ -3910,7 +3968,7 @@ fn publish_pending_global_events_publishes_local_rows_and_skips_remote_rows() {
         let _ = peer_service
             .try_tick(&mut peer_node)
             .expect("peer service tick");
-        std::thread::yield_now();
+        std::thread::sleep(Duration::from_millis(1));
     }
     assert_eq!(last, 2);
 }
@@ -3937,7 +3995,7 @@ fn dial_discovered_peer_endpoints_skips_invalid_self_and_missing_addrs() {
             },
             crate::control::DiscoveredPeerRecord {
                 node_id: "peer-b".to_owned(),
-                listen_addr: Some("not-a-multiaddr".to_owned()),
+                listen_addr: Some("not-a-network address".to_owned()),
                 source_kind: "unknown".to_owned(),
             },
         ],
@@ -3947,7 +4005,7 @@ fn dial_discovered_peer_endpoints_skips_invalid_self_and_missing_addrs() {
     let mut service = NetworkBridgeService::new(
         NetworkP2pNode::generate(NetworkP2pConfig {
             listen_addrs: vec!["/ip4/127.0.0.1/tcp/0".to_owned()],
-            enable_mdns: false,
+            enable_local_discovery: false,
             ..NetworkP2pConfig::default()
         })
         .expect("network node"),
@@ -3981,7 +4039,7 @@ fn latest_connected_peer_ids_uses_runtime_observability_snapshot() {
             local_iroh_endpoint_id: Some("iroh-endpoint".to_owned()),
             subscribed_iroh_gossip_topics: vec!["global:task:abc123".to_owned()],
             known_iroh_contacts: 1,
-            legacy_libp2p_active: false,
+            legacy_transport_active: false,
             subscribed_scopes: vec!["global".to_owned()],
             connected_peer_count: 1,
             nat_status: "unknown".to_owned(),

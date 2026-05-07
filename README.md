@@ -127,7 +127,7 @@ The workspace now includes dedicated crates and a control-plane bridge for node-
   - wraps Iroh control streams for typed backfill and contact-material request/response flows
   - tracks Iroh peer quality with per-peer inflight limits, stream failures, retry backoff, invalid payload penalties, and retry-suppression counters
   - exposes a pollable network runtime facade for subscribe/publish/backfill/contact/relationship-control flows
-  - keeps the existing libp2p behaviour set only as an explicit legacy/generated-node compatibility path; normal state-dir startup does not start a libp2p swarm
+  - keeps the generated-node compatibility path explicit; normal state-dir startup uses the Iroh runtime
 - `crates/network-transport-core`
   - owns the shared data-plane transport abstraction used across WattSwarm-family projects
   - defines transport capabilities, protected contact material, transfer intents, and route selection
@@ -137,10 +137,10 @@ The workspace now includes dedicated crates and a control-plane bridge for node-
   - reuses `iroh-gossip` and `iroh-blobs` capabilities first where they fit instead of adding custom equivalents
   - registers the official `iroh-blobs` protocol on the shared Iroh endpoint for BLAKE3-addressed large payload transfer
   - serves topic message bodies, direct-message bodies, task outputs, and reference/blob recovery selected by the shared transport router
-  - supports contact-material and typed-control request/response over Iroh streams without requiring libp2p identify
+  - supports contact-material and typed-control request/response over Iroh streams without requiring a separate identify protocol
 - `crates/control-plane/src/network_bridge/mod.rs`
   - starts an Iroh-backed `NetworkRuntime` from the node `state_dir` on the main Wattswarm/Wattetheria path
-  - still supports the legacy generated-node libp2p runtime in tests and compatibility paths
+  - still supports explicit generated-node compatibility paths in tests
   - bridges runtime gossip events into `node-core::ingest_remote`
   - serves scope-aware backfill requests from the local event log
   - applies backfill responses into the local node projection pipeline
@@ -186,9 +186,9 @@ Runtime toggles:
 
 - `WATTSWARM_P2P_ENABLED=true` by default
 - set `WATTSWARM_P2P_ENABLED=false` to run WattSwarm in local-only mode
-- `WATTSWARM_P2P_MDNS=true` by default for the legacy libp2p compatibility path
-- `WATTSWARM_P2P_PORT=4001` is the legacy libp2p compatibility listen port
-- `WATTSWARM_P2P_LISTEN_ADDRS` can override the legacy libp2p multiaddr list
+- `WATTSWARM_P2P_MDNS=true` is retained as a legacy local-discovery compatibility switch
+- `WATTSWARM_P2P_PORT=4001` is the default Iroh direct listen port
+- `WATTSWARM_P2P_LISTEN_ADDRS` can override the Iroh network address list
 - `WATTSWARM_P2P_REGION_IDS=sol-1,sol-2` subscribes the node to those region scopes
 - `WATTSWARM_P2P_NODE_IDS=lab-a` subscribes the node to matching node scopes
 - `WATTSWARM_P2P_LOCAL_IDS=lab-a` is still accepted as a legacy alias for node scopes
@@ -198,8 +198,8 @@ Network-mode bootstrap behavior:
 - `WATTSWARM_NODE_MODE=network` tells the node to join an existing shared network instead of creating `local:` or `lan:` topology.
 - a joining node must know at least one Iroh bootstrap contact exported by the genesis or bootstrap node:
   - export on the genesis/bootstrap node with `wattswarm --state-dir <genesis-state-dir> node export-contact`
-  - the default export is a short `<node-id>@<host:port>` contact string
-  - paste the output into startup `Bootstrap Contacts`, or add it from CLI with `wattswarm --state-dir <joining-state-dir> node add-bootstrap-contact '<node-id>@<host:port>'`
+  - the default export is a short `<iroh-node-id>@<host:port>` contact string, where `iroh-node-id` is the Iroh `NodeId` / `EndpointId`
+  - paste the output into startup `Bootstrap Contacts`, or add it from CLI with `wattswarm --state-dir <joining-state-dir> node add-bootstrap-contact '<iroh-node-id>@<host:port>'`
   - `wattswarm --state-dir <genesis-state-dir> node export-contact --json` is available for internal debugging only
 - if local PostgreSQL is missing `network_registry / org_registry / network_params`, the node now attempts an automatic bootstrap sync:
   - derives one or more bootstrap HTTP endpoints from configured peers (or explicit `WATTSWARM_NETWORK_BOOTSTRAP_HTTP_URLS`)
@@ -213,9 +213,9 @@ Network-mode bootstrap behavior:
 WattSwarm's current decentralized networking model is:
 
 - main state-dir startup path: Iroh-backed runtime
-- transition path: existing libp2p control-plane publish/subscribe remains available for explicit legacy/generated-node compatibility while the launch path moves to Iroh
+- transition path: explicit generated-node compatibility remains available while the launch path uses Iroh
 - Iroh notification/control/data transfer for gossip notifications, backfill/contact streams, topic bodies, DM bodies, task outputs, and artifact recovery
-- legacy bootstrap-peer and Kademlia-assisted peer discovery for libp2p compatibility paths
+- bootstrap-peer and BootstrapIndex-assisted peer discovery for compatibility paths
 - legacy relay-assisted WAN reachability with DCUtR upgrade attempts
 - legacy AutoNAT reachability probing against known peers
 - inbound dedupe and per-peer/topic traffic guards
@@ -230,7 +230,7 @@ Topic message reads are partitioned by `network_id + feed_key + scope_hint`. The
 
 ### Shared Control Plane vs Shared Data Plane
 
-WattSwarm is moving from a libp2p-control/Iroh-data split to an Iroh-first network foundation:
+WattSwarm is moving from a split legacy-control/Iroh-data model to an Iroh-first network foundation:
 
 - Iroh is the target foundation for:
   - endpoint identity (`NodeId` / neutral `network_peer_id` naming)
@@ -245,7 +245,7 @@ WattSwarm is moving from a libp2p-control/Iroh-data split to an Iroh-first netwo
   - topic message bodies
   - candidate/task output bodies
   - future direct session/data exchange
-- libp2p remains a transition/legacy runtime path for explicit generated-node tests and compatibility while the Iroh event/request facade is completed
+- explicit generated-node tests and compatibility paths remain while the Iroh event/request facade is completed
 
 This split keeps WattSwarm's decentralized network organization intact while enforcing a cleaner semantic boundary:
 
@@ -528,7 +528,7 @@ specialization / faster closure / more stable network-level behavior"]
   - `node_id`
   - listen address hints for LAN dialing
 - bootstrap Iroh contacts:
-  - startup-supplied short `<node-id>@<host:port>` contacts for genesis or other bootstrap nodes
+  - startup-supplied short `<iroh-node-id>@<host:port>` contacts for genesis or other bootstrap nodes
   - short contacts are normalized into internal Iroh contact material before runtime registration
 - transport reachability signals:
   - Iroh endpoint id, direct addrs, relay urls, and contact-material freshness
@@ -558,7 +558,7 @@ specialization / faster closure / more stable network-level behavior"]
 - WAN discovery today:
   - configured bootstrap/contact material is loaded from startup config and local PostgreSQL
   - `iroh_direct` contact material is persisted in `peer_metadata_local`
-  - discovered compatibility peers are still persisted into local PostgreSQL `discovered_peers_local` with source kinds such as `bootstrap`, `identify`, and `kademlia`
+  - discovered compatibility peers are still persisted into local PostgreSQL `discovered_peers_local` with source kinds such as `bootstrap`, `identify`, and `bootstrap_index`
   - compatibility identify metadata is persisted separately into `peer_metadata_local`
 - Node relationship execution today:
   - node-to-node relationship actions are point-to-point request/response messages, not gossip subscriptions
@@ -592,13 +592,13 @@ specialization / faster closure / more stable network-level behavior"]
   - backfill peer selection now considers peer health plus previous backfill success/failure quality
   - peer sync state persists known scopes, lane cursors, remote head ids, and backfill quality across reconnect/restart
 - Diagnose / observability today:
-  - active snapshots expose `p2p_foundation = iroh`, `local_iroh_endpoint_id`, joined Iroh gossip topic ids, known Iroh contact count, and `legacy_libp2p_active = false` on the state-dir startup path
-  - old NAT/relay/dial field names remain in the JSON shape for Wattetheria UI compatibility, but they are compatibility fields and should not be interpreted as active libp2p runtime state when `p2p_foundation` is `iroh`
+  - active snapshots expose `p2p_foundation = iroh`, `local_iroh_endpoint_id`, joined Iroh gossip topic ids, known Iroh contact count, and `legacy_transport_active = false` on the state-dir startup path
+  - old NAT/relay/dial field names remain in the JSON shape for Wattetheria UI compatibility, but they are compatibility fields and should not be interpreted as active non-Iroh transport state when `p2p_foundation` is `iroh`
 - PostgreSQL identity compatibility:
   - durable sync identity uses `network_peer_id` in `network_peer_sync_state_local`; this value is a neutral network endpoint identity and can be an Iroh endpoint id
-  - `peer_metadata_local.node_id`, `discovered_peers_local.node_id`, `peer_relationships_local.remote_node_id`, and DM `remote_node_id` fields are node/business identities, not libp2p `PeerId` requirements
+  - `peer_metadata_local.node_id`, `discovered_peers_local.node_id`, `peer_relationships_local.remote_node_id`, and DM `remote_node_id` fields are node/business identities, not iroh `NetworkNodeId` requirements
   - `peer_metadata_local.contact_material_json` may still contain a JSON key named `peer_id` for compatibility with existing transport payloads; for `iroh_direct`, the authoritative endpoint is `metadata.endpoint_id` / `extra.endpoint_id`
-  - storage tests audit the local-control schema so main-path tables do not reintroduce libp2p-only `peer_id` identity columns
+  - storage tests audit the local-control schema so main-path tables do not reintroduce transport-specific `peer_id` identity columns
 - Not yet fully active end-to-end:
   - `RuleAnnouncement`
   - `CheckpointAnnouncement`
@@ -848,7 +848,7 @@ P2P env vars:
 - `WATTSWARM_P2P_ENABLED=true` by default
 - `WATTSWARM_P2P_MDNS=true` is retained for the legacy generated-node compatibility path
 - `WATTSWARM_P2P_PORT=4001` is retained as the legacy compatibility listen port
-- `WATTSWARM_P2P_LISTEN_ADDRS` is an optional legacy compatibility multiaddr override
+- `WATTSWARM_P2P_LISTEN_ADDRS` is an optional legacy compatibility network address override
 - `WATTSWARM_P2P_REGION_IDS` optional comma-separated region scope subscription list
 - `WATTSWARM_P2P_NODE_IDS` optional comma-separated node scope subscription list
 - `WATTSWARM_P2P_LOCAL_IDS` optional legacy alias for node scope subscription list
@@ -856,7 +856,7 @@ P2P env vars:
 Startup UI behavior:
 
 - `Display Name`, `Network Mode`, `Bootstrap Contacts`, optional `Gateway URLs`, and `Core Agent` are saved to `startup_config.json`
-- `Bootstrap Contacts` is shown only for `LAN` / `WAN` and accepts short Iroh contact strings in `<node-id>@<host:port>` format, not libp2p `/p2p/<peer-id>` multiaddrs
+- `Bootstrap Contacts` is shown only for `LAN` / `WAN` and accepts short Iroh contact strings in `<iroh-node-id>@<host:port>` format.
 - genesis/bootstrap nodes can export a paste-ready contact with `wattswarm --state-dir <state-dir> node export-contact`
 - saving `Core Agent` also syncs the local executor route into PostgreSQL `executor_registry_local`
 - startup UI does not write network topology into PostgreSQL directly; topology and signed network params are still imported through bootstrap sync or regular node startup flows
@@ -868,7 +868,7 @@ Optional UDP announce switch (default off):
 - `WATTSWARM_UDP_ANNOUNCE_ADDR=239.255.42.99` (multicast default) or `255.255.255.255` for broadcast
 - `WATTSWARM_UDP_ANNOUNCE_PORT=37931`
 - with switch enabled, startup emits announce payload and UI process listens on the same port and records discovered peer IDs into PostgreSQL `discovered_peers_local`
-- the same local peer registry also stores WAN discoveries; `source_kind` distinguishes `udp`, `mdns`, `bootstrap`, `identify`, and `kademlia`
+- the same local peer registry also stores WAN discoveries; `source_kind` distinguishes `udp`, `local_discovery`, `bootstrap`, `identify`, and `bootstrap_index`
 - when a peer advertise includes legacy listen material, that address is recorded for compatibility; active Iroh sync uses persisted `iroh_direct` contact material when available
 - `peers list` and `/api/peers/list` include the discovered peers loaded from that local PostgreSQL cache
 

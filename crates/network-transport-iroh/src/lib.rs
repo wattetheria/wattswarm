@@ -11,7 +11,6 @@ use iroh_blobs::{
 };
 use iroh_gossip::Gossip;
 use iroh_gossip::TopicId as IrohGossipTopicId;
-use libp2p::PeerId;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::HashMap;
@@ -38,6 +37,7 @@ const MAX_FETCH_REQUEST_BYTES: usize = 64 * 1024;
 const MAX_FETCH_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_CONTROL_REQUEST_BYTES: usize = 1024 * 1024;
 const MAX_CONTROL_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
+const MAX_GOSSIP_MESSAGE_BYTES: usize = 512 * 1024;
 
 pub fn derive_gossip_topic_id(
     network_id: &str,
@@ -115,12 +115,6 @@ pub struct IrohTransportAdapter {
 }
 
 impl IrohTransportAdapter {
-    pub fn from_local_peer_id(peer_id: &PeerId) -> Result<Self> {
-        let endpoint_id = peer_id_to_endpoint_id(peer_id)
-            .ok_or_else(|| anyhow!("peer id is not ed25519-backed"))?;
-        Ok(Self::from_endpoint_id(endpoint_id, peer_id.to_string()))
-    }
-
     pub fn from_seed_bytes(secret_key_32: [u8; 32]) -> Result<Self> {
         let secret_key = SecretKey::from_bytes(&secret_key_32);
         Ok(Self::from_secret_key(&secret_key))
@@ -466,7 +460,9 @@ impl IrohDataPlaneService {
         let router_future = || async {
             let blob_store = FsStore::load(iroh_blob_store_path(state_dir)).await?;
             let blobs = BlobsProtocol::new(&blob_store, None);
-            let gossip = Gossip::builder().spawn(endpoint.clone());
+            let gossip = Gossip::builder()
+                .max_message_size(MAX_GOSSIP_MESSAGE_BYTES)
+                .spawn(endpoint.clone());
             let router = Router::builder(endpoint.clone())
                 .accept(
                     adapter.config.alpn.as_bytes(),
@@ -509,11 +505,18 @@ impl IrohDataPlaneService {
         }))
     }
 
-    fn block_on<T>(&self, future: impl Future<Output = T>) -> T {
-        if tokio::runtime::Handle::try_current().is_ok() {
-            tokio::task::block_in_place(|| self.runtime.block_on(future))
-        } else {
-            self.runtime.block_on(future)
+    fn block_on<T: Send>(&self, future: impl Future<Output = T> + Send) -> T {
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) if handle.runtime_flavor() == RuntimeFlavor::MultiThread => {
+                tokio::task::block_in_place(|| self.runtime.block_on(future))
+            }
+            Ok(_) => std::thread::scope(|scope| {
+                scope
+                    .spawn(|| self.runtime.block_on(future))
+                    .join()
+                    .expect("join iroh runtime blocking operation")
+            }),
+            Err(_) => self.runtime.block_on(future),
         }
     }
 
@@ -746,13 +749,6 @@ fn endpoint_addr_from_contact_material(contact: &TransportContactMaterial) -> Re
     Ok(EndpointAddr::from_parts(endpoint_id, addrs))
 }
 
-fn ensure_local_iroh_data_plane(
-    state_dir: &Path,
-    local_peer_id: &PeerId,
-) -> Result<Arc<IrohDataPlaneService>> {
-    ensure_local_iroh_data_plane_for_network_peer_id(state_dir, &local_peer_id.to_string())
-}
-
 fn ensure_local_iroh_data_plane_for_network_peer_id(
     state_dir: &Path,
     network_peer_id: &str,
@@ -774,14 +770,6 @@ fn ensure_local_iroh_data_plane_for_network_peer_id(
     Ok(service)
 }
 
-pub fn export_local_contact_material(
-    state_dir: &Path,
-    local_peer_id: &PeerId,
-    generated_at: u64,
-) -> Result<TransportContactMaterial> {
-    ensure_local_iroh_data_plane(state_dir, local_peer_id)?.export_contact_material(generated_at)
-}
-
 pub fn export_local_contact_material_for_network_peer_id(
     state_dir: &Path,
     network_peer_id: &str,
@@ -789,15 +777,6 @@ pub fn export_local_contact_material_for_network_peer_id(
 ) -> Result<TransportContactMaterial> {
     ensure_local_iroh_data_plane_for_network_peer_id(state_dir, network_peer_id)?
         .export_contact_material(generated_at)
-}
-
-pub fn fetch_direct_data(
-    state_dir: &Path,
-    local_peer_id: &PeerId,
-    remote_contact: &TransportContactMaterial,
-    request: &DirectDataFetchRequest,
-) -> Result<DirectDataFetchResponse> {
-    ensure_local_iroh_data_plane(state_dir, local_peer_id)?.fetch(remote_contact, request)
 }
 
 pub fn fetch_direct_data_for_network_peer_id(
@@ -985,15 +964,6 @@ pub fn shutdown_local_iroh_data_plane(state_dir: &Path) {
     }
 }
 
-pub fn peer_id_to_endpoint_id(peer_id: &PeerId) -> Option<EndpointId> {
-    let bytes = peer_id.to_bytes();
-    if bytes.len() != 38 {
-        return None;
-    }
-    let byte_array = <[u8; 32]>::try_from(&bytes[6..]).ok()?;
-    EndpointId::from_bytes(&byte_array).ok()
-}
-
 pub fn endpoint_id_from_secret_key(secret_key: &SecretKey) -> EndpointId {
     EndpointId::from_bytes(secret_key.public().as_bytes())
         .expect("iroh secret public key must be a valid endpoint id")
@@ -1006,21 +976,13 @@ pub fn local_endpoint_id_from_state_dir(state_dir: &Path) -> Result<EndpointId> 
 }
 
 fn network_peer_id_matches_endpoint_id(network_peer_id: &str, endpoint_id: EndpointId) -> bool {
-    if network_peer_id == endpoint_id.to_string() {
-        return true;
-    }
-    network_peer_id
-        .parse::<PeerId>()
-        .ok()
-        .and_then(|peer_id| peer_id_to_endpoint_id(&peer_id))
-        .is_some_and(|legacy_endpoint_id| legacy_endpoint_id == endpoint_id)
+    network_peer_id == endpoint_id.to_string()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use iroh_gossip::api::Event;
-    use libp2p::identity::Keypair;
     use n0_future::StreamExt;
     use tempfile::tempdir;
     use tokio::time::{Duration, timeout};
@@ -1030,25 +992,15 @@ mod tests {
     }
 
     #[test]
-    fn converts_ed25519_peer_id_to_iroh_endpoint_id() {
-        let keypair = Keypair::generate_ed25519();
-        let peer_id = keypair.public().to_peer_id();
-        let endpoint_id = peer_id_to_endpoint_id(&peer_id).expect("ed25519 peer id");
-        assert_eq!(endpoint_id.as_bytes(), &peer_id.to_bytes()[6..]);
-    }
-
-    #[test]
     fn exports_iroh_contact_material_with_capabilities() {
-        let keypair = Keypair::generate_ed25519();
-        let peer_id = keypair.public().to_peer_id();
-        let adapter = IrohTransportAdapter::from_local_peer_id(&peer_id).expect("adapter");
+        let adapter = IrohTransportAdapter::from_seed_bytes([5u8; 32]).expect("adapter");
         let material = adapter.material_payload(
             &["127.0.0.1:7777".to_owned()],
             &["https://relay.example".to_owned()],
             42,
         );
         assert_eq!(material.transport, "iroh_direct");
-        assert_eq!(material.peer_id, peer_id.to_string());
+        assert_eq!(material.peer_id, adapter.network_peer_id());
         assert_eq!(material.metadata.generated_at, 42);
         assert!(material.metadata.capabilities.supports_iroh_direct);
         assert!(material.metadata.endpoint_id.is_some());
@@ -1330,20 +1282,12 @@ mod tests {
         seed_state_dir(local_dir.path(), [7u8; 32]);
         seed_state_dir(remote_dir.path(), [9u8; 32]);
 
-        let local_peer_id = {
-            let secret = SecretKey::from_bytes(&[7u8; 32]);
-            PeerId::from_public_key(&libp2p::identity::PublicKey::from(
-                libp2p::identity::ed25519::PublicKey::try_from_bytes(secret.public().as_bytes())
-                    .expect("ed25519 public key"),
-            ))
-        };
-        let remote_peer_id = {
-            let secret = SecretKey::from_bytes(&[9u8; 32]);
-            PeerId::from_public_key(&libp2p::identity::PublicKey::from(
-                libp2p::identity::ed25519::PublicKey::try_from_bytes(secret.public().as_bytes())
-                    .expect("ed25519 public key"),
-            ))
-        };
+        let local_peer_id = local_endpoint_id_from_state_dir(local_dir.path())
+            .expect("local endpoint")
+            .to_string();
+        let remote_peer_id = local_endpoint_id_from_state_dir(remote_dir.path())
+            .expect("remote endpoint")
+            .to_string();
 
         let remote_store = open_artifact_store(remote_dir.path()).expect("artifact store");
         let bytes = br#"{"hello":"iroh"}"#;
@@ -1359,9 +1303,13 @@ mod tests {
             )
             .expect("write remote artifact");
 
-        let remote_contact = export_local_contact_material(remote_dir.path(), &remote_peer_id, 11)
-            .expect("remote contact material");
-        let response = fetch_direct_data(
+        let remote_contact = export_local_contact_material_for_network_peer_id(
+            remote_dir.path(),
+            &remote_peer_id,
+            11,
+        )
+        .expect("remote contact material");
+        let response = fetch_direct_data_for_network_peer_id(
             local_dir.path(),
             &local_peer_id,
             &remote_contact,
