@@ -6,8 +6,8 @@ use crate::task_template::sample_contract;
 use crate::types::{
     Candidate, ClaimRole, EventPayload, ExecutionIntentDeclaredPayload,
     ExecutionSetConfirmedPayload, ExecutionSetMember, FinalityProof, Membership,
-    NetworkBootstrapBundle, Role, TaskContract, VerificationStatus, VerifierResult, VoteChoice,
-    VoteCommitPayload, VoteRevealPayload,
+    NetworkBootstrapBundle, NetworkJoinManifest, Role, TaskContract, VerificationStatus,
+    VerifierResult, VoteChoice, VoteCommitPayload, VoteRevealPayload,
 };
 use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -400,23 +400,34 @@ where
     Err(last_err.unwrap_or_else(|| anyhow!("runtime probe failed without an error")))
 }
 
+fn normalize_bootstrap_bundle_endpoint(value: &str) -> String {
+    if value.contains("/api/") {
+        value.to_owned()
+    } else {
+        format!("{}/api/network/bootstrap", value.trim_end_matches('/'))
+    }
+}
+
+fn comma_separated_env_values(key: &str) -> Vec<String> {
+    env::var(key)
+        .ok()
+        .map(|raw| {
+            raw.split(',')
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 fn bootstrap_bundle_endpoint_candidates(state_dir: &Path) -> Result<Vec<String>> {
     let mut seen = BTreeSet::new();
     let mut endpoints = Vec::new();
-    if let Ok(raw) = env::var(ENV_NETWORK_BOOTSTRAP_HTTP_URLS) {
-        for value in raw
-            .split(',')
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-        {
-            let endpoint = if value.contains("/api/") {
-                value.to_owned()
-            } else {
-                format!("{}/api/network/bootstrap", value.trim_end_matches('/'))
-            };
-            if seen.insert(endpoint.clone()) {
-                endpoints.push(endpoint);
-            }
+    for value in comma_separated_env_values(ENV_NETWORK_BOOTSTRAP_HTTP_URLS) {
+        let endpoint = normalize_bootstrap_bundle_endpoint(&value);
+        if seen.insert(endpoint.clone()) {
+            endpoints.push(endpoint);
         }
     }
     if !endpoints.is_empty() {
@@ -439,6 +450,65 @@ fn bootstrap_bundle_endpoint_candidates(state_dir: &Path) -> Result<Vec<String>>
     Ok(endpoints)
 }
 
+const DEFAULT_WAN_JOIN_MANIFEST_BASE_URL: &str = "https://bootstrap.wattetheria.com";
+
+fn join_manifest_endpoint_candidates(include_default_wan_endpoint: bool) -> Vec<String> {
+    let mut seen = BTreeSet::new();
+    let mut endpoints = Vec::new();
+    for value in comma_separated_env_values(ENV_NETWORK_JOIN_MANIFEST_URLS) {
+        let endpoint = if value.ends_with(".json") || value.contains("/.well-known/") {
+            value
+        } else {
+            format!(
+                "{}{}",
+                value.trim_end_matches('/'),
+                NETWORK_JOIN_MANIFEST_ROUTE
+            )
+        };
+        if seen.insert(endpoint.clone()) {
+            endpoints.push(endpoint);
+        }
+    }
+    if endpoints.is_empty() && include_default_wan_endpoint {
+        endpoints.push(format!(
+            "{}{}",
+            DEFAULT_WAN_JOIN_MANIFEST_BASE_URL, NETWORK_JOIN_MANIFEST_ROUTE
+        ));
+    }
+    endpoints
+}
+
+fn fallback_bundle_endpoint_from_manifest_url(endpoint: &str) -> Option<String> {
+    let Ok(mut url) = reqwest::Url::parse(endpoint) else {
+        return None;
+    };
+    url.set_path(NETWORK_BOOTSTRAP_ROUTE);
+    url.set_query(None);
+    url.set_fragment(None);
+    Some(url.to_string())
+}
+
+fn bootstrap_bundle_endpoints_from_manifest(
+    manifest: &NetworkJoinManifest,
+    manifest_endpoint: &str,
+) -> Vec<String> {
+    let mut seen = BTreeSet::new();
+    let mut endpoints = Vec::new();
+    for value in &manifest.bootstrap_urls {
+        let endpoint = normalize_bootstrap_bundle_endpoint(value.trim());
+        if seen.insert(endpoint.clone()) {
+            endpoints.push(endpoint);
+        }
+    }
+    if endpoints.is_empty()
+        && let Some(endpoint) = fallback_bundle_endpoint_from_manifest_url(manifest_endpoint)
+        && seen.insert(endpoint.clone())
+    {
+        endpoints.push(endpoint);
+    }
+    endpoints
+}
+
 fn fetch_network_bootstrap_bundle(endpoint: &str) -> Result<NetworkBootstrapBundle> {
     let client = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(3))
@@ -459,17 +529,168 @@ fn fetch_network_bootstrap_bundle(endpoint: &str) -> Result<NetworkBootstrapBund
     Ok(payload.bundle)
 }
 
+fn fetch_network_join_manifest(endpoint: &str) -> Result<NetworkJoinManifest> {
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(3))
+        .build()
+        .context("build join manifest HTTP client")?;
+    client
+        .get(endpoint)
+        .send()
+        .with_context(|| format!("request join manifest from {endpoint}"))?
+        .error_for_status()
+        .with_context(|| format!("join manifest endpoint returned error: {endpoint}"))?
+        .json()
+        .with_context(|| format!("decode join manifest from {endpoint}"))
+}
+
+fn validate_bundle_against_join_manifest(
+    manifest: &NetworkJoinManifest,
+    bundle: &NetworkBootstrapBundle,
+) -> Result<()> {
+    let network = &bundle.topology.network;
+    if network.network_id != manifest.network_id {
+        bail!(
+            "join manifest network_id mismatch expected={} got={}",
+            manifest.network_id,
+            network.network_id
+        );
+    }
+    if network.genesis_node_id != manifest.genesis_node_id {
+        bail!(
+            "join manifest genesis_node_id mismatch expected={} got={}",
+            manifest.genesis_node_id,
+            network.genesis_node_id
+        );
+    }
+    if bundle.signed_params.params_hash != manifest.params_hash {
+        bail!(
+            "join manifest params_hash mismatch expected={} got={}",
+            manifest.params_hash,
+            bundle.signed_params.params_hash
+        );
+    }
+    Ok(())
+}
+
+fn merge_manifest_values(
+    value: &mut Value,
+    field: &str,
+    manifest_values: &[String],
+    trim_trailing_slash: bool,
+) {
+    let mut values = value
+        .get(field)
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|entry| entry.as_str().map(str::to_owned))
+        .collect::<Vec<_>>();
+    let mut seen = values.iter().cloned().collect::<BTreeSet<_>>();
+    for manifest_value in manifest_values {
+        let trimmed = manifest_value.trim();
+        let manifest_value = if trim_trailing_slash {
+            trimmed.trim_end_matches('/')
+        } else {
+            trimmed
+        };
+        if !manifest_value.is_empty() && seen.insert(manifest_value.to_owned()) {
+            values.push(manifest_value.to_owned());
+        }
+    }
+    value[field] = Value::Array(values.into_iter().map(Value::String).collect());
+}
+
+fn persist_join_manifest_startup_config(
+    state_dir: &Path,
+    manifest: &NetworkJoinManifest,
+) -> Result<()> {
+    if manifest.bootstrap_contacts.is_empty() && manifest.gateway_urls.is_empty() {
+        return Ok(());
+    }
+    fs::create_dir_all(state_dir)?;
+    let path = state_dir.join("startup_config.json");
+    let mut value = if path.exists() {
+        serde_json::from_slice::<Value>(&fs::read(&path)?)
+            .with_context(|| format!("parse startup config at {}", path.display()))?
+    } else {
+        json!({})
+    };
+    if !value.is_object() {
+        value = json!({});
+    }
+    if !value
+        .get("network_mode")
+        .and_then(Value::as_str)
+        .is_some_and(|mode| !mode.trim().is_empty())
+    {
+        value["network_mode"] = Value::String("wan".to_owned());
+    }
+    merge_manifest_values(
+        &mut value,
+        "bootstrap_contacts",
+        &manifest.bootstrap_contacts,
+        false,
+    );
+    merge_manifest_values(&mut value, "gateway_urls", &manifest.gateway_urls, true);
+    fs::write(&path, serde_json::to_vec_pretty(&value)?)?;
+    Ok(())
+}
+
+fn try_sync_network_bootstrap_bundle_from_join_manifest(
+    state_dir: &Path,
+    store: &PgStore,
+    include_default_wan_endpoint: bool,
+) -> Result<bool> {
+    let endpoints = join_manifest_endpoint_candidates(include_default_wan_endpoint);
+    if endpoints.is_empty() {
+        return Ok(false);
+    }
+    let mut last_err = None;
+    for manifest_endpoint in endpoints {
+        match retry_runtime_probe(|| fetch_network_join_manifest(&manifest_endpoint)) {
+            Ok(manifest) => {
+                let bundle_endpoints =
+                    bootstrap_bundle_endpoints_from_manifest(&manifest, &manifest_endpoint);
+                for bundle_endpoint in bundle_endpoints {
+                    match retry_runtime_probe(|| fetch_network_bootstrap_bundle(&bundle_endpoint)) {
+                        Ok(bundle) => {
+                            validate_bundle_against_join_manifest(&manifest, &bundle)?;
+                            store.import_network_bootstrap_bundle(&bundle)?;
+                            persist_join_manifest_startup_config(state_dir, &manifest)?;
+                            return Ok(true);
+                        }
+                        Err(err) => {
+                            last_err =
+                                Some(err.context(format!(
+                                    "fetch bootstrap bundle via {bundle_endpoint}"
+                                )));
+                        }
+                    }
+                }
+            }
+            Err(err) => {
+                last_err =
+                    Some(err.context(format!("fetch join manifest via {manifest_endpoint}")));
+            }
+        }
+    }
+    if let Some(err) = last_err {
+        return Err(err);
+    }
+    Ok(false)
+}
+
 fn maybe_sync_network_bootstrap_bundle(
     state_dir: &Path,
     store: &PgStore,
     self_node_id: &str,
     now: u64,
 ) -> Result<bool> {
-    let local_bundle_ready = match store.resolve_network_bootstrap_topology_descriptor(
-        self_node_id,
-        self_node_id,
-        now,
-    ) {
+    let local_topology =
+        store.resolve_network_bootstrap_topology_descriptor(self_node_id, self_node_id, now);
+    let local_bundle_ready = match &local_topology {
         Ok(topology) => store
             .for_org(&topology.org.org_id)
             .load_verified_network_protocol_params()
@@ -481,6 +702,15 @@ fn maybe_sync_network_bootstrap_bundle(
     }
 
     let endpoints = bootstrap_bundle_endpoint_candidates(state_dir)?;
+    let include_default_wan_endpoint = local_topology.is_err() && endpoints.is_empty();
+    if try_sync_network_bootstrap_bundle_from_join_manifest(
+        state_dir,
+        store,
+        include_default_wan_endpoint,
+    )? {
+        return Ok(true);
+    }
+
     if endpoints.is_empty() {
         return Ok(false);
     }
@@ -2400,16 +2630,27 @@ fn load_or_create_identity(seed_file: &Path) -> Result<NodeIdentity> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ENV_NETWORK_BOOTSTRAP_HTTP_URLS, accept_task_result_locally,
-        bootstrap_bundle_endpoint_candidates, peer_dm_content_from_envelope,
-        synthesize_peer_dm_envelope,
+        ENV_NETWORK_BOOTSTRAP_HTTP_URLS, ENV_NETWORK_JOIN_MANIFEST_URLS,
+        NETWORK_JOIN_MANIFEST_ROUTE, accept_task_result_locally,
+        bootstrap_bundle_endpoint_candidates, join_manifest_endpoint_candidates,
+        peer_dm_content_from_envelope, synthesize_peer_dm_envelope,
     };
     use crate::node::Node;
     use crate::task_template::sample_contract;
     use crate::types::{Candidate, Role};
     use serde_json::json;
     use std::fs;
+    use std::sync::{Mutex, OnceLock};
     use uuid::Uuid;
+
+    static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        ENV_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
 
     struct EnvVarGuard {
         key: &'static str,
@@ -2417,6 +2658,15 @@ mod tests {
     }
 
     impl EnvVarGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let prev = std::env::var(key).ok();
+            // SAFETY: test mutates process env and restores it on drop.
+            unsafe {
+                std::env::set_var(key, value);
+            }
+            Self { key, prev }
+        }
+
         fn remove(key: &'static str) -> Self {
             let prev = std::env::var(key).ok();
             // SAFETY: test mutates process env and restores it on drop.
@@ -2451,6 +2701,7 @@ mod tests {
 
     #[test]
     fn bootstrap_bundle_candidates_do_not_treat_startup_contacts_as_http_sources() {
+        let _guard = env_lock();
         let state_dir = temp_test_dir("bootstrap-candidates");
         let startup_config_path = state_dir.join("startup_config.json");
         fs::write(
@@ -2480,6 +2731,35 @@ mod tests {
             bootstrap_bundle_endpoint_candidates(&state_dir).expect("load bootstrap candidates");
         assert!(endpoints.is_empty());
         let _ = fs::remove_dir_all(state_dir);
+    }
+
+    #[test]
+    fn join_manifest_candidates_default_to_wattetheria_for_fresh_wan() {
+        let _guard = env_lock();
+        let _manifest_guard = EnvVarGuard::remove(ENV_NETWORK_JOIN_MANIFEST_URLS);
+        assert!(join_manifest_endpoint_candidates(false).is_empty());
+        assert_eq!(
+            join_manifest_endpoint_candidates(true),
+            vec![format!(
+                "https://bootstrap.wattetheria.com{NETWORK_JOIN_MANIFEST_ROUTE}"
+            )]
+        );
+    }
+
+    #[test]
+    fn join_manifest_candidates_use_explicit_env_without_default() {
+        let _guard = env_lock();
+        let _manifest_guard = EnvVarGuard::set(
+            ENV_NETWORK_JOIN_MANIFEST_URLS,
+            "https://custom.example.net,https://seed.example.net/.well-known/wattswarm/join.json",
+        );
+        assert_eq!(
+            join_manifest_endpoint_candidates(true),
+            vec![
+                format!("https://custom.example.net{NETWORK_JOIN_MANIFEST_ROUTE}"),
+                "https://seed.example.net/.well-known/wattswarm/join.json".to_owned(),
+            ]
+        );
     }
 
     #[test]

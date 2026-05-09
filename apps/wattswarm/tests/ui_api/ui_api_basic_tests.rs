@@ -446,7 +446,12 @@ fn ui_root_page_serves_startup_view_and_diagnostics_route_redirects_legacy_conso
         assert!(root_html.contains("Bootstrap Contacts"));
         assert!(root_html.contains("node export-contact"));
         assert!(root_html.contains("&lt;node-id&gt;@&lt;host:port&gt;"));
-        assert!(root_html.contains("Paste one short Iroh bootstrap contact per line"));
+        assert!(
+            root_html.contains(
+                "WAN discovers Wattetheria bootstrap and gateway endpoints automatically"
+            )
+        );
+        assert!(root_html.contains("Used only for LAN or private test networks"));
         assert!(!root_html.contains("<genesis-node-id>"));
         assert!(!root_html.contains("\"metadata\":{\"route\":\"iroh_direct\""));
         assert!(!root_html.contains("href=\"/console\""));
@@ -663,6 +668,92 @@ fn ui_exposes_network_bootstrap_bundle() {
         assert_eq!(
             json["bundle"]["signed_params"]["signed_by"].as_str(),
             Some(genesis_node_id.as_str())
+        );
+    });
+}
+
+#[test]
+fn ui_exposes_network_join_manifest() {
+    let _guard = env_lock();
+    let _db_lock = DbTestLock::acquire();
+    let schema = reset_test_schema("test");
+    let _schema_guard = EnvVarGuard::set("WATTSWARM_PG_SCHEMA", &schema);
+    let _mode_guard = EnvVarGuard::set("WATTSWARM_NODE_MODE", "network");
+    let _urls_guard = EnvVarGuard::set(
+        "WATTSWARM_PUBLIC_BOOTSTRAP_URLS",
+        "https://bootstrap.wattetheria.com",
+    );
+    let _contacts_guard = EnvVarGuard::set(
+        "WATTSWARM_PUBLIC_BOOTSTRAP_CONTACTS",
+        "iroh-contact-a,iroh-contact-b",
+    );
+    let _gateway_guard = EnvVarGuard::set(
+        "WATTSWARM_PUBLIC_GATEWAY_URLS",
+        "https://gateway.wattetheria.com",
+    );
+    let dir = tempdir().unwrap();
+    let state_dir = dir.path().join("state");
+    std::fs::create_dir_all(&state_dir).unwrap();
+    let db_path = state_dir.join("ui.state");
+    let genesis = NodeIdentity::random();
+    let genesis_node_id = genesis.node_id();
+    let network_id = "mainnet:wattetheria";
+    let store = wattswarm::storage::PgStore::open(&db_path).unwrap();
+    store
+        .ensure_mainnet_bootstrap_network_topology(
+            network_id,
+            "Wattetheria",
+            &genesis_node_id,
+            &genesis_node_id,
+            1_700_000_000_000,
+        )
+        .unwrap();
+    let signed = store
+        .put_network_protocol_params(network_id, &genesis, &NetworkProtocolParams::default())
+        .unwrap();
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let app = build_app(UiServerState::new(state_dir, db_path));
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/.well-known/wattswarm/join.json")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let json = json_from(res).await;
+        assert_eq!(json["network_id"].as_str(), Some(network_id));
+        assert_eq!(
+            json["genesis_node_id"].as_str(),
+            Some(genesis_node_id.as_str())
+        );
+        assert_eq!(
+            json["params_hash"].as_str(),
+            Some(signed.params_hash.as_str())
+        );
+        assert_eq!(
+            json["bootstrap_urls"][0].as_str(),
+            Some("https://bootstrap.wattetheria.com")
+        );
+        assert_eq!(
+            json["bootstrap_contacts"][0].as_str(),
+            Some("iroh-contact-a")
+        );
+        assert_eq!(
+            json["bootstrap_contacts"][1].as_str(),
+            Some("iroh-contact-b")
+        );
+        assert_eq!(
+            json["gateway_urls"][0].as_str(),
+            Some("https://gateway.wattetheria.com")
         );
     });
 }

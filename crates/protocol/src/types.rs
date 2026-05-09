@@ -940,6 +940,19 @@ pub struct NetworkBootstrapBundle {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NetworkJoinManifest {
+    pub network_id: String,
+    pub genesis_node_id: String,
+    pub params_hash: String,
+    #[serde(default)]
+    pub bootstrap_urls: Vec<String>,
+    #[serde(default)]
+    pub bootstrap_contacts: Vec<String>,
+    #[serde(default)]
+    pub gateway_urls: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MembershipUpdatedPayload {
     pub new_membership: Membership,
     pub quorum_threshold: u32,

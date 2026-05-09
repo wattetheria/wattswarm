@@ -411,6 +411,10 @@ pub fn build_app(state: UiServerState) -> Router {
         .route("/api/node/status", get(node_status))
         .route("/api/network/local", get(network_local))
         .route("/api/network/bootstrap", get(network_bootstrap))
+        .route(
+            "/.well-known/wattswarm/join.json",
+            get(network_join_manifest),
+        )
         .route("/api/startup-config", get(startup_config_get))
         .route("/api/startup-config", post(startup_config_save))
         .route("/api/peers/list", get(peers_list))
@@ -645,6 +649,50 @@ async fn network_bootstrap(State(state): State<UiServerState>) -> Result<Json<Va
     })))
 }
 
+const ENV_PUBLIC_BOOTSTRAP_URLS: &str = "WATTSWARM_PUBLIC_BOOTSTRAP_URLS";
+const ENV_PUBLIC_BOOTSTRAP_CONTACTS: &str = "WATTSWARM_PUBLIC_BOOTSTRAP_CONTACTS";
+const ENV_PUBLIC_GATEWAY_URLS: &str = "WATTSWARM_PUBLIC_GATEWAY_URLS";
+
+fn split_public_manifest_values(key: &str) -> Vec<String> {
+    std::env::var(key)
+        .ok()
+        .map(|raw| {
+            raw.split(',')
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+async fn network_join_manifest(
+    State(state): State<UiServerState>,
+) -> Result<Json<crate::types::NetworkJoinManifest>, ApiError> {
+    let state_clone = state.clone();
+    let manifest = run_blocking(move || -> Result<crate::types::NetworkJoinManifest> {
+        let node = open_configured_node(&state_clone.state_dir, &state_clone.db_path)?;
+        let bundle = node.store.load_network_bootstrap_bundle()?;
+        let mut bootstrap_contacts = split_public_manifest_values(ENV_PUBLIC_BOOTSTRAP_CONTACTS);
+        if bootstrap_contacts.is_empty()
+            && let Ok(contact) =
+                crate::network_bridge::export_local_bootstrap_contact_json(&state_clone.state_dir)
+        {
+            bootstrap_contacts.push(contact);
+        }
+        Ok(crate::types::NetworkJoinManifest {
+            network_id: bundle.topology.network.network_id,
+            genesis_node_id: bundle.topology.network.genesis_node_id,
+            params_hash: bundle.signed_params.params_hash,
+            bootstrap_urls: split_public_manifest_values(ENV_PUBLIC_BOOTSTRAP_URLS),
+            bootstrap_contacts,
+            gateway_urls: split_public_manifest_values(ENV_PUBLIC_GATEWAY_URLS),
+        })
+    })
+    .await?;
+    Ok(Json(manifest))
+}
+
 async fn startup_config_get(State(state): State<UiServerState>) -> Result<Json<Value>, ApiError> {
     let state_clone = state.clone();
     let config =
@@ -671,8 +719,16 @@ async fn startup_config_save(
         latitude: req.latitude.or(existing.latitude),
         longitude: req.longitude.or(existing.longitude),
         network_mode: req.network_mode,
-        bootstrap_contacts: req.bootstrap_contacts,
-        gateway_urls: req.gateway_urls,
+        bootstrap_contacts: if matches!(req.network_mode, crate::startup_config::NetworkMode::Lan) {
+            req.bootstrap_contacts
+        } else {
+            Vec::new()
+        },
+        gateway_urls: if matches!(req.network_mode, crate::startup_config::NetworkMode::Lan) {
+            req.gateway_urls
+        } else {
+            Vec::new()
+        },
         core_agent: req.core_agent.clone().unwrap_or(existing.core_agent),
     }
     .normalized();

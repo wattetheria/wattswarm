@@ -701,8 +701,10 @@ pub(crate) struct PreparedRuntime {
 }
 
 pub(crate) const ENV_NETWORK_BOOTSTRAP_HTTP_URLS: &str = "WATTSWARM_NETWORK_BOOTSTRAP_HTTP_URLS";
+pub(crate) const ENV_NETWORK_JOIN_MANIFEST_URLS: &str = "WATTSWARM_NETWORK_JOIN_MANIFEST_URLS";
 pub(crate) const DEFAULT_BOOTSTRAP_HTTP_PORT: u16 = 7788;
 pub(crate) const NETWORK_BOOTSTRAP_ROUTE: &str = "/api/network/bootstrap";
+pub(crate) const NETWORK_JOIN_MANIFEST_ROUTE: &str = "/.well-known/wattswarm/join.json";
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct NetworkBootstrapBundleResponse {

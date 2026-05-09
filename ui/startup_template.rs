@@ -330,7 +330,7 @@ pub const STARTUP_HTML: &str = r#"<!DOCTYPE html>
 
         <div class="panel">
           <h2>Network Mode</h2>
-          <div class="hint">Choose where this node should live. Deeper Iroh transport and contact settings stay out of the startup page.</div>
+          <div class="hint">Choose where this node should live. WAN discovers Wattetheria bootstrap and gateway endpoints automatically.</div>
           <div class="mode-buttons">
             <button id="networkLocal" class="mode" type="button" onclick="setNetworkMode('local')">Local</button>
             <button id="networkLan" class="mode" type="button" onclick="setNetworkMode('lan')">LAN</button>
@@ -346,15 +346,15 @@ pub const STARTUP_HTML: &str = r#"<!DOCTYPE html>
 wattswarm --state-dir &lt;genesis-state-dir&gt; node export-contact
 
 format: &lt;node-id&gt;@&lt;host:port&gt;"></textarea>
-            <div class="hint">Required for joining LAN/WAN. Paste one short Iroh bootstrap contact per line.</div>
+            <div class="hint">Used only for LAN or private test networks. Paste one Iroh bootstrap contact per line.</div>
           </div>
           <div id="gatewayUrlsField" class="field hidden">
             <label for="gatewayUrls">Gateway URLs</label>
             <textarea id="gatewayUrls" rows="3" placeholder="http://gateway.example.com:8080
 https://gw.example.com"></textarea>
-            <div class="hint">Optional ingest targets for the paired Wattetheria node. Enter one URL per line; comma-separated values are also accepted.</div>
+            <div class="hint">Used only for LAN or private test networks. WAN receives gateway URLs from the join manifest.</div>
           </div>
-          <div class="hint">Gateway deployment itself still stays in CLI, compose, or direct config edits.</div>
+          <div class="hint">Gateway deployment itself still stays in DNS, CLI, compose, or direct config edits.</div>
         </div>
 
       </div>
@@ -413,8 +413,9 @@ Those stay in CLI, compose, or config files for advanced operators.</pre>
           ? 'local-area distributed network'
           : 'single-machine startup';
       document.getElementById('networkModeMeaning').textContent = meaning;
-      document.getElementById('bootstrapContactsField').classList.toggle('hidden', mode === 'local');
-      document.getElementById('gatewayUrlsField').classList.toggle('hidden', mode === 'local');
+      const manualJoin = mode === 'lan';
+      document.getElementById('bootstrapContactsField').classList.toggle('hidden', !manualJoin);
+      document.getElementById('gatewayUrlsField').classList.toggle('hidden', !manualJoin);
     }
 
     function syncFormFromConfig(cfg) {
@@ -438,14 +439,14 @@ Those stay in CLI, compose, or config files for advanced operators.</pre>
         .split(/[\n,]+/)
         .map((value) => value.trim())
         .filter(Boolean);
-      const isLocal = startupConfig.network_mode === 'local';
+      const isLan = startupConfig.network_mode === 'lan';
       return {
         display_name: document.getElementById('displayName').value,
         latitude: latitudeValue === '' ? null : Number(latitudeValue),
         longitude: longitudeValue === '' ? null : Number(longitudeValue),
         network_mode: startupConfig.network_mode,
-        bootstrap_contacts: isLocal ? [] : bootstrapContacts,
-        gateway_urls: isLocal ? [] : gatewayUrls
+        bootstrap_contacts: isLan ? bootstrapContacts : [],
+        gateway_urls: isLan ? gatewayUrls : []
       };
     }
 

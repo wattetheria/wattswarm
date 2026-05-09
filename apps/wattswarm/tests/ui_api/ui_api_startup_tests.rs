@@ -6,6 +6,7 @@ fn ui_startup_config_roundtrips_network_settings_without_agent_binding() {
     let _db_lock = DbTestLock::acquire();
     let schema = reset_test_schema("test");
     let _schema_guard = EnvVarGuard::set("WATTSWARM_PG_SCHEMA", &schema);
+    let _p2p_guard = EnvVarGuard::set("WATTSWARM_P2P_ENABLED", "0");
     let dir = tempdir().unwrap();
     let state_dir = dir.path().join("state");
     std::fs::create_dir_all(&state_dir).unwrap();
@@ -109,6 +110,49 @@ fn ui_startup_config_roundtrips_network_settings_without_agent_binding() {
         assert_eq!(
             get_saved_json["config"]["core_agent"]["base_url"].as_str(),
             Some("http://127.0.0.1:8787")
+        );
+
+        let save_wan_res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/startup-config")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({
+                            "display_name": "Captain Aurora",
+                            "network_mode": "wan",
+                            "bootstrap_contacts": [
+                                "iroh-contact-should-be-automatic"
+                            ],
+                            "gateway_urls": [
+                                "https://gateway-should-be-automatic.example.com"
+                            ]
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(save_wan_res.status(), StatusCode::OK);
+        let save_wan_json = json_from(save_wan_res).await;
+        assert_eq!(
+            save_wan_json["config"]["network_mode"].as_str(),
+            Some("wan")
+        );
+        assert_eq!(
+            save_wan_json["config"]["bootstrap_contacts"]
+                .as_array()
+                .map(|items| items.len()),
+            Some(0)
+        );
+        assert_eq!(
+            save_wan_json["config"]["gateway_urls"]
+                .as_array()
+                .map(|items| items.len()),
+            Some(0)
         );
 
         let save_local_res = app

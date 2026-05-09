@@ -34,8 +34,8 @@ use wattswarm_control_plane::network_bridge::maybe_start_background_network_serv
 use wattswarm_control_plane::storage::{local_control_scope_id, storage::pg::Connection};
 use wattswarm_control_plane::task_template::sample_contract;
 use wattswarm_control_plane::types::{
-    Membership, NetworkBootstrapBundle, NetworkKind, NetworkProtocolParams, Role,
-    SignedNetworkProtocolParamsEnvelope, TaskAnnouncedPayload, UnsignedEvent,
+    Membership, NetworkBootstrapBundle, NetworkJoinManifest, NetworkKind, NetworkProtocolParams,
+    Role, SignedNetworkProtocolParamsEnvelope, TaskAnnouncedPayload, UnsignedEvent,
 };
 use wattswarm_control_plane::udp_announce::{announce_startup, maybe_start_listener};
 use wattswarm_network_transport_core::{TransferIntent, TransferKind, TransportRoute};
@@ -262,6 +262,15 @@ impl EnvVarGuard {
         }
         Self { key, prev }
     }
+
+    fn remove(key: &'static str) -> Self {
+        let prev = std::env::var(key).ok();
+        // SAFETY: tests serialize env mutations via ENV_LOCK when needed.
+        unsafe {
+            std::env::remove_var(key);
+        }
+        Self { key, prev }
+    }
 }
 
 impl Drop for EnvVarGuard {
@@ -340,6 +349,13 @@ struct BootstrapBundleStub {
 
 impl BootstrapBundleStub {
     fn start(bundle: NetworkBootstrapBundle) -> Self {
+        Self::start_with_manifest(bundle, None)
+    }
+
+    fn start_with_manifest(
+        bundle: NetworkBootstrapBundle,
+        manifest: Option<NetworkJoinManifest>,
+    ) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind bootstrap bundle stub");
         listener
             .set_nonblocking(true)
@@ -354,6 +370,7 @@ impl BootstrapBundleStub {
             "bundle": bundle,
         })
         .to_string();
+        let manifest_body = manifest.map(|manifest| serde_json::to_string(&manifest).unwrap());
 
         let handle = thread::spawn(move || {
             while !stop_flag.load(Ordering::Relaxed) {
@@ -367,6 +384,11 @@ impl BootstrapBundleStub {
                         let line = request.lines().next().unwrap_or_default();
                         let (status, payload) = if line.starts_with("GET /api/network/bootstrap ") {
                             (200, body.clone())
+                        } else if line.starts_with("GET /.well-known/wattswarm/join.json ") {
+                            match &manifest_body {
+                                Some(manifest_body) => (200, manifest_body.clone()),
+                                None => (404, "{}".to_owned()),
+                            }
                         } else {
                             (404, "{}".to_owned())
                         };
@@ -1499,6 +1521,179 @@ fn network_mode_loads_subnet_topology_as_network_subtype() {
         Some(parent_network_id)
     );
     assert_eq!(topology.org.network_id, topology.network.network_id);
+
+    cleanup_dir(&dir);
+}
+
+#[test]
+fn open_node_network_mode_auto_syncs_signed_bundle_from_join_manifest() {
+    let _guard = env_lock();
+    let _db_lock = DbTestLock::acquire();
+    let local_schema = format!("test_local_{}", Uuid::new_v4().simple());
+    let remote_schema = format!("test_remote_{}", Uuid::new_v4().simple());
+    reset_test_schema(&local_schema);
+    reset_test_schema(&remote_schema);
+
+    let remote_identity = NodeIdentity::random();
+    let remote_node_id = remote_identity.node_id();
+    let network_id = "mainnet:wattetheria";
+    let org_id = "mainnet:wattetheria:bootstrap";
+    let bundle = {
+        let _remote_schema_guard = EnvVarGuard::set("WATTSWARM_PG_SCHEMA", &remote_schema);
+        let remote_dir = temp_test_dir("remote-join-manifest-bundle");
+        let remote_state_dir = remote_dir.join("state");
+        fs::create_dir_all(&remote_state_dir).expect("create remote state dir");
+        let remote_db_path = remote_state_dir.join("remote.state");
+        let remote_store = wattswarm_control_plane::storage::PgStore::open(&remote_db_path)
+            .expect("open remote bootstrap store");
+        remote_store
+            .ensure_mainnet_bootstrap_network_topology(
+                network_id,
+                "Wattetheria",
+                &remote_node_id,
+                &remote_node_id,
+                1_700_000_000_000,
+            )
+            .expect("create remote mainnet bootstrap topology");
+        remote_store
+            .put_network_protocol_params(
+                network_id,
+                &remote_identity,
+                &NetworkProtocolParams::default(),
+            )
+            .expect("sign remote network params");
+        let bundle = remote_store
+            .for_org(org_id)
+            .load_network_bootstrap_bundle()
+            .expect("load remote bootstrap bundle");
+        cleanup_dir(&remote_dir);
+        bundle
+    };
+    let manifest = NetworkJoinManifest {
+        network_id: network_id.to_owned(),
+        genesis_node_id: remote_node_id.clone(),
+        params_hash: bundle.signed_params.params_hash.clone(),
+        bootstrap_urls: Vec::new(),
+        bootstrap_contacts: vec!["iroh-bootstrap-contact-json".to_owned()],
+        gateway_urls: vec!["https://gateway.wattetheria.com/".to_owned()],
+    };
+    let bootstrap_stub = BootstrapBundleStub::start_with_manifest(bundle.clone(), Some(manifest));
+    let _local_schema_guard = EnvVarGuard::set("WATTSWARM_PG_SCHEMA", &local_schema);
+    let _mode_guard = EnvVarGuard::set("WATTSWARM_NODE_MODE", "network");
+    let _bootstrap_url_guard = EnvVarGuard::remove("WATTSWARM_NETWORK_BOOTSTRAP_HTTP_URLS");
+    let _bootstrap_peers_guard = EnvVarGuard::remove("WATTSWARM_P2P_BOOTSTRAP_PEERS");
+    let _manifest_guard = EnvVarGuard::set(
+        "WATTSWARM_NETWORK_JOIN_MANIFEST_URLS",
+        &format!(
+            "http://127.0.0.1:{}/.well-known/wattswarm/join.json",
+            bootstrap_stub.addr.port()
+        ),
+    );
+
+    let dir = temp_test_dir("open-node-network-mode-join-manifest");
+    let state_dir = dir.join("state");
+    fs::create_dir_all(&state_dir).expect("create local state dir");
+    let db_path = state_dir.join("local.state");
+    let node = open_node(&state_dir, &db_path).expect("open node after join manifest sync");
+    let verified = node
+        .store
+        .load_verified_network_protocol_params()
+        .expect("load synced network params");
+    assert_eq!(verified.network_id, network_id);
+    assert_eq!(verified.genesis_node_id, remote_node_id);
+    assert_eq!(verified.signed, bundle.signed_params);
+    let startup_config: serde_json::Value =
+        serde_json::from_slice(&fs::read(state_dir.join("startup_config.json")).unwrap()).unwrap();
+    assert_eq!(startup_config["network_mode"].as_str(), Some("wan"));
+    assert_eq!(
+        startup_config["bootstrap_contacts"][0].as_str(),
+        Some("iroh-bootstrap-contact-json")
+    );
+    assert_eq!(
+        startup_config["gateway_urls"][0].as_str(),
+        Some("https://gateway.wattetheria.com")
+    );
+
+    cleanup_dir(&dir);
+}
+
+#[test]
+fn open_node_network_mode_rejects_join_manifest_params_hash_mismatch() {
+    let _guard = env_lock();
+    let _db_lock = DbTestLock::acquire();
+    let local_schema = format!("test_local_{}", Uuid::new_v4().simple());
+    let remote_schema = format!("test_remote_{}", Uuid::new_v4().simple());
+    reset_test_schema(&local_schema);
+    reset_test_schema(&remote_schema);
+
+    let remote_identity = NodeIdentity::random();
+    let remote_node_id = remote_identity.node_id();
+    let network_id = "mainnet:wattetheria";
+    let org_id = "mainnet:wattetheria:bootstrap";
+    let bundle = {
+        let _remote_schema_guard = EnvVarGuard::set("WATTSWARM_PG_SCHEMA", &remote_schema);
+        let remote_dir = temp_test_dir("remote-join-mismatch-bundle");
+        let remote_state_dir = remote_dir.join("state");
+        fs::create_dir_all(&remote_state_dir).expect("create remote state dir");
+        let remote_db_path = remote_state_dir.join("remote.state");
+        let remote_store = wattswarm_control_plane::storage::PgStore::open(&remote_db_path)
+            .expect("open remote bootstrap store");
+        remote_store
+            .ensure_mainnet_bootstrap_network_topology(
+                network_id,
+                "Wattetheria",
+                &remote_node_id,
+                &remote_node_id,
+                1_700_000_000_000,
+            )
+            .expect("create remote mainnet bootstrap topology");
+        remote_store
+            .put_network_protocol_params(
+                network_id,
+                &remote_identity,
+                &NetworkProtocolParams::default(),
+            )
+            .expect("sign remote network params");
+        let bundle = remote_store
+            .for_org(org_id)
+            .load_network_bootstrap_bundle()
+            .expect("load remote bootstrap bundle");
+        cleanup_dir(&remote_dir);
+        bundle
+    };
+    let manifest = NetworkJoinManifest {
+        network_id: network_id.to_owned(),
+        genesis_node_id: remote_node_id,
+        params_hash: "wrong-params-hash".to_owned(),
+        bootstrap_urls: Vec::new(),
+        bootstrap_contacts: Vec::new(),
+        gateway_urls: Vec::new(),
+    };
+    let bootstrap_stub = BootstrapBundleStub::start_with_manifest(bundle, Some(manifest));
+    let _local_schema_guard = EnvVarGuard::set("WATTSWARM_PG_SCHEMA", &local_schema);
+    let _mode_guard = EnvVarGuard::set("WATTSWARM_NODE_MODE", "network");
+    let _bootstrap_url_guard = EnvVarGuard::remove("WATTSWARM_NETWORK_BOOTSTRAP_HTTP_URLS");
+    let _bootstrap_peers_guard = EnvVarGuard::remove("WATTSWARM_P2P_BOOTSTRAP_PEERS");
+    let _manifest_guard = EnvVarGuard::set(
+        "WATTSWARM_NETWORK_JOIN_MANIFEST_URLS",
+        &format!(
+            "http://127.0.0.1:{}/.well-known/wattswarm/join.json",
+            bootstrap_stub.addr.port()
+        ),
+    );
+
+    let dir = temp_test_dir("open-node-network-mode-join-mismatch");
+    let state_dir = dir.join("state");
+    fs::create_dir_all(&state_dir).expect("create local state dir");
+    let db_path = state_dir.join("local.state");
+    let err = match open_node(&state_dir, &db_path) {
+        Ok(_) => panic!("mismatched params hash must fail"),
+        Err(err) => err,
+    };
+    assert!(
+        err.to_string()
+            .contains("join manifest params_hash mismatch")
+    );
 
     cleanup_dir(&dir);
 }
