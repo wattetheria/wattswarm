@@ -10,7 +10,9 @@ use crate::startup_config::{
 };
 pub use crate::task_template::{sample_artifact_ref, sample_contract};
 use crate::types::{
-    Event, EventPayload, Membership, MembershipUpdatedPayload, NetworkKind, TaskContract,
+    AuthoritySet, Event, EventPayload, Membership, MembershipUpdatedPayload, NetworkKind,
+    NetworkProtocolParams, SignedNetworkAuthoritySetEnvelope, SignedNetworkProtocolParamsEnvelope,
+    TaskContract,
 };
 use anyhow::{Context, Result, anyhow};
 use clap::{Args, Parser, Subcommand};
@@ -63,6 +65,22 @@ enum NodeAction {
         mode: String,
     },
     BootstrapContacts,
+    SignNetworkParams {
+        #[arg(long = "network-id")]
+        network_id: String,
+        #[arg(long = "params-file")]
+        params_file: Option<PathBuf>,
+        #[arg(long = "pg-url")]
+        pg_url: Option<String>,
+    },
+    UpdateAuthoritySet {
+        #[arg(long = "network-id")]
+        network_id: String,
+        #[arg(long = "authority-set-file")]
+        authority_set_file: Option<PathBuf>,
+        #[arg(long = "pg-url")]
+        pg_url: Option<String>,
+    },
 }
 
 #[derive(Args, Debug)]
@@ -368,8 +386,124 @@ fn handle_node(cmd: NodeCommand, state_dir: &Path, db_path: &Path) -> Result<()>
                 println!("{contact}");
             }
         }
+        NodeAction::SignNetworkParams {
+            network_id,
+            params_file,
+            pg_url,
+        } => {
+            if let Some(pg_url) = pg_url {
+                unsafe {
+                    std::env::set_var("WATTSWARM_PG_URL", pg_url);
+                }
+            }
+            let identity = load_node_identity_seed(state_dir)?;
+            let params = load_network_protocol_params(params_file.as_deref())?;
+            let store = crate::storage::storage::PgStore::open(db_path)?;
+            let signed = store.put_network_protocol_params(&network_id, &identity, &params)?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "network_id": signed.network_id,
+                    "version": signed.version,
+                    "prev_hash": signed.prev_hash,
+                    "params_hash": signed.params_hash,
+                    "signed_by": signed.signed_by,
+                }))?
+            );
+        }
+        NodeAction::UpdateAuthoritySet {
+            network_id,
+            authority_set_file,
+            pg_url,
+        } => {
+            if let Some(pg_url) = pg_url {
+                unsafe {
+                    std::env::set_var("WATTSWARM_PG_URL", pg_url);
+                }
+            }
+            let identity = load_node_identity_seed(state_dir)?;
+            let authority_set =
+                load_network_authority_set(authority_set_file.as_deref(), &identity)?;
+            let store = crate::storage::storage::PgStore::open(db_path)?;
+            let signed = store.put_network_authority_set(&network_id, &identity, &authority_set)?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "network_id": signed.network_id,
+                    "authority_set_id": signed.authority_set.authority_set_id,
+                    "prev_hash": signed.prev_hash,
+                    "authority_set_hash": signed.authority_set_hash,
+                    "signed_by": signed.signed_by,
+                }))?
+            );
+        }
     }
     Ok(())
+}
+
+fn load_node_identity_seed(state_dir: &Path) -> Result<crate::crypto::NodeIdentity> {
+    let seed_file = state_dir.join("node_seed.hex");
+    let hex_seed = fs::read_to_string(&seed_file)
+        .with_context(|| format!("read node identity seed from {}", seed_file.display()))?;
+    let bytes = decode_hex_seed(hex_seed.trim())?;
+    let arr: [u8; 32] = bytes
+        .try_into()
+        .map_err(|_| anyhow!("seed must be 32 bytes"))?;
+    Ok(crate::crypto::NodeIdentity::from_seed(arr))
+}
+
+fn decode_hex_seed(raw: &str) -> Result<Vec<u8>> {
+    let trimmed = raw.trim();
+    if !trimmed.len().is_multiple_of(2) {
+        return Err(anyhow!("seed hex must have an even number of characters"));
+    }
+    (0..trimmed.len())
+        .step_by(2)
+        .map(|idx| {
+            u8::from_str_radix(&trimmed[idx..idx + 2], 16)
+                .with_context(|| format!("invalid seed hex at byte {}", idx / 2))
+        })
+        .collect()
+}
+
+fn load_network_protocol_params(path: Option<&Path>) -> Result<NetworkProtocolParams> {
+    let Some(path) = path else {
+        return Ok(NetworkProtocolParams::default());
+    };
+    let raw = fs::read(path).with_context(|| format!("read params from {}", path.display()))?;
+    serde_json::from_slice::<NetworkProtocolParams>(&raw)
+        .or_else(|_| {
+            serde_json::from_slice::<SignedNetworkProtocolParamsEnvelope>(&raw)
+                .map(|signed| signed.params)
+        })
+        .with_context(|| {
+            format!(
+                "parse network params from {}; expected NetworkProtocolParams or signed envelope",
+                path.display()
+            )
+        })
+}
+
+fn load_network_authority_set(
+    path: Option<&Path>,
+    identity: &crate::crypto::NodeIdentity,
+) -> Result<AuthoritySet> {
+    let Some(path) = path else {
+        return Ok(AuthoritySet::genesis(&identity.node_id()));
+    };
+    let raw =
+        fs::read(path).with_context(|| format!("read authority set from {}", path.display()))?;
+    serde_json::from_slice::<AuthoritySet>(&raw)
+        .or_else(|_| {
+            serde_json::from_slice::<SignedNetworkAuthoritySetEnvelope>(&raw)
+                .map(|signed| signed.authority_set)
+        })
+        .with_context(|| {
+            format!(
+                "parse authority set from {}; expected AuthoritySet or signed envelope",
+                path.display()
+            )
+        })
 }
 
 fn parse_bootstrap_contact_mode(mode: &str) -> Result<NetworkMode> {

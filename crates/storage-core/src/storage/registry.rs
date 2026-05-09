@@ -1,8 +1,11 @@
 use super::*;
 use crate::crypto::{NodeIdentity, sha256_hex, verify_signature};
+use std::collections::{HashMap, HashSet};
 use wattswarm_protocol::types::{
-    NetworkBootstrapBundle, NetworkDescriptor, NetworkKind, NetworkProtocolParams, NetworkTopology,
-    OrgDescriptor, SignedNetworkProtocolParamsEnvelope, UnsignedNetworkProtocolParamsEnvelope,
+    AuthoritySet, DEFAULT_CONTROL_RANGE_LIMIT, NetworkBootstrapBundle, NetworkControlRecord,
+    NetworkDescriptor, NetworkKind, NetworkProtocolParams, NetworkTopology, OrgDescriptor,
+    SignedNetworkAuthoritySetEnvelope, SignedNetworkProtocolParamsEnvelope,
+    UnsignedNetworkAuthoritySetEnvelope, UnsignedNetworkProtocolParamsEnvelope,
 };
 
 pub const DEFAULT_LOCAL_ORG_NAME: &str = "Local Bootstrap";
@@ -105,6 +108,99 @@ fn verify_network_protocol_params(
         &signed.signature,
     )?;
     Ok(())
+}
+
+fn validate_authority_set(authority_set: &AuthoritySet) -> Result<()> {
+    if authority_set.members.is_empty() {
+        anyhow::bail!("network authority set must not be empty");
+    }
+    if authority_set.threshold_weight == 0 {
+        anyhow::bail!("network authority threshold must be > 0");
+    }
+    let mut members = HashSet::new();
+    let mut total_weight = 0u64;
+    for member in &authority_set.members {
+        if member.node_id.trim().is_empty() || member.weight == 0 {
+            anyhow::bail!("network authority member invalid");
+        }
+        if !members.insert(member.node_id.as_str()) {
+            anyhow::bail!("network authority members must be unique");
+        }
+        total_weight = total_weight.saturating_add(member.weight);
+    }
+    if authority_set.threshold_weight > total_weight {
+        anyhow::bail!("network authority threshold exceeds total weight");
+    }
+    Ok(())
+}
+
+fn network_authority_set_payload_hash(
+    payload: &UnsignedNetworkAuthoritySetEnvelope,
+) -> Result<String> {
+    Ok(sha256_hex(&serde_json::to_vec(payload)?))
+}
+
+fn sign_network_authority_set(
+    network_id: &str,
+    prev_hash: Option<String>,
+    authority_set: &AuthoritySet,
+    signer: &NodeIdentity,
+) -> Result<SignedNetworkAuthoritySetEnvelope> {
+    validate_authority_set(authority_set)?;
+    let payload = UnsignedNetworkAuthoritySetEnvelope {
+        network_id: network_id.to_owned(),
+        prev_hash,
+        authority_set: authority_set.clone(),
+    };
+    let authority_set_hash = network_authority_set_payload_hash(&payload)?;
+    Ok(SignedNetworkAuthoritySetEnvelope {
+        network_id: payload.network_id,
+        prev_hash: payload.prev_hash,
+        authority_set_hash: authority_set_hash.clone(),
+        authority_set: payload.authority_set,
+        signed_by: signer.node_id(),
+        signature: signer.sign_bytes(authority_set_hash.as_bytes()),
+    })
+}
+
+fn verify_network_authority_set(
+    expected_network_id: &str,
+    expected_genesis_node_id: &str,
+    signed: &SignedNetworkAuthoritySetEnvelope,
+) -> Result<()> {
+    if signed.network_id != expected_network_id {
+        anyhow::bail!(
+            "network authority set network_id mismatch expected={} got={}",
+            expected_network_id,
+            signed.network_id
+        );
+    }
+    if signed.signed_by != expected_genesis_node_id {
+        anyhow::bail!(
+            "network authority set signed_by mismatch expected={} got={}",
+            expected_genesis_node_id,
+            signed.signed_by
+        );
+    }
+    validate_authority_set(&signed.authority_set)?;
+    let expected_hash = network_authority_set_payload_hash(&signed.unsigned_payload())?;
+    if signed.authority_set_hash != expected_hash {
+        anyhow::bail!("network authority set hash mismatch");
+    }
+    verify_signature(
+        expected_genesis_node_id,
+        signed.authority_set_hash.as_bytes(),
+        &signed.signature,
+    )?;
+    Ok(())
+}
+
+pub fn network_control_payload_hash(payload: &serde_json::Value) -> Result<String> {
+    Ok(sha256_hex(&serde_json::to_vec(payload)?))
+}
+
+pub fn network_control_record_hash(record: &NetworkControlRecord) -> Result<String> {
+    Ok(sha256_hex(&serde_json::to_vec(&record.unsigned_payload())?))
 }
 
 impl PgStore {
@@ -346,6 +442,320 @@ impl PgStore {
             params![network_id],
             |r| r.get(0),
         )?)
+    }
+
+    pub fn load_network_authority_set(
+        &self,
+        network_id: &str,
+        authority_set_id: u64,
+    ) -> Result<AuthoritySet> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
+        let json: String = conn.query_row(
+            "SELECT authority_set_json
+             FROM network_authority_sets
+             WHERE network_id = $1 AND authority_set_id = $2",
+            params![network_id, authority_set_id as i64],
+            |r| r.get(0),
+        )?;
+        if let Ok(signed) = serde_json::from_str::<SignedNetworkAuthoritySetEnvelope>(&json) {
+            return Ok(signed.authority_set);
+        }
+        Ok(serde_json::from_str(&json)?)
+    }
+
+    pub fn load_latest_network_authority_set(&self, network_id: &str) -> Result<AuthoritySet> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
+        let json: String = conn.query_row(
+            "SELECT authority_set_json
+             FROM network_authority_sets
+             WHERE network_id = $1
+             ORDER BY authority_set_id DESC
+             LIMIT 1",
+            params![network_id],
+            |r| r.get(0),
+        )?;
+        if let Ok(signed) = serde_json::from_str::<SignedNetworkAuthoritySetEnvelope>(&json) {
+            return Ok(signed.authority_set);
+        }
+        Ok(serde_json::from_str(&json)?)
+    }
+
+    pub fn load_signed_network_authority_set(
+        &self,
+        network_id: &str,
+        authority_set_id: u64,
+    ) -> Result<SignedNetworkAuthoritySetEnvelope> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
+        let json: String = conn.query_row(
+            "SELECT authority_set_json
+             FROM network_authority_sets
+             WHERE network_id = $1 AND authority_set_id = $2",
+            params![network_id, authority_set_id as i64],
+            |r| r.get(0),
+        )?;
+        Ok(serde_json::from_str(&json)?)
+    }
+
+    pub fn load_latest_signed_network_authority_set(
+        &self,
+        network_id: &str,
+    ) -> Result<SignedNetworkAuthoritySetEnvelope> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
+        let json: String = conn.query_row(
+            "SELECT authority_set_json
+             FROM network_authority_sets
+             WHERE network_id = $1
+             ORDER BY authority_set_id DESC
+             LIMIT 1",
+            params![network_id],
+            |r| r.get(0),
+        )?;
+        Ok(serde_json::from_str(&json)?)
+    }
+
+    pub fn put_network_authority_set(
+        &self,
+        network_id: &str,
+        signer: &NodeIdentity,
+        authority_set: &AuthoritySet,
+    ) -> Result<SignedNetworkAuthoritySetEnvelope> {
+        let genesis_node_id = self.network_genesis_node_id(network_id)?;
+        if signer.node_id() != genesis_node_id {
+            anyhow::bail!(
+                "network authority set update must be signed by genesis node expected={} got={}",
+                genesis_node_id,
+                signer.node_id()
+            );
+        }
+        let prev_hash = {
+            let conn = self
+                .conn
+                .lock()
+                .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
+            let latest_json: Option<String> = conn
+                .query_row(
+                    "SELECT authority_set_json
+                     FROM network_authority_sets
+                     WHERE network_id = $1
+                     ORDER BY authority_set_id DESC
+                     LIMIT 1",
+                    params![network_id],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            match latest_json {
+                Some(json) => {
+                    match serde_json::from_str::<SignedNetworkAuthoritySetEnvelope>(&json) {
+                        Ok(signed) => Some(signed.authority_set_hash),
+                        Err(_) => {
+                            serde_json::from_str::<AuthoritySet>(&json)?;
+                            None
+                        }
+                    }
+                }
+                None => None,
+            }
+        };
+        let signed = sign_network_authority_set(network_id, prev_hash, authority_set, signer)?;
+        verify_network_authority_set(network_id, &genesis_node_id, &signed)?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
+        conn.execute(
+            "INSERT INTO network_authority_sets(network_id, authority_set_id, authority_set_json, created_at)
+             VALUES ($1, $2, $3, NOW())
+             ON CONFLICT(network_id, authority_set_id) DO UPDATE SET
+               authority_set_json = excluded.authority_set_json",
+            params![
+                network_id,
+                signed.authority_set.authority_set_id as i64,
+                serde_json::to_string(&signed)?,
+            ],
+        )?;
+        Ok(signed)
+    }
+
+    pub fn validate_network_control_record(&self, record: &NetworkControlRecord) -> Result<()> {
+        if record.network_id.trim().is_empty() {
+            anyhow::bail!("network control record network_id required");
+        }
+        if record.control_seq == 0 {
+            anyhow::bail!("network control record control_seq must be >= 1");
+        }
+        if record.signatures.is_empty() {
+            anyhow::bail!("network control record signatures required");
+        }
+        let expected_hash = network_control_record_hash(record)?;
+        if record.control_hash != expected_hash {
+            anyhow::bail!("network control record hash mismatch");
+        }
+        let expected_payload_hash = network_control_payload_hash(&record.payload)?;
+        if record.payload_hash != expected_payload_hash {
+            anyhow::bail!("network control payload hash mismatch");
+        }
+        let authority_set =
+            self.load_network_authority_set(&record.network_id, record.authority_set_id)?;
+        if authority_set.members.is_empty() {
+            anyhow::bail!("network authority set must not be empty");
+        }
+        if authority_set.threshold_weight == 0 {
+            anyhow::bail!("network authority threshold must be > 0");
+        }
+        let mut members = HashMap::new();
+        let mut total_weight = 0u64;
+        for member in &authority_set.members {
+            if member.node_id.trim().is_empty() || member.weight == 0 {
+                anyhow::bail!("network authority member invalid");
+            }
+            if members
+                .insert(member.node_id.as_str(), member.weight)
+                .is_some()
+            {
+                anyhow::bail!("network authority members must be unique");
+            }
+            total_weight = total_weight.saturating_add(member.weight);
+        }
+        if authority_set.threshold_weight > total_weight {
+            anyhow::bail!("network authority threshold exceeds total weight");
+        }
+
+        let mut seen_signers = HashSet::new();
+        let mut valid_weight = 0u64;
+        for signature in &record.signatures {
+            if !seen_signers.insert(signature.signer_node_id.as_str()) {
+                continue;
+            }
+            let Some(weight) = members.get(signature.signer_node_id.as_str()) else {
+                continue;
+            };
+            if verify_signature(
+                &signature.signer_node_id,
+                record.control_hash.as_bytes(),
+                &signature.signature_hex,
+            )
+            .is_ok()
+            {
+                valid_weight = valid_weight.saturating_add(*weight);
+            }
+        }
+        if valid_weight < authority_set.threshold_weight {
+            anyhow::bail!("network control authority signatures insufficient");
+        }
+        Ok(())
+    }
+
+    pub fn append_network_control_record(&self, record: &NetworkControlRecord) -> Result<()> {
+        self.validate_network_control_record(record)?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
+        let head: Option<(i64, String)> = conn
+            .query_row(
+                "SELECT control_seq, control_hash
+                 FROM network_control_log
+                 WHERE network_id = $1
+                 ORDER BY control_seq DESC
+                 LIMIT 1",
+                params![&record.network_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        match head {
+            Some((head_seq, head_hash)) => {
+                if record.control_seq != head_seq as u64 + 1 {
+                    anyhow::bail!("network control record must append at next seq");
+                }
+                if record.prev_control_hash.as_deref() != Some(head_hash.as_str()) {
+                    anyhow::bail!("network control record prev_control_hash mismatch");
+                }
+            }
+            None => {
+                if record.control_seq != 1 {
+                    anyhow::bail!("first network control record must use seq 1");
+                }
+                if record.prev_control_hash.is_some() {
+                    anyhow::bail!("first network control record must not include prev hash");
+                }
+            }
+        }
+        conn.execute(
+            "INSERT INTO network_control_log(network_id, control_seq, control_hash, prev_control_hash, record_json, created_at)
+             VALUES ($1, $2, $3, $4, $5, TIMESTAMPTZ 'epoch' + ($6::bigint * INTERVAL '1 millisecond'))",
+            params![
+                &record.network_id,
+                record.control_seq as i64,
+                &record.control_hash,
+                &record.prev_control_hash,
+                serde_json::to_string(record)?,
+                record.created_at as i64,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn network_control_head(&self, network_id: &str) -> Result<(u64, Option<String>)> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
+        let head: Option<(i64, String)> = conn
+            .query_row(
+                "SELECT control_seq, control_hash
+                 FROM network_control_log
+                 WHERE network_id = $1
+                 ORDER BY control_seq DESC
+                 LIMIT 1",
+                params![network_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        Ok(match head {
+            Some((seq, hash)) => (seq as u64, Some(hash)),
+            None => (0, None),
+        })
+    }
+
+    pub fn load_network_control_range(
+        &self,
+        network_id: &str,
+        from_control_seq: u64,
+        limit: usize,
+    ) -> Result<Vec<NetworkControlRecord>> {
+        let limit = limit.clamp(1, DEFAULT_CONTROL_RANGE_LIMIT);
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
+        let rows = conn
+            .prepare(
+                "SELECT record_json
+                 FROM network_control_log
+                 WHERE network_id = $1 AND control_seq >= $2
+                 ORDER BY control_seq ASC
+                 LIMIT $3",
+            )?
+            .query_map(
+                params![network_id, from_control_seq as i64, limit as i64],
+                |r| r.get::<_, String>(0),
+            )?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        rows.into_iter()
+            .map(|json| serde_json::from_str(&json).map_err(Into::into))
+            .collect()
     }
 
     pub fn ensure_bootstrap_signed_network_protocol_params(

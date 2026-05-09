@@ -9,7 +9,10 @@ use uuid::Uuid;
 use wattswarm::cli::sample_contract;
 use wattswarm::crypto::NodeIdentity;
 use wattswarm::policy::PolicyRegistry;
-use wattswarm::types::{Membership, Role};
+use wattswarm::types::{
+    AuthorityMember, AuthoritySet, Membership, NetworkProtocolParams, Role,
+    SignedNetworkAuthoritySetEnvelope, SignedNetworkProtocolParamsEnvelope,
+};
 use wattswarm::{control::NodeMode, storage::PgStore};
 use wattswarm_storage_core::storage::pg::Connection;
 
@@ -137,6 +140,38 @@ fn setup_mainnet_cli_state(
             .unwrap();
     });
     wattswarm::control::write_node_state(state_dir, true, NodeMode::Network).unwrap();
+}
+
+fn load_signed_network_params(
+    state_dir: &std::path::Path,
+    store: &str,
+    schema: &str,
+    network_id: &str,
+) -> SignedNetworkProtocolParamsEnvelope {
+    let db_path = state_dir.join(store);
+    with_pg_schema(schema, || {
+        PgStore::open(&db_path)
+            .unwrap()
+            .for_org(wattswarm::storage::storage::bootstrap_org_id(network_id))
+            .load_verified_network_protocol_params()
+            .unwrap()
+            .signed
+    })
+}
+
+fn load_signed_authority_set(
+    state_dir: &std::path::Path,
+    store: &str,
+    schema: &str,
+    network_id: &str,
+) -> SignedNetworkAuthoritySetEnvelope {
+    let db_path = state_dir.join(store);
+    with_pg_schema(schema, || {
+        PgStore::open(&db_path)
+            .unwrap()
+            .load_latest_signed_network_authority_set(network_id)
+            .unwrap()
+    })
 }
 
 #[test]
@@ -535,6 +570,162 @@ fn cli_knowledge_export_requires_exactly_one_selector() {
         .stderr(predicate::str::contains(
             "knowledge export requires exactly one of --task_type or --task_id",
         ));
+}
+
+#[test]
+fn cli_node_sign_network_params_updates_signed_envelope() {
+    let dir = tempdir().unwrap();
+    let state_dir = dir.path().join("genesis-state");
+    let store = "test.state";
+    let schema = CliSchemaGuard::new();
+    let genesis = NodeIdentity::from_seed([9_u8; 32]);
+    let genesis_node_id = genesis.node_id();
+    let network_id = format!("mainnet-cli-params-{}", Uuid::new_v4().simple());
+    setup_mainnet_cli_state(
+        &state_dir,
+        store,
+        schema.as_str(),
+        &genesis,
+        &genesis_node_id,
+        &network_id,
+    );
+
+    cmd(schema.as_str())
+        .args([
+            "--state-dir",
+            state_dir.to_str().unwrap(),
+            "--store",
+            store,
+            "node",
+            "sign-network-params",
+            "--network-id",
+            &network_id,
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"version\": 1"))
+        .stdout(predicate::str::contains(&genesis_node_id));
+
+    let first = load_signed_network_params(&state_dir, store, schema.as_str(), &network_id);
+    assert_eq!(first.version, 1);
+    assert_eq!(first.prev_hash, None);
+    assert_eq!(first.signed_by, genesis_node_id);
+
+    let params = NetworkProtocolParams {
+        max_established_per_peer: 3,
+        ..first.params.clone()
+    };
+    let params_file = dir.path().join("network-params.json");
+    std::fs::write(&params_file, serde_json::to_vec_pretty(&params).unwrap()).unwrap();
+
+    cmd(schema.as_str())
+        .args([
+            "--state-dir",
+            state_dir.to_str().unwrap(),
+            "--store",
+            store,
+            "node",
+            "sign-network-params",
+            "--network-id",
+            &network_id,
+            "--params-file",
+            params_file.to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"version\": 2"))
+        .stdout(predicate::str::contains(&first.params_hash));
+
+    let second = load_signed_network_params(&state_dir, store, schema.as_str(), &network_id);
+    assert_eq!(second.version, 2);
+    assert_eq!(
+        second.prev_hash.as_deref(),
+        Some(first.params_hash.as_str())
+    );
+    assert_eq!(second.params.max_established_per_peer, 3);
+}
+
+#[test]
+fn cli_node_update_authority_set_requires_genesis_and_updates_signed_envelope() {
+    let dir = tempdir().unwrap();
+    let state_dir = dir.path().join("genesis-state");
+    let store = "test.state";
+    let schema = CliSchemaGuard::new();
+    let genesis = NodeIdentity::from_seed([19_u8; 32]);
+    let second_authority = NodeIdentity::from_seed([20_u8; 32]);
+    let genesis_node_id = genesis.node_id();
+    let network_id = format!("mainnet-cli-authority-{}", Uuid::new_v4().simple());
+    setup_mainnet_cli_state(
+        &state_dir,
+        store,
+        schema.as_str(),
+        &genesis,
+        &genesis_node_id,
+        &network_id,
+    );
+
+    cmd(schema.as_str())
+        .args([
+            "--state-dir",
+            state_dir.to_str().unwrap(),
+            "--store",
+            store,
+            "node",
+            "update-authority-set",
+            "--network-id",
+            &network_id,
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"authority_set_id\": 0"))
+        .stdout(predicate::str::contains(&genesis_node_id));
+
+    let first = load_signed_authority_set(&state_dir, store, schema.as_str(), &network_id);
+    assert_eq!(first.authority_set.authority_set_id, 0);
+    assert_eq!(first.authority_set.members[0].node_id, genesis_node_id);
+    assert_eq!(first.signed_by, genesis_node_id);
+
+    let next = AuthoritySet {
+        authority_set_id: 1,
+        members: vec![
+            AuthorityMember {
+                node_id: genesis_node_id.clone(),
+                weight: 1,
+            },
+            AuthorityMember {
+                node_id: second_authority.node_id(),
+                weight: 1,
+            },
+        ],
+        threshold_weight: 2,
+    };
+    let authority_file = dir.path().join("authority-set.json");
+    std::fs::write(&authority_file, serde_json::to_vec_pretty(&next).unwrap()).unwrap();
+
+    cmd(schema.as_str())
+        .args([
+            "--state-dir",
+            state_dir.to_str().unwrap(),
+            "--store",
+            store,
+            "node",
+            "update-authority-set",
+            "--network-id",
+            &network_id,
+            "--authority-set-file",
+            authority_file.to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"authority_set_id\": 1"))
+        .stdout(predicate::str::contains(&first.authority_set_hash));
+
+    let second = load_signed_authority_set(&state_dir, store, schema.as_str(), &network_id);
+    assert_eq!(second.authority_set, next);
+    assert_eq!(
+        second.prev_hash.as_deref(),
+        Some(first.authority_set_hash.as_str())
+    );
 }
 
 #[test]

@@ -1,7 +1,7 @@
 use anyhow::{Context, Result, anyhow, bail};
 use hex::decode;
 use iroh::{
-    Endpoint, EndpointAddr, EndpointId, SecretKey, TransportAddr,
+    Endpoint, EndpointAddr, EndpointId, RelayMode, RelayUrl, SecretKey, TransportAddr,
     address_lookup::memory::MemoryLookup,
     endpoint::{Connection, presets},
     protocol::{AcceptError, ProtocolHandler, Router},
@@ -33,6 +33,8 @@ pub const DEFAULT_IROH_ALPN: &str = "/wattswarm/iroh/1";
 pub const DEFAULT_IROH_CONTROL_ALPN: &str = "/wattswarm/iroh-control/1";
 pub const IROH_CONTROL_KIND_CONTACT_MATERIAL: &str = "contact_material.v1";
 pub const WATTSWARM_IROH_GOSSIP_TOPIC_PREFIX: &str = "wattswarm:iroh-gossip-topic:v1";
+pub const ENV_IROH_RELAY_URLS: &str = "WATTSWARM_IROH_RELAY_URLS";
+pub const ENV_IROH_PUBLISH_DIRECT_ADDRS: &str = "WATTSWARM_IROH_PUBLISH_DIRECT_ADDRS";
 const MAX_FETCH_REQUEST_BYTES: usize = 64 * 1024;
 const MAX_FETCH_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_CONTROL_REQUEST_BYTES: usize = 1024 * 1024;
@@ -55,6 +57,38 @@ pub fn derive_gossip_topic_id(
 
 pub fn blob_hash_for_bytes(bytes: impl AsRef<[u8]>) -> IrohBlobHash {
     IrohBlobHash::new(bytes)
+}
+
+fn parse_relay_urls(raw: &str) -> Result<Vec<RelayUrl>> {
+    let mut urls = Vec::new();
+    for value in raw
+        .split(|ch| matches!(ch, ',' | '\n' | '\r'))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        let url =
+            RelayUrl::from_str(value).with_context(|| format!("parse iroh relay url {value}"))?;
+        if !urls.contains(&url) {
+            urls.push(url);
+        }
+    }
+    Ok(urls)
+}
+
+fn parse_bool_env(key: &str, raw: Option<&str>, default: bool) -> Result<bool> {
+    let Some(raw) = raw else {
+        return Ok(default);
+    };
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "" => Ok(default),
+        "1" | "true" | "yes" | "on" => Ok(true),
+        "0" | "false" | "no" | "off" => Ok(false),
+        value => bail!("{key} must be a boolean value, got {value}"),
+    }
+}
+
+fn normalize_public_relay_url(url: &RelayUrl) -> String {
+    url.to_string().trim_end_matches('/').to_owned()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -194,8 +228,60 @@ struct IrohDataPlaneService {
     gossip: Gossip,
     blob_store: FsStore,
     adapter: IrohTransportAdapter,
+    endpoint_options: IrohEndpointOptions,
     control_handlers: ControlStreamHandlers,
     op_lock: Mutex<()>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct IrohEndpointOptions {
+    relay_urls: Vec<RelayUrl>,
+    published_relay_urls: Vec<String>,
+    publish_direct_addrs: bool,
+}
+
+impl IrohEndpointOptions {
+    fn from_env() -> Result<Self> {
+        Self::from_raw_env(
+            std::env::var(ENV_IROH_RELAY_URLS).ok().as_deref(),
+            std::env::var(ENV_IROH_PUBLISH_DIRECT_ADDRS).ok().as_deref(),
+        )
+    }
+
+    fn from_raw_env(relay_urls: Option<&str>, publish_direct_addrs: Option<&str>) -> Result<Self> {
+        let relay_urls = parse_relay_urls(relay_urls.unwrap_or_default())?;
+        Ok(Self {
+            published_relay_urls: relay_urls
+                .iter()
+                .map(|url| normalize_public_relay_url(url))
+                .collect(),
+            relay_urls,
+            publish_direct_addrs: parse_bool_env(
+                ENV_IROH_PUBLISH_DIRECT_ADDRS,
+                publish_direct_addrs,
+                true,
+            )?,
+        })
+    }
+
+    fn published_direct_addrs(&self, observed_direct_addrs: Vec<String>) -> Vec<String> {
+        if self.publish_direct_addrs {
+            observed_direct_addrs
+        } else {
+            Vec::new()
+        }
+    }
+
+    fn published_relay_urls(&self, observed_relay_urls: Vec<String>) -> Vec<String> {
+        let mut relay_urls = self.published_relay_urls.clone();
+        for url in observed_relay_urls {
+            let normalized = url.trim().trim_end_matches('/').to_owned();
+            if !normalized.is_empty() && !relay_urls.contains(&normalized) {
+                relay_urls.push(normalized);
+            }
+        }
+        relay_urls
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -434,15 +520,18 @@ impl IrohDataPlaneService {
             );
         }
         let adapter = IrohTransportAdapter::from_endpoint_id(endpoint_id, network_peer_id);
+        let endpoint_options = IrohEndpointOptions::from_env()?;
         let runtime = RuntimeBuilder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
             .build()?;
         let endpoint_future = || async {
-            Endpoint::builder(presets::N0)
-                .secret_key(secret_key)
-                .bind()
-                .await
+            let mut builder = Endpoint::builder(presets::N0).secret_key(secret_key);
+            if !endpoint_options.relay_urls.is_empty() {
+                builder =
+                    builder.relay_mode(RelayMode::custom(endpoint_options.relay_urls.clone()));
+            }
+            builder.bind().await
         };
         let endpoint = match tokio::runtime::Handle::try_current() {
             Ok(handle) if handle.runtime_flavor() == RuntimeFlavor::MultiThread => {
@@ -500,6 +589,7 @@ impl IrohDataPlaneService {
             gossip,
             blob_store,
             adapter,
+            endpoint_options,
             control_handlers,
             op_lock: Mutex::new(()),
         }))
@@ -522,14 +612,17 @@ impl IrohDataPlaneService {
 
     fn export_contact_material(&self, generated_at: u64) -> Result<TransportContactMaterial> {
         let addr = self.endpoint.addr();
-        let direct_addrs = addr
-            .ip_addrs()
-            .map(|value| value.to_string())
-            .collect::<Vec<_>>();
-        let relay_urls = addr
-            .relay_urls()
-            .map(|value| value.to_string())
-            .collect::<Vec<_>>();
+        let direct_addrs = self
+            .endpoint_options
+            .published_direct_addrs(addr.ip_addrs().map(|value| value.to_string()).collect());
+        let relay_urls = self.endpoint_options.published_relay_urls(
+            addr.relay_urls()
+                .map(|value| value.to_string())
+                .collect::<Vec<_>>(),
+        );
+        if direct_addrs.is_empty() && relay_urls.is_empty() {
+            bail!("iroh contact material has no public direct addresses or relay urls");
+        }
         Ok(self
             .adapter
             .material_payload(&direct_addrs, &relay_urls, generated_at))
@@ -1007,6 +1100,52 @@ mod tests {
         let extra: IrohTransportMaterial =
             serde_json::from_value(material.extra.clone()).expect("extra");
         assert_eq!(extra.direct_addrs, vec!["127.0.0.1:7777".to_owned()]);
+    }
+
+    #[test]
+    fn iroh_endpoint_options_parse_custom_relay_and_publish_flag() {
+        let options = IrohEndpointOptions::from_raw_env(
+            Some("https://relay.wattetheria.com/, https://relay.wattetheria.com"),
+            Some("false"),
+        )
+        .expect("endpoint options");
+
+        assert_eq!(
+            options.published_relay_urls,
+            vec!["https://relay.wattetheria.com".to_owned()]
+        );
+        assert_eq!(
+            options.published_direct_addrs(vec!["10.0.0.1:1234".to_owned()]),
+            Vec::<String>::new()
+        );
+        assert!(!options.publish_direct_addrs);
+    }
+
+    #[test]
+    fn iroh_endpoint_options_keep_direct_addrs_by_default() {
+        let options = IrohEndpointOptions::from_raw_env(None, None).expect("endpoint options");
+
+        assert_eq!(
+            options.published_direct_addrs(vec!["10.0.0.1:1234".to_owned()]),
+            vec!["10.0.0.1:1234".to_owned()]
+        );
+        assert!(options.publish_direct_addrs);
+    }
+
+    #[test]
+    fn relay_only_contact_material_can_be_dial_target() {
+        let adapter = IrohTransportAdapter::from_seed_bytes([6u8; 32]).expect("adapter");
+        let material =
+            adapter.material_payload(&[], &["https://relay.wattetheria.com".to_owned()], 42);
+
+        let extra: IrohTransportMaterial =
+            serde_json::from_value(material.extra.clone()).expect("extra");
+        assert!(extra.direct_addrs.is_empty());
+        assert_eq!(
+            extra.relay_urls,
+            vec!["https://relay.wattetheria.com".to_owned()]
+        );
+        endpoint_addr_from_contact_material(&material).expect("relay-only endpoint addr");
     }
 
     #[test]

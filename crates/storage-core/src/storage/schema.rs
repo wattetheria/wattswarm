@@ -678,6 +678,25 @@ impl PgStore {
                 updated_at TIMESTAMPTZ NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS network_authority_sets (
+                network_id TEXT NOT NULL,
+                authority_set_id BIGINT NOT NULL,
+                authority_set_json TEXT NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL,
+                PRIMARY KEY(network_id, authority_set_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS network_control_log (
+                network_id TEXT NOT NULL,
+                control_seq BIGINT NOT NULL,
+                control_hash TEXT NOT NULL,
+                prev_control_hash TEXT,
+                record_json TEXT NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL,
+                PRIMARY KEY(network_id, control_seq),
+                UNIQUE(network_id, control_hash)
+            );
+
             CREATE TABLE IF NOT EXISTS node_registry (
                 node_id TEXT PRIMARY KEY,
                 public_key TEXT NOT NULL UNIQUE,

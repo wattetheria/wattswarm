@@ -1,7 +1,9 @@
 use wattswarm_protocol::types::{
-    ArtifactRef, BudgetMode, CheckpointCreatedPayload, EventKind, EventPayload,
-    EventRevokedPayload, ExecutionIntentDeclaredPayload, ExecutionSetConfirmedPayload,
-    FeedSubscriptionUpdatedPayload, Membership, NetworkDescriptor, NetworkKind, NetworkTopology,
+    ArtifactRef, BudgetMode, CheckpointCreatedPayload, DEFAULT_CONTROL_BACKFILL_RETRY_SECS,
+    DEFAULT_CONTROL_MAX_DRIFT_BEFORE_SNAPSHOT, DEFAULT_CONTROL_RANGE_LIMIT,
+    DEFAULT_CONTROL_STATUS_INTERVAL_SECS, EventKind, EventPayload, EventRevokedPayload,
+    ExecutionIntentDeclaredPayload, ExecutionSetConfirmedPayload, FeedSubscriptionUpdatedPayload,
+    Membership, NetworkControlSyncParams, NetworkDescriptor, NetworkKind, NetworkTopology,
     NodePenalizedPayload, OrgDescriptor, PolicyBinding, Role, ScopeHint, SummaryRevokedPayload,
     TaskAnnouncedPayload, TaskContract, TaskDisseminationLayer, TaskExpiredPayload, TaskMode,
     TopicMessagePostedPayload, TransportRoute, UnsignedEvent, canonical_scope_hint,
@@ -520,4 +522,26 @@ fn dissemination_layer_marks_only_low_frequency_layers_as_global_safe() {
         TaskDisseminationLayer::Checkpoint
     );
     assert!(checkpoint.allows_global_dissemination());
+}
+
+#[test]
+fn network_control_sync_defaults_are_fixed_for_regular_nodes() {
+    let defaults = NetworkControlSyncParams::default();
+    assert_eq!(
+        defaults.control_status_interval_secs,
+        DEFAULT_CONTROL_STATUS_INTERVAL_SECS
+    );
+    assert_eq!(
+        defaults.control_backfill_retry_secs,
+        DEFAULT_CONTROL_BACKFILL_RETRY_SECS
+    );
+    assert_eq!(defaults.control_range_limit, DEFAULT_CONTROL_RANGE_LIMIT);
+    assert_eq!(
+        defaults.control_max_drift_before_snapshot,
+        DEFAULT_CONTROL_MAX_DRIFT_BEFORE_SNAPSHOT
+    );
+    assert_eq!(DEFAULT_CONTROL_STATUS_INTERVAL_SECS, 30);
+    assert_eq!(DEFAULT_CONTROL_BACKFILL_RETRY_SECS, 10);
+    assert_eq!(DEFAULT_CONTROL_RANGE_LIMIT, 256);
+    assert_eq!(DEFAULT_CONTROL_MAX_DRIFT_BEFORE_SNAPSHOT, 5_000);
 }

@@ -1569,6 +1569,193 @@ pub fn normalized_scope_hint(raw: &str) -> String {
     canonical_scope_hint(raw).unwrap_or_else(|| raw.trim().to_owned())
 }
 
+pub const DEFAULT_CONTROL_STATUS_INTERVAL_SECS: u64 = 30;
+pub const DEFAULT_CONTROL_BACKFILL_RETRY_SECS: u64 = 10;
+pub const DEFAULT_CONTROL_RANGE_LIMIT: usize = 256;
+pub const DEFAULT_CONTROL_MAX_DRIFT_BEFORE_SNAPSHOT: u64 = 5_000;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NetworkControlSyncParams {
+    pub control_status_interval_secs: u64,
+    pub control_backfill_retry_secs: u64,
+    pub control_range_limit: usize,
+    pub control_max_drift_before_snapshot: u64,
+}
+
+impl Default for NetworkControlSyncParams {
+    fn default() -> Self {
+        Self {
+            control_status_interval_secs: DEFAULT_CONTROL_STATUS_INTERVAL_SECS,
+            control_backfill_retry_secs: DEFAULT_CONTROL_BACKFILL_RETRY_SECS,
+            control_range_limit: DEFAULT_CONTROL_RANGE_LIMIT,
+            control_max_drift_before_snapshot: DEFAULT_CONTROL_MAX_DRIFT_BEFORE_SNAPSHOT,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuthorityMember {
+    pub node_id: String,
+    pub weight: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuthoritySet {
+    pub authority_set_id: u64,
+    pub members: Vec<AuthorityMember>,
+    pub threshold_weight: u64,
+}
+
+impl AuthoritySet {
+    pub fn genesis(genesis_node_id: &str) -> Self {
+        Self {
+            authority_set_id: 0,
+            members: vec![AuthorityMember {
+                node_id: genesis_node_id.to_owned(),
+                weight: 1,
+            }],
+            threshold_weight: 1,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UnsignedNetworkAuthoritySetEnvelope {
+    pub network_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prev_hash: Option<String>,
+    pub authority_set: AuthoritySet,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SignedNetworkAuthoritySetEnvelope {
+    pub network_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prev_hash: Option<String>,
+    pub authority_set_hash: String,
+    pub authority_set: AuthoritySet,
+    pub signed_by: String,
+    pub signature: String,
+}
+
+impl SignedNetworkAuthoritySetEnvelope {
+    pub fn unsigned_payload(&self) -> UnsignedNetworkAuthoritySetEnvelope {
+        UnsignedNetworkAuthoritySetEnvelope {
+            network_id: self.network_id.clone(),
+            prev_hash: self.prev_hash.clone(),
+            authority_set: self.authority_set.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuthoritySignature {
+    pub signer_node_id: String,
+    pub signature_hex: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NetworkControlKind {
+    AuthoritySetUpdated,
+    NetworkParamsUpdated,
+    PolicyUpdated,
+    EventRevoked,
+    SummaryRevoked,
+    NodePenalized,
+    CheckpointCreated,
+    SoftwareSignal,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NetworkControlActivation {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub not_before_epoch: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub not_before_time_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct UnsignedNetworkControlRecord {
+    pub network_id: String,
+    pub control_seq: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prev_control_hash: Option<String>,
+    pub kind: NetworkControlKind,
+    pub payload_hash: String,
+    pub payload: Value,
+    pub authority_set_id: u64,
+    pub created_at: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activation: Option<NetworkControlActivation>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct NetworkControlRecord {
+    pub network_id: String,
+    pub control_seq: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prev_control_hash: Option<String>,
+    pub control_hash: String,
+    pub kind: NetworkControlKind,
+    pub payload_hash: String,
+    pub payload: Value,
+    pub authority_set_id: u64,
+    pub signatures: Vec<AuthoritySignature>,
+    pub created_at: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activation: Option<NetworkControlActivation>,
+}
+
+impl NetworkControlRecord {
+    pub fn unsigned_payload(&self) -> UnsignedNetworkControlRecord {
+        UnsignedNetworkControlRecord {
+            network_id: self.network_id.clone(),
+            control_seq: self.control_seq,
+            prev_control_hash: self.prev_control_hash.clone(),
+            kind: self.kind.clone(),
+            payload_hash: self.payload_hash.clone(),
+            payload: self.payload.clone(),
+            authority_set_id: self.authority_set_id,
+            created_at: self.created_at,
+            activation: self.activation.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NetworkControlStatus {
+    pub network_id: String,
+    pub genesis_node_id: String,
+    pub authority_set_id: u64,
+    pub control_head_seq: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub control_head_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub params_version: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub params_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub membership_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy_hash: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NetworkControlRangeRequest {
+    pub network_id: String,
+    pub from_control_seq: u64,
+    pub limit: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct NetworkControlRangeResponse {
+    pub network_id: String,
+    pub next_control_seq: u64,
+    #[serde(default)]
+    pub records: Vec<NetworkControlRecord>,
+}
+
 fn default_network_protocol_version() -> String {
     "/wattswarm/0.1.0".to_owned()
 }

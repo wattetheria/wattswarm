@@ -563,6 +563,7 @@ mod schema;
 
 pub use registry::{
     VerifiedNetworkProtocolParams, bootstrap_org_id, lan_network_id, local_network_id,
+    network_control_payload_hash, network_control_record_hash,
 };
 
 fn query_table_json(
