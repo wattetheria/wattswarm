@@ -2752,6 +2752,138 @@ fn set_state_dir_loads_startup_iroh_bootstrap_contacts_into_runtime() {
 }
 
 #[test]
+fn nearby_discovery_gossip_accepts_peer_inside_radius() {
+    let _lock = lock_env_test_mutex();
+    let _enabled = EnvVarGuard::set(ENV_NEARBY_DISCOVERY_ENABLED, None);
+    let _radius = EnvVarGuard::set(ENV_NEARBY_DISCOVERY_RADIUS_KM, None);
+    let _interval = EnvVarGuard::set(ENV_NEARBY_DISCOVERY_INTERVAL_MS, None);
+    let _ttl = EnvVarGuard::set(ENV_NEARBY_DISCOVERY_TTL_MS, None);
+    let local_dir = temp_startup_dir("nearby-discovery-local");
+    let remote_dir = temp_startup_dir("nearby-discovery-remote");
+    let local_seed = [93u8; 32];
+    let remote_seed = [94u8; 32];
+    std::fs::write(local_dir.join("node_seed.hex"), hex::encode(local_seed))
+        .expect("write local seed");
+    std::fs::write(remote_dir.join("node_seed.hex"), hex::encode(remote_seed))
+        .expect("write remote seed");
+    std::fs::write(
+        local_dir.join("startup_config.json"),
+        serde_json::to_vec(&json!({
+            "network_mode": "wan",
+            "latitude": 0.0,
+            "longitude": 0.0,
+            "nearby_radius_km": 20.0
+        }))
+        .expect("startup config json"),
+    )
+    .expect("write startup config");
+    crate::control::local_node_id(&remote_dir).expect("create remote identity");
+    let remote_endpoint =
+        wattswarm_network_transport_iroh::local_endpoint_id_from_state_dir(&remote_dir)
+            .expect("remote endpoint")
+            .to_string();
+    let remote_contact =
+        build_contact_material(&remote_dir, &remote_endpoint).expect("remote contact material");
+    let discovery = PeerDiscoveryAnnouncement {
+        scope: SwarmScope::Global,
+        network_id: DEFAULT_NETWORK_CONTEXT_ID.to_owned(),
+        source_node_id: remote_endpoint.clone(),
+        latitude: 0.1,
+        longitude: 0.1,
+        radius_km: 20.0,
+        contact_material: remote_contact,
+        updated_at: observed_at_ms(),
+        ttl_ms: DEFAULT_NEARBY_DISCOVERY_TTL_MS,
+    };
+    let mut node = Node::open_in_memory_with_roles(&[Role::Proposer]).expect("node");
+    let mut service = NetworkBridgeService::new(
+        NetworkP2pNode::from_iroh_state_dir(
+            NetworkP2pConfig::default(),
+            local_dir.clone(),
+            local_seed,
+        )
+        .expect("iroh node"),
+        &[SwarmScope::Global],
+        &NetworkProtocolParams::default(),
+    )
+    .expect("service");
+    service.set_state_dir(local_dir.clone(), local_dir.join("ui.state"));
+    let remote_peer = remote_endpoint
+        .parse::<NetworkNodeId>()
+        .expect("remote endpoint node id");
+
+    let tick = service
+        .process_runtime_event(
+            &mut node,
+            NetworkRuntimeEvent::Gossip {
+                propagation_source: remote_peer,
+                message: GossipMessage::Discovery(discovery),
+            },
+        )
+        .expect("process discovery");
+
+    assert!(
+        matches!(tick, NetworkBridgeTick::TransportNotice { detail } if detail.contains("nearby_discovery_accepted"))
+    );
+    assert!(node.peers().contains(&remote_endpoint));
+    assert_eq!(service.known_remote_contact_count(), 1);
+    let discovered =
+        crate::control::load_discovered_peer_records_state(&local_dir).expect("discovered peers");
+    assert_eq!(discovered[0].node_id, remote_endpoint);
+    assert_eq!(discovered[0].source_kind, "nearby");
+    let metadata =
+        crate::control::load_peer_metadata_records_state(&local_dir).expect("peer metadata");
+    assert_eq!(
+        metadata[0].network_id.as_deref(),
+        Some(DEFAULT_NETWORK_CONTEXT_ID)
+    );
+    assert_eq!(metadata[0].handshake_status, "nearby_discovery");
+
+    wattswarm_network_transport_iroh::shutdown_local_iroh_data_plane(&local_dir);
+    wattswarm_network_transport_iroh::shutdown_local_iroh_data_plane(&remote_dir);
+    std::fs::remove_dir_all(local_dir).expect("cleanup local");
+    std::fs::remove_dir_all(remote_dir).expect("cleanup remote");
+}
+
+#[test]
+fn nearby_discovery_rejects_peer_outside_radius() {
+    let settings = NearbyDiscoverySettings {
+        enabled: true,
+        latitude: Some(0.0),
+        longitude: Some(0.0),
+        radius_km: 5.0,
+        interval: DEFAULT_NEARBY_DISCOVERY_INTERVAL,
+        ttl_ms: DEFAULT_NEARBY_DISCOVERY_TTL_MS,
+    };
+    let announcement = PeerDiscoveryAnnouncement {
+        scope: SwarmScope::Global,
+        network_id: DEFAULT_NETWORK_CONTEXT_ID.to_owned(),
+        source_node_id: "peer-a".to_owned(),
+        latitude: 1.0,
+        longitude: 1.0,
+        radius_km: 5.0,
+        contact_material: RawContactMaterial {
+            material_json: "{}".to_owned(),
+            signature: None,
+            generated_at: observed_at_ms(),
+        },
+        updated_at: observed_at_ms(),
+        ttl_ms: DEFAULT_NEARBY_DISCOVERY_TTL_MS,
+    };
+
+    assert!(
+        nearby_discovery_is_eligible(
+            &settings,
+            "local-peer",
+            DEFAULT_NETWORK_CONTEXT_ID,
+            &announcement,
+            observed_at_ms(),
+        )
+        .is_none()
+    );
+}
+
+#[test]
 fn scopes_to_request_for_peer_falls_back_to_all_scopes_until_peer_is_profiled() {
     let peer = random_network_node_id();
     let target_scope = SwarmScope::Region("sol-1".to_owned());

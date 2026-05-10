@@ -193,6 +193,15 @@ Runtime toggles:
 - `WATTSWARM_P2P_NODE_IDS=lab-a` subscribes the node to matching node scopes
 - `WATTSWARM_P2P_LOCAL_IDS=lab-a` is still accepted as a legacy alias for node scopes
 
+Nearby discovery runs over the Iroh gossip discovery lane and is only a peer-discovery/contact exchange path. It does not send agent/MCP requests or task/topic payloads. It is active only when P2P is enabled, the startup `network_mode` is not `local`, and `startup_config.json` contains valid `latitude` and `longitude` values.
+
+- `WATTSWARM_NEARBY_DISCOVERY_ENABLED=true` by default; set `false` to stop publishing and accepting nearby discovery announcements.
+- `WATTSWARM_NEARBY_DISCOVERY_RADIUS_KM=1000` by default; accepts peers only when their geo distance is inside both the local radius and the remote announced radius. The env var overrides startup `nearby_radius_km`.
+- `WATTSWARM_NEARBY_DISCOVERY_INTERVAL_MS=30000` by default; controls how often the node republishes its nearby discovery announcement.
+- `WATTSWARM_NEARBY_DISCOVERY_TTL_MS=300000` by default; remote announcements older than this are ignored.
+
+Accepted nearby peers update `discovered_peers_local` with source kind `nearby`, persist Iroh contact material into `peer_metadata_local`, and are handed to the Iroh runtime for normal peer connectivity.
+
 Network-mode bootstrap behavior:
 
 - `WATTSWARM_NODE_MODE=network` tells the node to join an existing shared network instead of creating `local:` or `lan:` topology.
@@ -852,6 +861,10 @@ P2P env vars:
 - `WATTSWARM_P2P_REGION_IDS` optional comma-separated region scope subscription list
 - `WATTSWARM_P2P_NODE_IDS` optional comma-separated node scope subscription list
 - `WATTSWARM_P2P_LOCAL_IDS` optional legacy alias for node scope subscription list
+- `WATTSWARM_NEARBY_DISCOVERY_ENABLED=true` enables Iroh nearby discovery when startup geo is present and network mode is not `local`
+- `WATTSWARM_NEARBY_DISCOVERY_RADIUS_KM=1000` sets the local acceptance radius; env overrides startup `nearby_radius_km`
+- `WATTSWARM_NEARBY_DISCOVERY_INTERVAL_MS=30000` sets the discovery announcement publish interval
+- `WATTSWARM_NEARBY_DISCOVERY_TTL_MS=300000` sets the max accepted age for remote discovery announcements
 
 Startup UI behavior:
 

@@ -272,7 +272,7 @@ impl Node {
         if payload.gossip_kinds.iter().any(|kind| {
             !matches!(
                 kind.as_str(),
-                "events" | "messages" | "rules" | "checkpoints" | "summaries"
+                "events" | "messages" | "rules" | "checkpoints" | "summaries" | "discovery"
             )
         }) {
             return Err(

@@ -1,8 +1,9 @@
 use crate::control::{
     NodeState, RealTaskRunRequest, fetch_checkpoint_artifact_json,
-    load_peer_dm_message_records_state, load_peer_dm_thread_records_state,
-    load_peer_relationship_records_state, local_node_id, node_state_path, open_configured_node,
-    open_node, require_configured_node_mode, resolve_node_mode, run_real_task_flow,
+    load_discovered_peer_records_state, load_peer_dm_message_records_state,
+    load_peer_dm_thread_records_state, load_peer_relationship_records_state, local_node_id,
+    node_state_path, open_configured_node, open_node, require_configured_node_mode,
+    resolve_node_mode, run_real_task_flow,
 };
 use crate::http::{ApiError, UiServerState, run_blocking};
 use crate::run_control;
@@ -18,8 +19,8 @@ use axum::Json;
 use axum::extract::{Path as AxumPath, Query, State};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::collections::BTreeMap;
 use std::collections::hash_map::DefaultHasher;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
@@ -480,7 +481,10 @@ pub fn build_network_projection_snapshot(
     let distribution = node
         .store
         .peer_protocol_version_distribution(&node.identity.node_id())?;
-    let peers = node.peers();
+    let mut peers = node.peers().into_iter().collect::<BTreeSet<_>>();
+    for peer in load_discovered_peer_records_state(state_dir)? {
+        peers.insert(peer.node_id);
+    }
     Ok(NetworkProjectionSnapshot {
         generated_at: now_ms(),
         node_id: node.node_id(),
@@ -495,7 +499,7 @@ pub fn build_network_projection_snapshot(
             .into_iter()
             .map(|(version, count)| (version, u64::from(count)))
             .collect(),
-        peers,
+        peers: peers.into_iter().collect(),
     })
 }
 

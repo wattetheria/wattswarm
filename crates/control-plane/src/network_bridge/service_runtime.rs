@@ -490,6 +490,17 @@ impl NetworkBridgeService {
                             checkpoint_id: checkpoint.checkpoint_id,
                         })
                     }
+                    GossipMessage::Discovery(discovery) => {
+                        self.record_peer_scope_activity(
+                            propagation_source.clone(),
+                            &discovery.scope,
+                        );
+                        self.apply_nearby_discovery_announcement(
+                            node,
+                            &propagation_source,
+                            discovery,
+                        )
+                    }
                 }
             }
             NetworkRuntimeEvent::BackfillRequest {
@@ -1624,5 +1635,96 @@ impl NetworkBridgeService {
                 }
             }),
         }
+    }
+
+    fn apply_nearby_discovery_announcement(
+        &mut self,
+        node: &mut Node,
+        propagation_source: &NetworkNodeId,
+        discovery: PeerDiscoveryAnnouncement,
+    ) -> Result<NetworkBridgeTick> {
+        let Some(state_dir) = self.state_dir.clone() else {
+            return Ok(NetworkBridgeTick::TransportNotice {
+                detail: format!(
+                    "nearby_discovery_ignored peer={propagation_source} reason=missing_state_dir"
+                ),
+            });
+        };
+        let settings = nearby_discovery_settings_from_state_dir(&state_dir)?;
+        let network_id = current_network_context_id(node);
+        let now = observed_at_ms();
+        let Some(distance_km) = nearby_discovery_is_eligible(
+            &settings,
+            &self.local_peer_id().to_string(),
+            &network_id,
+            &discovery,
+            now,
+        ) else {
+            return Ok(NetworkBridgeTick::TransportNotice {
+                detail: format!("nearby_discovery_ignored peer={propagation_source}"),
+            });
+        };
+        let contacts = contact_material_transports(&discovery.contact_material)?;
+        let mut registered = 0usize;
+        for contact in contacts {
+            if contact.transport != DataTransportRoute::IrohDirect.as_str() {
+                continue;
+            }
+            let remote_network_peer_id = iroh_contact_network_peer_id(&contact)?;
+            if remote_network_peer_id != discovery.source_node_id {
+                bail!(
+                    "nearby discovery source_node_id {} does not match Iroh contact peer {}",
+                    discovery.source_node_id,
+                    remote_network_peer_id
+                );
+            }
+            self.runtime
+                .upsert_remote_contact_material(remote_network_peer_id, contact)?;
+            registered = registered.saturating_add(1);
+        }
+        if registered == 0 {
+            bail!("nearby discovery contact material has no Iroh transport contact");
+        }
+        upsert_contact_material_for_peer(
+            &state_dir,
+            &discovery.source_node_id,
+            &discovery.contact_material,
+        )?;
+        mark_peer_metadata_nearby_discovered(
+            &state_dir,
+            &discovery.source_node_id,
+            &discovery.network_id,
+        )?;
+        let _ = crate::control::add_discovered_peer_endpoint_with_source(
+            &state_dir,
+            &discovery.source_node_id,
+            None,
+            "nearby",
+        );
+        node.discover_peer(discovery.source_node_id.clone());
+        diagnostics::record_diagnostic(
+            Some(&state_dir),
+            diagnostics::DiagnosticEvent::new(
+                "info",
+                "discovery",
+                "nearby.peer.accepted",
+                "ok",
+                format!("nearby peer accepted: {}", discovery.source_node_id),
+            )
+            .object("peer", Some(discovery.source_node_id.clone()))
+            .source_node_id(Some(discovery.source_node_id.clone()))
+            .scope(&discovery.scope)
+            .details(json!({
+                "distance_km": distance_km,
+                "registered_contacts": registered,
+                "radius_km": settings.radius_km,
+            })),
+        );
+        Ok(NetworkBridgeTick::TransportNotice {
+            detail: format!(
+                "nearby_discovery_accepted peer={} distance_km={:.3}",
+                discovery.source_node_id, distance_km
+            ),
+        })
     }
 }
