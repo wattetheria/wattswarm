@@ -1,7 +1,6 @@
 #![allow(dead_code)]
 
 use serde_json::json;
-use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -9,16 +8,16 @@ use uuid::Uuid;
 use wattswarm_artifact_store::{ArtifactKind, ArtifactStore};
 use wattswarm_control_plane::control::{
     PeerDmDeliveryState, PeerDmMessageKind, PeerDmSessionState, PeerRelationshipAction,
-    PeerRelationshipState, add_discovered_peer_endpoint, artifact_store_path,
-    emit_topic_message_with_content, load_data_plane_status_records_state,
-    load_peer_dm_message_records_state, load_peer_dm_thread_records_state,
-    load_peer_metadata_records_state, load_peer_relationship_records_state,
+    PeerRelationshipState, artifact_store_path, emit_topic_message_with_content,
+    load_data_plane_status_records_state, load_peer_dm_message_records_state,
+    load_peer_dm_thread_records_state, load_peer_metadata_records_state,
+    load_peer_relationship_records_state,
 };
 use wattswarm_control_plane::crypto::{NodeIdentity, sha256_hex};
 use wattswarm_control_plane::network_bridge::{
     NetworkBridgeService, NetworkBridgeTick, build_knowledge_summary_for_task_type,
-    build_reputation_summary_for_runtime, dial_discovered_peer_endpoints,
-    latest_connected_peer_ids, publish_pending_global_events, publish_pending_scoped_updates,
+    build_reputation_summary_for_runtime, latest_connected_peer_ids, publish_pending_global_events,
+    publish_pending_scoped_updates,
 };
 use wattswarm_control_plane::network_p2p::{
     NetworkAddress, NetworkP2pConfig, NetworkP2pNode, PeerHandshakeMetadata, SwarmScope,
@@ -1162,7 +1161,7 @@ pub fn two_nodes_backfill_missing_events_over_request_response() {
     );
 }
 
-pub fn discovered_peer_endpoint_helper_dials_and_syncs_over_lan_state() {
+pub fn connected_peer_helper_syncs_over_lan_state() {
     let identity_a = NodeIdentity::random();
     let identity_b = NodeIdentity::random();
     let membership = membership_with_roles(&[identity_a.node_id(), identity_b.node_id()]);
@@ -1170,9 +1169,6 @@ pub fn discovered_peer_endpoint_helper_dials_and_syncs_over_lan_state() {
     let mut node_b = make_node(identity_b, membership);
     let mut service_a = make_service();
     let mut service_b = make_service();
-    let dir_a = temp_test_dir("network-dial-a");
-    let dir_b = temp_test_dir("network-dial-b");
-
     for _ in 0..4_096 {
         let _ = pump_once(&mut service_a, &mut node_a);
         let _ = pump_once(&mut service_b, &mut node_b);
@@ -1183,44 +1179,6 @@ pub fn discovered_peer_endpoint_helper_dials_and_syncs_over_lan_state() {
     }
     assert!(!service_a.listen_addrs().is_empty());
     assert!(!service_b.listen_addrs().is_empty());
-
-    let service_a_peer_id = service_a.local_peer_id().to_string();
-    let service_b_peer_id = service_b.local_peer_id().to_string();
-    add_discovered_peer_endpoint(
-        &dir_a,
-        &service_b_peer_id,
-        Some(&service_b.listen_addrs()[0].to_string()),
-    )
-    .expect("record node b endpoint");
-    add_discovered_peer_endpoint(
-        &dir_b,
-        &service_a_peer_id,
-        Some(&service_a.listen_addrs()[0].to_string()),
-    )
-    .expect("record node a endpoint");
-
-    let mut attempts_a = HashMap::new();
-    assert_eq!(
-        dial_discovered_peer_endpoints(
-            &mut service_a,
-            &dir_a,
-            &service_a_peer_id,
-            &mut attempts_a,
-        )
-        .expect("dial discovered peers a"),
-        1
-    );
-    let mut attempts_b = HashMap::new();
-    assert_eq!(
-        dial_discovered_peer_endpoints(
-            &mut service_b,
-            &dir_b,
-            &service_b_peer_id,
-            &mut attempts_b,
-        )
-        .expect("dial discovered peers b"),
-        1
-    );
 
     connect_services(&mut service_b, &mut node_b, &mut service_a, &mut node_a);
 
@@ -1258,11 +1216,9 @@ pub fn discovered_peer_endpoint_helper_dials_and_syncs_over_lan_state() {
         std::thread::yield_now();
     }
 
-    cleanup_dir(&dir_a);
-    cleanup_dir(&dir_b);
     assert!(
         synced,
-        "discovered peer endpoint dialing should sync local event; last_published_seq={last_published_seq} node_b_events={} last_tick_a={last_tick_a:?} last_tick_b={last_tick_b:?}",
+        "connected peers should sync local event; last_published_seq={last_published_seq} node_b_events={} last_tick_a={last_tick_a:?} last_tick_b={last_tick_b:?}",
         node_b
             .store
             .load_all_events()

@@ -49,10 +49,7 @@ use wattswarm_protocol::types::NetworkProtocolParams;
 pub use announcements::{
     apply_checkpoint_announcement, apply_rule_announcement, sign_rule_announcement,
 };
-pub use backfill::{
-    backfill_response_for_request, dial_bootstrap_peer_endpoints, dial_discovered_peer_endpoints,
-    ingest_backfill_response,
-};
+pub use backfill::{backfill_response_for_request, ingest_backfill_response};
 pub use diagnostics::{
     DiagnosticEntry, DiagnosticFilter, list_diagnostics as list_network_diagnostics,
 };
@@ -93,7 +90,6 @@ const ENV_P2P_ENABLED: &str = "WATTSWARM_P2P_ENABLED";
 const ENV_P2P_LOCAL_DISCOVERY: &str = "WATTSWARM_P2P_MDNS";
 const ENV_P2P_PORT: &str = "WATTSWARM_P2P_PORT";
 const ENV_P2P_LISTEN_ADDRS: &str = "WATTSWARM_P2P_LISTEN_ADDRS";
-const ENV_P2P_BOOTSTRAP_PEERS: &str = "WATTSWARM_P2P_BOOTSTRAP_PEERS";
 const STARTUP_CONFIG_FILE: &str = "startup_config.json";
 const DEFAULT_P2P_PORT: u16 = 4001;
 const GLOBAL_HIGH_FREQUENCY_WINDOW: Duration = Duration::from_secs(5);
@@ -1726,35 +1722,43 @@ fn recommended_backfill_route_for_peer(
 
 fn candidate_peer_addrs(state_dir: &Path, remote_node_id: &str) -> Result<Vec<NetworkAddress>> {
     let mut addrs = Vec::new();
-    for record in crate::control::load_discovered_peer_records_state(state_dir)? {
-        if record.node_id != remote_node_id {
-            continue;
-        }
-        let Some(listen_addr) = record.listen_addr else {
-            continue;
-        };
-        if let Ok(addr) = listen_addr.parse::<NetworkAddress>() {
-            addrs.push(addr);
-        }
-    }
     for record in crate::control::load_peer_metadata_records_state(state_dir)? {
         if record.node_id != remote_node_id {
             continue;
         }
-        if let Some(observed_addr) = record.observed_addr
-            && let Ok(addr) = observed_addr.parse::<NetworkAddress>()
-        {
-            addrs.push(addr);
-        }
-        for listen_addr in record.listen_addrs {
-            if let Ok(addr) = listen_addr.parse::<NetworkAddress>() {
-                addrs.push(addr);
+        for contact in record.transport_contact_materials() {
+            for direct_addr in transport_contact_direct_network_addrs(&contact) {
+                if let Ok(addr) = direct_addr.parse::<NetworkAddress>() {
+                    addrs.push(addr);
+                }
             }
         }
     }
     addrs.sort();
     addrs.dedup();
     Ok(addrs)
+}
+
+fn transport_contact_direct_network_addrs(contact: &TransportContactMaterial) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut addrs = Vec::new();
+    if let Some(items) = contact.extra.get("direct_addrs").and_then(Value::as_array) {
+        for item in items {
+            let Some(raw) = item.as_str().map(str::trim) else {
+                continue;
+            };
+            if raw.parse::<SocketAddr>().is_ok() && seen.insert(raw.to_owned()) {
+                addrs.push(raw.to_owned());
+            }
+        }
+    }
+    for raw in &contact.metadata.listen_addrs {
+        let trimmed = raw.trim();
+        if trimmed.parse::<SocketAddr>().is_ok() && seen.insert(trimmed.to_owned()) {
+            addrs.push(trimmed.to_owned());
+        }
+    }
+    addrs
 }
 
 fn upsert_dm_thread(
@@ -2212,14 +2216,9 @@ pub fn network_config_from_env() -> NetworkP2pConfig {
                 .unwrap_or(DEFAULT_P2P_PORT);
             vec![format!("/ip4/0.0.0.0/tcp/{port}")]
         });
-    let bootstrap_peers = env::var(ENV_P2P_BOOTSTRAP_PEERS)
-        .ok()
-        .map(|raw| parse_listen_addrs_env(&raw))
-        .unwrap_or_default();
-
     NetworkP2pConfig {
         listen_addrs,
-        bootstrap_peers,
+        bootstrap_peers: Vec::new(),
         enable_local_discovery: parse_bool_env_with_default(ENV_P2P_LOCAL_DISCOVERY, true),
         ..NetworkP2pConfig::default()
     }
@@ -2306,7 +2305,6 @@ fn run_background_network_service_with_hook(
     configured_scopes: Vec<SwarmScope>,
     post_tick_hook: Option<PostTickHook>,
 ) -> Result<()> {
-    let bootstrap_peers = config.bootstrap_peers.clone();
     let mut node = crate::control::open_configured_node(state_dir, db_path)?;
     let node_id = node.node_id();
     let scopes = merge_scopes(configured_scopes);
@@ -2338,7 +2336,6 @@ fn run_background_network_service_with_hook(
     let mut announced_listen = false;
     let mut announced_peers: HashMap<String, Instant> = HashMap::new();
     let mut last_published_seq = node.head_seq()?;
-    let mut next_dial_attempt_at = HashMap::new();
 
     loop {
         let mut did_work = false;
@@ -2372,20 +2369,6 @@ fn run_background_network_service_with_hook(
                     break;
                 }
             }
-        }
-        if dial_discovered_peer_endpoints(
-            &mut service,
-            state_dir,
-            &node_id,
-            &mut next_dial_attempt_at,
-        )? > 0
-        {
-            did_work = true;
-        }
-        if dial_bootstrap_peer_endpoints(&mut service, &bootstrap_peers, &mut next_dial_attempt_at)?
-            > 0
-        {
-            did_work = true;
         }
         let processed_pending_commands =
             match process_pending_network_commands(&mut service, state_dir) {

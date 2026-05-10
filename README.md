@@ -150,7 +150,7 @@ The workspace now includes dedicated crates and a control-plane bridge for node-
   - auto-publishes knowledge summaries on finalized decisions and reputation summaries on verifier updates
   - propagates append-only revoke/penalty events so malicious event effects can be rolled back without deleting the event log
   - suppresses summary fanout while local publish backlog is high, keeping event catch-up ahead of summary traffic
-  - can dial peer listen addresses discovered through the local PostgreSQL peer cache (`discovered_peers_local`)
+  - resolves peer connectivity from persisted Iroh contact material instead of dialing addresses from the local discovery cache
   - persists peer sync state in the local control database (`network_peer_sync_state_local`) so known scopes, backfill cursors, remote lane heads, and peer backfill quality survive reconnects and restarts
   - persists identify/handshake metadata into `peer_metadata_local`
   - executes node-to-node relationship requests over request-response and persists local relationship state into `peer_relationships_local`
@@ -551,15 +551,15 @@ specialization / faster closure / more stable network-level behavior"]
 - Broadcast today:
   - `Event` notifications on the resolved Iroh gossip topic
   - `Summary` notifications on the resolved Iroh gossip topic
-  - LAN peer discovery via UDP announce where enabled; mDNS remains legacy compatibility
+  - LAN peer sightings via UDP announce where enabled
 - Pull today:
   - missing historical events through Iroh control-stream backfill
   - topic message bodies, direct-message bodies, candidate outputs, reference artifacts, and BLAKE3-addressed blobs through Iroh using content/reference pointers carried by the control plane
 - WAN discovery today:
   - configured bootstrap/contact material is loaded from startup config and local PostgreSQL
   - `iroh_direct` contact material is persisted in `peer_metadata_local`
-  - discovered compatibility peers are still persisted into local PostgreSQL `discovered_peers_local` with source kinds such as `bootstrap`, `identify`, and `bootstrap_index`
-  - compatibility identify metadata is persisted separately into `peer_metadata_local`
+  - peer sightings are persisted into local PostgreSQL `discovered_peers_local` as node ids plus source kind only
+  - Iroh contact material is persisted separately into `peer_metadata_local` and is the source for active peer connectivity
 - Node relationship execution today:
   - node-to-node relationship actions are point-to-point request/response messages, not gossip subscriptions
   - supported actions are `request`, `accept`, `reject`, `cancel`, `remove`, `block`, and `unblock`
@@ -635,9 +635,9 @@ Feed subscriptions are scope plus gossip-kind subscriptions, not broad scope fir
 WattSwarm now separates three node-local peer layers:
 
 - `discovered_peers_local`
-  - discovery registry for LAN and WAN peer sightings
+  - discovery registry for LAN and WAN peer sightings; it stores node ids and source kinds, not dial addresses
 - `peer_metadata_local`
-  - identify/handshake metadata plus protected contact material snapshots
+  - handshake metadata plus protected Iroh contact material snapshots
 - `peer_relationships_local`
   - local relationship state machine (`requested`, `accepted`, `rejected`, `blocked`, etc.)
 
@@ -869,7 +869,7 @@ Optional UDP announce switch (default off):
 - `WATTSWARM_UDP_ANNOUNCE_PORT=37931`
 - with switch enabled, startup emits announce payload and UI process listens on the same port and records discovered peer IDs into PostgreSQL `discovered_peers_local`
 - the same local peer registry also stores WAN discoveries; `source_kind` distinguishes `udp`, `local_discovery`, `bootstrap`, `identify`, and `bootstrap_index`
-- when a peer advertise includes legacy listen material, that address is recorded for compatibility; active Iroh sync uses persisted `iroh_direct` contact material when available
+- announced listen material is not persisted in `discovered_peers_local`; active Iroh sync uses persisted `iroh_direct` contact material from `peer_metadata_local`
 - `peers list` and `/api/peers/list` include the discovered peers loaded from that local PostgreSQL cache
 
 Examples:

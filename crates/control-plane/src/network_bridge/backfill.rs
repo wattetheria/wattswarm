@@ -1,8 +1,6 @@
 use super::*;
-use crate::control::load_discovered_peer_records_state;
 use crate::network_p2p::BackfillResponse;
 
-const DISCOVERY_DIAL_RETRY_AFTER: Duration = Duration::from_secs(3);
 const BACKFILL_HEAD_EVENT_IDS_LIMIT: usize = 8;
 pub(super) const BACKFILL_KNOWN_EVENT_IDS_LIMIT: usize = 64;
 
@@ -163,80 +161,4 @@ pub(super) fn should_sync_event(node: &Node, event: &crate::types::Event) -> Res
         return Ok(true);
     }
     Ok(!node.store.is_event_revoked(&event.event_id)?)
-}
-
-pub fn dial_discovered_peer_endpoints(
-    service: &mut NetworkBridgeService,
-    state_dir: &Path,
-    local_node_id: &str,
-    next_attempt_at: &mut HashMap<String, std::time::Instant>,
-) -> Result<usize> {
-    let records = load_discovered_peer_records_state(state_dir)?;
-    let now = std::time::Instant::now();
-    let mut dialed = 0usize;
-    for record in records {
-        if record.node_id == local_node_id {
-            continue;
-        }
-        let Some(raw_addr) = record.listen_addr.as_deref() else {
-            continue;
-        };
-        let addr = match raw_addr.parse::<NetworkAddress>() {
-            Ok(addr) => addr,
-            Err(_) => continue,
-        };
-        let dial_addr = match NetworkAddress::new(format!("{}@{}", record.node_id, addr.as_str())) {
-            Ok(addr) => addr,
-            Err(_) => continue,
-        };
-        if next_attempt_at
-            .get(raw_addr)
-            .is_some_and(|deadline| *deadline > now)
-        {
-            continue;
-        }
-        next_attempt_at.insert(raw_addr.to_owned(), now + DISCOVERY_DIAL_RETRY_AFTER);
-        match service.dial(dial_addr) {
-            Ok(()) => dialed += 1,
-            Err(err)
-                if err
-                    .to_string()
-                    .to_ascii_lowercase()
-                    .contains("duplicate connection") => {}
-            Err(err) => eprintln!("p2p dial failed for {raw_addr}: {err}"),
-        }
-    }
-    Ok(dialed)
-}
-
-pub fn dial_bootstrap_peer_endpoints(
-    service: &mut NetworkBridgeService,
-    bootstrap_peers: &[String],
-    next_attempt_at: &mut HashMap<String, std::time::Instant>,
-) -> Result<usize> {
-    let now = std::time::Instant::now();
-    let mut dialed = 0usize;
-    for raw_addr in bootstrap_peers {
-        if next_attempt_at
-            .get(raw_addr)
-            .is_some_and(|deadline| *deadline > now)
-        {
-            continue;
-        }
-        let addr = match raw_addr.parse::<NetworkAddress>() {
-            Ok(addr) => addr,
-            Err(_) => continue,
-        };
-        next_attempt_at.insert(raw_addr.clone(), now + DISCOVERY_DIAL_RETRY_AFTER);
-        match service.dial(addr) {
-            Ok(()) => dialed += 1,
-            Err(err)
-                if err
-                    .to_string()
-                    .to_ascii_lowercase()
-                    .contains("duplicate connection") => {}
-            Err(err) => eprintln!("bootstrap dial failed for {raw_addr}: {err}"),
-        }
-    }
-    Ok(dialed)
 }

@@ -155,7 +155,6 @@ impl PgStore {
             .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
         let mut stmt = conn.prepare(
             "SELECT node_id,
-                    listen_addr,
                     source_kind,
                     (EXTRACT(EPOCH FROM discovered_at) * 1000)::BIGINT AS discovered_at_ms,
                     (EXTRACT(EPOCH FROM updated_at) * 1000)::BIGINT AS updated_at_ms
@@ -166,10 +165,9 @@ impl PgStore {
         let rows = stmt.query_map(params![scope_id], |r| {
             Ok(LocalDiscoveredPeerRow {
                 node_id: r.get(0)?,
-                listen_addr: r.get(1)?,
-                source_kind: r.get(2)?,
-                discovered_at: r.get::<_, i64>(3)? as u64,
-                updated_at: r.get::<_, i64>(4)? as u64,
+                source_kind: r.get(1)?,
+                discovered_at: r.get::<_, i64>(2)? as u64,
+                updated_at: r.get::<_, i64>(3)? as u64,
             })
         })?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
@@ -194,19 +192,17 @@ impl PgStore {
             )?;
             for peer in peers {
                 conn.execute(
-                    "INSERT INTO discovered_peers_local(scope_id, node_id, listen_addr, source_kind, discovered_at, updated_at)
+                    "INSERT INTO discovered_peers_local(scope_id, node_id, source_kind, discovered_at, updated_at)
                      VALUES (
                         $1,
                         $2,
                         $3,
-                        $4,
-                        TIMESTAMPTZ 'epoch' + ($5::bigint * INTERVAL '1 millisecond'),
-                        TIMESTAMPTZ 'epoch' + ($6::bigint * INTERVAL '1 millisecond')
+                        TIMESTAMPTZ 'epoch' + ($4::bigint * INTERVAL '1 millisecond'),
+                        TIMESTAMPTZ 'epoch' + ($5::bigint * INTERVAL '1 millisecond')
                      )",
                     params![
                         scope_id,
                         &peer.node_id,
-                        peer.listen_addr,
                         &peer.source_kind,
                         peer.discovered_at as i64,
                         now as i64
@@ -227,7 +223,6 @@ impl PgStore {
         &self,
         scope_id: &str,
         node_id: &str,
-        listen_addr: Option<&str>,
         source_kind: &str,
         now: u64,
     ) -> Result<bool> {
@@ -237,17 +232,13 @@ impl PgStore {
             .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
         let existing = conn
             .query_row(
-                "SELECT listen_addr, source_kind
+                "SELECT source_kind
                  FROM discovered_peers_local
                  WHERE scope_id = $1 AND node_id = $2",
                 params![scope_id, node_id],
-                |r| Ok((r.get::<_, Option<String>>(0)?, r.get::<_, String>(1)?)),
+                |r| r.get::<_, String>(0),
             )
             .optional()?;
-        let normalized = listen_addr
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(ToOwned::to_owned);
         let normalized_source = source_kind.trim();
         let normalized_source = if normalized_source.is_empty() {
             "unknown"
@@ -255,35 +246,28 @@ impl PgStore {
             normalized_source
         };
         match existing {
-            Some((current_addr, current_source))
-                if (normalized.is_none() || current_addr == normalized)
-                    && current_source == normalized_source =>
-            {
-                Ok(false)
-            }
+            Some(current_source) if current_source == normalized_source => Ok(false),
             Some(_) => {
                 conn.execute(
                     "UPDATE discovered_peers_local
-                     SET listen_addr = $2,
-                         source_kind = $3,
-                         updated_at = TIMESTAMPTZ 'epoch' + ($4::bigint * INTERVAL '1 millisecond')
-                     WHERE scope_id = $1 AND node_id = $5",
-                    params![scope_id, normalized, normalized_source, now as i64, node_id],
+                     SET source_kind = $2,
+                         updated_at = TIMESTAMPTZ 'epoch' + ($3::bigint * INTERVAL '1 millisecond')
+                     WHERE scope_id = $1 AND node_id = $4",
+                    params![scope_id, normalized_source, now as i64, node_id],
                 )?;
                 Ok(true)
             }
             None => {
                 conn.execute(
-                    "INSERT INTO discovered_peers_local(scope_id, node_id, listen_addr, source_kind, discovered_at, updated_at)
+                    "INSERT INTO discovered_peers_local(scope_id, node_id, source_kind, discovered_at, updated_at)
                      VALUES (
                         $1,
                         $2,
                         $3,
-                        $4,
-                        TIMESTAMPTZ 'epoch' + ($5::bigint * INTERVAL '1 millisecond'),
-                        TIMESTAMPTZ 'epoch' + ($5::bigint * INTERVAL '1 millisecond')
+                        TIMESTAMPTZ 'epoch' + ($4::bigint * INTERVAL '1 millisecond'),
+                        TIMESTAMPTZ 'epoch' + ($4::bigint * INTERVAL '1 millisecond')
                      )",
-                    params![scope_id, node_id, normalized, normalized_source, now as i64],
+                    params![scope_id, node_id, normalized_source, now as i64],
                 )?;
                 Ok(true)
             }

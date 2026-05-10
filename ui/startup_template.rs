@@ -423,8 +423,9 @@ Those stay in CLI, compose, or config files for advanced operators.</pre>
       document.getElementById('displayName').value = cfg.display_name || '';
       document.getElementById('latitude').value = Number.isFinite(cfg.latitude) ? String(cfg.latitude) : '';
       document.getElementById('longitude').value = Number.isFinite(cfg.longitude) ? String(cfg.longitude) : '';
-      document.getElementById('bootstrapContacts').value = (cfg.bootstrap_contacts || []).join('\n');
-      document.getElementById('gatewayUrls').value = (cfg.gateway_urls || []).join('\n');
+      const manualJoin = cfg.network_mode === 'lan';
+      document.getElementById('bootstrapContacts').value = manualJoin ? (cfg.bootstrap_contacts || []).join('\n') : '';
+      document.getElementById('gatewayUrls').value = manualJoin ? (cfg.gateway_urls || []).join('\n') : '';
       setNetworkMode(cfg.network_mode || 'local');
     }
 

@@ -133,7 +133,7 @@ impl NetworkBridgeService {
                     let _ = crate::control::add_discovered_peer_endpoint_with_source(
                         state_dir,
                         &peer.to_string(),
-                        Some(remote_addr_text.as_str()),
+                        None,
                         "connected",
                     );
                     diagnostics::record_diagnostic(

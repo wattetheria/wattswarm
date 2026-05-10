@@ -12,7 +12,6 @@ use crate::types::{
 };
 use crate::{node::Node, task_template::sample_contract};
 use serde_json::json;
-use std::collections::HashMap;
 use std::env;
 use std::fs;
 use std::io::{Read, Write};
@@ -1296,7 +1295,7 @@ fn network_config_defaults_to_enabled_with_fixed_tcp_port() {
     let _local_discovery = EnvVarGuard::set(ENV_P2P_LOCAL_DISCOVERY, None);
     let _port = EnvVarGuard::set(ENV_P2P_PORT, None);
     let _listen = EnvVarGuard::set(ENV_P2P_LISTEN_ADDRS, None);
-    let _bootstrap = EnvVarGuard::set(ENV_P2P_BOOTSTRAP_PEERS, None);
+    let _bootstrap = EnvVarGuard::set("WATTSWARM_P2P_BOOTSTRAP_PEERS", None);
     assert!(network_enabled_from_env());
     let config = network_config_from_env();
     assert!(config.enable_local_discovery);
@@ -2205,18 +2204,20 @@ fn lan_open_does_not_seed_default_protocol_roles() {
 }
 
 #[test]
-fn network_config_reads_bootstrap_peers_from_env() {
+fn network_config_ignores_legacy_bootstrap_peers_env() {
     let _lock = lock_env_test_mutex();
-    let _bootstrap = EnvVarGuard::set(ENV_P2P_BOOTSTRAP_PEERS, Some("node-a@127.0.0.1:4001"));
+    let _bootstrap = EnvVarGuard::set(
+        "WATTSWARM_P2P_BOOTSTRAP_PEERS",
+        Some("node-a@127.0.0.1:4001"),
+    );
     let config = network_config_from_env();
-    assert_eq!(config.bootstrap_peers.len(), 1);
-    assert_eq!(config.bootstrap_peers[0], "node-a@127.0.0.1:4001");
+    assert!(config.bootstrap_peers.is_empty());
 }
 
 #[test]
 fn network_config_does_not_read_bootstrap_contacts_as_legacy_peers() {
     let _lock = lock_env_test_mutex();
-    let _bootstrap = EnvVarGuard::set(ENV_P2P_BOOTSTRAP_PEERS, None);
+    let _bootstrap = EnvVarGuard::set("WATTSWARM_P2P_BOOTSTRAP_PEERS", None);
     let dir = temp_startup_dir("startup-bootstrap");
     fs::write(
         dir.join("startup_config.json"),
@@ -2543,7 +2544,6 @@ fn peer_discovered_event_persists_wan_source_into_local_registry() {
         rows,
         vec![crate::control::DiscoveredPeerRecord {
             node_id: peer.to_string(),
-            listen_addr: Some(address.to_string()),
             source_kind: "bootstrap".to_owned(),
         }]
     );
@@ -3971,55 +3971,6 @@ fn publish_pending_global_events_publishes_local_rows_and_skips_remote_rows() {
         std::thread::sleep(Duration::from_millis(1));
     }
     assert_eq!(last, 2);
-}
-
-#[test]
-fn dial_discovered_peer_endpoints_skips_invalid_self_and_missing_addrs() {
-    let dir = std::env::temp_dir().join(format!(
-        "wattswarm-network-bridge-{}",
-        uuid::Uuid::new_v4().simple()
-    ));
-    std::fs::create_dir_all(&dir).expect("create temp dir");
-    crate::control::save_discovered_peer_records(
-        &crate::control::discovered_peers_path(&dir),
-        &[
-            crate::control::DiscoveredPeerRecord {
-                node_id: "self".to_owned(),
-                listen_addr: Some("/ip4/127.0.0.1/tcp/4001".to_owned()),
-                source_kind: "udp".to_owned(),
-            },
-            crate::control::DiscoveredPeerRecord {
-                node_id: "peer-a".to_owned(),
-                listen_addr: None,
-                source_kind: "unknown".to_owned(),
-            },
-            crate::control::DiscoveredPeerRecord {
-                node_id: "peer-b".to_owned(),
-                listen_addr: Some("not-a-network address".to_owned()),
-                source_kind: "unknown".to_owned(),
-            },
-        ],
-    )
-    .expect("save discovered peers");
-
-    let mut service = NetworkBridgeService::new(
-        NetworkP2pNode::generate(NetworkP2pConfig {
-            listen_addrs: vec!["/ip4/127.0.0.1/tcp/0".to_owned()],
-            enable_local_discovery: false,
-            ..NetworkP2pConfig::default()
-        })
-        .expect("network node"),
-        &[SwarmScope::Global],
-        &NetworkProtocolParams::default(),
-    )
-    .expect("network service");
-
-    let mut attempts = HashMap::new();
-    let dialed = dial_discovered_peer_endpoints(&mut service, &dir, "self", &mut attempts)
-        .expect("dial discovered peers");
-    assert_eq!(dialed, 0);
-    assert!(attempts.is_empty());
-    let _ = std::fs::remove_dir_all(dir);
 }
 
 #[test]

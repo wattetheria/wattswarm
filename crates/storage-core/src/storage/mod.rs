@@ -243,7 +243,6 @@ pub struct LocalExecutorEntryRow {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LocalDiscoveredPeerRow {
     pub node_id: String,
-    pub listen_addr: Option<String>,
     pub source_kind: String,
     pub discovered_at: u64,
     pub updated_at: u64,

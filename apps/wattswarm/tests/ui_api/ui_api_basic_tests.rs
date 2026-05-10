@@ -452,6 +452,9 @@ fn ui_root_page_serves_startup_view_and_diagnostics_route_redirects_legacy_conso
             )
         );
         assert!(root_html.contains("Used only for LAN or private test networks"));
+        assert!(root_html.contains("const manualJoin = cfg.network_mode === 'lan';"));
+        assert!(root_html.contains("manualJoin ? (cfg.bootstrap_contacts || []).join"));
+        assert!(root_html.contains("manualJoin ? (cfg.gateway_urls || []).join"));
         assert!(!root_html.contains("<genesis-node-id>"));
         assert!(!root_html.contains("\"metadata\":{\"route\":\"iroh_direct\""));
         assert!(!root_html.contains("href=\"/console\""));

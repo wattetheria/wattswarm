@@ -420,10 +420,6 @@ impl BootstrapBundleStub {
             handle: Some(handle),
         }
     }
-
-    fn bootstrap_peer_addr(&self, peer_id: &str) -> String {
-        format!("{peer_id}@127.0.0.1:{}", self.addr.port())
-    }
 }
 
 impl Drop for BootstrapBundleStub {
@@ -664,12 +660,10 @@ fn discovered_peers_registry_roundtrip_and_legacy_parse() {
         vec![
             DiscoveredPeerRecord {
                 node_id: "node-b".to_owned(),
-                listen_addr: None,
                 source_kind: "unknown".to_owned(),
             },
             DiscoveredPeerRecord {
                 node_id: "node-a".to_owned(),
-                listen_addr: None,
                 source_kind: "unknown".to_owned(),
             }
         ]
@@ -721,17 +715,14 @@ fn add_discovered_peer_dedups_and_sorts() {
         vec![
             DiscoveredPeerRecord {
                 node_id: "node-a".to_owned(),
-                listen_addr: Some("/ip4/127.0.0.1/tcp/4001".to_owned()),
                 source_kind: "udp".to_owned(),
             },
             DiscoveredPeerRecord {
                 node_id: "node-b".to_owned(),
-                listen_addr: None,
                 source_kind: "unknown".to_owned(),
             },
             DiscoveredPeerRecord {
                 node_id: "node-c".to_owned(),
-                listen_addr: None,
                 source_kind: "unknown".to_owned(),
             }
         ]
@@ -787,11 +778,6 @@ fn network_directory_snapshot_lists_networks_feeds_domains_and_sync_endpoints() 
     let schema = format!("test_{}", Uuid::new_v4().simple());
     reset_test_schema(&schema);
     let _schema_guard = EnvVarGuard::set("WATTSWARM_PG_SCHEMA", &schema);
-    let bootstrap_peer = test_iroh_endpoint_id(101);
-    let _bootstrap_guard = EnvVarGuard::set(
-        "WATTSWARM_P2P_BOOTSTRAP_PEERS",
-        &format!("{bootstrap_peer}@127.0.0.1:4001"),
-    );
     let dir = temp_test_dir("network-directory-snapshot");
     let state_dir = dir.join("state");
     fs::create_dir_all(&state_dir).expect("create state dir");
@@ -881,18 +867,12 @@ fn network_directory_snapshot_lists_networks_feeds_domains_and_sync_endpoints() 
         snapshot.active_dissemination_domains,
         vec!["node:lab-7".to_owned(), "region:sol-1".to_owned()]
     );
-    assert_eq!(snapshot.sync_endpoints.len(), 2);
+    assert_eq!(snapshot.sync_endpoints.len(), 1);
     assert!(
         snapshot
             .sync_endpoints
             .iter()
-            .any(|entry| entry.source_kind == "udp_discovery" && entry.node_id == "peer-udp")
-    );
-    assert!(
-        snapshot
-            .sync_endpoints
-            .iter()
-            .any(|entry| entry.source_kind == "bootstrap")
+            .any(|entry| entry.source_kind == "contact_material" && entry.node_id == "peer-udp")
     );
     let udp_entry = snapshot
         .sync_endpoints
@@ -1412,11 +1392,6 @@ fn open_node_network_mode_auto_syncs_signed_bootstrap_bundle_from_remote() {
         bundle
     };
 
-    let remote_peer_id =
-        wattswarm_control_plane::network_p2p::network_peer_id_from_ed25519_public_key(
-            remote_identity.verifying_key().to_bytes(),
-        )
-        .expect("derive remote peer id");
     let bootstrap_stub = BootstrapBundleStub::start(bundle.clone());
     let _local_schema_guard = EnvVarGuard::set("WATTSWARM_PG_SCHEMA", &local_schema);
     let _mode_guard = EnvVarGuard::set("WATTSWARM_NODE_MODE", "network");
@@ -1424,11 +1399,6 @@ fn open_node_network_mode_auto_syncs_signed_bootstrap_bundle_from_remote() {
         "WATTSWARM_NETWORK_BOOTSTRAP_HTTP_URLS",
         &format!("http://127.0.0.1:{}", bootstrap_stub.addr.port()),
     );
-    let _bootstrap_peers_guard = EnvVarGuard::set(
-        "WATTSWARM_P2P_BOOTSTRAP_PEERS",
-        &bootstrap_stub.bootstrap_peer_addr(&remote_peer_id.to_string()),
-    );
-
     let dir = temp_test_dir("open-node-network-mode-auto-sync");
     let state_dir = dir.join("state");
     fs::create_dir_all(&state_dir).expect("create local state dir");
@@ -3023,10 +2993,9 @@ fn udp_announce_startup_and_listener_paths_execute() {
         let start = Instant::now();
         while start.elapsed() < Duration::from_millis(700) {
             if let Ok(records) = load_discovered_peer_records_state(&dir)
-                && records.iter().any(|record| {
-                    record.node_id == "node-peer"
-                        && record.listen_addr.as_deref() == Some("/ip4/127.0.0.1/tcp/4001")
-                })
+                && records
+                    .iter()
+                    .any(|record| record.node_id == "node-peer" && record.source_kind == "udp")
             {
                 found = true;
                 break;

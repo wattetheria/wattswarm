@@ -470,7 +470,6 @@ mod tests {
             &state_dir,
             &[crate::control::DiscoveredPeerRecord {
                 node_id: "peer-alpha".to_owned(),
-                listen_addr: Some("/ip4/203.0.113.10/tcp/4001".to_owned()),
                 source_kind: "bootstrap".to_owned(),
             }],
         )

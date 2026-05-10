@@ -199,6 +199,20 @@ fn migrate_discovered_peers_local_source_kind_schema(conn: &Connection) -> Resul
     Ok(())
 }
 
+fn migrate_discovered_peers_local_trim_listen_addr_schema(conn: &Connection) -> Result<()> {
+    if !column_exists(conn, "discovered_peers_local", "listen_addr") {
+        return Ok(());
+    }
+
+    conn.execute_batch(
+        "
+        ALTER TABLE discovered_peers_local
+        DROP COLUMN IF EXISTS listen_addr;
+        ",
+    )?;
+    Ok(())
+}
+
 fn migrate_peer_metadata_local_contact_material_schema(conn: &Connection) -> Result<()> {
     if !column_exists(conn, "peer_metadata_local", "contact_material_json") {
         conn.execute_batch(
@@ -746,7 +760,6 @@ impl PgStore {
             CREATE TABLE IF NOT EXISTS discovered_peers_local (
                 scope_id TEXT NOT NULL DEFAULT '',
                 node_id TEXT NOT NULL,
-                listen_addr TEXT,
                 source_kind TEXT NOT NULL DEFAULT 'unknown',
                 discovered_at TIMESTAMPTZ NOT NULL,
                 updated_at TIMESTAMPTZ NOT NULL,
@@ -1912,6 +1925,7 @@ impl PgStore {
             migrate_executor_registry_local_metadata_schema(&conn)?;
             migrate_discovered_peers_local_scope_schema(&conn)?;
             migrate_discovered_peers_local_source_kind_schema(&conn)?;
+            migrate_discovered_peers_local_trim_listen_addr_schema(&conn)?;
             migrate_peer_metadata_local_contact_material_schema(&conn)?;
             migrate_network_peer_sync_state_identity_schema(&conn)?;
             migrate_feed_subscription_network_id_schema(&conn)?;

@@ -382,7 +382,7 @@ fn legacy_discovered_peers_rows_are_migrated_to_scope_and_real_node_id() {
 
         let rows = conn
             .prepare(
-                "SELECT scope_id, node_id, listen_addr, source_kind
+                "SELECT scope_id, node_id, source_kind
                  FROM discovered_peers_local",
             )
             .expect("prepare migrated discovered peers query")
@@ -390,8 +390,7 @@ fn legacy_discovered_peers_rows_are_migrated_to_scope_and_real_node_id() {
                 Ok((
                     row.get::<usize, String>(0)?,
                     row.get::<usize, String>(1)?,
-                    row.get::<usize, Option<String>>(2)?,
-                    row.get::<usize, String>(3)?,
+                    row.get::<usize, String>(2)?,
                 ))
             })
             .expect("query migrated discovered peers")
@@ -400,13 +399,20 @@ fn legacy_discovered_peers_rows_are_migrated_to_scope_and_real_node_id() {
 
         assert_eq!(
             rows,
-            vec![(
-                scope_id,
-                "peer-a".to_owned(),
-                Some("/ip4/127.0.0.1/tcp/4001".to_owned()),
-                "unknown".to_owned(),
-            )]
+            vec![(scope_id, "peer-a".to_owned(), "unknown".to_owned(),)]
         );
+        let remaining_listen_addr_columns: i64 = conn
+            .query_row(
+                "SELECT COUNT(*)
+                 FROM information_schema.columns
+                 WHERE table_schema = current_schema()
+                   AND table_name = 'discovered_peers_local'
+                   AND column_name = 'listen_addr'",
+                wattswarm_storage_core::params![],
+                |row| row.get(0),
+            )
+            .expect("query discovered peers column check");
+        assert_eq!(remaining_listen_addr_columns, 0);
     });
 }
 

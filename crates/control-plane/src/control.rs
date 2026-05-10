@@ -16,6 +16,7 @@ use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::env;
 use std::fs;
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::Duration;
@@ -421,7 +422,7 @@ fn comma_separated_env_values(key: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
-fn bootstrap_bundle_endpoint_candidates(state_dir: &Path) -> Result<Vec<String>> {
+fn bootstrap_bundle_endpoint_candidates(_state_dir: &Path) -> Result<Vec<String>> {
     let mut seen = BTreeSet::new();
     let mut endpoints = Vec::new();
     for value in comma_separated_env_values(ENV_NETWORK_BOOTSTRAP_HTTP_URLS) {
@@ -434,19 +435,6 @@ fn bootstrap_bundle_endpoint_candidates(state_dir: &Path) -> Result<Vec<String>>
         return Ok(endpoints);
     }
 
-    let config = crate::network_bridge::network_config_from_state_dir(state_dir);
-    for raw_addr in config.bootstrap_peers {
-        match crate::network_p2p::bootstrap_http_base_url(&raw_addr, DEFAULT_BOOTSTRAP_HTTP_PORT) {
-            Ok(base_url) => {
-                if seen.insert(base_url.clone()) {
-                    endpoints.push(format!("{base_url}{NETWORK_BOOTSTRAP_ROUTE}"));
-                }
-            }
-            Err(err) => {
-                eprintln!("skip invalid bootstrap HTTP candidate '{raw_addr}': {err}");
-            }
-        }
-    }
     Ok(endpoints)
 }
 
@@ -602,6 +590,173 @@ fn merge_manifest_values(
     value[field] = Value::Array(values.into_iter().map(Value::String).collect());
 }
 
+fn merge_manifest_bootstrap_contacts(value: &mut Value, manifest_values: &[String]) {
+    let existing_values = value
+        .get("bootstrap_contacts")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|entry| entry.as_str().map(str::to_owned));
+
+    let mut values = Vec::<(String, String)>::new();
+    let mut indexes = BTreeMap::<String, usize>::new();
+    for raw in existing_values.chain(manifest_values.iter().cloned()) {
+        let Some((key, normalized)) = normalize_manifest_bootstrap_contact(&raw) else {
+            continue;
+        };
+        if let Some(index) = indexes.get(&key) {
+            values[*index].1 = normalized;
+        } else {
+            indexes.insert(key.clone(), values.len());
+            values.push((key, normalized));
+        }
+    }
+
+    value["bootstrap_contacts"] = Value::Array(
+        values
+            .into_iter()
+            .map(|(_, raw)| Value::String(raw))
+            .collect(),
+    );
+}
+
+fn normalize_manifest_bootstrap_contact(raw: &str) -> Option<(String, String)> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if !trimmed.starts_with('{') {
+        let key = trimmed
+            .rsplit_once('@')
+            .map(|(endpoint_id, _)| endpoint_id.trim())
+            .filter(|endpoint_id| !endpoint_id.is_empty())
+            .unwrap_or(trimmed);
+        return Some((format!("raw:{key}"), trimmed.to_owned()));
+    }
+
+    let mut contact = serde_json::from_str::<Value>(trimmed).ok()?;
+    sanitize_manifest_bootstrap_contact(&mut contact);
+    if !manifest_contact_has_transport_address(&contact) {
+        return None;
+    }
+    let key = manifest_bootstrap_contact_key(&contact).unwrap_or_else(|| trimmed.to_owned());
+    let normalized = serde_json::to_string(&contact).ok()?;
+    Some((format!("json:{key}"), normalized))
+}
+
+fn sanitize_manifest_bootstrap_contact(contact: &mut Value) {
+    sanitize_socket_addr_array(contact, "listen_addrs");
+    if let Some(transports) = contact.get_mut("transports").and_then(Value::as_array_mut) {
+        for transport in transports {
+            sanitize_transport_contact(transport);
+        }
+    } else {
+        sanitize_transport_contact(contact);
+    }
+}
+
+fn sanitize_transport_contact(contact: &mut Value) {
+    if let Some(metadata) = contact.get_mut("metadata") {
+        sanitize_socket_addr_array(metadata, "listen_addrs");
+    }
+    if let Some(extra) = contact.get_mut("extra") {
+        sanitize_socket_addr_array(extra, "direct_addrs");
+        sanitize_trimmed_string_array(extra, "relay_urls");
+    }
+}
+
+fn sanitize_socket_addr_array(value: &mut Value, field: &str) {
+    if let Some(items) = value.get_mut(field).and_then(Value::as_array_mut) {
+        let mut values = Vec::new();
+        let mut seen = BTreeSet::new();
+        for item in items.iter() {
+            let Some(raw) = item.as_str().map(str::trim) else {
+                continue;
+            };
+            if raw.parse::<SocketAddr>().is_ok() && seen.insert(raw.to_owned()) {
+                values.push(Value::String(raw.to_owned()));
+            }
+        }
+        *items = values;
+    }
+}
+
+fn sanitize_trimmed_string_array(value: &mut Value, field: &str) {
+    if let Some(items) = value.get_mut(field).and_then(Value::as_array_mut) {
+        let mut values = Vec::new();
+        let mut seen = BTreeSet::new();
+        for item in items.iter() {
+            let Some(raw) = item.as_str().map(str::trim).filter(|raw| !raw.is_empty()) else {
+                continue;
+            };
+            let normalized = raw.trim_end_matches('/').to_owned();
+            if seen.insert(normalized.clone()) {
+                values.push(Value::String(normalized));
+            }
+        }
+        *items = values;
+    }
+}
+
+fn manifest_bootstrap_contact_key(contact: &Value) -> Option<String> {
+    contact
+        .get("transports")
+        .and_then(Value::as_array)
+        .and_then(|transports| transports.iter().find_map(transport_contact_key))
+        .or_else(|| transport_contact_key(contact))
+        .or_else(|| string_field(contact, "node_id"))
+}
+
+fn transport_contact_key(contact: &Value) -> Option<String> {
+    contact
+        .get("extra")
+        .and_then(|extra| string_field(extra, "endpoint_id"))
+        .or_else(|| {
+            contact
+                .get("metadata")
+                .and_then(|metadata| string_field(metadata, "endpoint_id"))
+        })
+        .or_else(|| string_field(contact, "peer_id"))
+}
+
+fn string_field(value: &Value, field: &str) -> Option<String> {
+    value
+        .get(field)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+}
+
+fn manifest_contact_has_transport_address(contact: &Value) -> bool {
+    contact
+        .get("transports")
+        .and_then(Value::as_array)
+        .is_some_and(|transports| transports.iter().any(transport_has_transport_address))
+        || transport_has_transport_address(contact)
+}
+
+fn transport_has_transport_address(contact: &Value) -> bool {
+    contact.get("extra").is_some_and(|extra| {
+        value_array_has_strings(extra, "direct_addrs")
+            || value_array_has_strings(extra, "relay_urls")
+    }) || contact
+        .get("metadata")
+        .is_some_and(|metadata| value_array_has_strings(metadata, "listen_addrs"))
+}
+
+fn value_array_has_strings(value: &Value, field: &str) -> bool {
+    value
+        .get(field)
+        .and_then(Value::as_array)
+        .is_some_and(|items| {
+            items
+                .iter()
+                .any(|item| item.as_str().is_some_and(|raw| !raw.trim().is_empty()))
+        })
+}
+
 fn persist_join_manifest_startup_config(
     state_dir: &Path,
     manifest: &NetworkJoinManifest,
@@ -627,12 +782,7 @@ fn persist_join_manifest_startup_config(
     {
         value["network_mode"] = Value::String("wan".to_owned());
     }
-    merge_manifest_values(
-        &mut value,
-        "bootstrap_contacts",
-        &manifest.bootstrap_contacts,
-        false,
-    );
+    merge_manifest_bootstrap_contacts(&mut value, &manifest.bootstrap_contacts);
     merge_manifest_values(&mut value, "gateway_urls", &manifest.gateway_urls, true);
     fs::write(&path, serde_json::to_vec_pretty(&value)?)?;
     Ok(())
@@ -1244,55 +1394,26 @@ pub fn load_network_directory_snapshot(
         .map(|record| (record.node_id.clone(), record))
         .collect::<BTreeMap<_, _>>();
     let mut sync_endpoints = BTreeMap::<(String, String), DirectorySyncEndpoint>::new();
-    for record in load_discovered_peer_records_state(state_dir)? {
-        let Some(listen_addr) = record.listen_addr else {
-            continue;
-        };
-        let transports = peer_metadata
-            .get(&record.node_id)
-            .map_or_else(Vec::new, PeerMetadataRecord::advertised_transports);
-        let recommended_routes = peer_metadata
-            .get(&record.node_id)
-            .map_or_else(BTreeMap::new, PeerMetadataRecord::recommended_data_routes);
-        sync_endpoints.insert(
-            (record.node_id.clone(), listen_addr.clone()),
-            DirectorySyncEndpoint {
-                network_id: current_network_id.clone(),
-                node_id: record.node_id,
-                listen_addr,
-                source_kind: "udp_discovery".to_owned(),
-                transports,
-                recommended_routes,
-            },
-        );
-    }
-    let config = crate::network_bridge::network_config_from_env();
-    for raw_addr in config.bootstrap_peers {
-        let Some((node_id, listen_addr)) = raw_addr.split_once('@') else {
-            continue;
-        };
-        if listen_addr.trim().is_empty() || node_id.trim().is_empty() {
-            continue;
+    for (node_id, record) in &peer_metadata {
+        let transports = record.advertised_transports();
+        let recommended_routes = record.recommended_data_routes();
+        for endpoint in record
+            .transport_contact_materials()
+            .iter()
+            .flat_map(transport_contact_direct_addrs)
+        {
+            sync_endpoints.insert(
+                (node_id.clone(), endpoint.clone()),
+                DirectorySyncEndpoint {
+                    network_id: current_network_id.clone(),
+                    node_id: node_id.clone(),
+                    listen_addr: endpoint,
+                    source_kind: record.handshake_status.clone(),
+                    transports: transports.clone(),
+                    recommended_routes: recommended_routes.clone(),
+                },
+            );
         }
-        let node_id = node_id.trim().to_owned();
-        let key = (node_id.clone(), raw_addr.clone());
-        let transports = peer_metadata
-            .get(&node_id)
-            .map_or_else(Vec::new, PeerMetadataRecord::advertised_transports);
-        let recommended_routes = peer_metadata
-            .get(&node_id)
-            .map_or_else(BTreeMap::new, PeerMetadataRecord::recommended_data_routes);
-        sync_endpoints
-            .entry(key)
-            .and_modify(|entry| entry.source_kind = "bootstrap".to_owned())
-            .or_insert_with(|| DirectorySyncEndpoint {
-                network_id: current_network_id.clone(),
-                node_id,
-                listen_addr: raw_addr,
-                source_kind: "bootstrap".to_owned(),
-                transports,
-                recommended_routes,
-            });
     }
 
     Ok(NetworkDirectorySnapshot {
@@ -1302,6 +1423,28 @@ pub fn load_network_directory_snapshot(
         feeds,
         sync_endpoints: sync_endpoints.into_values().take(limit).collect(),
     })
+}
+
+fn transport_contact_direct_addrs(contact: &TransportContactMaterial) -> Vec<String> {
+    let mut seen = BTreeSet::new();
+    let mut addrs = Vec::new();
+    if let Some(items) = contact.extra.get("direct_addrs").and_then(Value::as_array) {
+        for item in items {
+            let Some(raw) = item.as_str().map(str::trim) else {
+                continue;
+            };
+            if raw.parse::<SocketAddr>().is_ok() && seen.insert(raw.to_owned()) {
+                addrs.push(raw.to_owned());
+            }
+        }
+    }
+    for raw in &contact.metadata.listen_addrs {
+        let trimmed = raw.trim();
+        if trimmed.parse::<SocketAddr>().is_ok() && seen.insert(trimmed.to_owned()) {
+            addrs.push(trimmed.to_owned());
+        }
+    }
+    addrs
 }
 
 fn availability_manifest(
@@ -2633,7 +2776,8 @@ mod tests {
         ENV_NETWORK_BOOTSTRAP_HTTP_URLS, ENV_NETWORK_JOIN_MANIFEST_URLS,
         NETWORK_JOIN_MANIFEST_ROUTE, accept_task_result_locally,
         bootstrap_bundle_endpoint_candidates, join_manifest_endpoint_candidates,
-        peer_dm_content_from_envelope, synthesize_peer_dm_envelope,
+        merge_manifest_bootstrap_contacts, peer_dm_content_from_envelope,
+        synthesize_peer_dm_envelope,
     };
     use crate::node::Node;
     use crate::task_template::sample_contract;
@@ -2759,6 +2903,82 @@ mod tests {
                 format!("https://custom.example.net{NETWORK_JOIN_MANIFEST_ROUTE}"),
                 "https://seed.example.net/.well-known/wattswarm/join.json".to_owned(),
             ]
+        );
+    }
+
+    #[test]
+    fn manifest_bootstrap_contacts_dedupe_by_endpoint_and_sanitize_invalid_direct_addrs() {
+        let endpoint_id = "83393ad000151bc41e686a1fc892e07a440a2a53110bbaeae3d13e5978599956";
+        let contact = |generated_at: u64| {
+            json!({
+                "generated_at": generated_at,
+                "listen_addrs": [endpoint_id],
+                "node_id": endpoint_id,
+                "peer_id": endpoint_id,
+                "recommended_routes": ["iroh_direct"],
+                "transports": [{
+                    "transport": "iroh_direct",
+                    "peer_id": endpoint_id,
+                    "metadata": {
+                        "route": "iroh_direct",
+                        "generated_at": generated_at,
+                        "endpoint_id": endpoint_id,
+                        "alpn": "/wattswarm/iroh/1",
+                        "listen_addrs": [endpoint_id],
+                        "capabilities": {
+                            "supports_iroh_direct": true,
+                            "supports_streaming": true,
+                            "max_recommended_inline_bytes": 16384,
+                            "preferred_data_route": "iroh_direct"
+                        }
+                    },
+                    "extra": {
+                        "endpoint_id": endpoint_id,
+                        "alpn": "/wattswarm/iroh/1",
+                        "direct_addrs": [endpoint_id],
+                        "relay_urls": [
+                            "https://relay.wattetheria.com/",
+                            "https://relay.wattetheria.com"
+                        ]
+                    }
+                }]
+            })
+            .to_string()
+        };
+        let mut value = json!({
+            "network_mode": "wan",
+            "bootstrap_contacts": [contact(1)]
+        });
+
+        merge_manifest_bootstrap_contacts(&mut value, &[contact(2)]);
+
+        let contacts = value["bootstrap_contacts"].as_array().expect("contacts");
+        assert_eq!(contacts.len(), 1);
+        let saved: serde_json::Value =
+            serde_json::from_str(contacts[0].as_str().expect("contact string")).unwrap();
+        assert_eq!(saved["generated_at"].as_u64(), Some(2));
+        assert!(
+            saved["listen_addrs"]
+                .as_array()
+                .expect("top-level listen_addrs")
+                .is_empty()
+        );
+        let transport = &saved["transports"][0];
+        assert!(
+            transport["metadata"]["listen_addrs"]
+                .as_array()
+                .expect("metadata listen_addrs")
+                .is_empty()
+        );
+        assert!(
+            transport["extra"]["direct_addrs"]
+                .as_array()
+                .expect("direct_addrs")
+                .is_empty()
+        );
+        assert_eq!(
+            transport["extra"]["relay_urls"],
+            json!(["https://relay.wattetheria.com"])
         );
     }
 

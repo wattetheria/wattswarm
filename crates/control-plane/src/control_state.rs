@@ -117,8 +117,6 @@ pub struct DiscoveredPeersRegistry {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 pub struct DiscoveredPeerRecord {
     pub node_id: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub listen_addr: Option<String>,
     #[serde(default = "default_discovered_peer_source_kind")]
     pub source_kind: String,
 }
@@ -702,7 +700,6 @@ pub(crate) struct PreparedRuntime {
 
 pub(crate) const ENV_NETWORK_BOOTSTRAP_HTTP_URLS: &str = "WATTSWARM_NETWORK_BOOTSTRAP_HTTP_URLS";
 pub(crate) const ENV_NETWORK_JOIN_MANIFEST_URLS: &str = "WATTSWARM_NETWORK_JOIN_MANIFEST_URLS";
-pub(crate) const DEFAULT_BOOTSTRAP_HTTP_PORT: u16 = 7788;
 pub(crate) const NETWORK_BOOTSTRAP_ROUTE: &str = "/api/network/bootstrap";
 pub(crate) const NETWORK_JOIN_MANIFEST_ROUTE: &str = "/.well-known/wattswarm/join.json";
 
@@ -906,7 +903,6 @@ pub fn load_discovered_peer_records(path: &Path) -> Result<Vec<DiscoveredPeerRec
             .into_iter()
             .map(|node_id| DiscoveredPeerRecord {
                 node_id,
-                listen_addr: None,
                 source_kind: default_discovered_peer_source_kind(),
             })
             .collect());
@@ -923,7 +919,6 @@ pub fn save_discovered_peers(path: &Path, peers: &[String]) -> Result<()> {
         .cloned()
         .map(|node_id| DiscoveredPeerRecord {
             node_id,
-            listen_addr: None,
             source_kind: default_discovered_peer_source_kind(),
         })
         .collect::<Vec<_>>();
@@ -954,7 +949,6 @@ pub fn load_discovered_peer_records_state(state_dir: &Path) -> Result<Vec<Discov
             .into_iter()
             .map(|row| DiscoveredPeerRecord {
                 node_id: row.node_id,
-                listen_addr: row.listen_addr,
                 source_kind: row.source_kind,
             })
             .collect());
@@ -969,7 +963,6 @@ pub fn load_discovered_peer_records_state(state_dir: &Path) -> Result<Vec<Discov
                 .iter()
                 .map(|record| crate::storage::LocalDiscoveredPeerRow {
                     node_id: record.node_id.clone(),
-                    listen_addr: record.listen_addr.clone(),
                     source_kind: record.source_kind.clone(),
                     discovered_at: now,
                     updated_at: now,
@@ -993,7 +986,6 @@ pub fn save_discovered_peer_records_state(
             .iter()
             .map(|record| crate::storage::LocalDiscoveredPeerRow {
                 node_id: record.node_id.clone(),
-                listen_addr: record.listen_addr.clone(),
                 source_kind: record.source_kind.clone(),
                 discovered_at: now,
                 updated_at: now,
@@ -1620,15 +1612,15 @@ pub fn add_discovered_peer(state_dir: &Path, peer_node_id: &str) -> Result<bool>
 pub fn add_discovered_peer_endpoint(
     state_dir: &Path,
     peer_node_id: &str,
-    listen_addr: Option<&str>,
+    _listen_addr: Option<&str>,
 ) -> Result<bool> {
-    add_discovered_peer_endpoint_with_source(state_dir, peer_node_id, listen_addr, "udp")
+    add_discovered_peer_endpoint_with_source(state_dir, peer_node_id, None, "udp")
 }
 
 pub fn add_discovered_peer_endpoint_with_source(
     state_dir: &Path,
     peer_node_id: &str,
-    listen_addr: Option<&str>,
+    _listen_addr: Option<&str>,
     source_kind: &str,
 ) -> Result<bool> {
     let peer = peer_node_id.trim();
@@ -1638,13 +1630,7 @@ pub fn add_discovered_peer_endpoint_with_source(
     fs::create_dir_all(state_dir)?;
     let now = chrono::Utc::now().timestamp_millis().max(0) as u64;
     let scope_id = local_control_scope_id(state_dir);
-    local_control_store(state_dir)?.upsert_local_discovered_peer(
-        &scope_id,
-        peer,
-        listen_addr,
-        source_kind,
-        now,
-    )
+    local_control_store(state_dir)?.upsert_local_discovered_peer(&scope_id, peer, source_kind, now)
 }
 
 pub fn load_executor_registry(path: &Path) -> Result<ExecutorRegistry> {
