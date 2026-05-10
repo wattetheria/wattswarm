@@ -13,6 +13,7 @@ pub mod run_queue {
 pub mod a2a;
 mod ap2;
 pub mod egress_agent;
+pub(crate) mod http;
 pub mod run_control;
 pub mod startup_config;
 pub mod wattetheria_sync;

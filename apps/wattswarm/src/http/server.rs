@@ -1,0 +1,207 @@
+use crate::control::local_node_id;
+use crate::http::UiServerState;
+use crate::http::background::mark_node_running_if_service_started;
+use crate::http::{
+    diagnostics, egress, executors, node, pages, peers, runs, startup, swarm, tasks, topics,
+};
+use crate::wattetheria_sync;
+use anyhow::{Context, Result};
+use axum::Router;
+use axum::routing::{get, post};
+use std::fs;
+use std::path::PathBuf;
+
+pub fn run(state_dir: PathBuf, db_path: PathBuf, listen: String) -> Result<()> {
+    fs::create_dir_all(&state_dir)?;
+    let node_id = local_node_id(&state_dir).ok();
+    let network_enabled = crate::network_bridge::network_enabled_from_env();
+    if network_enabled {
+        if let Some(id) = &node_id {
+            crate::udp_announce::maybe_start_listener(state_dir.clone(), id.clone());
+        }
+    }
+    let network_started = crate::network_bridge::maybe_start_background_network_service_with_hook(
+        state_dir.clone(),
+        db_path.clone(),
+        Some(Box::new(|node, sd| {
+            let _ = crate::run_queue::network_bridge::process_pending_bridge_tasks(node, sd);
+            let _ = crate::run_queue::network_bridge::process_pending_run_queue_results(sd);
+            let _ = crate::control::topic_interpretation::process_topic_interpretation(node, sd);
+            let _ = crate::control::topic_consensus::process_structured_topic_consensus(node, sd);
+        })),
+    )?;
+    if network_started {
+        mark_node_running_if_service_started(&state_dir, true)?;
+        eprintln!("wattswarm p2p network enabled");
+    } else {
+        eprintln!("wattswarm p2p network disabled");
+    }
+    if network_enabled {
+        crate::udp_announce::announce_startup("ui-startup", Some(&listen), node_id.as_deref());
+    }
+    let state = UiServerState { state_dir, db_path };
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("build tokio runtime for UI")?;
+
+    runtime.block_on(async move {
+        if let Some(grpc_listen) = wattetheria_sync::grpc_listen_addr_from_env() {
+            let grpc_state = state.clone();
+            let grpc_listen_task = grpc_listen.clone();
+            tokio::spawn(async move {
+                if let Err(error) =
+                    wattetheria_sync::serve_grpc(grpc_state, grpc_listen_task.clone()).await
+                {
+                    eprintln!(
+                        "wattswarm Wattetheria sync gRPC failed on {grpc_listen_task}: {error}"
+                    );
+                }
+            });
+            eprintln!("wattswarm Wattetheria sync gRPC listening on {grpc_listen}");
+        }
+        let app = build_app(state);
+        let listener = tokio::net::TcpListener::bind(&listen)
+            .await
+            .with_context(|| format!("bind UI on {}", listen))?;
+        println!("wattswarm-ui listening on http://{}", listen);
+        axum::serve(listener, app).await.context("serve UI")
+    })
+}
+
+pub fn build_app(state: UiServerState) -> Router {
+    Router::new()
+        .route("/", get(pages::index))
+        .route("/diagnostics", get(pages::diagnostics_page))
+        .route("/console", get(pages::legacy_console_redirect))
+        .route("/swarm", get(pages::swarm_page))
+        .route("/api/node/up", post(node::node_up))
+        .route("/api/node/down", post(node::node_down))
+        .route("/api/node/status", get(node::node_status))
+        .route(
+            "/api/network/local",
+            get(crate::http::network_bootstrap::network_local),
+        )
+        .route(
+            "/api/network/bootstrap",
+            get(crate::http::network_bootstrap::network_bootstrap),
+        )
+        .route(
+            "/.well-known/wattswarm/join.json",
+            get(crate::http::network_bootstrap::network_join_manifest),
+        )
+        .route("/api/startup-config", get(startup::startup_config_get))
+        .route("/api/startup-config", post(startup::startup_config_save))
+        .route("/api/peers/list", get(peers::peers_list))
+        .route(
+            "/api/peers/relationships",
+            get(peers::peer_relationships_list),
+        )
+        .route(
+            "/api/peers/relationships",
+            post(peers::peer_relationships_update),
+        )
+        .route("/api/peers/dm/threads", get(peers::peer_dm_threads_list))
+        .route("/api/peers/dm/messages", get(peers::peer_dm_messages_list))
+        .route("/api/peers/dm/messages", post(peers::peer_dm_messages_send))
+        .route("/api/payments/messages", post(peers::agent_payment_send))
+        .route("/api/log/head", get(diagnostics::log_head))
+        .route("/api/log/replay", post(diagnostics::log_replay))
+        .route("/api/log/verify", post(diagnostics::log_verify))
+        .route("/api/diagnostics", get(diagnostics::diagnostics))
+        .route("/api/executors/add", post(executors::executors_add))
+        .route("/api/executors/list", get(executors::executors_list))
+        .route("/api/executors/check", post(executors::executors_check))
+        .route("/api/egress-agent", get(egress::egress_agent_get))
+        .route("/api/egress-agent", post(egress::egress_agent_save))
+        .route(
+            "/api/a2a/google/agent-card",
+            get(egress::google_a2a_agent_card),
+        )
+        .route(
+            "/.well-known/agent.json",
+            get(egress::google_a2a_well_known),
+        )
+        .route(
+            "/api/a2a/google/message/send",
+            post(egress::google_a2a_message_send),
+        )
+        .route("/api/task/sample", get(tasks::task_sample))
+        .route("/api/task/submit", post(tasks::task_submit))
+        .route("/api/task/announce", post(tasks::task_announce))
+        .route("/api/task/claim", post(tasks::task_claim))
+        .route(
+            "/api/task/propose-candidate",
+            post(tasks::task_propose_candidate),
+        )
+        .route("/api/task/accept-result", post(tasks::task_accept_result))
+        .route("/api/task/watch/:task_id", get(tasks::task_watch))
+        .route("/api/task/decision/:task_id", get(tasks::task_decision))
+        .route(
+            "/api/task/facts/:task_id",
+            get(wattetheria_sync::task_facts_snapshot_http),
+        )
+        .route("/api/task/run-real", post(tasks::task_run_real))
+        .route("/api/run/submit", post(runs::run_submit))
+        .route("/api/run/kickoff/:run_id", post(runs::run_kickoff))
+        .route("/api/run/watch/:run_id", get(runs::run_watch))
+        .route("/api/run/result/:run_id", get(runs::run_result))
+        .route("/api/run/events/:run_id", get(runs::run_events))
+        .route("/api/run/cancel/:run_id", post(runs::run_cancel))
+        .route("/api/run/retry/:run_id", post(runs::run_retry))
+        .route("/api/knowledge/export", post(runs::knowledge_export))
+        .route("/api/topic/messages", get(topics::topic_messages))
+        .route("/api/topic/messages", post(topics::topic_message_post))
+        .route("/api/topic/cursor", get(topics::topic_cursor))
+        .route(
+            "/api/topic/subscriptions",
+            post(topics::topic_subscription_post),
+        )
+        .route(
+            "/api/wattetheria/network/snapshot",
+            get(wattetheria_sync::network_snapshot_http),
+        )
+        .route(
+            "/api/wattetheria/task-run/snapshot",
+            get(wattetheria_sync::task_run_snapshot_http),
+        )
+        .route(
+            "/api/wattetheria/task/decision/:task_id",
+            get(wattetheria_sync::task_decision_snapshot_http),
+        )
+        .route(
+            "/api/wattetheria/task/facts/:task_id",
+            get(wattetheria_sync::task_facts_snapshot_http),
+        )
+        .route(
+            "/api/wattetheria/run/result/:run_id",
+            get(wattetheria_sync::run_result_snapshot_http),
+        )
+        .route(
+            "/api/wattetheria/run/events/:run_id",
+            get(wattetheria_sync::run_events_snapshot_http),
+        )
+        .route(
+            "/api/wattetheria/topic/activity",
+            get(wattetheria_sync::topic_activity_http),
+        )
+        .route(
+            "/api/wattetheria/knowledge/export",
+            post(wattetheria_sync::knowledge_export_snapshot_http),
+        )
+        .route(
+            "/api/wattetheria/brain/publish-topic",
+            post(wattetheria_sync::brain_publish_topic_http),
+        )
+        .route(
+            "/api/wattetheria/brain/submit-run",
+            post(wattetheria_sync::brain_submit_run_http),
+        )
+        .route(
+            "/api/wattetheria/brain/run-task-real",
+            post(wattetheria_sync::brain_run_task_real_http),
+        )
+        .route("/api/swarm/state", get(swarm::swarm_state))
+        .route("/api/swarm/tick", post(swarm::swarm_tick))
+        .with_state(state)
+}

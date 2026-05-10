@@ -757,3 +757,79 @@ fn ui_exposes_network_join_manifest() {
         );
     });
 }
+
+#[test]
+fn ui_join_manifest_builds_relay_only_contact_without_exporting_local_iroh_endpoint() {
+    let _guard = env_lock();
+    let _db_lock = DbTestLock::acquire();
+    let schema = reset_test_schema("test");
+    let _schema_guard = EnvVarGuard::set("WATTSWARM_PG_SCHEMA", &schema);
+    let _mode_guard = EnvVarGuard::set("WATTSWARM_NODE_MODE", "network");
+    let _contacts_guard = EnvVarGuard::set("WATTSWARM_PUBLIC_BOOTSTRAP_CONTACTS", "");
+    let _relay_guard =
+        EnvVarGuard::set("WATTSWARM_IROH_RELAY_URLS", "https://relay.wattetheria.com");
+    let _direct_guard = EnvVarGuard::set("WATTSWARM_IROH_PUBLISH_DIRECT_ADDRS", "false");
+    let dir = tempdir().unwrap();
+    let state_dir = dir.path().join("state");
+    std::fs::create_dir_all(&state_dir).unwrap();
+    let seed_hex = [45_u8; 32]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    std::fs::write(state_dir.join("node_seed.hex"), seed_hex).unwrap();
+    let db_path = state_dir.join("ui.state");
+    let genesis = NodeIdentity::from_seed([45_u8; 32]);
+    let genesis_node_id = genesis.node_id();
+    let network_id = "mainnet:wattetheria";
+    let store = wattswarm::storage::PgStore::open(&db_path).unwrap();
+    store
+        .ensure_mainnet_bootstrap_network_topology(
+            network_id,
+            "Wattetheria",
+            &genesis_node_id,
+            &genesis_node_id,
+            1_700_000_000_000,
+        )
+        .unwrap();
+    store
+        .put_network_protocol_params(network_id, &genesis, &NetworkProtocolParams::default())
+        .unwrap();
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let app = build_app(UiServerState::new(state_dir, db_path));
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/.well-known/wattswarm/join.json")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let json = json_from(res).await;
+        let contact = serde_json::from_str::<Value>(
+            json["bootstrap_contacts"][0]
+                .as_str()
+                .expect("bootstrap contact"),
+        )
+        .expect("contact json");
+        assert_eq!(contact["listen_addrs"].as_array().unwrap().len(), 0);
+        assert_eq!(
+            contact["transports"][0]["extra"]["direct_addrs"]
+                .as_array()
+                .unwrap()
+                .len(),
+            0
+        );
+        assert_eq!(
+            contact["transports"][0]["extra"]["relay_urls"][0].as_str(),
+            Some("https://relay.wattetheria.com")
+        );
+    });
+}

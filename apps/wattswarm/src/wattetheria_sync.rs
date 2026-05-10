@@ -4,6 +4,7 @@ use crate::control::{
     load_peer_relationship_records_state, local_node_id, node_state_path, open_configured_node,
     open_node, require_configured_node_mode, resolve_node_mode, run_real_task_flow,
 };
+use crate::http::{ApiError, UiServerState, run_blocking};
 use crate::run_control;
 use crate::run_queue::{RunSubmitSpec, RunView};
 use crate::startup_config::{load_startup_config, startup_config_path};
@@ -11,7 +12,6 @@ use crate::storage::storage::{
     LocalRemoteTaskBridgeRow, TaskCandidateRow, TaskProjectionRow, TopicCursorRow, TopicMessageRow,
     VerifierResultRow, VoteRevealRow,
 };
-use crate::ui::UiServerState;
 use anyhow::{Context, Result, anyhow};
 use async_stream::try_stream;
 use axum::Json;
@@ -863,9 +863,9 @@ pub fn build_knowledge_export_snapshot(
 
 pub(crate) async fn network_snapshot_http(
     State(state): State<UiServerState>,
-) -> Result<Json<NetworkProjectionSnapshot>, crate::ui::ApiError> {
+) -> Result<Json<NetworkProjectionSnapshot>, ApiError> {
     let state_clone = state.clone();
-    let snapshot = crate::ui::run_blocking(move || {
+    let snapshot = run_blocking(move || {
         build_network_projection_snapshot(&state_clone.state_dir, &state_clone.db_path)
     })
     .await?;
@@ -875,10 +875,10 @@ pub(crate) async fn network_snapshot_http(
 pub(crate) async fn task_run_snapshot_http(
     State(state): State<UiServerState>,
     Query(query): Query<TaskRunSnapshotQuery>,
-) -> Result<Json<TaskRunProjectionSnapshot>, crate::ui::ApiError> {
+) -> Result<Json<TaskRunProjectionSnapshot>, ApiError> {
     let state_clone = state.clone();
     let pg_url = run_control::resolve_run_queue_pg_url(None);
-    let snapshot = crate::ui::run_blocking(move || {
+    let snapshot = run_blocking(move || {
         build_task_run_projection_snapshot(
             &state_clone.state_dir,
             &state_clone.db_path,
@@ -894,9 +894,9 @@ pub(crate) async fn task_run_snapshot_http(
 pub(crate) async fn topic_activity_http(
     State(state): State<UiServerState>,
     Query(query): Query<TopicActivityQuery>,
-) -> Result<Json<TopicActivitySnapshot>, crate::ui::ApiError> {
+) -> Result<Json<TopicActivitySnapshot>, ApiError> {
     let state_clone = state.clone();
-    let snapshot = crate::ui::run_blocking(move || {
+    let snapshot = run_blocking(move || {
         build_topic_activity_snapshot(
             &state_clone.state_dir,
             &state_clone.db_path,
@@ -914,9 +914,9 @@ pub(crate) async fn topic_activity_http(
 pub(crate) async fn task_decision_snapshot_http(
     State(state): State<UiServerState>,
     AxumPath(task_id): AxumPath<String>,
-) -> Result<Json<Value>, crate::ui::ApiError> {
+) -> Result<Json<Value>, ApiError> {
     let state_clone = state.clone();
-    let payload = crate::ui::run_blocking(move || {
+    let payload = run_blocking(move || {
         build_task_decision_snapshot(&state_clone.state_dir, &state_clone.db_path, &task_id)
     })
     .await?;
@@ -926,9 +926,9 @@ pub(crate) async fn task_decision_snapshot_http(
 pub(crate) async fn task_facts_snapshot_http(
     State(state): State<UiServerState>,
     AxumPath(task_id): AxumPath<String>,
-) -> Result<Json<TaskFactsSnapshot>, crate::ui::ApiError> {
+) -> Result<Json<TaskFactsSnapshot>, ApiError> {
     let state_clone = state.clone();
-    let payload = crate::ui::run_blocking(move || {
+    let payload = run_blocking(move || {
         build_task_facts_snapshot(&state_clone.state_dir, &state_clone.db_path, &task_id)
     })
     .await?;
@@ -938,10 +938,10 @@ pub(crate) async fn task_facts_snapshot_http(
 pub(crate) async fn run_result_snapshot_http(
     State(state): State<UiServerState>,
     AxumPath(run_id): AxumPath<String>,
-) -> Result<Json<Value>, crate::ui::ApiError> {
+) -> Result<Json<Value>, ApiError> {
     let state_clone = state.clone();
     let pg_url = run_control::resolve_run_queue_pg_url(None);
-    let payload = crate::ui::run_blocking(move || {
+    let payload = run_blocking(move || {
         build_run_result_snapshot(
             &state_clone.state_dir,
             &state_clone.db_path,
@@ -957,11 +957,11 @@ pub(crate) async fn run_events_snapshot_http(
     State(state): State<UiServerState>,
     AxumPath(run_id): AxumPath<String>,
     Query(query): Query<RunEventsSnapshotQuery>,
-) -> Result<Json<Value>, crate::ui::ApiError> {
+) -> Result<Json<Value>, ApiError> {
     let state_clone = state.clone();
     let pg_url = run_control::resolve_run_queue_pg_url(None);
     let limit = query.limit.unwrap_or(50);
-    let payload = crate::ui::run_blocking(move || {
+    let payload = run_blocking(move || {
         build_run_events_snapshot(
             &state_clone.state_dir,
             &state_clone.db_path,
@@ -977,9 +977,9 @@ pub(crate) async fn run_events_snapshot_http(
 pub(crate) async fn knowledge_export_snapshot_http(
     State(state): State<UiServerState>,
     Json(req): Json<KnowledgeExportBody>,
-) -> Result<Json<Value>, crate::ui::ApiError> {
+) -> Result<Json<Value>, ApiError> {
     let state_clone = state.clone();
-    let payload = crate::ui::run_blocking(move || {
+    let payload = run_blocking(move || {
         build_knowledge_export_snapshot(&state_clone.state_dir, &state_clone.db_path, req)
     })
     .await?;
@@ -989,9 +989,9 @@ pub(crate) async fn knowledge_export_snapshot_http(
 pub(crate) async fn brain_publish_topic_http(
     State(state): State<UiServerState>,
     Json(req): Json<BrainTopicPublishRequest>,
-) -> Result<Json<Value>, crate::ui::ApiError> {
+) -> Result<Json<Value>, ApiError> {
     let state_clone = state.clone();
-    let payload = crate::ui::run_blocking(move || {
+    let payload = run_blocking(move || {
         submit_brain_topic_publish(&state_clone.state_dir, &state_clone.db_path, req)
     })
     .await?;
@@ -1001,10 +1001,10 @@ pub(crate) async fn brain_publish_topic_http(
 pub(crate) async fn brain_submit_run_http(
     State(state): State<UiServerState>,
     Json(req): Json<BrainRunSubmitRequest>,
-) -> Result<Json<Value>, crate::ui::ApiError> {
+) -> Result<Json<Value>, ApiError> {
     let state_clone = state.clone();
     let pg_url = run_control::resolve_run_queue_pg_url(None);
-    let payload = crate::ui::run_blocking(move || {
+    let payload = run_blocking(move || {
         submit_brain_run(&state_clone.state_dir, &state_clone.db_path, &pg_url, req)
     })
     .await?;
@@ -1014,9 +1014,9 @@ pub(crate) async fn brain_submit_run_http(
 pub(crate) async fn brain_run_task_real_http(
     State(state): State<UiServerState>,
     Json(req): Json<BrainTaskRealRequest>,
-) -> Result<Json<Value>, crate::ui::ApiError> {
+) -> Result<Json<Value>, ApiError> {
     let state_clone = state.clone();
-    let result = crate::ui::run_blocking(move || {
+    let result = run_blocking(move || {
         submit_brain_task_real(&state_clone.state_dir, &state_clone.db_path, req)
     })
     .await?;
