@@ -117,7 +117,7 @@ Node identity reminder:
 The workspace now includes dedicated crates and a control-plane bridge for node-local storage plus live inter-node sync:
 
 - `crates/network-p2p`
-  - owns scope-aware topic naming (`global` / `region.*` / `node.*`)
+  - owns scope-aware topic naming (`global` / `region:<id>` / `node:<id>` / `group:<id>`)
   - defines network envelopes for events, rule broadcasts, checkpoint announcements, and summaries
   - defines typed backfill request/response messages
   - defines typed peer-relationship request/response messages for node-to-node relationship execution
@@ -139,14 +139,14 @@ The workspace now includes dedicated crates and a control-plane bridge for node-
   - serves topic message bodies, direct-message bodies, task outputs, and reference/blob recovery selected by the shared transport router
   - supports contact-material and typed-control request/response over Iroh streams without requiring a separate identify protocol
 - `crates/control-plane/src/network_bridge/mod.rs`
-  - starts an Iroh-backed `NetworkRuntime` from the node `state_dir` on the main Wattswarm/Wattetheria path
+  - starts an Iroh-backed `NetworkRuntime` from the node `state_dir` on the normal node startup path
   - still supports explicit generated-node compatibility paths in tests
   - bridges runtime gossip events into `node-core::ingest_remote`
   - serves scope-aware backfill requests from the local event log
   - applies backfill responses into the local node projection pipeline
   - auto-requests backfill for every configured scope when a peer connection is established
   - runs periodic anti-entropy backfill on connected peers so missed messages and post-partition gaps are re-requested without requiring a reconnect
-  - auto-publishes locally authored events into `global / region / node` topics based on task scope hints
+  - auto-publishes locally authored events into `global`, `region`, `node`, or `group` scoped topics based on event and task scope hints
   - auto-publishes knowledge summaries on finalized decisions and reputation summaries on verifier updates
   - propagates append-only revoke/penalty events so malicious event effects can be rolled back without deleting the event log
   - suppresses summary fanout while local publish backlog is high, keeping event catch-up ahead of summary traffic
@@ -193,7 +193,7 @@ Runtime toggles:
 - `WATTSWARM_P2P_NODE_IDS=lab-a` subscribes the node to matching node scopes
 - `WATTSWARM_P2P_LOCAL_IDS=lab-a` is still accepted as a legacy alias for node scopes
 
-Nearby discovery runs over the Iroh gossip discovery lane and is only a peer-discovery/contact exchange path. It does not send agent/MCP requests or task/topic payloads. It is active only when P2P is enabled, the startup `network_mode` is not `local`, and `startup_config.json` contains valid `latitude` and `longitude` values. Those coordinates are managed by the Wattetheria runtime sync path, not by manual startup UI input.
+Nearby discovery runs over the Iroh gossip discovery lane and is only a peer-discovery/contact exchange path. It does not send agent/MCP requests or task/topic payloads. It is active only when P2P is enabled, the startup `network_mode` is not `local`, and `startup_config.json` contains valid `latitude` and `longitude` values. Those coordinates are runtime-managed node metadata, not manual startup UI input.
 
 - `WATTSWARM_NEARBY_DISCOVERY_ENABLED=true` by default; set `false` to stop publishing and accepting nearby discovery announcements.
 - `WATTSWARM_NEARBY_DISCOVERY_RADIUS_KM=1000` by default; accepts peers only when their geo distance is inside both the local radius and the remote announced radius. The env var overrides startup `nearby_radius_km`.
@@ -235,7 +235,7 @@ WattSwarm's current decentralized networking model is:
 
 This means nodes do not replicate PostgreSQL state directly. Instead, they exchange notifications and sync metadata over the active P2P runtime, resolve content bodies over Iroh, and then each node re-applies the resulting state into its own local event log, projections, and artifact/object store.
 
-Topic message reads are partitioned by `network_id + feed_key + scope_hint`. The public topic message API and the Wattetheria topic activity HTTP/gRPC projection accept `network_id`; if it is omitted, Wattswarm resolves the current node network id and uses that value for the storage query. This prevents identical feed/scope names on different networks from sharing topic history.
+Topic message reads are partitioned by `network_id + feed_key + scope_hint`. The public topic message APIs accept `network_id`; if it is omitted, Wattswarm resolves the current node network id and uses that value for the storage query. This prevents identical feed/scope names on different networks from sharing topic history.
 
 ### Shared Control Plane vs Shared Data Plane
 
@@ -259,7 +259,6 @@ WattSwarm is moving from a split legacy-control/Iroh-data model to an Iroh-first
 This split keeps WattSwarm's decentralized network organization intact while enforcing a cleaner semantic boundary:
 
 - P2P transport moves bytes, notifications, and catch-up requests
-- product-layer task/topic/hive semantics stay above the transport runtime
 
 The separation is by role and protocol meaning, not by payload size.
 
@@ -328,11 +327,11 @@ This means a local or remote agent can:
 
 At the Wattswarm layer, this is simply decentralized topic exchange.
 
-At an upper product layer such as Wattetheria, that same topic activity can be projected into:
+An upper product layer can project that same topic activity into:
 
 - a visible chat room
 - a group
-- a guild
+- a team, guild, or other product-specific surface
 - an emergent organization
 
 So the kernel primitive is topic-based autonomous communication. "Group chat" is an upper-layer interpretation of that traffic, not a required kernel-first object.
@@ -588,7 +587,7 @@ specialization / faster closure / more stable network-level behavior"]
   - only `accepted` relationships should open user-visible DM threads at the product layer
   - `accept` triggers an explicit `relationship_established` message so both sides have a concrete “relationship is live” event
   - `relationship_established` exchanges DIAP-inspired (`Decentralized Intelligent Agent Protocol`) protected contact material and moves the thread into a ready session state
-  - current scope is still execution-layer transport/control; Wattetheria owns product-layer agent decisions, UI, access policy, and whether to project the private group into a visible conversation
+  - current scope is still execution-layer transport/control; the embedding product owns agent decisions, UI, access policy, and whether to project the private group into a visible conversation
 - Traffic protection today:
   - duplicate gossip payloads are dropped
   - malformed gossip is dropped and counted without failing the runtime loop
@@ -602,7 +601,7 @@ specialization / faster closure / more stable network-level behavior"]
   - peer sync state persists known scopes, lane cursors, remote head ids, and backfill quality across reconnect/restart
 - Diagnose / observability today:
   - active snapshots expose `p2p_foundation = iroh`, `local_iroh_endpoint_id`, joined Iroh gossip topic ids, known Iroh contact count, and `legacy_transport_active = false` on the state-dir startup path
-  - old NAT/relay/dial field names remain in the JSON shape for Wattetheria UI compatibility, but they are compatibility fields and should not be interpreted as active non-Iroh transport state when `p2p_foundation` is `iroh`
+  - old NAT/relay/dial field names remain in some JSON shapes for legacy UI compatibility, but they are compatibility fields and should not be interpreted as active non-Iroh transport state when `p2p_foundation` is `iroh`
 - PostgreSQL identity compatibility:
   - durable sync identity uses `network_peer_id` in `network_peer_sync_state_local`; this value is a neutral network endpoint identity and can be an Iroh endpoint id
   - `peer_metadata_local.node_id`, `discovered_peers_local.node_id`, `peer_relationships_local.remote_node_id`, and DM `remote_node_id` fields are node/business identities, not iroh `NetworkNodeId` requirements
@@ -660,15 +659,15 @@ Relationship execution currently remains point-to-point on the transition runtim
 
 Direct messaging currently remains point-to-point on the transition runtime:
 
-1. Wattetheria decides whether the sender is allowed to initiate or continue the conversation
+1. the embedding product decides whether the sender is allowed to initiate or continue the conversation
 2. the Wattswarm send API derives `group:dm-<stable-pair-digest>` from the local and remote node ids
 3. the sender subscribes the local node to `wattswarm.dm` / that private group with `gossip_kinds = ["messages"]`
 4. Wattswarm emits a `TopicMessagePosted` event with the DM content and optional A2A-style agent envelope
-5. the compatibility DM read model is updated so existing Wattetheria DM projections can continue reading thread/message rows
+5. the compatibility DM read model is updated so existing DM projections can continue reading thread/message rows
 
 This DM path is execution-layer only. Product-layer agent decisions about whether to request, accept, reject, or initiate a DM still belong above WattSwarm.
 
-Wattetheria still owns the product-layer projection: if a private DM group should be visible as a conversation, member-gated, or attached to identity/friend policy, that belongs in Wattetheria.
+The embedding product still owns the product-layer projection: if a private DM group should be visible as a conversation, member-gated, or attached to identity/friend policy, that belongs above Wattswarm.
 
 Topic chat and task candidate propagation now follow the same principle:
 
@@ -700,17 +699,21 @@ Synchronization is event-driven and eventually consistent:
 
 The local source of truth remains local. The shared network layer is the exchanged event and summary traffic, not a shared central database.
 
-To keep `global` from becoming a high-frequency firehose, the bridge now rate-limits high-frequency task-lifecycle traffic on the global scope. Fast-moving task coordination should use region or node scopes.
+To keep `global` from becoming a high-frequency firehose, the bridge rate-limits high-frequency task-lifecycle traffic on the global scope. Fast-moving task coordination should use a narrower region, node, or group scope.
 
 Anti-entropy is also scope-aware now: once a peer is observed carrying a given scope, recovery prefers routing that scope's backfill through that peer instead of blindly asking every connected peer for every scope on every round. Backfill is lane-aware (`peer + scope + optional feed lane`), records remote head hints, resets a lane when an empty response advertises unseen heads, and persists sync state so reconnects and restarts do not lose cursor knowledge.
 
 Task scope hints:
 
 - default task scope is `global`
-- set `inputs.swarm_scope = "region:<id>"` or `inputs.swarm_scope = "node:<id>"` to route a task into region/node sync
+- set `inputs.swarm_scope = "region:<id>"`, `inputs.swarm_scope = "node:<id>"`, or `inputs.swarm_scope = "group:<id>"` to route a task into a narrower sync scope
 - legacy `local:<id>` task hints are still accepted as aliases for `node:<id>`
-- object form is also accepted: `{"kind":"region","id":"sol-1"}` or `{"kind":"node","id":"lab-a"}`
-- `task_type` prefixes `region:<id>:`, `node:<id>:`, and legacy `local:<id>:` are supported as fallbacks
+- object form is also accepted: `{"kind":"region","id":"sol-1"}`, `{"kind":"node","id":"lab-a"}`, or `{"kind":"group","id":"task-123"}`
+- `task_type` prefixes `region:<id>:`, `node:<id>:`, `group:<id>:`, and legacy `local:<id>:` are supported as fallbacks
+- when a task should have its own lifecycle thread, use one fixed scope for the task, usually `group:<task_id>`
+- task announce and task contract metadata should carry the same scope
+- task claim subscribes the announcement feed on the task contract scope when `inputs.swarm_scope` is present, so claim, candidate/proposal, verification, and finalize events return to the same task scope
+- `group:<id>` is an opaque Wattswarm group scope. A product may map it to a channel, thread, private room, task, or other surface, but that meaning is not part of the Wattswarm protocol
 
 Malicious data rollback model:
 
@@ -869,7 +872,7 @@ P2P env vars:
 Startup UI behavior:
 
 - `Display Name`, `Network Mode`, `Bootstrap Contacts`, optional `Gateway URLs`, and `Core Agent` are saved to `startup_config.json`
-- startup geo coordinates are displayed read-only when present; Wattetheria resolves and syncs them for gateway-backed clients and nearby discovery
+- startup geo coordinates are displayed read-only when present; runtime or gateway sync paths resolve them for clients and nearby discovery
 - `Bootstrap Contacts` is shown only for `LAN` / `WAN` and accepts short Iroh contact strings in `<iroh-node-id>@<host:port>` format.
 - genesis/bootstrap nodes can export a paste-ready contact with `wattswarm --state-dir <state-dir> node export-contact`
 - saving `Core Agent` also syncs the local executor route into PostgreSQL `executor_registry_local`

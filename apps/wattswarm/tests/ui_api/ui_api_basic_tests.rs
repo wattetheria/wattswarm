@@ -144,7 +144,8 @@ fn ui_supports_core_cli_operations() {
             "task_type": "generic.analysis",
             "inputs": {
                 "request_id": "req-e2e",
-                "domain": "analysis"
+                "domain": "analysis",
+                "swarm_scope": "group:task-ordinary-e2e"
             },
             "output_schema": contract["output_schema"].clone(),
             "budget": contract["budget"].clone(),
@@ -220,6 +221,10 @@ fn ui_supports_core_cli_operations() {
         let claim_json = json_from(claim_res).await;
         assert_eq!(claim_json["ok"].as_bool(), Some(true));
         assert_eq!(claim_json["subscribed"].as_bool(), Some(true));
+        assert_eq!(
+            claim_json["subscription_scope_hint"].as_str(),
+            Some("group:task-ordinary-e2e")
+        );
         assert!(claim_json["execution_id"].as_str().is_some());
 
         let propose_candidate_res = app

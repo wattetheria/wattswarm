@@ -76,6 +76,21 @@ pub(crate) struct RunRealRequest {
     file_path: Option<String>,
 }
 
+fn task_contract_scope_hint(contract: &TaskContract) -> Option<String> {
+    if let Some(scope_hint) = contract
+        .inputs
+        .get("swarm_scope")
+        .and_then(Value::as_str)
+        .and_then(crate::types::canonical_scope_hint)
+    {
+        return Some(scope_hint);
+    }
+    let scope = contract.inputs.get("swarm_scope")?.as_object()?;
+    let kind = scope.get("kind").and_then(Value::as_str)?;
+    let id = scope.get("id").and_then(Value::as_str).unwrap_or_default();
+    crate::types::ScopeHint::from_kind_id(kind, id).map(|scope| scope.canonical())
+}
+
 pub(crate) async fn task_sample(
     State(state): State<UiServerState>,
     Query(q): Query<SampleQuery>,
@@ -204,10 +219,13 @@ pub(crate) async fn task_claim(
             task.epoch,
             now,
         )?;
-        let subscribed = if let Some(announcement) = node
+        let mut subscription_scope_hint = None;
+        let subscription_feed_key = if let Some(announcement) = node
             .store
             .get_task_announcement_detail_for_task(&req.task_id)?
         {
+            let scope_hint = task_contract_scope_hint(&task.contract)
+                .unwrap_or_else(|| announcement.announcement.scope_hint.clone());
             let network_id = resolve_network_id(&node);
             node.emit_at(
                 1,
@@ -216,23 +234,26 @@ pub(crate) async fn task_claim(
                         network_id: network_id.clone(),
                         subscriber_node_id: node.node_id(),
                         feed_key: announcement.announcement.feed_key.clone(),
-                        scope_hint: announcement.announcement.scope_hint.clone(),
+                        scope_hint: scope_hint.clone(),
                         gossip_kinds: vec!["events".to_owned()],
                         active: true,
                     },
                 ),
                 now.saturating_add(2),
             )?;
-            true
+            subscription_scope_hint = Some(scope_hint);
+            Some(announcement.announcement.feed_key)
         } else {
-            false
+            None
         };
         Ok(json!({
             "ok": true,
             "task_id": req.task_id,
             "execution_id": execution_id,
             "lease_until": lease_until,
-            "subscribed": subscribed
+            "subscribed": subscription_feed_key.is_some(),
+            "subscription_feed_key": subscription_feed_key,
+            "subscription_scope_hint": subscription_scope_hint
         }))
     })
     .await?;
