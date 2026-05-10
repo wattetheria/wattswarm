@@ -1563,6 +1563,19 @@ fn open_node_network_mode_auto_syncs_signed_bundle_from_join_manifest() {
     let dir = temp_test_dir("open-node-network-mode-join-manifest");
     let state_dir = dir.join("state");
     fs::create_dir_all(&state_dir).expect("create local state dir");
+    fs::write(
+        state_dir.join("startup_config.json"),
+        json!({
+            "display_name": "Existing Node",
+            "latitude": 37.0,
+            "longitude": -122.0,
+            "network_mode": "wan",
+            "bootstrap_contacts": ["stale-bootstrap-contact"],
+            "gateway_urls": ["https://old-gateway.wattetheria.com"]
+        })
+        .to_string(),
+    )
+    .expect("write existing startup config");
     let db_path = state_dir.join("local.state");
     let node = open_node(&state_dir, &db_path).expect("open node after join manifest sync");
     let verified = node
@@ -1576,8 +1589,28 @@ fn open_node_network_mode_auto_syncs_signed_bundle_from_join_manifest() {
         serde_json::from_slice(&fs::read(state_dir.join("startup_config.json")).unwrap()).unwrap();
     assert_eq!(startup_config["network_mode"].as_str(), Some("wan"));
     assert_eq!(
+        startup_config["display_name"].as_str(),
+        Some("Existing Node")
+    );
+    assert_eq!(startup_config["latitude"].as_f64(), Some(37.0));
+    assert_eq!(startup_config["longitude"].as_f64(), Some(-122.0));
+    assert_eq!(
+        startup_config["bootstrap_contacts"]
+            .as_array()
+            .expect("bootstrap contacts")
+            .len(),
+        1
+    );
+    assert_eq!(
         startup_config["bootstrap_contacts"][0].as_str(),
         Some("iroh-bootstrap-contact-json")
+    );
+    assert_eq!(
+        startup_config["gateway_urls"]
+            .as_array()
+            .expect("gateway urls")
+            .len(),
+        1
     );
     assert_eq!(
         startup_config["gateway_urls"][0].as_str(),

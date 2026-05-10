@@ -561,21 +561,14 @@ fn validate_bundle_against_join_manifest(
     Ok(())
 }
 
-fn merge_manifest_values(
+fn replace_manifest_values(
     value: &mut Value,
     field: &str,
     manifest_values: &[String],
     trim_trailing_slash: bool,
-) {
-    let mut values = value
-        .get(field)
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default()
-        .into_iter()
-        .filter_map(|entry| entry.as_str().map(str::to_owned))
-        .collect::<Vec<_>>();
-    let mut seen = values.iter().cloned().collect::<BTreeSet<_>>();
+) -> bool {
+    let mut values = Vec::new();
+    let mut seen = BTreeSet::new();
     for manifest_value in manifest_values {
         let trimmed = manifest_value.trim();
         let manifest_value = if trim_trailing_slash {
@@ -587,21 +580,18 @@ fn merge_manifest_values(
             values.push(manifest_value.to_owned());
         }
     }
-    value[field] = Value::Array(values.into_iter().map(Value::String).collect());
+    let replacement = Value::Array(values.into_iter().map(Value::String).collect());
+    if value.get(field) == Some(&replacement) {
+        return false;
+    }
+    value[field] = replacement;
+    true
 }
 
-fn merge_manifest_bootstrap_contacts(value: &mut Value, manifest_values: &[String]) {
-    let existing_values = value
-        .get("bootstrap_contacts")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default()
-        .into_iter()
-        .filter_map(|entry| entry.as_str().map(str::to_owned));
-
+fn replace_manifest_bootstrap_contacts(value: &mut Value, manifest_values: &[String]) -> bool {
     let mut values = Vec::<(String, String)>::new();
     let mut indexes = BTreeMap::<String, usize>::new();
-    for raw in existing_values.chain(manifest_values.iter().cloned()) {
+    for raw in manifest_values.iter().cloned() {
         let Some((key, normalized)) = normalize_manifest_bootstrap_contact(&raw) else {
             continue;
         };
@@ -613,12 +603,17 @@ fn merge_manifest_bootstrap_contacts(value: &mut Value, manifest_values: &[Strin
         }
     }
 
-    value["bootstrap_contacts"] = Value::Array(
+    let replacement = Value::Array(
         values
             .into_iter()
             .map(|(_, raw)| Value::String(raw))
             .collect(),
     );
+    if value.get("bootstrap_contacts") == Some(&replacement) {
+        return false;
+    }
+    value["bootstrap_contacts"] = replacement;
+    true
 }
 
 fn normalize_manifest_bootstrap_contact(raw: &str) -> Option<(String, String)> {
@@ -775,16 +770,20 @@ fn persist_join_manifest_startup_config(
     if !value.is_object() {
         value = json!({});
     }
+    let mut changed = false;
     if !value
         .get("network_mode")
         .and_then(Value::as_str)
         .is_some_and(|mode| !mode.trim().is_empty())
     {
         value["network_mode"] = Value::String("wan".to_owned());
+        changed = true;
     }
-    merge_manifest_bootstrap_contacts(&mut value, &manifest.bootstrap_contacts);
-    merge_manifest_values(&mut value, "gateway_urls", &manifest.gateway_urls, true);
-    fs::write(&path, serde_json::to_vec_pretty(&value)?)?;
+    changed |= replace_manifest_bootstrap_contacts(&mut value, &manifest.bootstrap_contacts);
+    changed |= replace_manifest_values(&mut value, "gateway_urls", &manifest.gateway_urls, true);
+    if changed {
+        fs::write(&path, serde_json::to_vec_pretty(&value)?)?;
+    }
     Ok(())
 }
 
@@ -2776,8 +2775,8 @@ mod tests {
         ENV_NETWORK_BOOTSTRAP_HTTP_URLS, ENV_NETWORK_JOIN_MANIFEST_URLS,
         NETWORK_JOIN_MANIFEST_ROUTE, accept_task_result_locally,
         bootstrap_bundle_endpoint_candidates, join_manifest_endpoint_candidates,
-        merge_manifest_bootstrap_contacts, peer_dm_content_from_envelope,
-        synthesize_peer_dm_envelope,
+        peer_dm_content_from_envelope, replace_manifest_bootstrap_contacts,
+        replace_manifest_values, synthesize_peer_dm_envelope,
     };
     use crate::node::Node;
     use crate::task_template::sample_contract;
@@ -2907,9 +2906,10 @@ mod tests {
     }
 
     #[test]
-    fn manifest_bootstrap_contacts_dedupe_by_endpoint_and_sanitize_invalid_direct_addrs() {
+    fn manifest_bootstrap_contacts_replace_existing_and_sanitize_invalid_direct_addrs() {
+        let stale_endpoint_id = "11113ad000151bc41e686a1fc892e07a440a2a53110bbaeae3d13e5978599956";
         let endpoint_id = "83393ad000151bc41e686a1fc892e07a440a2a53110bbaeae3d13e5978599956";
-        let contact = |generated_at: u64| {
+        let contact = |endpoint_id: &str, generated_at: u64| {
             json!({
                 "generated_at": generated_at,
                 "listen_addrs": [endpoint_id],
@@ -2947,16 +2947,20 @@ mod tests {
         };
         let mut value = json!({
             "network_mode": "wan",
-            "bootstrap_contacts": [contact(1)]
+            "bootstrap_contacts": [contact(stale_endpoint_id, 1)]
         });
 
-        merge_manifest_bootstrap_contacts(&mut value, &[contact(2)]);
+        assert!(replace_manifest_bootstrap_contacts(
+            &mut value,
+            &[contact(endpoint_id, 2), contact(endpoint_id, 3)],
+        ));
 
         let contacts = value["bootstrap_contacts"].as_array().expect("contacts");
         assert_eq!(contacts.len(), 1);
         let saved: serde_json::Value =
             serde_json::from_str(contacts[0].as_str().expect("contact string")).unwrap();
-        assert_eq!(saved["generated_at"].as_u64(), Some(2));
+        assert_eq!(saved["node_id"].as_str(), Some(endpoint_id));
+        assert_eq!(saved["generated_at"].as_u64(), Some(3));
         assert!(
             saved["listen_addrs"]
                 .as_array()
@@ -2980,6 +2984,39 @@ mod tests {
             transport["extra"]["relay_urls"],
             json!(["https://relay.wattetheria.com"])
         );
+        assert!(!replace_manifest_bootstrap_contacts(
+            &mut value,
+            &[contact(endpoint_id, 3)]
+        ));
+    }
+
+    #[test]
+    fn manifest_gateway_urls_replace_existing_and_normalize_latest_values() {
+        let mut value = json!({
+            "network_mode": "wan",
+            "gateway_urls": ["https://old-gateway.wattetheria.com"]
+        });
+
+        assert!(replace_manifest_values(
+            &mut value,
+            "gateway_urls",
+            &[
+                "https://gateway.wattetheria.com/".to_owned(),
+                "https://gateway.wattetheria.com".to_owned(),
+            ],
+            true,
+        ));
+
+        assert_eq!(
+            value["gateway_urls"],
+            json!(["https://gateway.wattetheria.com"])
+        );
+        assert!(!replace_manifest_values(
+            &mut value,
+            "gateway_urls",
+            &["https://gateway.wattetheria.com/".to_owned()],
+            true,
+        ));
     }
 
     #[test]

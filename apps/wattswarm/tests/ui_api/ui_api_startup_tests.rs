@@ -281,6 +281,62 @@ fn ui_startup_config_roundtrips_network_settings_without_agent_binding() {
 }
 
 #[test]
+fn ui_startup_config_save_preserves_managed_geo_coordinates() {
+    let _guard = env_lock();
+    let _db_lock = DbTestLock::acquire();
+    let schema = reset_test_schema("test");
+    let _schema_guard = EnvVarGuard::set("WATTSWARM_PG_SCHEMA", &schema);
+    let _p2p_guard = EnvVarGuard::set("WATTSWARM_P2P_ENABLED", "0");
+    let dir = tempdir().unwrap();
+    let state_dir = dir.path().join("state");
+    std::fs::create_dir_all(&state_dir).unwrap();
+    std::fs::write(
+        state_dir.join("startup_config.json"),
+        serde_json::to_vec(&json!({
+            "display_name": "Node Agent",
+            "network_mode": "wan",
+            "latitude": 37.0,
+            "longitude": -122.0
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let db_path = state_dir.join("ui.state");
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let app = build_app(UiServerState::new(state_dir.clone(), db_path.clone()));
+        let save_res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/startup-config")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({
+                            "display_name": "Node Agent",
+                            "network_mode": "wan",
+                            "latitude": 0.0,
+                            "longitude": 0.0
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(save_res.status(), StatusCode::OK);
+        let save_json = json_from(save_res).await;
+        assert_eq!(save_json["config"]["latitude"].as_f64(), Some(37.0));
+        assert_eq!(save_json["config"]["longitude"].as_f64(), Some(-122.0));
+    });
+}
+
+#[test]
 fn ui_startup_config_save_updates_existing_runtime_node_mode() {
     let _guard = env_lock();
     let _db_lock = DbTestLock::acquire();

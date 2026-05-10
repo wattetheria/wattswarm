@@ -193,7 +193,7 @@ Runtime toggles:
 - `WATTSWARM_P2P_NODE_IDS=lab-a` subscribes the node to matching node scopes
 - `WATTSWARM_P2P_LOCAL_IDS=lab-a` is still accepted as a legacy alias for node scopes
 
-Nearby discovery runs over the Iroh gossip discovery lane and is only a peer-discovery/contact exchange path. It does not send agent/MCP requests or task/topic payloads. It is active only when P2P is enabled, the startup `network_mode` is not `local`, and `startup_config.json` contains valid `latitude` and `longitude` values.
+Nearby discovery runs over the Iroh gossip discovery lane and is only a peer-discovery/contact exchange path. It does not send agent/MCP requests or task/topic payloads. It is active only when P2P is enabled, the startup `network_mode` is not `local`, and `startup_config.json` contains valid `latitude` and `longitude` values. Those coordinates are managed by the Wattetheria runtime sync path, not by manual startup UI input.
 
 - `WATTSWARM_NEARBY_DISCOVERY_ENABLED=true` by default; set `false` to stop publishing and accepting nearby discovery announcements.
 - `WATTSWARM_NEARBY_DISCOVERY_RADIUS_KM=1000` by default; accepts peers only when their geo distance is inside both the local radius and the remote announced radius. The env var overrides startup `nearby_radius_km`.
@@ -869,6 +869,7 @@ P2P env vars:
 Startup UI behavior:
 
 - `Display Name`, `Network Mode`, `Bootstrap Contacts`, optional `Gateway URLs`, and `Core Agent` are saved to `startup_config.json`
+- startup geo coordinates are displayed read-only when present; Wattetheria resolves and syncs them for gateway-backed clients and nearby discovery
 - `Bootstrap Contacts` is shown only for `LAN` / `WAN` and accepts short Iroh contact strings in `<iroh-node-id>@<host:port>` format.
 - genesis/bootstrap nodes can export a paste-ready contact with `wattswarm --state-dir <state-dir> node export-contact`
 - saving `Core Agent` also syncs the local executor route into PostgreSQL `executor_registry_local`

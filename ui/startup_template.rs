@@ -318,14 +318,10 @@ pub const STARTUP_HTML: &str = r#"<!DOCTYPE html>
             <input id="displayName" placeholder="Captain Aurora" />
           </div>
           <div class="field">
-            <label for="latitude">Latitude</label>
-            <input id="latitude" type="number" step="0.000001" min="-90" max="90" placeholder="37.7749" />
+            <label>Geo Location</label>
+            <input id="geoLocation" readonly value="loading..." />
           </div>
-          <div class="field">
-            <label for="longitude">Longitude</label>
-            <input id="longitude" type="number" step="0.000001" min="-180" max="180" placeholder="-122.4194" />
-          </div>
-          <div class="hint">Optional. When set, this node will render at the real world-map location in gateway-backed clients.</div>
+          <div class="hint">Read-only. Wattetheria resolves this automatically and syncs it into gateway-backed clients.</div>
         </div>
 
         <div class="panel">
@@ -421,8 +417,10 @@ Those stay in CLI, compose, or config files for advanced operators.</pre>
     function syncFormFromConfig(cfg) {
       startupConfig = cfg;
       document.getElementById('displayName').value = cfg.display_name || '';
-      document.getElementById('latitude').value = Number.isFinite(cfg.latitude) ? String(cfg.latitude) : '';
-      document.getElementById('longitude').value = Number.isFinite(cfg.longitude) ? String(cfg.longitude) : '';
+      const hasGeo = Number.isFinite(cfg.latitude) && Number.isFinite(cfg.longitude);
+      document.getElementById('geoLocation').value = hasGeo
+        ? `${cfg.latitude}, ${cfg.longitude}`
+        : 'automatic location pending';
       const manualJoin = cfg.network_mode === 'lan';
       document.getElementById('bootstrapContacts').value = manualJoin ? (cfg.bootstrap_contacts || []).join('\n') : '';
       document.getElementById('gatewayUrls').value = manualJoin ? (cfg.gateway_urls || []).join('\n') : '';
@@ -430,8 +428,6 @@ Those stay in CLI, compose, or config files for advanced operators.</pre>
     }
 
     function buildPayload() {
-      const latitudeValue = document.getElementById('latitude').value.trim();
-      const longitudeValue = document.getElementById('longitude').value.trim();
       const bootstrapContacts = document.getElementById('bootstrapContacts').value
         .split(/\n+/)
         .map((value) => value.trim())
@@ -443,8 +439,6 @@ Those stay in CLI, compose, or config files for advanced operators.</pre>
       const isLan = startupConfig.network_mode === 'lan';
       return {
         display_name: document.getElementById('displayName').value,
-        latitude: latitudeValue === '' ? null : Number(latitudeValue),
-        longitude: longitudeValue === '' ? null : Number(longitudeValue),
         network_mode: startupConfig.network_mode,
         bootstrap_contacts: isLan ? bootstrapContacts : [],
         gateway_urls: isLan ? gatewayUrls : []

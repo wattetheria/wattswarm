@@ -444,6 +444,11 @@ fn ui_root_page_serves_startup_view_and_diagnostics_route_redirects_legacy_conso
         assert!(root_html.contains("Open Network Diagnostics"));
         assert!(root_html.contains("href=\"/diagnostics\""));
         assert!(root_html.contains("Bootstrap Contacts"));
+        assert!(root_html.contains("Geo Location"));
+        assert!(root_html.contains("Read-only. Wattetheria resolves this automatically"));
+        assert!(root_html.contains("id=\"geoLocation\" readonly"));
+        assert!(!root_html.contains("id=\"latitude\""));
+        assert!(!root_html.contains("id=\"longitude\""));
         assert!(root_html.contains("node export-contact"));
         assert!(root_html.contains("&lt;node-id&gt;@&lt;host:port&gt;"));
         assert!(
