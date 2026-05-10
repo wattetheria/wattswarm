@@ -50,21 +50,21 @@ pub(crate) async fn startup_config_save(
     let existing =
         run_blocking(move || load_startup_config(&startup_config_path(&existing_state_dir)))
             .await?;
+    let (bootstrap_contacts, gateway_urls) = match req.network_mode {
+        crate::startup_config::NetworkMode::Lan => (req.bootstrap_contacts, req.gateway_urls),
+        crate::startup_config::NetworkMode::Wan => (
+            existing.bootstrap_contacts.clone(),
+            existing.gateway_urls.clone(),
+        ),
+        crate::startup_config::NetworkMode::Local => (Vec::new(), Vec::new()),
+    };
     let payload = StartupConfig {
         display_name: req.display_name,
         latitude: req.latitude.or(existing.latitude),
         longitude: req.longitude.or(existing.longitude),
         network_mode: req.network_mode,
-        bootstrap_contacts: if matches!(req.network_mode, crate::startup_config::NetworkMode::Lan) {
-            req.bootstrap_contacts
-        } else {
-            Vec::new()
-        },
-        gateway_urls: if matches!(req.network_mode, crate::startup_config::NetworkMode::Lan) {
-            req.gateway_urls
-        } else {
-            Vec::new()
-        },
+        bootstrap_contacts,
+        gateway_urls,
         core_agent: req.core_agent.clone().unwrap_or(existing.core_agent),
     }
     .normalized();

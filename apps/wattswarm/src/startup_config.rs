@@ -222,6 +222,20 @@ pub fn startup_config_path(state_dir: &Path) -> PathBuf {
     state_dir.join("startup_config.json")
 }
 
+pub fn ensure_default_wan_startup_config(state_dir: &Path) -> Result<StartupConfig> {
+    let path = startup_config_path(state_dir);
+    if path.exists() {
+        return load_startup_config(&path);
+    }
+    let config = StartupConfig {
+        network_mode: NetworkMode::Wan,
+        ..StartupConfig::default()
+    }
+    .normalized();
+    save_startup_config(&path, &config)?;
+    Ok(config)
+}
+
 pub fn load_startup_config(path: &Path) -> Result<StartupConfig> {
     if !path.exists() {
         return Ok(StartupConfig::default());
@@ -273,6 +287,8 @@ pub fn core_agent_executor_name() -> &'static str {
 mod tests {
     use super::{
         CoreAgentConfig, CoreAgentMode, NetworkMode, StartupConfig, core_agent_executor_name,
+        ensure_default_wan_startup_config, load_startup_config, save_startup_config,
+        startup_config_path,
     };
 
     #[test]
@@ -403,5 +419,34 @@ mod tests {
             ..StartupConfig::default()
         };
         assert!(invalid_longitude.validate().is_err());
+    }
+
+    #[test]
+    fn ensure_default_wan_startup_config_creates_missing_file() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let config = ensure_default_wan_startup_config(dir.path()).unwrap();
+
+        assert_eq!(config.network_mode, NetworkMode::Wan);
+        let saved = load_startup_config(&startup_config_path(dir.path())).unwrap();
+        assert_eq!(saved.network_mode, NetworkMode::Wan);
+    }
+
+    #[test]
+    fn ensure_default_wan_startup_config_preserves_existing_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let existing = StartupConfig {
+            network_mode: NetworkMode::Lan,
+            bootstrap_contacts: vec!["iroh-contact-a".to_owned()],
+            gateway_urls: vec!["https://gw.example.com".to_owned()],
+            ..StartupConfig::default()
+        };
+        save_startup_config(&startup_config_path(dir.path()), &existing).unwrap();
+
+        let config = ensure_default_wan_startup_config(dir.path()).unwrap();
+
+        assert_eq!(config.network_mode, NetworkMode::Lan);
+        assert_eq!(config.bootstrap_contacts, vec!["iroh-contact-a"]);
+        assert_eq!(config.gateway_urls, vec!["https://gw.example.com"]);
     }
 }

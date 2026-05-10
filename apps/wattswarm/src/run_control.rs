@@ -161,6 +161,7 @@ pub fn run_worker(
     pg_url: &str,
     opts: WorkerOptions,
 ) -> Result<()> {
+    crate::startup_config::ensure_default_wan_startup_config(state_dir)?;
     let mut wait_polls = 0_u64;
     let mut logged_waiting = false;
     while configured_node_mode(state_dir)?.is_none() {

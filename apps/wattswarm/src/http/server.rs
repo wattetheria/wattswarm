@@ -13,6 +13,7 @@ use std::path::PathBuf;
 
 pub fn run(state_dir: PathBuf, db_path: PathBuf, listen: String) -> Result<()> {
     fs::create_dir_all(&state_dir)?;
+    crate::startup_config::ensure_default_wan_startup_config(&state_dir)?;
     let node_id = local_node_id(&state_dir).ok();
     let network_enabled = crate::network_bridge::network_enabled_from_env();
     if network_enabled {

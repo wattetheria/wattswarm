@@ -143,16 +143,12 @@ fn ui_startup_config_roundtrips_network_settings_without_agent_binding() {
             Some("wan")
         );
         assert_eq!(
-            save_wan_json["config"]["bootstrap_contacts"]
-                .as_array()
-                .map(|items| items.len()),
-            Some(0)
+            save_wan_json["config"]["bootstrap_contacts"][0].as_str(),
+            Some(lan_contact)
         );
         assert_eq!(
-            save_wan_json["config"]["gateway_urls"]
-                .as_array()
-                .map(|items| items.len()),
-            Some(0)
+            save_wan_json["config"]["gateway_urls"][0].as_str(),
+            Some("http://gateway.example.com:8080")
         );
 
         let save_local_res = app
