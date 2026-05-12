@@ -544,6 +544,49 @@ fn network_discovery_auto_announces_local_record_to_bootnode() {
     assert!(record.body.transport_contact.is_some());
 }
 
+#[test]
+fn network_discovery_auto_announces_local_record_to_discovery_api_base_url() {
+    let _guard = env_lock();
+    let _db_lock = DbTestLock::acquire();
+    let schema = reset_test_schema("ui_discovery_auto_announce_base_url");
+    let _schema_guard = EnvVarGuard::set("WATTSWARM_PG_SCHEMA", &schema);
+    let _enabled_guard = EnvVarGuard::set("WATTSWARM_NEARBY_DISCOVERY_ENABLED", "true");
+    let _radius_guard = EnvVarGuard::set("WATTSWARM_NEARBY_DISCOVERY_RADIUS_KM", "25");
+    let _ttl_guard = EnvVarGuard::set("WATTSWARM_NEARBY_DISCOVERY_TTL_MS", "60000");
+
+    let dir = tempdir().expect("tempdir");
+    let state_dir = dir.path().join("state");
+    fs::create_dir_all(&state_dir).expect("create state dir");
+    wattswarm::startup_config::save_startup_config(
+        &wattswarm::startup_config::startup_config_path(&state_dir),
+        &wattswarm::startup_config::StartupConfig {
+            latitude: Some(37.0),
+            longitude: Some(-122.0),
+            network_mode: wattswarm::startup_config::NetworkMode::Local,
+            ..Default::default()
+        },
+    )
+    .expect("save startup config");
+    let stub = DiscoveryRecordStubServer::start();
+    wattswarm::control::save_discovery_bootnode_urls_state(
+        &state_dir,
+        &[format!("{}/api/network/discovery", stub.base_url())],
+    )
+    .expect("save discovery bootnode urls");
+
+    let report = wattswarm::ui::maybe_announce_local_record_to_discovery_bootnodes(
+        &state_dir,
+        &state_dir.join("local.state"),
+    )
+    .expect("announce local discovery record");
+
+    assert_eq!(report.attempted, 1);
+    assert_eq!(report.succeeded, 1);
+    assert_eq!(report.failed, 0);
+    let requests = stub.requests.lock().expect("discovery requests");
+    assert_eq!(requests.len(), 1);
+}
+
 fn sample_run_spec(run_id: &str) -> Value {
     json!({
         "run_id": run_id,

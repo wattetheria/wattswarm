@@ -286,6 +286,8 @@ fn discovery_records_endpoint(base_url: &str) -> String {
     let base_url = base_url.trim().trim_end_matches('/');
     if base_url.ends_with(DISCOVERY_RECORDS_ROUTE) {
         base_url.to_owned()
+    } else if base_url.ends_with("/api/network/discovery") {
+        format!("{base_url}/records")
     } else {
         format!("{base_url}{DISCOVERY_RECORDS_ROUTE}")
     }
