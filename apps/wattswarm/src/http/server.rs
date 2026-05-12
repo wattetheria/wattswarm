@@ -2,7 +2,8 @@ use crate::control::local_node_id;
 use crate::http::UiServerState;
 use crate::http::background::mark_node_running_if_service_started;
 use crate::http::{
-    diagnostics, egress, executors, node, pages, peers, runs, startup, swarm, tasks, topics,
+    diagnostics, discovery, egress, executors, node, pages, peers, runs, startup, swarm, tasks,
+    topics,
 };
 use crate::wattetheria_sync;
 use anyhow::{Context, Result};
@@ -33,6 +34,16 @@ pub fn run(state_dir: PathBuf, db_path: PathBuf, listen: String) -> Result<()> {
     )?;
     if network_started {
         mark_node_running_if_service_started(&state_dir, true)?;
+        match discovery::maybe_announce_local_record_to_discovery_bootnodes(&state_dir, &db_path) {
+            Ok(report) if report.attempted > 0 => {
+                eprintln!(
+                    "wattswarm discovery announce attempted={} succeeded={} failed={}",
+                    report.attempted, report.succeeded, report.failed
+                );
+            }
+            Ok(_) => {}
+            Err(error) => eprintln!("wattswarm discovery announce failed: {error}"),
+        }
         eprintln!("wattswarm p2p network enabled");
     } else {
         eprintln!("wattswarm p2p network disabled");
@@ -91,6 +102,22 @@ pub fn build_app(state: UiServerState) -> Router {
             "/.well-known/wattswarm/join.json",
             get(crate::http::network_bootstrap::network_join_manifest),
         )
+        .route(
+            "/api/network/discovery/records",
+            post(discovery::discovery_announce_record),
+        )
+        .route(
+            "/api/network/discovery/nearby",
+            get(discovery::discovery_find_nearby),
+        )
+        .route(
+            "/api/network/discovery/capability",
+            get(discovery::discovery_find_capability),
+        )
+        .route(
+            "/api/network/discovery/node/:node_id",
+            get(discovery::discovery_find_node),
+        )
         .route("/api/startup-config", get(startup::startup_config_get))
         .route("/api/startup-config", post(startup::startup_config_save))
         .route("/api/peers/list", get(peers::peers_list))
@@ -129,6 +156,10 @@ pub fn build_app(state: UiServerState) -> Router {
         )
         .route("/api/task/sample", get(tasks::task_sample))
         .route("/api/task/submit", post(tasks::task_submit))
+        .route(
+            "/api/task/import-contract",
+            post(tasks::task_import_contract),
+        )
         .route("/api/task/announce", post(tasks::task_announce))
         .route("/api/task/claim", post(tasks::task_claim))
         .route(

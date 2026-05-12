@@ -46,6 +46,34 @@ pub fn discovered_peers_path(state_dir: &Path) -> PathBuf {
     state_dir.join("discovered_peers.json")
 }
 
+pub fn discovery_bootnode_urls_path(state_dir: &Path) -> PathBuf {
+    state_dir.join("discovery_bootnode_urls_v1.json")
+}
+
+pub fn load_discovery_bootnode_urls_state(state_dir: &Path) -> Result<Vec<String>> {
+    let path = discovery_bootnode_urls_path(state_dir);
+    let Ok(bytes) = fs::read(&path) else {
+        return Ok(Vec::new());
+    };
+    let urls = serde_json::from_slice::<Vec<String>>(&bytes)
+        .with_context(|| format!("parse discovery bootnode URLs at {}", path.display()))?;
+    Ok(normalize_discovery_urls(&urls))
+}
+
+pub fn save_discovery_bootnode_urls_state(state_dir: &Path, urls: &[String]) -> Result<bool> {
+    let urls = normalize_discovery_urls(urls);
+    let existing = load_discovery_bootnode_urls_state(state_dir)?;
+    if existing == urls {
+        return Ok(false);
+    }
+    fs::create_dir_all(state_dir)?;
+    fs::write(
+        discovery_bootnode_urls_path(state_dir),
+        serde_json::to_vec_pretty(&urls)?,
+    )?;
+    Ok(true)
+}
+
 pub fn artifact_store_path(state_dir: &Path) -> PathBuf {
     state_dir.join("artifacts")
 }
@@ -588,6 +616,18 @@ fn replace_manifest_values(
     true
 }
 
+fn normalize_discovery_urls(values: &[String]) -> Vec<String> {
+    let mut normalized = Vec::new();
+    let mut seen = BTreeSet::new();
+    for value in values {
+        let value = value.trim().trim_end_matches('/').to_owned();
+        if !value.is_empty() && seen.insert(value.clone()) {
+            normalized.push(value);
+        }
+    }
+    normalized
+}
+
 fn replace_manifest_bootstrap_contacts(value: &mut Value, manifest_values: &[String]) -> bool {
     let mut values = Vec::<(String, String)>::new();
     let mut indexes = BTreeMap::<String, usize>::new();
@@ -756,6 +796,9 @@ fn persist_join_manifest_startup_config(
     state_dir: &Path,
     manifest: &NetworkJoinManifest,
 ) -> Result<()> {
+    if !manifest.discovery_urls.is_empty() {
+        let _ = save_discovery_bootnode_urls_state(state_dir, &manifest.discovery_urls)?;
+    }
     if manifest.bootstrap_contacts.is_empty() && manifest.gateway_urls.is_empty() {
         return Ok(());
     }

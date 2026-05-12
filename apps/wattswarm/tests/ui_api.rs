@@ -1,6 +1,7 @@
 use axum::body::{Body, to_bytes};
 use axum::http::{Request, StatusCode};
 use serde_json::{Value, json};
+use std::fs;
 use std::io::{ErrorKind, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::Arc;
@@ -29,6 +30,9 @@ use wattswarm::ui::{UiServerState, build_app};
 use wattswarm::wattetheria_sync;
 use wattswarm::wattetheria_sync::proto::ProjectionStreamRequest;
 use wattswarm::wattetheria_sync::proto::wattetheria_sync_service_client::WattetheriaSyncServiceClient;
+use wattswarm_network_discovery::{
+    DiscoveryGeo, DiscoveryNodeRecordBody, DiscoveryRecordCapabilities, SignedDiscoveryNodeRecord,
+};
 use wattswarm_storage_core::storage::pg::Connection;
 use wattswarm_storage_core::types::ArtifactRef;
 
@@ -116,6 +120,13 @@ struct UiStubRuntimeServer {
     handle: Option<std::thread::JoinHandle<()>>,
 }
 
+struct DiscoveryRecordStubServer {
+    addr: SocketAddr,
+    requests: Arc<Mutex<Vec<String>>>,
+    stop: Arc<AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
 impl UiStubRuntimeServer {
     fn start(cfg: UiStubRuntimeConfig) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind stub listener");
@@ -149,6 +160,53 @@ impl UiStubRuntimeServer {
 }
 
 impl Drop for UiStubRuntimeServer {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        let _ = TcpStream::connect(self.addr);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+impl DiscoveryRecordStubServer {
+    fn start() -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind discovery stub listener");
+        listener
+            .set_nonblocking(true)
+            .expect("set discovery stub nonblocking");
+        let addr = listener
+            .local_addr()
+            .expect("discovery listener local addr");
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let request_log = Arc::clone(&requests);
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_flag = Arc::clone(&stop);
+        let handle = std::thread::spawn(move || {
+            while !stop_flag.load(Ordering::Relaxed) {
+                match listener.accept() {
+                    Ok((stream, _)) => handle_discovery_stub_conn(stream, &request_log),
+                    Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        Self {
+            addr,
+            requests,
+            stop,
+            handle: Some(handle),
+        }
+    }
+
+    fn base_url(&self) -> String {
+        format!("http://{}", self.addr)
+    }
+}
+
+impl Drop for DiscoveryRecordStubServer {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
         let _ = TcpStream::connect(self.addr);
@@ -338,6 +396,26 @@ fn handle_stub_conn(mut stream: TcpStream, cfg: &UiStubRuntimeConfig) {
     write_stub_response(stream, 404, "{}")
 }
 
+fn handle_discovery_stub_conn(mut stream: TcpStream, requests: &Arc<Mutex<Vec<String>>>) {
+    let Ok(req_bytes) = read_stub_request(&mut stream) else {
+        return;
+    };
+    if req_bytes.is_empty() {
+        return;
+    }
+    let req = String::from_utf8_lossy(&req_bytes);
+    let line = req.lines().next().unwrap_or_default();
+    if line.starts_with("POST /api/network/discovery/records ") {
+        if let Some(raw_body) = req.split("\r\n\r\n").nth(1)
+            && let Ok(mut requests) = requests.lock()
+        {
+            requests.push(raw_body.to_owned());
+        }
+        return write_stub_response(stream, 200, "{\"ok\":true}");
+    }
+    write_stub_response(stream, 404, "{}")
+}
+
 impl DbTestLock {
     fn acquire() -> Self {
         let conn = Connection::open("ui-db-lock").expect("open db lock connection");
@@ -409,6 +487,61 @@ fn count_projection_rows(table: &str) -> i64 {
 async fn json_from(res: axum::response::Response) -> Value {
     let bytes = to_bytes(res.into_body(), usize::MAX).await.unwrap();
     serde_json::from_slice(&bytes).unwrap()
+}
+
+#[test]
+fn network_discovery_auto_announces_local_record_to_bootnode() {
+    let _guard = env_lock();
+    let _db_lock = DbTestLock::acquire();
+    let schema = reset_test_schema("ui_discovery_auto_announce");
+    let _schema_guard = EnvVarGuard::set("WATTSWARM_PG_SCHEMA", &schema);
+    let _enabled_guard = EnvVarGuard::set("WATTSWARM_NEARBY_DISCOVERY_ENABLED", "true");
+    let _radius_guard = EnvVarGuard::set("WATTSWARM_NEARBY_DISCOVERY_RADIUS_KM", "25");
+    let _ttl_guard = EnvVarGuard::set("WATTSWARM_NEARBY_DISCOVERY_TTL_MS", "60000");
+
+    let dir = tempdir().expect("tempdir");
+    let state_dir = dir.path().join("state");
+    fs::create_dir_all(&state_dir).expect("create state dir");
+    wattswarm::startup_config::save_startup_config(
+        &wattswarm::startup_config::startup_config_path(&state_dir),
+        &wattswarm::startup_config::StartupConfig {
+            latitude: Some(37.0),
+            longitude: Some(-122.0),
+            network_mode: wattswarm::startup_config::NetworkMode::Local,
+            ..Default::default()
+        },
+    )
+    .expect("save startup config");
+    let stub = DiscoveryRecordStubServer::start();
+    wattswarm::control::save_discovery_bootnode_urls_state(&state_dir, &[stub.base_url()])
+        .expect("save discovery bootnode urls");
+
+    let report = wattswarm::ui::maybe_announce_local_record_to_discovery_bootnodes(
+        &state_dir,
+        &state_dir.join("local.state"),
+    )
+    .expect("announce local discovery record");
+
+    assert_eq!(report.attempted, 1);
+    assert_eq!(report.succeeded, 1);
+    assert_eq!(report.failed, 0);
+    let requests = stub.requests.lock().expect("discovery requests");
+    assert_eq!(requests.len(), 1);
+    let record: SignedDiscoveryNodeRecord =
+        serde_json::from_str(&requests[0]).expect("parse signed discovery record");
+    record.verify().expect("verify discovery record");
+    assert_eq!(record.body.geo.as_ref().map(|geo| geo.latitude), Some(37.0));
+    assert_eq!(
+        record.body.geo.as_ref().map(|geo| geo.longitude),
+        Some(-122.0)
+    );
+    assert_eq!(
+        record.body.geo.as_ref().map(|geo| geo.radius_km),
+        Some(25.0)
+    );
+    assert_eq!(record.body.ttl_ms, 60000);
+    assert!(record.body.capabilities.contains("wattswarm.node"));
+    assert!(record.body.transport_contact.is_some());
 }
 
 fn sample_run_spec(run_id: &str) -> Value {

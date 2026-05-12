@@ -7,6 +7,7 @@ use std::path::PathBuf;
 
 pub(crate) mod background;
 pub(crate) mod diagnostics;
+pub(crate) mod discovery;
 pub(crate) mod egress;
 pub(crate) mod executors;
 pub(crate) mod helpers;

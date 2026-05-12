@@ -31,6 +31,7 @@ async-stream = "0.3"
 axum = { workspace = true }
 chrono = { workspace = true }
 clap = { workspace = true }
+hex = { workspace = true }
 prost = "0.13"
 reqwest = { workspace = true }
 serde = { workspace = true }
@@ -43,7 +44,9 @@ uuid = { workspace = true }
 wattswarm-protocol = { workspace = true }
 wattswarm-crypto = { workspace = true }
 wattswarm-artifact-store = { workspace = true }
+wattswarm-network-discovery = { workspace = true }
 wattswarm-network-p2p = { workspace = true }
+wattswarm-network-transport-iroh = { workspace = true }
 wattswarm-policy-engine = { workspace = true }
 wattswarm-runtime-client = { workspace = true }
 wattswarm-storage-core = { workspace = true }

@@ -282,6 +282,191 @@ fn ui_supports_core_cli_operations() {
 }
 
 #[test]
+fn task_import_contract_populates_projection_without_created_or_announced_events() {
+    let _guard = env_lock();
+    let _db_lock = DbTestLock::acquire();
+    let schema = reset_test_schema("test_import_contract");
+    let _schema_guard = EnvVarGuard::set("WATTSWARM_PG_SCHEMA", &schema);
+    let _mode_guard = EnvVarGuard::set("WATTSWARM_NODE_MODE", "local");
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let dir = tempdir().unwrap();
+        let state_dir = dir.path().join("state");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        let db_path = state_dir.join("ui.state");
+        let app = build_app(UiServerState::new(state_dir.clone(), db_path.clone()));
+
+        let sample_res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/task/sample?task_id=remote-task-import")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(sample_res.status(), StatusCode::OK);
+        let sample_json = json_from(sample_res).await;
+        let mut contract = sample_json["contract"].clone();
+        contract["inputs"]["swarm_scope"] = json!("group:remote-task-import");
+
+        let import_res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/task/import-contract")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({"contract": contract})).unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(import_res.status(), StatusCode::OK);
+        let import_json = json_from(import_res).await;
+        assert_eq!(import_json["ok"].as_bool(), Some(true));
+        assert_eq!(
+            import_json["scope_hint"].as_str(),
+            Some("group:remote-task-import")
+        );
+
+        let watch_res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/task/watch/remote-task-import")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(watch_res.status(), StatusCode::OK);
+
+        let events = tokio::task::spawn_blocking({
+            let state_dir = state_dir.clone();
+            let db_path = db_path.clone();
+            move || {
+                let node = open_node(&state_dir, &db_path).expect("open node");
+                node.store.load_all_events().expect("load events")
+            }
+        })
+        .await
+        .expect("join event load");
+        assert!(!events.iter().any(|(_, event)| {
+            event.task_id.as_deref() == Some("remote-task-import")
+                && matches!(
+                    &event.payload,
+                    EventPayload::TaskCreated(_) | EventPayload::TaskAnnounced(_)
+                )
+        }));
+
+        tokio::task::spawn_blocking({
+            let state_dir = state_dir.clone();
+            let db_path = db_path.clone();
+            move || {
+                let mut node = open_node(&state_dir, &db_path).expect("open node");
+                let network_id = if node.store.is_org_configured() {
+                    node.store
+                        .load_network_topology_for_org(node.store.org_id())
+                        .map(|topology| topology.network.network_id)
+                        .unwrap_or_else(|_| format!("local:{}", node.node_id()))
+                } else {
+                    node.store
+                        .load_verified_network_protocol_params()
+                        .map(|verified| verified.network_id)
+                        .unwrap_or_else(|_| format!("local:{}", node.node_id()))
+                };
+                node.emit_at(
+                    1,
+                    EventPayload::FeedSubscriptionUpdated(FeedSubscriptionUpdatedPayload {
+                        network_id,
+                        subscriber_node_id: node.node_id(),
+                        feed_key: "task.lifecycle.remote-task-import".to_owned(),
+                        scope_hint: "group:remote-task-import".to_owned(),
+                        gossip_kinds: vec!["events".to_owned()],
+                        active: true,
+                    }),
+                    1_700_000_000_000,
+                )
+                .expect("seed existing subscription");
+            }
+        })
+        .await
+        .expect("join subscription seed");
+
+        let claim_res = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/task/claim")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"task_id":"remote-task-import","execution_id":"exec-remote-agent"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(claim_res.status(), StatusCode::OK);
+        let claim_json = json_from(claim_res).await;
+        assert_eq!(claim_json["ok"].as_bool(), Some(true));
+        assert_eq!(claim_json["subscribed"].as_bool(), Some(true));
+        assert_eq!(
+            claim_json["subscription_scope_hint"].as_str(),
+            Some("group:remote-task-import")
+        );
+        assert_eq!(
+            claim_json["subscription_feed_key"].as_str(),
+            Some("task.lifecycle.remote-task-import")
+        );
+
+        let events = tokio::task::spawn_blocking(move || {
+            let node = open_node(&state_dir, &db_path).expect("open node");
+            node.store.load_all_events().expect("load events")
+        })
+        .await
+        .expect("join event load");
+        let claim_events = events
+            .iter()
+            .filter(|(_, event)| {
+                event.task_id.as_deref() == Some("remote-task-import")
+                    && matches!(&event.payload, EventPayload::TaskClaimed(_))
+            })
+            .count();
+        assert_eq!(claim_events, 1);
+        let subscription_events = events
+            .iter()
+            .filter(|(_, event)| {
+                matches!(
+                    &event.payload,
+                    EventPayload::FeedSubscriptionUpdated(payload)
+                        if payload.feed_key == "task.lifecycle.remote-task-import"
+                            && payload.scope_hint == "group:remote-task-import"
+                            && payload.gossip_kinds.as_slice() == ["events"]
+                            && payload.active
+                )
+            })
+            .count();
+        assert_eq!(subscription_events, 1);
+        assert!(!events.iter().any(|(_, event)| {
+            event.task_id.as_deref() == Some("remote-task-import")
+                && matches!(
+                    &event.payload,
+                    EventPayload::TaskCreated(_) | EventPayload::TaskAnnounced(_)
+                )
+        }));
+    });
+}
+
+#[test]
 fn peer_dm_send_uses_private_group_topic_messages() {
     let _guard = env_lock();
     let _db_lock = DbTestLock::acquire();
@@ -686,6 +871,111 @@ fn ui_exposes_network_bootstrap_bundle() {
 }
 
 #[test]
+fn network_discovery_bootnode_accepts_signed_records_and_filters_queries() {
+    let _guard = env_lock();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let dir = tempdir().unwrap();
+        let state_dir = dir.path().join("state");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        let db_path = state_dir.join("ui.state");
+        let app = build_app(UiServerState::new(state_dir, db_path));
+        let identity = NodeIdentity::from_seed([91; 32]);
+        let now_ms = chrono::Utc::now().timestamp_millis().max(0) as u64;
+        let node_id = identity.node_id();
+        let mut body = DiscoveryNodeRecordBody::new(
+            "mainnet:test",
+            node_id.clone(),
+            node_id.clone(),
+            1,
+            now_ms,
+        );
+        body.geo = Some(DiscoveryGeo {
+            latitude: 37.78,
+            longitude: -122.41,
+            radius_km: 50.0,
+        });
+        body.capabilities =
+            DiscoveryRecordCapabilities::new(["wattswarm.node", "discovery.bootnode"]).unwrap();
+        let record = SignedDiscoveryNodeRecord::sign(body, &identity).unwrap();
+
+        let announce_res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/network/discovery/records")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&record).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(announce_res.status(), StatusCode::OK);
+        let announce_json = json_from(announce_res).await;
+        assert_eq!(announce_json["ok"].as_bool(), Some(true));
+        assert_eq!(announce_json["status"].as_str(), Some("inserted"));
+        assert_eq!(announce_json["node_id"].as_str(), Some(node_id.as_str()));
+
+        let nearby_res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/network/discovery/nearby?network_id=mainnet:test&latitude=37.77&longitude=-122.42&radius_km=50&limit=10")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(nearby_res.status(), StatusCode::OK);
+        let nearby_json = json_from(nearby_res).await;
+        assert_eq!(
+            nearby_json["records"][0]["record"]["body"]["node_id"].as_str(),
+            Some(node_id.as_str())
+        );
+
+        let capability_res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/network/discovery/capability?network_id=mainnet:test&capability=WATTSWARM.NODE")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(capability_res.status(), StatusCode::OK);
+        let capability_json = json_from(capability_res).await;
+        assert_eq!(
+            capability_json["records"][0]["body"]["node_id"].as_str(),
+            Some(node_id.as_str())
+        );
+
+        let mut tampered = record.clone();
+        tampered.body.network_id = "mainnet:other".to_owned();
+        let tampered_res = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/network/discovery/records")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&tampered).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(tampered_res.status(), StatusCode::BAD_REQUEST);
+        let tampered_json = json_from(tampered_res).await;
+        assert_eq!(tampered_json["ok"].as_bool(), Some(false));
+    });
+}
+
+#[test]
 fn ui_exposes_network_join_manifest() {
     let _guard = env_lock();
     let _db_lock = DbTestLock::acquire();
@@ -703,6 +993,10 @@ fn ui_exposes_network_join_manifest() {
     let _gateway_guard = EnvVarGuard::set(
         "WATTSWARM_PUBLIC_GATEWAY_URLS",
         "https://gateway.wattetheria.com",
+    );
+    let _discovery_guard = EnvVarGuard::set(
+        "WATTSWARM_PUBLIC_DISCOVERY_URLS",
+        "https://bootstrap.wattetheria.com/api/network/discovery",
     );
     let dir = tempdir().unwrap();
     let state_dir = dir.path().join("state");
@@ -767,6 +1061,10 @@ fn ui_exposes_network_join_manifest() {
         assert_eq!(
             json["gateway_urls"][0].as_str(),
             Some("https://gateway.wattetheria.com")
+        );
+        assert_eq!(
+            json["discovery_urls"][0].as_str(),
+            Some("https://bootstrap.wattetheria.com/api/network/discovery")
         );
     });
 }

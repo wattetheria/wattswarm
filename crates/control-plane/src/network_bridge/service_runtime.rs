@@ -1,5 +1,9 @@
 use super::*;
 
+fn should_record_backfill_response_diagnostic(events_applied: usize) -> bool {
+    events_applied > 0
+}
+
 impl NetworkBridgeService {
     pub(crate) fn process_runtime_event(
         &mut self,
@@ -567,27 +571,29 @@ impl NetworkBridgeService {
                         response.next_from_event_seq,
                     );
                 }
-                diagnostics::record_diagnostic(
-                    self.state_dir.as_deref(),
-                    diagnostics::DiagnosticEvent::new(
-                        "info",
-                        "backfill",
-                        "response.ingest",
-                        "ok",
-                        format!("backfill response ingested {events} events"),
-                    )
-                    .source_node_id(Some(peer.to_string()))
-                    .scope(&response.scope)
-                    .details(json!({
-                        "request_id": request_id.to_string(),
-                        "events_applied": events,
-                        "events_received": response.events.len(),
-                        "feed_key": response.feed_key,
-                        "head_event_ids": response.head_event_ids,
-                        "unknown_empty_head": unknown_empty_head,
-                        "next_from_event_seq": response.next_from_event_seq,
-                    })),
-                );
+                if should_record_backfill_response_diagnostic(events) {
+                    diagnostics::record_diagnostic(
+                        self.state_dir.as_deref(),
+                        diagnostics::DiagnosticEvent::new(
+                            "info",
+                            "backfill",
+                            "response.ingest",
+                            "ok",
+                            format!("backfill response ingested {events} events"),
+                        )
+                        .source_node_id(Some(peer.to_string()))
+                        .scope(&response.scope)
+                        .details(json!({
+                            "request_id": request_id.to_string(),
+                            "events_applied": events,
+                            "events_received": response.events.len(),
+                            "feed_key": response.feed_key,
+                            "head_event_ids": response.head_event_ids,
+                            "unknown_empty_head": unknown_empty_head,
+                            "next_from_event_seq": response.next_from_event_seq,
+                        })),
+                    );
+                }
                 for envelope in &response.events {
                     diagnostics::record_diagnostic(
                         self.state_dir.as_deref(),
@@ -1726,5 +1732,16 @@ impl NetworkBridgeService {
                 discovery.source_node_id, distance_km
             ),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::should_record_backfill_response_diagnostic;
+
+    #[test]
+    fn backfill_response_diagnostics_skip_empty_responses() {
+        assert!(!should_record_backfill_response_diagnostic(0));
+        assert!(should_record_backfill_response_diagnostic(1));
     }
 }

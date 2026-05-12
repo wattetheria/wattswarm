@@ -5095,6 +5095,7 @@ dependencies = [
  "base64",
  "chrono",
  "clap",
+ "hex",
  "predicates",
  "prost",
  "protoc-bin-vendored",
@@ -5111,7 +5112,9 @@ dependencies = [
  "wattswarm-artifact-store",
  "wattswarm-control-plane",
  "wattswarm-crypto",
+ "wattswarm-network-discovery",
  "wattswarm-network-p2p",
+ "wattswarm-network-transport-iroh",
  "wattswarm-node-core",
  "wattswarm-policy-engine",
  "wattswarm-protocol",
@@ -5147,6 +5150,7 @@ dependencies = [
  "uuid",
  "wattswarm-artifact-store",
  "wattswarm-crypto",
+ "wattswarm-network-discovery",
  "wattswarm-network-p2p",
  "wattswarm-network-transport-core",
  "wattswarm-network-transport-iroh",
@@ -5169,6 +5173,18 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "wattswarm-protocol",
+]
+
+[[package]]
+name = "wattswarm-network-discovery"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "hex",
+ "serde",
+ "serde_jcs",
+ "wattswarm-crypto",
+ "wattswarm-network-transport-core",
 ]
 
 [[package]]

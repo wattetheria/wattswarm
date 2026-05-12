@@ -26,6 +26,13 @@ pub(crate) struct SubmitTaskRequest {
 }
 
 #[derive(Debug, Deserialize)]
+pub(crate) struct ImportTaskContractRequest {
+    contract: TaskContract,
+    #[serde(default)]
+    epoch: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
 pub(crate) struct TaskAnnounceRequest {
     task_id: String,
     #[serde(default)]
@@ -133,6 +140,28 @@ pub(crate) async fn task_submit(
     Ok(Json(json!({"ok": true, "task_id": task_id})))
 }
 
+pub(crate) async fn task_import_contract(
+    State(state): State<UiServerState>,
+    Json(req): Json<ImportTaskContractRequest>,
+) -> Result<Json<Value>, ApiError> {
+    let state_clone = state.clone();
+    let task_id = req.contract.task_id.clone();
+    let scope_hint = task_contract_scope_hint(&req.contract);
+    let epoch = req.epoch.unwrap_or(1);
+    run_blocking(move || -> Result<()> {
+        let node = open_node(&state_clone.state_dir, &state_clone.db_path)?;
+        node.store.upsert_task_contract(&req.contract, epoch)?;
+        Ok(())
+    })
+    .await?;
+    Ok(Json(json!({
+        "ok": true,
+        "task_id": task_id,
+        "epoch": epoch,
+        "scope_hint": scope_hint
+    })))
+}
+
 pub(crate) async fn task_announce(
     State(state): State<UiServerState>,
     Json(req): Json<TaskAnnounceRequest>,
@@ -211,41 +240,59 @@ pub(crate) async fn task_claim(
             .lease_ms
             .unwrap_or(task.contract.assignment.claim.lease_ms);
         let lease_until = now.saturating_add(lease_ms);
+        let mut subscription_scope_hint = None;
+        let subscription = if let Some(announcement) = node
+            .store
+            .get_task_announcement_detail_for_task(&req.task_id)?
+        {
+            let scope_hint = task_contract_scope_hint(&task.contract)
+                .unwrap_or_else(|| announcement.announcement.scope_hint.clone());
+            Some((announcement.announcement.feed_key, scope_hint))
+        } else {
+            task_contract_scope_hint(&task.contract)
+                .map(|scope_hint| (format!("task.lifecycle.{}", req.task_id), scope_hint))
+        };
+        let subscription_feed_key = if let Some((feed_key, scope_hint)) = subscription {
+            let network_id = resolve_network_id(&node);
+            let subscriber_node_id = node.node_id();
+            let gossip_kinds = vec!["events".to_owned()];
+            let already_subscribed = node
+                .store
+                .get_feed_subscription(&network_id, &subscriber_node_id, &feed_key)?
+                .is_some_and(|subscription| {
+                    subscription.active
+                        && subscription.scope_hint == scope_hint
+                        && subscription.gossip_kinds == gossip_kinds
+                });
+            if !already_subscribed {
+                node.emit_at(
+                    1,
+                    crate::types::EventPayload::FeedSubscriptionUpdated(
+                        crate::types::FeedSubscriptionUpdatedPayload {
+                            network_id: network_id.clone(),
+                            subscriber_node_id,
+                            feed_key: feed_key.clone(),
+                            scope_hint: scope_hint.clone(),
+                            gossip_kinds,
+                            active: true,
+                        },
+                    ),
+                    now,
+                )?;
+            }
+            subscription_scope_hint = Some(scope_hint);
+            Some(feed_key)
+        } else {
+            None
+        };
         node.claim_task(
             &req.task_id,
             role,
             &execution_id,
             lease_until,
             task.epoch,
-            now,
+            now.saturating_add(1),
         )?;
-        let mut subscription_scope_hint = None;
-        let subscription_feed_key = if let Some(announcement) = node
-            .store
-            .get_task_announcement_detail_for_task(&req.task_id)?
-        {
-            let scope_hint = task_contract_scope_hint(&task.contract)
-                .unwrap_or_else(|| announcement.announcement.scope_hint.clone());
-            let network_id = resolve_network_id(&node);
-            node.emit_at(
-                1,
-                crate::types::EventPayload::FeedSubscriptionUpdated(
-                    crate::types::FeedSubscriptionUpdatedPayload {
-                        network_id: network_id.clone(),
-                        subscriber_node_id: node.node_id(),
-                        feed_key: announcement.announcement.feed_key.clone(),
-                        scope_hint: scope_hint.clone(),
-                        gossip_kinds: vec!["events".to_owned()],
-                        active: true,
-                    },
-                ),
-                now.saturating_add(2),
-            )?;
-            subscription_scope_hint = Some(scope_hint);
-            Some(announcement.announcement.feed_key)
-        } else {
-            None
-        };
         Ok(json!({
             "ok": true,
             "task_id": req.task_id,

@@ -4,6 +4,7 @@ members = [
   "crates/protocol",
   "crates/crypto",
   "crates/artifact-store",
+  "crates/network-discovery",
   "crates/network-substrate",
   "crates/network-transport-core",
   "crates/network-transport-iroh",
@@ -49,6 +50,7 @@ tower = "0.5"
 wattswarm-protocol = { path = "crates/protocol" }
 wattswarm-crypto = { path = "crates/crypto" }
 wattswarm-artifact-store = { path = "crates/artifact-store" }
+wattswarm-network-discovery = { path = "crates/network-discovery" }
 wattswarm-network-substrate = { path = "crates/network-substrate" }
 wattswarm-network-transport-core = { path = "crates/network-transport-core" }
 wattswarm-network-transport-iroh = { path = "crates/network-transport-iroh" }

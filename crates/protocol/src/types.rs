@@ -950,6 +950,8 @@ pub struct NetworkJoinManifest {
     pub bootstrap_contacts: Vec<String>,
     #[serde(default)]
     pub gateway_urls: Vec<String>,
+    #[serde(default)]
+    pub discovery_urls: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

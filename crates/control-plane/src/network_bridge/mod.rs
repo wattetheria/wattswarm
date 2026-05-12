@@ -37,6 +37,7 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::runtime::Runtime;
 use uuid::Uuid;
+use wattswarm_network_discovery::{DiscoveryGeo, SignedDiscoveryNodeRecord};
 use wattswarm_network_transport_core::{
     PeerTransportCapabilities, TransferIntent, TransferKind, TransportContactMaterial,
     TransportMetadata, TransportRoute as DataTransportRoute, TransportRouter,
@@ -99,6 +100,8 @@ const DEFAULT_P2P_PORT: u16 = 4001;
 const DEFAULT_NEARBY_DISCOVERY_RADIUS_KM: f64 = 1000.0;
 const DEFAULT_NEARBY_DISCOVERY_INTERVAL: Duration = Duration::from_secs(30);
 const DEFAULT_NEARBY_DISCOVERY_TTL_MS: u64 = 5 * 60 * 1000;
+const DISCOVERY_BOOTNODE_QUERY_LIMIT: usize = 50;
+const DISCOVERY_BOOTNODE_QUERY_TIMEOUT: Duration = Duration::from_secs(3);
 const DATA_GOSSIP_KINDS: [GossipKind; 5] = [
     GossipKind::Events,
     GossipKind::Messages,
@@ -218,6 +221,11 @@ struct StartupNearbyDiscoveryConfig {
     nearby_radius_km: Option<f64>,
     #[serde(default)]
     network_mode: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct DiscoveryBootnodeNearbyResponse {
+    records: Vec<SignedDiscoveryNodeRecord>,
 }
 
 impl NearbyDiscoverySettings {
@@ -1835,6 +1843,210 @@ fn build_nearby_discovery_announcement(
     }))
 }
 
+fn query_discovery_bootnodes_for_nearby_records(
+    state_dir: &Path,
+    network_id: &str,
+    settings: &NearbyDiscoverySettings,
+    now_ms: u64,
+) -> Result<Vec<SignedDiscoveryNodeRecord>> {
+    if !settings.enabled || !settings.has_local_geo() {
+        return Ok(Vec::new());
+    }
+    let discovery_urls = crate::control::load_discovery_bootnode_urls_state(state_dir)?;
+    if discovery_urls.is_empty() {
+        return Ok(Vec::new());
+    }
+    let latitude = settings.latitude.expect("checked by has_local_geo");
+    let longitude = settings.longitude.expect("checked by has_local_geo");
+    let client = reqwest::blocking::Client::builder()
+        .timeout(DISCOVERY_BOOTNODE_QUERY_TIMEOUT)
+        .build()
+        .context("build discovery bootnode query HTTP client")?;
+    let mut records = Vec::new();
+    let mut seen = HashSet::new();
+    for discovery_url in discovery_urls {
+        let endpoint = match discovery_bootnode_nearby_endpoint(
+            &discovery_url,
+            network_id,
+            latitude,
+            longitude,
+            settings.radius_km,
+        ) {
+            Ok(endpoint) => endpoint,
+            Err(error) => {
+                eprintln!("discovery bootnode URL skipped {discovery_url}: {error}");
+                continue;
+            }
+        };
+        match client.get(endpoint.clone()).send() {
+            Ok(response) => match response.error_for_status() {
+                Ok(response) => match response.json::<DiscoveryBootnodeNearbyResponse>() {
+                    Ok(payload) => {
+                        for record in payload.records {
+                            if record.verify_fresh_at(now_ms).is_ok()
+                                && record.body.network_id == network_id
+                                && seen.insert(record.body.node_id.clone())
+                            {
+                                records.push(record);
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        eprintln!("discovery bootnode response decode failed {endpoint}: {error}")
+                    }
+                },
+                Err(error) => eprintln!("discovery bootnode query failed {endpoint}: {error}"),
+            },
+            Err(error) => eprintln!("discovery bootnode query failed {endpoint}: {error}"),
+        }
+    }
+    Ok(records)
+}
+
+fn discovery_bootnode_nearby_endpoint(
+    base_url: &str,
+    network_id: &str,
+    latitude: f64,
+    longitude: f64,
+    radius_km: f64,
+) -> Result<String> {
+    let base_url = base_url.trim().trim_end_matches('/');
+    let endpoint = if base_url.ends_with("/api/network/discovery/nearby") {
+        base_url.to_owned()
+    } else if base_url.ends_with("/api/network/discovery") {
+        format!("{base_url}/nearby")
+    } else {
+        format!("{base_url}/api/network/discovery/nearby")
+    };
+    let mut url = reqwest::Url::parse(&endpoint)
+        .with_context(|| format!("parse discovery bootnode URL {endpoint}"))?;
+    url.query_pairs_mut()
+        .append_pair("network_id", network_id)
+        .append_pair("latitude", &latitude.to_string())
+        .append_pair("longitude", &longitude.to_string())
+        .append_pair("radius_km", &radius_km.to_string())
+        .append_pair("limit", &DISCOVERY_BOOTNODE_QUERY_LIMIT.to_string());
+    Ok(url.to_string())
+}
+
+fn apply_discovery_bootnode_record(
+    service: &mut NetworkBridgeService,
+    node: &mut Node,
+    state_dir: &Path,
+    local_peer_id: &str,
+    network_id: &str,
+    settings: &NearbyDiscoverySettings,
+    record: SignedDiscoveryNodeRecord,
+    now_ms: u64,
+) -> Result<bool> {
+    record.verify_fresh_at(now_ms)?;
+    if record.body.network_id != network_id {
+        return Ok(false);
+    }
+    if record.body.node_id == local_peer_id {
+        return Ok(false);
+    }
+    let Some(remote_geo) = &record.body.geo else {
+        return Ok(false);
+    };
+    let Some(distance_km) = discovery_record_distance_km(settings, remote_geo) else {
+        return Ok(false);
+    };
+    if distance_km > settings.radius_km.min(remote_geo.radius_km) {
+        return Ok(false);
+    }
+    let Some(contact) = record.body.transport_contact.clone() else {
+        return Ok(false);
+    };
+    if contact.transport != DataTransportRoute::IrohDirect.as_str() {
+        return Ok(false);
+    }
+    let remote_network_peer_id = iroh_contact_network_peer_id(&contact)?;
+    if remote_network_peer_id != record.body.node_id {
+        bail!(
+            "discovery record node_id {} does not match Iroh contact peer {}",
+            record.body.node_id,
+            remote_network_peer_id
+        );
+    }
+    let registered = service
+        .runtime
+        .upsert_remote_contact_material(remote_network_peer_id.clone(), contact)?;
+    if !registered {
+        return Ok(false);
+    }
+    upsert_contact_material_for_peer(
+        state_dir,
+        &record.body.node_id,
+        &raw_contact_material_from_discovery_record(&record)?,
+    )?;
+    mark_peer_metadata_discovery_v1(state_dir, &record.body.node_id, &record.body.network_id)?;
+    node.discover_peer(record.body.node_id.clone());
+    diagnostics::record_diagnostic(
+        Some(state_dir),
+        diagnostics::DiagnosticEvent::new(
+            "info",
+            "discovery",
+            "discovery_v1.peer.accepted",
+            "ok",
+            format!("discovery v1 peer accepted: {}", record.body.node_id),
+        )
+        .object("peer", Some(record.body.node_id.clone()))
+        .source_node_id(Some(record.body.node_id.clone()))
+        .details(json!({
+            "distance_km": distance_km,
+            "registered_contact": registered,
+            "radius_km": settings.radius_km,
+        })),
+    );
+    Ok(registered)
+}
+
+fn discovery_record_distance_km(
+    settings: &NearbyDiscoverySettings,
+    remote_geo: &DiscoveryGeo,
+) -> Option<f64> {
+    let local_latitude = settings.latitude?;
+    let local_longitude = settings.longitude?;
+    if !valid_latitude(&remote_geo.latitude) || !valid_longitude(&remote_geo.longitude) {
+        return None;
+    }
+    Some(distance_km_between(
+        local_latitude,
+        local_longitude,
+        remote_geo.latitude,
+        remote_geo.longitude,
+    ))
+}
+
+fn raw_contact_material_from_discovery_record(
+    record: &SignedDiscoveryNodeRecord,
+) -> Result<RawContactMaterial> {
+    let contact = record
+        .body
+        .transport_contact
+        .clone()
+        .ok_or_else(|| anyhow!("discovery record missing transport contact"))?;
+    let recommended_routes =
+        crate::control::recommended_data_routes(Some(&contact.metadata.capabilities));
+    let node_id = record.body.node_id.clone();
+    let protocol_version = record.body.protocol_version.clone();
+    let material = json!({
+        "node_id": node_id,
+        "peer_id": contact.peer_id,
+        "listen_addrs": contact.metadata.listen_addrs.clone(),
+        "generated_at": record.body.updated_at_ms,
+        "transports": [contact],
+        "recommended_routes": recommended_routes,
+        "discovery_protocol": protocol_version,
+    });
+    Ok(RawContactMaterial {
+        material_json: serde_json::to_string(&material)?,
+        signature: Some(record.signature_hex.clone()),
+        generated_at: record.body.updated_at_ms,
+    })
+}
+
 fn contact_material_transports(
     contact_material: &RawContactMaterial,
 ) -> Result<Vec<TransportContactMaterial>> {
@@ -1949,6 +2161,25 @@ fn mark_peer_metadata_nearby_discovered(
     record.network_id = Some(network_id.to_owned());
     if record.handshake_status == "unknown" || record.handshake_status == "contact_material" {
         record.handshake_status = "nearby_discovery".to_owned();
+    }
+    record.last_error = None;
+    crate::control::save_peer_metadata_record_state(state_dir, &record)
+}
+
+fn mark_peer_metadata_discovery_v1(
+    state_dir: &Path,
+    remote_node_id: &str,
+    network_id: &str,
+) -> Result<()> {
+    let Some(mut record) = crate::control::load_peer_metadata_records_state(state_dir)?
+        .into_iter()
+        .find(|record| record.node_id == remote_node_id)
+    else {
+        return Ok(());
+    };
+    record.network_id = Some(network_id.to_owned());
+    if record.handshake_status == "unknown" || record.handshake_status == "contact_material" {
+        record.handshake_status = "discovery_v1".to_owned();
     }
     record.last_error = None;
     crate::control::save_peer_metadata_record_state(state_dir, &record)
@@ -2658,6 +2889,36 @@ fn run_background_network_service_with_hook(
             match nearby_discovery_settings_from_state_dir(state_dir) {
                 Ok(settings) => {
                     next_nearby_discovery_at = Instant::now() + settings.interval;
+                    let network_id = current_network_context_id(&node);
+                    match query_discovery_bootnodes_for_nearby_records(
+                        state_dir,
+                        &network_id,
+                        &settings,
+                        observed_at_ms(),
+                    ) {
+                        Ok(records) => {
+                            for record in records {
+                                let local_peer_id = service.local_peer_id().to_string();
+                                match apply_discovery_bootnode_record(
+                                    &mut service,
+                                    &mut node,
+                                    state_dir,
+                                    &local_peer_id,
+                                    &network_id,
+                                    &settings,
+                                    record,
+                                    observed_at_ms(),
+                                ) {
+                                    Ok(true) => did_work = true,
+                                    Ok(false) => {}
+                                    Err(err) => {
+                                        eprintln!("discovery bootnode record skipped: {err}")
+                                    }
+                                }
+                            }
+                        }
+                        Err(err) => eprintln!("discovery bootnode query skipped: {err}"),
+                    }
                     match build_nearby_discovery_announcement(
                         state_dir,
                         &node,

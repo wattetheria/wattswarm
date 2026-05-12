@@ -53,7 +53,7 @@ This repository now contains a Rust-first v0.1 implementation of:
 WattSwarm should be treated as a kernel-first project:
 
 - Kernel/Core: `crates/node-core`, `crates/storage-core`, `crates/policy-engine`, `crates/protocol`, `crates/crypto`, `crates/runtime-client`
-- Network and transport layer: `crates/network-p2p`, `crates/network-substrate`, `crates/network-transport-core`, `crates/network-transport-iroh`
+- Network and transport layer: `crates/network-discovery`, `crates/network-p2p`, `crates/network-substrate`, `crates/network-transport-core`, `crates/network-transport-iroh`
 - Artifact/object storage: `crates/artifact-store`
 - Network-to-kernel bridge: `crates/control-plane/src/network_bridge/mod.rs`
 - UI/Console: `ui/*` (optional operational shell)
@@ -128,6 +128,11 @@ The workspace now includes dedicated crates and a control-plane bridge for node-
   - tracks Iroh peer quality with per-peer inflight limits, stream failures, retry backoff, invalid payload penalties, and retry-suppression counters
   - exposes a pollable network runtime facade for subscribe/publish/backfill/contact/relationship-control flows
   - keeps the generated-node compatibility path explicit; normal state-dir startup uses the Iroh runtime
+- `crates/network-discovery`
+  - defines Wattswarm Discovery v1, a discv5/ENR-inspired discovery layer foundation that stays separate from the Iroh communication substrate
+  - owns signed node records with `network_id`, `node_id`, sequence number, TTL, optional geo, capabilities, and optional Iroh transport contact material
+  - verifies record signatures with the same Ed25519 node identity used by the Iroh endpoint id
+  - provides bootnode/routing-table primitives for `find_node`, `find_nearby`, and capability lookups without embedding product-specific semantics
 - `crates/network-transport-core`
   - owns the shared data-plane transport abstraction used across WattSwarm-family projects
   - defines transport capabilities, protected contact material, transfer intents, and route selection
@@ -201,6 +206,26 @@ Nearby discovery runs over the Iroh gossip discovery lane and is only a peer-dis
 - `WATTSWARM_NEARBY_DISCOVERY_TTL_MS=300000` by default; remote announcements older than this are ignored.
 
 Accepted nearby peers update `discovered_peers_local` with source kind `nearby`, persist Iroh contact material into `peer_metadata_local`, and are handed to the Iroh runtime for normal peer connectivity.
+
+Wattswarm Discovery v1 is the shared foundation for a dedicated discovery layer, separate from the communication layer. It is modeled after Ethereum's split between discovery records/bootnodes and the later transport session:
+
+- discovery finds candidate nodes and validates signed node records
+- Iroh remains responsible for real connectivity, gossip, backfill, task/topic sync, relationship requests, and DM traffic
+- bootnodes may store and answer queries over signed records, but records are still verified locally by every node
+- gateway and servicenet can reuse the same discovery record/routing primitives through `crates/network-discovery`
+
+The current runtime uses Discovery v1 as a bootnode-assisted candidate source: joining nodes persist `discovery_urls` from the join manifest, publish their own signed record after P2P startup, periodically query nearby records, verify them locally, and pass valid Iroh contact material into the communication substrate. The existing Iroh gossip nearby discovery remains as an additional peer-discovery path.
+
+Bootnode-assisted Discovery v1 HTTP surface:
+
+- `POST /api/network/discovery/records` accepts a `SignedDiscoveryNodeRecord`, verifies signature/TTL/sequence, and stores the freshest record in the node state directory.
+- `GET /api/network/discovery/node/:node_id` returns one active signed record by node id.
+- `GET /api/network/discovery/nearby?network_id=<id>&latitude=<lat>&longitude=<lon>&radius_km=<km>&limit=<n>` returns active records inside both local and remote radius bounds.
+- `GET /api/network/discovery/capability?network_id=<id>&capability=<capability>&limit=<n>` returns active records that advertise a capability.
+- `WATTSWARM_PUBLIC_DISCOVERY_URLS` publishes discovery API base URLs in `/.well-known/wattswarm/join.json` as `discovery_urls`.
+- joining nodes store manifest `discovery_urls` in `discovery_bootnode_urls_v1.json`, not in `startup_config.json`.
+- the network bridge queries configured discovery bootnodes on the nearby discovery interval and registers only records that pass signature, TTL, network id, self-node, geo-radius, and Iroh contact validation.
+- `discovered_peers_local` is updated by the existing `ConnectionEstablished` path with `source_kind=connected`; discovery candidates alone are stored as peer metadata/contact material, not as connected peers.
 
 Network-mode bootstrap behavior:
 

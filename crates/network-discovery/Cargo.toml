@@ -1,0 +1,12 @@
+[package]
+name = "wattswarm-network-discovery"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = { workspace = true }
+hex = { workspace = true }
+serde = { workspace = true }
+serde_jcs = { workspace = true }
+wattswarm-crypto = { workspace = true }
+wattswarm-network-transport-core = { workspace = true }
