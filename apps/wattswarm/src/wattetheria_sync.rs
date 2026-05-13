@@ -8,7 +8,7 @@ use crate::control::{
 use crate::http::{ApiError, UiServerState, run_blocking};
 use crate::run_control;
 use crate::run_queue::{RunSubmitSpec, RunView};
-use crate::startup_config::{load_startup_config, startup_config_path};
+use crate::startup_config::{load_startup_config, startup_config_path, update_startup_config_geo};
 use crate::storage::storage::{
     LocalRemoteTaskBridgeRow, TaskCandidateRow, TaskProjectionRow, TopicCursorRow, TopicMessageRow,
     VerifierResultRow, VoteRevealRow,
@@ -36,7 +36,9 @@ pub mod proto {
 use proto::wattetheria_sync_service_server::{
     WattetheriaSyncService, WattetheriaSyncServiceServer,
 };
-use proto::{ProjectionFrame, ProjectionStreamRequest};
+use proto::{
+    ProjectionFrame, ProjectionStreamRequest, UpdateStartupGeoRequest, UpdateStartupGeoResponse,
+};
 
 const DEFAULT_GRPC_LISTEN_ADDR: &str = "127.0.0.1:7791";
 
@@ -1043,6 +1045,35 @@ impl WattetheriaSyncService for WattetheriaSyncGrpcService {
     type StreamTaskRunProjectionStream = ProjectionStream;
     type StreamTopicActivityStream = ProjectionStream;
     type StreamSocialProjectionStream = ProjectionStream;
+
+    async fn update_startup_geo(
+        &self,
+        request: Request<UpdateStartupGeoRequest>,
+    ) -> std::result::Result<Response<UpdateStartupGeoResponse>, Status> {
+        let runtime = self.runtime.clone();
+        let request = request.into_inner();
+        if !request.latitude.is_finite() || !(-90.0..=90.0).contains(&request.latitude) {
+            return Err(Status::invalid_argument(
+                "latitude must be between -90 and 90",
+            ));
+        }
+        if !request.longitude.is_finite() || !(-180.0..=180.0).contains(&request.longitude) {
+            return Err(Status::invalid_argument(
+                "longitude must be between -180 and 180",
+            ));
+        }
+        let updated = tokio::task::spawn_blocking(move || {
+            update_startup_config_geo(
+                &startup_config_path(&runtime.state_dir),
+                request.latitude,
+                request.longitude,
+            )
+        })
+        .await
+        .map_err(|err| Status::internal(format!("join startup geo update task: {err}")))?
+        .map_err(|err| Status::internal(err.to_string()))?;
+        Ok(Response::new(UpdateStartupGeoResponse { updated }))
+    }
 
     async fn stream_network_projection(
         &self,

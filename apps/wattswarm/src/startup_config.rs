@@ -254,6 +254,28 @@ pub fn save_startup_config(path: &Path, config: &StartupConfig) -> Result<()> {
     Ok(())
 }
 
+pub fn update_startup_config_geo(path: &Path, latitude: f64, longitude: f64) -> Result<bool> {
+    validate_geo_coordinate(latitude, -90.0, 90.0, "latitude")?;
+    validate_geo_coordinate(longitude, -180.0, 180.0, "longitude")?;
+
+    let mut config = load_startup_config(path)?;
+    if config.latitude == Some(latitude) && config.longitude == Some(longitude) {
+        return Ok(false);
+    }
+    config.latitude = Some(latitude);
+    config.longitude = Some(longitude);
+    config.validate()?;
+    save_startup_config(path, &config)?;
+    Ok(true)
+}
+
+fn validate_geo_coordinate(value: f64, min: f64, max: f64, label: &str) -> Result<()> {
+    if !value.is_finite() || !(min..=max).contains(&value) {
+        bail!("{label} must be between {min} and {max}");
+    }
+    Ok(())
+}
+
 pub fn sync_core_agent_executor(state_dir: &Path, config: &StartupConfig) -> Result<bool> {
     if !matches!(
         config.core_agent.mode,
@@ -288,7 +310,7 @@ mod tests {
     use super::{
         CoreAgentConfig, CoreAgentMode, NetworkMode, StartupConfig, core_agent_executor_name,
         ensure_default_wan_startup_config, load_startup_config, save_startup_config,
-        startup_config_path,
+        startup_config_path, update_startup_config_geo,
     };
 
     #[test]
@@ -448,5 +470,50 @@ mod tests {
         assert_eq!(config.network_mode, NetworkMode::Lan);
         assert_eq!(config.bootstrap_contacts, vec!["iroh-contact-a"]);
         assert_eq!(config.gateway_urls, vec!["https://gw.example.com"]);
+    }
+
+    #[test]
+    fn update_startup_config_geo_preserves_other_startup_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = startup_config_path(dir.path());
+        let existing = StartupConfig {
+            display_name: "Sydney Node".to_owned(),
+            network_mode: NetworkMode::Wan,
+            gateway_urls: vec!["https://gateway.example.com".to_owned()],
+            latitude: Some(1.0),
+            longitude: Some(2.0),
+            ..StartupConfig::default()
+        };
+        save_startup_config(&path, &existing).unwrap();
+
+        let updated = update_startup_config_geo(&path, -33.8399, 151.0583).unwrap();
+
+        assert!(updated);
+        let saved = load_startup_config(&path).unwrap();
+        assert_eq!(saved.display_name, "Sydney Node");
+        assert_eq!(saved.network_mode, NetworkMode::Wan);
+        assert_eq!(
+            saved.gateway_urls,
+            vec!["https://gateway.example.com".to_owned()]
+        );
+        assert!(
+            saved
+                .latitude
+                .is_some_and(|value| (value - -33.8399).abs() < f64::EPSILON)
+        );
+        assert!(
+            saved
+                .longitude
+                .is_some_and(|value| (value - 151.0583).abs() < f64::EPSILON)
+        );
+    }
+
+    #[test]
+    fn update_startup_config_geo_rejects_invalid_coordinates() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = startup_config_path(dir.path());
+
+        assert!(update_startup_config_geo(&path, 91.0, 0.0).is_err());
+        assert!(update_startup_config_geo(&path, 0.0, f64::NAN).is_err());
     }
 }

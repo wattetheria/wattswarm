@@ -899,7 +899,9 @@ fn maybe_sync_network_bootstrap_bundle(
         state_dir,
         store,
         include_default_wan_endpoint,
-    )? {
+    )
+    .context("sync network bootstrap bundle from join manifest")?
+    {
         return Ok(true);
     }
 

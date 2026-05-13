@@ -2643,7 +2643,7 @@ pub fn maybe_start_background_network_service_with_hook(
             scopes,
             post_tick_hook,
         ) {
-            eprintln!("network bridge stopped: {err}");
+            eprintln!("network bridge stopped: {err:#}");
         }
         clear_latest_network_observability_snapshot(&state_dir_for_registry);
         let mut started = started_network_services()
@@ -2665,11 +2665,16 @@ fn run_background_network_service_with_hook(
     configured_scopes: Vec<SwarmScope>,
     post_tick_hook: Option<PostTickHook>,
 ) -> Result<()> {
-    let mut node = crate::control::open_configured_node(state_dir, db_path)?;
+    let mut node = crate::control::open_configured_node(state_dir, db_path)
+        .context("network bridge startup open configured node")?;
     let node_id = node.node_id();
     let scopes = merge_scopes(configured_scopes);
-    let dynamic_subscriptions = dynamic_subscription_scope_kinds_for_node(&node, &node_id)?;
-    let verified_protocol_params = node.store.load_verified_network_protocol_params()?;
+    let dynamic_subscriptions = dynamic_subscription_scope_kinds_for_node(&node, &node_id)
+        .context("network bridge startup load dynamic subscriptions")?;
+    let verified_protocol_params = node
+        .store
+        .load_verified_network_protocol_params()
+        .context("network bridge startup load verified protocol params")?;
     let protocol_params = verified_protocol_params.params().clone();
     let mut config = config.apply_protocol_params(&protocol_params);
     let handshake_network_id = verified_protocol_params.network_id.clone();
@@ -2682,17 +2687,28 @@ fn run_background_network_service_with_hook(
             params_version: handshake_params_version,
             params_hash: handshake_params_hash,
         });
-    config.validate()?;
+    config
+        .validate()
+        .context("network bridge startup validate p2p config")?;
     let mut service = NetworkBridgeService::new(
-        network_node_from_state_dir(state_dir, config)?,
+        network_node_from_state_dir(state_dir, config)
+            .context("network bridge startup create network p2p node")?,
         &scopes,
         &protocol_params,
-    )?;
+    )
+    .context("network bridge startup create bridge service")?;
     for (scope, gossip_kinds) in dynamic_subscriptions {
-        service.subscribe_scope_kinds(&scope, &gossip_kinds)?;
+        service
+            .subscribe_scope_kinds(&scope, &gossip_kinds)
+            .context("network bridge startup subscribe dynamic scope kinds")?;
     }
     service.set_state_dir(state_dir.to_path_buf(), db_path.to_path_buf());
-    store_latest_network_observability_snapshot(state_dir, service.observability_snapshot(&node)?);
+    store_latest_network_observability_snapshot(
+        state_dir,
+        service
+            .observability_snapshot(&node)
+            .context("network bridge startup build initial observability snapshot")?,
+    );
     let mut announced_listen = false;
     let mut announced_peers: HashMap<String, Instant> = HashMap::new();
     let mut last_published_seq = node.head_seq()?;
@@ -2743,7 +2759,8 @@ fn run_background_network_service_with_hook(
             did_work = true;
         }
         let new_last_published_seq =
-            publish_pending_scoped_updates(&mut service, &node, &node_id, last_published_seq)?;
+            publish_pending_scoped_updates(&mut service, &node, &node_id, last_published_seq)
+                .context("network bridge publish pending scoped updates")?;
         if new_last_published_seq != last_published_seq {
             did_work = true;
             last_published_seq = new_last_published_seq;
@@ -2790,7 +2807,11 @@ fn run_background_network_service_with_hook(
                 }
             }
         }
-        if service.run_anti_entropy(&node)? > 0 {
+        if service
+            .run_anti_entropy(&node)
+            .context("network bridge run anti-entropy")?
+            > 0
+        {
             did_work = true;
         }
         match service.observability_snapshot(&node) {

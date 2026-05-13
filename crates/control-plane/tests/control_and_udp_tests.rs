@@ -1703,10 +1703,11 @@ fn open_node_network_mode_rejects_join_manifest_params_hash_mismatch() {
         Ok(_) => panic!("mismatched params hash must fail"),
         Err(err) => err,
     };
-    assert!(
-        err.to_string()
+    assert!(err.chain().any(|cause| {
+        cause
+            .to_string()
             .contains("join manifest params_hash mismatch")
-    );
+    }));
 
     cleanup_dir(&dir);
 }

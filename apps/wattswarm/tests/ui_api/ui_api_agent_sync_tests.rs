@@ -1108,6 +1108,30 @@ fn ui_exposes_wattetheria_sync_grpc_streams() {
             }
         };
 
+        let geo_response = client
+            .update_startup_geo(GrpcRequest::new(UpdateStartupGeoRequest {
+                latitude: -33.8399,
+                longitude: 151.0583,
+            }))
+            .await
+            .expect("update startup geo")
+            .into_inner();
+        assert!(geo_response.updated);
+        let startup_config = wattswarm::startup_config::load_startup_config(
+            &wattswarm::startup_config::startup_config_path(&state_dir),
+        )
+        .expect("load startup config after geo update");
+        assert!(
+            startup_config
+                .latitude
+                .is_some_and(|value| (value - -33.8399).abs() < f64::EPSILON)
+        );
+        assert!(
+            startup_config
+                .longitude
+                .is_some_and(|value| (value - 151.0583).abs() < f64::EPSILON)
+        );
+
         let network_frame = tokio::time::timeout(Duration::from_secs(15), async {
             client
                 .stream_network_projection(GrpcRequest::new(ProjectionStreamRequest {

@@ -28,8 +28,8 @@ use wattswarm::types::{
 };
 use wattswarm::ui::{UiServerState, build_app};
 use wattswarm::wattetheria_sync;
-use wattswarm::wattetheria_sync::proto::ProjectionStreamRequest;
 use wattswarm::wattetheria_sync::proto::wattetheria_sync_service_client::WattetheriaSyncServiceClient;
+use wattswarm::wattetheria_sync::proto::{ProjectionStreamRequest, UpdateStartupGeoRequest};
 use wattswarm_network_discovery::{
     DEFAULT_RECORD_TTL_MS, DiscoveryGeo, DiscoveryNodeRecordBody, DiscoveryRecordCapabilities,
     SignedDiscoveryNodeRecord,

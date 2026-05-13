@@ -783,10 +783,21 @@ fn configured_node_mode_from_startup_config(state_dir: &Path) -> Result<Option<N
 
 pub fn write_node_state(state_dir: &Path, running: bool, mode: NodeMode) -> Result<()> {
     fs::create_dir_all(state_dir)?;
+    let state_path = node_state_path(state_dir);
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let tmp_path = state_dir.join(format!(
+        ".node_state.json.{}.{}.tmp",
+        std::process::id(),
+        nonce
+    ));
     fs::write(
-        node_state_path(state_dir),
+        &tmp_path,
         serde_json::to_vec_pretty(&NodeState { running, mode })?,
     )?;
+    fs::rename(&tmp_path, state_path)?;
     Ok(())
 }
 
@@ -850,27 +861,28 @@ fn open_node_for_topology(
 }
 
 pub fn open_node_in_mode(state_dir: &Path, db_path: &Path, mode: NodeMode) -> Result<Node> {
-    let identity = load_or_create_identity(&state_dir.join("node_seed.hex"))?;
+    let identity = load_or_create_identity(&state_dir.join("node_seed.hex"))
+        .context("open node load local identity")?;
     let self_node_id = identity.node_id();
     let now = chrono::Utc::now().timestamp_millis().max(0) as u64;
-    let store = PgStore::open(db_path)?;
+    let store = PgStore::open(db_path).context("open node open store")?;
     if mode == NodeMode::Network {
-        maybe_sync_network_bootstrap_bundle(state_dir, &store, &self_node_id, now)?;
+        maybe_sync_network_bootstrap_bundle(state_dir, &store, &self_node_id, now)
+            .context("open node sync network bootstrap bundle")?;
     }
     let topology = match mode {
-        NodeMode::Local => {
-            store.ensure_local_bootstrap_network_topology(&self_node_id, &self_node_id, now)?
-        }
-        NodeMode::Lan => {
-            store.ensure_lan_bootstrap_network_topology(&self_node_id, &self_node_id, now)?
-        }
-        NodeMode::Network => store.resolve_network_bootstrap_topology_descriptor(
-            &self_node_id,
-            &self_node_id,
-            now,
-        )?,
+        NodeMode::Local => store
+            .ensure_local_bootstrap_network_topology(&self_node_id, &self_node_id, now)
+            .context("open node ensure local bootstrap topology")?,
+        NodeMode::Lan => store
+            .ensure_lan_bootstrap_network_topology(&self_node_id, &self_node_id, now)
+            .context("open node ensure lan bootstrap topology")?,
+        NodeMode::Network => store
+            .resolve_network_bootstrap_topology_descriptor(&self_node_id, &self_node_id, now)
+            .context("open node resolve network bootstrap topology")?,
     };
     open_node_for_topology(state_dir, topology, identity, store)
+        .context("open node initialize topology-bound node")
 }
 
 pub fn open_node_on_network_id(state_dir: &Path, db_path: &Path, network_id: &str) -> Result<Node> {
@@ -1702,4 +1714,40 @@ pub fn save_executor_registry_state(state_dir: &Path, reg: &ExecutorRegistry) ->
             .collect::<Vec<_>>(),
         now,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn write_node_state_replaces_file_without_leaving_temp_file() {
+        let state_dir = std::env::temp_dir().join(format!(
+            "wattswarm-node-state-test-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        fs::create_dir_all(&state_dir).expect("create state dir");
+
+        write_node_state(&state_dir, true, NodeMode::Network).expect("write network state");
+        write_node_state(&state_dir, false, NodeMode::Local).expect("replace local state");
+
+        let state: NodeState = serde_json::from_slice(
+            &fs::read(node_state_path(&state_dir)).expect("read node state"),
+        )
+        .expect("parse node state");
+        assert!(!state.running);
+        assert_eq!(state.mode, NodeMode::Local);
+
+        let leftover_tmp = fs::read_dir(&state_dir)
+            .expect("read state dir")
+            .filter_map(|entry| entry.ok())
+            .any(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".node_state.json.")
+            });
+        assert!(!leftover_tmp);
+        fs::remove_dir_all(&state_dir).expect("remove state dir");
+    }
 }

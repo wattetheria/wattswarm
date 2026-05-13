@@ -18,9 +18,19 @@ message ProjectionFrame {
   string json_payload = 4;
 }
 
+message UpdateStartupGeoRequest {
+  double latitude = 1;
+  double longitude = 2;
+}
+
+message UpdateStartupGeoResponse {
+  bool updated = 1;
+}
+
 service WattetheriaSyncService {
   rpc StreamNetworkProjection(ProjectionStreamRequest) returns (stream ProjectionFrame);
   rpc StreamTaskRunProjection(ProjectionStreamRequest) returns (stream ProjectionFrame);
   rpc StreamTopicActivity(ProjectionStreamRequest) returns (stream ProjectionFrame);
   rpc StreamSocialProjection(ProjectionStreamRequest) returns (stream ProjectionFrame);
+  rpc UpdateStartupGeo(UpdateStartupGeoRequest) returns (UpdateStartupGeoResponse);
 }
