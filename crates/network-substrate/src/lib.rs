@@ -181,17 +181,15 @@ pub enum GossipKind {
     Rules,
     Checkpoints,
     Summaries,
-    Discovery,
 }
 
 impl GossipKind {
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 5] = [
         Self::Events,
         Self::Messages,
         Self::Rules,
         Self::Checkpoints,
         Self::Summaries,
-        Self::Discovery,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -201,7 +199,6 @@ impl GossipKind {
             Self::Rules => "rules",
             Self::Checkpoints => "checkpoints",
             Self::Summaries => "summaries",
-            Self::Discovery => "discovery",
         }
     }
 }
@@ -241,7 +238,6 @@ pub struct TopicCatalog {
     pub rules: String,
     pub checkpoints: String,
     pub summaries: String,
-    pub discovery: String,
 }
 
 impl TopicCatalog {
@@ -252,7 +248,6 @@ impl TopicCatalog {
             rules: namespace.topic_name(scope, GossipKind::Rules)?,
             checkpoints: namespace.topic_name(scope, GossipKind::Checkpoints)?,
             summaries: namespace.topic_name(scope, GossipKind::Summaries)?,
-            discovery: namespace.topic_name(scope, GossipKind::Discovery)?,
         })
     }
 }
@@ -2215,10 +2210,6 @@ mod tests {
         assert_eq!(
             catalog.checkpoints,
             "swarmnet.main-alpha.region.sol-1-alpha.checkpoints"
-        );
-        assert_eq!(
-            catalog.discovery,
-            "swarmnet.main-alpha.region.sol-1-alpha.discovery"
         );
     }
 

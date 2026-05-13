@@ -714,7 +714,8 @@ fn ui_diagnostics_api_lists_wattswarm_network_diagnostics() {
         std::fs::create_dir_all(state_dir.join("diagnostics")).unwrap();
         std::fs::write(
             state_dir.join("diagnostics/wattswarm_node.jsonl"),
-            r#"{"id":"diag-1","timestamp_ms":123,"level":"info","component":"wattswarm.network_bridge","category":"gossip","phase":"publish.event","status":"ok","message":"published local event","event_id":"event-1","object_kind":"task","object_id":"task-1","source_node_id":"peer-a","scope_hint":"node:peer-b","details":{"topic":"events"}}"#,
+            r#"{"id":"diag-1","timestamp_ms":123,"level":"info","component":"wattswarm.network_bridge","category":"gossip","phase":"publish.event","status":"ok","message":"published local event","event_id":"event-1","object_kind":"task","object_id":"task-1","source_node_id":"peer-a","scope_hint":"node:peer-b","details":{"topic":"events"}}
+{"id":"diag-2","timestamp_ms":124,"level":"info","component":"wattswarm.network_bridge","category":"gossip","phase":"publish.event","status":"ok","message":"published local event","event_id":"event-1","object_kind":"task","object_id":"task-1","source_node_id":"peer-a","scope_hint":"node:peer-b","details":{"topic":"events"}}"#,
         )
         .unwrap();
         let db_path = state_dir.join("ui.state");

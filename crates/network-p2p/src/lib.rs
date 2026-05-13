@@ -130,19 +130,6 @@ pub struct SummaryAnnouncement {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct PeerDiscoveryAnnouncement {
-    pub scope: SwarmScope,
-    pub network_id: String,
-    pub source_node_id: String,
-    pub latitude: f64,
-    pub longitude: f64,
-    pub radius_km: f64,
-    pub contact_material: RawContactMaterial,
-    pub updated_at: u64,
-    pub ttl_ms: u64,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", content = "payload")]
 pub enum GossipMessage {
     Event(EventEnvelope),
@@ -150,7 +137,6 @@ pub enum GossipMessage {
     Rule(RuleAnnouncement),
     Checkpoint(CheckpointAnnouncement),
     Summary(SummaryAnnouncement),
-    Discovery(PeerDiscoveryAnnouncement),
 }
 
 impl GossipMessage {
@@ -161,7 +147,6 @@ impl GossipMessage {
             Self::Rule(_) => GossipKind::Rules,
             Self::Checkpoint(_) => GossipKind::Checkpoints,
             Self::Summary(_) => GossipKind::Summaries,
-            Self::Discovery(_) => GossipKind::Discovery,
         }
     }
 
@@ -172,7 +157,6 @@ impl GossipMessage {
             Self::Rule(payload) => &payload.scope,
             Self::Checkpoint(payload) => &payload.scope,
             Self::Summary(payload) => &payload.scope,
-            Self::Discovery(payload) => &payload.scope,
         }
     }
 
@@ -868,7 +852,6 @@ pub(crate) fn decode_overlay_gossip(message: RawGossipMessage) -> Result<GossipM
         GossipKind::Rules => Ok(GossipMessage::Rule(serde_json::from_slice(payload)?)),
         GossipKind::Checkpoints => Ok(GossipMessage::Checkpoint(serde_json::from_slice(payload)?)),
         GossipKind::Summaries => Ok(GossipMessage::Summary(serde_json::from_slice(payload)?)),
-        GossipKind::Discovery => Ok(GossipMessage::Discovery(serde_json::from_slice(payload)?)),
     }
 }
 
@@ -878,7 +861,6 @@ pub(crate) fn encode_overlay_payload(message: &GossipMessage) -> Result<Vec<u8>>
         GossipMessage::Rule(rule) => Ok(serde_json::to_vec(rule)?),
         GossipMessage::Checkpoint(checkpoint) => Ok(serde_json::to_vec(checkpoint)?),
         GossipMessage::Summary(summary) => Ok(serde_json::to_vec(summary)?),
-        GossipMessage::Discovery(discovery) => Ok(serde_json::to_vec(discovery)?),
     }
 }
 
@@ -962,32 +944,6 @@ mod tests {
             summary_kind: "knowledge".to_owned(),
             artifact_path: None,
             payload: serde_json::json!({"ok": true}),
-        });
-        let raw = RawGossipMessage {
-            scope: overlay.scope().clone(),
-            kind: overlay.kind(),
-            payload: encode_overlay_payload(&overlay).unwrap(),
-        };
-        let decoded = decode_overlay_gossip(raw).unwrap();
-        assert_eq!(decoded, overlay);
-    }
-
-    #[test]
-    fn discovery_gossip_maps_back_to_overlay_message() {
-        let overlay = GossipMessage::Discovery(PeerDiscoveryAnnouncement {
-            scope: SwarmScope::Global,
-            network_id: "mainnet".to_owned(),
-            source_node_id: "node-1".to_owned(),
-            latitude: 1.25,
-            longitude: 2.5,
-            radius_km: 50.0,
-            contact_material: RawContactMaterial {
-                material_json: "{}".to_owned(),
-                signature: None,
-                generated_at: 42,
-            },
-            updated_at: 43,
-            ttl_ms: 60_000,
         });
         let raw = RawGossipMessage {
             scope: overlay.scope().clone(),

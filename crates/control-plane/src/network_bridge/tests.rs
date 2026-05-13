@@ -18,7 +18,7 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use uuid::Uuid;
-use wattswarm_network_discovery::DiscoveryNodeRecordBody;
+use wattswarm_network_discovery::{DEFAULT_RECORD_TTL_MS, DiscoveryNodeRecordBody};
 
 fn env_test_lock() -> &'static Mutex<()> {
     static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -2513,6 +2513,96 @@ fn connection_closed_with_zero_remaining_preserves_peer_sync_state() {
 }
 
 #[test]
+fn connection_established_diagnostics_skip_duplicate_peer_events() {
+    let dir = temp_startup_dir("connection-established-diagnostics-dedupe");
+    let peer = random_network_node_id();
+    let address = "/ip4/203.0.113.10/tcp/4001"
+        .parse::<NetworkAddress>()
+        .expect("addr");
+    let mut node = Node::open_in_memory_with_roles(&[Role::Proposer]).expect("node");
+    let mut service = NetworkBridgeService::new(
+        NetworkP2pNode::generate(NetworkP2pConfig::default()).expect("node"),
+        &[SwarmScope::Global],
+        &NetworkProtocolParams::default(),
+    )
+    .expect("service");
+    service.set_state_dir(dir.clone(), dir.join("ui.state"));
+
+    service
+        .process_runtime_event(
+            &mut node,
+            NetworkRuntimeEvent::ConnectionEstablished {
+                peer: peer.clone(),
+                remote_addr: address.clone(),
+            },
+        )
+        .expect("first connection event");
+    service
+        .process_runtime_event(
+            &mut node,
+            NetworkRuntimeEvent::ConnectionEstablished {
+                peer: peer.clone(),
+                remote_addr: address,
+            },
+        )
+        .expect("duplicate connection event");
+
+    let raw =
+        fs::read_to_string(dir.join("diagnostics/wattswarm_node.jsonl")).expect("diagnostic log");
+    assert_eq!(
+        raw.matches("\"phase\":\"connection.established\"").count(),
+        1
+    );
+    let rows = crate::control::load_discovered_peer_records_state(&dir).expect("load rows");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].node_id, peer.to_string());
+    assert_eq!(rows[0].source_kind, "connected");
+
+    std::fs::remove_dir_all(dir).expect("cleanup");
+}
+
+#[test]
+fn connection_closed_diagnostics_skip_duplicate_peer_events() {
+    let dir = temp_startup_dir("connection-closed-diagnostics-dedupe");
+    let peer = random_network_node_id();
+    let mut node = Node::open_in_memory_with_roles(&[Role::Proposer]).expect("node");
+    let mut service = NetworkBridgeService::new(
+        NetworkP2pNode::generate(NetworkP2pConfig::default()).expect("node"),
+        &[SwarmScope::Global],
+        &NetworkProtocolParams::default(),
+    )
+    .expect("service");
+    service.set_state_dir(dir.clone(), dir.join("ui.state"));
+    service.connected_peers.insert(peer.clone());
+
+    service
+        .process_runtime_event(
+            &mut node,
+            NetworkRuntimeEvent::ConnectionClosed {
+                peer: peer.clone(),
+                remaining_established: 0,
+            },
+        )
+        .expect("first close event");
+    service
+        .process_runtime_event(
+            &mut node,
+            NetworkRuntimeEvent::ConnectionClosed {
+                peer: peer.clone(),
+                remaining_established: 0,
+            },
+        )
+        .expect("duplicate close event");
+
+    let raw =
+        fs::read_to_string(dir.join("diagnostics/wattswarm_node.jsonl")).expect("diagnostic log");
+    assert_eq!(raw.matches("\"phase\":\"connection.closed\"").count(), 1);
+    assert!(!service.connected_peers.contains(&peer));
+
+    std::fs::remove_dir_all(dir).expect("cleanup");
+}
+
+#[test]
 fn peer_discovered_event_persists_wan_source_into_local_registry() {
     let dir = temp_startup_dir("peer-discovered-persist");
     let mut node = Node::open_in_memory_with_roles(&[Role::Proposer]).expect("node");
@@ -2753,138 +2843,6 @@ fn set_state_dir_loads_startup_iroh_bootstrap_contacts_into_runtime() {
 }
 
 #[test]
-fn nearby_discovery_gossip_accepts_peer_inside_radius() {
-    let _lock = lock_env_test_mutex();
-    let _enabled = EnvVarGuard::set(ENV_NEARBY_DISCOVERY_ENABLED, None);
-    let _radius = EnvVarGuard::set(ENV_NEARBY_DISCOVERY_RADIUS_KM, None);
-    let _interval = EnvVarGuard::set(ENV_NEARBY_DISCOVERY_INTERVAL_MS, None);
-    let _ttl = EnvVarGuard::set(ENV_NEARBY_DISCOVERY_TTL_MS, None);
-    let local_dir = temp_startup_dir("nearby-discovery-local");
-    let remote_dir = temp_startup_dir("nearby-discovery-remote");
-    let local_seed = [93u8; 32];
-    let remote_seed = [94u8; 32];
-    std::fs::write(local_dir.join("node_seed.hex"), hex::encode(local_seed))
-        .expect("write local seed");
-    std::fs::write(remote_dir.join("node_seed.hex"), hex::encode(remote_seed))
-        .expect("write remote seed");
-    std::fs::write(
-        local_dir.join("startup_config.json"),
-        serde_json::to_vec(&json!({
-            "network_mode": "wan",
-            "latitude": 0.0,
-            "longitude": 0.0,
-            "nearby_radius_km": 20.0
-        }))
-        .expect("startup config json"),
-    )
-    .expect("write startup config");
-    crate::control::local_node_id(&remote_dir).expect("create remote identity");
-    let remote_endpoint =
-        wattswarm_network_transport_iroh::local_endpoint_id_from_state_dir(&remote_dir)
-            .expect("remote endpoint")
-            .to_string();
-    let remote_contact =
-        build_contact_material(&remote_dir, &remote_endpoint).expect("remote contact material");
-    let discovery = PeerDiscoveryAnnouncement {
-        scope: SwarmScope::Global,
-        network_id: DEFAULT_NETWORK_CONTEXT_ID.to_owned(),
-        source_node_id: remote_endpoint.clone(),
-        latitude: 0.1,
-        longitude: 0.1,
-        radius_km: 20.0,
-        contact_material: remote_contact,
-        updated_at: observed_at_ms(),
-        ttl_ms: DEFAULT_NEARBY_DISCOVERY_TTL_MS,
-    };
-    let mut node = Node::open_in_memory_with_roles(&[Role::Proposer]).expect("node");
-    let mut service = NetworkBridgeService::new(
-        NetworkP2pNode::from_iroh_state_dir(
-            NetworkP2pConfig::default(),
-            local_dir.clone(),
-            local_seed,
-        )
-        .expect("iroh node"),
-        &[SwarmScope::Global],
-        &NetworkProtocolParams::default(),
-    )
-    .expect("service");
-    service.set_state_dir(local_dir.clone(), local_dir.join("ui.state"));
-    let remote_peer = remote_endpoint
-        .parse::<NetworkNodeId>()
-        .expect("remote endpoint node id");
-
-    let tick = service
-        .process_runtime_event(
-            &mut node,
-            NetworkRuntimeEvent::Gossip {
-                propagation_source: remote_peer,
-                message: GossipMessage::Discovery(discovery),
-            },
-        )
-        .expect("process discovery");
-
-    assert!(
-        matches!(tick, NetworkBridgeTick::TransportNotice { detail } if detail.contains("nearby_discovery_accepted"))
-    );
-    assert!(node.peers().contains(&remote_endpoint));
-    assert_eq!(service.known_remote_contact_count(), 1);
-    let discovered =
-        crate::control::load_discovered_peer_records_state(&local_dir).expect("discovered peers");
-    assert_eq!(discovered[0].node_id, remote_endpoint);
-    assert_eq!(discovered[0].source_kind, "nearby");
-    let metadata =
-        crate::control::load_peer_metadata_records_state(&local_dir).expect("peer metadata");
-    assert_eq!(
-        metadata[0].network_id.as_deref(),
-        Some(DEFAULT_NETWORK_CONTEXT_ID)
-    );
-    assert_eq!(metadata[0].handshake_status, "nearby_discovery");
-
-    wattswarm_network_transport_iroh::shutdown_local_iroh_data_plane(&local_dir);
-    wattswarm_network_transport_iroh::shutdown_local_iroh_data_plane(&remote_dir);
-    std::fs::remove_dir_all(local_dir).expect("cleanup local");
-    std::fs::remove_dir_all(remote_dir).expect("cleanup remote");
-}
-
-#[test]
-fn nearby_discovery_rejects_peer_outside_radius() {
-    let settings = NearbyDiscoverySettings {
-        enabled: true,
-        latitude: Some(0.0),
-        longitude: Some(0.0),
-        radius_km: 5.0,
-        interval: DEFAULT_NEARBY_DISCOVERY_INTERVAL,
-        ttl_ms: DEFAULT_NEARBY_DISCOVERY_TTL_MS,
-    };
-    let announcement = PeerDiscoveryAnnouncement {
-        scope: SwarmScope::Global,
-        network_id: DEFAULT_NETWORK_CONTEXT_ID.to_owned(),
-        source_node_id: "peer-a".to_owned(),
-        latitude: 1.0,
-        longitude: 1.0,
-        radius_km: 5.0,
-        contact_material: RawContactMaterial {
-            material_json: "{}".to_owned(),
-            signature: None,
-            generated_at: observed_at_ms(),
-        },
-        updated_at: observed_at_ms(),
-        ttl_ms: DEFAULT_NEARBY_DISCOVERY_TTL_MS,
-    };
-
-    assert!(
-        nearby_discovery_is_eligible(
-            &settings,
-            "local-peer",
-            DEFAULT_NETWORK_CONTEXT_ID,
-            &announcement,
-            observed_at_ms(),
-        )
-        .is_none()
-    );
-}
-
-#[test]
 fn discovery_bootnode_record_registers_iroh_contact_inside_radius_without_marking_connected() {
     let _lock = lock_env_test_mutex();
     let local_dir = temp_startup_dir("discovery-v1-local");
@@ -2905,7 +2863,7 @@ fn discovery_bootnode_record_registers_iroh_contact_inside_radius_without_markin
         .expect("startup config json"),
     )
     .expect("write startup config");
-    let settings = nearby_discovery_settings_from_state_dir(&local_dir).expect("settings");
+    let settings = discovery_bootnode_settings_from_state_dir(&local_dir).expect("settings");
     let record = signed_discovery_record_for_test(
         &remote_dir,
         remote_seed,
@@ -2960,6 +2918,75 @@ fn discovery_bootnode_record_registers_iroh_contact_inside_radius_without_markin
 }
 
 #[test]
+fn discovery_bootnode_record_accepts_candidate_without_local_geo() {
+    let local_dir = temp_startup_dir("discovery-v1-no-local-geo");
+    let remote_dir = temp_startup_dir("discovery-v1-no-local-geo-remote");
+    let local_seed = [113u8; 32];
+    let remote_seed = [114u8; 32];
+    fs::write(local_dir.join("node_seed.hex"), hex::encode(local_seed)).expect("write local seed");
+    fs::write(remote_dir.join("node_seed.hex"), hex::encode(remote_seed))
+        .expect("write remote seed");
+    fs::write(
+        local_dir.join("startup_config.json"),
+        serde_json::to_vec(&json!({
+            "network_mode": "wan"
+        }))
+        .expect("startup config json"),
+    )
+    .expect("write startup config");
+    let settings = discovery_bootnode_settings_from_state_dir(&local_dir).expect("settings");
+    assert!(settings.enabled);
+    assert!(!settings.has_local_geo());
+    let record = signed_discovery_record_for_test(
+        &remote_dir,
+        remote_seed,
+        DEFAULT_NETWORK_CONTEXT_ID,
+        70.0,
+        70.0,
+        1.0,
+    );
+    let remote_node_id = record.body.node_id.clone();
+    let mut node = Node::open_in_memory_with_roles(&[Role::Proposer]).expect("node");
+    let mut service = NetworkBridgeService::new(
+        NetworkP2pNode::from_iroh_state_dir(
+            NetworkP2pConfig::default(),
+            local_dir.clone(),
+            local_seed,
+        )
+        .expect("iroh node"),
+        &[SwarmScope::Global],
+        &NetworkProtocolParams::default(),
+    )
+    .expect("service");
+    service.set_state_dir(local_dir.clone(), local_dir.join("ui.state"));
+
+    let local_peer_id = service.local_peer_id().to_string();
+    let registered = apply_discovery_bootnode_record(
+        &mut service,
+        &mut node,
+        &local_dir,
+        &local_peer_id,
+        DEFAULT_NETWORK_CONTEXT_ID,
+        &settings,
+        record,
+        observed_at_ms(),
+    )
+    .expect("apply discovery record");
+
+    assert!(registered);
+    assert!(node.peers().contains(&remote_node_id));
+    let metadata =
+        crate::control::load_peer_metadata_records_state(&local_dir).expect("peer metadata");
+    assert_eq!(metadata[0].node_id, remote_node_id);
+    assert_eq!(metadata[0].handshake_status, "discovery_v1");
+
+    wattswarm_network_transport_iroh::shutdown_local_iroh_data_plane(&local_dir);
+    wattswarm_network_transport_iroh::shutdown_local_iroh_data_plane(&remote_dir);
+    fs::remove_dir_all(local_dir).expect("cleanup local");
+    fs::remove_dir_all(remote_dir).expect("cleanup remote");
+}
+
+#[test]
 fn discovery_bootnode_record_rejects_self_stale_and_out_of_radius_records() {
     let local_dir = temp_startup_dir("discovery-v1-reject-local");
     let remote_dir = temp_startup_dir("discovery-v1-reject-remote");
@@ -2979,7 +3006,7 @@ fn discovery_bootnode_record_rejects_self_stale_and_out_of_radius_records() {
         .expect("startup config json"),
     )
     .expect("write startup config");
-    let settings = nearby_discovery_settings_from_state_dir(&local_dir).expect("settings");
+    let settings = discovery_bootnode_settings_from_state_dir(&local_dir).expect("settings");
     let mut node = Node::open_in_memory_with_roles(&[Role::Proposer]).expect("node");
     let mut service = NetworkBridgeService::new(
         NetworkP2pNode::from_iroh_state_dir(
@@ -3098,7 +3125,10 @@ fn discovery_bootnode_query_fetches_and_verifies_nearby_records() {
     );
     let response_body = json!({
         "ok": true,
-        "records": [record],
+        "records": [{
+            "distance_km": 0.0,
+            "record": record,
+        }],
     })
     .to_string();
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind discovery listener");
@@ -3122,9 +3152,78 @@ fn discovery_bootnode_query_fetches_and_verifies_nearby_records() {
         &[format!("http://{addr}/api/network/discovery")],
     )
     .expect("save discovery urls");
-    let settings = nearby_discovery_settings_from_state_dir(&local_dir).expect("settings");
+    let settings = discovery_bootnode_settings_from_state_dir(&local_dir).expect("settings");
 
-    let records = query_discovery_bootnodes_for_nearby_records(
+    let records = query_discovery_bootnodes_for_candidate_records(
+        &local_dir,
+        DEFAULT_NETWORK_CONTEXT_ID,
+        &settings,
+        observed_at_ms(),
+    )
+    .expect("query discovery bootnode");
+
+    assert_eq!(records.len(), 1);
+    records[0].verify().expect("record verifies");
+    handle.join().expect("join discovery listener");
+    wattswarm_network_transport_iroh::shutdown_local_iroh_data_plane(&remote_dir);
+    fs::remove_dir_all(local_dir).expect("cleanup local");
+    fs::remove_dir_all(remote_dir).expect("cleanup remote");
+}
+
+#[test]
+fn discovery_bootnode_query_without_local_geo_uses_capability_records() {
+    let local_dir = temp_startup_dir("discovery-v1-query-no-geo-local");
+    let remote_dir = temp_startup_dir("discovery-v1-query-no-geo-remote");
+    let remote_seed = [115u8; 32];
+    fs::write(remote_dir.join("node_seed.hex"), hex::encode(remote_seed))
+        .expect("write remote seed");
+    fs::write(
+        local_dir.join("startup_config.json"),
+        serde_json::to_vec(&json!({
+            "network_mode": "wan"
+        }))
+        .expect("startup config json"),
+    )
+    .expect("write startup config");
+    let record = signed_discovery_record_for_test(
+        &remote_dir,
+        remote_seed,
+        DEFAULT_NETWORK_CONTEXT_ID,
+        70.0,
+        70.0,
+        1.0,
+    );
+    let response_body = json!({
+        "ok": true,
+        "records": [record],
+    })
+    .to_string();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind discovery listener");
+    let addr = listener.local_addr().expect("discovery listener addr");
+    let handle = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept discovery query");
+        let request = read_http_request(&mut stream);
+        assert!(request.starts_with("GET /api/network/discovery/capability?"));
+        assert!(request.contains("network_id=default"));
+        assert!(request.contains("capability=wattswarm.node"));
+        assert!(!request.contains("latitude="));
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            response_body.len(),
+            response_body
+        );
+        stream
+            .write_all(response.as_bytes())
+            .expect("write discovery response");
+    });
+    crate::control::save_discovery_bootnode_urls_state(
+        &local_dir,
+        &[format!("http://{addr}/api/network/discovery")],
+    )
+    .expect("save discovery urls");
+    let settings = discovery_bootnode_settings_from_state_dir(&local_dir).expect("settings");
+
+    let records = query_discovery_bootnodes_for_candidate_records(
         &local_dir,
         DEFAULT_NETWORK_CONTEXT_ID,
         &settings,
@@ -3157,7 +3256,7 @@ fn signed_discovery_record_for_test(
         longitude,
         radius_km,
         now,
-        DEFAULT_NEARBY_DISCOVERY_TTL_MS,
+        DEFAULT_RECORD_TTL_MS,
     )
 }
 

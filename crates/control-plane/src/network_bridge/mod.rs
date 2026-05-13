@@ -18,10 +18,10 @@ use crate::network_p2p::{
     BackfillRequest, BackfillRequestId, ContactMaterialRequestId, EventEnvelope, GossipKind,
     GossipMessage, NetworkAddress, NetworkNodeId, NetworkP2pConfig, NetworkP2pNode, NetworkRuntime,
     NetworkRuntimeEvent, PeerDirectMessageRequest, PeerDirectMessageRequestId,
-    PeerDirectMessageResponse, PeerDiscoveryAnnouncement, PeerHandshakeMetadata,
-    PeerRelationshipRequest, PeerRelationshipRequestId, PeerRelationshipResponse, RawAgentEnvelope,
-    RawContactMaterial, RawContactMaterialRequest, RawContactMaterialResponse,
-    RawPeerDirectMessageKind, RawPeerRelationshipAction, SummaryAnnouncement, SwarmScope,
+    PeerDirectMessageResponse, PeerHandshakeMetadata, PeerRelationshipRequest,
+    PeerRelationshipRequestId, PeerRelationshipResponse, RawAgentEnvelope, RawContactMaterial,
+    RawContactMaterialRequest, RawContactMaterialResponse, RawPeerDirectMessageKind,
+    RawPeerRelationshipAction, SummaryAnnouncement, SwarmScope,
 };
 use crate::node::Node;
 use serde::{Deserialize, Serialize};
@@ -91,24 +91,13 @@ const ENV_P2P_ENABLED: &str = "WATTSWARM_P2P_ENABLED";
 const ENV_P2P_LOCAL_DISCOVERY: &str = "WATTSWARM_P2P_MDNS";
 const ENV_P2P_PORT: &str = "WATTSWARM_P2P_PORT";
 const ENV_P2P_LISTEN_ADDRS: &str = "WATTSWARM_P2P_LISTEN_ADDRS";
-const ENV_NEARBY_DISCOVERY_ENABLED: &str = "WATTSWARM_NEARBY_DISCOVERY_ENABLED";
-const ENV_NEARBY_DISCOVERY_RADIUS_KM: &str = "WATTSWARM_NEARBY_DISCOVERY_RADIUS_KM";
-const ENV_NEARBY_DISCOVERY_INTERVAL_MS: &str = "WATTSWARM_NEARBY_DISCOVERY_INTERVAL_MS";
-const ENV_NEARBY_DISCOVERY_TTL_MS: &str = "WATTSWARM_NEARBY_DISCOVERY_TTL_MS";
 const STARTUP_CONFIG_FILE: &str = "startup_config.json";
 const DEFAULT_P2P_PORT: u16 = 4001;
-const DEFAULT_NEARBY_DISCOVERY_RADIUS_KM: f64 = 1000.0;
-const DEFAULT_NEARBY_DISCOVERY_INTERVAL: Duration = Duration::from_secs(30);
-const DEFAULT_NEARBY_DISCOVERY_TTL_MS: u64 = 5 * 60 * 1000;
+const DEFAULT_DISCOVERY_GEO_RADIUS_KM: f64 = 1000.0;
+const DEFAULT_DISCOVERY_BOOTNODE_QUERY_INTERVAL: Duration = Duration::from_secs(30);
 const DISCOVERY_BOOTNODE_QUERY_LIMIT: usize = 50;
 const DISCOVERY_BOOTNODE_QUERY_TIMEOUT: Duration = Duration::from_secs(3);
-const DATA_GOSSIP_KINDS: [GossipKind; 5] = [
-    GossipKind::Events,
-    GossipKind::Messages,
-    GossipKind::Rules,
-    GossipKind::Checkpoints,
-    GossipKind::Summaries,
-];
+const DISCOVERY_NODE_CAPABILITY: &str = "wattswarm.node";
 const GLOBAL_HIGH_FREQUENCY_WINDOW: Duration = Duration::from_secs(5);
 const GLOBAL_HIGH_FREQUENCY_LIMIT: usize = 32;
 const DEFAULT_NETWORK_CONTEXT_ID: &str = "default";
@@ -202,17 +191,16 @@ fn current_network_context_id(node: &Node) -> String {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-struct NearbyDiscoverySettings {
+struct DiscoveryBootnodeSettings {
     enabled: bool,
     latitude: Option<f64>,
     longitude: Option<f64>,
     radius_km: f64,
     interval: Duration,
-    ttl_ms: u64,
 }
 
 #[derive(Debug, Deserialize, Default)]
-struct StartupNearbyDiscoveryConfig {
+struct StartupDiscoveryConfig {
     #[serde(default)]
     latitude: Option<f64>,
     #[serde(default)]
@@ -225,105 +213,76 @@ struct StartupNearbyDiscoveryConfig {
 
 #[derive(Debug, Deserialize)]
 struct DiscoveryBootnodeNearbyResponse {
-    records: Vec<SignedDiscoveryNodeRecord>,
+    records: Vec<DiscoveryBootnodeRecordItem>,
 }
 
-impl NearbyDiscoverySettings {
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum DiscoveryBootnodeRecordItem {
+    Direct(SignedDiscoveryNodeRecord),
+    Nearby {
+        record: SignedDiscoveryNodeRecord,
+        #[serde(default, rename = "distance_km")]
+        _distance_km: Option<f64>,
+    },
+}
+
+impl DiscoveryBootnodeRecordItem {
+    fn into_record(self) -> SignedDiscoveryNodeRecord {
+        match self {
+            Self::Direct(record) | Self::Nearby { record, .. } => record,
+        }
+    }
+}
+
+impl DiscoveryBootnodeSettings {
     fn has_local_geo(&self) -> bool {
         self.latitude.is_some() && self.longitude.is_some()
     }
 }
 
-fn nearby_discovery_settings_from_state_dir(state_dir: &Path) -> Result<NearbyDiscoverySettings> {
-    let startup = load_nearby_discovery_startup_config(state_dir);
-    let env_enabled = parse_bool_env(ENV_NEARBY_DISCOVERY_ENABLED, true)?;
+fn discovery_bootnode_settings_from_state_dir(
+    state_dir: &Path,
+) -> Result<DiscoveryBootnodeSettings> {
+    let startup = load_discovery_startup_config(state_dir);
     let network_mode_allows = startup
         .network_mode
         .as_deref()
         .map(str::trim)
         .map(|value| !value.eq_ignore_ascii_case("local"))
         .unwrap_or(true);
-    let radius_km = parse_f64_env(ENV_NEARBY_DISCOVERY_RADIUS_KM)?
-        .or(startup.nearby_radius_km)
-        .unwrap_or(DEFAULT_NEARBY_DISCOVERY_RADIUS_KM);
+    let radius_km = startup
+        .nearby_radius_km
+        .unwrap_or(DEFAULT_DISCOVERY_GEO_RADIUS_KM);
     let radius_km = if radius_km.is_finite() && radius_km > 0.0 {
         radius_km
     } else {
-        DEFAULT_NEARBY_DISCOVERY_RADIUS_KM
+        DEFAULT_DISCOVERY_GEO_RADIUS_KM
     };
-    let interval = parse_u64_env(ENV_NEARBY_DISCOVERY_INTERVAL_MS)?
-        .map(Duration::from_millis)
-        .filter(|value| *value > Duration::from_millis(0))
-        .unwrap_or(DEFAULT_NEARBY_DISCOVERY_INTERVAL);
-    let ttl_ms = parse_u64_env(ENV_NEARBY_DISCOVERY_TTL_MS)?
-        .filter(|value| *value > 0)
-        .unwrap_or(DEFAULT_NEARBY_DISCOVERY_TTL_MS);
+    let interval = DEFAULT_DISCOVERY_BOOTNODE_QUERY_INTERVAL;
     let latitude = startup.latitude.filter(valid_latitude);
     let longitude = startup.longitude.filter(valid_longitude);
-    Ok(NearbyDiscoverySettings {
-        enabled: env_enabled && network_mode_allows && latitude.is_some() && longitude.is_some(),
+    Ok(DiscoveryBootnodeSettings {
+        enabled: network_mode_allows,
         latitude,
         longitude,
         radius_km,
         interval,
-        ttl_ms,
     })
 }
 
-fn load_nearby_discovery_startup_config(state_dir: &Path) -> StartupNearbyDiscoveryConfig {
+fn load_discovery_startup_config(state_dir: &Path) -> StartupDiscoveryConfig {
     let path = state_dir.join(STARTUP_CONFIG_FILE);
     let Ok(bytes) = fs::read(&path) else {
-        return StartupNearbyDiscoveryConfig::default();
+        return StartupDiscoveryConfig::default();
     };
-    serde_json::from_slice::<StartupNearbyDiscoveryConfig>(&bytes).unwrap_or_else(|error| {
+    serde_json::from_slice::<StartupDiscoveryConfig>(&bytes).unwrap_or_else(|error| {
         eprintln!(
-            "failed to parse nearby discovery config from {}: {error}",
+            "failed to parse discovery config from {}: {error}",
             path.display()
         );
-        StartupNearbyDiscoveryConfig::default()
+        StartupDiscoveryConfig::default()
     })
-}
-
-fn parse_bool_env(key: &str, default: bool) -> Result<bool> {
-    let Some(raw) = env::var(key).ok() else {
-        return Ok(default);
-    };
-    match raw.trim().to_ascii_lowercase().as_str() {
-        "" => Ok(default),
-        "1" | "true" | "yes" | "on" => Ok(true),
-        "0" | "false" | "no" | "off" => Ok(false),
-        value => bail!("{key} must be a boolean value, got {value}"),
-    }
-}
-
-fn parse_f64_env(key: &str) -> Result<Option<f64>> {
-    let Some(raw) = env::var(key).ok() else {
-        return Ok(None);
-    };
-    let value = raw.trim();
-    if value.is_empty() {
-        return Ok(None);
-    }
-    Ok(Some(
-        value
-            .parse::<f64>()
-            .with_context(|| format!("parse {key} as f64"))?,
-    ))
-}
-
-fn parse_u64_env(key: &str) -> Result<Option<u64>> {
-    let Some(raw) = env::var(key).ok() else {
-        return Ok(None);
-    };
-    let value = raw.trim();
-    if value.is_empty() {
-        return Ok(None);
-    }
-    Ok(Some(
-        value
-            .parse::<u64>()
-            .with_context(|| format!("parse {key} as u64"))?,
-    ))
 }
 
 fn valid_latitude(value: &f64) -> bool {
@@ -348,51 +307,6 @@ fn distance_km_between(
     let a = (delta_latitude / 2.0).sin().powi(2)
         + local_latitude.cos() * remote_latitude.cos() * (delta_longitude / 2.0).sin().powi(2);
     2.0 * earth_radius_km * a.sqrt().asin()
-}
-
-fn nearby_discovery_distance_km(
-    settings: &NearbyDiscoverySettings,
-    announcement: &PeerDiscoveryAnnouncement,
-) -> Option<f64> {
-    let local_latitude = settings.latitude?;
-    let local_longitude = settings.longitude?;
-    if !valid_latitude(&announcement.latitude) || !valid_longitude(&announcement.longitude) {
-        return None;
-    }
-    Some(distance_km_between(
-        local_latitude,
-        local_longitude,
-        announcement.latitude,
-        announcement.longitude,
-    ))
-}
-
-fn nearby_discovery_is_eligible(
-    settings: &NearbyDiscoverySettings,
-    local_node_id: &str,
-    network_id: &str,
-    announcement: &PeerDiscoveryAnnouncement,
-    now_ms: u64,
-) -> Option<f64> {
-    if !settings.enabled || !settings.has_local_geo() {
-        return None;
-    }
-    if announcement.source_node_id == local_node_id {
-        return None;
-    }
-    if announcement.network_id != network_id {
-        return None;
-    }
-    if announcement.updated_at.saturating_add(announcement.ttl_ms) < now_ms {
-        return None;
-    }
-    let distance_km = nearby_discovery_distance_km(settings, announcement)?;
-    let allowed_radius_km = settings.radius_km.min(announcement.radius_km);
-    if allowed_radius_km.is_finite() && distance_km <= allowed_radius_km {
-        Some(distance_km)
-    } else {
-        None
-    }
 }
 
 fn network_id_for_network_substrate_event(event: &crate::types::Event) -> Option<&str> {
@@ -424,7 +338,7 @@ fn scope_hint_label(scope: &SwarmScope) -> String {
 
 fn feed_subscription_gossip_kinds(raw_kinds: &[String]) -> Vec<GossipKind> {
     if raw_kinds.is_empty() {
-        return DATA_GOSSIP_KINDS.to_vec();
+        return GossipKind::ALL.to_vec();
     }
     let mut kinds = Vec::new();
     for raw in raw_kinds {
@@ -434,7 +348,6 @@ fn feed_subscription_gossip_kinds(raw_kinds: &[String]) -> Vec<GossipKind> {
             "rules" => GossipKind::Rules,
             "checkpoints" => GossipKind::Checkpoints,
             "summaries" => GossipKind::Summaries,
-            "discovery" => GossipKind::Discovery,
             _ => continue,
         };
         if !kinds.contains(&kind) {
@@ -1817,47 +1730,19 @@ fn build_contact_material(state_dir: &Path, local_peer_id: &str) -> Result<RawCo
     })
 }
 
-fn build_nearby_discovery_announcement(
-    state_dir: &Path,
-    node: &Node,
-    local_peer_id: &str,
-    settings: &NearbyDiscoverySettings,
-) -> Result<Option<PeerDiscoveryAnnouncement>> {
-    if !settings.enabled {
-        return Ok(None);
-    }
-    let (Some(latitude), Some(longitude)) = (settings.latitude, settings.longitude) else {
-        return Ok(None);
-    };
-    let updated_at = observed_at_ms();
-    Ok(Some(PeerDiscoveryAnnouncement {
-        scope: SwarmScope::Global,
-        network_id: current_network_context_id(node),
-        source_node_id: local_peer_id.to_owned(),
-        latitude,
-        longitude,
-        radius_km: settings.radius_km,
-        contact_material: build_contact_material(state_dir, local_peer_id)?,
-        updated_at,
-        ttl_ms: settings.ttl_ms,
-    }))
-}
-
-fn query_discovery_bootnodes_for_nearby_records(
+fn query_discovery_bootnodes_for_candidate_records(
     state_dir: &Path,
     network_id: &str,
-    settings: &NearbyDiscoverySettings,
+    settings: &DiscoveryBootnodeSettings,
     now_ms: u64,
 ) -> Result<Vec<SignedDiscoveryNodeRecord>> {
-    if !settings.enabled || !settings.has_local_geo() {
+    if !settings.enabled {
         return Ok(Vec::new());
     }
     let discovery_urls = crate::control::load_discovery_bootnode_urls_state(state_dir)?;
     if discovery_urls.is_empty() {
         return Ok(Vec::new());
     }
-    let latitude = settings.latitude.expect("checked by has_local_geo");
-    let longitude = settings.longitude.expect("checked by has_local_geo");
     let client = reqwest::blocking::Client::builder()
         .timeout(DISCOVERY_BOOTNODE_QUERY_TIMEOUT)
         .build()
@@ -1865,13 +1750,8 @@ fn query_discovery_bootnodes_for_nearby_records(
     let mut records = Vec::new();
     let mut seen = HashSet::new();
     for discovery_url in discovery_urls {
-        let endpoint = match discovery_bootnode_nearby_endpoint(
-            &discovery_url,
-            network_id,
-            latitude,
-            longitude,
-            settings.radius_km,
-        ) {
+        let endpoint = match discovery_bootnode_query_endpoint(&discovery_url, network_id, settings)
+        {
             Ok(endpoint) => endpoint,
             Err(error) => {
                 eprintln!("discovery bootnode URL skipped {discovery_url}: {error}");
@@ -1882,7 +1762,8 @@ fn query_discovery_bootnodes_for_nearby_records(
             Ok(response) => match response.error_for_status() {
                 Ok(response) => match response.json::<DiscoveryBootnodeNearbyResponse>() {
                     Ok(payload) => {
-                        for record in payload.records {
+                        for item in payload.records {
+                            let record = item.into_record();
                             if record.verify_fresh_at(now_ms).is_ok()
                                 && record.body.network_id == network_id
                                 && seen.insert(record.body.node_id.clone())
@@ -1892,40 +1773,53 @@ fn query_discovery_bootnodes_for_nearby_records(
                         }
                     }
                     Err(error) => {
-                        eprintln!("discovery bootnode response decode failed {endpoint}: {error}")
+                        eprintln!("discovery bootnode response decode failed {endpoint}: {error:#}")
                     }
                 },
-                Err(error) => eprintln!("discovery bootnode query failed {endpoint}: {error}"),
+                Err(error) => eprintln!("discovery bootnode query failed {endpoint}: {error:#}"),
             },
-            Err(error) => eprintln!("discovery bootnode query failed {endpoint}: {error}"),
+            Err(error) => eprintln!("discovery bootnode query failed {endpoint}: {error:#}"),
         }
     }
     Ok(records)
 }
 
-fn discovery_bootnode_nearby_endpoint(
+fn discovery_bootnode_query_endpoint(
     base_url: &str,
     network_id: &str,
-    latitude: f64,
-    longitude: f64,
-    radius_km: f64,
+    settings: &DiscoveryBootnodeSettings,
 ) -> Result<String> {
     let base_url = base_url.trim().trim_end_matches('/');
-    let endpoint = if base_url.ends_with("/api/network/discovery/nearby") {
+    let endpoint = if settings.has_local_geo() {
+        if base_url.ends_with("/api/network/discovery/nearby") {
+            base_url.to_owned()
+        } else if base_url.ends_with("/api/network/discovery") {
+            format!("{base_url}/nearby")
+        } else {
+            format!("{base_url}/api/network/discovery/nearby")
+        }
+    } else if base_url.ends_with("/api/network/discovery/capability") {
         base_url.to_owned()
     } else if base_url.ends_with("/api/network/discovery") {
-        format!("{base_url}/nearby")
+        format!("{base_url}/capability")
     } else {
-        format!("{base_url}/api/network/discovery/nearby")
+        format!("{base_url}/api/network/discovery/capability")
     };
     let mut url = reqwest::Url::parse(&endpoint)
         .with_context(|| format!("parse discovery bootnode URL {endpoint}"))?;
-    url.query_pairs_mut()
-        .append_pair("network_id", network_id)
-        .append_pair("latitude", &latitude.to_string())
-        .append_pair("longitude", &longitude.to_string())
-        .append_pair("radius_km", &radius_km.to_string())
-        .append_pair("limit", &DISCOVERY_BOOTNODE_QUERY_LIMIT.to_string());
+    {
+        let mut pairs = url.query_pairs_mut();
+        pairs.append_pair("network_id", network_id);
+        if let (Some(latitude), Some(longitude)) = (settings.latitude, settings.longitude) {
+            pairs
+                .append_pair("latitude", &latitude.to_string())
+                .append_pair("longitude", &longitude.to_string())
+                .append_pair("radius_km", &settings.radius_km.to_string());
+        } else {
+            pairs.append_pair("capability", DISCOVERY_NODE_CAPABILITY);
+        }
+        pairs.append_pair("limit", &DISCOVERY_BOOTNODE_QUERY_LIMIT.to_string());
+    }
     Ok(url.to_string())
 }
 
@@ -1935,7 +1829,7 @@ fn apply_discovery_bootnode_record(
     state_dir: &Path,
     local_peer_id: &str,
     network_id: &str,
-    settings: &NearbyDiscoverySettings,
+    settings: &DiscoveryBootnodeSettings,
     record: SignedDiscoveryNodeRecord,
     now_ms: u64,
 ) -> Result<bool> {
@@ -1946,15 +1840,20 @@ fn apply_discovery_bootnode_record(
     if record.body.node_id == local_peer_id {
         return Ok(false);
     }
-    let Some(remote_geo) = &record.body.geo else {
-        return Ok(false);
+    let distance_km = if settings.has_local_geo() {
+        let Some(remote_geo) = &record.body.geo else {
+            return Ok(false);
+        };
+        let Some(distance_km) = discovery_record_distance_km(settings, remote_geo) else {
+            return Ok(false);
+        };
+        if distance_km > settings.radius_km.min(remote_geo.radius_km) {
+            return Ok(false);
+        }
+        Some(distance_km)
+    } else {
+        None
     };
-    let Some(distance_km) = discovery_record_distance_km(settings, remote_geo) else {
-        return Ok(false);
-    };
-    if distance_km > settings.radius_km.min(remote_geo.radius_km) {
-        return Ok(false);
-    }
     let Some(contact) = record.body.transport_contact.clone() else {
         return Ok(false);
     };
@@ -2003,7 +1902,7 @@ fn apply_discovery_bootnode_record(
 }
 
 fn discovery_record_distance_km(
-    settings: &NearbyDiscoverySettings,
+    settings: &DiscoveryBootnodeSettings,
     remote_geo: &DiscoveryGeo,
 ) -> Option<f64> {
     let local_latitude = settings.latitude?;
@@ -2045,23 +1944,6 @@ fn raw_contact_material_from_discovery_record(
         signature: Some(record.signature_hex.clone()),
         generated_at: record.body.updated_at_ms,
     })
-}
-
-fn contact_material_transports(
-    contact_material: &RawContactMaterial,
-) -> Result<Vec<TransportContactMaterial>> {
-    let material: Value = serde_json::from_str(&contact_material.material_json)
-        .context("decode discovery contact material JSON")?;
-    material
-        .get("transports")
-        .and_then(Value::as_array)
-        .ok_or_else(|| anyhow!("discovery contact material missing transports"))?
-        .iter()
-        .map(|entry| {
-            serde_json::from_value::<TransportContactMaterial>(entry.clone())
-                .context("decode discovery transport contact")
-        })
-        .collect()
 }
 
 pub fn export_local_bootstrap_contact(state_dir: &Path) -> Result<String> {
@@ -2144,25 +2026,6 @@ fn upsert_contact_material_for_peer(
             .as_ref()
             .map_or(now, |entry| entry.last_identified_at),
     };
-    crate::control::save_peer_metadata_record_state(state_dir, &record)
-}
-
-fn mark_peer_metadata_nearby_discovered(
-    state_dir: &Path,
-    remote_node_id: &str,
-    network_id: &str,
-) -> Result<()> {
-    let Some(mut record) = crate::control::load_peer_metadata_records_state(state_dir)?
-        .into_iter()
-        .find(|record| record.node_id == remote_node_id)
-    else {
-        return Ok(());
-    };
-    record.network_id = Some(network_id.to_owned());
-    if record.handshake_status == "unknown" || record.handshake_status == "contact_material" {
-        record.handshake_status = "nearby_discovery".to_owned();
-    }
-    record.last_error = None;
     crate::control::save_peer_metadata_record_state(state_dir, &record)
 }
 
@@ -2833,7 +2696,7 @@ fn run_background_network_service_with_hook(
     let mut announced_listen = false;
     let mut announced_peers: HashMap<String, Instant> = HashMap::new();
     let mut last_published_seq = node.head_seq()?;
-    let mut next_nearby_discovery_at = Instant::now();
+    let mut next_discovery_bootnode_query_at = Instant::now();
 
     loop {
         let mut did_work = false;
@@ -2885,12 +2748,12 @@ fn run_background_network_service_with_hook(
             did_work = true;
             last_published_seq = new_last_published_seq;
         }
-        if Instant::now() >= next_nearby_discovery_at {
-            match nearby_discovery_settings_from_state_dir(state_dir) {
+        if Instant::now() >= next_discovery_bootnode_query_at {
+            match discovery_bootnode_settings_from_state_dir(state_dir) {
                 Ok(settings) => {
-                    next_nearby_discovery_at = Instant::now() + settings.interval;
+                    next_discovery_bootnode_query_at = Instant::now() + settings.interval;
                     let network_id = current_network_context_id(&node);
-                    match query_discovery_bootnodes_for_nearby_records(
+                    match query_discovery_bootnodes_for_candidate_records(
                         state_dir,
                         &network_id,
                         &settings,
@@ -2919,25 +2782,11 @@ fn run_background_network_service_with_hook(
                         }
                         Err(err) => eprintln!("discovery bootnode query skipped: {err}"),
                     }
-                    match build_nearby_discovery_announcement(
-                        state_dir,
-                        &node,
-                        &service.local_peer_id().to_string(),
-                        &settings,
-                    ) {
-                        Ok(Some(discovery)) => match service.publish_peer_discovery(discovery) {
-                            Ok(()) => {
-                                did_work = true;
-                            }
-                            Err(err) => eprintln!("nearby discovery publish failed: {err}"),
-                        },
-                        Ok(None) => {}
-                        Err(err) => eprintln!("nearby discovery build failed: {err}"),
-                    }
                 }
                 Err(err) => {
-                    next_nearby_discovery_at = Instant::now() + DEFAULT_NEARBY_DISCOVERY_INTERVAL;
-                    eprintln!("nearby discovery publish skipped: {err}");
+                    next_discovery_bootnode_query_at =
+                        Instant::now() + DEFAULT_DISCOVERY_BOOTNODE_QUERY_INTERVAL;
+                    eprintln!("discovery bootnode query skipped: {err}");
                 }
             }
         }

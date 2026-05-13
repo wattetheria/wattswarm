@@ -198,15 +198,6 @@ Runtime toggles:
 - `WATTSWARM_P2P_NODE_IDS=lab-a` subscribes the node to matching node scopes
 - `WATTSWARM_P2P_LOCAL_IDS=lab-a` is still accepted as a legacy alias for node scopes
 
-Nearby discovery runs over the Iroh gossip discovery lane and is only a peer-discovery/contact exchange path. It does not send agent/MCP requests or task/topic payloads. It is active only when P2P is enabled, the startup `network_mode` is not `local`, and `startup_config.json` contains valid `latitude` and `longitude` values. Those coordinates are runtime-managed node metadata, not manual startup UI input.
-
-- `WATTSWARM_NEARBY_DISCOVERY_ENABLED=true` by default; set `false` to stop publishing and accepting nearby discovery announcements.
-- `WATTSWARM_NEARBY_DISCOVERY_RADIUS_KM=1000` by default; accepts peers only when their geo distance is inside both the local radius and the remote announced radius. The env var overrides startup `nearby_radius_km`.
-- `WATTSWARM_NEARBY_DISCOVERY_INTERVAL_MS=30000` by default; controls how often the node republishes its nearby discovery announcement.
-- `WATTSWARM_NEARBY_DISCOVERY_TTL_MS=300000` by default; remote announcements older than this are ignored.
-
-Accepted nearby peers update `discovered_peers_local` with source kind `nearby`, persist Iroh contact material into `peer_metadata_local`, and are handed to the Iroh runtime for normal peer connectivity.
-
 Wattswarm Discovery v1 is the shared foundation for a dedicated discovery layer, separate from the communication layer. It is modeled after Ethereum's split between discovery records/bootnodes and the later transport session:
 
 - discovery finds candidate nodes and validates signed node records
@@ -214,7 +205,7 @@ Wattswarm Discovery v1 is the shared foundation for a dedicated discovery layer,
 - bootnodes may store and answer queries over signed records, but records are still verified locally by every node
 - gateway and servicenet can reuse the same discovery record/routing primitives through `crates/network-discovery`
 
-The current runtime uses Discovery v1 as a bootnode-assisted candidate source: joining nodes persist `discovery_urls` from the join manifest, publish their own signed record after P2P startup, periodically query nearby records, verify them locally, and pass valid Iroh contact material into the communication substrate. The existing Iroh gossip nearby discovery remains as an additional peer-discovery path.
+The current runtime uses Discovery v1 as a bootnode-assisted candidate source: joining nodes persist `discovery_urls` from the join manifest, publish their own signed record after P2P startup, periodically query candidate records, verify them locally, and pass valid Iroh contact material into the communication substrate. Iroh remains the communication layer after discovery; node discovery and optional geo/capability filtering stay in Discovery v1.
 
 Bootnode-assisted Discovery v1 HTTP surface:
 
@@ -224,7 +215,7 @@ Bootnode-assisted Discovery v1 HTTP surface:
 - `GET /api/network/discovery/capability?network_id=<id>&capability=<capability>&limit=<n>` returns active records that advertise a capability.
 - `WATTSWARM_PUBLIC_DISCOVERY_URLS` publishes discovery API base URLs in `/.well-known/wattswarm/join.json` as `discovery_urls`.
 - joining nodes store manifest `discovery_urls` in `discovery_bootnode_urls_v1.json`, not in `startup_config.json`.
-- the network bridge queries configured discovery bootnodes on the nearby discovery interval and registers only records that pass signature, TTL, network id, self-node, geo-radius, and Iroh contact validation.
+- the network bridge queries configured discovery bootnodes on the Discovery v1 interval and registers only records that pass signature, TTL, network id, self-node, optional geo-radius, and Iroh contact validation. Nodes without local geo still query capability candidates; geo only narrows the candidate set when present.
 - `discovered_peers_local` is updated by the existing `ConnectionEstablished` path with `source_kind=connected`; discovery candidates alone are stored as peer metadata/contact material, not as connected peers.
 
 Network-mode bootstrap behavior:
@@ -889,15 +880,11 @@ P2P env vars:
 - `WATTSWARM_P2P_REGION_IDS` optional comma-separated region scope subscription list
 - `WATTSWARM_P2P_NODE_IDS` optional comma-separated node scope subscription list
 - `WATTSWARM_P2P_LOCAL_IDS` optional legacy alias for node scope subscription list
-- `WATTSWARM_NEARBY_DISCOVERY_ENABLED=true` enables Iroh nearby discovery when startup geo is present and network mode is not `local`
-- `WATTSWARM_NEARBY_DISCOVERY_RADIUS_KM=1000` sets the local acceptance radius; env overrides startup `nearby_radius_km`
-- `WATTSWARM_NEARBY_DISCOVERY_INTERVAL_MS=30000` sets the discovery announcement publish interval
-- `WATTSWARM_NEARBY_DISCOVERY_TTL_MS=300000` sets the max accepted age for remote discovery announcements
 
 Startup UI behavior:
 
 - `Display Name`, `Network Mode`, `Bootstrap Contacts`, optional `Gateway URLs`, and `Core Agent` are saved to `startup_config.json`
-- startup geo coordinates are displayed read-only when present; runtime or gateway sync paths resolve them for clients and nearby discovery
+- startup geo coordinates are displayed read-only when present; runtime or gateway sync paths resolve them for clients and optional Discovery v1 geo filtering
 - `Bootstrap Contacts` is shown only for `LAN` / `WAN` and accepts short Iroh contact strings in `<iroh-node-id>@<host:port>` format.
 - genesis/bootstrap nodes can export a paste-ready contact with `wattswarm --state-dir <state-dir> node export-contact`
 - saving `Core Agent` also syncs the local executor route into PostgreSQL `executor_registry_local`

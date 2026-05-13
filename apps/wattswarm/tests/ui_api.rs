@@ -7,7 +7,7 @@ use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tempfile::tempdir;
 use tonic::Request as GrpcRequest;
 use tower::ServiceExt;
@@ -31,7 +31,8 @@ use wattswarm::wattetheria_sync;
 use wattswarm::wattetheria_sync::proto::ProjectionStreamRequest;
 use wattswarm::wattetheria_sync::proto::wattetheria_sync_service_client::WattetheriaSyncServiceClient;
 use wattswarm_network_discovery::{
-    DiscoveryGeo, DiscoveryNodeRecordBody, DiscoveryRecordCapabilities, SignedDiscoveryNodeRecord,
+    DEFAULT_RECORD_TTL_MS, DiscoveryGeo, DiscoveryNodeRecordBody, DiscoveryRecordCapabilities,
+    SignedDiscoveryNodeRecord,
 };
 use wattswarm_storage_core::storage::pg::Connection;
 use wattswarm_storage_core::types::ArtifactRef;
@@ -171,6 +172,10 @@ impl Drop for UiStubRuntimeServer {
 
 impl DiscoveryRecordStubServer {
     fn start() -> Self {
+        Self::start_with_delay(Duration::ZERO)
+    }
+
+    fn start_with_delay(response_delay: Duration) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind discovery stub listener");
         listener
             .set_nonblocking(true)
@@ -185,7 +190,9 @@ impl DiscoveryRecordStubServer {
         let handle = std::thread::spawn(move || {
             while !stop_flag.load(Ordering::Relaxed) {
                 match listener.accept() {
-                    Ok((stream, _)) => handle_discovery_stub_conn(stream, &request_log),
+                    Ok((stream, _)) => {
+                        handle_discovery_stub_conn(stream, &request_log, response_delay)
+                    }
                     Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
                         std::thread::sleep(std::time::Duration::from_millis(10));
                     }
@@ -396,7 +403,11 @@ fn handle_stub_conn(mut stream: TcpStream, cfg: &UiStubRuntimeConfig) {
     write_stub_response(stream, 404, "{}")
 }
 
-fn handle_discovery_stub_conn(mut stream: TcpStream, requests: &Arc<Mutex<Vec<String>>>) {
+fn handle_discovery_stub_conn(
+    mut stream: TcpStream,
+    requests: &Arc<Mutex<Vec<String>>>,
+    response_delay: Duration,
+) {
     let Ok(req_bytes) = read_stub_request(&mut stream) else {
         return;
     };
@@ -411,6 +422,7 @@ fn handle_discovery_stub_conn(mut stream: TcpStream, requests: &Arc<Mutex<Vec<St
         {
             requests.push(raw_body.to_owned());
         }
+        std::thread::sleep(response_delay);
         return write_stub_response(stream, 200, "{\"ok\":true}");
     }
     write_stub_response(stream, 404, "{}")
@@ -495,9 +507,6 @@ fn network_discovery_auto_announces_local_record_to_bootnode() {
     let _db_lock = DbTestLock::acquire();
     let schema = reset_test_schema("ui_discovery_auto_announce");
     let _schema_guard = EnvVarGuard::set("WATTSWARM_PG_SCHEMA", &schema);
-    let _enabled_guard = EnvVarGuard::set("WATTSWARM_NEARBY_DISCOVERY_ENABLED", "true");
-    let _radius_guard = EnvVarGuard::set("WATTSWARM_NEARBY_DISCOVERY_RADIUS_KM", "25");
-    let _ttl_guard = EnvVarGuard::set("WATTSWARM_NEARBY_DISCOVERY_TTL_MS", "60000");
 
     let dir = tempdir().expect("tempdir");
     let state_dir = dir.path().join("state");
@@ -537,9 +546,9 @@ fn network_discovery_auto_announces_local_record_to_bootnode() {
     );
     assert_eq!(
         record.body.geo.as_ref().map(|geo| geo.radius_km),
-        Some(25.0)
+        Some(1000.0)
     );
-    assert_eq!(record.body.ttl_ms, 60000);
+    assert_eq!(record.body.ttl_ms, DEFAULT_RECORD_TTL_MS);
     assert!(record.body.capabilities.contains("wattswarm.node"));
     assert!(record.body.transport_contact.is_some());
 }
@@ -550,9 +559,6 @@ fn network_discovery_auto_announces_local_record_to_discovery_api_base_url() {
     let _db_lock = DbTestLock::acquire();
     let schema = reset_test_schema("ui_discovery_auto_announce_base_url");
     let _schema_guard = EnvVarGuard::set("WATTSWARM_PG_SCHEMA", &schema);
-    let _enabled_guard = EnvVarGuard::set("WATTSWARM_NEARBY_DISCOVERY_ENABLED", "true");
-    let _radius_guard = EnvVarGuard::set("WATTSWARM_NEARBY_DISCOVERY_RADIUS_KM", "25");
-    let _ttl_guard = EnvVarGuard::set("WATTSWARM_NEARBY_DISCOVERY_TTL_MS", "60000");
 
     let dir = tempdir().expect("tempdir");
     let state_dir = dir.path().join("state");
@@ -583,6 +589,47 @@ fn network_discovery_auto_announces_local_record_to_discovery_api_base_url() {
     assert_eq!(report.attempted, 1);
     assert_eq!(report.succeeded, 1);
     assert_eq!(report.failed, 0);
+    let requests = stub.requests.lock().expect("discovery requests");
+    assert_eq!(requests.len(), 1);
+}
+
+#[test]
+fn network_discovery_bootnode_announce_does_not_block_startup_path() {
+    let _guard = env_lock();
+    let _db_lock = DbTestLock::acquire();
+    let schema = reset_test_schema("ui_discovery_nonblocking_startup");
+    let _schema_guard = EnvVarGuard::set("WATTSWARM_PG_SCHEMA", &schema);
+
+    let dir = tempdir().expect("tempdir");
+    let state_dir = dir.path().join("state");
+    fs::create_dir_all(&state_dir).expect("create state dir");
+    wattswarm::startup_config::save_startup_config(
+        &wattswarm::startup_config::startup_config_path(&state_dir),
+        &wattswarm::startup_config::StartupConfig {
+            latitude: Some(37.0),
+            longitude: Some(-122.0),
+            network_mode: wattswarm::startup_config::NetworkMode::Local,
+            ..Default::default()
+        },
+    )
+    .expect("save startup config");
+    let stub = DiscoveryRecordStubServer::start_with_delay(Duration::from_millis(250));
+    wattswarm::control::save_discovery_bootnode_urls_state(&state_dir, &[stub.base_url()])
+        .expect("save discovery bootnode urls");
+
+    let started = Instant::now();
+    let handle = wattswarm::ui::spawn_discovery_bootnode_announce(
+        state_dir.clone(),
+        state_dir.join("local.state"),
+    );
+    assert!(
+        started.elapsed() < Duration::from_millis(100),
+        "discovery announce must not block UI startup"
+    );
+    handle
+        .join()
+        .expect("discovery announce thread should finish");
+
     let requests = stub.requests.lock().expect("discovery requests");
     assert_eq!(requests.len(), 1);
 }

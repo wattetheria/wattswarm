@@ -487,11 +487,6 @@ impl NetworkBridgeService {
             .publish_gossip(&GossipMessage::Summary(summary))
     }
 
-    pub fn publish_peer_discovery(&mut self, discovery: PeerDiscoveryAnnouncement) -> Result<()> {
-        self.runtime
-            .publish_gossip(&GossipMessage::Discovery(discovery))
-    }
-
     pub fn publish_checkpoint(
         &mut self,
         checkpoint: crate::network_p2p::CheckpointAnnouncement,

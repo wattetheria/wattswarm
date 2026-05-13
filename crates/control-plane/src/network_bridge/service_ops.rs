@@ -435,8 +435,8 @@ impl NetworkBridgeService {
         inserted
     }
 
-    pub(crate) fn mark_peer_disconnected(&mut self, peer: NetworkNodeId) {
-        self.connected_peers.remove(&peer);
+    pub(crate) fn mark_peer_disconnected(&mut self, peer: NetworkNodeId) -> bool {
+        let removed = self.connected_peers.remove(&peer);
         if let Some(state) = self.peer_sync_state.get_mut(&peer) {
             state.inflight_backfills = 0;
         }
@@ -445,6 +445,7 @@ impl NetworkBridgeService {
         self.pending_dm_requests
             .retain(|_, pending| pending.peer != peer);
         self.persist_peer_sync_state();
+        removed
     }
 
     pub(crate) fn mark_backfill_completed(&mut self, peer: NetworkNodeId) {

@@ -11,6 +11,7 @@ use axum::Router;
 use axum::routing::{get, post};
 use std::fs;
 use std::path::PathBuf;
+use std::thread;
 
 pub fn run(state_dir: PathBuf, db_path: PathBuf, listen: String) -> Result<()> {
     fs::create_dir_all(&state_dir)?;
@@ -34,16 +35,7 @@ pub fn run(state_dir: PathBuf, db_path: PathBuf, listen: String) -> Result<()> {
     )?;
     if network_started {
         mark_node_running_if_service_started(&state_dir, true)?;
-        match discovery::maybe_announce_local_record_to_discovery_bootnodes(&state_dir, &db_path) {
-            Ok(report) if report.attempted > 0 => {
-                eprintln!(
-                    "wattswarm discovery announce attempted={} succeeded={} failed={}",
-                    report.attempted, report.succeeded, report.failed
-                );
-            }
-            Ok(_) => {}
-            Err(error) => eprintln!("wattswarm discovery announce failed: {error}"),
-        }
+        spawn_discovery_bootnode_announce(state_dir.clone(), db_path.clone());
         eprintln!("wattswarm p2p network enabled");
     } else {
         eprintln!("wattswarm p2p network disabled");
@@ -78,6 +70,24 @@ pub fn run(state_dir: PathBuf, db_path: PathBuf, listen: String) -> Result<()> {
             .with_context(|| format!("bind UI on {}", listen))?;
         println!("wattswarm-ui listening on http://{}", listen);
         axum::serve(listener, app).await.context("serve UI")
+    })
+}
+
+pub fn spawn_discovery_bootnode_announce(
+    state_dir: PathBuf,
+    db_path: PathBuf,
+) -> thread::JoinHandle<()> {
+    thread::spawn(move || {
+        match discovery::maybe_announce_local_record_to_discovery_bootnodes(&state_dir, &db_path) {
+            Ok(report) if report.attempted > 0 => {
+                eprintln!(
+                    "wattswarm discovery announce attempted={} succeeded={} failed={}",
+                    report.attempted, report.succeeded, report.failed
+                );
+            }
+            Ok(_) => {}
+            Err(error) => eprintln!("wattswarm discovery announce failed: {error}"),
+        }
     })
 }
 

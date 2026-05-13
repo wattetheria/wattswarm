@@ -7,7 +7,6 @@ use axum::Json;
 use axum::extract::{Path, Query, State};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::env;
 use std::fs;
 use std::path::Path as FsPath;
 use std::time::Duration;
@@ -22,10 +21,7 @@ const DISCOVERY_RECORDS_FILE: &str = "discovery_records_v1.json";
 const DEFAULT_DISCOVERY_QUERY_LIMIT: usize = 50;
 const MAX_DISCOVERY_QUERY_LIMIT: usize = 200;
 const DISCOVERY_RECORDS_ROUTE: &str = "/api/network/discovery/records";
-const ENV_NEARBY_DISCOVERY_ENABLED: &str = "WATTSWARM_NEARBY_DISCOVERY_ENABLED";
-const ENV_NEARBY_DISCOVERY_RADIUS_KM: &str = "WATTSWARM_NEARBY_DISCOVERY_RADIUS_KM";
-const ENV_NEARBY_DISCOVERY_TTL_MS: &str = "WATTSWARM_NEARBY_DISCOVERY_TTL_MS";
-const DEFAULT_NEARBY_DISCOVERY_RADIUS_KM: f64 = 1000.0;
+const DEFAULT_DISCOVERY_RECORD_RADIUS_KM: f64 = 1000.0;
 const DISCOVERY_ANNOUNCE_TIMEOUT: Duration = Duration::from_secs(3);
 
 #[derive(Debug, Deserialize)]
@@ -58,13 +54,6 @@ pub fn maybe_announce_local_record_to_discovery_bootnodes(
     state_dir: &FsPath,
     db_path: &FsPath,
 ) -> Result<DiscoveryAnnounceReport> {
-    if !env_bool(ENV_NEARBY_DISCOVERY_ENABLED, true)? {
-        return Ok(DiscoveryAnnounceReport {
-            attempted: 0,
-            succeeded: 0,
-            failed: 0,
-        });
-    }
     let discovery_urls = load_discovery_bootnode_urls_state(state_dir)?;
     if discovery_urls.is_empty() {
         return Ok(DiscoveryAnnounceReport {
@@ -233,7 +222,7 @@ fn build_local_discovery_record(
         now_ms,
         now_ms,
     );
-    body.ttl_ms = env_u64(ENV_NEARBY_DISCOVERY_TTL_MS)?.unwrap_or(DEFAULT_RECORD_TTL_MS);
+    body.ttl_ms = DEFAULT_RECORD_TTL_MS;
     body.capabilities = DiscoveryRecordCapabilities::new(["wattswarm.node"])?;
     body.geo = local_discovery_geo(state_dir)?;
     let peer_id = local_peer_id(state_dir)?;
@@ -275,8 +264,7 @@ fn local_discovery_geo(state_dir: &FsPath) -> Result<Option<DiscoveryGeo>> {
     let geo = DiscoveryGeo {
         latitude,
         longitude,
-        radius_km: env_f64(ENV_NEARBY_DISCOVERY_RADIUS_KM)?
-            .unwrap_or(DEFAULT_NEARBY_DISCOVERY_RADIUS_KM),
+        radius_km: DEFAULT_DISCOVERY_RECORD_RADIUS_KM,
     };
     geo.validate()?;
     Ok(Some(geo))
@@ -309,43 +297,4 @@ fn upsert_status(status: DiscoveryRecordUpsert) -> &'static str {
 
 fn now_ms() -> u64 {
     chrono::Utc::now().timestamp_millis().max(0) as u64
-}
-
-fn env_bool(name: &str, default: bool) -> Result<bool> {
-    let Ok(raw) = env::var(name) else {
-        return Ok(default);
-    };
-    match raw.trim().to_ascii_lowercase().as_str() {
-        "" => Ok(default),
-        "1" | "true" | "yes" | "on" => Ok(true),
-        "0" | "false" | "no" | "off" => Ok(false),
-        _ => anyhow::bail!("{name} must be a boolean"),
-    }
-}
-
-fn env_u64(name: &str) -> Result<Option<u64>> {
-    let Ok(raw) = env::var(name) else {
-        return Ok(None);
-    };
-    let raw = raw.trim();
-    if raw.is_empty() {
-        return Ok(None);
-    }
-    Ok(Some(raw.parse::<u64>().with_context(|| {
-        format!("{name} must be an unsigned integer")
-    })?))
-}
-
-fn env_f64(name: &str) -> Result<Option<f64>> {
-    let Ok(raw) = env::var(name) else {
-        return Ok(None);
-    };
-    let raw = raw.trim();
-    if raw.is_empty() {
-        return Ok(None);
-    }
-    Ok(Some(
-        raw.parse::<f64>()
-            .with_context(|| format!("{name} must be a number"))?,
-    ))
 }
