@@ -293,11 +293,9 @@ impl NetworkBridgeService {
         if state.known_scopes.is_empty() {
             return self.subscribed_scopes.clone();
         }
-        self.subscribed_scopes
-            .iter()
-            .filter(|scope| state.known_scopes.contains(*scope))
-            .cloned()
-            .collect()
+        let mut scopes = self.subscribed_scopes.clone();
+        scopes.sort_by_key(|scope| !state.known_scopes.contains(scope));
+        scopes
     }
 
     pub(crate) fn preferred_backfill_peer_for_scope(

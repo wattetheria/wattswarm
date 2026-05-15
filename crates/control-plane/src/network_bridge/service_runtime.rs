@@ -308,6 +308,14 @@ impl NetworkBridgeService {
                             &envelope.scope,
                         );
                         let ingested_event = ingest_event_envelope(node, &envelope)?;
+                        if let crate::types::EventPayload::FeedSubscriptionUpdated(payload) =
+                            &ingested_event.payload
+                        {
+                            self.apply_remote_feed_subscription_for_relay(
+                                &node.node_id(),
+                                payload,
+                            )?;
+                        }
                         diagnostics::record_diagnostic(
                             self.state_dir.as_deref(),
                             diagnostics::DiagnosticEvent::new(
@@ -588,6 +596,11 @@ impl NetworkBridgeService {
                     );
                 }
                 for envelope in &response.events {
+                    if let crate::types::EventPayload::FeedSubscriptionUpdated(payload) =
+                        &envelope.event.payload
+                    {
+                        self.apply_remote_feed_subscription_for_relay(&node.node_id(), payload)?;
+                    }
                     diagnostics::record_diagnostic(
                         self.state_dir.as_deref(),
                         diagnostics::DiagnosticEvent::new(

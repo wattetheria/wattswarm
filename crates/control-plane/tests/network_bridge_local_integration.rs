@@ -71,6 +71,12 @@ fn group_scoped_live_sync_only_reaches_matching_group_scope() {
 }
 
 #[test]
+fn remote_subscription_turns_middle_peer_into_group_relay() {
+    let _guard = network_bridge_local_test_guard();
+    support::network_bridge::remote_subscription_turns_middle_peer_into_group_relay();
+}
+
+#[test]
 fn subnet_nodes_sync_and_mainnet_overlay_stays_isolated() {
     let _guard = network_bridge_local_test_guard();
     support::network_bridge::subnet_nodes_sync_and_mainnet_overlay_stays_isolated();

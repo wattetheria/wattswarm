@@ -66,8 +66,8 @@ use backfill::{
 };
 use publish::GlobalPublishRateGuard;
 use scope::{
-    dynamic_subscription_scope_kinds_for_node, event_scope, merge_scopes,
-    node_has_active_subscription_scope_kinds,
+    dynamic_subscription_scope_kinds_for_node, event_scope, feed_subscription_target_scope,
+    merge_scopes, node_has_active_subscription_scope_kinds,
 };
 use summary::{
     knowledge_summary_for_event, mirror_summary_controls_to_parent_network,
@@ -510,6 +510,12 @@ impl BackfillLaneKey {
             feed_key: feed_key.map(ToOwned::to_owned),
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct RemoteRelaySubscriptionKey {
+    subscriber_node_id: String,
+    scope: SwarmScope,
 }
 
 #[derive(Debug, Clone)]
@@ -2988,6 +2994,8 @@ pub struct NetworkBridgeService {
     tokio_runtime: Runtime,
     subscribed_scopes: Vec<SwarmScope>,
     subscribed_scope_kinds: HashMap<SwarmScope, HashSet<GossipKind>>,
+    relay_scope_kinds: HashMap<SwarmScope, HashSet<GossipKind>>,
+    remote_relay_subscriptions: HashMap<RemoteRelaySubscriptionKey, HashSet<GossipKind>>,
     pinned_scopes: Vec<SwarmScope>,
     peer_sync_state: HashMap<NetworkNodeId, PeerSyncState>,
     connected_peers: HashSet<NetworkNodeId>,
@@ -3036,6 +3044,8 @@ impl NetworkBridgeService {
             pinned_scopes: subscribed_scopes.clone(),
             subscribed_scopes,
             subscribed_scope_kinds,
+            relay_scope_kinds: HashMap::new(),
+            remote_relay_subscriptions: HashMap::new(),
             peer_sync_state: HashMap::new(),
             connected_peers: HashSet::new(),
             global_publish_rate_guard: GlobalPublishRateGuard::new(Instant::now()),
@@ -3212,6 +3222,14 @@ impl NetworkBridgeService {
     }
 
     #[cfg(test)]
+    pub fn relay_gossip_kinds(&self, scope: &SwarmScope) -> Vec<GossipKind> {
+        self.relay_scope_kinds
+            .get(scope)
+            .map(|kinds| kinds.iter().copied().collect())
+            .unwrap_or_default()
+    }
+
+    #[cfg(test)]
     pub fn known_remote_contact_count(&self) -> usize {
         self.runtime.known_remote_contact_count()
     }
@@ -3240,6 +3258,79 @@ impl NetworkBridgeService {
         Ok(())
     }
 
+    fn local_scope_kinds(&self, scope: &SwarmScope) -> HashSet<GossipKind> {
+        self.subscribed_scope_kinds
+            .get(scope)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    fn recompute_relay_scope_kinds(&mut self, scope: &SwarmScope) -> HashSet<GossipKind> {
+        let mut relay_kinds = HashSet::new();
+        for (key, kinds) in &self.remote_relay_subscriptions {
+            if key.scope == *scope {
+                relay_kinds.extend(kinds.iter().copied());
+            }
+        }
+        if relay_kinds.is_empty() {
+            self.relay_scope_kinds.remove(scope);
+        } else {
+            self.relay_scope_kinds
+                .insert(scope.clone(), relay_kinds.clone());
+        }
+        relay_kinds
+    }
+
+    pub(crate) fn apply_remote_feed_subscription_for_relay(
+        &mut self,
+        local_node_id: &str,
+        payload: &crate::types::FeedSubscriptionUpdatedPayload,
+    ) -> Result<()> {
+        if payload.subscriber_node_id == local_node_id {
+            return Ok(());
+        }
+        let scope = feed_subscription_target_scope(payload);
+        let key = RemoteRelaySubscriptionKey {
+            subscriber_node_id: payload.subscriber_node_id.clone(),
+            scope: scope.clone(),
+        };
+        let previous_relay_kinds = self
+            .relay_scope_kinds
+            .get(&scope)
+            .cloned()
+            .unwrap_or_default();
+        if payload.active {
+            let kinds = feed_subscription_gossip_kinds(&payload.gossip_kinds);
+            if kinds.is_empty() {
+                return Ok(());
+            }
+            self.remote_relay_subscriptions
+                .insert(key, kinds.iter().copied().collect::<HashSet<GossipKind>>());
+        } else {
+            self.remote_relay_subscriptions.remove(&key);
+        }
+        let next_relay_kinds = self.recompute_relay_scope_kinds(&scope);
+        let local_kinds = self.local_scope_kinds(&scope);
+        let subscribe_kinds = next_relay_kinds
+            .difference(&previous_relay_kinds)
+            .copied()
+            .collect::<Vec<_>>();
+        if !subscribe_kinds.is_empty() {
+            self.runtime
+                .subscribe_scope_kinds(&scope, &subscribe_kinds)?;
+        }
+        let unsubscribe_kinds = previous_relay_kinds
+            .difference(&next_relay_kinds)
+            .filter(|kind| !local_kinds.contains(kind))
+            .copied()
+            .collect::<Vec<_>>();
+        if !unsubscribe_kinds.is_empty() && scope != SwarmScope::Global {
+            self.runtime
+                .unsubscribe_scope_kinds(&scope, &unsubscribe_kinds)?;
+        }
+        Ok(())
+    }
+
     pub fn unsubscribe_scope(&mut self, scope: &SwarmScope) -> Result<()> {
         self.unsubscribe_scope_kinds(scope, &GossipKind::ALL)
     }
@@ -3256,7 +3347,6 @@ impl NetworkBridgeService {
         {
             return Ok(());
         }
-        self.runtime.unsubscribe_scope_kinds(scope, kinds)?;
         if let Some(subscribed) = self.subscribed_scope_kinds.get_mut(scope) {
             for kind in kinds {
                 subscribed.remove(kind);
@@ -3265,6 +3355,20 @@ impl NetworkBridgeService {
                 self.subscribed_scope_kinds.remove(scope);
                 self.subscribed_scopes.retain(|existing| existing != scope);
             }
+        }
+        let relay_kinds = self
+            .relay_scope_kinds
+            .get(scope)
+            .cloned()
+            .unwrap_or_default();
+        let runtime_unsubscribe_kinds = kinds
+            .iter()
+            .filter(|kind| !relay_kinds.contains(kind))
+            .copied()
+            .collect::<Vec<_>>();
+        if !runtime_unsubscribe_kinds.is_empty() {
+            self.runtime
+                .unsubscribe_scope_kinds(scope, &runtime_unsubscribe_kinds)?;
         }
         Ok(())
     }

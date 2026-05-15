@@ -62,6 +62,12 @@ pub(super) fn dynamic_subscription_scope_kinds_for_node(
     Ok(subscriptions)
 }
 
+pub(super) fn feed_subscription_target_scope(
+    payload: &crate::types::FeedSubscriptionUpdatedPayload,
+) -> SwarmScope {
+    scope_from_optional_hint(payload.scope())
+}
+
 pub(super) fn node_has_active_subscription_scope_kinds(
     node: &Node,
     node_id: &str,
@@ -113,9 +119,7 @@ pub(super) fn contract_scope(contract: &crate::types::TaskContract) -> SwarmScop
 pub(super) fn event_scope(node: &Node, event: &crate::types::Event) -> Result<SwarmScope> {
     match &event.payload {
         crate::types::EventPayload::TaskCreated(contract) => Ok(contract_scope(contract)),
-        crate::types::EventPayload::FeedSubscriptionUpdated(payload) => {
-            Ok(scope_from_optional_hint(payload.scope()))
-        }
+        crate::types::EventPayload::FeedSubscriptionUpdated(_) => Ok(SwarmScope::Global),
         crate::types::EventPayload::TaskAnnounced(payload) => {
             Ok(scope_from_optional_hint(payload.scope()))
         }

@@ -20,13 +20,15 @@ use wattswarm_control_plane::network_bridge::{
     publish_pending_scoped_updates,
 };
 use wattswarm_control_plane::network_p2p::{
-    NetworkAddress, NetworkP2pConfig, NetworkP2pNode, PeerHandshakeMetadata, SwarmScope,
-    TopicNamespace,
+    GossipKind, NetworkAddress, NetworkP2pConfig, NetworkP2pNode, PeerHandshakeMetadata,
+    SwarmScope, TopicNamespace,
 };
 use wattswarm_control_plane::node::Node;
 use wattswarm_control_plane::storage::PgStore;
 use wattswarm_control_plane::task_template::sample_contract;
-use wattswarm_control_plane::types::{Membership, Role};
+use wattswarm_control_plane::types::{
+    EventPayload, FeedSubscriptionUpdatedPayload, Membership, Role,
+};
 use wattswarm_protocol::types::NetworkProtocolParams;
 
 fn membership_with_roles(node_ids: &[String]) -> Membership {
@@ -1419,6 +1421,92 @@ pub fn group_scoped_live_sync_only_reaches_matching_group_scope() {
             .task_view("task-group-live")
             .expect("task view")
             .is_none()
+    );
+}
+
+pub fn remote_subscription_turns_middle_peer_into_group_relay() {
+    let identity_a = NodeIdentity::random();
+    let identity_b = NodeIdentity::random();
+    let identity_c = NodeIdentity::random();
+    let membership = membership_with_roles(&[
+        identity_a.node_id(),
+        identity_b.node_id(),
+        identity_c.node_id(),
+    ]);
+    let mut node_a = make_node(identity_a, membership.clone());
+    let mut node_b = make_node(identity_b, membership.clone());
+    let mut node_c = make_node(identity_c, membership);
+    let mut service_a = make_service_with_scopes(&[SwarmScope::Global]);
+    let mut service_b = make_service_with_scopes(&[SwarmScope::Global]);
+    let mut service_c = make_service_with_scopes(&[SwarmScope::Global]);
+    let group_scope = SwarmScope::Group("crew-7".to_owned());
+
+    connect_services(&mut service_a, &mut node_a, &mut service_c, &mut node_c);
+    connect_services(&mut service_b, &mut node_b, &mut service_c, &mut node_c);
+
+    node_a
+        .emit_at(
+            1,
+            EventPayload::FeedSubscriptionUpdated(FeedSubscriptionUpdatedPayload {
+                network_id: "default".to_owned(),
+                subscriber_node_id: node_a.node_id(),
+                feed_key: "market.crew-7".to_owned(),
+                scope_hint: "group:crew-7".to_owned(),
+                gossip_kinds: vec!["events".to_owned()],
+                active: true,
+            }),
+            100,
+        )
+        .expect("node a subscription");
+
+    let mut last_a = 0;
+    for iteration in 0..4_096 {
+        last_a = publish_pending_scoped_updates(&mut service_a, &node_a, &node_a.node_id(), last_a)
+            .expect("publish node a subscription");
+        let _ = pump_once(&mut service_a, &mut node_a);
+        let _ = pump_once(&mut service_b, &mut node_b);
+        let _ = pump_once(&mut service_c, &mut node_c);
+        if last_a > 0 && iteration > 512 {
+            break;
+        }
+        std::thread::yield_now();
+    }
+
+    service_b
+        .subscribe_scope_kinds(&group_scope, &[GossipKind::Events])
+        .expect("node b joins group events");
+    let policy_hash = node_b
+        .policy_registry()
+        .binding_for("vp.schema_only.v1", json!({}))
+        .expect("policy binding")
+        .policy_hash;
+    let mut contract = sample_contract("task-group-relayed", policy_hash);
+    contract.task_type = "group:crew-7:swarm".to_owned();
+    contract.inputs = json!({"prompt":"relayed group sync", "swarm_scope":"group:crew-7"});
+    node_b.submit_task(contract, 1, 110).expect("submit task");
+
+    let mut last_b = 0;
+    let mut relayed_to_a = false;
+    for _ in 0..4_096 {
+        last_b = publish_pending_scoped_updates(&mut service_b, &node_b, &node_b.node_id(), last_b)
+            .expect("publish node b task");
+        let _ = pump_once(&mut service_a, &mut node_a);
+        let _ = pump_once(&mut service_b, &mut node_b);
+        let _ = pump_once(&mut service_c, &mut node_c);
+        if node_a
+            .task_view("task-group-relayed")
+            .expect("task view")
+            .is_some()
+        {
+            relayed_to_a = true;
+            break;
+        }
+        std::thread::yield_now();
+    }
+
+    assert!(
+        relayed_to_a,
+        "A and B are not directly connected, so the group event must relay through C"
     );
 }
 

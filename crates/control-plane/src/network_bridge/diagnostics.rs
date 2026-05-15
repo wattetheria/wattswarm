@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::collections::HashMap;
+use std::collections::HashSet;
 use std::fs::{self, OpenOptions};
 use std::io::Write as _;
 use std::path::Path;
@@ -10,8 +10,6 @@ use uuid::Uuid;
 use crate::network_p2p::SwarmScope;
 
 const DIAGNOSTIC_LOG_RELATIVE_PATH: &str = "diagnostics/wattswarm_node.jsonl";
-const DIAGNOSTIC_DEDUPE_WINDOW_MS: u64 = 5_000;
-const DIAGNOSTIC_DEDUPE_LOOKBACK_LINES: usize = 256;
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct DiagnosticEntry {
@@ -49,7 +47,6 @@ struct DiagnosticDedupeKey {
     object_id: Option<String>,
     source_node_id: Option<String>,
     scope_hint: Option<String>,
-    details: String,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -180,19 +177,12 @@ fn is_recent_duplicate(path: &Path, entry: &DiagnosticEntry) -> Result<bool> {
     let key = diagnostic_dedupe_key(entry);
     let raw = fs::read_to_string(path)
         .with_context(|| format!("read Wattswarm diagnostics log {}", path.display()))?;
-    for line in raw
-        .lines()
-        .rev()
-        .filter(|line| !line.trim().is_empty())
-        .take(DIAGNOSTIC_DEDUPE_LOOKBACK_LINES)
-    {
+    for line in raw.lines().rev().filter(|line| !line.trim().is_empty()) {
         let existing: DiagnosticEntry = match serde_json::from_str(line) {
             Ok(existing) => existing,
             Err(_) => continue,
         };
-        if diagnostic_dedupe_key(&existing) == key
-            && entry.timestamp_ms.abs_diff(existing.timestamp_ms) <= DIAGNOSTIC_DEDUPE_WINDOW_MS
-        {
+        if diagnostic_dedupe_key(&existing) == key {
             return Ok(true);
         }
     }
@@ -211,7 +201,7 @@ pub fn list_diagnostics(
     let raw = fs::read_to_string(&path)
         .with_context(|| format!("read Wattswarm diagnostics log {}", path.display()))?;
     let mut entries = Vec::with_capacity(limit);
-    let mut seen: HashMap<DiagnosticDedupeKey, u64> = HashMap::new();
+    let mut seen: HashSet<DiagnosticDedupeKey> = HashSet::new();
     for line in raw.lines().rev() {
         if line.trim().is_empty() {
             continue;
@@ -222,13 +212,10 @@ pub fn list_diagnostics(
         };
         if matches_filter(&entry, filter) {
             let key = diagnostic_dedupe_key(&entry);
-            if let Some(newer_timestamp_ms) = seen.get(&key)
-                && newer_timestamp_ms.saturating_sub(entry.timestamp_ms)
-                    <= DIAGNOSTIC_DEDUPE_WINDOW_MS
-            {
+            if seen.contains(&key) {
                 continue;
             }
-            seen.insert(key, entry.timestamp_ms);
+            seen.insert(key);
             entries.push(entry);
             if entries.len() >= limit {
                 break;
@@ -251,7 +238,6 @@ fn diagnostic_dedupe_key(entry: &DiagnosticEntry) -> DiagnosticDedupeKey {
         object_id: entry.object_id.clone(),
         source_node_id: entry.source_node_id.clone(),
         scope_hint: entry.scope_hint.clone(),
-        details: serde_json::to_string(&entry.details).unwrap_or_default(),
     }
 }
 

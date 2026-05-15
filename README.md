@@ -642,6 +642,8 @@ Each node derives its own base scope subscriptions from local configuration:
 
 Configured scopes subscribe the full gossip set. Active local feed subscriptions persisted through `FeedSubscriptionUpdated` subscribe only the gossip kinds declared by that feed.
 
+`FeedSubscriptionUpdated` is announced on the global control gossip lane while its payload `scope_hint` remains the target scope. Peers that observe a remote active subscription join the target scope/kind as a pass-through relay subscription without treating it as their own local product subscription. This lets a topology such as `publisher <-> bootstrap <-> claimant` form a topic relay path even when the publisher and claimant are not directly connected.
+
 For each subscribed scope, the node can derive five gossip kinds:
 
 - `events`

@@ -1414,6 +1414,127 @@ fn publish_pending_updates_subscribes_runtime_for_local_feed_subscription() {
 }
 
 #[test]
+fn feed_subscription_updates_publish_on_global_control_scope() {
+    let mut node = Node::open_in_memory_with_roles(&[]).expect("node");
+    let local_node_id = node.node_id();
+    node.emit_at(
+        1,
+        crate::types::EventPayload::FeedSubscriptionUpdated(
+            crate::types::FeedSubscriptionUpdatedPayload {
+                network_id: "default".to_owned(),
+                subscriber_node_id: local_node_id,
+                feed_key: "market.control".to_owned(),
+                scope_hint: "group:crew-7".to_owned(),
+                gossip_kinds: vec!["events".to_owned()],
+                active: true,
+            },
+        ),
+        100,
+    )
+    .expect("subscription event");
+    let (_, event) = node
+        .store
+        .load_all_events()
+        .expect("load events")
+        .into_iter()
+        .next()
+        .expect("event");
+
+    assert_eq!(
+        event_scope(&node, &event).expect("event scope"),
+        SwarmScope::Global
+    );
+    let crate::types::EventPayload::FeedSubscriptionUpdated(payload) = &event.payload else {
+        panic!("expected subscription update");
+    };
+    assert_eq!(
+        feed_subscription_target_scope(payload),
+        SwarmScope::Group("crew-7".to_owned())
+    );
+}
+
+#[test]
+fn remote_feed_subscription_adds_relay_scope_without_local_subscription() {
+    let mut service = NetworkBridgeService::new(
+        NetworkP2pNode::generate(NetworkP2pConfig {
+            listen_addrs: vec!["/ip4/127.0.0.1/tcp/0".to_owned()],
+            enable_local_discovery: false,
+            ..NetworkP2pConfig::default()
+        })
+        .expect("network node"),
+        &[SwarmScope::Global],
+        &NetworkProtocolParams::default(),
+    )
+    .expect("service");
+    let local_node_id = "local-node";
+    let payload = crate::types::FeedSubscriptionUpdatedPayload {
+        network_id: "default".to_owned(),
+        subscriber_node_id: "remote-node".to_owned(),
+        feed_key: "market.relay".to_owned(),
+        scope_hint: "group:crew-7".to_owned(),
+        gossip_kinds: vec!["events".to_owned()],
+        active: true,
+    };
+
+    service
+        .apply_remote_feed_subscription_for_relay(local_node_id, &payload)
+        .expect("apply relay subscription");
+
+    let scope = SwarmScope::Group("crew-7".to_owned());
+    assert!(!service.subscribed_scopes().contains(&scope));
+    let relay_kinds = service.relay_gossip_kinds(&scope);
+    assert!(relay_kinds.contains(&GossipKind::Events));
+    assert!(!relay_kinds.contains(&GossipKind::Messages));
+}
+
+#[test]
+fn remote_feed_unsubscribe_keeps_local_scope_subscription() {
+    let scope = SwarmScope::Group("crew-7".to_owned());
+    let mut service = NetworkBridgeService::new(
+        NetworkP2pNode::generate(NetworkP2pConfig {
+            listen_addrs: vec!["/ip4/127.0.0.1/tcp/0".to_owned()],
+            enable_local_discovery: false,
+            ..NetworkP2pConfig::default()
+        })
+        .expect("network node"),
+        &[SwarmScope::Global],
+        &NetworkProtocolParams::default(),
+    )
+    .expect("service");
+    service
+        .subscribe_scope_kinds(&scope, &[GossipKind::Events])
+        .expect("local subscribe");
+    let local_node_id = "local-node";
+    let active_payload = crate::types::FeedSubscriptionUpdatedPayload {
+        network_id: "default".to_owned(),
+        subscriber_node_id: "remote-node".to_owned(),
+        feed_key: "market.relay".to_owned(),
+        scope_hint: "group:crew-7".to_owned(),
+        gossip_kinds: vec!["events".to_owned()],
+        active: true,
+    };
+    service
+        .apply_remote_feed_subscription_for_relay(local_node_id, &active_payload)
+        .expect("apply relay subscription");
+    let inactive_payload = crate::types::FeedSubscriptionUpdatedPayload {
+        active: false,
+        ..active_payload
+    };
+
+    service
+        .apply_remote_feed_subscription_for_relay(local_node_id, &inactive_payload)
+        .expect("remove relay subscription");
+
+    assert!(service.subscribed_scopes().contains(&scope));
+    assert!(
+        service
+            .subscribed_gossip_kinds(&scope)
+            .contains(&GossipKind::Events)
+    );
+    assert!(service.relay_gossip_kinds(&scope).is_empty());
+}
+
+#[test]
 fn publish_pending_updates_unsubscribes_scope_when_local_subscription_is_disabled() {
     let mut node = Node::open_in_memory_with_roles(&[]).expect("node");
     let local_node_id = node.node_id();
@@ -2603,6 +2724,102 @@ fn connection_closed_diagnostics_skip_duplicate_peer_events() {
 }
 
 #[test]
+fn diagnostics_append_skips_stable_duplicate_discovery_records() {
+    let dir = temp_startup_dir("diagnostics-discovery-stable-dedupe");
+    let peer = random_network_node_id();
+
+    for distance_km in [1.0, 2.0] {
+        diagnostics::record_diagnostic(
+            Some(&dir),
+            diagnostics::DiagnosticEvent::new(
+                "info",
+                "discovery",
+                "discovery_v1.peer.accepted",
+                "ok",
+                format!("discovery v1 peer accepted: {peer}"),
+            )
+            .object("peer", Some(peer.to_string()))
+            .source_node_id(Some(peer.to_string()))
+            .details(json!({
+                "distance_km": distance_km,
+                "registered_contact": true,
+                "radius_km": 20.0,
+            })),
+        );
+    }
+
+    let raw =
+        fs::read_to_string(dir.join("diagnostics/wattswarm_node.jsonl")).expect("diagnostic log");
+    assert_eq!(
+        raw.matches("\"phase\":\"discovery_v1.peer.accepted\"")
+            .count(),
+        1
+    );
+
+    std::fs::remove_dir_all(dir).expect("cleanup");
+}
+
+#[test]
+fn diagnostics_list_collapses_legacy_duplicates_without_time_window() {
+    let dir = temp_startup_dir("diagnostics-list-stable-dedupe");
+    let path = dir.join("diagnostics/wattswarm_node.jsonl");
+    fs::create_dir_all(path.parent().expect("diagnostics parent")).expect("create diagnostics dir");
+    let peer = random_network_node_id();
+    let older = json!({
+        "id": "older",
+        "timestamp_ms": 1_u64,
+        "level": "info",
+        "component": "wattswarm.network_bridge",
+        "category": "discovery",
+        "phase": "discovery_v1.peer.accepted",
+        "status": "ok",
+        "message": format!("discovery v1 peer accepted: {peer}"),
+        "object_kind": "peer",
+        "object_id": peer.to_string(),
+        "source_node_id": peer.to_string(),
+        "details": {
+            "distance_km": 1.0,
+            "registered_contact": true,
+            "radius_km": 20.0
+        }
+    });
+    let newer = json!({
+        "id": "newer",
+        "timestamp_ms": 3_600_000_u64,
+        "level": "info",
+        "component": "wattswarm.network_bridge",
+        "category": "discovery",
+        "phase": "discovery_v1.peer.accepted",
+        "status": "ok",
+        "message": format!("discovery v1 peer accepted: {peer}"),
+        "object_kind": "peer",
+        "object_id": peer.to_string(),
+        "source_node_id": peer.to_string(),
+        "details": {
+            "distance_km": 2.0,
+            "registered_contact": true,
+            "radius_km": 20.0
+        }
+    });
+    fs::write(&path, format!("{older}\n{newer}\n")).expect("write legacy diagnostics");
+
+    let rows = diagnostics::list_diagnostics(
+        &dir,
+        &diagnostics::DiagnosticFilter {
+            limit: Some(10),
+            ..diagnostics::DiagnosticFilter::default()
+        },
+    )
+    .expect("list diagnostics");
+
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].id, "newer");
+    assert_eq!(rows[0].timestamp_ms, 3_600_000);
+
+    std::fs::remove_dir_all(dir).expect("cleanup");
+}
+
+#[test]
 fn peer_discovered_event_persists_wan_source_into_local_registry() {
     let dir = temp_startup_dir("peer-discovered-persist");
     let mut node = Node::open_in_memory_with_roles(&[Role::Proposer]).expect("node");
@@ -3308,6 +3525,31 @@ fn scopes_to_request_for_peer_falls_back_to_all_scopes_until_peer_is_profiled() 
     assert_eq!(
         service.scopes_to_request_for_peer(&peer),
         vec![SwarmScope::Global, target_scope]
+    );
+}
+
+#[test]
+fn scopes_to_request_for_peer_prioritizes_known_scopes_without_dropping_subscriptions() {
+    let peer = random_network_node_id();
+    let target_scope = SwarmScope::Region("sol-1".to_owned());
+    let other_scope = SwarmScope::Node("lab-1".to_owned());
+    let mut service = NetworkBridgeService::new(
+        NetworkP2pNode::generate(NetworkP2pConfig::default()).expect("node"),
+        &[
+            SwarmScope::Global,
+            target_scope.clone(),
+            other_scope.clone(),
+        ],
+        &NetworkProtocolParams::default(),
+    )
+    .expect("service");
+    let mut state = PeerSyncState::new(Instant::now());
+    state.known_scopes.insert(target_scope.clone());
+    service.peer_sync_state.insert(peer.clone(), state);
+
+    assert_eq!(
+        service.scopes_to_request_for_peer(&peer),
+        vec![target_scope, SwarmScope::Global, other_scope]
     );
 }
 
