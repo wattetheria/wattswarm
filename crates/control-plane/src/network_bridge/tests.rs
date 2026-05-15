@@ -1476,12 +1476,14 @@ fn remote_feed_subscription_adds_relay_scope_without_local_subscription() {
         active: true,
     };
 
-    service
+    let relayed_scope = service
         .apply_remote_feed_subscription_for_relay(local_node_id, &payload)
         .expect("apply relay subscription");
 
     let scope = SwarmScope::Group("crew-7".to_owned());
+    assert_eq!(relayed_scope, Some(scope.clone()));
     assert!(!service.subscribed_scopes().contains(&scope));
+    assert!(service.backfill_scopes().contains(&scope));
     let relay_kinds = service.relay_gossip_kinds(&scope);
     assert!(relay_kinds.contains(&GossipKind::Events));
     assert!(!relay_kinds.contains(&GossipKind::Messages));
@@ -2996,6 +2998,8 @@ fn set_state_dir_loads_persisted_iroh_contact_material_into_runtime() {
     service.set_state_dir(local_dir.clone(), local_dir.join("ui.state"));
 
     assert_eq!(service.known_remote_contact_count(), 1);
+    let remote_peer = NetworkNodeId::new(remote_endpoint.clone()).expect("remote peer id");
+    assert_eq!(service.reconnect_attempts_for_peer(&remote_peer), Some(0));
 
     wattswarm_network_transport_iroh::shutdown_local_iroh_data_plane(&local_dir);
     wattswarm_network_transport_iroh::shutdown_local_iroh_data_plane(&remote_dir);
@@ -3047,11 +3051,182 @@ fn set_state_dir_loads_startup_iroh_bootstrap_contacts_into_runtime() {
     service.set_state_dir(local_dir.clone(), local_dir.join("ui.state"));
 
     assert_eq!(service.known_remote_contact_count(), 1);
+    let remote_peer = NetworkNodeId::new(remote_endpoint.clone()).expect("remote peer id");
+    assert_eq!(service.reconnect_attempts_for_peer(&remote_peer), Some(0));
     let rows =
         crate::control::load_peer_metadata_records_state(&local_dir).expect("peer metadata rows");
     assert!(rows.iter().any(|row| {
         row.node_id == remote_endpoint && row.handshake_status == "startup_contact"
     }));
+
+    wattswarm_network_transport_iroh::shutdown_local_iroh_data_plane(&local_dir);
+    wattswarm_network_transport_iroh::shutdown_local_iroh_data_plane(&remote_dir);
+    std::fs::remove_dir_all(local_dir).expect("cleanup local");
+    std::fs::remove_dir_all(remote_dir).expect("cleanup remote");
+}
+
+#[test]
+fn reconnect_supervision_redials_remembered_peer_address() {
+    let local_dir = temp_startup_dir("reconnect-local");
+    let remote_dir = temp_startup_dir("reconnect-remote");
+    let local_seed = [93u8; 32];
+    let remote_seed = [94u8; 32];
+    std::fs::write(local_dir.join("node_seed.hex"), hex::encode(local_seed))
+        .expect("write local seed");
+    std::fs::write(remote_dir.join("node_seed.hex"), hex::encode(remote_seed))
+        .expect("write remote seed");
+    let remote_endpoint =
+        wattswarm_network_transport_iroh::local_endpoint_id_from_state_dir(&remote_dir)
+            .expect("remote endpoint")
+            .to_string();
+    let peer = NetworkNodeId::new(remote_endpoint).expect("remote peer id");
+    let mut service = NetworkBridgeService::new(
+        NetworkP2pNode::from_iroh_state_dir(
+            NetworkP2pConfig::default(),
+            local_dir.clone(),
+            local_seed,
+        )
+        .expect("iroh node"),
+        &[SwarmScope::Global],
+        &NetworkProtocolParams::default(),
+    )
+    .expect("service");
+
+    service.remember_peer_address(
+        peer.clone(),
+        NetworkAddress::new("127.0.0.1:4002".to_owned()).expect("address"),
+    );
+    let attempts = service
+        .run_reconnect_supervision()
+        .expect("run reconnect supervision");
+
+    assert_eq!(attempts, 1);
+    assert_eq!(service.known_remote_contact_count(), 1);
+    assert_eq!(service.reconnect_attempts_for_peer(&peer), Some(1));
+
+    wattswarm_network_transport_iroh::shutdown_local_iroh_data_plane(&local_dir);
+    wattswarm_network_transport_iroh::shutdown_local_iroh_data_plane(&remote_dir);
+    std::fs::remove_dir_all(local_dir).expect("cleanup local");
+    std::fs::remove_dir_all(remote_dir).expect("cleanup remote");
+}
+
+#[test]
+fn urgent_backfill_request_bypasses_retry_delay_for_relay_scope() {
+    let node = Node::open_in_memory_with_roles(&[Role::Proposer]).expect("node");
+    let local_dir = temp_startup_dir("urgent-backfill-local");
+    let remote_dir = temp_startup_dir("urgent-backfill-remote");
+    let local_seed = [95u8; 32];
+    let remote_seed = [96u8; 32];
+    std::fs::write(local_dir.join("node_seed.hex"), hex::encode(local_seed))
+        .expect("write local seed");
+    std::fs::write(remote_dir.join("node_seed.hex"), hex::encode(remote_seed))
+        .expect("write remote seed");
+    let remote_endpoint =
+        wattswarm_network_transport_iroh::local_endpoint_id_from_state_dir(&remote_dir)
+            .expect("remote endpoint")
+            .to_string();
+    let peer = NetworkNodeId::new(remote_endpoint).expect("remote peer id");
+    let mut service = NetworkBridgeService::new(
+        NetworkP2pNode::from_iroh_state_dir(
+            NetworkP2pConfig::default(),
+            local_dir.clone(),
+            local_seed,
+        )
+        .expect("iroh node"),
+        &[SwarmScope::Global],
+        &NetworkProtocolParams::default(),
+    )
+    .expect("service");
+    service
+        .runtime
+        .dial(NetworkAddress::new(format!("{peer}@127.0.0.1:4003")).expect("dial target"))
+        .expect("dial peer");
+    service.connected_peers.insert(peer.clone());
+    let scope = SwarmScope::Group("crew-urgent".to_owned());
+    let mut state = PeerSyncState::new(Instant::now());
+    state.next_retry_at = Instant::now() + Duration::from_secs(60);
+    state.known_scopes.insert(scope.clone());
+    service.peer_sync_state.insert(peer.clone(), state);
+
+    assert!(
+        !service
+            .request_backfill_scopes_for_peer(&peer, &node, std::slice::from_ref(&scope))
+            .expect("retry-gated backfill")
+    );
+    assert!(
+        service
+            .request_backfill_scopes_for_peer_now(&peer, &node, &[scope])
+            .expect("urgent backfill")
+    );
+    assert_eq!(
+        service
+            .peer_sync_state
+            .get(&peer)
+            .expect("peer sync state")
+            .inflight_backfills,
+        1
+    );
+
+    wattswarm_network_transport_iroh::shutdown_local_iroh_data_plane(&local_dir);
+    wattswarm_network_transport_iroh::shutdown_local_iroh_data_plane(&remote_dir);
+    std::fs::remove_dir_all(local_dir).expect("cleanup local");
+    std::fs::remove_dir_all(remote_dir).expect("cleanup remote");
+}
+
+#[test]
+fn anti_entropy_requests_relay_scope_backfill() {
+    let node = Node::open_in_memory_with_roles(&[Role::Proposer]).expect("node");
+    let local_dir = temp_startup_dir("relay-anti-entropy-local");
+    let remote_dir = temp_startup_dir("relay-anti-entropy-remote");
+    let local_seed = [97u8; 32];
+    let remote_seed = [98u8; 32];
+    std::fs::write(local_dir.join("node_seed.hex"), hex::encode(local_seed))
+        .expect("write local seed");
+    std::fs::write(remote_dir.join("node_seed.hex"), hex::encode(remote_seed))
+        .expect("write remote seed");
+    let remote_endpoint =
+        wattswarm_network_transport_iroh::local_endpoint_id_from_state_dir(&remote_dir)
+            .expect("remote endpoint")
+            .to_string();
+    let peer = NetworkNodeId::new(remote_endpoint).expect("remote peer id");
+    let mut service = NetworkBridgeService::new(
+        NetworkP2pNode::from_iroh_state_dir(
+            NetworkP2pConfig::default(),
+            local_dir.clone(),
+            local_seed,
+        )
+        .expect("iroh node"),
+        &[SwarmScope::Global],
+        &NetworkProtocolParams::default(),
+    )
+    .expect("service");
+    service
+        .runtime
+        .dial(NetworkAddress::new(format!("{peer}@127.0.0.1:4004")).expect("dial target"))
+        .expect("dial peer");
+    service.connected_peers.insert(peer.clone());
+    let scope = SwarmScope::Group("crew-relay".to_owned());
+    service
+        .relay_scope_kinds
+        .insert(scope.clone(), HashSet::from([GossipKind::Events]));
+    let mut state = PeerSyncState::new(Instant::now());
+    state.known_scopes.insert(scope);
+    service.peer_sync_state.insert(peer.clone(), state);
+
+    assert_eq!(
+        service
+            .run_anti_entropy(&node)
+            .expect("run anti-entropy for relay scope"),
+        1
+    );
+    assert!(
+        service
+            .peer_sync_state
+            .get(&peer)
+            .expect("peer sync state")
+            .inflight_backfills
+            >= 1
+    );
 
     wattswarm_network_transport_iroh::shutdown_local_iroh_data_plane(&local_dir);
     wattswarm_network_transport_iroh::shutdown_local_iroh_data_plane(&remote_dir);

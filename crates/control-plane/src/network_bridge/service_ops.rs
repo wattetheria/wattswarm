@@ -167,13 +167,13 @@ impl NetworkBridgeService {
         self.handle_runtime_event(node, event)
     }
 
-    pub(crate) fn request_backfill_for_peer(
+    pub(crate) fn request_backfill_for_peer_now(
         &mut self,
         peer: &NetworkNodeId,
         node: &Node,
     ) -> Result<bool> {
         let scopes = self.scopes_to_request_for_peer(peer);
-        self.request_backfill_scopes_for_peer(peer, node, &scopes)
+        self.request_backfill_scopes_for_peer_now(peer, node, &scopes)
     }
 
     pub(crate) fn request_backfill_scopes_for_peer(
@@ -182,12 +182,32 @@ impl NetworkBridgeService {
         node: &Node,
         scopes: &[SwarmScope],
     ) -> Result<bool> {
+        self.request_backfill_scopes_for_peer_inner(peer, node, scopes, false)
+    }
+
+    pub(crate) fn request_backfill_scopes_for_peer_now(
+        &mut self,
+        peer: &NetworkNodeId,
+        node: &Node,
+        scopes: &[SwarmScope],
+    ) -> Result<bool> {
+        self.request_backfill_scopes_for_peer_inner(peer, node, scopes, true)
+    }
+
+    fn request_backfill_scopes_for_peer_inner(
+        &mut self,
+        peer: &NetworkNodeId,
+        node: &Node,
+        scopes: &[SwarmScope],
+        ignore_retry_delay: bool,
+    ) -> Result<bool> {
         let now = Instant::now();
         let state = self
             .peer_sync_state
             .entry(peer.clone())
             .or_insert_with(|| PeerSyncState::new(now));
-        if state.inflight_backfills >= MAX_INFLIGHT_BACKFILLS_PER_PEER || state.next_retry_at > now
+        if state.inflight_backfills >= MAX_INFLIGHT_BACKFILLS_PER_PEER
+            || (!ignore_retry_delay && state.next_retry_at > now)
         {
             return Ok(false);
         }
@@ -269,7 +289,7 @@ impl NetworkBridgeService {
     pub fn run_anti_entropy(&mut self, node: &Node) -> Result<usize> {
         let now = Instant::now();
         let mut requested = 0usize;
-        let mut scopes = self.subscribed_scopes.clone();
+        let mut scopes = self.backfill_scopes();
         scopes.sort_by_key(|scope| matches!(scope, SwarmScope::Global));
         let mut requests_by_peer: HashMap<NetworkNodeId, Vec<SwarmScope>> = HashMap::new();
         for scope in scopes {
@@ -288,13 +308,23 @@ impl NetworkBridgeService {
 
     pub(crate) fn scopes_to_request_for_peer(&self, peer: &NetworkNodeId) -> Vec<SwarmScope> {
         let Some(state) = self.peer_sync_state.get(peer) else {
-            return self.subscribed_scopes.clone();
+            return self.backfill_scopes();
         };
         if state.known_scopes.is_empty() {
-            return self.subscribed_scopes.clone();
+            return self.backfill_scopes();
         }
-        let mut scopes = self.subscribed_scopes.clone();
+        let mut scopes = self.backfill_scopes();
         scopes.sort_by_key(|scope| !state.known_scopes.contains(scope));
+        scopes
+    }
+
+    pub(crate) fn backfill_scopes(&self) -> Vec<SwarmScope> {
+        let mut scopes = self.subscribed_scopes.clone();
+        for scope in self.relay_scope_kinds.keys() {
+            if !scopes.contains(scope) {
+                scopes.push(scope.clone());
+            }
+        }
         scopes
     }
 
@@ -427,8 +457,9 @@ impl NetworkBridgeService {
     pub(crate) fn mark_peer_connected(&mut self, peer: NetworkNodeId) -> bool {
         let inserted = self.connected_peers.insert(peer.clone());
         self.peer_sync_state
-            .entry(peer)
+            .entry(peer.clone())
             .or_insert_with(|| PeerSyncState::new(Instant::now()));
+        self.peer_reconnect_state.remove(&peer);
         self.persist_peer_sync_state();
         inserted
     }
@@ -444,6 +475,104 @@ impl NetworkBridgeService {
             .retain(|_, pending| pending.peer != peer);
         self.persist_peer_sync_state();
         removed
+    }
+
+    pub(crate) fn remember_peer_address(&mut self, peer: NetworkNodeId, address: NetworkAddress) {
+        self.known_peer_addrs.insert(peer.clone(), address);
+        self.peer_reconnect_state
+            .entry(peer)
+            .or_insert_with(PeerReconnectState::ready_now);
+    }
+
+    pub(crate) fn remember_peer_address_from_contact(
+        &mut self,
+        peer: &str,
+        contact: &TransportContactMaterial,
+    ) {
+        let Some(address) = contact.metadata.listen_addrs.first() else {
+            return;
+        };
+        let Ok(peer) = NetworkNodeId::new(peer.to_owned()) else {
+            return;
+        };
+        let Ok(address) = NetworkAddress::new(address.clone()) else {
+            return;
+        };
+        self.remember_peer_address(peer, address);
+    }
+
+    pub(crate) fn schedule_peer_reconnect(&mut self, peer: NetworkNodeId) {
+        if self.known_peer_addrs.contains_key(&peer) {
+            self.peer_reconnect_state
+                .entry(peer)
+                .or_insert_with(PeerReconnectState::ready_now);
+        }
+    }
+
+    pub fn run_reconnect_supervision(&mut self) -> Result<usize> {
+        let now = Instant::now();
+        let peers = self
+            .known_peer_addrs
+            .iter()
+            .filter(|(peer, _)| !self.connected_peers.contains(*peer))
+            .filter(|(peer, _)| {
+                self.peer_reconnect_state
+                    .get(*peer)
+                    .is_none_or(|state| state.next_attempt_at <= now)
+            })
+            .map(|(peer, address)| (peer.clone(), address.clone()))
+            .collect::<Vec<_>>();
+        let mut attempts = 0usize;
+        for (peer, address) in peers {
+            let dial_target = NetworkAddress::new(format!("{peer}@{address}"))?;
+            let result = self.runtime.dial(dial_target);
+            let state = self
+                .peer_reconnect_state
+                .entry(peer.clone())
+                .or_insert_with(PeerReconnectState::ready_now);
+            state.schedule_next_attempt(now);
+            attempts += 1;
+            match result {
+                Ok(()) => {
+                    diagnostics::record_diagnostic(
+                        self.state_dir.as_deref(),
+                        diagnostics::DiagnosticEvent::new(
+                            "info",
+                            "transport",
+                            "reconnect.dial",
+                            "ok",
+                            format!("peer reconnect dial scheduled: {peer}"),
+                        )
+                        .object("peer", Some(peer.to_string()))
+                        .source_node_id(Some(peer.to_string()))
+                        .details(json!({
+                            "address": address.to_string(),
+                            "attempts": state.attempts,
+                        })),
+                    );
+                }
+                Err(err) => {
+                    diagnostics::record_diagnostic(
+                        self.state_dir.as_deref(),
+                        diagnostics::DiagnosticEvent::new(
+                            "warn",
+                            "transport",
+                            "reconnect.dial",
+                            "failed",
+                            format!("peer reconnect dial failed: {peer}"),
+                        )
+                        .object("peer", Some(peer.to_string()))
+                        .source_node_id(Some(peer.to_string()))
+                        .details(json!({
+                            "address": address.to_string(),
+                            "attempts": state.attempts,
+                            "error": err.to_string(),
+                        })),
+                    );
+                }
+            }
+        }
+        Ok(attempts)
     }
 
     pub(crate) fn mark_backfill_completed(&mut self, peer: NetworkNodeId) {

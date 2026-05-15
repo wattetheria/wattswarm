@@ -24,6 +24,7 @@ impl NetworkBridgeService {
                         source.as_str(),
                     );
                 }
+                self.remember_peer_address(peer.clone(), address.clone());
                 Ok(NetworkBridgeTick::TransportNotice {
                     detail: format!(
                         "peer_discovered peer={peer} source={} address={address}",
@@ -131,6 +132,11 @@ impl NetworkBridgeService {
                 })
             }
             NetworkRuntimeEvent::ConnectionEstablished { peer, remote_addr } => {
+                if !self.known_peer_addrs.contains_key(&peer)
+                    && remote_addr.as_str() != peer.as_str()
+                {
+                    self.remember_peer_address(peer.clone(), remote_addr.clone());
+                }
                 let newly_connected = self.mark_peer_connected(peer.clone());
                 if let Some(state_dir) = &self.state_dir {
                     let remote_addr_text = remote_addr.to_string();
@@ -168,7 +174,7 @@ impl NetworkBridgeService {
                 {
                     eprintln!("contact material request failed for {peer}: {err}");
                 }
-                let _ = self.request_backfill_for_peer(&peer, node)?;
+                let _ = self.request_backfill_for_peer_now(&peer, node)?;
                 if !node.store.is_node_penalized(&node.node_id())? {
                     for entry in node
                         .store
@@ -264,6 +270,9 @@ impl NetworkBridgeService {
             } => {
                 let disconnected = remaining_established == 0;
                 let was_connected = disconnected && self.mark_peer_disconnected(peer.clone());
+                if disconnected {
+                    self.schedule_peer_reconnect(peer.clone());
+                }
                 let should_record_diagnostic = !disconnected || was_connected;
                 if should_record_diagnostic && let Some(state_dir) = &self.state_dir {
                     diagnostics::record_diagnostic(
@@ -311,10 +320,16 @@ impl NetworkBridgeService {
                         if let crate::types::EventPayload::FeedSubscriptionUpdated(payload) =
                             &ingested_event.payload
                         {
-                            self.apply_remote_feed_subscription_for_relay(
+                            if let Some(scope) = self.apply_remote_feed_subscription_for_relay(
                                 &node.node_id(),
                                 payload,
-                            )?;
+                            )? {
+                                let _ = self.request_backfill_scopes_for_peer_now(
+                                    &propagation_source,
+                                    node,
+                                    &[scope],
+                                )?;
+                            }
                         }
                         diagnostics::record_diagnostic(
                             self.state_dir.as_deref(),
@@ -599,7 +614,12 @@ impl NetworkBridgeService {
                     if let crate::types::EventPayload::FeedSubscriptionUpdated(payload) =
                         &envelope.event.payload
                     {
-                        self.apply_remote_feed_subscription_for_relay(&node.node_id(), payload)?;
+                        if let Some(scope) =
+                            self.apply_remote_feed_subscription_for_relay(&node.node_id(), payload)?
+                        {
+                            let _ =
+                                self.request_backfill_scopes_for_peer_now(&peer, node, &[scope])?;
+                        }
                     }
                     diagnostics::record_diagnostic(
                         self.state_dir.as_deref(),
