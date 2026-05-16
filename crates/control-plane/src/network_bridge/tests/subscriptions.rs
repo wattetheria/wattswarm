@@ -201,6 +201,47 @@ fn remote_feed_subscription_adds_relay_scope_without_local_subscription() {
 }
 
 #[test]
+fn startup_restores_remote_feed_subscription_relay_scopes() {
+    let node = Node::open_in_memory_with_roles(&[]).expect("node");
+    let local_node_id = node.node_id();
+    node.store
+        .upsert_feed_subscription(
+            "default",
+            "remote-node",
+            "task.lifecycle.crew-7",
+            "group:crew-7",
+            &["events".to_owned()],
+            true,
+            100,
+        )
+        .expect("remote subscription projection");
+
+    let mut service = NetworkBridgeService::new(
+        NetworkP2pNode::generate(NetworkP2pConfig {
+            listen_addrs: vec!["/ip4/127.0.0.1/tcp/0".to_owned()],
+            enable_local_discovery: false,
+            ..NetworkP2pConfig::default()
+        })
+        .expect("network node"),
+        &[SwarmScope::Global],
+        &NetworkProtocolParams::default(),
+    )
+    .expect("service");
+
+    let restored = service
+        .restore_remote_feed_subscriptions_for_relay(&node, &local_node_id)
+        .expect("restore remote relay subscriptions");
+
+    let scope = SwarmScope::Group("crew-7".to_owned());
+    assert_eq!(restored, vec![scope.clone()]);
+    assert!(!service.subscribed_scopes().contains(&scope));
+    assert!(service.backfill_scopes().contains(&scope));
+    let relay_kinds = service.relay_gossip_kinds(&scope);
+    assert!(relay_kinds.contains(&GossipKind::Events));
+    assert!(!relay_kinds.contains(&GossipKind::Messages));
+}
+
+#[test]
 fn remote_feed_unsubscribe_keeps_local_scope_subscription() {
     let scope = SwarmScope::Group("crew-7".to_owned());
     let mut service = NetworkBridgeService::new(

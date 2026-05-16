@@ -109,6 +109,7 @@ use publish::GlobalPublishRateGuard;
 use scope::{
     dynamic_subscription_scope_kinds_for_node, event_scope, feed_subscription_target_scope,
     merge_scopes, node_has_active_subscription_scope_kinds,
+    remote_feed_subscription_payloads_for_relay,
 };
 #[cfg(test)]
 use service_loop::{
@@ -1082,6 +1083,23 @@ impl NetworkBridgeService {
                 .unsubscribe_scope_kinds(&scope, &unsubscribe_kinds)?;
         }
         Ok((payload.active && !next_relay_kinds.is_empty()).then_some(scope))
+    }
+
+    pub(crate) fn restore_remote_feed_subscriptions_for_relay(
+        &mut self,
+        node: &Node,
+        local_node_id: &str,
+    ) -> Result<Vec<SwarmScope>> {
+        let mut restored = Vec::new();
+        for payload in remote_feed_subscription_payloads_for_relay(node, local_node_id)? {
+            if let Some(scope) =
+                self.apply_remote_feed_subscription_for_relay(local_node_id, &payload)?
+                && !restored.contains(&scope)
+            {
+                restored.push(scope);
+            }
+        }
+        Ok(restored)
     }
 
     pub fn unsubscribe_scope(&mut self, scope: &SwarmScope) -> Result<()> {

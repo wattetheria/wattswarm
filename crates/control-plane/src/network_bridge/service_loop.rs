@@ -270,6 +270,15 @@ fn run_background_network_service_with_hook(
             .subscribe_scope_kinds(&scope, &gossip_kinds)
             .context("network bridge startup subscribe dynamic scope kinds")?;
     }
+    let restored_relay_scopes = service
+        .restore_remote_feed_subscriptions_for_relay(&node, &node_id)
+        .context("network bridge startup restore remote relay subscriptions")?;
+    if !restored_relay_scopes.is_empty() {
+        eprintln!(
+            "network bridge restored {} remote relay subscription scopes",
+            restored_relay_scopes.len()
+        );
+    }
     service.set_state_dir(state_dir.to_path_buf(), db_path.to_path_buf());
     store_latest_network_observability_snapshot(
         state_dir,

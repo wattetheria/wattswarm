@@ -62,6 +62,34 @@ pub(super) fn dynamic_subscription_scope_kinds_for_node(
     Ok(subscriptions)
 }
 
+pub(super) fn remote_feed_subscription_payloads_for_relay(
+    node: &Node,
+    local_node_id: &str,
+) -> Result<Vec<crate::types::FeedSubscriptionUpdatedPayload>> {
+    let network_id = super::current_network_context_id(node);
+    let mut subscriptions = Vec::new();
+    for subscription in node
+        .store
+        .list_active_feed_subscriptions_for_network(&network_id)?
+    {
+        if subscription.subscriber_node_id == local_node_id {
+            continue;
+        }
+        if parse_scope_hint_string(&subscription.scope_hint).is_none() {
+            continue;
+        }
+        subscriptions.push(crate::types::FeedSubscriptionUpdatedPayload {
+            network_id: subscription.network_id,
+            subscriber_node_id: subscription.subscriber_node_id,
+            feed_key: subscription.feed_key,
+            scope_hint: subscription.scope_hint,
+            gossip_kinds: subscription.gossip_kinds,
+            active: true,
+        });
+    }
+    Ok(subscriptions)
+}
+
 pub(super) fn feed_subscription_target_scope(
     payload: &crate::types::FeedSubscriptionUpdatedPayload,
 ) -> SwarmScope {
