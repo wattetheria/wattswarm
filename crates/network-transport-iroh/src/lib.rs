@@ -35,12 +35,13 @@ pub const IROH_CONTROL_KIND_CONTACT_MATERIAL: &str = "contact_material.v1";
 pub const WATTSWARM_IROH_GOSSIP_TOPIC_PREFIX: &str = "wattswarm:iroh-gossip-topic:v1";
 pub const ENV_IROH_RELAY_URLS: &str = "WATTSWARM_IROH_RELAY_URLS";
 pub const ENV_IROH_PUBLISH_DIRECT_ADDRS: &str = "WATTSWARM_IROH_PUBLISH_DIRECT_ADDRS";
+pub const ENV_IROH_DATA_PLANE_START_TIMEOUT_MS: &str = "WATTSWARM_IROH_DATA_PLANE_START_TIMEOUT_MS";
 const MAX_FETCH_REQUEST_BYTES: usize = 64 * 1024;
 const MAX_FETCH_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_CONTROL_REQUEST_BYTES: usize = 1024 * 1024;
 const MAX_CONTROL_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_GOSSIP_MESSAGE_BYTES: usize = 512 * 1024;
-const DEFAULT_IROH_DATA_PLANE_START_TIMEOUT_MS: u64 = 15_000;
+const DEFAULT_IROH_DATA_PLANE_START_TIMEOUT_MS: u64 = 120_000;
 
 pub fn derive_gossip_topic_id(
     network_id: &str,
@@ -86,6 +87,34 @@ fn parse_bool_env(key: &str, raw: Option<&str>, default: bool) -> Result<bool> {
         "0" | "false" | "no" | "off" => Ok(false),
         value => bail!("{key} must be a boolean value, got {value}"),
     }
+}
+
+fn parse_positive_u64_env(key: &str, raw: Option<&str>, default: u64) -> Result<u64> {
+    let Some(raw) = raw else {
+        return Ok(default);
+    };
+    let value = raw.trim();
+    if value.is_empty() {
+        return Ok(default);
+    }
+    let parsed = value
+        .parse::<u64>()
+        .with_context(|| format!("{key} must be an integer value, got {value}"))?;
+    if parsed == 0 {
+        bail!("{key} must be greater than zero");
+    }
+    Ok(parsed)
+}
+
+fn iroh_data_plane_start_timeout() -> Result<Duration> {
+    parse_positive_u64_env(
+        ENV_IROH_DATA_PLANE_START_TIMEOUT_MS,
+        std::env::var(ENV_IROH_DATA_PLANE_START_TIMEOUT_MS)
+            .ok()
+            .as_deref(),
+        DEFAULT_IROH_DATA_PLANE_START_TIMEOUT_MS,
+    )
+    .map(Duration::from_millis)
 }
 
 fn normalize_public_relay_url(url: &RelayUrl) -> String {
@@ -337,7 +366,7 @@ fn block_on_iroh_data_plane_start<T: Send>(
     operation: &'static str,
     future: impl Future<Output = Result<T>> + Send,
 ) -> Result<T> {
-    let timeout = Duration::from_millis(DEFAULT_IROH_DATA_PLANE_START_TIMEOUT_MS);
+    let timeout = iroh_data_plane_start_timeout()?;
     let result = std::thread::scope(|scope| {
         scope
             .spawn(move || {
@@ -347,12 +376,7 @@ fn block_on_iroh_data_plane_start<T: Send>(
             .expect("join iroh data plane startup operation")
     });
     result
-        .with_context(|| {
-            format!(
-                "{operation} timed out after {}ms",
-                DEFAULT_IROH_DATA_PLANE_START_TIMEOUT_MS
-            )
-        })?
+        .with_context(|| format!("{operation} timed out after {}ms", timeout.as_millis()))?
         .with_context(|| format!("{operation} failed"))
 }
 
@@ -1138,6 +1162,28 @@ mod tests {
             vec!["10.0.0.1:1234".to_owned()]
         );
         assert!(options.publish_direct_addrs);
+    }
+
+    #[test]
+    fn iroh_data_plane_start_timeout_parses_override() {
+        assert_eq!(
+            parse_positive_u64_env(ENV_IROH_DATA_PLANE_START_TIMEOUT_MS, None, 120_000)
+                .expect("default timeout"),
+            120_000
+        );
+        assert_eq!(
+            parse_positive_u64_env(ENV_IROH_DATA_PLANE_START_TIMEOUT_MS, Some("45000"), 120_000)
+                .expect("custom timeout"),
+            45_000
+        );
+        assert!(
+            parse_positive_u64_env(ENV_IROH_DATA_PLANE_START_TIMEOUT_MS, Some("0"), 120_000)
+                .is_err()
+        );
+        assert!(
+            parse_positive_u64_env(ENV_IROH_DATA_PLANE_START_TIMEOUT_MS, Some("slow"), 120_000)
+                .is_err()
+        );
     }
 
     #[test]

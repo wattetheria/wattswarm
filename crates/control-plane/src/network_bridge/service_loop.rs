@@ -6,10 +6,13 @@ static LATEST_NETWORK_OBSERVABILITY_SNAPSHOTS: OnceLock<
     Mutex<HashMap<PathBuf, NetworkBridgeObservabilitySnapshot>>,
 > = OnceLock::new();
 
+const NETWORK_SERVICE_START_RETRY_DELAY: Duration = Duration::from_secs(5);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum NetworkServiceStatus {
     Starting,
     Running,
+    Retrying,
     Failed,
     Stopped,
 }
@@ -19,13 +22,14 @@ impl NetworkServiceStatus {
         match self {
             Self::Starting => "starting",
             Self::Running => "running",
+            Self::Retrying => "retrying",
             Self::Failed => "failed",
             Self::Stopped => "stopped",
         }
     }
 
     fn is_active(self) -> bool {
-        matches!(self, Self::Starting | Self::Running)
+        matches!(self, Self::Starting | Self::Running | Self::Retrying)
     }
 }
 
@@ -52,6 +56,19 @@ fn record_startup_step(state_dir: &Path, step: &'static str) {
         )
         .details(json!({ "step": step })),
     );
+}
+
+fn record_loop_error(state_dir: &Path, phase: &'static str, message: &'static str, error: String) {
+    diagnostics::record_diagnostic(
+        Some(state_dir),
+        diagnostics::DiagnosticEvent::new("error", "transport", phase, "failed", message)
+            .details(json!({ "error": error })),
+    );
+}
+
+fn is_retryable_network_service_startup_error(error: &str) -> bool {
+    let error = error.to_ascii_lowercase();
+    error.contains("timed out") || error.contains("deadline has elapsed")
 }
 
 fn record_peer_announcement(
@@ -262,57 +279,90 @@ pub fn maybe_start_background_network_service_with_hook(
         }
         statuses.insert(state_dir.clone(), NetworkServiceStatus::Starting);
     }
-    clear_latest_network_observability_snapshot(&state_dir);
-    diagnostics::record_diagnostic(
-        Some(&state_dir),
-        diagnostics::DiagnosticEvent::new(
-            "info",
-            "transport",
-            "startup.starting",
-            "starting",
-            "network bridge startup requested",
-        ),
-    );
     let state_dir_for_registry = state_dir.clone();
     thread::spawn(move || {
-        match run_background_network_service_with_hook(
-            &state_dir,
-            &db_path,
-            config,
-            scopes,
-            post_tick_hook,
-        ) {
-            Ok(()) => {
-                set_network_service_status(&state_dir_for_registry, NetworkServiceStatus::Stopped);
-                diagnostics::record_diagnostic(
-                    Some(&state_dir_for_registry),
-                    diagnostics::DiagnosticEvent::new(
-                        "warn",
-                        "transport",
-                        "startup.stopped",
-                        "stopped",
-                        "network bridge stopped",
-                    ),
-                );
-            }
-            Err(err) => {
-                let error = format!("{err:#}");
-                eprintln!("network bridge stopped: {error}");
-                set_network_service_status(&state_dir_for_registry, NetworkServiceStatus::Failed);
-                diagnostics::record_diagnostic(
-                    Some(&state_dir_for_registry),
-                    diagnostics::DiagnosticEvent::new(
-                        "error",
-                        "transport",
-                        "startup.failed",
-                        "failed",
-                        "network bridge startup failed",
-                    )
-                    .details(json!({ "error": error })),
-                );
+        loop {
+            clear_latest_network_observability_snapshot(&state_dir_for_registry);
+            set_network_service_status(&state_dir_for_registry, NetworkServiceStatus::Starting);
+            diagnostics::record_diagnostic(
+                Some(&state_dir_for_registry),
+                diagnostics::DiagnosticEvent::new(
+                    "info",
+                    "transport",
+                    "startup.starting",
+                    "starting",
+                    "network bridge startup requested",
+                ),
+            );
+            match run_background_network_service_with_hook(
+                &state_dir,
+                &db_path,
+                config.clone(),
+                scopes.clone(),
+                post_tick_hook.as_ref(),
+            ) {
+                Ok(()) => {
+                    set_network_service_status(
+                        &state_dir_for_registry,
+                        NetworkServiceStatus::Stopped,
+                    );
+                    diagnostics::record_diagnostic(
+                        Some(&state_dir_for_registry),
+                        diagnostics::DiagnosticEvent::new(
+                            "warn",
+                            "transport",
+                            "startup.stopped",
+                            "stopped",
+                            "network bridge stopped",
+                        ),
+                    );
+                    clear_latest_network_observability_snapshot(&state_dir_for_registry);
+                    break;
+                }
+                Err(err) => {
+                    let error = format!("{err:#}");
+                    eprintln!("network bridge stopped: {error}");
+                    clear_latest_network_observability_snapshot(&state_dir_for_registry);
+                    if !is_retryable_network_service_startup_error(&error) {
+                        set_network_service_status(
+                            &state_dir_for_registry,
+                            NetworkServiceStatus::Failed,
+                        );
+                        diagnostics::record_diagnostic(
+                            Some(&state_dir_for_registry),
+                            diagnostics::DiagnosticEvent::new(
+                                "error",
+                                "transport",
+                                "startup.failed",
+                                "failed",
+                                "network bridge startup failed",
+                            )
+                            .details(json!({ "error": error })),
+                        );
+                        break;
+                    }
+                    set_network_service_status(
+                        &state_dir_for_registry,
+                        NetworkServiceStatus::Retrying,
+                    );
+                    diagnostics::record_diagnostic(
+                        Some(&state_dir_for_registry),
+                        diagnostics::DiagnosticEvent::new(
+                            "warn",
+                            "transport",
+                            "startup.retrying",
+                            "retrying",
+                            "network bridge startup failed; retrying",
+                        )
+                        .details(json!({
+                            "error": error,
+                            "retry_delay_ms": NETWORK_SERVICE_START_RETRY_DELAY.as_millis()
+                        })),
+                    );
+                    thread::sleep(NETWORK_SERVICE_START_RETRY_DELAY);
+                }
             }
         }
-        clear_latest_network_observability_snapshot(&state_dir_for_registry);
     });
     Ok(true)
 }
@@ -326,7 +376,7 @@ fn run_background_network_service_with_hook(
     db_path: &Path,
     config: NetworkP2pConfig,
     configured_scopes: Vec<SwarmScope>,
-    post_tick_hook: Option<PostTickHook>,
+    post_tick_hook: Option<&PostTickHook>,
 ) -> Result<()> {
     record_startup_step(state_dir, "open_configured_node.begin");
     let mut node = crate::control::open_configured_node(state_dir, db_path)
@@ -456,19 +506,41 @@ fn run_background_network_service_with_hook(
         if processed_pending_commands > 0 {
             did_work = true;
         }
-        if service
+        match service
             .run_reconnect_supervision()
-            .context("network bridge run reconnect supervision")?
-            > 0
+            .context("network bridge run reconnect supervision")
         {
-            did_work = true;
+            Ok(count) if count > 0 => did_work = true,
+            Ok(_) => {}
+            Err(err) => {
+                let error = format!("{err:#}");
+                eprintln!("network bridge reconnect supervision failed: {error}");
+                record_loop_error(
+                    state_dir,
+                    "reconnect.failed",
+                    "network bridge reconnect supervision failed",
+                    error,
+                );
+            }
         }
-        let new_last_published_seq =
-            publish_pending_scoped_updates(&mut service, &node, &node_id, last_published_seq)
-                .context("network bridge publish pending scoped updates")?;
-        if new_last_published_seq != last_published_seq {
-            did_work = true;
-            last_published_seq = new_last_published_seq;
+        match publish_pending_scoped_updates(&mut service, &node, &node_id, last_published_seq)
+            .context("network bridge publish pending scoped updates")
+        {
+            Ok(new_last_published_seq) if new_last_published_seq != last_published_seq => {
+                did_work = true;
+                last_published_seq = new_last_published_seq;
+            }
+            Ok(_) => {}
+            Err(err) => {
+                let error = format!("{err:#}");
+                eprintln!("network bridge publish pending scoped updates failed: {error}");
+                record_loop_error(
+                    state_dir,
+                    "publish.failed",
+                    "network bridge publish pending scoped updates failed",
+                    error,
+                );
+            }
         }
         if Instant::now() >= next_discovery_bootnode_query_at {
             match discovery_bootnode_settings_from_state_dir(state_dir) {
@@ -512,18 +584,28 @@ fn run_background_network_service_with_hook(
                 }
             }
         }
-        if service
+        match service
             .run_anti_entropy(&node)
-            .context("network bridge run anti-entropy")?
-            > 0
+            .context("network bridge run anti-entropy")
         {
-            did_work = true;
+            Ok(count) if count > 0 => did_work = true,
+            Ok(_) => {}
+            Err(err) => {
+                let error = format!("{err:#}");
+                eprintln!("network bridge anti-entropy failed: {error}");
+                record_loop_error(
+                    state_dir,
+                    "anti_entropy.failed",
+                    "network bridge anti-entropy failed",
+                    error,
+                );
+            }
         }
         match service.observability_snapshot(&node) {
             Ok(snapshot) => store_latest_network_observability_snapshot(state_dir, snapshot),
             Err(err) => eprintln!("network bridge observability snapshot failed: {err}"),
         }
-        if let Some(hook) = &post_tick_hook {
+        if let Some(hook) = post_tick_hook {
             hook(&mut node, state_dir);
         }
         if !did_work {
@@ -552,6 +634,11 @@ mod tests {
         assert_eq!(network_service_status(&state_dir), "running");
         assert!(network_service_started(&state_dir));
 
+        set_network_service_status(&state_dir, NetworkServiceStatus::Retrying);
+        assert_eq!(network_service_status(&state_dir), "retrying");
+        assert!(!network_service_started(&state_dir));
+        assert!(NetworkServiceStatus::Retrying.is_active());
+
         set_network_service_status(&state_dir, NetworkServiceStatus::Failed);
         assert_eq!(network_service_status(&state_dir), "failed");
         assert!(!network_service_started(&state_dir));
@@ -559,5 +646,18 @@ mod tests {
         set_network_service_status(&state_dir, NetworkServiceStatus::Stopped);
         assert_eq!(network_service_status(&state_dir), "stopped");
         assert!(!network_service_started(&state_dir));
+    }
+
+    #[test]
+    fn retryable_network_service_startup_error_detects_timeouts() {
+        assert!(is_retryable_network_service_startup_error(
+            "network bridge startup create bridge service: initialize iroh router timed out after 15000ms"
+        ));
+        assert!(is_retryable_network_service_startup_error(
+            "initialize iroh router failed: deadline has elapsed"
+        ));
+        assert!(!is_retryable_network_service_startup_error(
+            "network bridge startup validate p2p config: invalid listen address"
+        ));
     }
 }
