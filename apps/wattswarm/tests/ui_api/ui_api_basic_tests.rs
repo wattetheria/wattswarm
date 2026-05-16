@@ -752,6 +752,10 @@ fn ui_diagnostics_api_lists_wattswarm_network_diagnostics() {
             payload["network_service_started"].as_bool(),
             Some(false)
         );
+        assert_eq!(
+            payload["network_service_status"].as_str(),
+            Some("stopped")
+        );
     });
 }
 

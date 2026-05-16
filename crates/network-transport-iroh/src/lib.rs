@@ -20,7 +20,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::runtime::{Builder as RuntimeBuilder, Runtime, RuntimeFlavor};
 use wattswarm_artifact_store::{ArtifactKind, ArtifactStore};
 use wattswarm_network_transport_core::{
@@ -40,6 +40,7 @@ const MAX_FETCH_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_CONTROL_REQUEST_BYTES: usize = 1024 * 1024;
 const MAX_CONTROL_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_GOSSIP_MESSAGE_BYTES: usize = 512 * 1024;
+const DEFAULT_IROH_DATA_PLANE_START_TIMEOUT_MS: u64 = 15_000;
 
 pub fn derive_gossip_topic_id(
     network_id: &str,
@@ -331,6 +332,30 @@ fn iroh_blob_store_path(state_dir: &Path) -> PathBuf {
     state_dir.join("iroh-blobs")
 }
 
+fn block_on_iroh_data_plane_start<T: Send>(
+    runtime: &Runtime,
+    operation: &'static str,
+    future: impl Future<Output = Result<T>> + Send,
+) -> Result<T> {
+    let timeout = Duration::from_millis(DEFAULT_IROH_DATA_PLANE_START_TIMEOUT_MS);
+    let result = std::thread::scope(|scope| {
+        scope
+            .spawn(move || {
+                runtime.block_on(async move { tokio::time::timeout(timeout, future).await })
+            })
+            .join()
+            .expect("join iroh data plane startup operation")
+    });
+    result
+        .with_context(|| {
+            format!(
+                "{operation} timed out after {}ms",
+                DEFAULT_IROH_DATA_PLANE_START_TIMEOUT_MS
+            )
+        })?
+        .with_context(|| format!("{operation} failed"))
+}
+
 fn open_artifact_store(state_dir: &Path) -> Result<ArtifactStore> {
     let store = ArtifactStore::new(artifact_store_path(state_dir));
     store.ensure_layout()?;
@@ -531,20 +556,13 @@ impl IrohDataPlaneService {
                 builder =
                     builder.relay_mode(RelayMode::custom(endpoint_options.relay_urls.clone()));
             }
-            builder.bind().await
+            Ok(builder.bind().await?)
         };
-        let endpoint = match tokio::runtime::Handle::try_current() {
-            Ok(handle) if handle.runtime_flavor() == RuntimeFlavor::MultiThread => {
-                tokio::task::block_in_place(|| runtime.block_on(endpoint_future()))?
-            }
-            Ok(_) => std::thread::scope(|scope| {
-                scope
-                    .spawn(|| runtime.block_on(endpoint_future()))
-                    .join()
-                    .expect("join iroh endpoint init thread")
-            })?,
-            Err(_) => runtime.block_on(endpoint_future())?,
-        };
+        let endpoint = block_on_iroh_data_plane_start(
+            &runtime,
+            "initialize iroh endpoint",
+            endpoint_future(),
+        )?;
         let control_handlers = Arc::new(Mutex::new(HashMap::new()));
         let router_future = || async {
             let blob_store = FsStore::load(iroh_blob_store_path(state_dir)).await?;
@@ -570,18 +588,8 @@ impl IrohDataPlaneService {
                 .spawn();
             Result::<(Gossip, FsStore, Router)>::Ok((gossip, blob_store, router))
         };
-        let (gossip, blob_store, router) = match tokio::runtime::Handle::try_current() {
-            Ok(handle) if handle.runtime_flavor() == RuntimeFlavor::MultiThread => {
-                tokio::task::block_in_place(|| runtime.block_on(router_future()))?
-            }
-            Ok(_) => std::thread::scope(|scope| {
-                scope
-                    .spawn(|| runtime.block_on(router_future()))
-                    .join()
-                    .expect("join iroh router init thread")
-            })?,
-            Err(_) => runtime.block_on(router_future())?,
-        };
+        let (gossip, blob_store, router) =
+            block_on_iroh_data_plane_start(&runtime, "initialize iroh router", router_future())?;
         Ok(Arc::new(Self {
             runtime,
             endpoint,

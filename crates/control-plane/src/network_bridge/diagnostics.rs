@@ -174,6 +174,9 @@ fn is_recent_duplicate(path: &Path, entry: &DiagnosticEntry) -> Result<bool> {
     if !path.exists() {
         return Ok(false);
     }
+    if entry.phase.starts_with("startup.") {
+        return Ok(false);
+    }
     let key = diagnostic_dedupe_key(entry);
     let raw = fs::read_to_string(path)
         .with_context(|| format!("read Wattswarm diagnostics log {}", path.display()))?;

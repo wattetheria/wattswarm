@@ -499,8 +499,16 @@ impl NetworkRuntime {
         self.inner.observability_snapshot().known_iroh_contacts
     }
 
+    pub fn remote_contact_peer_ids(&self) -> Vec<NetworkNodeId> {
+        self.inner.remote_contact_peer_ids()
+    }
+
     pub fn allows_outbound_backfill_to(&self, peer: &NetworkNodeId) -> bool {
         self.inner.allows_outbound_backfill_to(peer)
+    }
+
+    pub fn rejoin_gossip_with_remote_contact(&mut self, peer: &NetworkNodeId) -> Result<bool> {
+        self.inner.rejoin_gossip_with_remote_contact(peer)
     }
 
     pub fn upsert_remote_contact_material(

@@ -1,12 +1,57 @@
 use super::*;
 
-static STARTED_NETWORK_SERVICES: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
+static NETWORK_SERVICE_STATUSES: OnceLock<Mutex<HashMap<PathBuf, NetworkServiceStatus>>> =
+    OnceLock::new();
 static LATEST_NETWORK_OBSERVABILITY_SNAPSHOTS: OnceLock<
     Mutex<HashMap<PathBuf, NetworkBridgeObservabilitySnapshot>>,
 > = OnceLock::new();
 
-fn started_network_services() -> &'static Mutex<HashSet<PathBuf>> {
-    STARTED_NETWORK_SERVICES.get_or_init(|| Mutex::new(HashSet::new()))
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NetworkServiceStatus {
+    Starting,
+    Running,
+    Failed,
+    Stopped,
+}
+
+impl NetworkServiceStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Starting => "starting",
+            Self::Running => "running",
+            Self::Failed => "failed",
+            Self::Stopped => "stopped",
+        }
+    }
+
+    fn is_active(self) -> bool {
+        matches!(self, Self::Starting | Self::Running)
+    }
+}
+
+fn network_service_statuses() -> &'static Mutex<HashMap<PathBuf, NetworkServiceStatus>> {
+    NETWORK_SERVICE_STATUSES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn set_network_service_status(state_dir: &Path, status: NetworkServiceStatus) {
+    let mut statuses = network_service_statuses()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    statuses.insert(state_dir.to_path_buf(), status);
+}
+
+fn record_startup_step(state_dir: &Path, step: &'static str) {
+    diagnostics::record_diagnostic(
+        Some(state_dir),
+        diagnostics::DiagnosticEvent::new(
+            "info",
+            "transport",
+            "startup.step",
+            "running",
+            format!("network bridge startup step: {step}"),
+        )
+        .details(json!({ "step": step })),
+    );
 }
 
 fn record_peer_announcement(
@@ -69,10 +114,22 @@ pub fn latest_network_observability_snapshot(
 }
 
 pub fn network_service_started(state_dir: &Path) -> bool {
-    started_network_services()
+    network_service_statuses()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .contains(state_dir)
+        .get(state_dir)
+        .is_some_and(|status| *status == NetworkServiceStatus::Running)
+}
+
+pub fn network_service_status(state_dir: &Path) -> String {
+    network_service_statuses()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(state_dir)
+        .copied()
+        .unwrap_or(NetworkServiceStatus::Stopped)
+        .as_str()
+        .to_owned()
 }
 
 fn parse_bool_env_with_default(key: &str, default: bool) -> bool {
@@ -194,30 +251,68 @@ pub fn maybe_start_background_network_service_with_hook(
     let scopes = configured_network_scopes_from_env();
     config.validate()?;
     {
-        let mut started = started_network_services()
+        let mut statuses = network_service_statuses()
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if started.contains(&state_dir) {
+        if statuses
+            .get(&state_dir)
+            .is_some_and(|status| status.is_active())
+        {
             return Ok(true);
         }
-        started.insert(state_dir.clone());
+        statuses.insert(state_dir.clone(), NetworkServiceStatus::Starting);
     }
+    clear_latest_network_observability_snapshot(&state_dir);
+    diagnostics::record_diagnostic(
+        Some(&state_dir),
+        diagnostics::DiagnosticEvent::new(
+            "info",
+            "transport",
+            "startup.starting",
+            "starting",
+            "network bridge startup requested",
+        ),
+    );
     let state_dir_for_registry = state_dir.clone();
     thread::spawn(move || {
-        if let Err(err) = run_background_network_service_with_hook(
+        match run_background_network_service_with_hook(
             &state_dir,
             &db_path,
             config,
             scopes,
             post_tick_hook,
         ) {
-            eprintln!("network bridge stopped: {err:#}");
+            Ok(()) => {
+                set_network_service_status(&state_dir_for_registry, NetworkServiceStatus::Stopped);
+                diagnostics::record_diagnostic(
+                    Some(&state_dir_for_registry),
+                    diagnostics::DiagnosticEvent::new(
+                        "warn",
+                        "transport",
+                        "startup.stopped",
+                        "stopped",
+                        "network bridge stopped",
+                    ),
+                );
+            }
+            Err(err) => {
+                let error = format!("{err:#}");
+                eprintln!("network bridge stopped: {error}");
+                set_network_service_status(&state_dir_for_registry, NetworkServiceStatus::Failed);
+                diagnostics::record_diagnostic(
+                    Some(&state_dir_for_registry),
+                    diagnostics::DiagnosticEvent::new(
+                        "error",
+                        "transport",
+                        "startup.failed",
+                        "failed",
+                        "network bridge startup failed",
+                    )
+                    .details(json!({ "error": error })),
+                );
+            }
         }
         clear_latest_network_observability_snapshot(&state_dir_for_registry);
-        let mut started = started_network_services()
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        started.remove(&state_dir_for_registry);
     });
     Ok(true)
 }
@@ -233,16 +328,22 @@ fn run_background_network_service_with_hook(
     configured_scopes: Vec<SwarmScope>,
     post_tick_hook: Option<PostTickHook>,
 ) -> Result<()> {
+    record_startup_step(state_dir, "open_configured_node.begin");
     let mut node = crate::control::open_configured_node(state_dir, db_path)
         .context("network bridge startup open configured node")?;
+    record_startup_step(state_dir, "open_configured_node.end");
     let node_id = node.node_id();
     let scopes = merge_scopes(configured_scopes);
+    record_startup_step(state_dir, "dynamic_subscriptions.begin");
     let dynamic_subscriptions = dynamic_subscription_scope_kinds_for_node(&node, &node_id)
         .context("network bridge startup load dynamic subscriptions")?;
+    record_startup_step(state_dir, "dynamic_subscriptions.end");
+    record_startup_step(state_dir, "protocol_params.begin");
     let verified_protocol_params = node
         .store
         .load_verified_network_protocol_params()
         .context("network bridge startup load verified protocol params")?;
+    record_startup_step(state_dir, "protocol_params.end");
     let protocol_params = verified_protocol_params.params().clone();
     let mut config = config.apply_protocol_params(&protocol_params);
     let handshake_network_id = verified_protocol_params.network_id.clone();
@@ -258,33 +359,53 @@ fn run_background_network_service_with_hook(
     config
         .validate()
         .context("network bridge startup validate p2p config")?;
-    let mut service = NetworkBridgeService::new(
-        network_node_from_state_dir(state_dir, config)
-            .context("network bridge startup create network p2p node")?,
-        &scopes,
-        &protocol_params,
-    )
-    .context("network bridge startup create bridge service")?;
+    record_startup_step(state_dir, "create_p2p_node.begin");
+    let network_node = network_node_from_state_dir(state_dir, config)
+        .context("network bridge startup create network p2p node")?;
+    record_startup_step(state_dir, "create_p2p_node.end");
+    record_startup_step(state_dir, "create_bridge_service.begin");
+    let mut service = NetworkBridgeService::new(network_node, &scopes, &protocol_params)
+        .context("network bridge startup create bridge service")?;
+    record_startup_step(state_dir, "create_bridge_service.end");
+    record_startup_step(state_dir, "subscribe_dynamic_scopes.begin");
     for (scope, gossip_kinds) in dynamic_subscriptions {
         service
             .subscribe_scope_kinds(&scope, &gossip_kinds)
             .context("network bridge startup subscribe dynamic scope kinds")?;
     }
+    record_startup_step(state_dir, "subscribe_dynamic_scopes.end");
+    record_startup_step(state_dir, "restore_remote_relay.begin");
     let restored_relay_scopes = service
         .restore_remote_feed_subscriptions_for_relay(&node, &node_id)
         .context("network bridge startup restore remote relay subscriptions")?;
+    record_startup_step(state_dir, "restore_remote_relay.end");
     if !restored_relay_scopes.is_empty() {
         eprintln!(
             "network bridge restored {} remote relay subscription scopes",
             restored_relay_scopes.len()
         );
     }
+    record_startup_step(state_dir, "set_state_dir.begin");
     service.set_state_dir(state_dir.to_path_buf(), db_path.to_path_buf());
+    record_startup_step(state_dir, "set_state_dir.end");
+    record_startup_step(state_dir, "initial_snapshot.begin");
     store_latest_network_observability_snapshot(
         state_dir,
         service
             .observability_snapshot(&node)
             .context("network bridge startup build initial observability snapshot")?,
+    );
+    record_startup_step(state_dir, "initial_snapshot.end");
+    set_network_service_status(state_dir, NetworkServiceStatus::Running);
+    diagnostics::record_diagnostic(
+        Some(state_dir),
+        diagnostics::DiagnosticEvent::new(
+            "info",
+            "transport",
+            "startup.ready",
+            "ok",
+            "network bridge startup completed",
+        ),
     );
     let mut announced_listen = false;
     let mut announced_peers: HashMap<String, Instant> = HashMap::new();
@@ -408,5 +529,35 @@ fn run_background_network_service_with_hook(
         if !did_work {
             thread::sleep(IDLE_NETWORK_SLEEP);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn unique_state_dir(label: &str) -> PathBuf {
+        env::temp_dir().join(format!("wattswarm-{label}-{}", Uuid::new_v4()))
+    }
+
+    #[test]
+    fn network_service_started_only_reports_running_after_ready() {
+        let state_dir = unique_state_dir("network-service-status");
+
+        set_network_service_status(&state_dir, NetworkServiceStatus::Starting);
+        assert_eq!(network_service_status(&state_dir), "starting");
+        assert!(!network_service_started(&state_dir));
+
+        set_network_service_status(&state_dir, NetworkServiceStatus::Running);
+        assert_eq!(network_service_status(&state_dir), "running");
+        assert!(network_service_started(&state_dir));
+
+        set_network_service_status(&state_dir, NetworkServiceStatus::Failed);
+        assert_eq!(network_service_status(&state_dir), "failed");
+        assert!(!network_service_started(&state_dir));
+
+        set_network_service_status(&state_dir, NetworkServiceStatus::Stopped);
+        assert_eq!(network_service_status(&state_dir), "stopped");
+        assert!(!network_service_started(&state_dir));
     }
 }

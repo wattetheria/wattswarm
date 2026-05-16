@@ -248,6 +248,29 @@ impl SubstrateRuntime {
         }
     }
 
+    fn block_on_gossip_bootstrap<T: Send>(
+        &self,
+        operation: &'static str,
+        future: impl Future<Output = T> + Send,
+    ) -> Result<T> {
+        let timeout = Duration::from_millis(DEFAULT_GOSSIP_BOOTSTRAP_TIMEOUT_MS);
+        let runtime = self.runtime();
+        std::thread::scope(|scope| {
+            scope
+                .spawn(move || {
+                    runtime.block_on(async move { tokio::time::timeout(timeout, future).await })
+                })
+                .join()
+                .expect("join substrate runtime gossip bootstrap operation")
+        })
+        .with_context(|| {
+            format!(
+                "{operation} timed out after {}ms",
+                DEFAULT_GOSSIP_BOOTSTRAP_TIMEOUT_MS
+            )
+        })
+    }
+
     pub fn observability_snapshot(&self) -> NetworkRuntimeObservabilitySnapshot {
         let mut subscribed_iroh_gossip_topics = self
             .subscriptions
@@ -323,6 +346,21 @@ impl SubstrateRuntime {
 
     pub fn allows_outbound_backfill_to(&self, peer: &NetworkNodeId) -> bool {
         self.remote_contacts.contains_key(peer.as_str())
+    }
+
+    pub fn remote_contact_peer_ids(&self) -> Vec<NetworkNodeId> {
+        self.remote_contacts
+            .keys()
+            .filter_map(|peer| NetworkNodeId::new(peer.clone()).ok())
+            .collect()
+    }
+
+    pub fn rejoin_gossip_with_remote_contact(&mut self, peer: &NetworkNodeId) -> Result<bool> {
+        if !self.remote_contacts.contains_key(peer.as_str()) {
+            return Ok(false);
+        }
+        self.join_gossip_topics_with_bootstrap_contacts()?;
+        Ok(true)
     }
 
     pub fn subscribe_scope(&mut self, scope: &SwarmScope) -> Result<()> {
@@ -426,8 +464,11 @@ impl SubstrateRuntime {
             return Ok(());
         }
         for topic in self.gossip_topics.values() {
-            self.block_on(topic.sender.join_peers(bootstrap.clone()))
-                .map_err(|err| anyhow!("join iroh gossip peers: {err}"))?;
+            self.block_on_gossip_bootstrap(
+                "join iroh gossip bootstrap peers",
+                topic.sender.join_peers(bootstrap.clone()),
+            )?
+            .map_err(|err| anyhow!("join iroh gossip peers: {err}"))?;
         }
         Ok(())
     }
@@ -989,7 +1030,10 @@ impl SubstrateRuntime {
         let gossip =
             local_gossip_for_network_peer_id(&self.state_dir, self.local_peer_id.as_str())?;
         let topic = self
-            .block_on(gossip.subscribe(topic_id, bootstrap))
+            .block_on_gossip_bootstrap(
+                "subscribe iroh gossip topic",
+                gossip.subscribe(topic_id, bootstrap),
+            )?
             .map_err(|err| anyhow!("subscribe iroh gossip topic: {err}"))?;
         let (sender, mut receiver) = topic.split();
         let inbound_tx = self.gossip_tx.clone();

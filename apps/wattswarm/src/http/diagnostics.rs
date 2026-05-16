@@ -2,7 +2,7 @@ use crate::control::open_node;
 use crate::http::{ApiError, UiServerState, run_blocking};
 use crate::network_bridge::{
     DiagnosticFilter, latest_network_observability_snapshot, list_network_diagnostics,
-    network_service_started,
+    network_service_started, network_service_status,
 };
 use anyhow::Result;
 use axum::Json;
@@ -87,6 +87,7 @@ pub(crate) async fn diagnostics(
             "ok": true,
             "generated_at": chrono::Utc::now().to_rfc3339(),
             "network_service_started": network_service_started(&state_clone.state_dir),
+            "network_service_status": network_service_status(&state_clone.state_dir),
             "snapshot": snapshot,
             "diagnostics": diagnostics,
         }))

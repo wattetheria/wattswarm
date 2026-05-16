@@ -502,7 +502,9 @@ impl NetworkBridgeService {
     }
 
     pub(crate) fn schedule_peer_reconnect(&mut self, peer: NetworkNodeId) {
-        if self.known_peer_addrs.contains_key(&peer) {
+        if self.known_peer_addrs.contains_key(&peer)
+            || self.runtime.allows_outbound_backfill_to(&peer)
+        {
             self.peer_reconnect_state
                 .entry(peer)
                 .or_insert_with(PeerReconnectState::ready_now);
@@ -511,21 +513,48 @@ impl NetworkBridgeService {
 
     pub fn run_reconnect_supervision(&mut self) -> Result<usize> {
         let now = Instant::now();
-        let peers = self
+        let mut reconnect_candidates = self
             .known_peer_addrs
-            .iter()
-            .filter(|(peer, _)| !self.connected_peers.contains(*peer))
-            .filter(|(peer, _)| {
+            .keys()
+            .cloned()
+            .collect::<HashSet<_>>();
+        reconnect_candidates.extend(self.runtime.remote_contact_peer_ids());
+        let peers = reconnect_candidates
+            .into_iter()
+            .filter(|peer| !self.connected_peers.contains(peer))
+            .filter(|peer| {
                 self.peer_reconnect_state
-                    .get(*peer)
+                    .get(peer)
                     .is_none_or(|state| state.next_attempt_at <= now)
             })
-            .map(|(peer, address)| (peer.clone(), address.clone()))
             .collect::<Vec<_>>();
         let mut attempts = 0usize;
-        for (peer, address) in peers {
-            let dial_target = NetworkAddress::new(format!("{peer}@{address}"))?;
-            let result = self.runtime.dial(dial_target);
+        for peer in peers {
+            let reconnect_address = self.known_peer_addrs.get(&peer).cloned();
+            let reconnect_route = if reconnect_address.is_some() {
+                "direct_addr"
+            } else {
+                "iroh_contact"
+            };
+            let reconnect_phase = if reconnect_address.is_some() {
+                "reconnect.dial"
+            } else {
+                "reconnect.bootstrap"
+            };
+            let result = if let Some(address) = reconnect_address.clone() {
+                let dial_target = NetworkAddress::new(format!("{peer}@{address}"))?;
+                self.runtime.dial(dial_target)
+            } else {
+                self.runtime
+                    .rejoin_gossip_with_remote_contact(&peer)
+                    .and_then(|joined| {
+                        if joined {
+                            Ok(())
+                        } else {
+                            Err(anyhow!("missing iroh contact material for {peer}"))
+                        }
+                    })
+            };
             let state = self
                 .peer_reconnect_state
                 .entry(peer.clone())
@@ -539,14 +568,15 @@ impl NetworkBridgeService {
                         diagnostics::DiagnosticEvent::new(
                             "info",
                             "transport",
-                            "reconnect.dial",
+                            reconnect_phase,
                             "ok",
-                            format!("peer reconnect dial scheduled: {peer}"),
+                            format!("peer reconnect scheduled: {peer}"),
                         )
                         .object("peer", Some(peer.to_string()))
                         .source_node_id(Some(peer.to_string()))
                         .details(json!({
-                            "address": address.to_string(),
+                            "address": reconnect_address.as_ref().map(ToString::to_string),
+                            "route": reconnect_route,
                             "attempts": state.attempts,
                         })),
                     );
@@ -557,14 +587,15 @@ impl NetworkBridgeService {
                         diagnostics::DiagnosticEvent::new(
                             "warn",
                             "transport",
-                            "reconnect.dial",
+                            reconnect_phase,
                             "failed",
-                            format!("peer reconnect dial failed: {peer}"),
+                            format!("peer reconnect failed: {peer}"),
                         )
                         .object("peer", Some(peer.to_string()))
                         .source_node_id(Some(peer.to_string()))
                         .details(json!({
-                            "address": address.to_string(),
+                            "address": reconnect_address.as_ref().map(ToString::to_string),
+                            "route": reconnect_route,
                             "attempts": state.attempts,
                             "error": err.to_string(),
                         })),

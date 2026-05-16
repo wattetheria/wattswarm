@@ -491,6 +491,30 @@ fn diagnostics_append_skips_stable_duplicate_discovery_records() {
 }
 
 #[test]
+fn diagnostics_append_keeps_repeated_startup_records() {
+    let dir = temp_startup_dir("diagnostics-startup-no-dedupe");
+
+    for _ in 0..2 {
+        diagnostics::record_diagnostic(
+            Some(&dir),
+            diagnostics::DiagnosticEvent::new(
+                "info",
+                "transport",
+                "startup.ready",
+                "ok",
+                "network bridge startup completed",
+            ),
+        );
+    }
+
+    let raw =
+        fs::read_to_string(dir.join("diagnostics/wattswarm_node.jsonl")).expect("diagnostic log");
+    assert_eq!(raw.matches("\"phase\":\"startup.ready\"").count(), 2);
+
+    std::fs::remove_dir_all(dir).expect("cleanup");
+}
+
+#[test]
 fn diagnostics_list_collapses_legacy_duplicates_without_time_window() {
     let dir = temp_startup_dir("diagnostics-list-stable-dedupe");
     let path = dir.join("diagnostics/wattswarm_node.jsonl");
@@ -831,6 +855,71 @@ fn reconnect_supervision_redials_remembered_peer_address() {
 
     assert_eq!(attempts, 1);
     assert_eq!(service.known_remote_contact_count(), 1);
+    assert_eq!(service.reconnect_attempts_for_peer(&peer), Some(1));
+
+    wattswarm_network_transport_iroh::shutdown_local_iroh_data_plane(&local_dir);
+    wattswarm_network_transport_iroh::shutdown_local_iroh_data_plane(&remote_dir);
+    std::fs::remove_dir_all(local_dir).expect("cleanup local");
+    std::fs::remove_dir_all(remote_dir).expect("cleanup remote");
+}
+
+#[test]
+fn reconnect_supervision_rejoins_relay_only_bootstrap_contact() {
+    let local_dir = temp_startup_dir("reconnect-relay-only-local");
+    let remote_dir = temp_startup_dir("reconnect-relay-only-remote");
+    let local_seed = [109u8; 32];
+    let remote_seed = [110u8; 32];
+    std::fs::write(local_dir.join("node_seed.hex"), hex::encode(local_seed))
+        .expect("write local seed");
+    std::fs::write(remote_dir.join("node_seed.hex"), hex::encode(remote_seed))
+        .expect("write remote seed");
+    let remote_endpoint =
+        wattswarm_network_transport_iroh::local_endpoint_id_from_state_dir(&remote_dir)
+            .expect("remote endpoint")
+            .to_string();
+    let mut remote_contact = export_local_contact_material_for_network_peer_id(
+        &remote_dir,
+        &remote_endpoint,
+        observed_at_ms(),
+    )
+    .expect("remote contact");
+    remote_contact.metadata.listen_addrs.clear();
+    remote_contact.extra["direct_addrs"] = json!([]);
+    remote_contact.extra["relay_urls"] = json!(["https://relay.wattetheria.com"]);
+    std::fs::write(
+        local_dir.join("startup_config.json"),
+        serde_json::to_vec(&json!({
+            "network_mode": "wan",
+            "bootstrap_contacts": [json!({
+                "node_id": remote_endpoint,
+                "peer_id": remote_contact.peer_id,
+                "transports": [remote_contact]
+            }).to_string()]
+        }))
+        .expect("startup config json"),
+    )
+    .expect("write startup config");
+    let peer = NetworkNodeId::new(remote_endpoint).expect("remote peer id");
+    let mut service = NetworkBridgeService::new(
+        NetworkP2pNode::from_iroh_state_dir(
+            NetworkP2pConfig::default(),
+            local_dir.clone(),
+            local_seed,
+        )
+        .expect("iroh node"),
+        &[SwarmScope::Global],
+        &NetworkProtocolParams::default(),
+    )
+    .expect("service");
+    service.set_state_dir(local_dir.clone(), local_dir.join("ui.state"));
+
+    assert_eq!(service.known_remote_contact_count(), 1);
+    assert_eq!(service.reconnect_attempts_for_peer(&peer), None);
+    let attempts = service
+        .run_reconnect_supervision()
+        .expect("run reconnect supervision");
+
+    assert_eq!(attempts, 1);
     assert_eq!(service.reconnect_attempts_for_peer(&peer), Some(1));
 
     wattswarm_network_transport_iroh::shutdown_local_iroh_data_plane(&local_dir);
