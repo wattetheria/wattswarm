@@ -410,11 +410,18 @@ pub const INDEX_HTML: &str = r#"<!DOCTYPE html>
         return;
       }
       list.innerHTML = visible.map((row) => {
+        const details = row.details && typeof row.details === "object" ? row.details : {};
+        const targetScope = details.target_scope_hint || details.target_scope || "";
+        const feedKey = details.feed_key || "";
+        const subscriberNode = details.subscriber_node_id || "";
         const meta = [
           row.component,
           row.category,
           row.phase,
-          row.scope_hint ? `scope ${row.scope_hint}` : "",
+          row.scope_hint ? `lane ${row.scope_hint}` : "",
+          targetScope ? `target scope ${targetScope}` : "",
+          feedKey ? `feed ${compact(feedKey, 26)}` : "",
+          subscriberNode ? `subscriber ${compact(subscriberNode, 18)}` : "",
           row.object_id ? `object ${row.object_id}` : "",
           row.event_id ? `event ${compact(row.event_id, 18)}` : "",
           row.source_node_id ? `from ${compact(row.source_node_id, 18)}` : "",

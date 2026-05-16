@@ -107,6 +107,84 @@ pub(super) fn upsert_contact_material_for_peer(
     crate::control::save_peer_metadata_record_state(state_dir, &record)
 }
 
+pub(super) fn configured_iroh_relay_urls() -> Vec<String> {
+    let Ok(raw) = env::var(wattswarm_network_transport_iroh::ENV_IROH_RELAY_URLS) else {
+        return Vec::new();
+    };
+    let mut seen = HashSet::new();
+    let mut urls = Vec::new();
+    for value in raw
+        .split(|ch| matches!(ch, ',' | '\n' | '\r'))
+        .map(str::trim)
+        .map(|value| value.trim_end_matches('/'))
+        .filter(|value| !value.is_empty())
+    {
+        if seen.insert(value.to_owned()) {
+            urls.push(value.to_owned());
+        }
+    }
+    urls
+}
+
+pub(super) fn relay_contact_material_for_peer(
+    peer: &NetworkNodeId,
+    relay_urls: &[String],
+) -> Result<(RawContactMaterial, TransportContactMaterial)> {
+    if relay_urls.is_empty() {
+        bail!("configured Iroh relay URLs are required");
+    }
+    let generated_at = observed_at_ms();
+    let peer_id = NetworkNodeId::new(peer.to_string())?.to_string();
+    let contact = TransportContactMaterial {
+        transport: DataTransportRoute::IrohDirect.as_str().to_owned(),
+        peer_id: peer_id.clone(),
+        metadata: TransportMetadata {
+            route: DataTransportRoute::IrohDirect,
+            generated_at,
+            endpoint_id: Some(peer_id.clone()),
+            alpn: Some(wattswarm_network_transport_iroh::DEFAULT_IROH_ALPN.to_owned()),
+            listen_addrs: Vec::new(),
+            capabilities: PeerTransportCapabilities::iroh_direct_default(),
+        },
+        extra: json!({
+            "endpoint_id": peer_id,
+            "alpn": wattswarm_network_transport_iroh::DEFAULT_IROH_ALPN,
+            "direct_addrs": [],
+            "relay_urls": relay_urls,
+        }),
+    };
+    let material = startup_contact_material_from_transport(contact.clone());
+    Ok((
+        RawContactMaterial {
+            material_json: serde_json::to_string(&material)?,
+            signature: None,
+            generated_at,
+        },
+        contact,
+    ))
+}
+
+impl NetworkBridgeService {
+    pub(super) fn ensure_peer_relay_contact_material(
+        &mut self,
+        state_dir: &Path,
+        peer: &NetworkNodeId,
+    ) -> Result<bool> {
+        if self.runtime.allows_outbound_backfill_to(peer) {
+            return Ok(false);
+        }
+        let relay_urls = configured_iroh_relay_urls();
+        if relay_urls.is_empty() {
+            return Ok(false);
+        }
+        let (raw_contact, contact) = relay_contact_material_for_peer(peer, &relay_urls)?;
+        upsert_contact_material_for_peer(state_dir, peer.as_str(), &raw_contact)?;
+        self.runtime
+            .upsert_remote_contact_material(peer.to_string(), contact)?;
+        Ok(true)
+    }
+}
+
 pub(super) fn candidate_peer_addrs(
     state_dir: &Path,
     remote_node_id: &str,

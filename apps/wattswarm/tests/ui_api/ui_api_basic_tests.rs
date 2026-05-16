@@ -675,6 +675,8 @@ fn ui_root_page_serves_startup_view_and_diagnostics_route_redirects_legacy_conso
         assert!(diagnostics_html.contains("Iroh transport"));
         assert!(diagnostics_html.contains("Iroh Endpoint"));
         assert!(diagnostics_html.contains("Known Iroh Contacts"));
+        assert!(diagnostics_html.contains("target scope"));
+        assert!(diagnostics_html.contains("lane "));
         assert!(!diagnostics_html.contains("Local Peer"));
         assert!(!diagnostics_html.contains("Connected Peers"));
         assert!(!diagnostics_html.contains("peer id"));
@@ -714,8 +716,8 @@ fn ui_diagnostics_api_lists_wattswarm_network_diagnostics() {
         std::fs::create_dir_all(state_dir.join("diagnostics")).unwrap();
         std::fs::write(
             state_dir.join("diagnostics/wattswarm_node.jsonl"),
-            r#"{"id":"diag-1","timestamp_ms":123,"level":"info","component":"wattswarm.network_bridge","category":"gossip","phase":"publish.event","status":"ok","message":"published local event","event_id":"event-1","object_kind":"task","object_id":"task-1","source_node_id":"peer-a","scope_hint":"node:peer-b","details":{"topic":"events"}}
-{"id":"diag-2","timestamp_ms":124,"level":"info","component":"wattswarm.network_bridge","category":"gossip","phase":"publish.event","status":"ok","message":"published local event","event_id":"event-1","object_kind":"task","object_id":"task-1","source_node_id":"peer-a","scope_hint":"node:peer-b","details":{"topic":"events"}}"#,
+            r#"{"id":"diag-1","timestamp_ms":123,"level":"info","component":"wattswarm.network_bridge","category":"gossip","phase":"publish.event","status":"ok","message":"published local event","event_id":"event-1","object_kind":"task","object_id":"task-1","source_node_id":"peer-a","scope_hint":"global","details":{"target_scope_hint":"node:peer-b","feed_key":"task.lifecycle.task-1","subscriber_node_id":"peer-a","topic":"events"}}
+{"id":"diag-2","timestamp_ms":124,"level":"info","component":"wattswarm.network_bridge","category":"gossip","phase":"publish.event","status":"ok","message":"published local event","event_id":"event-1","object_kind":"task","object_id":"task-1","source_node_id":"peer-a","scope_hint":"global","details":{"target_scope_hint":"node:peer-b","feed_key":"task.lifecycle.task-1","subscriber_node_id":"peer-a","topic":"events"}}"#,
         )
         .unwrap();
         let db_path = state_dir.join("ui.state");
@@ -737,6 +739,14 @@ fn ui_diagnostics_api_lists_wattswarm_network_diagnostics() {
         assert_eq!(
             payload["diagnostics"][0]["phase"].as_str(),
             Some("publish.event")
+        );
+        assert_eq!(
+            payload["diagnostics"][0]["scope_hint"].as_str(),
+            Some("global")
+        );
+        assert_eq!(
+            payload["diagnostics"][0]["details"]["target_scope_hint"].as_str(),
+            Some("node:peer-b")
         );
         assert_eq!(
             payload["network_service_started"].as_bool(),

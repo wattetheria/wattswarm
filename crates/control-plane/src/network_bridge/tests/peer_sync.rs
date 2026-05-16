@@ -301,6 +301,119 @@ fn connection_established_diagnostics_skip_duplicate_peer_events() {
 }
 
 #[test]
+fn connection_established_persists_relay_contact_material_from_configured_relay() {
+    let _env_lock = lock_env_test_mutex();
+    let _relay_urls = EnvVarGuard::set(
+        wattswarm_network_transport_iroh::ENV_IROH_RELAY_URLS,
+        Some("https://relay.wattetheria.com/"),
+    );
+    let dir = temp_startup_dir("connection-established-relay-contact");
+    let peer = random_network_node_id();
+    let mut node = Node::open_in_memory_with_roles(&[Role::Proposer]).expect("node");
+    let mut service = NetworkBridgeService::new(
+        NetworkP2pNode::generate(NetworkP2pConfig::default()).expect("node"),
+        &[SwarmScope::Global],
+        &NetworkProtocolParams::default(),
+    )
+    .expect("service");
+    service.set_state_dir(dir.clone(), dir.join("ui.state"));
+
+    service
+        .process_runtime_event(
+            &mut node,
+            NetworkRuntimeEvent::ConnectionEstablished {
+                peer: peer.clone(),
+                remote_addr: NetworkAddress::new(peer.to_string()).expect("peer address"),
+            },
+        )
+        .expect("connection event");
+
+    assert_eq!(service.known_remote_contact_count(), 1);
+    let rows = crate::control::load_peer_metadata_records_state(&dir).expect("peer metadata rows");
+    let row = rows
+        .iter()
+        .find(|row| row.node_id == peer.to_string())
+        .expect("peer metadata row");
+    let material = row
+        .contact_material
+        .as_ref()
+        .expect("persisted contact material");
+    assert_eq!(
+        material["transports"][0]["metadata"]["endpoint_id"],
+        peer.to_string()
+    );
+    assert_eq!(
+        material["transports"][0]["extra"]["relay_urls"],
+        json!(["https://relay.wattetheria.com"])
+    );
+
+    std::fs::remove_dir_all(dir).expect("cleanup");
+}
+
+#[test]
+fn gossip_from_peer_persists_relay_contact_material_from_configured_relay() {
+    let _env_lock = lock_env_test_mutex();
+    let _relay_urls = EnvVarGuard::set(
+        wattswarm_network_transport_iroh::ENV_IROH_RELAY_URLS,
+        Some("https://relay.wattetheria.com"),
+    );
+    let dir = temp_startup_dir("gossip-relay-contact");
+    let local = NodeIdentity::random();
+    let remote = NodeIdentity::random();
+    let membership = membership_with_roles(&[local.node_id(), remote.node_id()]);
+    let mut node =
+        Node::new(local, PgStore::open_in_memory().expect("store"), membership).expect("node");
+    let peer = random_network_node_id();
+    let remote_event = build_event_for_external(
+        &remote,
+        1,
+        10,
+        crate::types::EventPayload::FeedSubscriptionUpdated(
+            crate::types::FeedSubscriptionUpdatedPayload {
+                network_id: "default".to_owned(),
+                subscriber_node_id: remote.node_id(),
+                feed_key: "crew.chat".to_owned(),
+                scope_hint: "group:crew-7".to_owned(),
+                gossip_kinds: vec!["events".to_owned()],
+                active: true,
+            },
+        ),
+    )
+    .expect("signed event");
+    let mut service = NetworkBridgeService::new(
+        NetworkP2pNode::generate(NetworkP2pConfig::default()).expect("node"),
+        &[SwarmScope::Global, SwarmScope::Group("crew-7".to_owned())],
+        &NetworkProtocolParams::default(),
+    )
+    .expect("service");
+    service.set_state_dir(dir.clone(), dir.join("ui.state"));
+
+    service
+        .handle_runtime_event(
+            &mut node,
+            Ok(NetworkRuntimeEvent::Gossip {
+                propagation_source: peer.clone(),
+                message: GossipMessage::Event(EventEnvelope {
+                    scope: SwarmScope::Global,
+                    event: remote_event,
+                    content_source_node_id: None,
+                }),
+            }),
+        )
+        .expect("gossip event");
+
+    assert_eq!(service.known_remote_contact_count(), 1);
+    let rows = crate::control::load_peer_metadata_records_state(&dir).expect("peer metadata rows");
+    assert!(rows.iter().any(|row| row.node_id == peer.to_string()
+        && row.contact_material.as_ref().is_some_and(|material| {
+            material["transports"][0]["extra"]["relay_urls"]
+                == json!(["https://relay.wattetheria.com"])
+        })));
+
+    std::fs::remove_dir_all(dir).expect("cleanup");
+}
+
+#[test]
 fn connection_closed_diagnostics_skip_duplicate_peer_events() {
     let dir = temp_startup_dir("connection-closed-diagnostics-dedupe");
     let peer = random_network_node_id();

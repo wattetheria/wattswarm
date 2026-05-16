@@ -103,6 +103,8 @@ pub fn publish_pending_scoped_updates(
         };
         match publish_result {
             Ok(()) => {
+                let mut details = event_diagnostic_details(&event);
+                details.insert("seq".to_owned(), json!(seq));
                 diagnostics::record_diagnostic(
                     service.state_dir.as_deref(),
                     diagnostics::DiagnosticEvent::new(
@@ -116,12 +118,7 @@ pub fn publish_pending_scoped_updates(
                     .object("task", event.task_id.clone())
                     .source_node_id(Some(event.author_node_id.clone()))
                     .scope(&scope)
-                    .details(json!({
-                        "seq": seq,
-                        "event_kind": format!("{:?}", event.event_kind),
-                        "author_node_id": event.author_node_id.clone(),
-                        "payload_kind": format!("{:?}", event.payload.kind()),
-                    })),
+                    .details(Value::Object(details)),
                 );
                 service.record_scope_event_published(&scope);
                 last_published_seq = seq;

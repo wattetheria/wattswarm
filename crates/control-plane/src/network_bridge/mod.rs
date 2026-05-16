@@ -30,7 +30,7 @@ use crate::network_p2p::{
 };
 use crate::node::Node;
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
@@ -172,6 +172,31 @@ fn network_id_for_network_substrate_event(event: &crate::types::Event) -> Option
         crate::types::EventPayload::TopicMessagePosted(payload) => Some(&payload.network_id),
         _ => None,
     }
+}
+
+fn event_diagnostic_details(event: &crate::types::Event) -> Map<String, Value> {
+    let mut details = Map::new();
+    details.insert(
+        "event_kind".to_owned(),
+        json!(format!("{:?}", event.event_kind)),
+    );
+    details.insert("author_node_id".to_owned(), json!(event.author_node_id));
+    details.insert("created_at".to_owned(), json!(event.created_at));
+    details.insert(
+        "payload_kind".to_owned(),
+        json!(format!("{:?}", event.payload.kind())),
+    );
+    if let crate::types::EventPayload::FeedSubscriptionUpdated(payload) = &event.payload {
+        details.insert("target_scope_hint".to_owned(), json!(payload.scope_hint));
+        details.insert("feed_key".to_owned(), json!(payload.feed_key));
+        details.insert(
+            "subscriber_node_id".to_owned(),
+            json!(payload.subscriber_node_id),
+        );
+        details.insert("gossip_kinds".to_owned(), json!(payload.gossip_kinds));
+        details.insert("active".to_owned(), json!(payload.active));
+    }
+    details
 }
 
 fn observed_at_ms() -> u64 {

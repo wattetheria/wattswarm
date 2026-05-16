@@ -164,6 +164,11 @@ impl NetworkBridgeService {
                         )
                     }
                 }
+                if let Some(state_dir) = self.state_dir.clone()
+                    && let Err(err) = self.ensure_peer_relay_contact_material(&state_dir, &peer)
+                {
+                    eprintln!("relay contact material bootstrap failed for {peer}: {err}");
+                }
                 if !newly_connected {
                     return Ok(NetworkBridgeTick::TransportNotice {
                         detail: format!("iroh topic neighbor already connected: {peer}"),
@@ -310,6 +315,14 @@ impl NetworkBridgeService {
                 message,
             } => {
                 self.connected_peers.insert(propagation_source.clone());
+                if let Some(state_dir) = self.state_dir.clone()
+                    && let Err(err) =
+                        self.ensure_peer_relay_contact_material(&state_dir, &propagation_source)
+                {
+                    eprintln!(
+                        "relay contact material bootstrap failed for {propagation_source}: {err}"
+                    );
+                }
                 match message {
                     GossipMessage::Event(envelope) => {
                         self.record_peer_scope_activity(
@@ -347,11 +360,7 @@ impl NetworkBridgeService {
                             .object("task", ingested_event.task_id.clone())
                             .source_node_id(Some(propagation_source.to_string()))
                             .scope(&envelope.scope)
-                            .details(json!({
-                                "event_kind": format!("{:?}", ingested_event.event_kind),
-                                "author_node_id": ingested_event.author_node_id,
-                                "created_at": ingested_event.created_at,
-                            })),
+                            .details(Value::Object(event_diagnostic_details(&ingested_event))),
                         );
                         if let Err(err) = self.maybe_sync_candidate_output(node, &ingested_event) {
                             eprintln!(
@@ -634,11 +643,7 @@ impl NetworkBridgeService {
                         .object("task", envelope.event.task_id.clone())
                         .source_node_id(Some(peer.to_string()))
                         .scope(&response.scope)
-                        .details(json!({
-                            "event_kind": format!("{:?}", envelope.event.event_kind),
-                            "author_node_id": envelope.event.author_node_id,
-                            "created_at": envelope.event.created_at,
-                        })),
+                        .details(Value::Object(event_diagnostic_details(&envelope.event))),
                     );
                     if let Err(err) = self.maybe_sync_candidate_output(node, &envelope.event) {
                         eprintln!(
