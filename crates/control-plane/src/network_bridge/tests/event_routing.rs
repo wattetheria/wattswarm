@@ -179,6 +179,189 @@ fn deliver_agent_event_writes_local_diagnostics() {
 }
 
 #[test]
+fn deliver_agent_event_retries_callback_timeout_before_marking_delivered() {
+    let _env_lock = lock_env_test_mutex();
+    let _timeout = EnvVarGuard::set("WATTSWARM_AGENT_EVENT_CALLBACK_TIMEOUT_MS", Some("50"));
+    let _attempts = EnvVarGuard::set("WATTSWARM_AGENT_EVENT_CALLBACK_MAX_ATTEMPTS", Some("2"));
+    let _backoff = EnvVarGuard::set("WATTSWARM_AGENT_EVENT_CALLBACK_RETRY_BACKOFF_MS", Some("1"));
+    let state_dir = temp_startup_dir("agent-event-callback-retry");
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind executor listener");
+    let executor_addr = listener.local_addr().expect("executor addr");
+    let accepted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let accepted_clone = Arc::clone(&accepted);
+    std::thread::spawn(move || {
+        for _ in 0..2 {
+            let (mut stream, _) = listener.accept().expect("accept executor connection");
+            let attempt = accepted_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+            std::thread::spawn(move || {
+                let raw = read_http_request(&mut stream);
+                assert!(raw.contains("POST /agent-events "));
+                if attempt == 1 {
+                    std::thread::sleep(Duration::from_millis(200));
+                    return;
+                }
+                let body =
+                    serde_json::to_string(&wattswarm_protocol::types::AgentEventCallbackResponse {
+                        ok: true,
+                        acked_at: Some(2),
+                        detail: Some("retried".to_owned()),
+                        decision: None,
+                    })
+                    .expect("serialize executor response");
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                stream
+                    .write_all(response.as_bytes())
+                    .expect("write executor response");
+            });
+        }
+    });
+    crate::control::save_executor_registry_state(
+        &state_dir,
+        &crate::control::ExecutorRegistry {
+            entries: vec![crate::control::ExecutorRegistryEntry {
+                name: crate::control::CORE_AGENT_EXECUTOR_NAME.to_owned(),
+                base_url: format!("http://{executor_addr}"),
+                agent_event_callback_base_url: None,
+                kind: crate::control::ExecutorKind::Local,
+                target_node_id: None,
+                scope_hint: None,
+                commit_plane_endpoint: None,
+                commit_plane_token_file: None,
+            }],
+        },
+    )
+    .expect("save executor registry");
+    let event = build_agent_event(
+        wattswarm_protocol::types::AgentEventType::TaskClaimReceived,
+        wattswarm_protocol::types::AgentEventSourceKind::TaskLifecycle,
+        Some("peer-a".to_owned()),
+        None,
+        json!({"task_id": "task-retry"}),
+        false,
+        vec!["inspect_task".to_owned()],
+        Some("task-retry".to_owned()),
+        Some("task_claim:task-retry:exec-1".to_owned()),
+    );
+
+    deliver_agent_event_to_local_executor(&state_dir, None, &event).expect("deliver with retry");
+
+    assert_eq!(accepted.load(std::sync::atomic::Ordering::SeqCst), 2);
+    let scope_id = local_control_scope_id(&state_dir);
+    let rows = local_control_store(&state_dir)
+        .expect("open local control store")
+        .list_local_agent_events(&scope_id)
+        .expect("list local agent events");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].status, "acked");
+    let deliveries = local_control_store(&state_dir)
+        .expect("open local control store")
+        .list_local_agent_event_deliveries(&scope_id, &event.event_id)
+        .expect("list local agent event deliveries");
+    assert_eq!(deliveries.len(), 2);
+    assert_eq!(deliveries[0].delivery_status, "retrying");
+    assert!(deliveries[0].next_retry_at.is_some());
+    assert_eq!(deliveries[1].delivery_status, "acked");
+    assert_eq!(deliveries[1].response_code, Some(200));
+    let raw = fs::read_to_string(state_dir.join("diagnostics/wattswarm_node.jsonl"))
+        .expect("diagnostic log");
+    assert!(raw.contains("\"phase\":\"delivery.callback.retry\""));
+    assert!(raw.contains("\"request\""));
+    assert!(raw.contains("\"response\""));
+    assert!(raw.contains("task-retry"));
+}
+
+#[test]
+fn deliver_agent_event_marks_callback_ack_error_as_failed_with_body() {
+    let state_dir = temp_startup_dir("agent-event-callback-ack-error");
+    let executor_listener =
+        std::net::TcpListener::bind("127.0.0.1:0").expect("bind executor listener");
+    let executor_addr = executor_listener.local_addr().expect("executor addr");
+    std::thread::spawn(move || {
+        let (mut stream, _) = executor_listener
+            .accept()
+            .expect("accept executor connection");
+        let raw = read_http_request(&mut stream);
+        assert!(raw.contains("POST /agent-events "));
+        let body = serde_json::to_string(&wattswarm_protocol::types::AgentEventCallbackResponse {
+            ok: false,
+            acked_at: Some(1),
+            detail: Some("openai-compatible response missing content".to_owned()),
+            decision: None,
+        })
+        .expect("serialize executor response");
+        let response = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        stream
+            .write_all(response.as_bytes())
+            .expect("write executor response");
+    });
+    crate::control::save_executor_registry_state(
+        &state_dir,
+        &crate::control::ExecutorRegistry {
+            entries: vec![crate::control::ExecutorRegistryEntry {
+                name: crate::control::CORE_AGENT_EXECUTOR_NAME.to_owned(),
+                base_url: format!("http://{executor_addr}"),
+                agent_event_callback_base_url: None,
+                kind: crate::control::ExecutorKind::Local,
+                target_node_id: None,
+                scope_hint: None,
+                commit_plane_endpoint: None,
+                commit_plane_token_file: None,
+            }],
+        },
+    )
+    .expect("save executor registry");
+    let event = build_agent_event(
+        wattswarm_protocol::types::AgentEventType::TaskClaimReceived,
+        wattswarm_protocol::types::AgentEventSourceKind::TaskLifecycle,
+        Some("peer-a".to_owned()),
+        None,
+        json!({"task_id": "task-ack-error"}),
+        false,
+        vec!["inspect_task".to_owned()],
+        Some("task-ack-error".to_owned()),
+        Some("task_claim:task-ack-error:exec-1".to_owned()),
+    );
+
+    deliver_agent_event_to_local_executor(&state_dir, None, &event).expect("deliver ack error");
+
+    let scope_id = local_control_scope_id(&state_dir);
+    let rows = local_control_store(&state_dir)
+        .expect("open local control store")
+        .list_local_agent_events(&scope_id)
+        .expect("list local agent events");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].status, "failed");
+    let deliveries = local_control_store(&state_dir)
+        .expect("open local control store")
+        .list_local_agent_event_deliveries(&scope_id, &event.event_id)
+        .expect("list local agent event deliveries");
+    assert_eq!(deliveries.len(), 1);
+    assert_eq!(deliveries[0].delivery_status, "failed");
+    assert_eq!(deliveries[0].response_code, Some(200));
+    assert!(
+        deliveries[0]
+            .response_body
+            .as_deref()
+            .is_some_and(|body| body.contains("openai-compatible response missing content"))
+    );
+    let raw = fs::read_to_string(state_dir.join("diagnostics/wattswarm_node.jsonl"))
+        .expect("diagnostic log");
+    assert!(raw.contains("\"callback_ok\":false"));
+    assert!(raw.contains("\"request\""));
+    assert!(raw.contains("\"response\""));
+    assert!(raw.contains("task-ack-error"));
+    assert!(raw.contains("openai-compatible response missing content"));
+}
+
+#[test]
 fn task_result_agent_event_supports_retry_updates() {
     let event = crate::types::Event {
         event_id: "evt-retry".to_owned(),
