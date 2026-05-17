@@ -91,6 +91,9 @@ services:
       WATTSWARM_WORKER_CONCURRENCY: ${WATTSWARM_WORKER_CONCURRENCY:-16}
       WATTSWARM_WORKER_POLL_MS: ${WATTSWARM_WORKER_POLL_MS:-250}
       WATTSWARM_WORKER_LEASE_MS: ${WATTSWARM_WORKER_LEASE_MS:-30000}
+      # Worker shares state_dir with kernel; kernel owns the iroh data plane.
+      # Disabling P2P here prevents redb (iroh-blobs/blobs.db) flock contention.
+      WATTSWARM_P2P_ENABLED: "false"
     volumes:
       - wattswarm_state_data:/var/lib/wattswarm
     entrypoint: ["/app/target/release/wattswarm"]

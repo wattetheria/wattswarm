@@ -7,6 +7,11 @@ static LATEST_NETWORK_OBSERVABILITY_SNAPSHOTS: OnceLock<
 > = OnceLock::new();
 
 const NETWORK_SERVICE_START_RETRY_DELAY: Duration = Duration::from_secs(5);
+/// Cap retry attempts so a stuck dependency (e.g. an unreachable relay) doesn't
+/// keep the network bridge in `retrying` forever. After this many consecutive
+/// retryable failures the bridge thread exits with status=Failed; operators
+/// see a clear terminal state and the container can be restarted by docker.
+const MAX_NETWORK_SERVICE_START_RETRIES: u32 = 5;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum NetworkServiceStatus {
@@ -68,6 +73,22 @@ fn record_loop_error(state_dir: &Path, phase: &'static str, message: &'static st
 
 fn is_retryable_network_service_startup_error(error: &str) -> bool {
     let error = error.to_ascii_lowercase();
+    // Permanent failures: in-process retry cannot fix these and only delays
+    // surfacing the real cause to the operator.
+    //
+    // - "iroh data plane already locked": another process holds the redb
+    //   flock on this state_dir's iroh-blobs/. Retrying just rediscovers the
+    //   same lock holder. Operator must reconcile the deployment topology.
+    // - "initialize iroh router/endpoint timed out": ~always means a missing
+    //   precondition (lock contention, unreachable relay, broken DNS). The
+    //   underlying work is not making forward progress, so 120s timeouts
+    //   stacked on top of each other waste CPU and obscure the real cause.
+    if error.contains("iroh data plane already locked")
+        || error.contains("initialize iroh router timed out")
+        || error.contains("initialize iroh endpoint timed out")
+    {
+        return false;
+    }
     error.contains("timed out") || error.contains("deadline has elapsed")
 }
 
@@ -281,6 +302,7 @@ pub fn maybe_start_background_network_service_with_hook(
     }
     let state_dir_for_registry = state_dir.clone();
     thread::spawn(move || {
+        let mut retry_attempts: u32 = 0;
         loop {
             clear_latest_network_observability_snapshot(&state_dir_for_registry);
             set_network_service_status(&state_dir_for_registry, NetworkServiceStatus::Starting);
@@ -323,11 +345,18 @@ pub fn maybe_start_background_network_service_with_hook(
                     let error = format!("{err:#}");
                     eprintln!("network bridge stopped: {error}");
                     clear_latest_network_observability_snapshot(&state_dir_for_registry);
-                    if !is_retryable_network_service_startup_error(&error) {
+                    let retryable = is_retryable_network_service_startup_error(&error);
+                    let attempts_exhausted = retry_attempts >= MAX_NETWORK_SERVICE_START_RETRIES;
+                    if !retryable || attempts_exhausted {
                         set_network_service_status(
                             &state_dir_for_registry,
                             NetworkServiceStatus::Failed,
                         );
+                        let reason = if !retryable {
+                            "non-retryable startup error"
+                        } else {
+                            "retry attempts exhausted"
+                        };
                         diagnostics::record_diagnostic(
                             Some(&state_dir_for_registry),
                             diagnostics::DiagnosticEvent::new(
@@ -337,10 +366,16 @@ pub fn maybe_start_background_network_service_with_hook(
                                 "failed",
                                 "network bridge startup failed",
                             )
-                            .details(json!({ "error": error })),
+                            .details(json!({
+                                "error": error,
+                                "reason": reason,
+                                "attempts": retry_attempts,
+                                "max_attempts": MAX_NETWORK_SERVICE_START_RETRIES,
+                            })),
                         );
                         break;
                     }
+                    retry_attempts = retry_attempts.saturating_add(1);
                     set_network_service_status(
                         &state_dir_for_registry,
                         NetworkServiceStatus::Retrying,
@@ -356,7 +391,9 @@ pub fn maybe_start_background_network_service_with_hook(
                         )
                         .details(json!({
                             "error": error,
-                            "retry_delay_ms": NETWORK_SERVICE_START_RETRY_DELAY.as_millis()
+                            "retry_delay_ms": NETWORK_SERVICE_START_RETRY_DELAY.as_millis(),
+                            "attempt": retry_attempts,
+                            "max_attempts": MAX_NETWORK_SERVICE_START_RETRIES,
                         })),
                     );
                     thread::sleep(NETWORK_SERVICE_START_RETRY_DELAY);
@@ -649,13 +686,27 @@ mod tests {
     }
 
     #[test]
-    fn retryable_network_service_startup_error_detects_timeouts() {
-        assert!(is_retryable_network_service_startup_error(
-            "network bridge startup create bridge service: initialize iroh router timed out after 15000ms"
+    fn retryable_network_service_startup_error_treats_iroh_init_as_permanent() {
+        // Iroh init timeouts are NOT retryable: in-process retries cannot fix
+        // a held redb lock or an unreachable relay, and stacking 120s timeouts
+        // only obscures the real cause.
+        assert!(!is_retryable_network_service_startup_error(
+            "network bridge startup create bridge service: initialize iroh router timed out after 120000ms"
         ));
-        assert!(is_retryable_network_service_startup_error(
-            "initialize iroh router failed: deadline has elapsed"
+        assert!(!is_retryable_network_service_startup_error(
+            "network bridge startup create bridge service: initialize iroh endpoint timed out after 120000ms"
         ));
+        // Lock-collision errors are emitted by the new sentinel pre-check and
+        // are explicitly non-retryable.
+        assert!(!is_retryable_network_service_startup_error(
+            "iroh data plane already locked at /var/lib/wattswarm/iroh-blobs/.wattswarm-data-plane.lock"
+        ));
+        // Other transient timeouts (e.g. database connection startup) remain
+        // retryable — we still want a few attempts before giving up.
+        assert!(is_retryable_network_service_startup_error(
+            "network bridge startup load verified protocol params: postgres connect timed out"
+        ));
+        // Pure configuration errors are non-retryable, as before.
         assert!(!is_retryable_network_service_startup_error(
             "network bridge startup validate p2p config: invalid listen address"
         ));

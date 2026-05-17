@@ -261,6 +261,11 @@ struct IrohDataPlaneService {
     endpoint_options: IrohEndpointOptions,
     control_handlers: ControlStreamHandlers,
     op_lock: Mutex<()>,
+    // Sentinel flock held for the lifetime of the service. Drop releases the
+    // OS-level lock so a subsequent process can acquire it. Held to prevent two
+    // wattswarm processes from sharing one state_dir (which would otherwise
+    // deadlock on the iroh-blobs redb file lock with a misleading 120s timeout).
+    _data_plane_lock: fs::File,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -359,6 +364,50 @@ fn artifact_store_path(state_dir: &Path) -> PathBuf {
 
 fn iroh_blob_store_path(state_dir: &Path) -> PathBuf {
     state_dir.join("iroh-blobs")
+}
+
+fn iroh_data_plane_lock_path(state_dir: &Path) -> PathBuf {
+    iroh_blob_store_path(state_dir).join(".wattswarm-data-plane.lock")
+}
+
+/// Acquire an exclusive advisory flock on the data-plane sentinel file.
+///
+/// The returned [`fs::File`] must be kept alive for the lifetime of the iroh
+/// data plane; dropping it (or process exit) releases the lock.
+///
+/// Fails fast with a descriptive error when another process already holds the
+/// lock, instead of letting `iroh-blobs` deadlock on its internal redb file
+/// lock and surface as a misleading 120s "initialize iroh router timed out".
+fn acquire_data_plane_sentinel_lock(state_dir: &Path) -> Result<fs::File> {
+    let blob_dir = iroh_blob_store_path(state_dir);
+    fs::create_dir_all(&blob_dir)
+        .with_context(|| format!("create iroh data plane directory {}", blob_dir.display()))?;
+    let lock_path = iroh_data_plane_lock_path(state_dir);
+    let file = fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(&lock_path)
+        .with_context(|| format!("open iroh data plane lock file {}", lock_path.display()))?;
+    match file.try_lock() {
+        Ok(()) => Ok(file),
+        Err(std::fs::TryLockError::WouldBlock) => bail!(
+            "iroh data plane already locked at {} — another wattswarm process is using state_dir {}. \
+             On Linux, run `cat /proc/locks | grep $(stat -c %i {})` to find the holding PID. \
+             Common cause: a sibling container (e.g. wattswarm-worker) mounts the same state volume; \
+             give it its own state_dir or disable its P2P stack with WATTSWARM_P2P_ENABLED=false.",
+            lock_path.display(),
+            state_dir.display(),
+            lock_path.display()
+        ),
+        Err(std::fs::TryLockError::Error(err)) => Err(err).with_context(|| {
+            format!(
+                "acquire exclusive flock on iroh data plane lock file {}",
+                lock_path.display()
+            )
+        }),
+    }
 }
 
 fn block_on_iroh_data_plane_start<T: Send>(
@@ -568,6 +617,10 @@ impl IrohDataPlaneService {
                 "iroh network peer id {network_peer_id} does not match node seed endpoint id {endpoint_id}"
             );
         }
+        // Fail fast if another wattswarm process is already using this state_dir.
+        // Must happen before any iroh init so we don't deadlock on iroh-blobs's
+        // internal redb file lock and emit a misleading "router timed out" error.
+        let data_plane_lock = acquire_data_plane_sentinel_lock(state_dir)?;
         let adapter = IrohTransportAdapter::from_endpoint_id(endpoint_id, network_peer_id);
         let endpoint_options = IrohEndpointOptions::from_env()?;
         let runtime = RuntimeBuilder::new_multi_thread()
@@ -624,6 +677,7 @@ impl IrohDataPlaneService {
             endpoint_options,
             control_handlers,
             op_lock: Mutex::new(()),
+            _data_plane_lock: data_plane_lock,
         }))
     }
 
@@ -1184,6 +1238,22 @@ mod tests {
             parse_positive_u64_env(ENV_IROH_DATA_PLANE_START_TIMEOUT_MS, Some("slow"), 120_000)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn data_plane_sentinel_lock_rejects_concurrent_acquisition() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let first = acquire_data_plane_sentinel_lock(dir.path()).expect("first lock acquired");
+        let err = acquire_data_plane_sentinel_lock(dir.path())
+            .expect_err("second lock acquisition must fail while the first is held");
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("iroh data plane already locked"),
+            "expected fail-fast message, got: {message}"
+        );
+        drop(first);
+        let _retry = acquire_data_plane_sentinel_lock(dir.path())
+            .expect("lock acquisition succeeds after the first holder is dropped");
     }
 
     #[test]
