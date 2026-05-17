@@ -762,8 +762,9 @@ impl SubstrateRuntime {
         let local_peer_id = self.local_peer_id.clone();
         let peer = peer.clone();
         let control_tx = self.control_tx.clone();
+        let timeout = Duration::from_millis(self.config.control_request_timeout_ms);
         std::thread::spawn(move || {
-            let response = send_control_stream_request_for_network_peer_id(
+            let response = send_control_stream_request_for_network_peer_id_with_timeout(
                 &state_dir,
                 local_peer_id.as_str(),
                 &remote_contact,
@@ -771,6 +772,7 @@ impl SubstrateRuntime {
                     kind: kind.clone(),
                     payload,
                 },
+                timeout,
             )
             .and_then(|response| decode_raw_control_response(&kind, response));
             let _ = control_tx.send(build_event(peer, response));

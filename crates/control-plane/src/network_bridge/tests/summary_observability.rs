@@ -623,7 +623,12 @@ fn observability_snapshot_reports_network_and_sync_health() {
     peer_state
         .known_scopes
         .insert(SwarmScope::Region("sol-1".to_owned()));
-    peer_state.inflight_backfills = 1;
+    peer_state.record_pending_backfill(
+        BackfillRequestId::new(42),
+        SwarmScope::Global,
+        None,
+        Instant::now(),
+    );
     peer_state.next_retry_at = Instant::now() + Duration::from_secs(5);
     service.peer_sync_state.insert(peer, peer_state);
     service.scope_traffic.insert(

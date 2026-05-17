@@ -58,6 +58,101 @@ fn task_claim_agent_event_uses_generic_task_schema() {
 }
 
 #[test]
+fn backfill_task_claimed_delivers_local_agent_event() {
+    let state_dir = temp_startup_dir("backfill-task-claim-agent-event");
+    let publisher_identity = NodeIdentity::random();
+    let claimer_identity = NodeIdentity::random();
+    let membership =
+        membership_with_roles(&[publisher_identity.node_id(), claimer_identity.node_id()]);
+    let mut publisher = Node::new(
+        publisher_identity,
+        PgStore::open_in_memory().expect("store"),
+        membership,
+    )
+    .expect("publisher node");
+    let policy_hash = publisher
+        .policy_registry()
+        .binding_for("vp.schema_only.v1", json!({}))
+        .expect("policy")
+        .policy_hash;
+    let task_id = "task-backfill-claim";
+    let scope = SwarmScope::Group(task_id.to_owned());
+    let mut contract = sample_contract(task_id, policy_hash);
+    contract.inputs = json!({
+        "kind": "generic_task",
+        "agent_did": "publisher-agent",
+        "swarm_scope": scope_hint_label(&scope)
+    });
+    publisher
+        .submit_task(contract, 1, 100)
+        .expect("submit task");
+    let claim_event = build_event_for_external(
+        &claimer_identity,
+        1,
+        110,
+        crate::types::EventPayload::TaskClaimed(crate::types::ClaimPayload {
+            task_id: task_id.to_owned(),
+            role: crate::types::ClaimRole::Propose,
+            claimer_node_id: claimer_identity.node_id(),
+            execution_id: format!("exec-{task_id}"),
+            lease_until: 500,
+        }),
+    )
+    .expect("claim event");
+    let mut service = NetworkBridgeService::new(
+        NetworkP2pNode::generate(NetworkP2pConfig::default()).expect("p2p node"),
+        &[SwarmScope::Global, scope.clone()],
+        &NetworkProtocolParams::default(),
+    )
+    .expect("service");
+    service.set_state_dir(state_dir.clone(), state_dir.join("control.sqlite"));
+    let peer = random_network_node_id();
+    let request_id = BackfillRequestId::new(42);
+
+    let tick = service
+        .process_runtime_event(
+            &mut publisher,
+            NetworkRuntimeEvent::BackfillResponse {
+                peer,
+                request_id,
+                response: crate::network_p2p::BackfillResponse {
+                    scope: scope.clone(),
+                    next_from_event_seq: 1,
+                    feed_key: None,
+                    head_event_ids: vec![claim_event.event_id.clone()],
+                    events: vec![EventEnvelope {
+                        scope,
+                        event: claim_event,
+                        content_source_node_id: None,
+                    }],
+                },
+            },
+        )
+        .expect("process backfill response");
+
+    assert!(matches!(
+        tick,
+        NetworkBridgeTick::BackfillApplied {
+            request_id: applied_request,
+            events: 1,
+            ..
+        } if applied_request == request_id
+    ));
+    let records =
+        crate::control::load_agent_event_records_state(&state_dir).expect("agent event records");
+    assert_eq!(records.len(), 1);
+    assert_eq!(
+        records[0].event_type,
+        wattswarm_protocol::types::AgentEventType::TaskClaimReceived
+    );
+    assert_eq!(records[0].payload["task_id"].as_str(), Some(task_id));
+    assert_eq!(
+        records[0].target_executor.as_deref(),
+        Some(CORE_AGENT_EXECUTOR_NAME)
+    );
+}
+
+#[test]
 fn deliver_agent_event_writes_local_diagnostics() {
     let state_dir = temp_startup_dir("agent-event-diagnostics");
     let event = build_agent_event(

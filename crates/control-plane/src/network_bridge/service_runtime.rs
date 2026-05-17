@@ -5,6 +5,36 @@ fn should_record_backfill_response_diagnostic(events_applied: usize) -> bool {
 }
 
 impl NetworkBridgeService {
+    fn deliver_task_lifecycle_agent_event(&self, node: &Node, event: &crate::types::Event) {
+        let Some(state_dir) = &self.state_dir else {
+            return;
+        };
+        match &event.payload {
+            crate::types::EventPayload::TaskClaimed(payload) => {
+                if let Ok(agent_event) = task_claim_agent_event(node, event, payload) {
+                    let _ = deliver_agent_event_to_local_executor(
+                        state_dir,
+                        self.db_path.as_deref(),
+                        &agent_event,
+                    );
+                }
+            }
+            crate::types::EventPayload::CandidateProposed(_)
+            | crate::types::EventPayload::DecisionFinalized(_)
+            | crate::types::EventPayload::TaskError(_)
+            | crate::types::EventPayload::TaskRetryScheduled(_) => {
+                if let Ok(Some(agent_event)) = task_result_agent_event(node, event) {
+                    let _ = deliver_agent_event_to_local_executor(
+                        state_dir,
+                        self.db_path.as_deref(),
+                        &agent_event,
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+
     pub(crate) fn process_runtime_event(
         &mut self,
         node: &mut Node,
@@ -370,35 +400,8 @@ impl NetworkBridgeService {
                         }
                         if let Some(state_dir) = &self.state_dir {
                             log_run_queue_events_if_applicable(node, state_dir, &ingested_event);
-                            match &ingested_event.payload {
-                                crate::types::EventPayload::TaskClaimed(payload) => {
-                                    if let Ok(event) =
-                                        task_claim_agent_event(node, &ingested_event, payload)
-                                    {
-                                        let _ = deliver_agent_event_to_local_executor(
-                                            state_dir,
-                                            self.db_path.as_deref(),
-                                            &event,
-                                        );
-                                    }
-                                }
-                                crate::types::EventPayload::CandidateProposed(_)
-                                | crate::types::EventPayload::DecisionFinalized(_)
-                                | crate::types::EventPayload::TaskError(_)
-                                | crate::types::EventPayload::TaskRetryScheduled(_) => {
-                                    if let Ok(Some(event)) =
-                                        task_result_agent_event(node, &ingested_event)
-                                    {
-                                        let _ = deliver_agent_event_to_local_executor(
-                                            state_dir,
-                                            self.db_path.as_deref(),
-                                            &event,
-                                        );
-                                    }
-                                }
-                                _ => {}
-                            }
                         }
+                        self.deliver_task_lifecycle_agent_event(node, &ingested_event);
                         self.record_scope_event_ingested(&envelope.scope);
                         Ok(NetworkBridgeTick::EventIngested {
                             peer: propagation_source,
@@ -565,7 +568,7 @@ impl NetworkBridgeService {
                 response,
             } => {
                 self.record_peer_scope_activity(peer.clone(), &response.scope);
-                self.mark_backfill_completed(peer.clone());
+                self.mark_backfill_completed(peer.clone(), request_id);
                 self.record_peer_remote_head_event_ids(
                     peer.clone(),
                     &response.scope,
@@ -651,6 +654,7 @@ impl NetworkBridgeService {
                             envelope.event.event_id
                         );
                     }
+                    self.deliver_task_lifecycle_agent_event(node, &envelope.event);
                     if let Err(err) = self.maybe_sync_topic_message_content(
                         node,
                         &envelope.event,
@@ -680,7 +684,7 @@ impl NetworkBridgeService {
                 request_id,
                 error,
             } => {
-                self.mark_backfill_failed(peer.clone());
+                self.mark_backfill_failed(peer.clone(), request_id);
                 Ok(NetworkBridgeTick::BackfillFailed {
                     peer,
                     request_id,

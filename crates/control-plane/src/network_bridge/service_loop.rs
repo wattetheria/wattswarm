@@ -621,6 +621,9 @@ fn run_background_network_service_with_hook(
                 }
             }
         }
+        if service.expire_stale_backfill_requests(Instant::now(), BACKFILL_REQUEST_TIMEOUT) > 0 {
+            did_work = true;
+        }
         match service
             .run_anti_entropy(&node)
             .context("network bridge run anti-entropy")

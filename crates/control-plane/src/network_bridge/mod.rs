@@ -129,7 +129,8 @@ const REPUTATION_SUMMARY_KIND: &str = "reputation_runtime_profile_v1";
 const TASK_OUTCOME_SUMMARY_KIND: &str = "task_outcome_v1";
 const AGENT_PAYMENT_SUMMARY_KIND: &str = "agent_payment_session_v1";
 const CORE_AGENT_EXECUTOR_NAME: &str = "core-agent";
-const MAX_INFLIGHT_BACKFILLS_PER_PEER: usize = 1;
+const MAX_INFLIGHT_BACKFILLS_PER_PEER: usize = 8;
+const BACKFILL_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const SUMMARY_BACKPRESSURE_HIGH_WATERMARK: u64 = 256;
 const IDLE_NETWORK_SLEEP: Duration = Duration::from_millis(50);
 const ANNOUNCED_PEER_TTL: Duration = Duration::from_secs(60 * 60);
@@ -372,14 +373,21 @@ struct RemoteRelaySubscriptionKey {
 
 #[derive(Debug, Clone)]
 struct PeerSyncState {
-    inflight_backfills: usize,
     last_backfill_request_at: Option<Instant>,
     next_retry_at: Instant,
     known_scopes: HashSet<SwarmScope>,
     backfill_cursors: HashMap<BackfillLaneKey, u64>,
     remote_head_event_ids: HashMap<BackfillLaneKey, Vec<String>>,
+    inflight_backfill_requests: HashMap<BackfillRequestId, PendingBackfillRequest>,
     backfill_successes: u64,
     backfill_failures: u64,
+}
+
+#[derive(Debug, Clone)]
+struct PendingBackfillRequest {
+    scope: SwarmScope,
+    feed_key: Option<String>,
+    sent_at: Instant,
 }
 
 #[derive(Debug, Clone)]
@@ -409,15 +417,36 @@ impl PeerReconnectState {
 impl PeerSyncState {
     fn new(now: Instant) -> Self {
         Self {
-            inflight_backfills: 0,
             last_backfill_request_at: None,
             next_retry_at: now,
             known_scopes: HashSet::new(),
             backfill_cursors: HashMap::new(),
             remote_head_event_ids: HashMap::new(),
+            inflight_backfill_requests: HashMap::new(),
             backfill_successes: 0,
             backfill_failures: 0,
         }
+    }
+
+    fn inflight_backfills(&self) -> usize {
+        self.inflight_backfill_requests.len()
+    }
+
+    fn record_pending_backfill(
+        &mut self,
+        request_id: BackfillRequestId,
+        scope: SwarmScope,
+        feed_key: Option<String>,
+        sent_at: Instant,
+    ) {
+        self.inflight_backfill_requests.insert(
+            request_id,
+            PendingBackfillRequest {
+                scope,
+                feed_key,
+                sent_at,
+            },
+        );
     }
 
     fn backfill_cursor(&self, scope: &SwarmScope, feed_key: Option<&str>) -> u64 {

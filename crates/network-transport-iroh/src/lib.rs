@@ -42,6 +42,7 @@ const MAX_CONTROL_REQUEST_BYTES: usize = 1024 * 1024;
 const MAX_CONTROL_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_GOSSIP_MESSAGE_BYTES: usize = 512 * 1024;
 const DEFAULT_IROH_DATA_PLANE_START_TIMEOUT_MS: u64 = 120_000;
+const DEFAULT_IROH_CONTROL_STREAM_TIMEOUT_MS: u64 = 30_000;
 
 pub fn derive_gossip_topic_id(
     network_id: &str,
@@ -763,6 +764,7 @@ impl IrohDataPlaneService {
         &self,
         remote: &TransportContactMaterial,
         request: &IrohControlStreamRequest,
+        timeout: Duration,
     ) -> Result<IrohControlStreamResponse> {
         let _guard = self
             .op_lock
@@ -774,26 +776,36 @@ impl IrohDataPlaneService {
             bail!("iroh control stream request exceeds max request bytes");
         }
         self.block_on(async {
-            let connection = self
-                .endpoint
-                .connect(endpoint_addr, DEFAULT_IROH_CONTROL_ALPN.as_bytes())
-                .await
-                .context("connect iroh control stream endpoint")?;
-            let (mut send, mut recv) = connection
-                .open_bi()
-                .await
-                .context("open iroh control stream")?;
-            send.write_all(&request_bytes)
-                .await
-                .context("write iroh control stream request")?;
-            send.finish().context("finish control stream request")?;
-            let response_bytes = recv
-                .read_to_end(MAX_CONTROL_RESPONSE_BYTES)
-                .await
-                .context("read iroh control stream response")?;
-            let response: IrohControlStreamResponse = serde_json::from_slice(&response_bytes)
-                .context("decode iroh control stream response")?;
-            Ok(response)
+            tokio::time::timeout(timeout, async {
+                let connection = self
+                    .endpoint
+                    .connect(endpoint_addr, DEFAULT_IROH_CONTROL_ALPN.as_bytes())
+                    .await
+                    .context("connect iroh control stream endpoint")?;
+                let (mut send, mut recv) = connection
+                    .open_bi()
+                    .await
+                    .context("open iroh control stream")?;
+                send.write_all(&request_bytes)
+                    .await
+                    .context("write iroh control stream request")?;
+                send.finish().context("finish control stream request")?;
+                let response_bytes = recv
+                    .read_to_end(MAX_CONTROL_RESPONSE_BYTES)
+                    .await
+                    .context("read iroh control stream response")?;
+                let response: IrohControlStreamResponse =
+                    serde_json::from_slice(&response_bytes)
+                        .context("decode iroh control stream response")?;
+                Ok(response)
+            })
+            .await
+            .with_context(|| {
+                format!(
+                    "iroh control stream request timed out after {}ms",
+                    timeout.as_millis()
+                )
+            })?
         })
     }
 
@@ -974,8 +986,24 @@ pub fn send_control_stream_request_for_network_peer_id(
     remote_contact: &TransportContactMaterial,
     request: &IrohControlStreamRequest,
 ) -> Result<IrohControlStreamResponse> {
+    send_control_stream_request_for_network_peer_id_with_timeout(
+        state_dir,
+        network_peer_id,
+        remote_contact,
+        request,
+        Duration::from_millis(DEFAULT_IROH_CONTROL_STREAM_TIMEOUT_MS),
+    )
+}
+
+pub fn send_control_stream_request_for_network_peer_id_with_timeout(
+    state_dir: &Path,
+    network_peer_id: &str,
+    remote_contact: &TransportContactMaterial,
+    request: &IrohControlStreamRequest,
+    timeout: Duration,
+) -> Result<IrohControlStreamResponse> {
     ensure_local_iroh_data_plane_for_network_peer_id(state_dir, network_peer_id)?
-        .send_control_stream_request(remote_contact, request)
+        .send_control_stream_request(remote_contact, request, timeout)
 }
 
 pub fn set_local_control_stream_handler_for_network_peer_id<H>(

@@ -248,7 +248,79 @@ fn connection_closed_with_zero_remaining_preserves_peer_sync_state() {
     assert!(matches!(tick, NetworkBridgeTick::Disconnected { peer: seen } if seen == peer));
     assert!(!service.connected_peers.contains(&peer));
     assert!(service.peer_sync_state.contains_key(&peer));
-    assert_eq!(service.peer_sync_state[&peer].inflight_backfills, 0);
+    assert_eq!(service.peer_sync_state[&peer].inflight_backfills(), 0);
+}
+
+#[test]
+fn stale_backfill_requests_expire_and_release_peer_slot() {
+    let state_dir = temp_startup_dir("backfill-timeout-release");
+    let peer = random_network_node_id();
+    let mut service = NetworkBridgeService::new(
+        NetworkP2pNode::generate(NetworkP2pConfig::default()).expect("node"),
+        &[SwarmScope::Global],
+        &NetworkProtocolParams::default(),
+    )
+    .expect("service");
+    service.set_state_dir(state_dir.clone(), state_dir.join("control.sqlite"));
+    let mut state = PeerSyncState::new(Instant::now());
+    state.record_pending_backfill(
+        BackfillRequestId::new(99),
+        SwarmScope::Global,
+        None,
+        Instant::now() - Duration::from_secs(60),
+    );
+    service.peer_sync_state.insert(peer.clone(), state);
+
+    let expired = service.expire_stale_backfill_requests(Instant::now(), Duration::from_millis(1));
+
+    assert_eq!(expired, 1);
+    let state = service.peer_sync_state.get(&peer).expect("peer state");
+    assert_eq!(state.inflight_backfills(), 0);
+    assert_eq!(state.backfill_failures, 1);
+    let raw = fs::read_to_string(state_dir.join("diagnostics/wattswarm_node.jsonl"))
+        .expect("diagnostics");
+    assert!(raw.contains("\"phase\":\"request.timeout\""));
+}
+
+#[test]
+fn backfill_requests_respect_remaining_peer_slots() {
+    let peer = random_network_node_id();
+    let node = Node::open_in_memory_with_roles(&[Role::Proposer]).expect("node");
+    let mut service = NetworkBridgeService::new(
+        NetworkP2pNode::generate(NetworkP2pConfig::default()).expect("node"),
+        &[SwarmScope::Global, SwarmScope::Group("crew-a".to_owned())],
+        &NetworkProtocolParams::default(),
+    )
+    .expect("service");
+    let mut state = PeerSyncState::new(Instant::now());
+    for index in 0..(MAX_INFLIGHT_BACKFILLS_PER_PEER - 1) {
+        state.record_pending_backfill(
+            BackfillRequestId::new(1_000 + index as u64),
+            SwarmScope::Global,
+            None,
+            Instant::now(),
+        );
+    }
+    service.peer_sync_state.insert(peer.clone(), state);
+
+    assert!(
+        service
+            .request_backfill_scopes_for_peer_now(
+                &peer,
+                &node,
+                &[SwarmScope::Global, SwarmScope::Group("crew-a".to_owned())],
+            )
+            .expect("request backfill")
+    );
+
+    assert_eq!(
+        service
+            .peer_sync_state
+            .get(&peer)
+            .expect("peer state")
+            .inflight_backfills(),
+        MAX_INFLIGHT_BACKFILLS_PER_PEER
+    );
 }
 
 #[test]
@@ -981,7 +1053,7 @@ fn urgent_backfill_request_bypasses_retry_delay_for_relay_scope() {
             .peer_sync_state
             .get(&peer)
             .expect("peer sync state")
-            .inflight_backfills,
+            .inflight_backfills(),
         1
     );
 
@@ -1042,7 +1114,7 @@ fn anti_entropy_requests_relay_scope_backfill() {
             .peer_sync_state
             .get(&peer)
             .expect("peer sync state")
-            .inflight_backfills
+            .inflight_backfills()
             >= 1
     );
 

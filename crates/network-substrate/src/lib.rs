@@ -22,7 +22,7 @@ use wattswarm_network_transport_iroh::{
     install_local_contact_material_control_handler_for_network_peer_id,
     local_endpoint_id_from_state_dir, local_gossip_for_network_peer_id,
     register_remote_contact_material_for_network_peer_id,
-    send_control_stream_request_for_network_peer_id,
+    send_control_stream_request_for_network_peer_id_with_timeout,
     set_local_control_stream_handler_for_network_peer_id, shutdown_local_iroh_data_plane,
 };
 use wattswarm_protocol::types::ArtifactRef;
