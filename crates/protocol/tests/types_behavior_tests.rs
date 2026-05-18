@@ -1,13 +1,13 @@
 use wattswarm_protocol::types::{
-    ArtifactRef, BudgetMode, CheckpointCreatedPayload, DEFAULT_CONTROL_BACKFILL_RETRY_SECS,
-    DEFAULT_CONTROL_MAX_DRIFT_BEFORE_SNAPSHOT, DEFAULT_CONTROL_RANGE_LIMIT,
-    DEFAULT_CONTROL_STATUS_INTERVAL_SECS, EventKind, EventPayload, EventRevokedPayload,
-    ExecutionIntentDeclaredPayload, ExecutionSetConfirmedPayload, FeedSubscriptionUpdatedPayload,
-    Membership, NetworkControlSyncParams, NetworkDescriptor, NetworkKind, NetworkTopology,
-    NodePenalizedPayload, OrgDescriptor, PolicyBinding, Role, ScopeHint, SummaryRevokedPayload,
-    TaskAnnouncedPayload, TaskContract, TaskDisseminationLayer, TaskExpiredPayload, TaskMode,
-    TopicMessagePostedPayload, TransportRoute, UnsignedEvent, canonical_scope_hint,
-    normalized_scope_hint,
+    AgentEnvelope, ArtifactRef, BudgetMode, CheckpointCreatedPayload,
+    DEFAULT_CONTROL_BACKFILL_RETRY_SECS, DEFAULT_CONTROL_MAX_DRIFT_BEFORE_SNAPSHOT,
+    DEFAULT_CONTROL_RANGE_LIMIT, DEFAULT_CONTROL_STATUS_INTERVAL_SECS, EventKind, EventPayload,
+    EventRevokedPayload, ExecutionIntentDeclaredPayload, ExecutionSetConfirmedPayload,
+    FeedSubscriptionUpdatedPayload, Membership, NetworkControlSyncParams, NetworkDescriptor,
+    NetworkKind, NetworkTopology, NodePenalizedPayload, OrgDescriptor, PolicyBinding, Role,
+    ScopeHint, SummaryRevokedPayload, TaskAnnouncedPayload, TaskContract, TaskDisseminationLayer,
+    TaskExpiredPayload, TaskMode, TopicMessagePostedPayload, TransportRoute, UnsignedEvent,
+    canonical_scope_hint, normalized_scope_hint,
 };
 
 fn sample_topic_content_ref() -> ArtifactRef {
@@ -19,6 +19,36 @@ fn sample_topic_content_ref() -> ArtifactRef {
         created_at: 1,
         producer: "node-topic".to_owned(),
     }
+}
+
+#[test]
+fn agent_envelope_accepts_structured_message_aliases() {
+    let envelope: AgentEnvelope = serde_json::from_value(serde_json::json!({
+        "protocol": "a2a.task.v1",
+        "source_agent_id": "agent-a",
+        "target_agent_id": "agent-b",
+        "capability": "task.claim",
+        "message": {
+            "task_id": "task-1",
+            "action": "claim"
+        },
+        "extensions": {
+            "source": "wattetheria"
+        },
+        "signature": "sig"
+    }))
+    .expect("decode agent envelope");
+
+    assert_eq!(envelope.protocol, "a2a.task.v1");
+    assert_eq!(envelope.capability.as_deref(), Some("task.claim"));
+    assert_eq!(
+        envelope.message_json,
+        r#"{"action":"claim","task_id":"task-1"}"#
+    );
+    assert_eq!(
+        envelope.extensions_json.as_deref(),
+        Some(r#"{"source":"wattetheria"}"#)
+    );
 }
 
 #[test]
@@ -234,6 +264,7 @@ fn scope_hint_parse_and_canonicalization_are_shared() {
             scope_hint: "node:lab-9".to_owned(),
             summary: serde_json::json!({}),
             detail_ref: None,
+            agent_envelope: None,
         }
         .scope(),
         Some(ScopeHint::Node("lab-9".to_owned()))
@@ -457,6 +488,7 @@ fn dissemination_layer_marks_only_low_frequency_layers_as_global_safe() {
             created_at: 42,
             producer: "node-a".to_owned(),
         }),
+        agent_envelope: None,
     });
     assert_eq!(
         announcement.dissemination_layer(),
@@ -489,6 +521,7 @@ fn dissemination_layer_marks_only_low_frequency_layers_as_global_safe() {
         custom_reason_code: None,
         custom_reason_message: None,
         message: "timed out".to_owned(),
+        agent_envelope: None,
     });
     assert_eq!(
         process.dissemination_layer(),

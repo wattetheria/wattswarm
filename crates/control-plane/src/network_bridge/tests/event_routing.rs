@@ -28,6 +28,7 @@ fn task_claim_agent_event_uses_generic_task_schema() {
             claimer_node_id: "peer-a".to_owned(),
             execution_id: "exec-agent-a".to_owned(),
             lease_until: 88,
+            agent_envelope: None,
         }),
         signature_hex: "sig".to_owned(),
     };
@@ -86,6 +87,19 @@ fn backfill_task_claimed_delivers_local_agent_event() {
     publisher
         .submit_task(contract, 1, 100)
         .expect("submit task");
+    let agent_envelope = wattswarm_protocol::types::AgentEnvelope {
+        protocol: "a2a.task.v1".to_owned(),
+        source_agent_id: Some("claimer-agent".to_owned()),
+        target_agent_id: Some("publisher-agent".to_owned()),
+        capability: Some("task.claim".to_owned()),
+        message_json: json!({
+            "task_id": task_id,
+            "action": "claim"
+        })
+        .to_string(),
+        extensions_json: None,
+        signature: Some("sig-a2a".to_owned()),
+    };
     let claim_event = build_event_for_external(
         &claimer_identity,
         1,
@@ -96,6 +110,7 @@ fn backfill_task_claimed_delivers_local_agent_event() {
             claimer_node_id: claimer_identity.node_id(),
             execution_id: format!("exec-{task_id}"),
             lease_until: 500,
+            agent_envelope: Some(agent_envelope.clone()),
         }),
     )
     .expect("claim event");
@@ -150,6 +165,8 @@ fn backfill_task_claimed_delivers_local_agent_event() {
         records[0].target_executor.as_deref(),
         Some(CORE_AGENT_EXECUTOR_NAME)
     );
+    assert_eq!(records[0].agent_envelope, Some(agent_envelope));
+    assert!(records[0].payload["agent_envelope"].is_object());
 }
 
 #[test]
@@ -376,6 +393,7 @@ fn task_result_agent_event_supports_retry_updates() {
                 task_id: "task-1".to_owned(),
                 attempt: 3,
                 run_at: 1234,
+                agent_envelope: None,
             },
         ),
         signature_hex: "sig".to_owned(),
@@ -439,6 +457,7 @@ fn task_result_agent_event_uses_generic_task_actions() {
         crate::types::EventPayload::CandidateProposed(crate::types::CandidateProposedPayload {
             task_id: "task-result-generic".to_owned(),
             candidate: candidate.clone(),
+            agent_envelope: None,
         }),
     )
     .expect("candidate proposed event");

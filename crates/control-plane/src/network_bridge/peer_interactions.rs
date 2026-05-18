@@ -68,6 +68,7 @@ enum PendingNetworkCommand {
         remote_node_id: String,
         message_kind: String,
         payment: Value,
+        agent_envelope: RawAgentEnvelope,
     },
 }
 
@@ -128,6 +129,7 @@ pub fn enqueue_agent_payment_command(
     remote_node_id: &str,
     message_kind: &str,
     payment: Value,
+    agent_envelope: RawAgentEnvelope,
 ) -> Result<()> {
     enqueue_pending_network_command(
         state_dir,
@@ -135,6 +137,7 @@ pub fn enqueue_agent_payment_command(
             remote_node_id: remote_node_id.trim().to_owned(),
             message_kind: message_kind.trim().to_owned(),
             payment,
+            agent_envelope,
         },
     )
 }
@@ -160,6 +163,7 @@ fn build_agent_payment_summary(
     remote_node_id: &str,
     message_kind: &str,
     payment: Value,
+    agent_envelope: RawAgentEnvelope,
 ) -> SummaryAnnouncement {
     let remote_node_id = remote_node_id.trim();
     let payment_id = payment
@@ -175,6 +179,7 @@ fn build_agent_payment_summary(
         payload: json!({
             "message_kind": message_kind,
             "payment": payment,
+            "agent_envelope": agent_envelope,
         }),
     }
 }
@@ -231,7 +236,7 @@ pub(super) fn attach_agent_envelope_to_relationship(
     crate::control::save_peer_relationship_record_state(state_dir, &record)
 }
 
-pub(super) fn default_agent_envelope(
+pub fn default_agent_envelope(
     local_node_id: &str,
     remote_node_id: &str,
     capability: &str,
@@ -387,6 +392,12 @@ pub(super) fn save_agent_payment_summary(
         .get("payment")
         .cloned()
         .ok_or_else(|| anyhow!("agent payment summary missing payment payload"))?;
+    let agent_envelope = summary
+        .payload
+        .get("agent_envelope")
+        .cloned()
+        .map(serde_json::from_value::<wattswarm_protocol::types::AgentEnvelope>)
+        .transpose()?;
     let payment_id = payment
         .get("payment_id")
         .and_then(Value::as_str)
@@ -406,15 +417,17 @@ pub(super) fn save_agent_payment_summary(
         wattswarm_protocol::types::AgentEventType::PaymentUpdate
     };
     let allowed_actions = payment_allowed_actions(message_kind);
-    let event = build_agent_event(
+    let event = build_agent_event_with_agent_envelope(
         event_type,
         wattswarm_protocol::types::AgentEventSourceKind::PaymentSummary,
         Some(remote_node_id.to_owned()),
         None,
+        agent_envelope.clone(),
         json!({
             "summary_id": summary.summary_id,
             "message_kind": message_kind,
             "payment": record.payment,
+            "agent_envelope": agent_envelope,
         }),
         true,
         allowed_actions,
@@ -483,9 +496,14 @@ pub(super) fn process_pending_network_commands(
                 remote_node_id,
                 message_kind,
                 payment,
+                agent_envelope,
             } => {
-                let mut summary =
-                    build_agent_payment_summary(&remote_node_id, &message_kind, payment);
+                let mut summary = build_agent_payment_summary(
+                    &remote_node_id,
+                    &message_kind,
+                    payment,
+                    agent_envelope,
+                );
                 summary.source_node_id = service.local_peer_id().to_string();
                 service.publish_summary(summary).map(|_| ())
             }

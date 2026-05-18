@@ -120,6 +120,61 @@ pub struct TransportRoute {
     pub forward_budget: u8,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct AgentEnvelope {
+    pub protocol: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_agent_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_agent_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capability: Option<String>,
+    #[serde(
+        default,
+        alias = "message",
+        deserialize_with = "deserialize_json_string_field"
+    )]
+    pub message_json: String,
+    #[serde(
+        default,
+        alias = "extensions",
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_optional_json_string_field"
+    )]
+    pub extensions_json: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature: Option<String>,
+}
+
+fn deserialize_json_string_field<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Option::<Value>::deserialize(deserializer)?;
+    Ok(match value {
+        Some(Value::String(value)) => value,
+        Some(value) => serde_json::to_string(&value).map_err(serde::de::Error::custom)?,
+        None => String::new(),
+    })
+}
+
+fn deserialize_optional_json_string_field<'de, D>(
+    deserializer: D,
+) -> Result<Option<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Option::<Value>::deserialize(deserializer)?;
+    match value {
+        Some(Value::Null) | None => Ok(None),
+        Some(Value::String(value)) if value.trim().is_empty() => Ok(None),
+        Some(Value::String(value)) => Ok(Some(value)),
+        Some(value) => serde_json::to_string(&value)
+            .map(Some)
+            .map_err(serde::de::Error::custom),
+    }
+}
+
 fn is_zero_u8(value: &u8) -> bool {
     *value == 0
 }
@@ -170,6 +225,8 @@ pub struct AgentEvent {
     pub target_agent_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target_executor: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_envelope: Option<AgentEnvelope>,
     pub payload: Value,
     pub requires_commit: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -565,6 +622,8 @@ pub struct ClaimPayload {
     pub claimer_node_id: String,
     pub execution_id: String,
     pub lease_until: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_envelope: Option<AgentEnvelope>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -588,6 +647,7 @@ pub struct ClaimReleasePayload {
 pub struct CandidateProposedPayload {
     pub task_id: String,
     pub candidate: Candidate,
+    pub agent_envelope: Option<AgentEnvelope>,
 }
 
 #[derive(Serialize)]
@@ -614,12 +674,16 @@ struct CandidateWireOwned {
 struct CandidateProposedPayloadWireView<'a> {
     task_id: &'a str,
     candidate: CandidateWireView<'a>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    agent_envelope: Option<&'a AgentEnvelope>,
 }
 
 #[derive(Deserialize)]
 struct CandidateProposedPayloadWireOwned {
     task_id: String,
     candidate: CandidateWireOwned,
+    #[serde(default)]
+    agent_envelope: Option<AgentEnvelope>,
 }
 
 impl Serialize for CandidateProposedPayload {
@@ -636,6 +700,7 @@ impl Serialize for CandidateProposedPayload {
                 evidence_inline: &self.candidate.evidence_inline,
                 evidence_refs: &self.candidate.evidence_refs,
             },
+            agent_envelope: self.agent_envelope.as_ref(),
         }
         .serialize(serializer)
     }
@@ -657,6 +722,7 @@ impl<'de> Deserialize<'de> for CandidateProposedPayload {
                 evidence_inline: wire.candidate.evidence_inline,
                 evidence_refs: wire.candidate.evidence_refs,
             },
+            agent_envelope: wire.agent_envelope,
         })
     }
 }
@@ -698,6 +764,8 @@ pub struct DecisionFinalizedPayload {
     pub candidate_id: String,
     pub winning_candidate_hash: String,
     pub finality_proof: FinalityProof,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_envelope: Option<AgentEnvelope>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -709,6 +777,8 @@ pub struct TaskErrorPayload {
     pub custom_reason_code: Option<String>,
     pub custom_reason_message: Option<String>,
     pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_envelope: Option<AgentEnvelope>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -716,6 +786,8 @@ pub struct TaskRetryScheduledPayload {
     pub task_id: String,
     pub attempt: u32,
     pub run_at: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_envelope: Option<AgentEnvelope>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -794,6 +866,8 @@ pub struct TaskAnnouncedPayload {
     pub summary: Value,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail_ref: Option<ArtifactRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_envelope: Option<AgentEnvelope>,
 }
 
 impl TaskAnnouncedPayload {

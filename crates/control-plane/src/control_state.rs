@@ -694,7 +694,7 @@ pub struct RemoteTaskBridgeRecord {
 
 #[derive(Clone)]
 pub(crate) struct PreparedRuntime {
-    pub(crate) runtime: HttpRuntimeClient,
+    pub(crate) runtime: std::sync::Arc<dyn RuntimeClient>,
     pub(crate) capabilities: RuntimeCapabilities,
 }
 
@@ -1418,6 +1418,13 @@ pub fn load_agent_event_records_state(
                 source_node_id: row.source_node_id,
                 target_agent_id: row.target_agent_id,
                 target_executor: row.target_executor,
+                agent_envelope: payload
+                    .get("agent_envelope")
+                    .cloned()
+                    .map(serde_json::from_value)
+                    .transpose()
+                    .ok()
+                    .flatten(),
                 payload,
                 requires_commit: row.requires_commit,
                 allowed_actions,
@@ -1483,6 +1490,11 @@ pub fn find_agent_event_record_by_dedupe_key(
         source_node_id: row.source_node_id,
         target_agent_id: row.target_agent_id,
         target_executor: row.target_executor,
+        agent_envelope: serde_json::from_str::<Value>(&row.payload_json)?
+            .get("agent_envelope")
+            .cloned()
+            .map(serde_json::from_value)
+            .transpose()?,
         payload: serde_json::from_str(&row.payload_json)?,
         allowed_actions: serde_json::from_str(&row.allowed_actions_json)?,
         requires_commit: row.requires_commit,

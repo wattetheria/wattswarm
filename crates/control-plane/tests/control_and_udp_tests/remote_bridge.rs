@@ -79,6 +79,7 @@ fn remote_task_bridge_materializes_executes_and_dedupes() {
                 created_at: 100,
                 producer: remote.node_id(),
             }),
+            agent_envelope: None,
         }),
     );
     let announcement = remote
@@ -247,6 +248,7 @@ fn remote_task_bridge_rejects_node_scoped_tasks_for_other_nodes() {
                 created_at: 100,
                 producer: remote.node_id(),
             }),
+            agent_envelope: None,
         }),
     );
     let announcement = remote
@@ -370,6 +372,7 @@ fn remote_task_bridge_allows_group_scoped_tasks_for_target_nodes() {
                 created_at: 100,
                 producer: remote.node_id(),
             }),
+            agent_envelope: None,
         }),
     );
     let announcement = remote

@@ -60,7 +60,7 @@ pub use diagnostics::{
     DiagnosticEntry, DiagnosticFilter, list_diagnostics as list_network_diagnostics,
 };
 pub use peer_interactions::{
-    enqueue_agent_payment_command, enqueue_peer_direct_message_command,
+    default_agent_envelope, enqueue_agent_payment_command, enqueue_peer_direct_message_command,
     enqueue_peer_relationship_action_command,
 };
 pub use publish::{publish_pending_global_events, publish_pending_scoped_updates};
@@ -79,8 +79,9 @@ pub use summary::{
 #[cfg(test)]
 use agent_delivery::topic_message_requires_reply;
 use agent_delivery::{
-    build_agent_event, deliver_agent_event_to_local_executor, task_claim_agent_event,
-    task_result_agent_event, topic_message_agent_event,
+    build_agent_event, build_agent_event_with_agent_envelope,
+    deliver_agent_event_to_local_executor, task_claim_agent_event, task_result_agent_event,
+    topic_message_agent_event,
 };
 use backfill::{
     BACKFILL_KNOWN_EVENT_IDS_LIMIT, recent_backfill_lane_event_ids, should_publish_summaries,
@@ -101,10 +102,10 @@ use discovery_bootnode::{
 use peer_interactions::payment_allowed_actions;
 use peer_interactions::{
     PendingContactMaterialRequest, PendingPeerDirectMessageRequest, PendingPeerRelationshipRequest,
-    attach_agent_envelope_to_relationship, control_peer_relationship_action,
-    default_agent_envelope, peer_dm_thread_id, process_pending_network_commands,
-    relationship_state_for, save_agent_payment_summary, save_dm_message, upsert_dm_thread,
-    verify_agent_envelope_signature, wire_peer_relationship_action,
+    attach_agent_envelope_to_relationship, control_peer_relationship_action, peer_dm_thread_id,
+    process_pending_network_commands, relationship_state_for, save_agent_payment_summary,
+    save_dm_message, upsert_dm_thread, verify_agent_envelope_signature,
+    wire_peer_relationship_action,
 };
 use publish::GlobalPublishRateGuard;
 use scope::{

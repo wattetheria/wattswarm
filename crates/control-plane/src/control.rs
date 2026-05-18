@@ -609,6 +609,15 @@ pub fn accept_task_result_locally(
     task_id: &str,
     candidate_id: &str,
 ) -> Result<Value> {
+    accept_task_result_locally_with_agent_envelope(node, task_id, candidate_id, None)
+}
+
+pub fn accept_task_result_locally_with_agent_envelope(
+    node: &mut Node,
+    task_id: &str,
+    candidate_id: &str,
+    agent_envelope: Option<crate::types::AgentEnvelope>,
+) -> Result<Value> {
     let task = node
         .task_view(task_id)?
         .ok_or_else(|| anyhow!("task not found: {task_id}"))?;
@@ -635,11 +644,12 @@ pub fn accept_task_result_locally(
     let now = observed_at_ms();
     let verify_execution_id = format!("verify-{}", Uuid::new_v4());
     let lease_until = now.saturating_add(task.contract.assignment.claim.lease_ms);
-    node.claim_task(
+    node.claim_task_with_agent_envelope(
         task_id,
         ClaimRole::Verify,
         &verify_execution_id,
         lease_until,
+        agent_envelope.clone(),
         task.epoch,
         now.saturating_add(1),
     )?;
@@ -699,7 +709,7 @@ pub fn accept_task_result_locally(
         now.saturating_add(4),
     )?;
     node.commit_decision(task_id, task.epoch, candidate_id, now.saturating_add(5))?;
-    node.finalize_decision(
+    node.finalize_decision_with_agent_envelope(
         task_id,
         task.epoch,
         candidate_id,
@@ -712,6 +722,7 @@ pub fn accept_task_result_locally(
                 candidate_id,
             )],
         },
+        agent_envelope,
         now.saturating_add(6),
     )?;
     Ok(json!({

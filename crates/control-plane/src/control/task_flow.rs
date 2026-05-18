@@ -83,6 +83,10 @@ fn save_remote_task_bridge_registry(
     )
 }
 
+fn runtime_client_for_executor(entry: &ExecutorRegistryEntry) -> std::sync::Arc<dyn RuntimeClient> {
+    std::sync::Arc::new(HttpRuntimeClient::new(entry.base_url.clone()))
+}
+
 pub(crate) fn prepare_runtime_for_executor(
     state_dir: &Path,
     executor: &str,
@@ -96,7 +100,7 @@ pub(crate) fn prepare_runtime_for_executor(
         .find(|e| e.name == executor)
         .ok_or_else(|| anyhow!("executor not found: {executor}"))?;
 
-    let runtime = HttpRuntimeClient::new(entry.base_url.clone());
+    let runtime = runtime_client_for_executor(entry);
     retry_runtime_probe(|| runtime.health()).with_context(|| {
         format!(
             "runtime /health failed (executor='{}', base_url='{}')",
@@ -527,7 +531,7 @@ pub fn bridge_remote_task_into_local_execution(
     let run = run_existing_task_with_runtime(
         node,
         state_dir,
-        &prepared.runtime,
+        prepared.runtime.as_ref(),
         &prepared.capabilities,
         &executor,
         &profile,
@@ -627,7 +631,7 @@ pub fn run_real_task_flow(
     run_existing_task_with_runtime(
         node,
         state_dir,
-        &prepared.runtime,
+        prepared.runtime.as_ref(),
         &prepared.capabilities,
         &executor,
         &profile,

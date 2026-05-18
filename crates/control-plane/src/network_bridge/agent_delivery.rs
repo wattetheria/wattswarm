@@ -258,8 +258,12 @@ fn route_task_result_to_wattswarm(
                     "candidate_id",
                     &event.event_type,
                 )?;
-                let result =
-                    crate::control::accept_task_result_locally(&mut node, &task_id, &candidate_id)?;
+                let result = crate::control::accept_task_result_locally_with_agent_envelope(
+                    &mut node,
+                    &task_id,
+                    &candidate_id,
+                    event.agent_envelope.clone(),
+                )?;
                 return Ok((200, result.to_string()));
             }
             return Ok((
@@ -418,11 +422,12 @@ pub(super) fn task_claim_agent_event(
         .task_view(&payload.task_id)?
         .map(|task| task.contract.inputs)
         .unwrap_or(Value::Null);
-    Ok(build_agent_event(
+    Ok(build_agent_event_with_agent_envelope(
         wattswarm_protocol::types::AgentEventType::TaskClaimReceived,
         wattswarm_protocol::types::AgentEventSourceKind::TaskLifecycle,
         Some(event.author_node_id.clone()),
         None,
+        payload.agent_envelope.clone(),
         json!({
             "event_id": &event.event_id,
             "event_kind": "task_claimed",
@@ -432,6 +437,7 @@ pub(super) fn task_claim_agent_event(
             "role": payload.role,
             "lease_until": payload.lease_until,
             "task_inputs": task_inputs,
+            "agent_envelope": payload.agent_envelope,
             "created_at": event.created_at,
         }),
         false,
@@ -455,11 +461,12 @@ pub(super) fn task_result_agent_event(
                 .get_candidate_by_id(&payload.task_id, &payload.candidate.candidate_id)?
                 .map(|candidate| candidate.output)
                 .unwrap_or(Value::Null);
-            Ok(Some(build_agent_event(
+            Ok(Some(build_agent_event_with_agent_envelope(
                 wattswarm_protocol::types::AgentEventType::TaskResultReceived,
                 wattswarm_protocol::types::AgentEventSourceKind::TaskLifecycle,
                 Some(event.author_node_id.clone()),
                 None,
+                payload.agent_envelope.clone(),
                 json!({
                     "event_id": &event.event_id,
                     "event_kind": "candidate_proposed",
@@ -468,6 +475,7 @@ pub(super) fn task_result_agent_event(
                     "execution_id": &payload.candidate.execution_id,
                     "candidate_hash": &payload.candidate.output_ref.digest,
                     "candidate_output": candidate_output,
+                    "agent_envelope": payload.agent_envelope,
                     "created_at": event.created_at,
                 }),
                 false,
@@ -484,74 +492,86 @@ pub(super) fn task_result_agent_event(
                 )),
             )))
         }
-        crate::types::EventPayload::DecisionFinalized(payload) => Ok(Some(build_agent_event(
-            wattswarm_protocol::types::AgentEventType::TaskResultReceived,
-            wattswarm_protocol::types::AgentEventSourceKind::TaskLifecycle,
-            Some(event.author_node_id.clone()),
-            None,
-            json!({
-                "event_id": &event.event_id,
-                "event_kind": "decision_finalized",
-                "task_id": &payload.task_id,
-                "candidate_id": &payload.candidate_id,
-                "winning_candidate_hash": &payload.winning_candidate_hash,
-                "finality_proof": &payload.finality_proof,
-                "created_at": event.created_at,
-            }),
-            false,
-            vec!["inspect_task".to_owned(), "accept_result".to_owned()],
-            Some(payload.task_id.clone()),
-            Some(format!(
-                "task_result:{}:finalized:{}",
-                payload.task_id, payload.candidate_id
-            )),
-        ))),
-        crate::types::EventPayload::TaskError(payload) => Ok(Some(build_agent_event(
-            wattswarm_protocol::types::AgentEventType::TaskResultReceived,
-            wattswarm_protocol::types::AgentEventSourceKind::TaskLifecycle,
-            Some(event.author_node_id.clone()),
-            None,
-            json!({
-                "event_id": &event.event_id,
-                "event_kind": "task_error",
-                "task_id": &payload.task_id,
-                "reason": payload.reason,
-                "reason_codes": &payload.reason_codes,
-                "message": &payload.message,
-                "custom_reason_namespace": &payload.custom_reason_namespace,
-                "custom_reason_code": &payload.custom_reason_code,
-                "custom_reason_message": &payload.custom_reason_message,
-                "created_at": event.created_at,
-            }),
-            false,
-            vec!["inspect_task".to_owned(), "request_retry".to_owned()],
-            Some(payload.task_id.clone()),
-            Some(format!(
-                "task_result:{}:error:{}",
-                payload.task_id, event.event_id
-            )),
-        ))),
-        crate::types::EventPayload::TaskRetryScheduled(payload) => Ok(Some(build_agent_event(
-            wattswarm_protocol::types::AgentEventType::TaskResultReceived,
-            wattswarm_protocol::types::AgentEventSourceKind::TaskLifecycle,
-            Some(event.author_node_id.clone()),
-            None,
-            json!({
-                "event_id": &event.event_id,
-                "event_kind": "task_retry_scheduled",
-                "task_id": &payload.task_id,
-                "attempt": payload.attempt,
-                "run_at": payload.run_at,
-                "created_at": event.created_at,
-            }),
-            false,
-            vec!["inspect_task".to_owned()],
-            Some(payload.task_id.clone()),
-            Some(format!(
-                "task_result:{}:retry:{}",
-                payload.task_id, payload.attempt
-            )),
-        ))),
+        crate::types::EventPayload::DecisionFinalized(payload) => {
+            Ok(Some(build_agent_event_with_agent_envelope(
+                wattswarm_protocol::types::AgentEventType::TaskResultReceived,
+                wattswarm_protocol::types::AgentEventSourceKind::TaskLifecycle,
+                Some(event.author_node_id.clone()),
+                None,
+                payload.agent_envelope.clone(),
+                json!({
+                    "event_id": &event.event_id,
+                    "event_kind": "decision_finalized",
+                    "task_id": &payload.task_id,
+                    "candidate_id": &payload.candidate_id,
+                    "winning_candidate_hash": &payload.winning_candidate_hash,
+                    "finality_proof": &payload.finality_proof,
+                    "agent_envelope": payload.agent_envelope,
+                    "created_at": event.created_at,
+                }),
+                false,
+                vec!["inspect_task".to_owned(), "accept_result".to_owned()],
+                Some(payload.task_id.clone()),
+                Some(format!(
+                    "task_result:{}:finalized:{}",
+                    payload.task_id, payload.candidate_id
+                )),
+            )))
+        }
+        crate::types::EventPayload::TaskError(payload) => {
+            Ok(Some(build_agent_event_with_agent_envelope(
+                wattswarm_protocol::types::AgentEventType::TaskResultReceived,
+                wattswarm_protocol::types::AgentEventSourceKind::TaskLifecycle,
+                Some(event.author_node_id.clone()),
+                None,
+                payload.agent_envelope.clone(),
+                json!({
+                    "event_id": &event.event_id,
+                    "event_kind": "task_error",
+                    "task_id": &payload.task_id,
+                    "reason": payload.reason,
+                    "reason_codes": &payload.reason_codes,
+                    "message": &payload.message,
+                    "custom_reason_namespace": &payload.custom_reason_namespace,
+                    "custom_reason_code": &payload.custom_reason_code,
+                    "custom_reason_message": &payload.custom_reason_message,
+                    "agent_envelope": payload.agent_envelope,
+                    "created_at": event.created_at,
+                }),
+                false,
+                vec!["inspect_task".to_owned(), "request_retry".to_owned()],
+                Some(payload.task_id.clone()),
+                Some(format!(
+                    "task_result:{}:error:{}",
+                    payload.task_id, event.event_id
+                )),
+            )))
+        }
+        crate::types::EventPayload::TaskRetryScheduled(payload) => {
+            Ok(Some(build_agent_event_with_agent_envelope(
+                wattswarm_protocol::types::AgentEventType::TaskResultReceived,
+                wattswarm_protocol::types::AgentEventSourceKind::TaskLifecycle,
+                Some(event.author_node_id.clone()),
+                None,
+                payload.agent_envelope.clone(),
+                json!({
+                    "event_id": &event.event_id,
+                    "event_kind": "task_retry_scheduled",
+                    "task_id": &payload.task_id,
+                    "attempt": payload.attempt,
+                    "run_at": payload.run_at,
+                    "agent_envelope": payload.agent_envelope,
+                    "created_at": event.created_at,
+                }),
+                false,
+                vec!["inspect_task".to_owned()],
+                Some(payload.task_id.clone()),
+                Some(format!(
+                    "task_result:{}:retry:{}",
+                    payload.task_id, payload.attempt
+                )),
+            )))
+        }
         _ => Ok(None),
     }
 }
@@ -600,6 +620,33 @@ pub(super) fn build_agent_event(
     correlation_id: Option<String>,
     dedupe_key: Option<String>,
 ) -> wattswarm_protocol::types::AgentEvent {
+    build_agent_event_with_agent_envelope(
+        event_type,
+        source_kind,
+        source_node_id,
+        target_agent_id,
+        None,
+        payload,
+        requires_commit,
+        allowed_actions,
+        correlation_id,
+        dedupe_key,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn build_agent_event_with_agent_envelope(
+    event_type: wattswarm_protocol::types::AgentEventType,
+    source_kind: wattswarm_protocol::types::AgentEventSourceKind,
+    source_node_id: Option<String>,
+    target_agent_id: Option<String>,
+    agent_envelope: Option<wattswarm_protocol::types::AgentEnvelope>,
+    payload: Value,
+    requires_commit: bool,
+    allowed_actions: Vec<String>,
+    correlation_id: Option<String>,
+    dedupe_key: Option<String>,
+) -> wattswarm_protocol::types::AgentEvent {
     wattswarm_protocol::types::AgentEvent {
         event_id: Uuid::new_v4().to_string(),
         event_type,
@@ -607,6 +654,7 @@ pub(super) fn build_agent_event(
         source_node_id,
         target_agent_id,
         target_executor: Some(CORE_AGENT_EXECUTOR_NAME.to_owned()),
+        agent_envelope,
         payload,
         requires_commit,
         allowed_actions,

@@ -48,6 +48,7 @@ fn task_detail_and_evidence_artifacts_roundtrip_and_missing_refs_schedule_repair
                     created_at: 11,
                     producer: node.node_id(),
                 }),
+                agent_envelope: None,
             },
         ),
         11,

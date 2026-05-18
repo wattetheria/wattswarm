@@ -243,6 +243,7 @@ fn task_outcome_summary_imports_compressed_result_facts() {
                     signature_hex: "sig-1".to_owned(),
                 }],
             },
+            agent_envelope: None,
         }),
     )
     .expect("finalized event");
@@ -345,6 +346,7 @@ fn subnet_outcome_summary_and_checkpoint_anchor_mirror_to_parent_network() {
                     signature_hex: "sig-parent".to_owned(),
                 }],
             },
+            agent_envelope: None,
         }),
     )
     .expect("finalized event");

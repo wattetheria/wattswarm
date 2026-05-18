@@ -29,6 +29,7 @@ fn task_announcement_event_persists_summary_and_detail_reference() {
                 created_at: 100,
                 producer: node.node_id(),
             }),
+            agent_envelope: None,
         }),
         100,
     )
@@ -520,6 +521,7 @@ fn mainnet_non_genesis_finalization_does_not_break_outcome_summary_generation() 
                     "cand-mainnet-non-genesis-summary",
                 )],
             },
+            agent_envelope: None,
         }),
     )
     .expect("finalized event");
@@ -553,6 +555,7 @@ fn administrative_task_lifecycle_events_require_roles() {
             task_id: "task-admin-no-role".to_owned(),
             attempt: 1,
             run_at: 12,
+            agent_envelope: None,
         }),
     )
     .expect("retry event");
@@ -681,6 +684,7 @@ fn global_publish_rate_guard_limits_only_high_frequency_global_events() {
             claimer_node_id: "node-a".to_owned(),
             execution_id: "exec-1".to_owned(),
             lease_until: 20,
+            agent_envelope: None,
         }),
     )
     .expect("event");

@@ -4,7 +4,7 @@ use crate::control::{
 use crate::http::helpers::resolve_network_id;
 use crate::http::{ApiError, UiServerState, run_blocking};
 use crate::task_template::sample_contract;
-use crate::types::{Candidate, ClaimRole, TaskContract};
+use crate::types::{AgentEnvelope, Candidate, ClaimRole, TaskContract};
 use anyhow::{Result, anyhow};
 use axum::Json;
 use axum::extract::{Path, Query, State};
@@ -42,6 +42,8 @@ pub(crate) struct TaskAnnounceRequest {
     summary: Value,
     #[serde(default)]
     detail_ref: Option<crate::types::ArtifactRef>,
+    #[serde(default)]
+    agent_envelope: Option<AgentEnvelope>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -53,6 +55,8 @@ pub(crate) struct TaskClaimRequest {
     execution_id: Option<String>,
     #[serde(default)]
     lease_ms: Option<u64>,
+    #[serde(default)]
+    agent_envelope: Option<AgentEnvelope>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -67,12 +71,16 @@ pub(crate) struct TaskProposeCandidateRequest {
     evidence_inline: Vec<crate::types::InlineEvidence>,
     #[serde(default)]
     evidence_refs: Vec<crate::types::ArtifactRef>,
+    #[serde(default)]
+    agent_envelope: Option<AgentEnvelope>,
 }
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct TaskAcceptResultRequest {
     task_id: String,
     candidate_id: String,
+    #[serde(default)]
+    agent_envelope: Option<AgentEnvelope>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -175,6 +183,7 @@ pub(crate) async fn task_announce(
             scope_hint,
             summary,
             detail_ref,
+            agent_envelope,
         } = req;
         let mut node = open_node(&state_clone.state_dir, &state_clone.db_path)?;
         let task = node
@@ -182,13 +191,14 @@ pub(crate) async fn task_announce(
             .ok_or_else(|| anyhow!("task not found: {}", task_id))?;
         let now = chrono::Utc::now().timestamp_millis().max(0) as u64;
         let announcement_id = announcement_id.unwrap_or_else(|| format!("ann-{}", Uuid::new_v4()));
-        node.announce_task(
+        node.announce_task_with_agent_envelope(
             &task_id,
             &announcement_id,
             &feed_key,
             &scope_hint,
             summary,
             detail_ref,
+            agent_envelope,
             task.epoch,
             now.saturating_add(1),
         )?;
@@ -285,11 +295,12 @@ pub(crate) async fn task_claim(
         } else {
             None
         };
-        node.claim_task(
+        node.claim_task_with_agent_envelope(
             &req.task_id,
             role,
             &execution_id,
             lease_until,
+            req.agent_envelope,
             task.epoch,
             now.saturating_add(1),
         )?;
@@ -320,6 +331,7 @@ pub(crate) async fn task_propose_candidate(
             candidate_id,
             evidence_inline,
             evidence_refs,
+            agent_envelope,
         } = req;
         let mut node = open_node(&state_clone.state_dir, &state_clone.db_path)?;
         let task = node
@@ -342,7 +354,13 @@ pub(crate) async fn task_propose_candidate(
             evidence_inline,
             evidence_refs,
         };
-        node.propose_candidate(&task_id, candidate, task.epoch, now)?;
+        node.propose_candidate_with_agent_envelope(
+            &task_id,
+            candidate,
+            agent_envelope,
+            task.epoch,
+            now,
+        )?;
         Ok(json!({
             "ok": true,
             "task_id": task_id,
@@ -361,7 +379,12 @@ pub(crate) async fn task_accept_result(
     let state_clone = state.clone();
     let response = run_blocking(move || -> Result<Value> {
         let mut node = open_node(&state_clone.state_dir, &state_clone.db_path)?;
-        crate::control::accept_task_result_locally(&mut node, &req.task_id, &req.candidate_id)
+        crate::control::accept_task_result_locally_with_agent_envelope(
+            &mut node,
+            &req.task_id,
+            &req.candidate_id,
+            req.agent_envelope,
+        )
     })
     .await?;
     Ok(Json(response))

@@ -332,6 +332,7 @@ mod agent_event_tests {
                 source_node_id: Some("peer-a".to_owned()),
                 target_agent_id: Some("agent-b".to_owned()),
                 target_executor: Some("core-agent".to_owned()),
+                agent_envelope: None,
                 payload: json!({"hello": "world"}),
                 requires_commit: true,
                 allowed_actions: vec!["accept".to_owned(), "reject".to_owned()],

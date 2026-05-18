@@ -1,4 +1,5 @@
 use super::*;
+use serde::Deserializer;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RawBackfillRequest {
@@ -185,12 +186,50 @@ pub struct RawAgentEnvelope {
     pub target_agent_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capability: Option<String>,
-    #[serde(default)]
+    #[serde(
+        default,
+        alias = "message",
+        deserialize_with = "deserialize_json_string_field"
+    )]
     pub message_json: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        alias = "extensions",
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_optional_json_string_field"
+    )]
     pub extensions_json: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signature: Option<String>,
+}
+
+fn deserialize_json_string_field<'de, D>(deserializer: D) -> std::result::Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(match value {
+        Some(serde_json::Value::String(value)) => value,
+        Some(value) => serde_json::to_string(&value).map_err(serde::de::Error::custom)?,
+        None => String::new(),
+    })
+}
+
+fn deserialize_optional_json_string_field<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    match value {
+        Some(serde_json::Value::Null) | None => Ok(None),
+        Some(serde_json::Value::String(value)) if value.trim().is_empty() => Ok(None),
+        Some(serde_json::Value::String(value)) => Ok(Some(value)),
+        Some(value) => serde_json::to_string(&value)
+            .map(Some)
+            .map_err(serde::de::Error::custom),
+    }
 }
 
 impl RawAgentEnvelope {

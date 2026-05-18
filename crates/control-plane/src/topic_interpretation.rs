@@ -569,7 +569,7 @@ fn maybe_interpret_message(
         let _ = run_existing_task_with_runtime(
             node,
             state_dir,
-            &prepared.runtime,
+            prepared.runtime.as_ref(),
             &prepared.capabilities,
             CORE_AGENT_EXECUTOR_NAME,
             DEFAULT_PROFILE,

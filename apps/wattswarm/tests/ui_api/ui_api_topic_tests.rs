@@ -649,6 +649,7 @@ fn task_facts_snapshot_exposes_remote_bridge_facts() {
                     created_at: 100,
                     producer: remote_node_id.clone(),
                 }),
+                agent_envelope: None,
             }),
         ))
         .expect("sign remote announcement");

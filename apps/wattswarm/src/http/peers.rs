@@ -7,8 +7,8 @@ use crate::control::{
 use crate::http::helpers::resolve_network_id;
 use crate::http::{ApiError, UiServerState, run_blocking};
 use crate::network_bridge::{
-    enqueue_agent_payment_command, enqueue_peer_relationship_action_command,
-    network_service_started,
+    default_agent_envelope, enqueue_agent_payment_command,
+    enqueue_peer_relationship_action_command, network_service_started,
 };
 use crate::network_p2p::RawAgentEnvelope;
 use anyhow::{Result, anyhow, bail};
@@ -42,6 +42,8 @@ pub(crate) struct AgentPaymentSendRequest {
     remote_node_id: String,
     message_kind: String,
     payment: Value,
+    #[serde(default)]
+    agent_envelope: Option<RawAgentEnvelope>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -297,11 +299,26 @@ pub(crate) async fn agent_payment_send(
         if message_kind.is_empty() {
             bail!("message_kind is required");
         }
+        let agent_envelope = if let Some(agent_envelope) = req.agent_envelope {
+            agent_envelope
+        } else {
+            let node = open_configured_node(&state_clone.state_dir, &state_clone.db_path)?;
+            default_agent_envelope(
+                &node.node_id(),
+                &remote_node_id,
+                "payment.agent_message",
+                json!({
+                    "message_kind": message_kind,
+                    "payment": req.payment.clone(),
+                }),
+            )
+        };
         enqueue_agent_payment_command(
             &state_clone.state_dir,
             &remote_node_id,
             &message_kind,
             req.payment,
+            agent_envelope,
         )?;
         Ok::<Value, anyhow::Error>(json!({
             "ok": true,

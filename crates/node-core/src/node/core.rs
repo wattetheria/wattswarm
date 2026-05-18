@@ -1,4 +1,5 @@
 use super::*;
+use crate::types::AgentEnvelope;
 
 impl Node {
     pub(crate) fn current_network_context_id(&self) -> String {
@@ -213,6 +214,32 @@ impl Node {
         epoch: u64,
         created_at: u64,
     ) -> Result<Event> {
+        self.announce_task_with_agent_envelope(
+            task_id,
+            announcement_id,
+            feed_key,
+            scope_hint,
+            summary,
+            detail_ref,
+            None,
+            epoch,
+            created_at,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn announce_task_with_agent_envelope(
+        &mut self,
+        task_id: &str,
+        announcement_id: &str,
+        feed_key: &str,
+        scope_hint: &str,
+        summary: Value,
+        detail_ref: Option<ArtifactRef>,
+        agent_envelope: Option<AgentEnvelope>,
+        epoch: u64,
+        created_at: u64,
+    ) -> Result<Event> {
         let network_id = self.current_network_context_id();
         self.emit_at(
             epoch,
@@ -224,6 +251,7 @@ impl Node {
                 scope_hint: scope_hint.to_owned(),
                 summary,
                 detail_ref,
+                agent_envelope,
             }),
             created_at,
         )
@@ -292,6 +320,28 @@ impl Node {
         epoch: u64,
         created_at: u64,
     ) -> Result<Event> {
+        self.claim_task_with_agent_envelope(
+            task_id,
+            role,
+            execution_id,
+            lease_until,
+            None,
+            epoch,
+            created_at,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn claim_task_with_agent_envelope(
+        &mut self,
+        task_id: &str,
+        role: ClaimRole,
+        execution_id: &str,
+        lease_until: u64,
+        agent_envelope: Option<AgentEnvelope>,
+        epoch: u64,
+        created_at: u64,
+    ) -> Result<Event> {
         self.emit_at(
             epoch,
             EventPayload::TaskClaimed(ClaimPayload {
@@ -300,6 +350,7 @@ impl Node {
                 claimer_node_id: self.node_id(),
                 execution_id: execution_id.to_owned(),
                 lease_until,
+                agent_envelope,
             }),
             created_at,
         )
@@ -354,11 +405,23 @@ impl Node {
         epoch: u64,
         created_at: u64,
     ) -> Result<Event> {
+        self.propose_candidate_with_agent_envelope(task_id, candidate, None, epoch, created_at)
+    }
+
+    pub fn propose_candidate_with_agent_envelope(
+        &mut self,
+        task_id: &str,
+        candidate: Candidate,
+        agent_envelope: Option<AgentEnvelope>,
+        epoch: u64,
+        created_at: u64,
+    ) -> Result<Event> {
         self.emit_at(
             epoch,
             EventPayload::CandidateProposed(CandidateProposedPayload {
                 task_id: task_id.to_owned(),
                 candidate,
+                agent_envelope,
             }),
             created_at,
         )
@@ -473,6 +536,25 @@ impl Node {
         finality_proof: crate::types::FinalityProof,
         created_at: u64,
     ) -> Result<Event> {
+        self.finalize_decision_with_agent_envelope(
+            task_id,
+            epoch,
+            candidate_id,
+            finality_proof,
+            None,
+            created_at,
+        )
+    }
+
+    pub fn finalize_decision_with_agent_envelope(
+        &mut self,
+        task_id: &str,
+        epoch: u64,
+        candidate_id: &str,
+        finality_proof: crate::types::FinalityProof,
+        agent_envelope: Option<AgentEnvelope>,
+        created_at: u64,
+    ) -> Result<Event> {
         let candidate = self
             .store
             .get_candidate_by_id(task_id, candidate_id)?
@@ -486,6 +568,7 @@ impl Node {
                 candidate_id: candidate_id.to_owned(),
                 winning_candidate_hash: winning_hash,
                 finality_proof,
+                agent_envelope,
             }),
             created_at,
         )
@@ -499,6 +582,18 @@ impl Node {
         epoch: u64,
         created_at: u64,
     ) -> Result<Event> {
+        self.task_error_with_agent_envelope(task_id, reason, message, None, epoch, created_at)
+    }
+
+    pub fn task_error_with_agent_envelope(
+        &mut self,
+        task_id: &str,
+        reason: crate::types::TaskErrorReason,
+        message: &str,
+        agent_envelope: Option<AgentEnvelope>,
+        epoch: u64,
+        created_at: u64,
+    ) -> Result<Event> {
         self.emit_at(
             epoch,
             EventPayload::TaskError(TaskErrorPayload {
@@ -509,6 +604,7 @@ impl Node {
                 custom_reason_code: None,
                 custom_reason_message: None,
                 message: message.to_owned(),
+                agent_envelope,
             }),
             created_at,
         )
@@ -522,12 +618,25 @@ impl Node {
         epoch: u64,
         created_at: u64,
     ) -> Result<Event> {
+        self.schedule_retry_with_agent_envelope(task_id, attempt, run_at, None, epoch, created_at)
+    }
+
+    pub fn schedule_retry_with_agent_envelope(
+        &mut self,
+        task_id: &str,
+        attempt: u32,
+        run_at: u64,
+        agent_envelope: Option<AgentEnvelope>,
+        epoch: u64,
+        created_at: u64,
+    ) -> Result<Event> {
         self.emit_at(
             epoch,
             EventPayload::TaskRetryScheduled(TaskRetryScheduledPayload {
                 task_id: task_id.to_owned(),
                 attempt,
                 run_at,
+                agent_envelope,
             }),
             created_at,
         )
