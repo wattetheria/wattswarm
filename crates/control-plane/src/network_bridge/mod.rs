@@ -61,7 +61,7 @@ pub use diagnostics::{
 };
 pub use peer_interactions::{
     default_agent_envelope, enqueue_agent_payment_command, enqueue_peer_direct_message_command,
-    enqueue_peer_relationship_action_command,
+    enqueue_peer_relationship_action_command, verified_agent_context_for_source,
 };
 pub use publish::{publish_pending_global_events, publish_pending_scoped_updates};
 pub use service_loop::{
@@ -101,9 +101,10 @@ use discovery_bootnode::{
 use peer_interactions::payment_allowed_actions;
 use peer_interactions::{
     PendingContactMaterialRequest, PendingPeerDirectMessageRequest, PendingPeerRelationshipRequest,
-    attach_agent_envelope_to_relationship, control_peer_relationship_action, peer_dm_thread_id,
-    process_pending_network_commands, raw_agent_envelope_to_protocol, relationship_state_for,
-    save_agent_payment_summary, save_dm_message, upsert_dm_thread,
+    attach_agent_envelope_to_relationship, control_peer_relationship_action,
+    optional_verified_agent_context_for_protocol_source, payload_with_verified_agent_context,
+    peer_dm_thread_id, process_pending_network_commands, raw_agent_envelope_to_protocol,
+    relationship_state_for, save_agent_payment_summary, save_dm_message, upsert_dm_thread,
     verify_agent_envelope_signature_for_source, verify_protocol_agent_envelope_for_source,
     wire_peer_relationship_action,
 };

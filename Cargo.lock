@@ -5085,6 +5085,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "watt-did"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "bs58",
+ "ed25519-dalek 2.2.0",
+ "percent-encoding",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "wattswarm"
 version = "0.1.0"
 dependencies = [
@@ -5151,6 +5165,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "uuid",
+ "watt-did",
  "wattswarm-artifact-store",
  "wattswarm-crypto",
  "wattswarm-network-discovery",

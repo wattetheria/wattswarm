@@ -29,6 +29,7 @@ wattswarm-node-core = { workspace = true }
 wattswarm-protocol = { workspace = true }
 wattswarm-runtime-client = { workspace = true }
 wattswarm-storage-core = { workspace = true }
+watt-did = { workspace = true }
 
 [dev-dependencies]
 base64 = { workspace = true }

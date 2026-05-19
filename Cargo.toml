@@ -61,3 +61,4 @@ wattswarm-storage-core = { path = "crates/storage-core" }
 wattswarm-node-core = { path = "crates/node-core" }
 wattswarm-control-plane = { path = "crates/control-plane" }
 wattswarm-run-queue = { path = "crates/run-queue" }
+watt-did = { path = "../watt-did" }

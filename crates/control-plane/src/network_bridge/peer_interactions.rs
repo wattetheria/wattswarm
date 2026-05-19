@@ -1,4 +1,5 @@
 use super::*;
+use watt_did::{Did, VerifiedAgentContext};
 
 pub(super) fn wire_peer_relationship_action(
     action: crate::control::PeerRelationshipAction,
@@ -285,6 +286,38 @@ pub(super) fn verify_agent_envelope_signature_for_source(
     .context("verify agent envelope signature")
 }
 
+pub fn verified_agent_context_for_source(
+    envelope: &RawAgentEnvelope,
+    expected_source_node_id: &str,
+) -> Result<VerifiedAgentContext> {
+    verify_agent_envelope_signature_for_source(envelope, Some(expected_source_node_id))?;
+    if envelope.signature.as_deref().unwrap_or_default().is_empty() {
+        bail!("verified agent context requires signed agent envelope");
+    }
+    let source_agent_id = envelope
+        .source_agent_id
+        .as_deref()
+        .ok_or_else(|| anyhow!("verified agent context requires source_agent_id"))?;
+    let agent_did = Did::parse(source_agent_id)
+        .map_err(|error| anyhow!("verified agent context requires DID source_agent_id: {error}"))?;
+    let context = VerifiedAgentContext {
+        agent_did,
+        controller_node_id: expected_source_node_id.to_owned(),
+        source_node_id: envelope.source_node_id.clone(),
+        envelope_verified: true,
+        source_node_verified: true,
+        controller_binding_verified: false,
+        controller_binding_proof: None,
+        payment_account_binding: None,
+        verified_at_ms: observed_at_ms(),
+        expires_at_ms: None,
+    };
+    context
+        .validate_basic()
+        .map_err(|error| anyhow!("invalid verified agent context: {error}"))?;
+    Ok(context)
+}
+
 fn verify_source_agent_card(
     envelope: &RawAgentEnvelope,
     card: &RawSourceAgentCard,
@@ -517,9 +550,13 @@ pub(super) fn save_agent_payment_summary(
         .cloned()
         .map(serde_json::from_value::<wattswarm_protocol::types::AgentEnvelope>)
         .transpose()?;
-    if let Some(envelope) = &agent_envelope {
-        verify_protocol_agent_envelope_for_source(envelope, Some(remote_node_id))?;
-    }
+    let verified_context = match agent_envelope.as_ref() {
+        Some(envelope) => {
+            verify_protocol_agent_envelope_for_source(envelope, Some(remote_node_id))?;
+            optional_verified_agent_context_for_protocol_source(envelope, remote_node_id)?
+        }
+        None => None,
+    };
     let payment_id = payment
         .get("payment_id")
         .and_then(Value::as_str)
@@ -539,17 +576,21 @@ pub(super) fn save_agent_payment_summary(
         wattswarm_protocol::types::AgentEventType::PaymentUpdate
     };
     let allowed_actions = payment_allowed_actions(message_kind);
+    let payload = payload_with_verified_agent_context(
+        json!({
+            "summary_id": summary.summary_id,
+            "message_kind": message_kind,
+            "payment": record.payment,
+        }),
+        verified_context.as_ref(),
+    )?;
     let event = build_agent_event_with_agent_envelope(
         event_type,
         wattswarm_protocol::types::AgentEventSourceKind::PaymentSummary,
         Some(remote_node_id.to_owned()),
         None,
         agent_envelope.clone(),
-        json!({
-            "summary_id": summary.summary_id,
-            "message_kind": message_kind,
-            "payment": record.payment,
-        }),
+        payload,
         true,
         allowed_actions,
         Some(record.payment_id.clone()),
@@ -563,7 +604,64 @@ pub(super) fn verify_protocol_agent_envelope_for_source(
     envelope: &wattswarm_protocol::types::AgentEnvelope,
     expected_source_node_id: Option<&str>,
 ) -> Result<()> {
-    let raw = RawAgentEnvelope {
+    let raw = protocol_agent_envelope_to_raw(envelope);
+    verify_agent_envelope_signature_for_source(&raw, expected_source_node_id)
+}
+
+pub(super) fn verified_agent_context_for_protocol_source(
+    envelope: &wattswarm_protocol::types::AgentEnvelope,
+    expected_source_node_id: &str,
+) -> Result<VerifiedAgentContext> {
+    let raw = protocol_agent_envelope_to_raw(envelope);
+    verified_agent_context_for_source(&raw, expected_source_node_id)
+}
+
+/// Derive a verified context only when the envelope can support one.
+///
+/// Returns `Ok(None)` for unsigned envelopes or envelopes whose
+/// `source_agent_id` is not a DID, preserving the lenient acceptance done by
+/// [`verify_protocol_agent_envelope_for_source`]. Returns `Err` only when an
+/// envelope that should produce a context fails verification.
+pub(super) fn optional_verified_agent_context_for_protocol_source(
+    envelope: &wattswarm_protocol::types::AgentEnvelope,
+    expected_source_node_id: &str,
+) -> Result<Option<VerifiedAgentContext>> {
+    if envelope.signature.as_deref().unwrap_or_default().is_empty() {
+        return Ok(None);
+    }
+    let Some(source_agent_id) = envelope.source_agent_id.as_deref() else {
+        return Ok(None);
+    };
+    if Did::parse(source_agent_id).is_err() {
+        return Ok(None);
+    }
+    Ok(Some(verified_agent_context_for_protocol_source(
+        envelope,
+        expected_source_node_id,
+    )?))
+}
+
+pub(super) const VERIFIED_AGENT_CONTEXT_PAYLOAD_KEY: &str = "__verified_agent_context";
+
+pub(super) fn payload_with_verified_agent_context(
+    mut payload: Value,
+    context: Option<&VerifiedAgentContext>,
+) -> Result<Value> {
+    let Some(context) = context else {
+        return Ok(payload);
+    };
+    let serialized =
+        serde_json::to_value(context).context("serialize verified agent context for payload")?;
+    if let Some(object) = payload.as_object_mut() {
+        object.insert(VERIFIED_AGENT_CONTEXT_PAYLOAD_KEY.to_owned(), serialized);
+    }
+    Ok(payload)
+}
+
+fn protocol_agent_envelope_to_raw(
+    envelope: &wattswarm_protocol::types::AgentEnvelope,
+) -> RawAgentEnvelope {
+    RawAgentEnvelope {
         protocol: envelope.protocol.clone(),
         transport_profile: envelope.transport_profile.clone(),
         source_agent_id: envelope.source_agent_id.clone(),
@@ -585,8 +683,7 @@ pub(super) fn verify_protocol_agent_envelope_for_source(
         message_json: envelope.message_json.clone(),
         extensions_json: envelope.extensions_json.clone(),
         signature: envelope.signature.clone(),
-    };
-    verify_agent_envelope_signature_for_source(&raw, expected_source_node_id)
+    }
 }
 
 pub(super) fn payment_allowed_actions(message_kind: &str) -> Vec<String> {
@@ -787,6 +884,23 @@ mod tests {
     }
 
     #[test]
+    fn verified_agent_context_contains_did_and_verified_source_node() {
+        let envelope = signed_envelope_with_card("node-a", "node-b");
+        let context = verified_agent_context_for_source(&envelope, "node-a")
+            .expect("verified context from signed envelope");
+
+        assert_eq!(
+            context.agent_did.to_string(),
+            envelope.source_agent_id.as_deref().unwrap()
+        );
+        assert_eq!(context.controller_node_id, "node-a");
+        assert_eq!(context.source_node_id.as_deref(), Some("node-a"));
+        assert!(context.envelope_verified);
+        assert!(context.source_node_verified);
+        assert!(!context.controller_binding_verified);
+    }
+
+    #[test]
     fn verify_agent_envelope_rejects_wrong_network_source_node() {
         let envelope = signed_envelope_with_card("node-a", "node-b");
         let err = verify_agent_envelope_signature_for_source(&envelope, Some("node-c"))
@@ -796,5 +910,71 @@ mod tests {
                 .contains("agent envelope source_node_id does not match network source node"),
             "{err:#}"
         );
+    }
+
+    #[test]
+    fn verified_agent_context_for_protocol_source_matches_raw_envelope() {
+        let raw = signed_envelope_with_card("node-a", "node-b");
+        let protocol_envelope = raw_agent_envelope_to_protocol(&raw);
+        let context = verified_agent_context_for_protocol_source(&protocol_envelope, "node-a")
+            .expect("verified context from signed protocol envelope");
+        assert_eq!(
+            context.agent_did.to_string(),
+            raw.source_agent_id.as_deref().unwrap()
+        );
+        assert_eq!(context.controller_node_id, "node-a");
+        assert_eq!(context.source_node_id.as_deref(), Some("node-a"));
+    }
+
+    #[test]
+    fn optional_verified_agent_context_skips_unsigned_envelope() {
+        let raw = signed_envelope_with_card("node-a", "node-b");
+        let mut protocol_envelope = raw_agent_envelope_to_protocol(&raw);
+        protocol_envelope.signature = None;
+        let context =
+            optional_verified_agent_context_for_protocol_source(&protocol_envelope, "node-a")
+                .expect("unsigned envelope skipped without error");
+        assert!(context.is_none());
+    }
+
+    #[test]
+    fn optional_verified_agent_context_skips_non_did_source_agent_id() {
+        let raw = signed_envelope_with_card("node-a", "node-b");
+        let mut protocol_envelope = raw_agent_envelope_to_protocol(&raw);
+        protocol_envelope.source_agent_id = Some("not-a-did".to_owned());
+        let context =
+            optional_verified_agent_context_for_protocol_source(&protocol_envelope, "node-a")
+                .expect("non-DID source agent id skipped without error");
+        assert!(context.is_none());
+    }
+
+    #[test]
+    fn payload_with_verified_agent_context_inserts_key_when_present() {
+        let raw = signed_envelope_with_card("node-a", "node-b");
+        let protocol_envelope = raw_agent_envelope_to_protocol(&raw);
+        let context = verified_agent_context_for_protocol_source(&protocol_envelope, "node-a")
+            .expect("verified context");
+        let payload =
+            payload_with_verified_agent_context(json!({"summary_id": "s"}), Some(&context))
+                .expect("payload with context");
+        let context_value = payload
+            .get(VERIFIED_AGENT_CONTEXT_PAYLOAD_KEY)
+            .expect("context key present");
+        let round_trip: VerifiedAgentContext = serde_json::from_value(context_value.clone())
+            .expect("payload context deserializes back to VerifiedAgentContext");
+        assert_eq!(round_trip, context);
+        assert_eq!(round_trip.controller_node_id, "node-a");
+        assert_eq!(round_trip.source_node_id.as_deref(), Some("node-a"));
+        assert!(round_trip.envelope_verified);
+        assert!(round_trip.source_node_verified);
+        assert_eq!(payload.get("summary_id").and_then(Value::as_str), Some("s"));
+    }
+
+    #[test]
+    fn payload_with_verified_agent_context_passes_through_when_none() {
+        let payload =
+            payload_with_verified_agent_context(json!({"summary_id": "s"}), None).expect("payload");
+        assert!(payload.get(VERIFIED_AGENT_CONTEXT_PAYLOAD_KEY).is_none());
+        assert_eq!(payload.get("summary_id").and_then(Value::as_str), Some("s"));
     }
 }

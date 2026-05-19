@@ -413,24 +413,31 @@ pub(super) fn topic_message_requires_reply(content: &Value) -> bool {
     )
 }
 
+fn verified_context_for_event_envelope(
+    envelope: Option<&wattswarm_protocol::types::AgentEnvelope>,
+    author_node_id: &str,
+) -> Result<Option<watt_did::VerifiedAgentContext>> {
+    let Some(envelope) = envelope else {
+        return Ok(None);
+    };
+    verify_protocol_agent_envelope_for_source(envelope, Some(author_node_id))?;
+    optional_verified_agent_context_for_protocol_source(envelope, author_node_id)
+}
+
 pub(super) fn task_claim_agent_event(
     node: &Node,
     event: &crate::types::Event,
     payload: &crate::types::ClaimPayload,
 ) -> Result<wattswarm_protocol::types::AgentEvent> {
-    if let Some(agent_envelope) = &payload.agent_envelope {
-        verify_protocol_agent_envelope_for_source(agent_envelope, Some(&event.author_node_id))?;
-    }
+    let verified_context = verified_context_for_event_envelope(
+        payload.agent_envelope.as_ref(),
+        &event.author_node_id,
+    )?;
     let task_inputs = node
         .task_view(&payload.task_id)?
         .map(|task| task.contract.inputs)
         .unwrap_or(Value::Null);
-    Ok(build_agent_event_with_agent_envelope(
-        wattswarm_protocol::types::AgentEventType::TaskClaimReceived,
-        wattswarm_protocol::types::AgentEventSourceKind::TaskLifecycle,
-        Some(event.author_node_id.clone()),
-        None,
-        payload.agent_envelope.clone(),
+    let payload_value = payload_with_verified_agent_context(
         json!({
             "event_id": &event.event_id,
             "event_kind": "task_claimed",
@@ -442,6 +449,15 @@ pub(super) fn task_claim_agent_event(
             "task_inputs": task_inputs,
             "created_at": event.created_at,
         }),
+        verified_context.as_ref(),
+    )?;
+    Ok(build_agent_event_with_agent_envelope(
+        wattswarm_protocol::types::AgentEventType::TaskClaimReceived,
+        wattswarm_protocol::types::AgentEventSourceKind::TaskLifecycle,
+        Some(event.author_node_id.clone()),
+        None,
+        payload.agent_envelope.clone(),
+        payload_value,
         false,
         vec!["inspect_task".to_owned(), "decide_claim".to_owned()],
         Some(payload.task_id.clone()),
@@ -458,23 +474,16 @@ pub(super) fn task_result_agent_event(
 ) -> Result<Option<wattswarm_protocol::types::AgentEvent>> {
     match &event.payload {
         crate::types::EventPayload::CandidateProposed(payload) => {
-            if let Some(agent_envelope) = &payload.agent_envelope {
-                verify_protocol_agent_envelope_for_source(
-                    agent_envelope,
-                    Some(&event.author_node_id),
-                )?;
-            }
+            let verified_context = verified_context_for_event_envelope(
+                payload.agent_envelope.as_ref(),
+                &event.author_node_id,
+            )?;
             let candidate_output = node
                 .store
                 .get_candidate_by_id(&payload.task_id, &payload.candidate.candidate_id)?
                 .map(|candidate| candidate.output)
                 .unwrap_or(Value::Null);
-            Ok(Some(build_agent_event_with_agent_envelope(
-                wattswarm_protocol::types::AgentEventType::TaskResultReceived,
-                wattswarm_protocol::types::AgentEventSourceKind::TaskLifecycle,
-                Some(event.author_node_id.clone()),
-                None,
-                payload.agent_envelope.clone(),
+            let payload_value = payload_with_verified_agent_context(
                 json!({
                     "event_id": &event.event_id,
                     "event_kind": "candidate_proposed",
@@ -485,6 +494,15 @@ pub(super) fn task_result_agent_event(
                     "candidate_output": candidate_output,
                     "created_at": event.created_at,
                 }),
+                verified_context.as_ref(),
+            )?;
+            Ok(Some(build_agent_event_with_agent_envelope(
+                wattswarm_protocol::types::AgentEventType::TaskResultReceived,
+                wattswarm_protocol::types::AgentEventSourceKind::TaskLifecycle,
+                Some(event.author_node_id.clone()),
+                None,
+                payload.agent_envelope.clone(),
+                payload_value,
                 false,
                 vec![
                     "inspect_task".to_owned(),
@@ -500,18 +518,11 @@ pub(super) fn task_result_agent_event(
             )))
         }
         crate::types::EventPayload::DecisionFinalized(payload) => {
-            if let Some(agent_envelope) = &payload.agent_envelope {
-                verify_protocol_agent_envelope_for_source(
-                    agent_envelope,
-                    Some(&event.author_node_id),
-                )?;
-            }
-            Ok(Some(build_agent_event_with_agent_envelope(
-                wattswarm_protocol::types::AgentEventType::TaskResultReceived,
-                wattswarm_protocol::types::AgentEventSourceKind::TaskLifecycle,
-                Some(event.author_node_id.clone()),
-                None,
-                payload.agent_envelope.clone(),
+            let verified_context = verified_context_for_event_envelope(
+                payload.agent_envelope.as_ref(),
+                &event.author_node_id,
+            )?;
+            let payload_value = payload_with_verified_agent_context(
                 json!({
                     "event_id": &event.event_id,
                     "event_kind": "decision_finalized",
@@ -521,6 +532,15 @@ pub(super) fn task_result_agent_event(
                     "finality_proof": &payload.finality_proof,
                     "created_at": event.created_at,
                 }),
+                verified_context.as_ref(),
+            )?;
+            Ok(Some(build_agent_event_with_agent_envelope(
+                wattswarm_protocol::types::AgentEventType::TaskResultReceived,
+                wattswarm_protocol::types::AgentEventSourceKind::TaskLifecycle,
+                Some(event.author_node_id.clone()),
+                None,
+                payload.agent_envelope.clone(),
+                payload_value,
                 false,
                 vec!["inspect_task".to_owned(), "accept_result".to_owned()],
                 Some(payload.task_id.clone()),
@@ -531,18 +551,11 @@ pub(super) fn task_result_agent_event(
             )))
         }
         crate::types::EventPayload::TaskError(payload) => {
-            if let Some(agent_envelope) = &payload.agent_envelope {
-                verify_protocol_agent_envelope_for_source(
-                    agent_envelope,
-                    Some(&event.author_node_id),
-                )?;
-            }
-            Ok(Some(build_agent_event_with_agent_envelope(
-                wattswarm_protocol::types::AgentEventType::TaskResultReceived,
-                wattswarm_protocol::types::AgentEventSourceKind::TaskLifecycle,
-                Some(event.author_node_id.clone()),
-                None,
-                payload.agent_envelope.clone(),
+            let verified_context = verified_context_for_event_envelope(
+                payload.agent_envelope.as_ref(),
+                &event.author_node_id,
+            )?;
+            let payload_value = payload_with_verified_agent_context(
                 json!({
                     "event_id": &event.event_id,
                     "event_kind": "task_error",
@@ -555,6 +568,15 @@ pub(super) fn task_result_agent_event(
                     "custom_reason_message": &payload.custom_reason_message,
                     "created_at": event.created_at,
                 }),
+                verified_context.as_ref(),
+            )?;
+            Ok(Some(build_agent_event_with_agent_envelope(
+                wattswarm_protocol::types::AgentEventType::TaskResultReceived,
+                wattswarm_protocol::types::AgentEventSourceKind::TaskLifecycle,
+                Some(event.author_node_id.clone()),
+                None,
+                payload.agent_envelope.clone(),
+                payload_value,
                 false,
                 vec!["inspect_task".to_owned(), "request_retry".to_owned()],
                 Some(payload.task_id.clone()),
@@ -565,18 +587,11 @@ pub(super) fn task_result_agent_event(
             )))
         }
         crate::types::EventPayload::TaskRetryScheduled(payload) => {
-            if let Some(agent_envelope) = &payload.agent_envelope {
-                verify_protocol_agent_envelope_for_source(
-                    agent_envelope,
-                    Some(&event.author_node_id),
-                )?;
-            }
-            Ok(Some(build_agent_event_with_agent_envelope(
-                wattswarm_protocol::types::AgentEventType::TaskResultReceived,
-                wattswarm_protocol::types::AgentEventSourceKind::TaskLifecycle,
-                Some(event.author_node_id.clone()),
-                None,
-                payload.agent_envelope.clone(),
+            let verified_context = verified_context_for_event_envelope(
+                payload.agent_envelope.as_ref(),
+                &event.author_node_id,
+            )?;
+            let payload_value = payload_with_verified_agent_context(
                 json!({
                     "event_id": &event.event_id,
                     "event_kind": "task_retry_scheduled",
@@ -585,6 +600,15 @@ pub(super) fn task_result_agent_event(
                     "run_at": payload.run_at,
                     "created_at": event.created_at,
                 }),
+                verified_context.as_ref(),
+            )?;
+            Ok(Some(build_agent_event_with_agent_envelope(
+                wattswarm_protocol::types::AgentEventType::TaskResultReceived,
+                wattswarm_protocol::types::AgentEventSourceKind::TaskLifecycle,
+                Some(event.author_node_id.clone()),
+                None,
+                payload.agent_envelope.clone(),
+                payload_value,
                 false,
                 vec!["inspect_task".to_owned()],
                 Some(payload.task_id.clone()),
