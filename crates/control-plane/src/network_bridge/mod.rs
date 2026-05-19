@@ -26,7 +26,7 @@ use crate::network_p2p::{
     PeerDirectMessageResponse, PeerHandshakeMetadata, PeerRelationshipRequest,
     PeerRelationshipRequestId, PeerRelationshipResponse, RawAgentEnvelope, RawContactMaterial,
     RawContactMaterialRequest, RawContactMaterialResponse, RawPeerDirectMessageKind,
-    RawPeerRelationshipAction, SummaryAnnouncement, SwarmScope,
+    RawPeerRelationshipAction, RawSourceAgentCard, SummaryAnnouncement, SwarmScope,
 };
 use crate::node::Node;
 use serde::{Deserialize, Serialize};
@@ -77,11 +77,10 @@ pub use summary::{
 };
 
 #[cfg(test)]
-use agent_delivery::topic_message_requires_reply;
+use agent_delivery::{build_agent_event, topic_message_requires_reply};
 use agent_delivery::{
-    build_agent_event, build_agent_event_with_agent_envelope,
-    deliver_agent_event_to_local_executor, task_claim_agent_event, task_result_agent_event,
-    topic_message_agent_event,
+    build_agent_event_with_agent_envelope, deliver_agent_event_to_local_executor,
+    task_claim_agent_event, task_result_agent_event, topic_message_agent_event,
 };
 use backfill::{
     BACKFILL_KNOWN_EVENT_IDS_LIMIT, recent_backfill_lane_event_ids, should_publish_summaries,
@@ -103,8 +102,9 @@ use peer_interactions::payment_allowed_actions;
 use peer_interactions::{
     PendingContactMaterialRequest, PendingPeerDirectMessageRequest, PendingPeerRelationshipRequest,
     attach_agent_envelope_to_relationship, control_peer_relationship_action, peer_dm_thread_id,
-    process_pending_network_commands, relationship_state_for, save_agent_payment_summary,
-    save_dm_message, upsert_dm_thread, verify_agent_envelope_signature,
+    process_pending_network_commands, raw_agent_envelope_to_protocol, relationship_state_for,
+    save_agent_payment_summary, save_dm_message, upsert_dm_thread,
+    verify_agent_envelope_signature_for_source, verify_protocol_agent_envelope_for_source,
     wire_peer_relationship_action,
 };
 use publish::GlobalPublishRateGuard;

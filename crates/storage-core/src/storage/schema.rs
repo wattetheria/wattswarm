@@ -255,6 +255,17 @@ fn migrate_peer_metadata_local_contact_material_schema(conn: &Connection) -> Res
     Ok(())
 }
 
+fn migrate_agent_event_bus_local_agent_envelope_schema(conn: &Connection) -> Result<()> {
+    if !column_exists(conn, "agent_event_bus_local", "agent_envelope_json") {
+        conn.execute(
+            "ALTER TABLE agent_event_bus_local
+             ADD COLUMN agent_envelope_json TEXT;",
+            [],
+        )?;
+    }
+    Ok(())
+}
+
 fn migrate_network_peer_sync_state_identity_schema(conn: &Connection) -> Result<()> {
     if column_exists(conn, "network_peer_sync_state_local", "network_peer_id") {
         return Ok(());
@@ -886,6 +897,7 @@ impl PgStore {
                 source_node_id TEXT,
                 target_agent_id TEXT,
                 target_executor TEXT,
+                agent_envelope_json TEXT,
                 payload_json TEXT NOT NULL,
                 allowed_actions_json TEXT NOT NULL DEFAULT '[]',
                 requires_commit BOOLEAN NOT NULL DEFAULT FALSE,
@@ -1927,6 +1939,7 @@ impl PgStore {
             migrate_discovered_peers_local_source_kind_schema(&conn)?;
             migrate_discovered_peers_local_trim_listen_addr_schema(&conn)?;
             migrate_peer_metadata_local_contact_material_schema(&conn)?;
+            migrate_agent_event_bus_local_agent_envelope_schema(&conn)?;
             migrate_network_peer_sync_state_identity_schema(&conn)?;
             migrate_feed_subscription_network_id_schema(&conn)?;
             migrate_topic_cursor_network_id_schema(&conn)?;

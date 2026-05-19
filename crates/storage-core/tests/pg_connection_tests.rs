@@ -801,6 +801,16 @@ fn local_control_agent_event_and_delivery_roundtrip() {
                     source_node_id: Some("peer-a".to_owned()),
                     target_agent_id: Some("agent-b".to_owned()),
                     target_executor: Some("core-agent".to_owned()),
+                    agent_envelope_json: Some(
+                        serde_json::json!({
+                            "protocol": "google_a2a",
+                            "source_agent_id": "agent-a",
+                            "target_agent_id": "agent-b",
+                            "capability": "peer.relationship.request",
+                            "message_json": "{\"kind\":\"friend_request\"}",
+                        })
+                        .to_string(),
+                    ),
                     payload_json: serde_json::to_string(&serde_json::json!({
                         "remote_node_id": "peer-a"
                     }))

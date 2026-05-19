@@ -418,6 +418,9 @@ pub(super) fn task_claim_agent_event(
     event: &crate::types::Event,
     payload: &crate::types::ClaimPayload,
 ) -> Result<wattswarm_protocol::types::AgentEvent> {
+    if let Some(agent_envelope) = &payload.agent_envelope {
+        verify_protocol_agent_envelope_for_source(agent_envelope, Some(&event.author_node_id))?;
+    }
     let task_inputs = node
         .task_view(&payload.task_id)?
         .map(|task| task.contract.inputs)
@@ -437,7 +440,6 @@ pub(super) fn task_claim_agent_event(
             "role": payload.role,
             "lease_until": payload.lease_until,
             "task_inputs": task_inputs,
-            "agent_envelope": payload.agent_envelope,
             "created_at": event.created_at,
         }),
         false,
@@ -456,6 +458,12 @@ pub(super) fn task_result_agent_event(
 ) -> Result<Option<wattswarm_protocol::types::AgentEvent>> {
     match &event.payload {
         crate::types::EventPayload::CandidateProposed(payload) => {
+            if let Some(agent_envelope) = &payload.agent_envelope {
+                verify_protocol_agent_envelope_for_source(
+                    agent_envelope,
+                    Some(&event.author_node_id),
+                )?;
+            }
             let candidate_output = node
                 .store
                 .get_candidate_by_id(&payload.task_id, &payload.candidate.candidate_id)?
@@ -475,7 +483,6 @@ pub(super) fn task_result_agent_event(
                     "execution_id": &payload.candidate.execution_id,
                     "candidate_hash": &payload.candidate.output_ref.digest,
                     "candidate_output": candidate_output,
-                    "agent_envelope": payload.agent_envelope,
                     "created_at": event.created_at,
                 }),
                 false,
@@ -493,6 +500,12 @@ pub(super) fn task_result_agent_event(
             )))
         }
         crate::types::EventPayload::DecisionFinalized(payload) => {
+            if let Some(agent_envelope) = &payload.agent_envelope {
+                verify_protocol_agent_envelope_for_source(
+                    agent_envelope,
+                    Some(&event.author_node_id),
+                )?;
+            }
             Ok(Some(build_agent_event_with_agent_envelope(
                 wattswarm_protocol::types::AgentEventType::TaskResultReceived,
                 wattswarm_protocol::types::AgentEventSourceKind::TaskLifecycle,
@@ -506,7 +519,6 @@ pub(super) fn task_result_agent_event(
                     "candidate_id": &payload.candidate_id,
                     "winning_candidate_hash": &payload.winning_candidate_hash,
                     "finality_proof": &payload.finality_proof,
-                    "agent_envelope": payload.agent_envelope,
                     "created_at": event.created_at,
                 }),
                 false,
@@ -519,6 +531,12 @@ pub(super) fn task_result_agent_event(
             )))
         }
         crate::types::EventPayload::TaskError(payload) => {
+            if let Some(agent_envelope) = &payload.agent_envelope {
+                verify_protocol_agent_envelope_for_source(
+                    agent_envelope,
+                    Some(&event.author_node_id),
+                )?;
+            }
             Ok(Some(build_agent_event_with_agent_envelope(
                 wattswarm_protocol::types::AgentEventType::TaskResultReceived,
                 wattswarm_protocol::types::AgentEventSourceKind::TaskLifecycle,
@@ -535,7 +553,6 @@ pub(super) fn task_result_agent_event(
                     "custom_reason_namespace": &payload.custom_reason_namespace,
                     "custom_reason_code": &payload.custom_reason_code,
                     "custom_reason_message": &payload.custom_reason_message,
-                    "agent_envelope": payload.agent_envelope,
                     "created_at": event.created_at,
                 }),
                 false,
@@ -548,6 +565,12 @@ pub(super) fn task_result_agent_event(
             )))
         }
         crate::types::EventPayload::TaskRetryScheduled(payload) => {
+            if let Some(agent_envelope) = &payload.agent_envelope {
+                verify_protocol_agent_envelope_for_source(
+                    agent_envelope,
+                    Some(&event.author_node_id),
+                )?;
+            }
             Ok(Some(build_agent_event_with_agent_envelope(
                 wattswarm_protocol::types::AgentEventType::TaskResultReceived,
                 wattswarm_protocol::types::AgentEventSourceKind::TaskLifecycle,
@@ -560,7 +583,6 @@ pub(super) fn task_result_agent_event(
                     "task_id": &payload.task_id,
                     "attempt": payload.attempt,
                     "run_at": payload.run_at,
-                    "agent_envelope": payload.agent_envelope,
                     "created_at": event.created_at,
                 }),
                 false,

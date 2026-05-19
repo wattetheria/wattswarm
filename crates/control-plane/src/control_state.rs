@@ -379,11 +379,19 @@ pub struct PeerRelationshipRecord {
 pub struct AgentInteractionEnvelope {
     pub protocol: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transport_profile: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_agent_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target_agent_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_node_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_node_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capability: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_agent_card: Option<Value>,
     #[serde(default)]
     pub message: Value,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1418,13 +1426,22 @@ pub fn load_agent_event_records_state(
                 source_node_id: row.source_node_id,
                 target_agent_id: row.target_agent_id,
                 target_executor: row.target_executor,
-                agent_envelope: payload
-                    .get("agent_envelope")
-                    .cloned()
-                    .map(serde_json::from_value)
+                agent_envelope: row
+                    .agent_envelope_json
+                    .as_deref()
+                    .map(serde_json::from_str)
                     .transpose()
                     .ok()
-                    .flatten(),
+                    .flatten()
+                    .or_else(|| {
+                        payload
+                            .get("agent_envelope")
+                            .cloned()
+                            .map(serde_json::from_value)
+                            .transpose()
+                            .ok()
+                            .flatten()
+                    }),
                 payload,
                 requires_commit: row.requires_commit,
                 allowed_actions,
@@ -1458,6 +1475,11 @@ pub fn save_agent_event_record_state(
             source_node_id: event.source_node_id.clone(),
             target_agent_id: event.target_agent_id.clone(),
             target_executor: event.target_executor.clone(),
+            agent_envelope_json: event
+                .agent_envelope
+                .as_ref()
+                .map(serde_json::to_string)
+                .transpose()?,
             payload_json: serde_json::to_string(&event.payload)?,
             allowed_actions_json: serde_json::to_string(&event.allowed_actions)?,
             requires_commit: event.requires_commit,
@@ -1490,11 +1512,24 @@ pub fn find_agent_event_record_by_dedupe_key(
         source_node_id: row.source_node_id,
         target_agent_id: row.target_agent_id,
         target_executor: row.target_executor,
-        agent_envelope: serde_json::from_str::<Value>(&row.payload_json)?
-            .get("agent_envelope")
-            .cloned()
-            .map(serde_json::from_value)
-            .transpose()?,
+        agent_envelope: row
+            .agent_envelope_json
+            .as_deref()
+            .map(serde_json::from_str)
+            .transpose()?
+            .or_else(|| {
+                serde_json::from_str::<Value>(&row.payload_json)
+                    .ok()
+                    .and_then(|payload| {
+                        payload
+                            .get("agent_envelope")
+                            .cloned()
+                            .map(serde_json::from_value)
+                            .transpose()
+                            .ok()
+                            .flatten()
+                    })
+            }),
         payload: serde_json::from_str(&row.payload_json)?,
         allowed_actions: serde_json::from_str(&row.allowed_actions_json)?,
         requires_commit: row.requires_commit,

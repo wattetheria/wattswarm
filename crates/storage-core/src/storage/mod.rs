@@ -349,6 +349,7 @@ pub struct LocalAgentEventRow {
     pub source_node_id: Option<String>,
     pub target_agent_id: Option<String>,
     pub target_executor: Option<String>,
+    pub agent_envelope_json: Option<String>,
     pub payload_json: String,
     pub allowed_actions_json: String,
     pub requires_commit: bool,

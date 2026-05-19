@@ -178,14 +178,34 @@ impl RawPeerRelationshipResponse {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct RawSourceAgentCard {
+    pub agent_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_id: Option<String>,
+    pub card_hash: String,
+    pub issued_at: u64,
+    pub card: serde_json::Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct RawAgentEnvelope {
     pub protocol: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transport_profile: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_agent_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target_agent_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_node_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_node_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capability: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_agent_card: Option<RawSourceAgentCard>,
     #[serde(
         default,
         alias = "message",
@@ -246,6 +266,20 @@ impl RawAgentEnvelope {
             validate_max_bytes(
                 "agent envelope extensions_json",
                 extensions_json,
+                MAX_AGENT_ENVELOPE_JSON_BYTES,
+            )?;
+        }
+        if let Some(source_agent_card) = &self.source_agent_card {
+            if source_agent_card.agent_id.trim().is_empty() {
+                bail!("source_agent_card agent_id is required");
+            }
+            if source_agent_card.card_hash.trim().is_empty() {
+                bail!("source_agent_card card_hash is required");
+            }
+            validate_max_bytes(
+                "source_agent_card card",
+                &serde_json::to_string(&source_agent_card.card)
+                    .context("serialize source_agent_card card")?,
                 MAX_AGENT_ENVELOPE_JSON_BYTES,
             )?;
         }

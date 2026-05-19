@@ -147,14 +147,48 @@ fn raw_agent_envelope_to_control_record(
 ) -> crate::control::AgentInteractionEnvelope {
     crate::control::AgentInteractionEnvelope {
         protocol: envelope.protocol.clone(),
+        transport_profile: envelope.transport_profile.clone(),
         source_agent_id: envelope.source_agent_id.clone(),
         target_agent_id: envelope.target_agent_id.clone(),
+        source_node_id: envelope.source_node_id.clone(),
+        target_node_id: envelope.target_node_id.clone(),
         capability: envelope.capability.clone(),
+        source_agent_card: envelope
+            .source_agent_card
+            .as_ref()
+            .and_then(|card| serde_json::to_value(card).ok()),
         message: serde_json::from_str(&envelope.message_json).unwrap_or_else(|_| json!({})),
         extensions: envelope
             .extensions_json
             .as_deref()
             .and_then(|value| serde_json::from_str(value).ok()),
+        signature: envelope.signature.clone(),
+    }
+}
+
+pub(super) fn raw_agent_envelope_to_protocol(
+    envelope: &RawAgentEnvelope,
+) -> wattswarm_protocol::types::AgentEnvelope {
+    wattswarm_protocol::types::AgentEnvelope {
+        protocol: envelope.protocol.clone(),
+        transport_profile: envelope.transport_profile.clone(),
+        source_agent_id: envelope.source_agent_id.clone(),
+        target_agent_id: envelope.target_agent_id.clone(),
+        source_node_id: envelope.source_node_id.clone(),
+        target_node_id: envelope.target_node_id.clone(),
+        capability: envelope.capability.clone(),
+        source_agent_card: envelope.source_agent_card.as_ref().map(|card| {
+            wattswarm_protocol::types::SourceAgentCard {
+                agent_id: card.agent_id.clone(),
+                node_id: card.node_id.clone(),
+                card_hash: card.card_hash.clone(),
+                issued_at: card.issued_at,
+                card: card.card.clone(),
+                signature: card.signature.clone(),
+            }
+        }),
+        message_json: envelope.message_json.clone(),
+        extensions_json: envelope.extensions_json.clone(),
         signature: envelope.signature.clone(),
     }
 }
@@ -188,17 +222,40 @@ fn build_agent_payment_summary(
 struct UnsignedAgentEnvelope<'a> {
     protocol: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
+    transport_profile: Option<&'a String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     source_agent_id: Option<&'a String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     target_agent_id: Option<&'a String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    source_node_id: Option<&'a String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target_node_id: Option<&'a String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     capability: Option<&'a String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source_agent_card_hash: Option<&'a String>,
     message_json: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     extensions_json: Option<&'a String>,
 }
 
-pub(super) fn verify_agent_envelope_signature(envelope: &RawAgentEnvelope) -> Result<()> {
+#[derive(Debug, Serialize)]
+struct UnsignedSourceAgentCard<'a> {
+    agent_id: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    node_id: Option<&'a String>,
+    card_hash: &'a str,
+    issued_at: u64,
+}
+
+pub(super) fn verify_agent_envelope_signature_for_source(
+    envelope: &RawAgentEnvelope,
+    expected_source_node_id: Option<&str>,
+) -> Result<()> {
+    if let Some(card) = &envelope.source_agent_card {
+        verify_source_agent_card(envelope, card, expected_source_node_id)?;
+    }
     let Some(signature) = envelope.signature.as_deref() else {
         return Ok(());
     };
@@ -207,9 +264,16 @@ pub(super) fn verify_agent_envelope_signature(envelope: &RawAgentEnvelope) -> Re
     })?;
     let unsigned = UnsignedAgentEnvelope {
         protocol: &envelope.protocol,
+        transport_profile: envelope.transport_profile.as_ref(),
         source_agent_id: envelope.source_agent_id.as_ref(),
         target_agent_id: envelope.target_agent_id.as_ref(),
+        source_node_id: envelope.source_node_id.as_ref(),
+        target_node_id: envelope.target_node_id.as_ref(),
         capability: envelope.capability.as_ref(),
+        source_agent_card_hash: envelope
+            .source_agent_card
+            .as_ref()
+            .map(|card| &card.card_hash),
         message_json: &envelope.message_json,
         extensions_json: envelope.extensions_json.as_ref(),
     };
@@ -219,6 +283,57 @@ pub(super) fn verify_agent_envelope_signature(envelope: &RawAgentEnvelope) -> Re
         signature,
     )
     .context("verify agent envelope signature")
+}
+
+fn verify_source_agent_card(
+    envelope: &RawAgentEnvelope,
+    card: &RawSourceAgentCard,
+    expected_source_node_id: Option<&str>,
+) -> Result<()> {
+    if let Some(source_agent_id) = envelope.source_agent_id.as_deref()
+        && source_agent_id != card.agent_id
+    {
+        bail!("agent envelope source_agent_id does not match source_agent_card agent_id");
+    }
+    if let Some(envelope_source_node_id) = envelope.source_node_id.as_deref()
+        && card.node_id.as_deref() != Some(envelope_source_node_id)
+    {
+        bail!("agent envelope source_node_id does not match source_agent_card node_id");
+    }
+    if let Some(expected_source_node_id) = expected_source_node_id {
+        if envelope.source_node_id.as_deref() != Some(expected_source_node_id) {
+            bail!("agent envelope source_node_id does not match network source node");
+        }
+        if let Some(card_node_id) = card.node_id.as_deref()
+            && card_node_id != expected_source_node_id
+        {
+            bail!("source_agent_card node_id does not match network source node");
+        }
+    }
+
+    let card_hash = format!(
+        "sha256:{}",
+        crate::crypto::sha256_hex(serde_jcs::to_string(&card.card)?.as_bytes())
+    );
+    if card.card_hash != card_hash {
+        bail!("source_agent_card hash mismatch");
+    }
+
+    let Some(signature) = card.signature.as_deref() else {
+        return Ok(());
+    };
+    let unsigned = UnsignedSourceAgentCard {
+        agent_id: &card.agent_id,
+        node_id: card.node_id.as_ref(),
+        card_hash: &card.card_hash,
+        issued_at: card.issued_at,
+    };
+    crate::crypto::verify_signature_ref(
+        &card.agent_id,
+        serde_jcs::to_string(&unsigned)?.as_bytes(),
+        signature,
+    )
+    .context("verify source_agent_card signature")
 }
 
 pub(super) fn attach_agent_envelope_to_relationship(
@@ -244,9 +359,13 @@ pub fn default_agent_envelope(
 ) -> RawAgentEnvelope {
     RawAgentEnvelope {
         protocol: "google_a2a".to_owned(),
+        transport_profile: Some("wattswarm_mesh".to_owned()),
         source_agent_id: Some(local_node_id.to_owned()),
         target_agent_id: Some(remote_node_id.to_owned()),
+        source_node_id: Some(local_node_id.to_owned()),
+        target_node_id: Some(remote_node_id.to_owned()),
         capability: Some(capability.to_owned()),
+        source_agent_card: None,
         message_json: serde_json::to_string(&payload).unwrap_or_else(|_| "{}".to_owned()),
         extensions_json: None,
         signature: None,
@@ -398,6 +517,9 @@ pub(super) fn save_agent_payment_summary(
         .cloned()
         .map(serde_json::from_value::<wattswarm_protocol::types::AgentEnvelope>)
         .transpose()?;
+    if let Some(envelope) = &agent_envelope {
+        verify_protocol_agent_envelope_for_source(envelope, Some(remote_node_id))?;
+    }
     let payment_id = payment
         .get("payment_id")
         .and_then(Value::as_str)
@@ -427,7 +549,6 @@ pub(super) fn save_agent_payment_summary(
             "summary_id": summary.summary_id,
             "message_kind": message_kind,
             "payment": record.payment,
-            "agent_envelope": agent_envelope,
         }),
         true,
         allowed_actions,
@@ -436,6 +557,36 @@ pub(super) fn save_agent_payment_summary(
     );
     deliver_agent_event_to_local_executor(state_dir, None, &event)?;
     Ok(record)
+}
+
+pub(super) fn verify_protocol_agent_envelope_for_source(
+    envelope: &wattswarm_protocol::types::AgentEnvelope,
+    expected_source_node_id: Option<&str>,
+) -> Result<()> {
+    let raw = RawAgentEnvelope {
+        protocol: envelope.protocol.clone(),
+        transport_profile: envelope.transport_profile.clone(),
+        source_agent_id: envelope.source_agent_id.clone(),
+        target_agent_id: envelope.target_agent_id.clone(),
+        source_node_id: envelope.source_node_id.clone(),
+        target_node_id: envelope.target_node_id.clone(),
+        capability: envelope.capability.clone(),
+        source_agent_card: envelope
+            .source_agent_card
+            .as_ref()
+            .map(|card| RawSourceAgentCard {
+                agent_id: card.agent_id.clone(),
+                node_id: card.node_id.clone(),
+                card_hash: card.card_hash.clone(),
+                issued_at: card.issued_at,
+                card: card.card.clone(),
+                signature: card.signature.clone(),
+            }),
+        message_json: envelope.message_json.clone(),
+        extensions_json: envelope.extensions_json.clone(),
+        signature: envelope.signature.clone(),
+    };
+    verify_agent_envelope_signature_for_source(&raw, expected_source_node_id)
 }
 
 pub(super) fn payment_allowed_actions(message_kind: &str) -> Vec<String> {
@@ -526,4 +677,124 @@ pub(super) fn process_pending_network_commands(
             .and_then(|mut file| file.write_all(retry.as_bytes()));
     }
     Ok(processed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use base64::Engine as _;
+    use ed25519_dalek::{Signer, SigningKey};
+    use serde::Serialize;
+    use serde_json::json;
+
+    fn did_key_for_identity(identity: &crate::crypto::NodeIdentity) -> String {
+        let mut encoded = vec![0xed, 0x01];
+        encoded.extend_from_slice(identity.verifying_key().as_bytes());
+        format!("did:key:z{}", bs58::encode(encoded).into_string())
+    }
+
+    fn sign_json<T: Serialize>(identity: &crate::crypto::NodeIdentity, payload: &T) -> String {
+        let bytes = serde_jcs::to_string(payload)
+            .expect("canonical payload")
+            .into_bytes();
+        let signing_key = SigningKey::from_bytes(&identity.secret_bytes());
+        base64::engine::general_purpose::STANDARD.encode(signing_key.sign(&bytes).to_bytes())
+    }
+
+    fn signed_envelope_with_card(source_node: &str, target_node: &str) -> RawAgentEnvelope {
+        let identity = crate::crypto::NodeIdentity::random();
+        let agent_id = did_key_for_identity(&identity);
+        let card = json!({
+            "protocolVersion": "0.3.0",
+            "name": "Test Agent",
+            "skills": [{"id": "task", "name": "Task", "tags": ["task"]}],
+            "metadata": {
+                "agent_id": agent_id,
+                "node_id": source_node,
+                "transport_profile": "wattswarm_mesh"
+            }
+        });
+        let card_hash = format!(
+            "sha256:{}",
+            crate::crypto::sha256_hex(
+                serde_jcs::to_string(&card)
+                    .expect("canonical card")
+                    .as_bytes()
+            )
+        );
+        let source_node_id = source_node.to_owned();
+        let source_agent_card = RawSourceAgentCard {
+            agent_id: agent_id.clone(),
+            node_id: Some(source_node_id.clone()),
+            card_hash: card_hash.clone(),
+            issued_at: 42,
+            card,
+            signature: Some(sign_json(
+                &identity,
+                &UnsignedSourceAgentCard {
+                    agent_id: &agent_id,
+                    node_id: Some(&source_node_id),
+                    card_hash: &card_hash,
+                    issued_at: 42,
+                },
+            )),
+        };
+        let message_json = json!({
+            "task_id": "task-1",
+            "action": "claim"
+        })
+        .to_string();
+        let protocol = "google_a2a".to_owned();
+        let transport_profile = Some("wattswarm_mesh".to_owned());
+        let capability = Some("task.claim".to_owned());
+        let source_agent_id = Some(agent_id.clone());
+        let target_agent_id = Some("did:key:ztarget".to_owned());
+        let source_node_id = Some(source_node_id);
+        let target_node_id = Some(target_node.to_owned());
+        let unsigned = UnsignedAgentEnvelope {
+            protocol: &protocol,
+            transport_profile: transport_profile.as_ref(),
+            source_agent_id: source_agent_id.as_ref(),
+            target_agent_id: target_agent_id.as_ref(),
+            source_node_id: source_node_id.as_ref(),
+            target_node_id: target_node_id.as_ref(),
+            capability: capability.as_ref(),
+            source_agent_card_hash: Some(&card_hash),
+            message_json: &message_json,
+            extensions_json: None,
+        };
+        let signature = sign_json(&identity, &unsigned);
+        RawAgentEnvelope {
+            protocol,
+            transport_profile,
+            source_agent_id,
+            target_agent_id,
+            source_node_id,
+            target_node_id,
+            capability,
+            source_agent_card: Some(source_agent_card),
+            message_json,
+            extensions_json: None,
+            signature: Some(signature),
+        }
+    }
+
+    #[test]
+    fn verify_agent_envelope_accepts_signed_source_agent_card() {
+        let envelope = signed_envelope_with_card("node-a", "node-b");
+        verify_agent_envelope_signature_for_source(&envelope, Some("node-a"))
+            .expect("valid source agent card and envelope signature");
+    }
+
+    #[test]
+    fn verify_agent_envelope_rejects_wrong_network_source_node() {
+        let envelope = signed_envelope_with_card("node-a", "node-b");
+        let err = verify_agent_envelope_signature_for_source(&envelope, Some("node-c"))
+            .expect_err("network source node must match source card node");
+        assert!(
+            err.to_string()
+                .contains("agent envelope source_node_id does not match network source node"),
+            "{err:#}"
+        );
+    }
 }

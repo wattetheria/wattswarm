@@ -62,7 +62,7 @@ pub use wire::{
     RawContactMaterialRequest, RawContactMaterialResponse, RawControlRequest, RawControlResponse,
     RawGossipMessage, RawPeerDirectMessageKind, RawPeerDirectMessageRequest,
     RawPeerDirectMessageResponse, RawPeerRelationshipAction, RawPeerRelationshipRequest,
-    RawPeerRelationshipResponse,
+    RawPeerRelationshipResponse, RawSourceAgentCard,
 };
 
 #[cfg(test)]

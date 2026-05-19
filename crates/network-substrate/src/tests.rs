@@ -155,6 +155,7 @@ fn peer_relationship_wire_supports_agent_envelope_roundtrip() {
         message_json: "{\"intent\":\"friend_request\"}".to_owned(),
         extensions_json: Some("{\"reason\":\"collaboration\"}".to_owned()),
         signature: Some("sig-123".to_owned()),
+        ..RawAgentEnvelope::default()
     };
     let request = RawPeerRelationshipRequest {
         source_node_id: "node-a".to_owned(),

@@ -29,3 +29,8 @@ wattswarm-node-core = { workspace = true }
 wattswarm-protocol = { workspace = true }
 wattswarm-runtime-client = { workspace = true }
 wattswarm-storage-core = { workspace = true }
+
+[dev-dependencies]
+base64 = { workspace = true }
+bs58 = { workspace = true }
+ed25519-dalek = { workspace = true }

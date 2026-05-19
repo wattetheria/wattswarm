@@ -77,9 +77,16 @@ fn raw_agent_envelope_to_interaction(
 ) -> crate::control::AgentInteractionEnvelope {
     crate::control::AgentInteractionEnvelope {
         protocol: envelope.protocol.clone(),
+        transport_profile: envelope.transport_profile.clone(),
         source_agent_id: envelope.source_agent_id.clone(),
         target_agent_id: envelope.target_agent_id.clone(),
+        source_node_id: envelope.source_node_id.clone(),
+        target_node_id: envelope.target_node_id.clone(),
         capability: envelope.capability.clone(),
+        source_agent_card: envelope
+            .source_agent_card
+            .as_ref()
+            .and_then(|card| serde_json::to_value(card).ok()),
         message: serde_json::from_str(&envelope.message_json).unwrap_or_else(|_| json!({})),
         extensions: envelope
             .extensions_json

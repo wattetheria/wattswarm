@@ -16,8 +16,8 @@ pub use substrate::{
     NetworkNodeId, NetworkRuntimeObservabilitySnapshot, PeerDirectMessageResponseChannel,
     PeerDiscoverySourceKind, PeerHandshakeMetadata, PeerMetadata, PeerRelationshipResponseChannel,
     RawAgentEnvelope, RawContactMaterial, RawContactMaterialRequest, RawContactMaterialResponse,
-    RawPeerDirectMessageKind, RawPeerRelationshipAction, SwarmScope, TopicCatalog, TopicNamespace,
-    TrafficGuardPeerHealth, sanitize_segment,
+    RawPeerDirectMessageKind, RawPeerRelationshipAction, RawSourceAgentCard, SwarmScope,
+    TopicCatalog, TopicNamespace, TrafficGuardPeerHealth, sanitize_segment,
 };
 
 pub type BackfillRequest = substrate::RawBackfillRequest;

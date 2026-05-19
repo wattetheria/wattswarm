@@ -876,7 +876,10 @@ impl NetworkBridgeService {
                     )
                 } else if let Some(state_dir) = self.state_dir.clone() {
                     if let Some(agent_envelope) = request.agent_envelope.as_ref() {
-                        verify_agent_envelope_signature(agent_envelope)?;
+                        verify_agent_envelope_signature_for_source(
+                            agent_envelope,
+                            Some(&request.source_node_id),
+                        )?;
                     }
                     match crate::control::apply_peer_relationship_action_state(
                         &state_dir,
@@ -893,7 +896,7 @@ impl NetworkBridgeService {
                                 )?;
                             }
                             if action == crate::control::PeerRelationshipAction::Request {
-                                let event = build_agent_event(
+                                let event = build_agent_event_with_agent_envelope(
                                     wattswarm_protocol::types::AgentEventType::FriendRequest,
                                     wattswarm_protocol::types::AgentEventSourceKind::PeerRelationship,
                                     Some(request.source_node_id.clone()),
@@ -901,13 +904,16 @@ impl NetworkBridgeService {
                                         .agent_envelope
                                         .as_ref()
                                         .and_then(|envelope| envelope.target_agent_id.clone()),
+                                    request
+                                        .agent_envelope
+                                        .as_ref()
+                                        .map(raw_agent_envelope_to_protocol),
                                     json!({
                                         "source_node_id": request.source_node_id,
                                         "target_node_id": request.target_node_id,
                                         "action": request.action,
                                         "relationship_state": record.relationship_state,
                                         "updated_at": record.updated_at,
-                                        "agent_envelope": request.agent_envelope,
                                     }),
                                     true,
                                     vec![
@@ -1284,7 +1290,10 @@ impl NetworkBridgeService {
                 };
                 let now = observed_at_ms();
                 if let Some(agent_envelope) = request.agent_envelope.as_ref() {
-                    verify_agent_envelope_signature(agent_envelope)?;
+                    verify_agent_envelope_signature_for_source(
+                        agent_envelope,
+                        Some(&request.source_node_id),
+                    )?;
                 }
                 if let Some(contact_material) = &request.contact_material {
                     upsert_contact_material_for_peer(
@@ -1390,7 +1399,7 @@ impl NetworkBridgeService {
                     None,
                 )?;
                 if matches!(request.kind, RawPeerDirectMessageKind::Message) {
-                    let event = build_agent_event(
+                    let event = build_agent_event_with_agent_envelope(
                         wattswarm_protocol::types::AgentEventType::DmReceived,
                         wattswarm_protocol::types::AgentEventSourceKind::PeerDirectMessage,
                         Some(request.source_node_id.clone()),
@@ -1398,13 +1407,16 @@ impl NetworkBridgeService {
                             .agent_envelope
                             .as_ref()
                             .and_then(|envelope| envelope.target_agent_id.clone()),
+                        request
+                            .agent_envelope
+                            .as_ref()
+                            .map(raw_agent_envelope_to_protocol),
                         json!({
                             "thread_id": request.thread_id,
                             "message_id": request.message_id,
                             "source_node_id": request.source_node_id,
                             "target_node_id": request.target_node_id,
                             "kind": request.kind,
-                            "agent_envelope": request.agent_envelope,
                             "content": request
                                 .control_json
                                 .as_deref()

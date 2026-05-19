@@ -121,14 +121,34 @@ pub struct TransportRoute {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct SourceAgentCard {
+    pub agent_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_id: Option<String>,
+    pub card_hash: String,
+    pub issued_at: u64,
+    pub card: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct AgentEnvelope {
     pub protocol: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transport_profile: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_agent_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target_agent_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_node_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_node_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capability: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_agent_card: Option<SourceAgentCard>,
     #[serde(
         default,
         alias = "message",

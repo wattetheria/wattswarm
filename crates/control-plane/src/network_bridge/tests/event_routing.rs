@@ -98,7 +98,8 @@ fn backfill_task_claimed_delivers_local_agent_event() {
         })
         .to_string(),
         extensions_json: None,
-        signature: Some("sig-a2a".to_owned()),
+        signature: None,
+        ..wattswarm_protocol::types::AgentEnvelope::default()
     };
     let claim_event = build_event_for_external(
         &claimer_identity,
@@ -166,7 +167,7 @@ fn backfill_task_claimed_delivers_local_agent_event() {
         Some(CORE_AGENT_EXECUTOR_NAME)
     );
     assert_eq!(records[0].agent_envelope, Some(agent_envelope));
-    assert!(records[0].payload["agent_envelope"].is_object());
+    assert!(records[0].payload.get("agent_envelope").is_none());
 }
 
 #[test]
@@ -609,19 +610,27 @@ fn deliver_agent_event_routes_decision_to_wattetheria_commit_plane() {
     )
     .expect("save executor registry");
 
-    let event = build_agent_event(
+    let agent_envelope = wattswarm_protocol::types::AgentEnvelope {
+        protocol: "google_a2a".to_owned(),
+        source_agent_id: Some("did:key:remote-agent".to_owned()),
+        target_agent_id: Some("did:key:agent".to_owned()),
+        capability: Some("peer.relationship.request".to_owned()),
+        message_json: json!({
+            "source_public_id": "remote-public",
+            "target_public_id": "local-public"
+        })
+        .to_string(),
+        extensions_json: None,
+        signature: Some("sig-a2a".to_owned()),
+        ..wattswarm_protocol::types::AgentEnvelope::default()
+    };
+    let event = build_agent_event_with_agent_envelope(
         wattswarm_protocol::types::AgentEventType::FriendRequest,
         wattswarm_protocol::types::AgentEventSourceKind::PeerRelationship,
         Some("peer-a".to_owned()),
         Some("did:key:agent".to_owned()),
-        json!({
-            "agent_envelope": {
-                "message": {
-                    "source_public_id": "remote-public",
-                    "target_public_id": "local-public"
-                }
-            }
-        }),
+        Some(agent_envelope),
+        json!({}),
         true,
         vec!["accept".to_owned(), "reject".to_owned(), "block".to_owned()],
         Some("friend-request".to_owned()),
