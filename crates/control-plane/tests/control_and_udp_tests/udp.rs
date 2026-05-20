@@ -8,7 +8,7 @@ fn udp_announce_startup_and_listener_paths_execute() {
     let payload = serde_json::json!({
         "kind": "wattswarm_udp_announce_v1",
         "node_id": "node-peer",
-        "listen_addr": "/ip4/127.0.0.1/tcp/4001"
+        "listen_addr": "127.0.0.1:4001"
     })
     .to_string();
 

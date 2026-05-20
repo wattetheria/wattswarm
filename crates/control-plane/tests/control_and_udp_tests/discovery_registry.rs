@@ -53,11 +53,11 @@ fn add_discovered_peer_dedups_and_sorts() {
     assert!(add_discovered_peer(&dir, "node-b").expect("add node-b"));
     assert!(!add_discovered_peer(&dir, "node-a").expect("add duplicate"));
     assert!(
-        add_discovered_peer_endpoint(&dir, "node-a", Some("/ip4/127.0.0.1/tcp/4001"))
+        add_discovered_peer_endpoint(&dir, "node-a", Some("127.0.0.1:4001"))
             .expect("add node-a endpoint")
     );
     assert!(
-        !add_discovered_peer_endpoint(&dir, "node-a", Some("/ip4/127.0.0.1/tcp/4001"))
+        !add_discovered_peer_endpoint(&dir, "node-a", Some("127.0.0.1:4001"))
             .expect("dedup node-a endpoint")
     );
     assert!(!add_discovered_peer(&dir, "   ").expect("add empty"));
@@ -281,7 +281,7 @@ fn recommended_transfer_route_uses_peer_contact_material_capabilities() {
             agent_version_raw: Some("wattswarm-network-p2p|wan|7|params-iroh".to_owned()),
             agent_version_prefix: Some("wattswarm-network-p2p".to_owned()),
             protocol_version: Some("wattswarm/1.0.0".to_owned()),
-            observed_addr: Some("/ip4/198.51.100.7/tcp/4001".to_owned()),
+            observed_addr: Some("198.51.100.7:4001".to_owned()),
             listen_addrs: vec![],
             protocols: vec![],
             handshake_status: "contact_material".to_owned(),

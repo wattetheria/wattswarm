@@ -28,6 +28,12 @@ COPY crates/network-transport-iroh/Cargo.toml crates/network-transport-iroh/Carg
 COPY apps/wattswarm/Cargo.toml apps/wattswarm/Cargo.toml
 COPY apps/wattswarm-runtime/Cargo.toml apps/wattswarm-runtime/Cargo.toml
 
+# Release Docker builds do not have the sibling checkout mounted at
+# ../watt-did, so use the published git source inside the image build.
+RUN sed -i \
+    -e 's|watt-did = { path = "../watt-did" }|watt-did = { git = "https://github.com/wattetheria/watt-did.git" }|' \
+    Cargo.toml
+
 RUN mkdir -p \
     crates/protocol/src \
     crates/crypto/src \
@@ -77,6 +83,10 @@ FROM chef AS builder
 
 COPY . .
 COPY --from=cacher /app/target /app/target
+
+RUN sed -i \
+    -e 's|watt-did = { path = "../watt-did" }|watt-did = { git = "https://github.com/wattetheria/watt-did.git" }|' \
+    Cargo.toml
 
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \

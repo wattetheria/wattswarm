@@ -608,7 +608,7 @@ fn observability_snapshot_reports_network_and_sync_health() {
 
     let mut service = NetworkBridgeService::new(
         NetworkP2pNode::generate(NetworkP2pConfig {
-            listen_addrs: vec!["/ip4/127.0.0.1/tcp/0".to_owned()],
+            listen_addrs: vec!["127.0.0.1:0".to_owned()],
             enable_local_discovery: false,
             ..NetworkP2pConfig::default()
         })
@@ -913,7 +913,7 @@ fn publish_pending_global_events_publishes_local_rows_and_skips_remote_rows() {
 
     let mut service = NetworkBridgeService::new(
         NetworkP2pNode::generate(NetworkP2pConfig {
-            listen_addrs: vec!["/ip4/127.0.0.1/tcp/0".to_owned()],
+            listen_addrs: vec!["127.0.0.1:0".to_owned()],
             enable_local_discovery: false,
             ..NetworkP2pConfig::default()
         })
@@ -925,7 +925,7 @@ fn publish_pending_global_events_publishes_local_rows_and_skips_remote_rows() {
     let mut peer_node = Node::open_in_memory_with_roles(&[Role::Proposer]).expect("peer node");
     let mut peer_service = NetworkBridgeService::new(
         NetworkP2pNode::generate(NetworkP2pConfig {
-            listen_addrs: vec!["/ip4/127.0.0.1/tcp/0".to_owned()],
+            listen_addrs: vec!["127.0.0.1:0".to_owned()],
             enable_local_discovery: false,
             ..NetworkP2pConfig::default()
         })
@@ -1014,7 +1014,7 @@ fn latest_connected_peer_ids_uses_runtime_observability_snapshot() {
         &dir,
         NetworkBridgeObservabilitySnapshot {
             local_network_peer_id: "local-peer".to_owned(),
-            local_endpoint_addrs: vec!["/ip4/127.0.0.1/tcp/4001".to_owned()],
+            local_endpoint_addrs: vec!["127.0.0.1:4001".to_owned()],
             p2p_foundation: "iroh".to_owned(),
             local_iroh_endpoint_id: Some("iroh-endpoint".to_owned()),
             subscribed_iroh_gossip_topics: vec!["global:task:abc123".to_owned()],

@@ -9,6 +9,7 @@ services:
       target: dev
     volumes:
       - .:/app
+      - ../watt-did:/watt-did:ro
       - wattswarm_cargo_target:/app/target
       - wattswarm_cargo_registry:/usr/local/cargo/registry
       - wattswarm_state_data:/var/lib/wattswarm
@@ -22,6 +23,7 @@ services:
       target: dev
     volumes:
       - .:/app
+      - ../watt-did:/watt-did:ro
       - wattswarm_cargo_target:/app/target
       - wattswarm_cargo_registry:/usr/local/cargo/registry
     entrypoint: ["/bin/sh", "-c"]
@@ -41,6 +43,7 @@ services:
       target: dev
     volumes:
       - .:/app
+      - ../watt-did:/watt-did:ro
       - wattswarm_cargo_target:/app/target
       - wattswarm_cargo_registry:/usr/local/cargo/registry
       - wattswarm_state_data:/var/lib/wattswarm

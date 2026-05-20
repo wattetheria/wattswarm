@@ -237,7 +237,7 @@ pub fn network_config_from_env() -> NetworkP2pConfig {
                 .ok()
                 .and_then(|raw| raw.parse::<u16>().ok())
                 .unwrap_or(DEFAULT_P2P_PORT);
-            vec![format!("/ip4/0.0.0.0/tcp/{port}")]
+            vec![format!("0.0.0.0:{port}")]
         });
     NetworkP2pConfig {
         listen_addrs,

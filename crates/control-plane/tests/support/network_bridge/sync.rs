@@ -94,7 +94,7 @@ pub fn two_nodes_sync_topic_message_content_over_iroh() {
         std::slice::from_ref(&scope),
         &test_protocol_params(),
         NetworkP2pConfig {
-            listen_addrs: vec!["/ip4/127.0.0.1/tcp/0".to_owned()],
+            listen_addrs: vec!["127.0.0.1:0".to_owned()],
             enable_local_discovery: false,
             ..NetworkP2pConfig::default()
         },
@@ -104,7 +104,7 @@ pub fn two_nodes_sync_topic_message_content_over_iroh() {
         std::slice::from_ref(&scope),
         &test_protocol_params(),
         NetworkP2pConfig {
-            listen_addrs: vec!["/ip4/127.0.0.1/tcp/0".to_owned()],
+            listen_addrs: vec!["127.0.0.1:0".to_owned()],
             enable_local_discovery: false,
             ..NetworkP2pConfig::default()
         },

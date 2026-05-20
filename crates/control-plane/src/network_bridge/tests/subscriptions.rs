@@ -11,7 +11,7 @@ fn network_config_defaults_to_enabled_with_fixed_tcp_port() {
     assert!(network_enabled_from_env());
     let config = network_config_from_env();
     assert!(config.enable_local_discovery);
-    assert_eq!(config.listen_addrs, vec!["/ip4/0.0.0.0/tcp/4001"]);
+    assert_eq!(config.listen_addrs, vec!["0.0.0.0:4001"]);
     assert!(config.bootstrap_peers.is_empty());
 }
 
@@ -100,7 +100,7 @@ fn publish_pending_updates_subscribes_runtime_for_local_feed_subscription() {
 
     let mut service = NetworkBridgeService::new(
         NetworkP2pNode::generate(NetworkP2pConfig {
-            listen_addrs: vec!["/ip4/127.0.0.1/tcp/0".to_owned()],
+            listen_addrs: vec!["127.0.0.1:0".to_owned()],
             bootstrap_peers: Vec::new(),
             enable_local_discovery: false,
             ..NetworkP2pConfig::default()
@@ -168,7 +168,7 @@ fn feed_subscription_updates_publish_on_global_control_scope() {
 fn remote_feed_subscription_adds_relay_scope_without_local_subscription() {
     let mut service = NetworkBridgeService::new(
         NetworkP2pNode::generate(NetworkP2pConfig {
-            listen_addrs: vec!["/ip4/127.0.0.1/tcp/0".to_owned()],
+            listen_addrs: vec!["127.0.0.1:0".to_owned()],
             enable_local_discovery: false,
             ..NetworkP2pConfig::default()
         })
@@ -218,7 +218,7 @@ fn startup_restores_remote_feed_subscription_relay_scopes() {
 
     let mut service = NetworkBridgeService::new(
         NetworkP2pNode::generate(NetworkP2pConfig {
-            listen_addrs: vec!["/ip4/127.0.0.1/tcp/0".to_owned()],
+            listen_addrs: vec!["127.0.0.1:0".to_owned()],
             enable_local_discovery: false,
             ..NetworkP2pConfig::default()
         })
@@ -246,7 +246,7 @@ fn remote_feed_unsubscribe_keeps_local_scope_subscription() {
     let scope = SwarmScope::Group("crew-7".to_owned());
     let mut service = NetworkBridgeService::new(
         NetworkP2pNode::generate(NetworkP2pConfig {
-            listen_addrs: vec!["/ip4/127.0.0.1/tcp/0".to_owned()],
+            listen_addrs: vec!["127.0.0.1:0".to_owned()],
             enable_local_discovery: false,
             ..NetworkP2pConfig::default()
         })
@@ -325,7 +325,7 @@ fn publish_pending_updates_unsubscribes_scope_when_local_subscription_is_disable
 
     let mut service = NetworkBridgeService::new(
         NetworkP2pNode::generate(NetworkP2pConfig {
-            listen_addrs: vec!["/ip4/127.0.0.1/tcp/0".to_owned()],
+            listen_addrs: vec!["127.0.0.1:0".to_owned()],
             enable_local_discovery: false,
             ..NetworkP2pConfig::default()
         })

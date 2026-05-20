@@ -763,10 +763,8 @@ fn ui_diagnostics_api_lists_wattswarm_network_diagnostics() {
 fn ui_exposes_local_network_peer_identity_and_listen_addrs() {
     let _guard = env_lock();
     let _p2p_enabled = EnvVarGuard::set("WATTSWARM_P2P_ENABLED", "true");
-    let _listen_addrs = EnvVarGuard::set(
-        "WATTSWARM_P2P_LISTEN_ADDRS",
-        "/ip4/127.0.0.1/tcp/4010,/ip4/0.0.0.0/tcp/4011",
-    );
+    let _listen_addrs =
+        EnvVarGuard::set("WATTSWARM_P2P_LISTEN_ADDRS", "127.0.0.1:4010,0.0.0.0:4011");
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -801,8 +799,8 @@ fn ui_exposes_local_network_peer_identity_and_listen_addrs() {
         assert_eq!(
             json["listen_addrs"].as_array().unwrap(),
             &vec![
-                Value::String("/ip4/127.0.0.1/tcp/4010".to_owned()),
-                Value::String("/ip4/0.0.0.0/tcp/4011".to_owned()),
+                Value::String("127.0.0.1:4010".to_owned()),
+                Value::String("0.0.0.0:4011".to_owned()),
             ]
         );
     });

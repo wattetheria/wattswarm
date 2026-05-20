@@ -107,7 +107,7 @@ fn make_service_for_network_with_scopes(
                     params_hash: format!("params-{network_id}"),
                 },
             ),
-        listen_addrs: vec!["/ip4/127.0.0.1/tcp/0".to_owned()],
+        listen_addrs: vec!["127.0.0.1:0".to_owned()],
         enable_local_discovery: false,
         ..NetworkP2pConfig::default()
     };
@@ -134,7 +134,7 @@ fn make_service_with_params(
         scopes,
         params,
         NetworkP2pConfig {
-            listen_addrs: vec!["/ip4/127.0.0.1/tcp/0".to_owned()],
+            listen_addrs: vec!["127.0.0.1:0".to_owned()],
             enable_local_discovery: false,
             ..NetworkP2pConfig::default()
         },
@@ -150,7 +150,7 @@ fn make_bootstrap_service_with_params(
         scopes,
         params,
         NetworkP2pConfig {
-            listen_addrs: vec!["/ip4/127.0.0.1/tcp/0".to_owned()],
+            listen_addrs: vec!["127.0.0.1:0".to_owned()],
             enable_local_discovery: false,
             bootstrap_peers: bootstrap_peers.to_vec(),
             ..NetworkP2pConfig::default()

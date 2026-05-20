@@ -985,7 +985,7 @@ mod tests {
         let tokio_runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
         let _guard = tokio_runtime.enter();
         let node = NetworkP2pNode::generate(NetworkP2pConfig {
-            listen_addrs: vec!["/ip4/127.0.0.1/tcp/0".to_owned()],
+            listen_addrs: vec!["127.0.0.1:0".to_owned()],
             enable_local_discovery: false,
             ..NetworkP2pConfig::default()
         })
@@ -1001,7 +1001,7 @@ mod tests {
     fn dialed_iroh_peers_join_existing_gossip_subscriptions() {
         let mut runtime_a = NetworkRuntime::new(
             NetworkP2pNode::generate(NetworkP2pConfig {
-                listen_addrs: vec!["/ip4/127.0.0.1/tcp/0".to_owned()],
+                listen_addrs: vec!["127.0.0.1:0".to_owned()],
                 enable_local_discovery: false,
                 ..NetworkP2pConfig::default()
             })
@@ -1010,7 +1010,7 @@ mod tests {
         .expect("runtime a");
         let mut runtime_b = NetworkRuntime::new(
             NetworkP2pNode::generate(NetworkP2pConfig {
-                listen_addrs: vec!["/ip4/127.0.0.1/tcp/0".to_owned()],
+                listen_addrs: vec!["127.0.0.1:0".to_owned()],
                 enable_local_discovery: false,
                 ..NetworkP2pConfig::default()
             })

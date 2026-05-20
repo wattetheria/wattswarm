@@ -327,9 +327,7 @@ fn backfill_requests_respect_remaining_peer_slots() {
 fn connection_established_diagnostics_skip_duplicate_peer_events() {
     let dir = temp_startup_dir("connection-established-diagnostics-dedupe");
     let peer = random_network_node_id();
-    let address = "/ip4/203.0.113.10/tcp/4001"
-        .parse::<NetworkAddress>()
-        .expect("addr");
+    let address = "203.0.113.10:4001".parse::<NetworkAddress>().expect("addr");
     let mut node = Node::open_in_memory_with_roles(&[Role::Proposer]).expect("node");
     let mut service = NetworkBridgeService::new(
         NetworkP2pNode::generate(NetworkP2pConfig::default()).expect("node"),
@@ -658,9 +656,7 @@ fn peer_discovered_event_persists_wan_source_into_local_registry() {
     .expect("service");
     service.set_state_dir(dir.clone(), dir.join("ui.state"));
     let peer = random_network_node_id();
-    let address = "/ip4/203.0.113.10/tcp/4001"
-        .parse::<NetworkAddress>()
-        .expect("addr");
+    let address = "203.0.113.10:4001".parse::<NetworkAddress>().expect("addr");
 
     let tick = service
         .process_runtime_event(
@@ -712,8 +708,8 @@ fn peer_identified_event_persists_peer_metadata_locally() {
                         .to_owned(),
                     agent_version_prefix: "wattswarm-network-p2p".to_owned(),
                     protocol_version: "wattswarm/1.0.0".to_owned(),
-                    observed_addr: "/ip4/198.51.100.2/tcp/4001".to_owned(),
-                    listen_addrs: vec!["/ip4/203.0.113.10/tcp/4001".to_owned()],
+                    observed_addr: "198.51.100.2:4001".to_owned(),
+                    listen_addrs: vec!["203.0.113.10:4001".to_owned()],
                     protocols: vec!["/meshsub/1.1.0".to_owned()],
                 },
             },
@@ -728,7 +724,7 @@ fn peer_identified_event_persists_peer_metadata_locally() {
     assert_eq!(rows[0].params_version, Some(7));
     assert_eq!(rows[0].params_hash.as_deref(), Some("params-abc"));
     assert_eq!(rows[0].handshake_status, "identified");
-    assert_eq!(rows[0].listen_addrs, vec!["/ip4/203.0.113.10/tcp/4001"]);
+    assert_eq!(rows[0].listen_addrs, vec!["203.0.113.10:4001"]);
     assert_eq!(rows[0].protocols, vec!["/meshsub/1.1.0"]);
 
     std::fs::remove_dir_all(dir).expect("cleanup");

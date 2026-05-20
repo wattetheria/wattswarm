@@ -12,7 +12,7 @@ pub fn two_nodes_execute_peer_relationship_request_and_accept_over_network() {
         &[SwarmScope::Global],
         &test_protocol_params(),
         NetworkP2pConfig {
-            listen_addrs: vec!["/ip4/127.0.0.1/tcp/0".to_owned()],
+            listen_addrs: vec!["127.0.0.1:0".to_owned()],
             enable_local_discovery: false,
             ..NetworkP2pConfig::default()
         },
@@ -22,7 +22,7 @@ pub fn two_nodes_execute_peer_relationship_request_and_accept_over_network() {
         &[SwarmScope::Global],
         &test_protocol_params(),
         NetworkP2pConfig {
-            listen_addrs: vec!["/ip4/127.0.0.1/tcp/0".to_owned()],
+            listen_addrs: vec!["127.0.0.1:0".to_owned()],
             enable_local_discovery: false,
             ..NetworkP2pConfig::default()
         },
@@ -92,7 +92,7 @@ pub fn two_nodes_execute_peer_relationship_request_and_block_over_network() {
         &[],
         &test_protocol_params(),
         NetworkP2pConfig {
-            listen_addrs: vec!["/ip4/127.0.0.1/tcp/0".to_owned()],
+            listen_addrs: vec!["127.0.0.1:0".to_owned()],
             enable_local_discovery: false,
             ..NetworkP2pConfig::default()
         },
@@ -102,7 +102,7 @@ pub fn two_nodes_execute_peer_relationship_request_and_block_over_network() {
         &[],
         &test_protocol_params(),
         NetworkP2pConfig {
-            listen_addrs: vec!["/ip4/127.0.0.1/tcp/0".to_owned()],
+            listen_addrs: vec!["127.0.0.1:0".to_owned()],
             enable_local_discovery: false,
             ..NetworkP2pConfig::default()
         },
@@ -168,7 +168,7 @@ pub fn two_nodes_establish_dm_session_and_exchange_messages_over_network() {
         &[],
         &test_protocol_params(),
         NetworkP2pConfig {
-            listen_addrs: vec!["/ip4/127.0.0.1/tcp/0".to_owned()],
+            listen_addrs: vec!["127.0.0.1:0".to_owned()],
             enable_local_discovery: false,
             ..NetworkP2pConfig::default()
         },
@@ -178,7 +178,7 @@ pub fn two_nodes_establish_dm_session_and_exchange_messages_over_network() {
         &[],
         &test_protocol_params(),
         NetworkP2pConfig {
-            listen_addrs: vec!["/ip4/127.0.0.1/tcp/0".to_owned()],
+            listen_addrs: vec!["127.0.0.1:0".to_owned()],
             enable_local_discovery: false,
             ..NetworkP2pConfig::default()
         },

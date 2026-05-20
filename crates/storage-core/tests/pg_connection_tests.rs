@@ -373,7 +373,7 @@ fn legacy_discovered_peers_rows_are_migrated_to_scope_and_real_node_id() {
                 TIMESTAMPTZ 'epoch' + (1700000000000::bigint * INTERVAL '1 millisecond'),
                 TIMESTAMPTZ 'epoch' + (1700000000000::bigint * INTERVAL '1 millisecond')
              )",
-            wattswarm_storage_core::params![legacy_node_id, "/ip4/127.0.0.1/tcp/4001"],
+            wattswarm_storage_core::params![legacy_node_id, "127.0.0.1:4001"],
         )
         .expect("insert legacy discovered peer");
 
@@ -506,11 +506,9 @@ fn local_control_peer_metadata_and_relationship_roundtrip() {
                     ),
                     agent_version_prefix: Some("wattswarm-network-p2p".to_owned()),
                     protocol_version: Some("wattswarm/1.0.0".to_owned()),
-                    observed_addr: Some("/ip4/198.51.100.2/tcp/4001".to_owned()),
-                    listen_addrs_json: serde_json::to_string(&vec![
-                        "/ip4/203.0.113.10/tcp/4001".to_owned(),
-                    ])
-                    .expect("listen_addrs_json"),
+                    observed_addr: Some("198.51.100.2:4001".to_owned()),
+                    listen_addrs_json: serde_json::to_string(&vec!["203.0.113.10:4001".to_owned()])
+                        .expect("listen_addrs_json"),
                     protocols_json: serde_json::to_string(&vec!["/meshsub/1.1.0".to_owned()])
                         .expect("protocols_json"),
                     handshake_status: "identified".to_owned(),
