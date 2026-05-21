@@ -457,6 +457,7 @@ mod tests {
                 network_mode: NetworkMode::Wan,
                 bootstrap_contacts: vec!["iroh-bootstrap-contact".to_owned()],
                 gateway_urls: Vec::new(),
+                servicenet_urls: Vec::new(),
                 core_agent: CoreAgentConfig::default(),
             },
         )

@@ -1011,6 +1011,10 @@ fn ui_exposes_network_join_manifest() {
         "WATTSWARM_PUBLIC_DISCOVERY_URLS",
         "https://bootstrap.wattetheria.com/api/network/discovery",
     );
+    let _servicenet_guard = EnvVarGuard::set(
+        "WATTETHERIA_SERVICENET_URLS",
+        "https://servicenet.wattetheria.com",
+    );
     let dir = tempdir().unwrap();
     let state_dir = dir.path().join("state");
     std::fs::create_dir_all(&state_dir).unwrap();
@@ -1078,6 +1082,10 @@ fn ui_exposes_network_join_manifest() {
         assert_eq!(
             json["discovery_urls"][0].as_str(),
             Some("https://bootstrap.wattetheria.com/api/network/discovery")
+        );
+        assert_eq!(
+            json["servicenet_urls"][0].as_str(),
+            Some("https://servicenet.wattetheria.com")
         );
     });
 }

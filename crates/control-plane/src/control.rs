@@ -471,7 +471,10 @@ fn persist_join_manifest_startup_config(
     if !manifest.discovery_urls.is_empty() {
         let _ = save_discovery_bootnode_urls_state(state_dir, &manifest.discovery_urls)?;
     }
-    if manifest.bootstrap_contacts.is_empty() && manifest.gateway_urls.is_empty() {
+    if manifest.bootstrap_contacts.is_empty()
+        && manifest.gateway_urls.is_empty()
+        && manifest.servicenet_urls.is_empty()
+    {
         return Ok(());
     }
     fs::create_dir_all(state_dir)?;
@@ -496,6 +499,12 @@ fn persist_join_manifest_startup_config(
     }
     changed |= replace_manifest_bootstrap_contacts(&mut value, &manifest.bootstrap_contacts);
     changed |= replace_manifest_values(&mut value, "gateway_urls", &manifest.gateway_urls, true);
+    changed |= replace_manifest_values(
+        &mut value,
+        "servicenet_urls",
+        &manifest.servicenet_urls,
+        true,
+    );
     if changed {
         fs::write(&path, serde_json::to_vec_pretty(&value)?)?;
     }

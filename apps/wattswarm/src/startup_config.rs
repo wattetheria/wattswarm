@@ -87,6 +87,8 @@ pub struct StartupConfig {
     #[serde(default)]
     pub gateway_urls: Vec<String>,
     #[serde(default)]
+    pub servicenet_urls: Vec<String>,
+    #[serde(default)]
     pub core_agent: CoreAgentConfig,
 }
 
@@ -99,6 +101,7 @@ impl Default for StartupConfig {
             network_mode: NetworkMode::default(),
             bootstrap_contacts: Vec::new(),
             gateway_urls: Vec::new(),
+            servicenet_urls: Vec::new(),
             core_agent: CoreAgentConfig::default(),
         }
     }
@@ -123,9 +126,11 @@ impl StartupConfig {
         self.longitude = normalize_longitude(self.longitude);
         self.bootstrap_contacts = normalize_bootstrap_contacts(&self.bootstrap_contacts);
         self.gateway_urls = normalize_gateway_urls(&self.gateway_urls);
+        self.servicenet_urls = normalize_servicenet_urls(&self.servicenet_urls);
         if matches!(self.network_mode, NetworkMode::Local) {
             self.bootstrap_contacts.clear();
             self.gateway_urls.clear();
+            self.servicenet_urls.clear();
         }
         self.core_agent.provider = self.core_agent.provider.trim().to_owned();
         self.core_agent.base_url = self
@@ -199,6 +204,14 @@ fn normalize_bootstrap_contacts(values: &[String]) -> Vec<String> {
 }
 
 fn normalize_gateway_urls(values: &[String]) -> Vec<String> {
+    normalize_url_values(values)
+}
+
+fn normalize_servicenet_urls(values: &[String]) -> Vec<String> {
+    normalize_url_values(values)
+}
+
+fn normalize_url_values(values: &[String]) -> Vec<String> {
     let mut normalized = Vec::new();
     for value in values {
         let trimmed = value.trim().trim_end_matches('/');
