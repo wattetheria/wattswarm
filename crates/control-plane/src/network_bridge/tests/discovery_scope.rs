@@ -398,6 +398,32 @@ fn discovery_bootnode_query_without_local_geo_uses_capability_records() {
 }
 
 #[test]
+fn discovery_bootnode_query_timeout_allows_proxy_jitter() {
+    assert_eq!(DISCOVERY_BOOTNODE_QUERY_TIMEOUT, Duration::from_secs(10));
+}
+
+#[test]
+fn discovery_bootnode_query_failure_logging_suppresses_repeated_endpoint_failures() {
+    let endpoint = format!(
+        "https://example.invalid/api/network/discovery/nearby/{}",
+        Uuid::new_v4().simple()
+    );
+    reset_discovery_bootnode_failure_log_state(&endpoint);
+
+    assert_eq!(discovery_bootnode_failure_log_decision(&endpoint), Some(0));
+    for _ in 2..DISCOVERY_BOOTNODE_FAILURE_LOG_EVERY {
+        assert_eq!(discovery_bootnode_failure_log_decision(&endpoint), None);
+    }
+    assert_eq!(
+        discovery_bootnode_failure_log_decision(&endpoint),
+        Some(DISCOVERY_BOOTNODE_FAILURE_LOG_EVERY - 2)
+    );
+
+    reset_discovery_bootnode_failure_log_state(&endpoint);
+    assert_eq!(discovery_bootnode_failure_log_decision(&endpoint), Some(0));
+}
+
+#[test]
 fn scopes_to_request_for_peer_falls_back_to_all_scopes_until_peer_is_profiled() {
     let peer = random_network_node_id();
     let target_scope = SwarmScope::Region("sol-1".to_owned());

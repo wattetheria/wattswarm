@@ -21,6 +21,8 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      secrets:
+        - github_token
     container_name: wattswarm-kernel
     restart: unless-stopped
     depends_on:
@@ -58,6 +60,8 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      secrets:
+        - github_token
     container_name: wattswarm-runtime
     restart: unless-stopped
     entrypoint: ["/app/target/release/wattswarm-runtime"]
@@ -75,6 +79,8 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      secrets:
+        - github_token
     container_name: wattswarm-worker
     restart: unless-stopped
     depends_on:
@@ -116,3 +122,7 @@ services:
 volumes:
   wattswarm_pg_data:
   wattswarm_state_data:
+
+secrets:
+  github_token:
+    environment: GITHUB_TOKEN

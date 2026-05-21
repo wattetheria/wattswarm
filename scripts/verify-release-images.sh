@@ -30,6 +30,8 @@ require_file "$COMPOSE_FILE"
 require_file "$ENTRYPOINT"
 
 require_text "$DOCKERFILE" "cargo chef cook --release" "Docker builds must keep dependency caching"
+require_text "$DOCKERFILE" "--mount=type=secret,id=github_token" "Docker build must consume the GitHub token secret for private git dependencies"
+require_text "$DOCKERFILE" "CARGO_NET_GIT_FETCH_WITH_CLI=true" "Docker build must route Cargo git fetches through git CLI auth"
 require_text "$DOCKERFILE" "cargo build --release -p wattswarm --bin wattswarm --bin wattswarm-runtime" "Docker build must produce both release binaries"
 require_text "$DOCKERFILE" "/app/target/release/wattswarm" "final image must include the wattswarm CLI/kernel binary"
 require_text "$DOCKERFILE" "/app/target/release/wattswarm-runtime" "final image must include the runtime binary"
@@ -43,11 +45,13 @@ require_text "$ENTRYPOINT" '--store "${STORE_NAME}"' "kernel entrypoint must pas
 require_text "$COMPOSE_FILE" "wattswarm_state_data:/var/lib/wattswarm" "compose must persist Wattswarm state"
 require_text "$COMPOSE_FILE" "WATTSWARM_STATE_DIR: /var/lib/wattswarm" "compose must point services at persisted state"
 require_text "$COMPOSE_FILE" "WATTSWARM_STORE_NAME: wattswarm.state" "compose must keep the expected store name"
+require_text "$COMPOSE_FILE" "github_token:" "compose must declare the GitHub token build secret"
+require_text "$COMPOSE_FILE" "environment: GITHUB_TOKEN" "compose must source the build secret from GITHUB_TOKEN"
 require_text "$COMPOSE_FILE" 'entrypoint: ["/app/target/release/wattswarm-runtime"]' "runtime service must override the shared image entrypoint"
 require_text "$COMPOSE_FILE" 'entrypoint: ["/app/target/release/wattswarm"]' "worker service must override the shared image entrypoint"
 
 if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then
-  docker compose -f "$COMPOSE_FILE" config >/dev/null
+  GITHUB_TOKEN="${GITHUB_TOKEN:-release-image-check-placeholder}" docker compose -f "$COMPOSE_FILE" config >/dev/null
 fi
 
 echo "release image artifacts verified"

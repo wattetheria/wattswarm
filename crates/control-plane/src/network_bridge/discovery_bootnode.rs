@@ -26,6 +26,17 @@ struct DiscoveryBootnodeNearbyResponse {
     records: Vec<DiscoveryBootnodeRecordItem>,
 }
 
+#[derive(Debug, Default)]
+struct DiscoveryBootnodeFailureLogState {
+    consecutive_failures: u64,
+    suppressed_failures: u64,
+}
+
+type DiscoveryBootnodeFailureLogStates = HashMap<String, DiscoveryBootnodeFailureLogState>;
+
+static DISCOVERY_BOOTNODE_FAILURE_LOG_STATES: OnceLock<Mutex<DiscoveryBootnodeFailureLogStates>> =
+    OnceLock::new();
+
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
 enum DiscoveryBootnodeRecordItem {
@@ -48,6 +59,48 @@ impl DiscoveryBootnodeRecordItem {
 impl DiscoveryBootnodeSettings {
     pub(super) fn has_local_geo(&self) -> bool {
         self.latitude.is_some() && self.longitude.is_some()
+    }
+}
+
+fn discovery_bootnode_failure_log_states() -> &'static Mutex<DiscoveryBootnodeFailureLogStates> {
+    DISCOVERY_BOOTNODE_FAILURE_LOG_STATES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+pub(super) fn discovery_bootnode_failure_log_decision(endpoint: &str) -> Option<u64> {
+    let mut states = discovery_bootnode_failure_log_states()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let state = states.entry(endpoint.to_owned()).or_default();
+    state.consecutive_failures = state.consecutive_failures.saturating_add(1);
+    if state.consecutive_failures == 1
+        || state.consecutive_failures % DISCOVERY_BOOTNODE_FAILURE_LOG_EVERY == 0
+    {
+        let suppressed = state.suppressed_failures;
+        state.suppressed_failures = 0;
+        Some(suppressed)
+    } else {
+        state.suppressed_failures = state.suppressed_failures.saturating_add(1);
+        None
+    }
+}
+
+pub(super) fn reset_discovery_bootnode_failure_log_state(endpoint: &str) {
+    let mut states = discovery_bootnode_failure_log_states()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    states.remove(endpoint);
+}
+
+fn log_discovery_bootnode_query_failure(endpoint: &str, error: &reqwest::Error) {
+    let Some(suppressed) = discovery_bootnode_failure_log_decision(endpoint) else {
+        return;
+    };
+    if suppressed > 0 {
+        eprintln!(
+            "discovery bootnode query failed {endpoint}: {error:#} (suppressed {suppressed} repeated failures)"
+        );
+    } else {
+        eprintln!("discovery bootnode query failed {endpoint}: {error:#}");
     }
 }
 
@@ -151,6 +204,7 @@ pub(super) fn query_discovery_bootnodes_for_candidate_records(
             Ok(response) => match response.error_for_status() {
                 Ok(response) => match response.json::<DiscoveryBootnodeNearbyResponse>() {
                     Ok(payload) => {
+                        reset_discovery_bootnode_failure_log_state(&endpoint);
                         for item in payload.records {
                             let record = item.into_record();
                             if record.verify_fresh_at(now_ms).is_ok()
@@ -165,9 +219,9 @@ pub(super) fn query_discovery_bootnodes_for_candidate_records(
                         eprintln!("discovery bootnode response decode failed {endpoint}: {error:#}")
                     }
                 },
-                Err(error) => eprintln!("discovery bootnode query failed {endpoint}: {error:#}"),
+                Err(error) => log_discovery_bootnode_query_failure(&endpoint, &error),
             },
-            Err(error) => eprintln!("discovery bootnode query failed {endpoint}: {error:#}"),
+            Err(error) => log_discovery_bootnode_query_failure(&endpoint, &error),
         }
     }
     Ok(records)

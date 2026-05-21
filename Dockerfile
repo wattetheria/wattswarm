@@ -2,6 +2,8 @@ FROM rust:1.93-bookworm AS chef
 
 WORKDIR /app
 
+ENV CARGO_NET_GIT_FETCH_WITH_CLI=true
+
 RUN cargo install cargo-chef --locked
 
 FROM chef AS dev
@@ -76,8 +78,13 @@ FROM chef AS cacher
 COPY --from=planner /app/recipe.json /app/recipe.json
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
-    cargo chef cook --release --recipe-path recipe.json \
-    -p wattswarm --bin wattswarm --bin wattswarm-runtime
+    --mount=type=secret,id=github_token \
+    if [ -f /run/secrets/github_token ]; then \
+      git config --global url."https://$(cat /run/secrets/github_token)@github.com/".insteadOf "https://github.com/"; \
+    fi \
+    && cargo chef cook --release --recipe-path recipe.json \
+    -p wattswarm --bin wattswarm --bin wattswarm-runtime \
+    && rm -f /root/.gitconfig
 
 FROM chef AS builder
 
@@ -90,7 +97,12 @@ RUN sed -i \
 
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
-    cargo build --release -p wattswarm --bin wattswarm --bin wattswarm-runtime
+    --mount=type=secret,id=github_token \
+    if [ -f /run/secrets/github_token ]; then \
+      git config --global url."https://$(cat /run/secrets/github_token)@github.com/".insteadOf "https://github.com/"; \
+    fi \
+    && cargo build --release -p wattswarm --bin wattswarm --bin wattswarm-runtime \
+    && rm -f /root/.gitconfig
 
 FROM debian:bookworm-slim
 

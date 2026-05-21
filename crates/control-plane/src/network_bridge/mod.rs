@@ -98,6 +98,10 @@ use discovery_bootnode::{
     query_discovery_bootnodes_for_candidate_records,
 };
 #[cfg(test)]
+use discovery_bootnode::{
+    discovery_bootnode_failure_log_decision, reset_discovery_bootnode_failure_log_state,
+};
+#[cfg(test)]
 use peer_interactions::payment_allowed_actions;
 use peer_interactions::{
     PendingContactMaterialRequest, PendingPeerDirectMessageRequest, PendingPeerRelationshipRequest,
@@ -148,7 +152,8 @@ const DEFAULT_P2P_PORT: u16 = 4001;
 const DEFAULT_DISCOVERY_GEO_RADIUS_KM: f64 = 1000.0;
 const DEFAULT_DISCOVERY_BOOTNODE_QUERY_INTERVAL: Duration = Duration::from_secs(30);
 const DISCOVERY_BOOTNODE_QUERY_LIMIT: usize = 50;
-const DISCOVERY_BOOTNODE_QUERY_TIMEOUT: Duration = Duration::from_secs(3);
+const DISCOVERY_BOOTNODE_QUERY_TIMEOUT: Duration = Duration::from_secs(10);
+const DISCOVERY_BOOTNODE_FAILURE_LOG_EVERY: u64 = 10;
 const DISCOVERY_NODE_CAPABILITY: &str = "wattswarm.node";
 const GLOBAL_HIGH_FREQUENCY_WINDOW: Duration = Duration::from_secs(5);
 const GLOBAL_HIGH_FREQUENCY_LIMIT: usize = 32;
