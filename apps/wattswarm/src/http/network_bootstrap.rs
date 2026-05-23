@@ -10,7 +10,6 @@ const ENV_PUBLIC_BOOTSTRAP_URLS: &str = "WATTSWARM_PUBLIC_BOOTSTRAP_URLS";
 const ENV_PUBLIC_BOOTSTRAP_CONTACTS: &str = "WATTSWARM_PUBLIC_BOOTSTRAP_CONTACTS";
 const ENV_PUBLIC_GATEWAY_URLS: &str = "WATTSWARM_PUBLIC_GATEWAY_URLS";
 const ENV_PUBLIC_DISCOVERY_URLS: &str = "WATTSWARM_PUBLIC_DISCOVERY_URLS";
-const ENV_WATTETHERIA_SERVICENET_URLS: &str = "WATTETHERIA_SERVICENET_URLS";
 const ENV_IROH_RELAY_URLS: &str = "WATTSWARM_IROH_RELAY_URLS";
 const ENV_IROH_PUBLISH_DIRECT_ADDRS: &str = "WATTSWARM_IROH_PUBLISH_DIRECT_ADDRS";
 
@@ -78,7 +77,6 @@ pub(crate) async fn network_join_manifest(
             bootstrap_contacts,
             gateway_urls: split_public_manifest_values(ENV_PUBLIC_GATEWAY_URLS),
             discovery_urls: split_public_manifest_values(ENV_PUBLIC_DISCOVERY_URLS),
-            servicenet_urls: split_public_manifest_values(ENV_WATTETHERIA_SERVICENET_URLS),
         })
     })
     .await?;

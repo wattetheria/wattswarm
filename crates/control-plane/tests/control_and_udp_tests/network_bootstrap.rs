@@ -332,10 +332,6 @@ fn open_node_network_mode_auto_syncs_signed_bundle_from_join_manifest() {
             "https://bootstrap.wattetheria.com/api/network/discovery/".to_owned(),
             "https://bootstrap.wattetheria.com/api/network/discovery".to_owned(),
         ],
-        servicenet_urls: vec![
-            "https://servicenet.wattetheria.com/".to_owned(),
-            "https://servicenet.wattetheria.com".to_owned(),
-        ],
     };
     let bootstrap_stub = BootstrapBundleStub::start_with_manifest(bundle.clone(), Some(manifest));
     let _local_schema_guard = EnvVarGuard::set("WATTSWARM_PG_SCHEMA", &local_schema);
@@ -411,17 +407,7 @@ fn open_node_network_mode_auto_syncs_signed_bundle_from_join_manifest() {
             .expect("load discovery urls"),
         vec!["https://bootstrap.wattetheria.com/api/network/discovery".to_owned()]
     );
-    assert_eq!(
-        startup_config["servicenet_urls"]
-            .as_array()
-            .expect("servicenet urls")
-            .len(),
-        1
-    );
-    assert_eq!(
-        startup_config["servicenet_urls"][0].as_str(),
-        Some("https://servicenet.wattetheria.com")
-    );
+    assert!(startup_config.get("servicenet_urls").is_none());
 
     cleanup_dir(&dir);
 }
@@ -478,7 +464,6 @@ fn open_node_network_mode_rejects_join_manifest_params_hash_mismatch() {
         bootstrap_contacts: Vec::new(),
         gateway_urls: Vec::new(),
         discovery_urls: Vec::new(),
-        servicenet_urls: Vec::new(),
     };
     let bootstrap_stub = BootstrapBundleStub::start_with_manifest(bundle, Some(manifest));
     let _local_schema_guard = EnvVarGuard::set("WATTSWARM_PG_SCHEMA", &local_schema);
