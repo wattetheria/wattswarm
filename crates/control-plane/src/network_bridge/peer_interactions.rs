@@ -1,6 +1,14 @@
 use super::*;
 use watt_did::{Did, VerifiedAgentContext};
 
+const PENDING_NETWORK_COMMAND_INITIAL_RETRY_MS: i64 = 5_000;
+const PENDING_NETWORK_COMMAND_MAX_RETRY_MS: i64 = 60_000;
+const PENDING_NETWORK_COMMAND_MAX_ATTEMPTS: u32 = 10;
+
+fn is_zero(value: &u32) -> bool {
+    *value == 0
+}
+
 pub(super) fn wire_peer_relationship_action(
     action: crate::control::PeerRelationshipAction,
 ) -> RawPeerRelationshipAction {
@@ -59,18 +67,102 @@ enum PendingNetworkCommand {
         remote_node_id: String,
         action: crate::control::PeerRelationshipAction,
         agent_envelope: RawAgentEnvelope,
+        #[serde(default, skip_serializing_if = "is_zero")]
+        attempts: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        next_retry_at: Option<i64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        last_error: Option<String>,
     },
     PeerDirectMessage {
         remote_node_id: String,
         agent_envelope: RawAgentEnvelope,
         content: Value,
+        #[serde(default, skip_serializing_if = "is_zero")]
+        attempts: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        next_retry_at: Option<i64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        last_error: Option<String>,
     },
     AgentPayment {
         remote_node_id: String,
         message_kind: String,
         payment: Value,
         agent_envelope: RawAgentEnvelope,
+        #[serde(default, skip_serializing_if = "is_zero")]
+        attempts: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        next_retry_at: Option<i64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        last_error: Option<String>,
     },
+}
+
+impl PendingNetworkCommand {
+    fn is_due(&self, now_ms: i64) -> bool {
+        self.next_retry_at().is_none_or(|next| next <= now_ms)
+    }
+
+    fn next_retry_at(&self) -> Option<i64> {
+        match self {
+            Self::PeerRelationship { next_retry_at, .. }
+            | Self::PeerDirectMessage { next_retry_at, .. }
+            | Self::AgentPayment { next_retry_at, .. } => *next_retry_at,
+        }
+    }
+
+    fn remote_node_id(&self) -> &str {
+        match self {
+            Self::PeerRelationship { remote_node_id, .. }
+            | Self::PeerDirectMessage { remote_node_id, .. }
+            | Self::AgentPayment { remote_node_id, .. } => remote_node_id,
+        }
+    }
+
+    fn attempts(&self) -> u32 {
+        match self {
+            Self::PeerRelationship { attempts, .. }
+            | Self::PeerDirectMessage { attempts, .. }
+            | Self::AgentPayment { attempts, .. } => *attempts,
+        }
+    }
+
+    fn record_failure(&mut self, error: &str, now_ms: i64) {
+        let next_attempts = self.attempts().saturating_add(1);
+        let delay = PENDING_NETWORK_COMMAND_INITIAL_RETRY_MS
+            .saturating_mul(2_i64.saturating_pow(next_attempts.saturating_sub(1)))
+            .min(PENDING_NETWORK_COMMAND_MAX_RETRY_MS);
+        let next_retry_at = Some(now_ms.saturating_add(delay));
+        match self {
+            Self::PeerRelationship {
+                attempts,
+                next_retry_at: retry_at,
+                last_error,
+                ..
+            }
+            | Self::PeerDirectMessage {
+                attempts,
+                next_retry_at: retry_at,
+                last_error,
+                ..
+            }
+            | Self::AgentPayment {
+                attempts,
+                next_retry_at: retry_at,
+                last_error,
+                ..
+            } => {
+                *attempts = next_attempts;
+                *retry_at = next_retry_at;
+                *last_error = Some(error.to_owned());
+            }
+        }
+    }
+
+    fn should_abandon(&self) -> bool {
+        self.attempts() >= PENDING_NETWORK_COMMAND_MAX_ATTEMPTS
+    }
 }
 
 fn pending_network_commands_path(state_dir: &Path) -> PathBuf {
@@ -105,6 +197,9 @@ pub fn enqueue_peer_relationship_action_command(
             remote_node_id: remote_node_id.trim().to_owned(),
             action,
             agent_envelope,
+            attempts: 0,
+            next_retry_at: None,
+            last_error: None,
         },
     )
 }
@@ -121,6 +216,9 @@ pub fn enqueue_peer_direct_message_command(
             remote_node_id: remote_node_id.trim().to_owned(),
             agent_envelope,
             content,
+            attempts: 0,
+            next_retry_at: None,
+            last_error: None,
         },
     )
 }
@@ -139,6 +237,9 @@ pub fn enqueue_agent_payment_command(
             message_kind: message_kind.trim().to_owned(),
             payment,
             agent_envelope,
+            attempts: 0,
+            next_retry_at: None,
+            last_error: None,
         },
     )
 }
@@ -712,24 +813,37 @@ pub(super) fn process_pending_network_commands(
     if content.trim().is_empty() {
         return Ok(0);
     }
+    let now_ms = observed_at_ms() as i64;
+    let has_due_command = content.lines().any(|line| {
+        serde_json::from_str::<PendingNetworkCommand>(line.trim())
+            .is_ok_and(|command| command.is_due(now_ms))
+    });
+    if !has_due_command {
+        return Ok(0);
+    }
     fs::write(&pending_path, "")?;
 
     let mut processed = 0_u64;
-    let mut failed = Vec::new();
+    let mut retry = Vec::new();
     for line in content.lines() {
         let line = line.trim();
         if line.is_empty() {
             continue;
         }
-        let command: PendingNetworkCommand = match serde_json::from_str(line) {
+        let mut command: PendingNetworkCommand = match serde_json::from_str(line) {
             Ok(value) => value,
             Err(_) => continue,
         };
-        let result = match command {
+        if !command.is_due(now_ms) {
+            retry.push(line.to_owned());
+            continue;
+        }
+        let result = match command.clone() {
             PendingNetworkCommand::PeerRelationship {
                 remote_node_id,
                 action,
                 agent_envelope,
+                ..
             } => service
                 .send_peer_relationship_action(&remote_node_id, action, Some(agent_envelope))
                 .map(|_| ()),
@@ -737,6 +851,7 @@ pub(super) fn process_pending_network_commands(
                 remote_node_id,
                 agent_envelope,
                 content,
+                ..
             } => service
                 .send_peer_direct_message(&remote_node_id, Some(agent_envelope), content)
                 .map(|_| ()),
@@ -745,6 +860,7 @@ pub(super) fn process_pending_network_commands(
                 message_kind,
                 payment,
                 agent_envelope,
+                ..
             } => {
                 let mut summary = build_agent_payment_summary(
                     &remote_node_id,
@@ -759,13 +875,27 @@ pub(super) fn process_pending_network_commands(
         match result {
             Ok(()) => processed += 1,
             Err(err) => {
-                eprintln!("network_bridge: failed to process queued network command: {err:#}");
-                failed.push(line.to_owned());
+                let error = format!("{err:#}");
+                command.record_failure(&error, now_ms);
+                if command.should_abandon() {
+                    eprintln!(
+                        "network_bridge: abandoning queued network command after {} attempts for {}: {error}",
+                        command.attempts(),
+                        command.remote_node_id()
+                    );
+                } else {
+                    if command.attempts() == 1 {
+                        eprintln!(
+                            "network_bridge: failed to process queued network command: {error}"
+                        );
+                    }
+                    retry.push(serde_json::to_string(&command)?);
+                }
             }
         }
     }
-    if !failed.is_empty() {
-        let mut retry = failed.join("\n");
+    if !retry.is_empty() {
+        let mut retry = retry.join("\n");
         retry.push('\n');
         let _ = std::fs::OpenOptions::new()
             .create(true)
@@ -976,5 +1106,48 @@ mod tests {
             payload_with_verified_agent_context(json!({"summary_id": "s"}), None).expect("payload");
         assert!(payload.get(VERIFIED_AGENT_CONTEXT_PAYLOAD_KEY).is_none());
         assert_eq!(payload.get("summary_id").and_then(Value::as_str), Some("s"));
+    }
+
+    #[test]
+    fn pending_network_command_defaults_retry_metadata_for_legacy_lines() {
+        let command: PendingNetworkCommand = serde_json::from_value(json!({
+            "kind": "peer_relationship",
+            "remote_node_id": "node-a",
+            "action": "request",
+            "agent_envelope": {
+                "protocol": "google_a2a",
+                "message": {}
+            }
+        }))
+        .expect("legacy command parses");
+
+        assert_eq!(command.attempts(), 0);
+        assert!(command.is_due(100));
+        assert_eq!(command.next_retry_at(), None);
+    }
+
+    #[test]
+    fn pending_network_command_failure_sets_retry_backoff() {
+        let mut command: PendingNetworkCommand = serde_json::from_value(json!({
+            "kind": "peer_direct_message",
+            "remote_node_id": "node-a",
+            "agent_envelope": {
+                "protocol": "google_a2a",
+                "message": {}
+            },
+            "content": {"text": "hello"}
+        }))
+        .expect("command parses");
+
+        command.record_failure("not connected", 1_000);
+
+        assert_eq!(command.attempts(), 1);
+        assert_eq!(
+            command.next_retry_at(),
+            Some(1_000 + PENDING_NETWORK_COMMAND_INITIAL_RETRY_MS)
+        );
+        assert!(!command.is_due(1_001));
+        assert!(command.is_due(1_000 + PENDING_NETWORK_COMMAND_INITIAL_RETRY_MS));
+        assert!(!command.should_abandon());
     }
 }

@@ -142,6 +142,7 @@ const IDLE_NETWORK_SLEEP: Duration = Duration::from_millis(50);
 const ANNOUNCED_PEER_TTL: Duration = Duration::from_secs(60 * 60);
 const PEER_RECONNECT_INITIAL_DELAY: Duration = Duration::from_secs(1);
 const PEER_RECONNECT_MAX_DELAY: Duration = Duration::from_secs(60);
+const PEER_RECONNECT_MAX_ATTEMPTS: u32 = 10;
 
 const ENV_P2P_ENABLED: &str = "WATTSWARM_P2P_ENABLED";
 const ENV_P2P_LOCAL_DISCOVERY: &str = "WATTSWARM_P2P_MDNS";
@@ -418,6 +419,10 @@ impl PeerReconnectState {
             .saturating_mul(2_u64.saturating_pow(self.attempts.saturating_sub(1)))
             .min(PEER_RECONNECT_MAX_DELAY.as_secs());
         self.next_attempt_at = now + Duration::from_secs(delay_secs);
+    }
+
+    fn should_abandon(&self) -> bool {
+        self.attempts >= PEER_RECONNECT_MAX_ATTEMPTS
     }
 }
 
@@ -859,6 +864,7 @@ pub struct NetworkBridgeService {
     connected_peers: HashSet<NetworkNodeId>,
     known_peer_addrs: HashMap<NetworkNodeId, NetworkAddress>,
     peer_reconnect_state: HashMap<NetworkNodeId, PeerReconnectState>,
+    abandoned_reconnect_peers: HashSet<NetworkNodeId>,
     global_publish_rate_guard: GlobalPublishRateGuard,
     anti_entropy_interval: Duration,
     backfill_retry_after: Duration,
@@ -910,6 +916,7 @@ impl NetworkBridgeService {
             connected_peers: HashSet::new(),
             known_peer_addrs: HashMap::new(),
             peer_reconnect_state: HashMap::new(),
+            abandoned_reconnect_peers: HashSet::new(),
             global_publish_rate_guard: GlobalPublishRateGuard::new(Instant::now()),
             anti_entropy_interval: Duration::from_secs(protocol_params.anti_entropy_interval_secs),
             backfill_retry_after: Duration::from_secs(protocol_params.backfill_retry_after_secs),
@@ -1048,6 +1055,18 @@ impl NetworkBridgeService {
         self.peer_reconnect_state
             .get(peer)
             .map(|state| state.attempts)
+    }
+
+    #[cfg(test)]
+    pub fn reconnect_abandoned_for_peer(&self, peer: &NetworkNodeId) -> bool {
+        self.abandoned_reconnect_peers.contains(peer)
+    }
+
+    #[cfg(test)]
+    pub fn force_reconnect_due_for_peer(&mut self, peer: &NetworkNodeId) {
+        if let Some(state) = self.peer_reconnect_state.get_mut(peer) {
+            state.next_attempt_at = Instant::now();
+        }
     }
 
     pub fn subscribe_scope(&mut self, scope: &SwarmScope) -> Result<()> {

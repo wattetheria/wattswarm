@@ -932,6 +932,67 @@ fn reconnect_supervision_redials_remembered_peer_address() {
 }
 
 #[test]
+fn reconnect_supervision_abandons_stale_peer_until_rediscovered() {
+    let local_dir = temp_startup_dir("reconnect-abandon-local");
+    let remote_dir = temp_startup_dir("reconnect-abandon-remote");
+    let local_seed = [107u8; 32];
+    let remote_seed = [108u8; 32];
+    std::fs::write(local_dir.join("node_seed.hex"), hex::encode(local_seed))
+        .expect("write local seed");
+    std::fs::write(remote_dir.join("node_seed.hex"), hex::encode(remote_seed))
+        .expect("write remote seed");
+    let remote_endpoint =
+        wattswarm_network_transport_iroh::local_endpoint_id_from_state_dir(&remote_dir)
+            .expect("remote endpoint")
+            .to_string();
+    let peer = NetworkNodeId::new(remote_endpoint).expect("remote peer id");
+    let address = NetworkAddress::new("127.0.0.1:4002".to_owned()).expect("address");
+    let mut service = NetworkBridgeService::new(
+        NetworkP2pNode::from_iroh_state_dir(
+            NetworkP2pConfig::default(),
+            local_dir.clone(),
+            local_seed,
+        )
+        .expect("iroh node"),
+        &[SwarmScope::Global],
+        &NetworkProtocolParams::default(),
+    )
+    .expect("service");
+
+    service.remember_peer_address(peer.clone(), address.clone());
+    for _ in 0..PEER_RECONNECT_MAX_ATTEMPTS {
+        let attempts = service
+            .run_reconnect_supervision()
+            .expect("run reconnect supervision");
+        assert_eq!(attempts, 1);
+        service.force_reconnect_due_for_peer(&peer);
+    }
+
+    assert!(service.reconnect_abandoned_for_peer(&peer));
+    assert_eq!(service.reconnect_attempts_for_peer(&peer), None);
+    assert_eq!(
+        service
+            .run_reconnect_supervision()
+            .expect("abandoned peer is not retried"),
+        0
+    );
+
+    service.remember_peer_address(peer.clone(), address);
+    assert!(!service.reconnect_abandoned_for_peer(&peer));
+    assert_eq!(
+        service
+            .run_reconnect_supervision()
+            .expect("rediscovered peer is retried"),
+        1
+    );
+
+    wattswarm_network_transport_iroh::shutdown_local_iroh_data_plane(&local_dir);
+    wattswarm_network_transport_iroh::shutdown_local_iroh_data_plane(&remote_dir);
+    std::fs::remove_dir_all(local_dir).expect("cleanup local");
+    std::fs::remove_dir_all(remote_dir).expect("cleanup remote");
+}
+
+#[test]
 fn reconnect_supervision_rejoins_relay_only_bootstrap_contact() {
     let local_dir = temp_startup_dir("reconnect-relay-only-local");
     let remote_dir = temp_startup_dir("reconnect-relay-only-remote");

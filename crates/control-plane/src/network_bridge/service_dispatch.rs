@@ -7,22 +7,17 @@ impl NetworkBridgeService {
         action: crate::control::PeerRelationshipAction,
         agent_envelope: Option<RawAgentEnvelope>,
     ) -> Result<PeerRelationshipRequestId> {
-        let Some(state_dir) = &self.state_dir else {
+        let Some(state_dir) = self.state_dir.clone() else {
             bail!("peer relationship actions require state_dir to be configured");
         };
-        let remote_node_id = remote_node_id.trim();
-        if remote_node_id.is_empty() {
-            bail!("remote_node_id is required");
-        }
-        let peer = remote_node_id
-            .parse::<NetworkNodeId>()
-            .map_err(|err| anyhow!("parse remote_node_id as iroh node id: {err}"))?;
-        if !self.connected_peers.contains(&peer) {
-            bail!("peer relationship actions require a connected peer");
-        }
-        let relationship_record = crate::control::apply_peer_relationship_action_state(
-            state_dir,
+        let (remote_node_id, peer) = self.connected_peer_for_operation(
+            &state_dir,
             remote_node_id,
+            "peer relationship actions",
+        )?;
+        let relationship_record = crate::control::apply_peer_relationship_action_state(
+            &state_dir,
+            &remote_node_id,
             action,
             crate::control::PeerRelationshipInitiator::Local,
         )?;
@@ -39,11 +34,11 @@ impl NetworkBridgeService {
         let envelope = agent_envelope.unwrap_or_else(|| {
             default_agent_envelope(
                 &local_node_id,
-                remote_node_id,
+                &remote_node_id,
                 capability,
                 json!({
                     "action": wire_peer_relationship_action(action),
-                    "remote_node_id": remote_node_id,
+                    "remote_node_id": remote_node_id.clone(),
                 }),
             )
         });
@@ -52,8 +47,8 @@ impl NetworkBridgeService {
                 == crate::control::PeerRelationshipState::Accepted
         {
             self.finalize_dm_session_from_relationship(
-                state_dir,
-                remote_node_id,
+                &state_dir,
+                &remote_node_id,
                 crate::control::PeerDmDirection::Outbound,
                 &envelope.protocol,
                 relationship_record.updated_at,
@@ -63,7 +58,7 @@ impl NetworkBridgeService {
             &peer,
             PeerRelationshipRequest {
                 source_node_id: local_node_id,
-                target_node_id: remote_node_id.to_owned(),
+                target_node_id: remote_node_id.clone(),
                 action: wire_peer_relationship_action(action),
                 agent_envelope: Some(envelope),
             },
@@ -72,7 +67,7 @@ impl NetworkBridgeService {
             request_id,
             PendingPeerRelationshipRequest {
                 peer,
-                remote_node_id: remote_node_id.to_owned(),
+                remote_node_id,
                 action,
             },
         );
@@ -86,26 +81,24 @@ impl NetworkBridgeService {
         let Some(state_dir) = self.state_dir.clone() else {
             bail!("contact material requests require state_dir to be configured");
         };
-        let peer = remote_node_id
-            .parse::<NetworkNodeId>()
-            .map_err(|err| anyhow!("parse remote_node_id as iroh node id: {err}"))?;
-        self.ensure_peer_connected(&state_dir, &peer, remote_node_id)?;
-        if !self.connected_peers.contains(&peer) {
-            bail!("contact material requests require a connected peer");
-        }
+        let (remote_node_id, peer) = self.connected_peer_for_operation(
+            &state_dir,
+            remote_node_id,
+            "contact material requests",
+        )?;
         let local_node_id = self.local_peer_id().to_string();
         let request_id = self.runtime.send_contact_material_request(
             &peer,
             RawContactMaterialRequest {
                 source_node_id: local_node_id,
-                target_node_id: remote_node_id.to_owned(),
+                target_node_id: remote_node_id.clone(),
             },
         )?;
         self.pending_contact_material_requests.insert(
             request_id,
             PendingContactMaterialRequest {
                 peer,
-                remote_node_id: remote_node_id.to_owned(),
+                remote_node_id,
             },
         );
         Ok(request_id)
@@ -125,21 +118,10 @@ impl NetworkBridgeService {
         {
             bail!("peer direct messages require an accepted relationship");
         }
-        let remote_node_id = remote_node_id.trim();
-        if remote_node_id.is_empty() {
-            bail!("remote_node_id is required");
-        }
-        let peer = remote_node_id
-            .parse::<NetworkNodeId>()
-            .map_err(|err| anyhow!("parse remote_node_id as iroh node id: {err}"))?;
-        if !self.connected_peers.contains(&peer) {
-            self.ensure_peer_connected(&state_dir, &peer, remote_node_id)?;
-        }
-        if !self.connected_peers.contains(&peer) {
-            bail!("peer direct messages require a connected peer");
-        }
+        let (remote_node_id, peer) =
+            self.connected_peer_for_operation(&state_dir, remote_node_id, "peer direct messages")?;
         let local_node_id = self.local_peer_id().to_string();
-        let thread_id = peer_dm_thread_id(&local_node_id, remote_node_id);
+        let thread_id = peer_dm_thread_id(&local_node_id, &remote_node_id);
         let thread = crate::control::load_peer_dm_thread_records_state(&state_dir)?
             .into_iter()
             .find(|record| record.thread_id == thread_id)
@@ -158,7 +140,7 @@ impl NetworkBridgeService {
         let envelope = agent_envelope.unwrap_or_else(|| {
             default_agent_envelope(
                 &local_node_id,
-                remote_node_id,
+                &remote_node_id,
                 "peer.dm.message",
                 content.clone(),
             )
@@ -166,7 +148,7 @@ impl NetworkBridgeService {
         let a2a_protocol = envelope.protocol.clone();
         save_dm_message(
             &state_dir,
-            remote_node_id,
+            &remote_node_id,
             &thread_id,
             &message_id,
             crate::control::PeerDmMessageKind::Message,
@@ -181,7 +163,7 @@ impl NetworkBridgeService {
             &state_dir,
             "dm_message",
             &message_id,
-            Some(remote_node_id),
+            Some(&remote_node_id),
             "iroh_direct",
             "content_materialized",
             None,
@@ -190,7 +172,7 @@ impl NetworkBridgeService {
             &peer,
             PeerDirectMessageRequest {
                 source_node_id: local_node_id,
-                target_node_id: remote_node_id.to_owned(),
+                target_node_id: remote_node_id.clone(),
                 thread_id: thread_id.clone(),
                 message_id: message_id.clone(),
                 kind: RawPeerDirectMessageKind::Message,
@@ -204,7 +186,7 @@ impl NetworkBridgeService {
             &state_dir,
             "dm_message",
             &message_id,
-            Some(remote_node_id),
+            Some(&remote_node_id),
             "iroh_control",
             "control_sent",
             None,
@@ -213,7 +195,7 @@ impl NetworkBridgeService {
             request_id,
             PendingPeerDirectMessageRequest {
                 peer,
-                remote_node_id: remote_node_id.to_owned(),
+                remote_node_id,
                 thread_id,
                 message_id,
                 kind: crate::control::PeerDmMessageKind::Message,
@@ -446,6 +428,29 @@ impl NetworkBridgeService {
             }
         }
         Ok(())
+    }
+
+    fn connected_peer_for_operation(
+        &mut self,
+        state_dir: &Path,
+        remote_node_id: &str,
+        operation: &str,
+    ) -> Result<(String, NetworkNodeId)> {
+        let remote_node_id = remote_node_id.trim();
+        if remote_node_id.is_empty() {
+            bail!("remote_node_id is required");
+        }
+        let peer = remote_node_id
+            .parse::<NetworkNodeId>()
+            .map_err(|err| anyhow!("parse remote_node_id as iroh node id: {err}"))?;
+        if !self.connected_peers.contains(&peer) {
+            self.ensure_peer_connected(state_dir, &peer, remote_node_id)?;
+        }
+        if !self.connected_peers.contains(&peer) {
+            self.schedule_peer_reconnect(peer.clone());
+            bail!("{operation} require a connected peer");
+        }
+        Ok((remote_node_id.to_owned(), peer))
     }
 
     pub fn publish_event_for_scope(

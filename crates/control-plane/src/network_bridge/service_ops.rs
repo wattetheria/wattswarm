@@ -494,6 +494,7 @@ impl NetworkBridgeService {
             .entry(peer.clone())
             .or_insert_with(|| PeerSyncState::new(Instant::now()));
         self.peer_reconnect_state.remove(&peer);
+        self.abandoned_reconnect_peers.remove(&peer);
         self.persist_peer_sync_state();
         inserted
     }
@@ -512,6 +513,7 @@ impl NetworkBridgeService {
     }
 
     pub(crate) fn remember_peer_address(&mut self, peer: NetworkNodeId, address: NetworkAddress) {
+        self.abandoned_reconnect_peers.remove(&peer);
         self.known_peer_addrs.insert(peer.clone(), address);
         self.peer_reconnect_state
             .entry(peer)
@@ -536,6 +538,9 @@ impl NetworkBridgeService {
     }
 
     pub(crate) fn schedule_peer_reconnect(&mut self, peer: NetworkNodeId) {
+        if self.abandoned_reconnect_peers.contains(&peer) {
+            return;
+        }
         if self.known_peer_addrs.contains_key(&peer)
             || self.runtime.allows_outbound_backfill_to(&peer)
         {
@@ -561,6 +566,7 @@ impl NetworkBridgeService {
                     .get(peer)
                     .is_none_or(|state| state.next_attempt_at <= now)
             })
+            .filter(|peer| !self.abandoned_reconnect_peers.contains(peer))
             .collect::<Vec<_>>();
         let mut attempts = 0usize;
         for peer in peers {
@@ -589,11 +595,14 @@ impl NetworkBridgeService {
                         }
                     })
             };
-            let state = self
-                .peer_reconnect_state
-                .entry(peer.clone())
-                .or_insert_with(PeerReconnectState::ready_now);
-            state.schedule_next_attempt(now);
+            let reconnect_attempts = {
+                let state = self
+                    .peer_reconnect_state
+                    .entry(peer.clone())
+                    .or_insert_with(PeerReconnectState::ready_now);
+                state.schedule_next_attempt(now);
+                state.attempts
+            };
             attempts += 1;
             match result {
                 Ok(()) => {
@@ -611,7 +620,7 @@ impl NetworkBridgeService {
                         .details(json!({
                             "address": reconnect_address.as_ref().map(ToString::to_string),
                             "route": reconnect_route,
-                            "attempts": state.attempts,
+                            "attempts": reconnect_attempts,
                         })),
                     );
                 }
@@ -630,14 +639,55 @@ impl NetworkBridgeService {
                         .details(json!({
                             "address": reconnect_address.as_ref().map(ToString::to_string),
                             "route": reconnect_route,
-                            "attempts": state.attempts,
+                            "attempts": reconnect_attempts,
                             "error": err.to_string(),
                         })),
                     );
                 }
             }
+            if self
+                .peer_reconnect_state
+                .get(&peer)
+                .is_some_and(PeerReconnectState::should_abandon)
+            {
+                self.abandon_peer_reconnect(
+                    peer,
+                    reconnect_attempts,
+                    reconnect_route,
+                    reconnect_address,
+                );
+            }
         }
         Ok(attempts)
+    }
+
+    fn abandon_peer_reconnect(
+        &mut self,
+        peer: NetworkNodeId,
+        attempts: u32,
+        route: &str,
+        address: Option<NetworkAddress>,
+    ) {
+        self.peer_reconnect_state.remove(&peer);
+        self.known_peer_addrs.remove(&peer);
+        self.abandoned_reconnect_peers.insert(peer.clone());
+        diagnostics::record_diagnostic(
+            self.state_dir.as_deref(),
+            diagnostics::DiagnosticEvent::new(
+                "warn",
+                "transport",
+                "reconnect.abandoned",
+                "abandoned",
+                format!("peer reconnect abandoned: {peer}"),
+            )
+            .object("peer", Some(peer.to_string()))
+            .source_node_id(Some(peer.to_string()))
+            .details(json!({
+                "address": address.as_ref().map(ToString::to_string),
+                "route": route,
+                "attempts": attempts,
+            })),
+        );
     }
 
     pub(crate) fn mark_backfill_completed(
