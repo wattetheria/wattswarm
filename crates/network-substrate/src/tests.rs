@@ -93,16 +93,11 @@ fn backfill_response_validate_enforces_bounds() {
 
 #[test]
 fn raw_control_request_and_response_validate_payloads() {
-    let invalid_request = RawControlRequest::PeerDirectMessage(RawPeerDirectMessageRequest {
-        source_node_id: "node-a".to_owned(),
+    let invalid_request = RawControlRequest::PeerRelationship(RawPeerRelationshipRequest {
+        source_node_id: String::new(),
         target_node_id: "node-b".to_owned(),
-        thread_id: "thread-1".to_owned(),
-        message_id: "message-1".to_owned(),
-        kind: RawPeerDirectMessageKind::Message,
+        action: RawPeerRelationshipAction::Request,
         agent_envelope: None,
-        contact_material: None,
-        content_ref: None,
-        control_json: None,
     });
     assert!(invalid_request.validate(10, 20).is_err());
 
@@ -118,17 +113,16 @@ fn raw_control_request_and_response_validate_payloads() {
 
 #[test]
 fn control_payload_validation_rejects_oversized_json() {
-    let oversized = "x".repeat(MAX_CONTROL_JSON_BYTES + 1);
-    let request = RawPeerDirectMessageRequest {
+    let oversized = "x".repeat(MAX_AGENT_ENVELOPE_JSON_BYTES + 1);
+    let request = RawPeerRelationshipRequest {
         source_node_id: "node-a".to_owned(),
         target_node_id: "node-b".to_owned(),
-        thread_id: "thread-1".to_owned(),
-        message_id: "message-1".to_owned(),
-        kind: RawPeerDirectMessageKind::SessionInit,
-        agent_envelope: None,
-        contact_material: None,
-        content_ref: None,
-        control_json: Some(oversized),
+        action: RawPeerRelationshipAction::Request,
+        agent_envelope: Some(RawAgentEnvelope {
+            protocol: "google_a2a".to_owned(),
+            message_json: oversized,
+            ..RawAgentEnvelope::default()
+        }),
     };
     assert!(request.validate().is_err());
 }

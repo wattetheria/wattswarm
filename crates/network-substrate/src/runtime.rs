@@ -88,25 +88,6 @@ pub enum SubstrateRuntimeEvent {
         peer: NetworkNodeId,
         error: String,
     },
-    PeerDirectMessageRequest {
-        peer: NetworkNodeId,
-        request: RawPeerDirectMessageRequest,
-        channel: PeerDirectMessageResponseChannel,
-    },
-    PeerDirectMessageResponse {
-        peer: NetworkNodeId,
-        request_id: PeerDirectMessageRequestId,
-        response: RawPeerDirectMessageResponse,
-    },
-    PeerDirectMessageOutboundFailure {
-        peer: NetworkNodeId,
-        request_id: PeerDirectMessageRequestId,
-        error: String,
-    },
-    PeerDirectMessageInboundFailure {
-        peer: NetworkNodeId,
-        error: String,
-    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -685,66 +666,6 @@ impl SubstrateRuntime {
             .map_err(|_| anyhow!("peer relationship response channel closed"))
     }
 
-    pub fn send_peer_direct_message_request(
-        &mut self,
-        peer: &NetworkNodeId,
-        request: RawPeerDirectMessageRequest,
-    ) -> Result<PeerDirectMessageRequestId> {
-        let request_id = PeerDirectMessageRequestId::new(self.reserve_request_number());
-        let (kind, payload) =
-            match encode_raw_control_request(RawControlRequest::PeerDirectMessage(request)) {
-                Ok(encoded) => encoded,
-                Err(err) => {
-                    self.pending_events.push_back(
-                        SubstrateRuntimeEvent::PeerDirectMessageOutboundFailure {
-                            peer: peer.clone(),
-                            request_id,
-                            error: err.to_string(),
-                        },
-                    );
-                    return Ok(request_id);
-                }
-            };
-        let Some(remote_contact) = self.remote_contacts.get(peer.as_str()).cloned() else {
-            self.pending_events.push_back(
-                SubstrateRuntimeEvent::PeerDirectMessageOutboundFailure {
-                    peer: peer.clone(),
-                    request_id,
-                    error: format!("missing iroh contact material for {peer}"),
-                },
-            );
-            return Ok(request_id);
-        };
-        self.counters.stream_request_attempts =
-            self.counters.stream_request_attempts.saturating_add(1);
-        self.spawn_control_request(
-            peer,
-            kind,
-            payload,
-            remote_contact,
-            move |peer, response| match response {
-                Ok(RawControlResponse::PeerDirectMessage(response)) => {
-                    SubstrateRuntimeEvent::PeerDirectMessageResponse {
-                        peer,
-                        request_id,
-                        response,
-                    }
-                }
-                Ok(_) => SubstrateRuntimeEvent::PeerDirectMessageOutboundFailure {
-                    peer,
-                    request_id,
-                    error: "unexpected peer direct message control response kind".to_owned(),
-                },
-                Err(err) => SubstrateRuntimeEvent::PeerDirectMessageOutboundFailure {
-                    peer,
-                    request_id,
-                    error: err.to_string(),
-                },
-            },
-        );
-        Ok(request_id)
-    }
-
     fn spawn_control_request(
         &self,
         peer: &NetworkNodeId,
@@ -777,16 +698,6 @@ impl SubstrateRuntime {
             .and_then(|response| decode_raw_control_response(&kind, response));
             let _ = control_tx.send(build_event(peer, response));
         });
-    }
-
-    pub fn send_peer_direct_message_response(
-        &mut self,
-        channel: PeerDirectMessageResponseChannel,
-        response: RawPeerDirectMessageResponse,
-    ) -> Result<()> {
-        channel
-            .send(response)
-            .map_err(|_| anyhow!("peer direct message response channel closed"))
     }
 
     pub async fn next_event(&mut self) -> Result<SubstrateRuntimeEvent> {
@@ -896,14 +807,6 @@ impl SubstrateRuntime {
         self.install_typed_control_handler::<RawPeerRelationshipRequest, RawPeerRelationshipResponse>(
             IROH_CONTROL_KIND_PEER_RELATIONSHIP,
             |peer, request, channel| SubstrateRuntimeEvent::PeerRelationshipRequest {
-                peer,
-                request,
-                channel,
-            },
-        )?;
-        self.install_typed_control_handler::<RawPeerDirectMessageRequest, RawPeerDirectMessageResponse>(
-            IROH_CONTROL_KIND_PEER_DIRECT_MESSAGE,
-            |peer, request, channel| SubstrateRuntimeEvent::PeerDirectMessageRequest {
                 peer,
                 request,
                 channel,

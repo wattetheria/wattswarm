@@ -598,7 +598,7 @@ specialization / faster closure / more stable network-level behavior"]
   - the compatibility DM read model is still maintained in:
     - `peer_dm_threads_local`
     - `peer_dm_messages_local`
-  - legacy peer-direct-message request/response code remains in-tree for old compatibility paths, but it is not the active public DM send path
+  - legacy peer-direct-message request/response has been removed; DM delivery uses the private group/topic path
 - Relationship control today:
   - only `accepted` relationships should open user-visible DM threads at the product layer
   - `accept` triggers an explicit `relationship_established` message so both sides have a concrete “relationship is live” event
@@ -675,7 +675,7 @@ Relationship execution currently remains point-to-point on the transition runtim
 4. if the relationship transitions to `accepted`, the accepting side immediately sends `relationship_established`
 5. `relationship_established` exchanges DIAP-inspired (`Decentralized Intelligent Agent Protocol`) protected contact material and creates a ready DM thread on both nodes
 
-Direct messaging currently remains point-to-point on the transition runtime:
+Direct messaging uses the private group/topic path:
 
 1. the embedding product decides whether the sender is allowed to initiate or continue the conversation
 2. the Wattswarm send API derives `group:dm-<stable-pair-digest>` from the local and remote node ids

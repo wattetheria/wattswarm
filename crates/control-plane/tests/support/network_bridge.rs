@@ -7,11 +7,12 @@ use std::time::{Duration, Instant};
 use uuid::Uuid;
 use wattswarm_artifact_store::{ArtifactKind, ArtifactStore};
 use wattswarm_control_plane::control::{
-    PeerDmDeliveryState, PeerDmMessageKind, PeerDmSessionState, PeerRelationshipAction,
-    PeerRelationshipState, artifact_store_path, emit_topic_message_with_content,
-    load_data_plane_status_records_state, load_peer_dm_message_records_state,
-    load_peer_dm_thread_records_state, load_peer_metadata_records_state,
-    load_peer_relationship_records_state,
+    PRIVATE_DM_FEED_KEY, PeerDmDeliveryState, PeerDmMessageKind, PeerDmSessionState,
+    PeerRelationshipAction, PeerRelationshipState, artifact_store_path,
+    emit_topic_message_with_content, load_data_plane_status_records_state,
+    load_peer_dm_message_records_state, load_peer_dm_thread_records_state,
+    load_peer_metadata_records_state, load_peer_relationship_records_state, open_node,
+    private_dm_scope_hint, private_dm_thread_id,
 };
 use wattswarm_control_plane::crypto::{NodeIdentity, sha256_hex};
 use wattswarm_control_plane::network_bridge::{
@@ -283,6 +284,37 @@ fn ensure_seeded_test_dir(path: &Path) -> NodeIdentity {
 fn cleanup_dir(path: &Path) {
     wattswarm_network_transport_iroh::shutdown_local_iroh_data_plane(path);
     let _ = fs::remove_dir_all(path);
+}
+
+fn has_private_dm_subscription(
+    state_dir: &Path,
+    local_node_id: &str,
+    remote_node_id: &str,
+) -> bool {
+    let db_path = state_dir.join("ui.state");
+    let Ok(node) = open_node(state_dir, &db_path) else {
+        return false;
+    };
+    node.store
+        .load_all_events()
+        .unwrap_or_default()
+        .into_iter()
+        .any(|(_, event)| {
+            matches!(
+                event.payload,
+                EventPayload::FeedSubscriptionUpdated(FeedSubscriptionUpdatedPayload {
+                    ref subscriber_node_id,
+                    ref feed_key,
+                    ref scope_hint,
+                    ref gossip_kinds,
+                    active: true,
+                    ..
+                }) if subscriber_node_id == local_node_id
+                    && feed_key == PRIVATE_DM_FEED_KEY
+                    && scope_hint == &private_dm_scope_hint(local_node_id, remote_node_id)
+                    && gossip_kinds.iter().any(|kind| kind == "messages")
+            )
+        })
 }
 
 fn wait_for_listen_addrs(service: &mut NetworkBridgeService, node: &mut Node) {

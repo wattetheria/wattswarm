@@ -13,24 +13,21 @@ use wattswarm_protocol::types::{EventKind, EventPayload};
 
 pub use substrate::{
     BackfillResponseChannel, ContactMaterialResponseChannel, GossipKind, NetworkAddress,
-    NetworkNodeId, NetworkRuntimeObservabilitySnapshot, PeerDirectMessageResponseChannel,
-    PeerDiscoverySourceKind, PeerHandshakeMetadata, PeerMetadata, PeerRelationshipResponseChannel,
-    RawAgentEnvelope, RawContactMaterial, RawContactMaterialRequest, RawContactMaterialResponse,
-    RawPeerDirectMessageKind, RawPeerRelationshipAction, RawSourceAgentCard, SwarmScope,
-    TopicCatalog, TopicNamespace, TrafficGuardPeerHealth, sanitize_segment,
+    NetworkNodeId, NetworkRuntimeObservabilitySnapshot, PeerDiscoverySourceKind,
+    PeerHandshakeMetadata, PeerMetadata, PeerRelationshipResponseChannel, RawAgentEnvelope,
+    RawContactMaterial, RawContactMaterialRequest, RawContactMaterialResponse,
+    RawPeerRelationshipAction, RawSourceAgentCard, SwarmScope, TopicCatalog, TopicNamespace,
+    TrafficGuardPeerHealth, sanitize_segment,
 };
 
 pub type BackfillRequest = substrate::RawBackfillRequest;
 pub type ContactMaterialRequest = substrate::RawContactMaterialRequest;
 pub type ContactMaterialResponse = substrate::RawContactMaterialResponse;
-pub type PeerDirectMessageRequest = substrate::RawPeerDirectMessageRequest;
-pub type PeerDirectMessageResponse = substrate::RawPeerDirectMessageResponse;
 pub type PeerRelationshipRequest = substrate::RawPeerRelationshipRequest;
 pub type PeerRelationshipResponse = substrate::RawPeerRelationshipResponse;
 pub type BackfillRequestId = substrate::BackfillRequestId;
 pub type ContactMaterialRequestId = substrate::ContactMaterialRequestId;
 pub type PeerRelationshipRequestId = substrate::PeerRelationshipRequestId;
-pub type PeerDirectMessageRequestId = substrate::PeerDirectMessageRequestId;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct InboundRequestId(u64);
@@ -402,25 +399,6 @@ pub enum NetworkRuntimeEvent {
         peer: NetworkNodeId,
         error: String,
     },
-    PeerDirectMessageRequest {
-        peer: NetworkNodeId,
-        request: PeerDirectMessageRequest,
-        request_id: InboundRequestId,
-    },
-    PeerDirectMessageResponse {
-        peer: NetworkNodeId,
-        request_id: PeerDirectMessageRequestId,
-        response: PeerDirectMessageResponse,
-    },
-    PeerDirectMessageOutboundFailure {
-        peer: NetworkNodeId,
-        request_id: PeerDirectMessageRequestId,
-        error: String,
-    },
-    PeerDirectMessageInboundFailure {
-        peer: NetworkNodeId,
-        error: String,
-    },
     NatStatusChanged {
         old: String,
         new: String,
@@ -454,8 +432,6 @@ pub struct NetworkRuntime {
     backfill_response_channels: HashMap<InboundRequestId, BackfillResponseChannel>,
     contact_material_response_channels: HashMap<InboundRequestId, ContactMaterialResponseChannel>,
     peer_relationship_response_channels: HashMap<InboundRequestId, PeerRelationshipResponseChannel>,
-    peer_direct_message_response_channels:
-        HashMap<InboundRequestId, PeerDirectMessageResponseChannel>,
 }
 
 impl NetworkRuntime {
@@ -471,7 +447,6 @@ impl NetworkRuntime {
             backfill_response_channels: HashMap::new(),
             contact_material_response_channels: HashMap::new(),
             peer_relationship_response_channels: HashMap::new(),
-            peer_direct_message_response_channels: HashMap::new(),
         })
     }
 
@@ -629,29 +604,6 @@ impl NetworkRuntime {
             .ok_or_else(|| anyhow!("unknown peer relationship response request id {request_id}"))?;
         self.inner
             .send_peer_relationship_response(channel, response)
-    }
-
-    pub fn send_peer_direct_message_request(
-        &mut self,
-        peer: &NetworkNodeId,
-        request: PeerDirectMessageRequest,
-    ) -> Result<PeerDirectMessageRequestId> {
-        self.inner.send_peer_direct_message_request(peer, request)
-    }
-
-    pub fn send_peer_direct_message_response(
-        &mut self,
-        request_id: InboundRequestId,
-        response: PeerDirectMessageResponse,
-    ) -> Result<()> {
-        let channel = self
-            .peer_direct_message_response_channels
-            .remove(&request_id)
-            .ok_or_else(|| {
-                anyhow!("unknown peer direct message response request id {request_id}")
-            })?;
-        self.inner
-            .send_peer_direct_message_response(channel, response)
     }
 
     pub async fn next_event(&mut self) -> Result<NetworkRuntimeEvent> {
@@ -812,41 +764,6 @@ impl NetworkRuntime {
             },
             SubstrateRuntimeEvent::PeerRelationshipInboundFailure { peer, error } => {
                 NetworkRuntimeEvent::PeerRelationshipInboundFailure { peer, error }
-            }
-            SubstrateRuntimeEvent::PeerDirectMessageRequest {
-                peer,
-                request,
-                channel,
-            } => {
-                let request_id = self.reserve_inbound_request_id();
-                self.peer_direct_message_response_channels
-                    .insert(request_id, channel);
-                NetworkRuntimeEvent::PeerDirectMessageRequest {
-                    peer,
-                    request,
-                    request_id,
-                }
-            }
-            SubstrateRuntimeEvent::PeerDirectMessageResponse {
-                peer,
-                request_id,
-                response,
-            } => NetworkRuntimeEvent::PeerDirectMessageResponse {
-                peer,
-                request_id,
-                response,
-            },
-            SubstrateRuntimeEvent::PeerDirectMessageOutboundFailure {
-                peer,
-                request_id,
-                error,
-            } => NetworkRuntimeEvent::PeerDirectMessageOutboundFailure {
-                peer,
-                request_id,
-                error,
-            },
-            SubstrateRuntimeEvent::PeerDirectMessageInboundFailure { peer, error } => {
-                NetworkRuntimeEvent::PeerDirectMessageInboundFailure { peer, error }
             }
         })
     }

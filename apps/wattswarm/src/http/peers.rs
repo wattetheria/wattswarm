@@ -1,8 +1,9 @@
 use crate::control::{
-    PeerRelationshipAction, PeerRelationshipInitiator, apply_peer_relationship_action_state,
-    load_peer_dm_message_records_state, load_peer_dm_thread_records_state,
-    load_peer_metadata_records_state, load_peer_relationship_records_state, open_configured_node,
-    open_node,
+    PRIVATE_DM_FEED_KEY, PeerRelationshipAction, PeerRelationshipInitiator,
+    apply_peer_relationship_action_state, load_peer_dm_message_records_state,
+    load_peer_dm_thread_records_state, load_peer_metadata_records_state,
+    load_peer_relationship_records_state, open_configured_node, open_node, private_dm_scope_hint,
+    private_dm_thread_id,
 };
 use crate::http::helpers::resolve_network_id;
 use crate::http::{ApiError, UiServerState, run_blocking};
@@ -49,27 +50,6 @@ pub(crate) struct AgentPaymentSendRequest {
 #[derive(Debug, Deserialize)]
 pub(crate) struct PeerDirectMessageQuery {
     thread_id: String,
-}
-
-const PRIVATE_DM_FEED_KEY: &str = "wattswarm.dm";
-
-fn private_dm_pair_digest(local_node_id: &str, remote_node_id: &str) -> String {
-    let mut members = [
-        local_node_id.trim().to_owned(),
-        remote_node_id.trim().to_owned(),
-    ];
-    members.sort();
-    crate::crypto::sha256_hex(format!("dm-v1\0{}\0{}", members[0], members[1]).as_bytes())
-}
-
-fn private_dm_thread_id(local_node_id: &str, remote_node_id: &str) -> String {
-    let digest = private_dm_pair_digest(local_node_id, remote_node_id);
-    format!("dm:{}", &digest[..24])
-}
-
-fn private_dm_scope_hint(local_node_id: &str, remote_node_id: &str) -> String {
-    let digest = private_dm_pair_digest(local_node_id, remote_node_id);
-    format!("group:dm-{}", &digest[..24])
 }
 
 fn raw_agent_envelope_to_interaction(

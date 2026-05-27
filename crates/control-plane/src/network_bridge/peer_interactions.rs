@@ -45,16 +45,6 @@ pub(super) struct PendingPeerRelationshipRequest {
 }
 
 #[derive(Debug, Clone)]
-pub(super) struct PendingPeerDirectMessageRequest {
-    pub(super) peer: NetworkNodeId,
-    pub(super) remote_node_id: String,
-    pub(super) thread_id: String,
-    pub(super) message_id: String,
-    pub(super) kind: crate::control::PeerDmMessageKind,
-    pub(super) a2a_protocol: String,
-}
-
-#[derive(Debug, Clone)]
 pub(super) struct PendingContactMaterialRequest {
     pub(super) peer: NetworkNodeId,
     pub(super) remote_node_id: String,
@@ -67,17 +57,6 @@ enum PendingNetworkCommand {
         remote_node_id: String,
         action: crate::control::PeerRelationshipAction,
         agent_envelope: RawAgentEnvelope,
-        #[serde(default, skip_serializing_if = "is_zero")]
-        attempts: u32,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        next_retry_at: Option<i64>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        last_error: Option<String>,
-    },
-    PeerDirectMessage {
-        remote_node_id: String,
-        agent_envelope: RawAgentEnvelope,
-        content: Value,
         #[serde(default, skip_serializing_if = "is_zero")]
         attempts: u32,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -107,7 +86,6 @@ impl PendingNetworkCommand {
     fn next_retry_at(&self) -> Option<i64> {
         match self {
             Self::PeerRelationship { next_retry_at, .. }
-            | Self::PeerDirectMessage { next_retry_at, .. }
             | Self::AgentPayment { next_retry_at, .. } => *next_retry_at,
         }
     }
@@ -115,16 +93,15 @@ impl PendingNetworkCommand {
     fn remote_node_id(&self) -> &str {
         match self {
             Self::PeerRelationship { remote_node_id, .. }
-            | Self::PeerDirectMessage { remote_node_id, .. }
             | Self::AgentPayment { remote_node_id, .. } => remote_node_id,
         }
     }
 
     fn attempts(&self) -> u32 {
         match self {
-            Self::PeerRelationship { attempts, .. }
-            | Self::PeerDirectMessage { attempts, .. }
-            | Self::AgentPayment { attempts, .. } => *attempts,
+            Self::PeerRelationship { attempts, .. } | Self::AgentPayment { attempts, .. } => {
+                *attempts
+            }
         }
     }
 
@@ -136,12 +113,6 @@ impl PendingNetworkCommand {
         let next_retry_at = Some(now_ms.saturating_add(delay));
         match self {
             Self::PeerRelationship {
-                attempts,
-                next_retry_at: retry_at,
-                last_error,
-                ..
-            }
-            | Self::PeerDirectMessage {
                 attempts,
                 next_retry_at: retry_at,
                 last_error,
@@ -197,25 +168,6 @@ pub fn enqueue_peer_relationship_action_command(
             remote_node_id: remote_node_id.trim().to_owned(),
             action,
             agent_envelope,
-            attempts: 0,
-            next_retry_at: None,
-            last_error: None,
-        },
-    )
-}
-
-pub fn enqueue_peer_direct_message_command(
-    state_dir: &Path,
-    remote_node_id: &str,
-    agent_envelope: RawAgentEnvelope,
-    content: Value,
-) -> Result<()> {
-    enqueue_pending_network_command(
-        state_dir,
-        &PendingNetworkCommand::PeerDirectMessage {
-            remote_node_id: remote_node_id.trim().to_owned(),
-            agent_envelope,
-            content,
             attempts: 0,
             next_retry_at: None,
             last_error: None,
@@ -513,21 +465,7 @@ fn peer_dm_content_from_control_envelope(
 }
 
 pub(super) fn peer_dm_thread_id(local_node_id: &str, remote_node_id: &str) -> String {
-    let mut members = [local_node_id.to_owned(), remote_node_id.to_owned()];
-    members.sort();
-    format!("dm:{}:{}", members[0], members[1])
-}
-
-pub(super) fn relationship_state_for(
-    state_dir: &Path,
-    remote_node_id: &str,
-) -> Result<Option<crate::control::PeerRelationshipState>> {
-    Ok(
-        crate::control::load_peer_relationship_records_state(state_dir)?
-            .into_iter()
-            .find(|record| record.remote_node_id == remote_node_id)
-            .map(|record| record.relationship_state),
-    )
+    crate::control::private_dm_thread_id(local_node_id, remote_node_id)
 }
 
 pub(super) fn upsert_dm_thread(
@@ -847,14 +785,6 @@ pub(super) fn process_pending_network_commands(
             } => service
                 .send_peer_relationship_action(&remote_node_id, action, Some(agent_envelope))
                 .map(|_| ()),
-            PendingNetworkCommand::PeerDirectMessage {
-                remote_node_id,
-                agent_envelope,
-                content,
-                ..
-            } => service
-                .send_peer_direct_message(&remote_node_id, Some(agent_envelope), content)
-                .map(|_| ()),
             PendingNetworkCommand::AgentPayment {
                 remote_node_id,
                 message_kind,
@@ -1129,13 +1059,13 @@ mod tests {
     #[test]
     fn pending_network_command_failure_sets_retry_backoff() {
         let mut command: PendingNetworkCommand = serde_json::from_value(json!({
-            "kind": "peer_direct_message",
+            "kind": "peer_relationship",
             "remote_node_id": "node-a",
+            "action": "request",
             "agent_envelope": {
                 "protocol": "google_a2a",
                 "message": {}
-            },
-            "content": {"text": "hello"}
+            }
         }))
         .expect("command parses");
 

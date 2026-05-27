@@ -105,12 +105,10 @@ macro_rules! define_request_id {
 define_request_id!(BackfillRequestId);
 define_request_id!(ContactMaterialRequestId);
 define_request_id!(PeerRelationshipRequestId);
-define_request_id!(PeerDirectMessageRequestId);
 
 pub type BackfillResponseChannel = Sender<RawBackfillResponse>;
 pub type ContactMaterialResponseChannel = Sender<RawContactMaterialResponse>;
 pub type PeerRelationshipResponseChannel = Sender<RawPeerRelationshipResponse>;
-pub type PeerDirectMessageResponseChannel = Sender<RawPeerDirectMessageResponse>;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

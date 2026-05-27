@@ -367,135 +367,6 @@ impl RawContactMaterialResponse {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum RawPeerDirectMessageKind {
-    RelationshipEstablished,
-    SessionInit,
-    Message,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RawPeerDirectMessageRequest {
-    pub source_node_id: String,
-    pub target_node_id: String,
-    pub thread_id: String,
-    pub message_id: String,
-    pub kind: RawPeerDirectMessageKind,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub agent_envelope: Option<RawAgentEnvelope>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub contact_material: Option<RawContactMaterial>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub content_ref: Option<ArtifactRef>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub control_json: Option<String>,
-}
-
-impl RawPeerDirectMessageRequest {
-    pub fn validate(&self) -> Result<()> {
-        if self.source_node_id.trim().is_empty() {
-            bail!("peer direct message source_node_id is required");
-        }
-        if self.target_node_id.trim().is_empty() {
-            bail!("peer direct message target_node_id is required");
-        }
-        if self.thread_id.trim().is_empty() {
-            bail!("peer direct message thread_id is required");
-        }
-        if self.message_id.trim().is_empty() {
-            bail!("peer direct message message_id is required");
-        }
-        if let Some(envelope) = &self.agent_envelope {
-            envelope.validate()?;
-        }
-        if let Some(material) = &self.contact_material {
-            material.validate()?;
-        }
-        match self.kind {
-            RawPeerDirectMessageKind::Message => {
-                let Some(content_ref) = &self.content_ref else {
-                    bail!("peer direct message content_ref is required for message kind");
-                };
-                if content_ref.uri.trim().is_empty()
-                    || content_ref.digest.trim().is_empty()
-                    || content_ref.mime.trim().is_empty()
-                    || content_ref.producer.trim().is_empty()
-                    || content_ref.size_bytes == 0
-                {
-                    bail!("peer direct message content_ref is invalid");
-                }
-            }
-            RawPeerDirectMessageKind::RelationshipEstablished
-            | RawPeerDirectMessageKind::SessionInit => {
-                let control_json = self.control_json.as_deref().unwrap_or("");
-                if control_json.trim().is_empty() {
-                    bail!("peer direct message control_json is required for control kinds");
-                }
-                validate_max_bytes(
-                    "peer direct message control_json",
-                    control_json,
-                    MAX_CONTROL_JSON_BYTES,
-                )?;
-            }
-        }
-        Ok(())
-    }
-}
-
-impl InboundControlPeer for RawPeerDirectMessageRequest {
-    fn inbound_peer(&self, _fallback: &NetworkNodeId) -> Result<NetworkNodeId> {
-        NetworkNodeId::new(self.source_node_id.clone())
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RawPeerDirectMessageResponse {
-    pub source_node_id: String,
-    pub target_node_id: String,
-    pub thread_id: String,
-    pub message_id: String,
-    pub kind: RawPeerDirectMessageKind,
-    pub applied: bool,
-    pub delivery_state: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub contact_material: Option<RawContactMaterial>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub detail: Option<String>,
-    pub updated_at: u64,
-}
-
-impl RawPeerDirectMessageResponse {
-    pub fn validate(&self) -> Result<()> {
-        if self.source_node_id.trim().is_empty() {
-            bail!("peer direct message response source_node_id is required");
-        }
-        if self.target_node_id.trim().is_empty() {
-            bail!("peer direct message response target_node_id is required");
-        }
-        if self.thread_id.trim().is_empty() {
-            bail!("peer direct message response thread_id is required");
-        }
-        if self.message_id.trim().is_empty() {
-            bail!("peer direct message response message_id is required");
-        }
-        if self.delivery_state.trim().is_empty() {
-            bail!("peer direct message response delivery_state is required");
-        }
-        if let Some(material) = &self.contact_material {
-            material.validate()?;
-        }
-        if let Some(detail) = &self.detail {
-            validate_max_bytes(
-                "peer direct message response detail",
-                detail,
-                MAX_CONTROL_DETAIL_BYTES,
-            )?;
-        }
-        Ok(())
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RawGossipMessage {
     pub scope: SwarmScope,
@@ -519,7 +390,6 @@ pub enum RawControlRequest {
     Backfill(RawBackfillRequest),
     ContactMaterial(RawContactMaterialRequest),
     PeerRelationship(RawPeerRelationshipRequest),
-    PeerDirectMessage(RawPeerDirectMessageRequest),
 }
 
 impl RawControlRequest {
@@ -528,7 +398,6 @@ impl RawControlRequest {
             Self::Backfill(request) => request.validate(max_backfill_events, backfill_hard_limit),
             Self::ContactMaterial(request) => request.validate(),
             Self::PeerRelationship(request) => request.validate(),
-            Self::PeerDirectMessage(request) => request.validate(),
         }
     }
 }
@@ -538,7 +407,6 @@ pub enum RawControlResponse {
     Backfill(RawBackfillResponse),
     ContactMaterial(RawContactMaterialResponse),
     PeerRelationship(RawPeerRelationshipResponse),
-    PeerDirectMessage(RawPeerDirectMessageResponse),
 }
 
 impl RawControlResponse {
@@ -547,7 +415,6 @@ impl RawControlResponse {
             Self::Backfill(response) => response.validate(max_backfill_events, backfill_hard_limit),
             Self::ContactMaterial(response) => response.validate(),
             Self::PeerRelationship(response) => response.validate(),
-            Self::PeerDirectMessage(response) => response.validate(),
         }
     }
 }

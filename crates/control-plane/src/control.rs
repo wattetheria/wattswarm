@@ -53,6 +53,34 @@ use task_flow::retry_runtime_probe;
 pub use task_flow::{bridge_remote_task_into_local_execution, run_real_task_flow};
 pub(crate) use task_flow::{prepare_runtime_for_executor, run_existing_task_with_runtime};
 
+pub const PRIVATE_DM_FEED_KEY: &str = "wattswarm.dm";
+
+pub fn private_dm_pair_digest(local_node_id: &str, remote_node_id: &str) -> String {
+    let mut members = [
+        local_node_id.trim().to_owned(),
+        remote_node_id.trim().to_owned(),
+    ];
+    members.sort();
+    sha256_hex(format!("dm-v1\0{}\0{}", members[0], members[1]).as_bytes())
+}
+
+pub fn private_dm_group_id(local_node_id: &str, remote_node_id: &str) -> String {
+    let digest = private_dm_pair_digest(local_node_id, remote_node_id);
+    format!("dm-{}", &digest[..24])
+}
+
+pub fn private_dm_scope_hint(local_node_id: &str, remote_node_id: &str) -> String {
+    format!(
+        "group:{}",
+        private_dm_group_id(local_node_id, remote_node_id)
+    )
+}
+
+pub fn private_dm_thread_id(local_node_id: &str, remote_node_id: &str) -> String {
+    let digest = private_dm_pair_digest(local_node_id, remote_node_id);
+    format!("dm:{}", &digest[..24])
+}
+
 pub fn executor_registry_path(state_dir: &Path) -> PathBuf {
     state_dir.join("executors.json")
 }

@@ -25,7 +25,6 @@ use wattswarm_network_transport_iroh::{
     send_control_stream_request_for_network_peer_id_with_timeout,
     set_local_control_stream_handler_for_network_peer_id, shutdown_local_iroh_data_plane,
 };
-use wattswarm_protocol::types::ArtifactRef;
 
 const DEFAULT_NAMESPACE: &str = "wattswarm";
 const DEFAULT_IDENTIFY_AGENT_NAME: &str = "wattswarm-network-substrate";
@@ -33,14 +32,12 @@ const MAX_BACKFILL_KNOWN_EVENT_IDS: usize = 256;
 const MAX_BACKFILL_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_AGENT_ENVELOPE_JSON_BYTES: usize = 64 * 1024;
 const MAX_CONTACT_MATERIAL_JSON_BYTES: usize = 64 * 1024;
-const MAX_CONTROL_JSON_BYTES: usize = 64 * 1024;
 const MAX_CONTROL_DETAIL_BYTES: usize = 8 * 1024;
 const DEFAULT_SUBSTRATE_CONTROL_REQUEST_TIMEOUT_MS: u64 = 30_000;
 const DEFAULT_GOSSIP_BOOTSTRAP_TIMEOUT_MS: u64 = 5_000;
 const IROH_CONTROL_KIND_BACKFILL: &str = "backfill.v1";
 const IROH_CONTROL_KIND_CONTACT_MATERIAL: &str = "contact_material.v1";
 const IROH_CONTROL_KIND_PEER_RELATIONSHIP: &str = "peer_relationship.v1";
-const IROH_CONTROL_KIND_PEER_DIRECT_MESSAGE: &str = "peer_direct_message.v1";
 
 mod runtime;
 mod types;
@@ -52,16 +49,15 @@ pub use runtime::{
 pub use types::{
     BackfillRequestId, BackfillResponseChannel, ContactMaterialRequestId,
     ContactMaterialResponseChannel, GossipKind, NetworkAddress, NetworkNodeId,
-    PeerDirectMessageRequestId, PeerDirectMessageResponseChannel, PeerHandshakeMetadata,
-    PeerMetadata, PeerRelationshipRequestId, PeerRelationshipResponseChannel, SubstrateConfig,
-    SubstrateNode, SwarmScope, TopicCatalog, TopicNamespace,
+    PeerHandshakeMetadata, PeerMetadata, PeerRelationshipRequestId,
+    PeerRelationshipResponseChannel, SubstrateConfig, SubstrateNode, SwarmScope, TopicCatalog,
+    TopicNamespace,
 };
 use wire::InboundControlPeer;
 pub use wire::{
     RawAgentEnvelope, RawBackfillRequest, RawBackfillResponse, RawContactMaterial,
     RawContactMaterialRequest, RawContactMaterialResponse, RawControlRequest, RawControlResponse,
-    RawGossipMessage, RawPeerDirectMessageKind, RawPeerDirectMessageRequest,
-    RawPeerDirectMessageResponse, RawPeerRelationshipAction, RawPeerRelationshipRequest,
+    RawGossipMessage, RawPeerRelationshipAction, RawPeerRelationshipRequest,
     RawPeerRelationshipResponse, RawSourceAgentCard,
 };
 
@@ -126,10 +122,6 @@ fn encode_raw_control_request(request: RawControlRequest) -> Result<(String, Vec
             IROH_CONTROL_KIND_PEER_RELATIONSHIP.to_owned(),
             serde_json::to_vec(&request)?,
         )),
-        RawControlRequest::PeerDirectMessage(request) => Ok((
-            IROH_CONTROL_KIND_PEER_DIRECT_MESSAGE.to_owned(),
-            serde_json::to_vec(&request)?,
-        )),
     }
 }
 
@@ -154,9 +146,6 @@ fn decode_raw_control_response(
         }
         IROH_CONTROL_KIND_PEER_RELATIONSHIP => {
             RawControlResponse::PeerRelationship(serde_json::from_slice(&response.payload)?)
-        }
-        IROH_CONTROL_KIND_PEER_DIRECT_MESSAGE => {
-            RawControlResponse::PeerDirectMessage(serde_json::from_slice(&response.payload)?)
         }
         other => bail!("unexpected iroh control response kind {other}"),
     })

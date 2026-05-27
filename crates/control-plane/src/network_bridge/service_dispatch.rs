@@ -104,107 +104,6 @@ impl NetworkBridgeService {
         Ok(request_id)
     }
 
-    pub fn send_peer_direct_message(
-        &mut self,
-        remote_node_id: &str,
-        agent_envelope: Option<RawAgentEnvelope>,
-        content: Value,
-    ) -> Result<PeerDirectMessageRequestId> {
-        let Some(state_dir) = self.state_dir.clone() else {
-            bail!("peer direct messages require state_dir to be configured");
-        };
-        if relationship_state_for(&state_dir, remote_node_id)?
-            != Some(crate::control::PeerRelationshipState::Accepted)
-        {
-            bail!("peer direct messages require an accepted relationship");
-        }
-        let (remote_node_id, peer) =
-            self.connected_peer_for_operation(&state_dir, remote_node_id, "peer direct messages")?;
-        let local_node_id = self.local_peer_id().to_string();
-        let thread_id = peer_dm_thread_id(&local_node_id, &remote_node_id);
-        let thread = crate::control::load_peer_dm_thread_records_state(&state_dir)?
-            .into_iter()
-            .find(|record| record.thread_id == thread_id)
-            .ok_or_else(|| anyhow!("peer direct messages require an established session"))?;
-        if thread.session_state != crate::control::PeerDmSessionState::Ready {
-            bail!("peer direct messages require a ready session");
-        }
-        let message_id = Uuid::new_v4().to_string();
-        let content_ref = crate::control::materialize_json_content_artifact(
-            &state_dir,
-            wattswarm_artifact_store::ArtifactKind::DirectMessage,
-            &local_node_id,
-            &content,
-            observed_at_ms(),
-        )?;
-        let envelope = agent_envelope.unwrap_or_else(|| {
-            default_agent_envelope(
-                &local_node_id,
-                &remote_node_id,
-                "peer.dm.message",
-                content.clone(),
-            )
-        });
-        let a2a_protocol = envelope.protocol.clone();
-        save_dm_message(
-            &state_dir,
-            &remote_node_id,
-            &thread_id,
-            &message_id,
-            crate::control::PeerDmMessageKind::Message,
-            crate::control::PeerDmDirection::Outbound,
-            crate::control::PeerDmDeliveryState::Pending,
-            &envelope.protocol,
-            Some(&envelope),
-            content.clone(),
-            None,
-        )?;
-        record_data_plane_status(
-            &state_dir,
-            "dm_message",
-            &message_id,
-            Some(&remote_node_id),
-            "iroh_direct",
-            "content_materialized",
-            None,
-        )?;
-        let request_id = self.runtime.send_peer_direct_message_request(
-            &peer,
-            PeerDirectMessageRequest {
-                source_node_id: local_node_id,
-                target_node_id: remote_node_id.clone(),
-                thread_id: thread_id.clone(),
-                message_id: message_id.clone(),
-                kind: RawPeerDirectMessageKind::Message,
-                agent_envelope: Some(envelope),
-                contact_material: None,
-                content_ref: Some(content_ref),
-                control_json: None,
-            },
-        )?;
-        record_data_plane_status(
-            &state_dir,
-            "dm_message",
-            &message_id,
-            Some(&remote_node_id),
-            "iroh_control",
-            "control_sent",
-            None,
-        )?;
-        self.pending_dm_requests.insert(
-            request_id,
-            PendingPeerDirectMessageRequest {
-                peer,
-                remote_node_id,
-                thread_id,
-                message_id,
-                kind: crate::control::PeerDmMessageKind::Message,
-                a2a_protocol,
-            },
-        );
-        Ok(request_id)
-    }
-
     pub(crate) fn maybe_sync_topic_message_content(
         &mut self,
         node: &mut Node,
@@ -359,7 +258,7 @@ impl NetworkBridgeService {
     }
 
     pub(crate) fn finalize_dm_session_from_relationship(
-        &self,
+        &mut self,
         state_dir: &Path,
         remote_node_id: &str,
         direction: crate::control::PeerDmDirection,
@@ -368,6 +267,12 @@ impl NetworkBridgeService {
     ) -> Result<()> {
         let local_node_id = self.local_peer_id().to_string();
         let thread_id = peer_dm_thread_id(&local_node_id, remote_node_id);
+        self.ensure_private_dm_group_subscription(
+            state_dir,
+            &local_node_id,
+            remote_node_id,
+            established_at,
+        )?;
         upsert_dm_thread(
             state_dir,
             remote_node_id,
@@ -402,6 +307,49 @@ impl NetworkBridgeService {
             a2a_protocol,
             Some(established_at),
         )?;
+        Ok(())
+    }
+
+    fn ensure_private_dm_group_subscription(
+        &mut self,
+        state_dir: &Path,
+        local_node_id: &str,
+        remote_node_id: &str,
+        subscribed_at: u64,
+    ) -> Result<()> {
+        let Some(db_path) = self.db_path.as_ref() else {
+            return Ok(());
+        };
+        let mut node = crate::control::open_node(state_dir, db_path)?;
+        let scope = SwarmScope::Group(crate::control::private_dm_group_id(
+            local_node_id,
+            remote_node_id,
+        ));
+        if !node_has_active_subscription_scope_kinds(
+            &node,
+            local_node_id,
+            &scope,
+            &[GossipKind::Messages],
+        )? {
+            node.emit_at(
+                1,
+                crate::types::EventPayload::FeedSubscriptionUpdated(
+                    crate::types::FeedSubscriptionUpdatedPayload {
+                        network_id: current_network_context_id(&node),
+                        subscriber_node_id: local_node_id.to_owned(),
+                        feed_key: crate::control::PRIVATE_DM_FEED_KEY.to_owned(),
+                        scope_hint: crate::control::private_dm_scope_hint(
+                            local_node_id,
+                            remote_node_id,
+                        ),
+                        gossip_kinds: vec!["messages".to_owned()],
+                        active: true,
+                    },
+                ),
+                subscribed_at,
+            )?;
+        }
+        self.subscribe_scope_kinds(&scope, &[GossipKind::Messages])?;
         Ok(())
     }
 

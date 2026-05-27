@@ -506,8 +506,6 @@ impl NetworkBridgeService {
         }
         self.pending_relationship_requests
             .retain(|_, pending| pending.peer != peer);
-        self.pending_dm_requests
-            .retain(|_, pending| pending.peer != peer);
         self.persist_peer_sync_state();
         removed
     }
