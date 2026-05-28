@@ -86,6 +86,35 @@ impl NetworkBridgeService {
             remote_node_id,
             "contact material requests",
         )?;
+        let request_id =
+            self.send_contact_material_request_to_peer(&remote_node_id, peer.clone())?;
+        Ok(request_id)
+    }
+
+    pub(crate) fn probe_peer_contact_material(
+        &mut self,
+        peer: &NetworkNodeId,
+    ) -> Result<Option<ContactMaterialRequestId>> {
+        if self
+            .pending_contact_material_requests
+            .values()
+            .any(|pending| &pending.peer == peer)
+        {
+            return Ok(None);
+        }
+        if !self.runtime.allows_outbound_backfill_to(peer) {
+            bail!("missing iroh contact material for {peer}");
+        }
+        let request_id = self.send_contact_material_request_to_peer(peer.as_str(), peer.clone())?;
+        Ok(Some(request_id))
+    }
+
+    fn send_contact_material_request_to_peer(
+        &mut self,
+        remote_node_id: &str,
+        peer: NetworkNodeId,
+    ) -> Result<ContactMaterialRequestId> {
+        let remote_node_id = remote_node_id.to_owned();
         let local_node_id = self.local_peer_id().to_string();
         let request_id = self.runtime.send_contact_material_request(
             &peer,

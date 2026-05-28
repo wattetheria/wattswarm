@@ -685,6 +685,7 @@ impl NetworkBridgeService {
                 error,
             } => {
                 self.mark_backfill_failed(peer.clone(), request_id);
+                self.mark_peer_control_stream_failed(peer.clone());
                 Ok(NetworkBridgeTick::BackfillFailed {
                     peer,
                     request_id,
@@ -783,6 +784,29 @@ impl NetworkBridgeService {
                         contact_material,
                     )?;
                 }
+                let newly_connected = self.mark_peer_connected(peer.clone());
+                if let Some(state_dir) = &self.state_dir {
+                    let _ = crate::control::add_discovered_peer_endpoint_with_source(
+                        state_dir,
+                        &peer.to_string(),
+                        None,
+                        "contact_material_probe",
+                    );
+                    if newly_connected {
+                        diagnostics::record_diagnostic(
+                            Some(state_dir),
+                            diagnostics::DiagnosticEvent::new(
+                                "info",
+                                "transport",
+                                "connection.probed",
+                                "ok",
+                                format!("iroh contact material probe succeeded: {peer}"),
+                            )
+                            .object("peer", Some(peer.to_string()))
+                            .source_node_id(Some(peer.to_string())),
+                        );
+                    }
+                }
                 Ok(NetworkBridgeTick::TransportNotice {
                     detail: format!("contact_material_updated peer={peer}"),
                 })
@@ -793,6 +817,7 @@ impl NetworkBridgeService {
                 error,
             } => {
                 self.pending_contact_material_requests.remove(&request_id);
+                self.mark_peer_control_stream_failed(peer.clone());
                 Ok(NetworkBridgeTick::TransportNotice {
                     detail: format!(
                         "contact_material_outbound_failure peer={peer} request_id={request_id:?} error={error}"
@@ -1163,6 +1188,7 @@ impl NetworkBridgeService {
                     .remove(&request_id)
                     .map(|pending| pending.action)
                     .unwrap_or(crate::control::PeerRelationshipAction::Request);
+                self.mark_peer_control_stream_failed(peer.clone());
                 Ok(NetworkBridgeTick::PeerRelationshipFailed {
                     peer,
                     action,

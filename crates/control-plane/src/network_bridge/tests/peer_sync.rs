@@ -993,7 +993,7 @@ fn reconnect_supervision_abandons_stale_peer_until_rediscovered() {
 }
 
 #[test]
-fn reconnect_supervision_rejoins_relay_only_bootstrap_contact() {
+fn reconnect_supervision_probes_relay_only_bootstrap_contact() {
     let local_dir = temp_startup_dir("reconnect-relay-only-local");
     let remote_dir = temp_startup_dir("reconnect-relay-only-remote");
     let local_seed = [109u8; 32];
@@ -1050,6 +1050,15 @@ fn reconnect_supervision_rejoins_relay_only_bootstrap_contact() {
 
     assert_eq!(attempts, 1);
     assert_eq!(service.reconnect_attempts_for_peer(&peer), Some(1));
+    assert_eq!(
+        service.pending_contact_material_request_count_for_peer(&peer),
+        1
+    );
+    service.force_reconnect_due_for_peer(&peer);
+    let attempts = service
+        .run_reconnect_supervision()
+        .expect("pending probe suppresses duplicate reconnect");
+    assert_eq!(attempts, 0);
 
     wattswarm_network_transport_iroh::shutdown_local_iroh_data_plane(&local_dir);
     wattswarm_network_transport_iroh::shutdown_local_iroh_data_plane(&remote_dir);

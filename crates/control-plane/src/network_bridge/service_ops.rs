@@ -510,6 +510,11 @@ impl NetworkBridgeService {
         removed
     }
 
+    pub(crate) fn mark_peer_control_stream_failed(&mut self, peer: NetworkNodeId) {
+        self.mark_peer_disconnected(peer.clone());
+        self.schedule_peer_reconnect(peer);
+    }
+
     pub(crate) fn remember_peer_address(&mut self, peer: NetworkNodeId, address: NetworkAddress) {
         self.abandoned_reconnect_peers.remove(&peer);
         self.known_peer_addrs.insert(peer.clone(), address);
@@ -560,6 +565,12 @@ impl NetworkBridgeService {
             .into_iter()
             .filter(|peer| !self.connected_peers.contains(peer))
             .filter(|peer| {
+                !self
+                    .pending_contact_material_requests
+                    .values()
+                    .any(|pending| &pending.peer == peer)
+            })
+            .filter(|peer| {
                 self.peer_reconnect_state
                     .get(peer)
                     .is_none_or(|state| state.next_attempt_at <= now)
@@ -583,15 +594,11 @@ impl NetworkBridgeService {
                 let dial_target = NetworkAddress::new(format!("{peer}@{address}"))?;
                 self.runtime.dial(dial_target)
             } else {
-                self.runtime
-                    .rejoin_gossip_with_remote_contact(&peer)
-                    .and_then(|joined| {
-                        if joined {
-                            Ok(())
-                        } else {
-                            Err(anyhow!("missing iroh contact material for {peer}"))
-                        }
-                    })
+                match self.runtime.rejoin_gossip_with_remote_contact(&peer) {
+                    Ok(true) => self.probe_peer_contact_material(&peer).map(|_| ()),
+                    Ok(false) => Err(anyhow!("missing iroh contact material for {peer}")),
+                    Err(err) => Err(err),
+                }
             };
             let reconnect_attempts = {
                 let state = self

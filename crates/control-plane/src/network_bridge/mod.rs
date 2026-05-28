@@ -1050,6 +1050,14 @@ impl NetworkBridgeService {
     }
 
     #[cfg(test)]
+    pub fn pending_contact_material_request_count_for_peer(&self, peer: &NetworkNodeId) -> usize {
+        self.pending_contact_material_requests
+            .values()
+            .filter(|pending| &pending.peer == peer)
+            .count()
+    }
+
+    #[cfg(test)]
     pub fn force_reconnect_due_for_peer(&mut self, peer: &NetworkNodeId) {
         if let Some(state) = self.peer_reconnect_state.get_mut(peer) {
             state.next_attempt_at = Instant::now();
