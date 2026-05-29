@@ -12,6 +12,9 @@ use axum::routing::{get, post};
 use std::fs;
 use std::path::PathBuf;
 use std::thread;
+use std::time::Duration;
+
+const DISCOVERY_BOOTNODE_ANNOUNCE_INTERVAL: Duration = Duration::from_secs(60);
 
 pub fn run(state_dir: PathBuf, db_path: PathBuf, listen: String) -> Result<()> {
     fs::create_dir_all(&state_dir)?;
@@ -35,7 +38,7 @@ pub fn run(state_dir: PathBuf, db_path: PathBuf, listen: String) -> Result<()> {
     )?;
     if network_started {
         mark_node_running_if_service_started(&state_dir, true)?;
-        spawn_discovery_bootnode_announce(state_dir.clone(), db_path.clone());
+        spawn_periodic_discovery_bootnode_announce(state_dir.clone(), db_path.clone());
         eprintln!("wattswarm p2p network enabled");
     } else {
         eprintln!("wattswarm p2p network disabled");
@@ -78,17 +81,53 @@ pub fn spawn_discovery_bootnode_announce(
     db_path: PathBuf,
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
-        match discovery::maybe_announce_local_record_to_discovery_bootnodes(&state_dir, &db_path) {
-            Ok(report) if report.attempted > 0 => {
-                eprintln!(
-                    "wattswarm discovery announce attempted={} succeeded={} failed={}",
-                    report.attempted, report.succeeded, report.failed
-                );
+        run_discovery_bootnode_announce(&state_dir, &db_path);
+    })
+}
+
+pub fn spawn_periodic_discovery_bootnode_announce(
+    state_dir: PathBuf,
+    db_path: PathBuf,
+) -> thread::JoinHandle<()> {
+    spawn_discovery_bootnode_announce_loop(
+        state_dir,
+        db_path,
+        DISCOVERY_BOOTNODE_ANNOUNCE_INTERVAL,
+        None,
+    )
+}
+
+#[doc(hidden)]
+pub fn spawn_discovery_bootnode_announce_loop(
+    state_dir: PathBuf,
+    db_path: PathBuf,
+    interval: Duration,
+    max_runs: Option<usize>,
+) -> thread::JoinHandle<()> {
+    thread::spawn(move || {
+        let mut runs = 0usize;
+        loop {
+            run_discovery_bootnode_announce(&state_dir, &db_path);
+            runs = runs.saturating_add(1);
+            if max_runs.is_some_and(|max_runs| runs >= max_runs) {
+                break;
             }
-            Ok(_) => {}
-            Err(error) => eprintln!("wattswarm discovery announce failed: {error}"),
+            thread::sleep(interval);
         }
     })
+}
+
+fn run_discovery_bootnode_announce(state_dir: &std::path::Path, db_path: &std::path::Path) {
+    match discovery::maybe_announce_local_record_to_discovery_bootnodes(state_dir, db_path) {
+        Ok(report) if report.attempted > 0 => {
+            eprintln!(
+                "wattswarm discovery announce attempted={} succeeded={} failed={}",
+                report.attempted, report.succeeded, report.failed
+            );
+        }
+        Ok(_) => {}
+        Err(error) => eprintln!("wattswarm discovery announce failed: {error}"),
+    }
 }
 
 pub fn build_app(state: UiServerState) -> Router {

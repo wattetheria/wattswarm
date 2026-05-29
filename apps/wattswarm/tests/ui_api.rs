@@ -634,6 +634,52 @@ fn network_discovery_bootnode_announce_does_not_block_startup_path() {
     assert_eq!(requests.len(), 1);
 }
 
+#[test]
+fn network_discovery_periodic_announce_refreshes_bootnode_records() {
+    let _guard = env_lock();
+    let _db_lock = DbTestLock::acquire();
+    let schema = reset_test_schema("ui_discovery_periodic_announce");
+    let _schema_guard = EnvVarGuard::set("WATTSWARM_PG_SCHEMA", &schema);
+
+    let dir = tempdir().expect("tempdir");
+    let state_dir = dir.path().join("state");
+    fs::create_dir_all(&state_dir).expect("create state dir");
+    wattswarm::startup_config::save_startup_config(
+        &wattswarm::startup_config::startup_config_path(&state_dir),
+        &wattswarm::startup_config::StartupConfig {
+            latitude: Some(37.0),
+            longitude: Some(-122.0),
+            network_mode: wattswarm::startup_config::NetworkMode::Local,
+            ..Default::default()
+        },
+    )
+    .expect("save startup config");
+    let stub = DiscoveryRecordStubServer::start();
+    wattswarm::control::save_discovery_bootnode_urls_state(&state_dir, &[stub.base_url()])
+        .expect("save discovery bootnode urls");
+
+    let handle = wattswarm::ui::spawn_discovery_bootnode_announce_loop(
+        state_dir.clone(),
+        state_dir.join("local.state"),
+        Duration::from_millis(10),
+        Some(2),
+    );
+    handle
+        .join()
+        .expect("periodic discovery announce thread should finish");
+
+    let requests = stub.requests.lock().expect("discovery requests");
+    assert_eq!(requests.len(), 2);
+    for request in requests.iter() {
+        let record: SignedDiscoveryNodeRecord =
+            serde_json::from_str(request).expect("parse signed discovery record");
+        record.verify().expect("verify discovery record");
+        assert_eq!(record.body.ttl_ms, DEFAULT_RECORD_TTL_MS);
+        assert!(record.body.capabilities.contains("wattswarm.node"));
+        assert!(record.body.transport_contact.is_some());
+    }
+}
+
 fn sample_run_spec(run_id: &str) -> Value {
     json!({
         "run_id": run_id,
