@@ -677,6 +677,18 @@ fn ui_root_page_serves_startup_view_and_diagnostics_route_redirects_legacy_conso
         assert!(diagnostics_html.contains("Known Iroh Contacts"));
         assert!(diagnostics_html.contains("target scope"));
         assert!(diagnostics_html.contains("lane "));
+        assert!(diagnostics_html.contains(r#"data-mode="agent-events""#));
+        assert!(
+            diagnostics_html
+                .contains(r#"if (activeMode === "gossip") return category === "gossip";"#)
+        );
+        assert!(
+            diagnostics_html
+                .contains(r#"if (activeMode === "agent-events") return isAgentEvent(row);"#)
+        );
+        assert!(diagnostics_html.contains(
+            r#"if (activeMode === "backfill") return text.includes("backfill") && !isError(row);"#
+        ));
         assert!(!diagnostics_html.contains("Local Peer"));
         assert!(!diagnostics_html.contains("Connected Peers"));
         assert!(!diagnostics_html.contains("peer id"));

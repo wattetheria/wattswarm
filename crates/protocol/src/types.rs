@@ -1,3 +1,4 @@
+use serde::ser::SerializeStruct;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
@@ -941,14 +942,14 @@ impl ExecutionSetConfirmedPayload {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct TopicMessagePostedPayload {
     #[serde(default = "default_network_context_id")]
     pub network_id: String,
     pub feed_key: String,
     pub scope_hint: String,
     pub content_ref: ArtifactRef,
-    #[serde(default, skip_serializing, skip_deserializing)]
+    #[serde(default)]
     pub local_content_cache: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reply_to_message_id: Option<String>,
@@ -957,6 +958,31 @@ pub struct TopicMessagePostedPayload {
 impl TopicMessagePostedPayload {
     pub fn scope(&self) -> Option<ScopeHint> {
         ScopeHint::parse(&self.scope_hint)
+    }
+}
+
+impl Serialize for TopicMessagePostedPayload {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let include_content_cache =
+            self.feed_key == "wattswarm.dm" && self.local_content_cache.is_some();
+        let field_count = 4
+            + usize::from(include_content_cache)
+            + usize::from(self.reply_to_message_id.is_some());
+        let mut state = serializer.serialize_struct("TopicMessagePostedPayload", field_count)?;
+        state.serialize_field("network_id", &self.network_id)?;
+        state.serialize_field("feed_key", &self.feed_key)?;
+        state.serialize_field("scope_hint", &self.scope_hint)?;
+        state.serialize_field("content_ref", &self.content_ref)?;
+        if include_content_cache {
+            state.serialize_field("local_content_cache", &self.local_content_cache)?;
+        }
+        if let Some(reply_to_message_id) = &self.reply_to_message_id {
+            state.serialize_field("reply_to_message_id", reply_to_message_id)?;
+        }
+        state.end()
     }
 }
 

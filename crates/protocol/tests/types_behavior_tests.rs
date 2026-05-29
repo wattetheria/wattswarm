@@ -578,3 +578,49 @@ fn network_control_sync_defaults_are_fixed_for_regular_nodes() {
     assert_eq!(DEFAULT_CONTROL_RANGE_LIMIT, 256);
     assert_eq!(DEFAULT_CONTROL_MAX_DRIFT_BEFORE_SNAPSHOT, 5_000);
 }
+
+#[test]
+fn topic_message_payload_roundtrip_preserves_inline_content_cache() {
+    let payload = EventPayload::TopicMessagePosted(TopicMessagePostedPayload {
+        network_id: "default".to_owned(),
+        feed_key: "wattswarm.dm".to_owned(),
+        scope_hint: "group:dm-123".to_owned(),
+        content_ref: sample_topic_content_ref(),
+        local_content_cache: Some(serde_json::json!({
+            "kind": "direct_message",
+            "content": "hello from dm"
+        })),
+        reply_to_message_id: None,
+    });
+
+    let encoded = serde_json::to_string(&payload).expect("encode topic payload");
+    let decoded: EventPayload = serde_json::from_str(&encoded).expect("decode topic payload");
+
+    let EventPayload::TopicMessagePosted(decoded) = decoded else {
+        panic!("expected topic message payload");
+    };
+    assert_eq!(
+        decoded.local_content_cache,
+        Some(serde_json::json!({
+            "kind": "direct_message",
+            "content": "hello from dm"
+        }))
+    );
+
+    let public_payload = EventPayload::TopicMessagePosted(TopicMessagePostedPayload {
+        network_id: "default".to_owned(),
+        feed_key: "crew.chat".to_owned(),
+        scope_hint: "group:crew".to_owned(),
+        content_ref: sample_topic_content_ref(),
+        local_content_cache: Some(serde_json::json!({"text": "public chat"})),
+        reply_to_message_id: None,
+    });
+    let public_encoded =
+        serde_json::to_value(&public_payload).expect("encode public topic payload");
+    assert!(
+        public_encoded
+            .get("payload")
+            .and_then(|payload| payload.get("local_content_cache"))
+            .is_none()
+    );
+}

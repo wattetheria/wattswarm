@@ -413,6 +413,15 @@ pub(super) fn topic_message_requires_reply(content: &Value) -> bool {
     )
 }
 
+fn topic_message_agent_content(feed_key: &str, content: &Value) -> Value {
+    if feed_key == crate::control::PRIVATE_DM_FEED_KEY
+        && topic_message_kind(content) == Some("direct_message")
+    {
+        return content.get("content").cloned().unwrap_or(Value::Null);
+    }
+    content.clone()
+}
+
 fn verified_context_for_event_envelope(
     envelope: Option<&wattswarm_protocol::types::AgentEnvelope>,
     author_node_id: &str,
@@ -644,7 +653,8 @@ pub(super) fn topic_message_agent_event(
             "feed_key": &payload.feed_key,
             "scope_hint": &payload.scope_hint,
             "author_node_id": &event.author_node_id,
-            "content": topic_message.content,
+            "content": topic_message_agent_content(&payload.feed_key, &topic_message.content),
+            "topic_content": topic_message.content,
             "reply_to_message_id": &payload.reply_to_message_id,
             "created_at": event.created_at,
         }),

@@ -308,6 +308,7 @@ pub const INDEX_HTML: &str = r#"<!DOCTYPE html>
         <button class="tab" type="button" data-mode="transport">Transport</button>
         <button class="tab" type="button" data-mode="gossip">Gossip</button>
         <button class="tab" type="button" data-mode="backfill">Backfill</button>
+        <button class="tab" type="button" data-mode="agent-events">Agent Events</button>
         <button class="tab" type="button" data-mode="callback">Callback</button>
         <button class="tab" type="button" data-mode="errors">Errors</button>
       </div>
@@ -387,10 +388,41 @@ pub const INDEX_HTML: &str = r#"<!DOCTYPE html>
       return text.includes("error") || text.includes("fail") || text.includes("warn");
     }
 
+    function diagnosticDetails(row) {
+      return row && row.details && typeof row.details === "object" && !Array.isArray(row.details)
+        ? row.details
+        : {};
+    }
+
+    function diagnosticText(row) {
+      const details = diagnosticDetails(row);
+      return [
+        row.category,
+        row.phase,
+        row.component,
+        row.object_kind,
+        row.message,
+        details.event_type,
+        details.feed_key,
+        details.payload_kind,
+      ].filter(Boolean).join(" ").toLowerCase();
+    }
+
+    function isAgentEvent(row) {
+      const category = String(row.category || "").toLowerCase();
+      const objectKind = String(row.object_kind || "").toLowerCase();
+      return category === "agent_event" || objectKind === "agent_event";
+    }
+
     function modeMatches(row) {
       if (activeMode === "all") return true;
       if (activeMode === "errors") return isError(row);
-      const text = `${row.category || ""} ${row.phase || ""} ${row.component || ""}`.toLowerCase();
+      const category = String(row.category || "").toLowerCase();
+      if (activeMode === "transport") return category === "transport";
+      if (activeMode === "gossip") return category === "gossip";
+      if (activeMode === "agent-events") return isAgentEvent(row);
+      const text = diagnosticText(row);
+      if (activeMode === "backfill") return text.includes("backfill") && !isError(row);
       return text.includes(activeMode);
     }
 

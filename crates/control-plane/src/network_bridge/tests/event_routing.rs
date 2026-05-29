@@ -510,6 +510,58 @@ fn topic_message_requires_reply_excludes_consensus_kinds() {
 }
 
 #[test]
+fn private_dm_topic_agent_event_exposes_direct_message_content() {
+    let local = NodeIdentity::random();
+    let remote = NodeIdentity::random();
+    let membership = membership_with_roles(&[local.node_id(), remote.node_id()]);
+    let mut node =
+        Node::new(local, PgStore::open_in_memory().expect("store"), membership).expect("node");
+    let dm_content = json!({
+        "kind": "direct_message",
+        "thread_id": "dm-thread",
+        "message_id": "dm-message",
+        "content": "hello private dm"
+    });
+    let remote_event = build_event_for_external(
+        &remote,
+        1,
+        10,
+        crate::types::EventPayload::TopicMessagePosted(crate::types::TopicMessagePostedPayload {
+            network_id: "default".to_owned(),
+            feed_key: crate::control::PRIVATE_DM_FEED_KEY.to_owned(),
+            scope_hint: "group:dm-test".to_owned(),
+            content_ref: sample_topic_content_ref("sha256:dm-message", &remote.node_id()),
+            local_content_cache: Some(dm_content),
+            reply_to_message_id: None,
+        }),
+    )
+    .expect("signed event");
+    let envelope = EventEnvelope {
+        scope: SwarmScope::Group("dm-test".to_owned()),
+        event: remote_event,
+        content_source_node_id: None,
+    };
+
+    let ingested = ingest_event_envelope(&mut node, &envelope).expect("ingest dm event");
+    let crate::types::EventPayload::TopicMessagePosted(payload) = &ingested.payload else {
+        panic!("expected topic message");
+    };
+    let agent_event = topic_message_agent_event(&node, &ingested, payload)
+        .expect("agent event result")
+        .expect("agent event");
+
+    assert_eq!(agent_event.payload["content"], json!("hello private dm"));
+    assert_eq!(
+        agent_event.payload["topic_content"]["kind"].as_str(),
+        Some("direct_message")
+    );
+    assert_eq!(
+        agent_event.payload["topic_content"]["message_id"].as_str(),
+        Some("dm-message")
+    );
+}
+
+#[test]
 fn payment_update_allowed_actions_follow_message_kind() {
     assert_eq!(
         payment_allowed_actions("payment_request"),
