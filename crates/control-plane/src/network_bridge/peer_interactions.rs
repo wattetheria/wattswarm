@@ -568,6 +568,78 @@ pub(super) fn save_dm_message(
     Ok(record)
 }
 
+pub(super) fn save_inbound_private_dm_topic_message(
+    state_dir: &Path,
+    local_node_id: &str,
+    author_node_id: &str,
+    event_id: &str,
+    content: &Value,
+    created_at: u64,
+) -> Result<Option<crate::control::PeerDmMessageRecord>> {
+    let kind = content.get("kind").and_then(Value::as_str).map(str::trim);
+    if kind != Some("direct_message") {
+        return Ok(None);
+    }
+    let remote_node_id = author_node_id.trim();
+    if remote_node_id.is_empty() {
+        return Ok(None);
+    }
+    let thread_id = content
+        .get("thread_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| peer_dm_thread_id(local_node_id, remote_node_id));
+    let message_id = content
+        .get("message_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(event_id);
+    let message_content = content.get("content").cloned().unwrap_or(Value::Null);
+    let parsed_envelope = content.get("agent_envelope").cloned().and_then(|value| {
+        serde_json::from_value::<crate::control::AgentInteractionEnvelope>(value).ok()
+    });
+    let a2a_protocol = parsed_envelope
+        .as_ref()
+        .map(|envelope| envelope.protocol.trim())
+        .filter(|protocol| !protocol.is_empty())
+        .unwrap_or("google_a2a")
+        .to_owned();
+    let agent_envelope = parsed_envelope.or_else(|| {
+        Some(crate::control::synthesize_peer_dm_envelope(
+            &a2a_protocol,
+            &message_content,
+        ))
+    });
+
+    upsert_dm_thread(
+        state_dir,
+        remote_node_id,
+        &thread_id,
+        crate::control::PeerDmSessionState::Ready,
+        None,
+        Some(created_at),
+    )?;
+
+    let record = crate::control::PeerDmMessageRecord {
+        thread_id,
+        message_id: message_id.to_owned(),
+        remote_node_id: remote_node_id.to_owned(),
+        message_kind: crate::control::PeerDmMessageKind::Message,
+        direction: crate::control::PeerDmDirection::Inbound,
+        delivery_state: crate::control::PeerDmDeliveryState::Delivered,
+        a2a_protocol,
+        content: message_content,
+        agent_envelope,
+        created_at,
+        acknowledged_at: Some(created_at),
+    };
+    crate::control::save_peer_dm_message_record_state(state_dir, &record)?;
+    Ok(Some(record))
+}
+
 pub(super) fn save_agent_payment_summary(
     state_dir: &Path,
     remote_node_id: &str,

@@ -562,6 +562,112 @@ fn private_dm_topic_agent_event_exposes_direct_message_content() {
 }
 
 #[test]
+fn inbound_private_dm_topic_is_projected_to_local_dm_store() {
+    let state_dir = temp_startup_dir("inbound-private-dm-projection");
+    let db_path = state_dir.join("ui.state");
+    let local = crate::control::load_local_identity(&state_dir).expect("local identity");
+    let remote = NodeIdentity::random();
+    let membership = membership_with_roles(&[local.node_id(), remote.node_id()]);
+    let mut node = Node::new(
+        local.clone(),
+        PgStore::open(&db_path).expect("store"),
+        membership,
+    )
+    .expect("node");
+    let thread_id = crate::control::private_dm_thread_id(&local.node_id(), &remote.node_id());
+    let message_id = "dm-message-inbound-1";
+    let dm_content = json!({
+        "kind": "direct_message",
+        "thread_id": thread_id,
+        "message_id": message_id,
+        "content": {
+            "type": "text",
+            "text": "hello from remote"
+        },
+        "agent_envelope": {
+            "protocol": "google_a2a",
+            "source_agent_id": "did:key:remote",
+            "target_agent_id": "did:key:local",
+            "source_node_id": remote.node_id(),
+            "target_node_id": local.node_id(),
+            "capability": "social.dm.send",
+            "message": {
+                "content": {
+                    "type": "text",
+                    "text": "hello from remote"
+                },
+                "message_id": message_id
+            },
+            "signature": "sig"
+        }
+    });
+    let remote_event = build_event_for_external(
+        &remote,
+        1,
+        10,
+        crate::types::EventPayload::TopicMessagePosted(crate::types::TopicMessagePostedPayload {
+            network_id: "default".to_owned(),
+            feed_key: crate::control::PRIVATE_DM_FEED_KEY.to_owned(),
+            scope_hint: crate::control::private_dm_scope_hint(&local.node_id(), &remote.node_id()),
+            content_ref: sample_topic_content_ref("sha256:dm-message", &remote.node_id()),
+            local_content_cache: Some(dm_content),
+            reply_to_message_id: None,
+        }),
+    )
+    .expect("signed event");
+    let scope = SwarmScope::Group(crate::control::private_dm_group_id(
+        &local.node_id(),
+        &remote.node_id(),
+    ));
+    let mut service = NetworkBridgeService::new(
+        NetworkP2pNode::generate(NetworkP2pConfig::default()).expect("p2p node"),
+        &[SwarmScope::Global, scope.clone()],
+        &NetworkProtocolParams::default(),
+    )
+    .expect("service");
+    service.set_state_dir(state_dir.clone(), db_path.clone());
+
+    service
+        .process_runtime_event(
+            &mut node,
+            NetworkRuntimeEvent::Gossip {
+                propagation_source: random_network_node_id(),
+                message: GossipMessage::Chat(EventEnvelope {
+                    scope,
+                    event: remote_event,
+                    content_source_node_id: None,
+                }),
+            },
+        )
+        .expect("ingest inbound private dm");
+
+    let threads =
+        crate::control::load_peer_dm_thread_records_state(&state_dir).expect("load dm threads");
+    let thread = threads
+        .iter()
+        .find(|record| record.remote_node_id == remote.node_id())
+        .expect("inbound dm thread projected");
+    let messages =
+        crate::control::load_peer_dm_message_records_state(&state_dir, &thread.thread_id)
+            .expect("load dm messages");
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0].message_id, message_id);
+    assert_eq!(messages[0].remote_node_id, remote.node_id());
+    assert_eq!(
+        messages[0].direction,
+        crate::control::PeerDmDirection::Inbound
+    );
+    assert_eq!(
+        messages[0].delivery_state,
+        crate::control::PeerDmDeliveryState::Delivered
+    );
+    assert_eq!(
+        messages[0].content["text"].as_str(),
+        Some("hello from remote")
+    );
+}
+
+#[test]
 fn payment_update_allowed_actions_follow_message_kind() {
     assert_eq!(
         payment_allowed_actions("payment_request"),

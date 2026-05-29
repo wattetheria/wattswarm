@@ -107,9 +107,9 @@ use peer_interactions::{
     attach_agent_envelope_to_relationship, control_peer_relationship_action,
     optional_verified_agent_context_for_protocol_source, payload_with_verified_agent_context,
     peer_dm_thread_id, process_pending_network_commands, raw_agent_envelope_to_protocol,
-    save_agent_payment_summary, save_dm_message, upsert_dm_thread,
-    verify_agent_envelope_signature_for_source, verify_protocol_agent_envelope_for_source,
-    wire_peer_relationship_action,
+    save_agent_payment_summary, save_dm_message, save_inbound_private_dm_topic_message,
+    upsert_dm_thread, verify_agent_envelope_signature_for_source,
+    verify_protocol_agent_envelope_for_source, wire_peer_relationship_action,
 };
 use publish::GlobalPublishRateGuard;
 use scope::{

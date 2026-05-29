@@ -5,6 +5,44 @@ fn should_record_backfill_response_diagnostic(events_applied: usize) -> bool {
 }
 
 impl NetworkBridgeService {
+    fn save_inbound_private_dm_topic_if_applicable(
+        &self,
+        node: &Node,
+        event: &crate::types::Event,
+        payload: &crate::types::TopicMessagePostedPayload,
+    ) {
+        if payload.feed_key != crate::control::PRIVATE_DM_FEED_KEY {
+            return;
+        }
+        let Some(state_dir) = &self.state_dir else {
+            return;
+        };
+        match node.store.get_topic_message(&event.event_id) {
+            Ok(Some(topic_message)) => {
+                if let Err(err) = save_inbound_private_dm_topic_message(
+                    state_dir,
+                    &node.node_id(),
+                    &event.author_node_id,
+                    &event.event_id,
+                    &topic_message.content,
+                    event.created_at,
+                ) {
+                    eprintln!(
+                        "inbound private dm projection failed for {}: {err}",
+                        event.event_id
+                    );
+                }
+            }
+            Ok(None) => {}
+            Err(err) => {
+                eprintln!(
+                    "inbound private dm content lookup failed for {}: {err}",
+                    event.event_id
+                );
+            }
+        }
+    }
+
     fn deliver_task_lifecycle_agent_event(&self, node: &Node, event: &crate::types::Event) {
         let Some(state_dir) = &self.state_dir else {
             return;
@@ -463,6 +501,11 @@ impl NetworkBridgeService {
                                 &ingested_event.event_id,
                                 ingested_event.created_at,
                             )?;
+                            self.save_inbound_private_dm_topic_if_applicable(
+                                node,
+                                &ingested_event,
+                                payload,
+                            );
                             if let Some(state_dir) = &self.state_dir
                                 && let Ok(Some(event)) =
                                     topic_message_agent_event(node, &ingested_event, payload)
@@ -663,6 +706,15 @@ impl NetworkBridgeService {
                         eprintln!(
                             "topic content sync failed for {}: {err}",
                             envelope.event.event_id
+                        );
+                    }
+                    if let crate::types::EventPayload::TopicMessagePosted(payload) =
+                        &envelope.event.payload
+                    {
+                        self.save_inbound_private_dm_topic_if_applicable(
+                            node,
+                            &envelope.event,
+                            payload,
                         );
                     }
                 }
