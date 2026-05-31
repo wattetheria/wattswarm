@@ -392,6 +392,7 @@ fn task_import_contract_populates_projection_without_created_or_announced_events
                         feed_key: "task.lifecycle.remote-task-import".to_owned(),
                         scope_hint: "group:remote-task-import".to_owned(),
                         gossip_kinds: vec!["events".to_owned()],
+                        provider_capabilities: None,
                         active: true,
                     }),
                     1_700_000_000_000,
@@ -925,6 +926,12 @@ fn network_discovery_bootnode_accepts_signed_records_and_filters_queries() {
         });
         body.capabilities =
             DiscoveryRecordCapabilities::new(["wattswarm.node", "discovery.bootnode"]).unwrap();
+        body.topic_providers.push(DiscoveryTopicProvider {
+            feed_key: "sydney-weather".to_owned(),
+            scope_hint: "group:sydney-weather".to_owned(),
+            capabilities: DiscoveryTopicProviderCapabilities::local_history_provider(),
+            updated_at_ms: now_ms,
+        });
         let record = SignedDiscoveryNodeRecord::sign(body, &identity).unwrap();
 
         let announce_res = app
@@ -978,6 +985,24 @@ fn network_discovery_bootnode_accepts_signed_records_and_filters_queries() {
         let capability_json = json_from(capability_res).await;
         assert_eq!(
             capability_json["records"][0]["body"]["node_id"].as_str(),
+            Some(node_id.as_str())
+        );
+
+        let topic_provider_res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/network/discovery/topic-providers?network_id=mainnet:test&feed_key=sydney-weather&scope_hint=group%3Asydney-weather")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(topic_provider_res.status(), StatusCode::OK);
+        let topic_provider_json = json_from(topic_provider_res).await;
+        assert_eq!(
+            topic_provider_json["records"][0]["body"]["node_id"].as_str(),
             Some(node_id.as_str())
         );
 

@@ -32,7 +32,7 @@ use wattswarm::wattetheria_sync::proto::wattetheria_sync_service_client::Watteth
 use wattswarm::wattetheria_sync::proto::{ProjectionStreamRequest, UpdateStartupGeoRequest};
 use wattswarm_network_discovery::{
     DEFAULT_RECORD_TTL_MS, DiscoveryGeo, DiscoveryNodeRecordBody, DiscoveryRecordCapabilities,
-    SignedDiscoveryNodeRecord,
+    DiscoveryTopicProvider, DiscoveryTopicProviderCapabilities, SignedDiscoveryNodeRecord,
 };
 use wattswarm_storage_core::storage::pg::Connection;
 use wattswarm_storage_core::types::ArtifactRef;

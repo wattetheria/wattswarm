@@ -174,6 +174,7 @@ fn distance_km_between(
 
 pub(super) fn query_discovery_bootnodes_for_candidate_records(
     state_dir: &Path,
+    node: &Node,
     network_id: &str,
     settings: &DiscoveryBootnodeSettings,
     now_ms: u64,
@@ -191,7 +192,7 @@ pub(super) fn query_discovery_bootnodes_for_candidate_records(
         .context("build discovery bootnode query HTTP client")?;
     let mut records = Vec::new();
     let mut seen = HashSet::new();
-    for discovery_url in discovery_urls {
+    for discovery_url in &discovery_urls {
         let endpoint = match discovery_bootnode_query_endpoint(&discovery_url, network_id, settings)
         {
             Ok(endpoint) => endpoint,
@@ -200,31 +201,83 @@ pub(super) fn query_discovery_bootnodes_for_candidate_records(
                 continue;
             }
         };
-        match client.get(endpoint.clone()).send() {
-            Ok(response) => match response.error_for_status() {
-                Ok(response) => match response.json::<DiscoveryBootnodeNearbyResponse>() {
-                    Ok(payload) => {
-                        reset_discovery_bootnode_failure_log_state(&endpoint);
-                        for item in payload.records {
-                            let record = item.into_record();
-                            if record.verify_fresh_at(now_ms).is_ok()
-                                && record.body.network_id == network_id
-                                && seen.insert(record.body.node_id.clone())
-                            {
-                                records.push(record);
-                            }
-                        }
-                    }
-                    Err(error) => {
-                        eprintln!("discovery bootnode response decode failed {endpoint}: {error:#}")
-                    }
-                },
-                Err(error) => log_discovery_bootnode_query_failure(&endpoint, &error),
-            },
-            Err(error) => log_discovery_bootnode_query_failure(&endpoint, &error),
+        fetch_discovery_bootnode_records(
+            &client,
+            endpoint,
+            network_id,
+            now_ms,
+            &mut seen,
+            &mut records,
+        );
+    }
+    let subscriptions = match node
+        .store
+        .list_active_feed_subscriptions(network_id, &node.node_id())
+    {
+        Ok(subscriptions) => subscriptions,
+        Err(error) => {
+            eprintln!("discovery bootnode topic provider query skipped: {error:#}");
+            return Ok(records);
+        }
+    };
+    for subscription in subscriptions {
+        for discovery_url in &discovery_urls {
+            let endpoint = match discovery_bootnode_topic_provider_endpoint(
+                discovery_url,
+                network_id,
+                &subscription.feed_key,
+                &subscription.scope_hint,
+            ) {
+                Ok(endpoint) => endpoint,
+                Err(error) => {
+                    eprintln!("discovery bootnode URL skipped {discovery_url}: {error}");
+                    continue;
+                }
+            };
+            fetch_discovery_bootnode_records(
+                &client,
+                endpoint,
+                network_id,
+                now_ms,
+                &mut seen,
+                &mut records,
+            );
         }
     }
     Ok(records)
+}
+
+fn fetch_discovery_bootnode_records(
+    client: &reqwest::blocking::Client,
+    endpoint: String,
+    network_id: &str,
+    now_ms: u64,
+    seen: &mut HashSet<String>,
+    records: &mut Vec<SignedDiscoveryNodeRecord>,
+) {
+    match client.get(endpoint.clone()).send() {
+        Ok(response) => match response.error_for_status() {
+            Ok(response) => match response.json::<DiscoveryBootnodeNearbyResponse>() {
+                Ok(payload) => {
+                    reset_discovery_bootnode_failure_log_state(&endpoint);
+                    for item in payload.records {
+                        let record = item.into_record();
+                        if record.verify_fresh_at(now_ms).is_ok()
+                            && record.body.network_id == network_id
+                            && seen.insert(record.body.node_id.clone())
+                        {
+                            records.push(record);
+                        }
+                    }
+                }
+                Err(error) => {
+                    eprintln!("discovery bootnode response decode failed {endpoint}: {error:#}")
+                }
+            },
+            Err(error) => log_discovery_bootnode_query_failure(&endpoint, &error),
+        },
+        Err(error) => log_discovery_bootnode_query_failure(&endpoint, &error),
+    }
 }
 
 fn discovery_bootnode_query_endpoint(
@@ -262,6 +315,33 @@ fn discovery_bootnode_query_endpoint(
             pairs.append_pair("capability", DISCOVERY_NODE_CAPABILITY);
         }
         pairs.append_pair("limit", &DISCOVERY_BOOTNODE_QUERY_LIMIT.to_string());
+    }
+    Ok(url.to_string())
+}
+
+fn discovery_bootnode_topic_provider_endpoint(
+    base_url: &str,
+    network_id: &str,
+    feed_key: &str,
+    scope_hint: &str,
+) -> Result<String> {
+    let base_url = base_url.trim().trim_end_matches('/');
+    let endpoint = if base_url.ends_with("/api/network/discovery/topic-providers") {
+        base_url.to_owned()
+    } else if base_url.ends_with("/api/network/discovery") {
+        format!("{base_url}/topic-providers")
+    } else {
+        format!("{base_url}/api/network/discovery/topic-providers")
+    };
+    let mut url = reqwest::Url::parse(&endpoint)
+        .with_context(|| format!("parse discovery bootnode URL {endpoint}"))?;
+    {
+        let mut pairs = url.query_pairs_mut();
+        pairs
+            .append_pair("network_id", network_id)
+            .append_pair("feed_key", feed_key)
+            .append_pair("scope_hint", scope_hint)
+            .append_pair("limit", &DISCOVERY_BOOTNODE_QUERY_LIMIT.to_string());
     }
     Ok(url.to_string())
 }

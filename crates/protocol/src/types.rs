@@ -859,6 +859,30 @@ pub struct CheckpointCreatedPayload {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TopicProviderCapabilities {
+    #[serde(default)]
+    pub live_gossip: bool,
+    #[serde(default)]
+    pub history_backfill: bool,
+    #[serde(default)]
+    pub local_store: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retention_ms: Option<u64>,
+}
+
+impl TopicProviderCapabilities {
+    #[must_use]
+    pub fn local_history_provider() -> Self {
+        Self {
+            live_gossip: true,
+            history_backfill: true,
+            local_store: true,
+            retention_ms: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FeedSubscriptionUpdatedPayload {
     #[serde(default = "default_network_context_id")]
     pub network_id: String,
@@ -867,6 +891,8 @@ pub struct FeedSubscriptionUpdatedPayload {
     pub scope_hint: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub gossip_kinds: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_capabilities: Option<TopicProviderCapabilities>,
     pub active: bool,
 }
 

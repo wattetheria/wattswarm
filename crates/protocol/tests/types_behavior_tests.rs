@@ -6,8 +6,8 @@ use wattswarm_protocol::types::{
     FeedSubscriptionUpdatedPayload, Membership, NetworkControlSyncParams, NetworkDescriptor,
     NetworkKind, NetworkTopology, NodePenalizedPayload, OrgDescriptor, PolicyBinding, Role,
     ScopeHint, SummaryRevokedPayload, TaskAnnouncedPayload, TaskContract, TaskDisseminationLayer,
-    TaskExpiredPayload, TaskMode, TopicMessagePostedPayload, TransportRoute, UnsignedEvent,
-    canonical_scope_hint, normalized_scope_hint,
+    TaskExpiredPayload, TaskMode, TopicMessagePostedPayload, TopicProviderCapabilities,
+    TransportRoute, UnsignedEvent, canonical_scope_hint, normalized_scope_hint,
 };
 
 fn sample_topic_content_ref() -> ArtifactRef {
@@ -250,6 +250,7 @@ fn scope_hint_parse_and_canonicalization_are_shared() {
             feed_key: "feed".to_owned(),
             scope_hint: "region:sol-1".to_owned(),
             gossip_kinds: vec!["events".to_owned()],
+            provider_capabilities: None,
             active: true,
         }
         .scope(),
@@ -334,6 +335,32 @@ fn scope_hint_parse_and_canonicalization_are_shared() {
     assert_eq!(
         ScopeHint::parse_with_prefix_fallback(" group:crew-7:task "),
         Some(ScopeHint::Group("crew-7".to_owned()))
+    );
+}
+
+#[test]
+fn feed_subscription_provider_capabilities_roundtrip() {
+    let payload = FeedSubscriptionUpdatedPayload {
+        network_id: "mainnet:test".to_owned(),
+        subscriber_node_id: "node-a".to_owned(),
+        feed_key: "topic.chat".to_owned(),
+        scope_hint: "group:sydney-weather".to_owned(),
+        gossip_kinds: vec!["messages".to_owned()],
+        provider_capabilities: Some(TopicProviderCapabilities::local_history_provider()),
+        active: true,
+    };
+
+    let encoded = serde_json::to_string(&payload).unwrap();
+    let decoded: FeedSubscriptionUpdatedPayload = serde_json::from_str(&encoded).unwrap();
+
+    assert_eq!(decoded, payload);
+    assert_eq!(
+        decoded.provider_capabilities.as_ref().map(|caps| (
+            caps.live_gossip,
+            caps.history_backfill,
+            caps.local_store
+        )),
+        Some((true, true, true))
     );
 }
 

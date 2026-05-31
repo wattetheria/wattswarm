@@ -179,28 +179,50 @@ impl PgStore {
         active: bool,
         updated_at: u64,
     ) -> Result<()> {
-        let gossip_kinds_json = serde_json::to_string(gossip_kinds)?;
+        self.upsert_feed_subscription_with_provider_capabilities(FeedSubscriptionUpsert {
+            network_id,
+            subscriber_node_id,
+            feed_key,
+            scope_hint,
+            gossip_kinds,
+            provider_capabilities: None,
+            active,
+            updated_at,
+        })
+    }
+
+    pub fn upsert_feed_subscription_with_provider_capabilities(
+        &self,
+        upsert: FeedSubscriptionUpsert<'_>,
+    ) -> Result<()> {
+        let gossip_kinds_json = serde_json::to_string(upsert.gossip_kinds)?;
+        let provider_capabilities_json = upsert
+            .provider_capabilities
+            .map(serde_json::to_string)
+            .transpose()?;
         let conn = self
             .conn
             .lock()
             .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
         conn.execute(
-            "INSERT INTO feed_subscriptions(org_id, network_id, subscriber_node_id, feed_key, scope_hint, gossip_kinds_json, active, updated_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, TIMESTAMPTZ 'epoch' + ($8::bigint * INTERVAL '1 millisecond'))
+            "INSERT INTO feed_subscriptions(org_id, network_id, subscriber_node_id, feed_key, scope_hint, gossip_kinds_json, provider_capabilities_json, active, updated_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, TIMESTAMPTZ 'epoch' + ($9::bigint * INTERVAL '1 millisecond'))
              ON CONFLICT(org_id, network_id, subscriber_node_id, feed_key) DO UPDATE SET
                scope_hint = excluded.scope_hint,
                gossip_kinds_json = excluded.gossip_kinds_json,
+               provider_capabilities_json = excluded.provider_capabilities_json,
                active = excluded.active,
                updated_at = excluded.updated_at",
             params![
                 self.org_id(),
-                network_id,
-                subscriber_node_id,
-                feed_key,
-                scope_hint,
+                upsert.network_id,
+                upsert.subscriber_node_id,
+                upsert.feed_key,
+                upsert.scope_hint,
                 gossip_kinds_json,
-                active,
-                updated_at as i64
+                provider_capabilities_json,
+                upsert.active,
+                upsert.updated_at as i64
             ],
         )?;
         Ok(())
@@ -264,19 +286,20 @@ impl PgStore {
             .lock()
             .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
         conn.query_row(
-            "SELECT scope_hint, gossip_kinds_json, active, CAST(EXTRACT(EPOCH FROM updated_at) * 1000 AS BIGINT)
+            "SELECT scope_hint, gossip_kinds_json, provider_capabilities_json, active, CAST(EXTRACT(EPOCH FROM updated_at) * 1000 AS BIGINT)
              FROM feed_subscriptions
              WHERE org_id = $1 AND network_id = $2 AND subscriber_node_id = $3 AND feed_key = $4",
             params![self.org_id(), network_id, subscriber_node_id, feed_key],
             |r| {
-                let updated_at_ms: i64 = r.get(3)?;
+                let updated_at_ms: i64 = r.get(4)?;
                 Ok(FeedSubscriptionRow {
                     network_id: network_id.to_owned(),
                     subscriber_node_id: subscriber_node_id.to_owned(),
                     feed_key: feed_key.to_owned(),
                     scope_hint: Self::canonical_scope_hint_or_original(r.get(0)?),
                     gossip_kinds: Self::decode_gossip_kinds_json(r.get(1)?),
-                    active: r.get(2)?,
+                    provider_capabilities: Self::decode_topic_provider_capabilities_json(r.get(2)?),
+                    active: r.get(3)?,
                     updated_at: updated_at_ms as u64,
                 })
             },
@@ -295,7 +318,7 @@ impl PgStore {
             .lock()
             .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
         let mut stmt = conn.prepare(
-            "SELECT feed_key, scope_hint, gossip_kinds_json, active, CAST(EXTRACT(EPOCH FROM updated_at) * 1000 AS BIGINT)
+            "SELECT feed_key, scope_hint, gossip_kinds_json, provider_capabilities_json, active, CAST(EXTRACT(EPOCH FROM updated_at) * 1000 AS BIGINT)
              FROM feed_subscriptions
              WHERE org_id = $1 AND network_id = $2 AND subscriber_node_id = $3 AND active = TRUE
              ORDER BY updated_at DESC, feed_key ASC",
@@ -303,14 +326,15 @@ impl PgStore {
         let rows = stmt.query_map(
             params![self.org_id(), network_id, subscriber_node_id],
             |r| {
-                let updated_at_ms: i64 = r.get(4)?;
+                let updated_at_ms: i64 = r.get(5)?;
                 Ok(FeedSubscriptionRow {
                     network_id: network_id.to_owned(),
                     subscriber_node_id: subscriber_node_id.to_owned(),
                     feed_key: r.get(0)?,
                     scope_hint: Self::canonical_scope_hint_or_original(r.get(1)?),
                     gossip_kinds: Self::decode_gossip_kinds_json(r.get(2)?),
-                    active: r.get(3)?,
+                    provider_capabilities: Self::decode_topic_provider_capabilities_json(r.get(3)?),
+                    active: r.get(4)?,
                     updated_at: updated_at_ms as u64,
                 })
             },
@@ -331,20 +355,21 @@ impl PgStore {
             .lock()
             .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
         let mut stmt = conn.prepare(
-            "SELECT subscriber_node_id, feed_key, scope_hint, gossip_kinds_json, active, CAST(EXTRACT(EPOCH FROM updated_at) * 1000 AS BIGINT)
+            "SELECT subscriber_node_id, feed_key, scope_hint, gossip_kinds_json, provider_capabilities_json, active, CAST(EXTRACT(EPOCH FROM updated_at) * 1000 AS BIGINT)
              FROM feed_subscriptions
              WHERE org_id = $1 AND network_id = $2 AND active = TRUE
              ORDER BY updated_at DESC, subscriber_node_id ASC, feed_key ASC",
         )?;
         let rows = stmt.query_map(params![self.org_id(), network_id], |r| {
-            let updated_at_ms: i64 = r.get(5)?;
+            let updated_at_ms: i64 = r.get(6)?;
             Ok(FeedSubscriptionRow {
                 network_id: network_id.to_owned(),
                 subscriber_node_id: r.get(0)?,
                 feed_key: r.get(1)?,
                 scope_hint: Self::canonical_scope_hint_or_original(r.get(2)?),
                 gossip_kinds: Self::decode_gossip_kinds_json(r.get(3)?),
-                active: r.get(4)?,
+                provider_capabilities: Self::decode_topic_provider_capabilities_json(r.get(4)?),
+                active: r.get(5)?,
                 updated_at: updated_at_ms as u64,
             })
         })?;

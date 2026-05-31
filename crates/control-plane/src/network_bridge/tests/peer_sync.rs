@@ -445,6 +445,7 @@ fn gossip_from_peer_persists_relay_contact_material_from_configured_relay() {
                 feed_key: "crew.chat".to_owned(),
                 scope_hint: "group:crew-7".to_owned(),
                 gossip_kinds: vec!["events".to_owned()],
+                provider_capabilities: None,
                 active: true,
             },
         ),

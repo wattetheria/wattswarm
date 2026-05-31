@@ -24,6 +24,7 @@ fn ui_exposes_topic_message_history_and_cursor_queries() {
                 feed_key: "crew.chat".to_owned(),
                 scope_hint: "group:crew-7".to_owned(),
                 gossip_kinds: vec!["messages".to_owned()],
+                provider_capabilities: None,
                 active: true,
             }),
             100,

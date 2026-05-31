@@ -345,15 +345,19 @@ impl Node {
             }
             EventPayload::FeedSubscriptionUpdated(payload) => {
                 let scope_hint = crate::types::normalized_scope_hint(&payload.scope_hint);
-                self.store.upsert_feed_subscription(
-                    &payload.network_id,
-                    &payload.subscriber_node_id,
-                    &payload.feed_key,
-                    &scope_hint,
-                    &payload.gossip_kinds,
-                    payload.active,
-                    event.created_at,
-                )?;
+                self.store
+                    .upsert_feed_subscription_with_provider_capabilities(
+                        crate::storage::FeedSubscriptionUpsert {
+                            network_id: &payload.network_id,
+                            subscriber_node_id: &payload.subscriber_node_id,
+                            feed_key: &payload.feed_key,
+                            scope_hint: &scope_hint,
+                            gossip_kinds: &payload.gossip_kinds,
+                            provider_capabilities: payload.provider_capabilities.as_ref(),
+                            active: payload.active,
+                            updated_at: event.created_at,
+                        },
+                    )?;
             }
             EventPayload::TaskAnnounced(payload) => {
                 let scope_hint = crate::types::normalized_scope_hint(&payload.scope_hint);

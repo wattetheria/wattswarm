@@ -18,7 +18,10 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use uuid::Uuid;
-use wattswarm_network_discovery::{DEFAULT_RECORD_TTL_MS, DiscoveryNodeRecordBody};
+use wattswarm_network_discovery::{
+    DEFAULT_RECORD_TTL_MS, DiscoveryNodeRecordBody, DiscoveryTopicProvider,
+    DiscoveryTopicProviderCapabilities,
+};
 
 mod discovery_scope;
 mod event_routing;

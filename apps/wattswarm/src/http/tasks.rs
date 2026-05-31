@@ -212,6 +212,9 @@ pub(crate) async fn task_announce(
                     feed_key: feed_key.clone(),
                     scope_hint: scope_hint.clone(),
                     gossip_kinds: vec!["events".to_owned()],
+                    provider_capabilities: Some(
+                        crate::types::TopicProviderCapabilities::local_history_provider(),
+                    ),
                     active: true,
                 },
             ),
@@ -284,6 +287,9 @@ pub(crate) async fn task_claim(
                             feed_key: feed_key.clone(),
                             scope_hint: scope_hint.clone(),
                             gossip_kinds,
+                            provider_capabilities: Some(
+                                crate::types::TopicProviderCapabilities::local_history_provider(),
+                            ),
                             active: true,
                         },
                     ),

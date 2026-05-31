@@ -85,8 +85,53 @@ pub struct DiscoveryNodeRecordBody {
     pub geo: Option<DiscoveryGeo>,
     #[serde(default)]
     pub capabilities: DiscoveryRecordCapabilities,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub topic_providers: Vec<DiscoveryTopicProvider>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transport_contact: Option<TransportContactMaterial>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiscoveryTopicProviderCapabilities {
+    #[serde(default)]
+    pub live_gossip: bool,
+    #[serde(default)]
+    pub history_backfill: bool,
+    #[serde(default)]
+    pub local_store: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retention_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiscoveryTopicProvider {
+    pub feed_key: String,
+    pub scope_hint: String,
+    pub capabilities: DiscoveryTopicProviderCapabilities,
+    pub updated_at_ms: u64,
+}
+
+impl DiscoveryTopicProviderCapabilities {
+    #[must_use]
+    pub fn local_history_provider() -> Self {
+        Self {
+            live_gossip: true,
+            history_backfill: true,
+            local_store: true,
+            retention_ms: None,
+        }
+    }
+}
+
+impl DiscoveryTopicProvider {
+    pub fn validate(&self) -> Result<()> {
+        validate_segment("topic provider feed_key", &self.feed_key)?;
+        validate_segment("topic provider scope_hint", &self.scope_hint)?;
+        if self.updated_at_ms == 0 {
+            bail!("topic provider updated_at_ms must be greater than zero");
+        }
+        Ok(())
+    }
 }
 
 impl DiscoveryNodeRecordBody {
@@ -107,6 +152,7 @@ impl DiscoveryNodeRecordBody {
             ttl_ms: DEFAULT_RECORD_TTL_MS,
             geo: None,
             capabilities: DiscoveryRecordCapabilities::default(),
+            topic_providers: Vec::new(),
             transport_contact: None,
         }
     }
@@ -129,6 +175,9 @@ impl DiscoveryNodeRecordBody {
         }
         if let Some(geo) = &self.geo {
             geo.validate()?;
+        }
+        for provider in &self.topic_providers {
+            provider.validate()?;
         }
         if let Some(contact) = &self.transport_contact {
             if contact.peer_id != self.node_id {
@@ -269,6 +318,28 @@ impl DiscoveryRoutingTable {
             .collect()
     }
 
+    pub fn find_topic_providers(
+        &self,
+        network_id: &str,
+        feed_key: &str,
+        scope_hint: &str,
+        now_ms: u64,
+        limit: usize,
+    ) -> Vec<SignedDiscoveryNodeRecord> {
+        self.records
+            .values()
+            .filter(|record| {
+                record.body.network_id == network_id
+                    && !record.body.is_expired_at(now_ms)
+                    && record.body.topic_providers.iter().any(|provider| {
+                        provider.feed_key == feed_key && provider.scope_hint == scope_hint
+                    })
+            })
+            .take(limit)
+            .cloned()
+            .collect()
+    }
+
     pub fn find_nearby(
         &self,
         network_id: &str,
@@ -366,6 +437,18 @@ impl DiscoveryBootnode {
     ) -> Vec<SignedDiscoveryNodeRecord> {
         self.routing_table
             .find_capability(network_id, capability, now_ms, limit)
+    }
+
+    pub fn find_topic_providers(
+        &self,
+        network_id: &str,
+        feed_key: &str,
+        scope_hint: &str,
+        now_ms: u64,
+        limit: usize,
+    ) -> Vec<SignedDiscoveryNodeRecord> {
+        self.routing_table
+            .find_topic_providers(network_id, feed_key, scope_hint, now_ms, limit)
     }
 }
 
@@ -608,6 +691,101 @@ mod tests {
         let gateways = bootnode.find_capability("net", "GATEWAY.NODE", 2_000, 10);
         assert_eq!(gateways.len(), 1);
         assert_eq!(gateways[0].body.node_id, gateway_identity.node_id());
+    }
+
+    #[test]
+    fn topic_provider_query_returns_matching_active_records_only() {
+        let provider_identity = NodeIdentity::from_seed([11; 32]);
+        let other_topic_identity = NodeIdentity::from_seed([12; 32]);
+        let other_network_identity = NodeIdentity::from_seed([13; 32]);
+        let mut table = DiscoveryRoutingTable::new();
+
+        let provider = record(
+            &provider_identity,
+            "mainnet:wattetheria",
+            1,
+            10_000,
+            0.0,
+            0.0,
+            1_000.0,
+            &["wattswarm.node"],
+        );
+        let mut provider_body = provider.body;
+        provider_body.topic_providers.push(DiscoveryTopicProvider {
+            feed_key: "sydney-weather".to_owned(),
+            scope_hint: "group:sydney-weather".to_owned(),
+            capabilities: DiscoveryTopicProviderCapabilities::local_history_provider(),
+            updated_at_ms: 10_000,
+        });
+        table
+            .announce_record(
+                SignedDiscoveryNodeRecord::sign(provider_body, &provider_identity).unwrap(),
+                10_001,
+            )
+            .unwrap();
+
+        let other_topic = record(
+            &other_topic_identity,
+            "mainnet:wattetheria",
+            1,
+            10_000,
+            0.0,
+            0.0,
+            1_000.0,
+            &["wattswarm.node"],
+        );
+        let mut other_topic_body = other_topic.body;
+        other_topic_body
+            .topic_providers
+            .push(DiscoveryTopicProvider {
+                feed_key: "london-economy".to_owned(),
+                scope_hint: "group:london-economy".to_owned(),
+                capabilities: DiscoveryTopicProviderCapabilities::local_history_provider(),
+                updated_at_ms: 10_000,
+            });
+        table
+            .announce_record(
+                SignedDiscoveryNodeRecord::sign(other_topic_body, &other_topic_identity).unwrap(),
+                10_001,
+            )
+            .unwrap();
+
+        let other_network = record(
+            &other_network_identity,
+            "mainnet:other",
+            1,
+            10_000,
+            0.0,
+            0.0,
+            1_000.0,
+            &["wattswarm.node"],
+        );
+        let mut other_network_body = other_network.body;
+        other_network_body
+            .topic_providers
+            .push(DiscoveryTopicProvider {
+                feed_key: "sydney-weather".to_owned(),
+                scope_hint: "group:sydney-weather".to_owned(),
+                capabilities: DiscoveryTopicProviderCapabilities::local_history_provider(),
+                updated_at_ms: 10_000,
+            });
+        table
+            .announce_record(
+                SignedDiscoveryNodeRecord::sign(other_network_body, &other_network_identity)
+                    .unwrap(),
+                10_001,
+            )
+            .unwrap();
+
+        let records = table.find_topic_providers(
+            "mainnet:wattetheria",
+            "sydney-weather",
+            "group:sydney-weather",
+            10_100,
+            10,
+        );
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].body.node_id, provider_identity.node_id());
     }
 
     #[test]

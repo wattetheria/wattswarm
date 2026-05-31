@@ -311,9 +311,11 @@ fn discovery_bootnode_query_fetches_and_verifies_nearby_records() {
     )
     .expect("save discovery urls");
     let settings = discovery_bootnode_settings_from_state_dir(&local_dir).expect("settings");
+    let node = Node::open_in_memory_with_roles(&[Role::Proposer]).expect("node");
 
     let records = query_discovery_bootnodes_for_candidate_records(
         &local_dir,
+        &node,
         DEFAULT_NETWORK_CONTEXT_ID,
         &settings,
         observed_at_ms(),
@@ -380,9 +382,11 @@ fn discovery_bootnode_query_without_local_geo_uses_capability_records() {
     )
     .expect("save discovery urls");
     let settings = discovery_bootnode_settings_from_state_dir(&local_dir).expect("settings");
+    let node = Node::open_in_memory_with_roles(&[Role::Proposer]).expect("node");
 
     let records = query_discovery_bootnodes_for_candidate_records(
         &local_dir,
+        &node,
         DEFAULT_NETWORK_CONTEXT_ID,
         &settings,
         observed_at_ms(),
@@ -390,6 +394,125 @@ fn discovery_bootnode_query_without_local_geo_uses_capability_records() {
     .expect("query discovery bootnode");
 
     assert_eq!(records.len(), 1);
+    records[0].verify().expect("record verifies");
+    handle.join().expect("join discovery listener");
+    wattswarm_network_transport_iroh::shutdown_local_iroh_data_plane(&remote_dir);
+    fs::remove_dir_all(local_dir).expect("cleanup local");
+    fs::remove_dir_all(remote_dir).expect("cleanup remote");
+}
+
+#[test]
+fn discovery_bootnode_query_fetches_topic_provider_records_for_local_subscriptions() {
+    let local_dir = temp_startup_dir("discovery-v1-query-topic-provider-local");
+    let remote_dir = temp_startup_dir("discovery-v1-query-topic-provider-remote");
+    let local_identity = NodeIdentity::from_seed([116u8; 32]);
+    let remote_seed = [117u8; 32];
+    fs::write(remote_dir.join("node_seed.hex"), hex::encode(remote_seed))
+        .expect("write remote seed");
+    fs::write(
+        local_dir.join("startup_config.json"),
+        serde_json::to_vec(&json!({
+            "network_mode": "wan"
+        }))
+        .expect("startup config json"),
+    )
+    .expect("write startup config");
+    let node = Node::new(
+        local_identity.clone(),
+        PgStore::open_in_memory().expect("store"),
+        membership_with_roles(&[local_identity.node_id()]),
+    )
+    .expect("node");
+    node.store
+        .upsert_feed_subscription_with_provider_capabilities(
+            crate::storage::FeedSubscriptionUpsert {
+                network_id: DEFAULT_NETWORK_CONTEXT_ID,
+                subscriber_node_id: &node.node_id(),
+                feed_key: "sydney-weather",
+                scope_hint: "group:sydney-weather",
+                gossip_kinds: &["events".to_owned()],
+                provider_capabilities: Some(
+                    &crate::types::TopicProviderCapabilities::local_history_provider(),
+                ),
+                active: true,
+                updated_at: observed_at_ms(),
+            },
+        )
+        .expect("upsert subscription");
+    let mut record = signed_discovery_record_for_test(
+        &remote_dir,
+        remote_seed,
+        DEFAULT_NETWORK_CONTEXT_ID,
+        70.0,
+        70.0,
+        1.0,
+    );
+    record.body.topic_providers.push(DiscoveryTopicProvider {
+        feed_key: "sydney-weather".to_owned(),
+        scope_hint: "group:sydney-weather".to_owned(),
+        capabilities: DiscoveryTopicProviderCapabilities::local_history_provider(),
+        updated_at_ms: observed_at_ms(),
+    });
+    record = SignedDiscoveryNodeRecord::sign(record.body, &NodeIdentity::from_seed(remote_seed))
+        .expect("resign topic provider record");
+    let empty_response_body = json!({
+        "ok": true,
+        "records": [],
+    })
+    .to_string();
+    let topic_response_body = json!({
+        "ok": true,
+        "records": [record],
+    })
+    .to_string();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind discovery listener");
+    let addr = listener.local_addr().expect("discovery listener addr");
+    let handle = thread::spawn(move || {
+        for _ in 0..2 {
+            let (mut stream, _) = listener.accept().expect("accept discovery query");
+            let request = read_http_request(&mut stream);
+            let body = if request.starts_with("GET /api/network/discovery/capability?") {
+                assert!(request.contains("network_id=default"));
+                assert!(request.contains("capability=wattswarm.node"));
+                &empty_response_body
+            } else {
+                assert!(request.starts_with("GET /api/network/discovery/topic-providers?"));
+                assert!(request.contains("network_id=default"));
+                assert!(request.contains("feed_key=sydney-weather"));
+                assert!(request.contains("scope_hint=group%3Asydney-weather"));
+                &topic_response_body
+            };
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream
+                .write_all(response.as_bytes())
+                .expect("write discovery response");
+        }
+    });
+    crate::control::save_discovery_bootnode_urls_state(
+        &local_dir,
+        &[format!("http://{addr}/api/network/discovery")],
+    )
+    .expect("save discovery urls");
+    let settings = discovery_bootnode_settings_from_state_dir(&local_dir).expect("settings");
+
+    let records = query_discovery_bootnodes_for_candidate_records(
+        &local_dir,
+        &node,
+        DEFAULT_NETWORK_CONTEXT_ID,
+        &settings,
+        observed_at_ms(),
+    )
+    .expect("query discovery bootnode");
+
+    assert_eq!(records.len(), 1);
+    assert_eq!(
+        records[0].body.topic_providers[0].feed_key,
+        "sydney-weather"
+    );
     records[0].verify().expect("record verifies");
     handle.join().expect("join discovery listener");
     wattswarm_network_transport_iroh::shutdown_local_iroh_data_plane(&remote_dir);
@@ -583,6 +706,7 @@ fn backfill_response_skips_network_substrate_events_for_other_networks() {
                 feed_key: "market.alpha".to_owned(),
                 scope_hint: "region:sol-1".to_owned(),
                 gossip_kinds: vec!["events".to_owned()],
+                provider_capabilities: None,
                 active: true,
             },
         ),

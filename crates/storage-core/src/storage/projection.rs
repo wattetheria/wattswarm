@@ -14,6 +14,12 @@ impl PgStore {
     fn decode_gossip_kinds_json(raw: String) -> Vec<String> {
         serde_json::from_str(&raw).unwrap_or_default()
     }
+
+    fn decode_topic_provider_capabilities_json(
+        raw: Option<String>,
+    ) -> Option<TopicProviderCapabilities> {
+        raw.and_then(|value| serde_json::from_str(&value).ok())
+    }
 }
 
 fn parse_decision_memory_row(r: &pg::Row) -> std::result::Result<DecisionMemoryHitRow, pg::Error> {

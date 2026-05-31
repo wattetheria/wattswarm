@@ -164,6 +164,8 @@ pub(crate) async fn topic_subscription_post(
                     feed_key: feed_key.clone(),
                     scope_hint: scope_hint.clone(),
                     gossip_kinds: vec!["messages".to_owned()],
+                    provider_capabilities: active
+                        .then(crate::types::TopicProviderCapabilities::local_history_provider),
                     active,
                 },
             ),

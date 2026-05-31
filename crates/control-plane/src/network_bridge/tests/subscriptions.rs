@@ -62,6 +62,7 @@ fn dynamic_subscription_scopes_merge_with_configured_scopes() {
                 feed_key: "market.alpha".to_owned(),
                 scope_hint: "region:sol-1".to_owned(),
                 gossip_kinds: vec!["events".to_owned()],
+                provider_capabilities: None,
                 active: true,
             },
         ),
@@ -91,6 +92,7 @@ fn publish_pending_updates_subscribes_runtime_for_local_feed_subscription() {
                 feed_key: "market.beta".to_owned(),
                 scope_hint: "node:lab-9".to_owned(),
                 gossip_kinds: vec!["events".to_owned()],
+                provider_capabilities: None,
                 active: true,
             },
         ),
@@ -137,6 +139,7 @@ fn feed_subscription_updates_publish_on_global_control_scope() {
                 feed_key: "market.control".to_owned(),
                 scope_hint: "group:crew-7".to_owned(),
                 gossip_kinds: vec!["events".to_owned()],
+                provider_capabilities: None,
                 active: true,
             },
         ),
@@ -184,6 +187,7 @@ fn remote_feed_subscription_adds_relay_scope_without_local_subscription() {
         feed_key: "market.relay".to_owned(),
         scope_hint: "group:crew-7".to_owned(),
         gossip_kinds: vec!["events".to_owned()],
+        provider_capabilities: None,
         active: true,
     };
 
@@ -265,6 +269,7 @@ fn remote_feed_unsubscribe_keeps_local_scope_subscription() {
         feed_key: "market.relay".to_owned(),
         scope_hint: "group:crew-7".to_owned(),
         gossip_kinds: vec!["events".to_owned()],
+        provider_capabilities: None,
         active: true,
     };
     service
@@ -301,6 +306,7 @@ fn publish_pending_updates_unsubscribes_scope_when_local_subscription_is_disable
                 feed_key: "market.gamma".to_owned(),
                 scope_hint: "region:sol-8".to_owned(),
                 gossip_kinds: vec!["events".to_owned()],
+                provider_capabilities: None,
                 active: true,
             },
         ),
@@ -316,6 +322,7 @@ fn publish_pending_updates_unsubscribes_scope_when_local_subscription_is_disable
                 feed_key: "market.gamma".to_owned(),
                 scope_hint: "region:sol-8".to_owned(),
                 gossip_kinds: vec!["events".to_owned()],
+                provider_capabilities: None,
                 active: false,
             },
         ),

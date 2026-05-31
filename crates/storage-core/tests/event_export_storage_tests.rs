@@ -4,10 +4,12 @@ use wattswarm_storage_core::types::{
     ClaimPolicy, DecisionCommittedPayload, Event, EventPayload, EvidencePolicy, ExploreAssignment,
     ExploreStopPolicy, FeedbackCapabilityPolicy, FinalizeAssignment, MaxConcurrency, PolicyBinding,
     SettlementBadPenalty, SettlementDiminishingReturns, SettlementPolicy, TaskContract,
-    TaskExpiredPayload, TaskMode, VerificationStatus, VerifierResult, VerifyAssignment, VoteChoice,
-    VotePolicy,
+    TaskExpiredPayload, TaskMode, TopicProviderCapabilities, VerificationStatus, VerifierResult,
+    VerifyAssignment, VoteChoice, VotePolicy,
 };
-use wattswarm_storage_core::{AdvisoryStateRow, ImportedTaskOutcomeRow, PgStore, ProjectionScope};
+use wattswarm_storage_core::{
+    AdvisoryStateRow, FeedSubscriptionUpsert, ImportedTaskOutcomeRow, PgStore, ProjectionScope,
+};
 
 fn open_test_store() -> PgStore {
     PgStore::open_in_memory()
@@ -121,6 +123,32 @@ fn feed_subscriptions_are_partitioned_by_network_id() {
         .expect("load subnet subscription")
         .expect("subnet subscription exists");
     assert_eq!(subnet.scope_hint, "group:subnet");
+}
+
+#[test]
+fn feed_subscription_provider_capabilities_are_persisted() {
+    let store = open_test_store();
+    let capabilities = TopicProviderCapabilities::local_history_provider();
+    store
+        .upsert_feed_subscription_with_provider_capabilities(FeedSubscriptionUpsert {
+            network_id: "mainnet",
+            subscriber_node_id: "node-a",
+            feed_key: "hive.chat",
+            scope_hint: "group:sydney-weather",
+            gossip_kinds: &["messages".to_owned()],
+            provider_capabilities: Some(&capabilities),
+            active: true,
+            updated_at: 100,
+        })
+        .expect("upsert subscription");
+
+    let subscription = store
+        .get_feed_subscription("mainnet", "node-a", "hive.chat")
+        .expect("load subscription")
+        .expect("subscription exists");
+
+    assert_eq!(subscription.provider_capabilities, Some(capabilities));
+    assert_eq!(subscription.gossip_kinds, vec!["messages".to_owned()]);
 }
 
 #[test]

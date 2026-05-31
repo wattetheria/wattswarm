@@ -2,6 +2,7 @@ use crate::control::{load_discovery_bootnode_urls_state, local_peer_id, open_con
 use crate::http::{ApiError, UiServerState, run_blocking};
 use crate::startup_config::{load_startup_config, startup_config_path};
 use crate::storage::PgStore;
+use crate::types::TopicProviderCapabilities;
 use anyhow::{Context, Result};
 use axum::Json;
 use axum::extract::{Path, Query, State};
@@ -13,7 +14,8 @@ use std::time::Duration;
 use wattswarm_crypto::NodeIdentity;
 use wattswarm_network_discovery::{
     DEFAULT_RECORD_TTL_MS, DiscoveryGeo, DiscoveryNodeRecordBody, DiscoveryRecordCapabilities,
-    DiscoveryRecordUpsert, DiscoveryRoutingTable, SignedDiscoveryNodeRecord,
+    DiscoveryRecordUpsert, DiscoveryRoutingTable, DiscoveryTopicProvider,
+    DiscoveryTopicProviderCapabilities, SignedDiscoveryNodeRecord,
 };
 use wattswarm_network_transport_iroh::export_local_contact_material_for_network_peer_id;
 
@@ -39,6 +41,15 @@ pub(crate) struct NearbyDiscoveryQuery {
 pub(crate) struct CapabilityDiscoveryQuery {
     network_id: String,
     capability: String,
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct TopicProviderDiscoveryQuery {
+    network_id: String,
+    feed_key: String,
+    scope_hint: String,
     #[serde(default)]
     limit: Option<usize>,
 }
@@ -176,6 +187,30 @@ pub(crate) async fn discovery_find_capability(
     Ok(Json(response))
 }
 
+pub(crate) async fn discovery_find_topic_providers(
+    State(state): State<UiServerState>,
+    Query(query): Query<TopicProviderDiscoveryQuery>,
+) -> Result<Json<Value>, ApiError> {
+    let state_clone = state.clone();
+    let response = run_blocking(move || -> Result<Value> {
+        let now_ms = now_ms();
+        let table = load_discovery_records(&state_clone.state_dir, now_ms)?;
+        let records = table.find_topic_providers(
+            &query.network_id,
+            &query.feed_key,
+            &query.scope_hint,
+            now_ms,
+            normalize_limit(query.limit),
+        );
+        Ok(json!({
+            "ok": true,
+            "records": records,
+        }))
+    })
+    .await?;
+    Ok(Json(response))
+}
+
 fn load_discovery_records(state_dir: &FsPath, now_ms: u64) -> Result<DiscoveryRoutingTable> {
     let path = discovery_records_path(state_dir);
     let mut table = DiscoveryRoutingTable::new();
@@ -224,6 +259,14 @@ fn build_local_discovery_record(
     );
     body.ttl_ms = DEFAULT_RECORD_TTL_MS;
     body.capabilities = DiscoveryRecordCapabilities::new(["wattswarm.node"])?;
+    body.topic_providers =
+        match local_topic_provider_records(state_dir, db_path, &body.network_id, &identity) {
+            Ok(providers) => providers,
+            Err(error) => {
+                eprintln!("wattswarm discovery topic provider export skipped: {error:#}");
+                Vec::new()
+            }
+        };
     body.geo = local_discovery_geo(state_dir)?;
     let peer_id = local_peer_id(state_dir)?;
     if let Ok(contact) =
@@ -232,6 +275,44 @@ fn build_local_discovery_record(
         body.transport_contact = Some(contact);
     }
     SignedDiscoveryNodeRecord::sign(body, &identity)
+}
+
+fn local_topic_provider_records(
+    state_dir: &FsPath,
+    db_path: &FsPath,
+    network_id: &str,
+    identity: &NodeIdentity,
+) -> Result<Vec<DiscoveryTopicProvider>> {
+    let node = open_configured_node(state_dir, db_path)?;
+    let subscriptions = node
+        .store
+        .list_active_feed_subscriptions(network_id, &identity.node_id())?;
+    subscriptions
+        .into_iter()
+        .map(|subscription| {
+            Ok(DiscoveryTopicProvider {
+                feed_key: subscription.feed_key,
+                scope_hint: subscription.scope_hint,
+                capabilities: discovery_provider_capabilities(
+                    subscription.provider_capabilities.as_ref(),
+                ),
+                updated_at_ms: subscription.updated_at,
+            })
+        })
+        .collect()
+}
+
+fn discovery_provider_capabilities(
+    capabilities: Option<&TopicProviderCapabilities>,
+) -> DiscoveryTopicProviderCapabilities {
+    capabilities
+        .map(|capabilities| DiscoveryTopicProviderCapabilities {
+            live_gossip: capabilities.live_gossip,
+            history_backfill: capabilities.history_backfill,
+            local_store: capabilities.local_store,
+            retention_ms: capabilities.retention_ms,
+        })
+        .unwrap_or_else(DiscoveryTopicProviderCapabilities::local_history_provider)
 }
 
 fn load_current_network_id(state_dir: &FsPath, db_path: &FsPath) -> Result<String> {

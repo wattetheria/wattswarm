@@ -1101,6 +1101,7 @@ impl PgStore {
                 feed_key TEXT NOT NULL,
                 scope_hint TEXT NOT NULL,
                 gossip_kinds_json TEXT NOT NULL DEFAULT '[]',
+                provider_capabilities_json TEXT,
                 active BOOLEAN NOT NULL DEFAULT TRUE,
                 updated_at TIMESTAMPTZ NOT NULL,
                 PRIMARY KEY(org_id, network_id, subscriber_node_id, feed_key)
@@ -1581,6 +1582,11 @@ impl PgStore {
                     "feed_subscriptions",
                     "gossip_kinds_json",
                     "ALTER TABLE feed_subscriptions ADD COLUMN gossip_kinds_json TEXT NOT NULL DEFAULT '[]'",
+                ),
+                (
+                    "feed_subscriptions",
+                    "provider_capabilities_json",
+                    "ALTER TABLE feed_subscriptions ADD COLUMN provider_capabilities_json TEXT",
                 ),
                 (
                     "candidates",

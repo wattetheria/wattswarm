@@ -201,6 +201,9 @@ pub(crate) async fn peer_dm_messages_send(
                     feed_key: PRIVATE_DM_FEED_KEY.to_owned(),
                     scope_hint: scope_hint.clone(),
                     gossip_kinds: vec!["messages".to_owned()],
+                    provider_capabilities: Some(
+                        crate::types::TopicProviderCapabilities::local_history_provider(),
+                    ),
                     active: true,
                 },
             ),

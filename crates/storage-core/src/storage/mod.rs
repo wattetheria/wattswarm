@@ -3,7 +3,8 @@ use crate::error::SwarmError;
 use crate::params;
 use crate::storage::pg::{Connection, OptionalExtension, types::ValueRef};
 use crate::types::{
-    ArtifactRef, Candidate, Event, TaskContract, TaskTerminalState, VerifierResult, VoteChoice,
+    ArtifactRef, Candidate, Event, TaskContract, TaskTerminalState, TopicProviderCapabilities,
+    VerifierResult, VoteChoice,
 };
 use anyhow::{Context, Result};
 use serde::{Serialize, de::DeserializeOwned};
@@ -181,6 +182,19 @@ pub struct FeedSubscriptionRow {
     pub feed_key: String,
     pub scope_hint: String,
     pub gossip_kinds: Vec<String>,
+    pub provider_capabilities: Option<TopicProviderCapabilities>,
+    pub active: bool,
+    pub updated_at: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct FeedSubscriptionUpsert<'a> {
+    pub network_id: &'a str,
+    pub subscriber_node_id: &'a str,
+    pub feed_key: &'a str,
+    pub scope_hint: &'a str,
+    pub gossip_kinds: &'a [String],
+    pub provider_capabilities: Option<&'a TopicProviderCapabilities>,
     pub active: bool,
     pub updated_at: u64,
 }

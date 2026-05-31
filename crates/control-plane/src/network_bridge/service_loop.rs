@@ -586,6 +586,7 @@ fn run_background_network_service_with_hook(
                     let network_id = current_network_context_id(&node);
                     match query_discovery_bootnodes_for_candidate_records(
                         state_dir,
+                        &node,
                         &network_id,
                         &settings,
                         observed_at_ms(),

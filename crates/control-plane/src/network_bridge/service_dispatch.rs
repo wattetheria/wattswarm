@@ -372,6 +372,9 @@ impl NetworkBridgeService {
                             remote_node_id,
                         ),
                         gossip_kinds: vec!["messages".to_owned()],
+                        provider_capabilities: Some(
+                            crate::types::TopicProviderCapabilities::local_history_provider(),
+                        ),
                         active: true,
                     },
                 ),

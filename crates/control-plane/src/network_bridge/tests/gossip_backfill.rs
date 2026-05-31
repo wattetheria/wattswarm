@@ -444,6 +444,7 @@ fn topic_backfill_response_advances_local_cursor() {
                 feed_key: "crew.chat".to_owned(),
                 scope_hint: "group:crew-7".to_owned(),
                 gossip_kinds: vec!["messages".to_owned()],
+                provider_capabilities: None,
                 active: true,
             },
         ),
