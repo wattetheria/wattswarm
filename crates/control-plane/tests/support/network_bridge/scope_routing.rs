@@ -225,6 +225,7 @@ pub fn remote_subscription_turns_middle_peer_into_group_relay() {
                 scope_hint: "group:crew-7".to_owned(),
                 gossip_kinds: vec!["events".to_owned()],
                 provider_capabilities: None,
+                agent_envelope: None,
                 active: true,
             }),
             100,

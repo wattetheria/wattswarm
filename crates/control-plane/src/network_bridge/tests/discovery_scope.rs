@@ -707,6 +707,7 @@ fn backfill_response_skips_network_substrate_events_for_other_networks() {
                 scope_hint: "region:sol-1".to_owned(),
                 gossip_kinds: vec!["events".to_owned()],
                 provider_capabilities: None,
+                agent_envelope: None,
                 active: true,
             },
         ),

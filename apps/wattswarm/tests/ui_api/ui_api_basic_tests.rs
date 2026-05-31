@@ -393,6 +393,7 @@ fn task_import_contract_populates_projection_without_created_or_announced_events
                         scope_hint: "group:remote-task-import".to_owned(),
                         gossip_kinds: vec!["events".to_owned()],
                         provider_capabilities: None,
+                        agent_envelope: None,
                         active: true,
                     }),
                     1_700_000_000_000,

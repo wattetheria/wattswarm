@@ -3,8 +3,8 @@ use crate::error::SwarmError;
 use crate::params;
 use crate::storage::pg::{Connection, OptionalExtension, types::ValueRef};
 use crate::types::{
-    ArtifactRef, Candidate, Event, TaskContract, TaskTerminalState, TopicProviderCapabilities,
-    VerifierResult, VoteChoice,
+    AgentEnvelope, ArtifactRef, Candidate, Event, TaskContract, TaskTerminalState,
+    TopicProviderCapabilities, VerifierResult, VoteChoice,
 };
 use anyhow::{Context, Result};
 use serde::{Serialize, de::DeserializeOwned};
@@ -218,6 +218,7 @@ pub struct TopicMessageRow {
     pub feed_key: String,
     pub scope_hint: String,
     pub author_node_id: String,
+    pub agent_envelope: Option<AgentEnvelope>,
     pub content_ref: ArtifactRef,
     pub content: Value,
     pub content_resolved_at: Option<u64>,

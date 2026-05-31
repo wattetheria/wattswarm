@@ -114,6 +114,7 @@ fn event_payload_kind_and_task_id_cover_task_and_non_task_variants() {
         content_ref: sample_topic_content_ref(),
         local_content_cache: Some(serde_json::json!({"text":"hello"})),
         reply_to_message_id: None,
+        agent_envelope: None,
     });
     assert_eq!(topic_message_payload.kind(), EventKind::TopicMessagePosted);
     assert_eq!(topic_message_payload.task_id(), None);
@@ -251,6 +252,7 @@ fn scope_hint_parse_and_canonicalization_are_shared() {
             scope_hint: "region:sol-1".to_owned(),
             gossip_kinds: vec!["events".to_owned()],
             provider_capabilities: None,
+            agent_envelope: None,
             active: true,
         }
         .scope(),
@@ -303,6 +305,7 @@ fn scope_hint_parse_and_canonicalization_are_shared() {
             content_ref: sample_topic_content_ref(),
             local_content_cache: Some(serde_json::json!({"text":"hello"})),
             reply_to_message_id: Some("message-1".to_owned()),
+            agent_envelope: None,
         }
         .scope(),
         Some(ScopeHint::Group("crew-7".to_owned()))
@@ -347,6 +350,7 @@ fn feed_subscription_provider_capabilities_roundtrip() {
         scope_hint: "group:sydney-weather".to_owned(),
         gossip_kinds: vec!["messages".to_owned()],
         provider_capabilities: Some(TopicProviderCapabilities::local_history_provider()),
+        agent_envelope: None,
         active: true,
     };
 
@@ -563,6 +567,7 @@ fn dissemination_layer_marks_only_low_frequency_layers_as_global_safe() {
         content_ref: sample_topic_content_ref(),
         local_content_cache: Some(serde_json::json!({"text":"hello"})),
         reply_to_message_id: None,
+        agent_envelope: None,
     });
     assert_eq!(chat.dissemination_layer(), TaskDisseminationLayer::Process);
     assert!(!chat.allows_global_dissemination());
@@ -618,6 +623,7 @@ fn topic_message_payload_roundtrip_preserves_inline_content_cache() {
             "content": "hello from dm"
         })),
         reply_to_message_id: None,
+        agent_envelope: None,
     });
 
     let encoded = serde_json::to_string(&payload).expect("encode topic payload");
@@ -641,6 +647,7 @@ fn topic_message_payload_roundtrip_preserves_inline_content_cache() {
         content_ref: sample_topic_content_ref(),
         local_content_cache: Some(serde_json::json!({"text": "public chat"})),
         reply_to_message_id: None,
+        agent_envelope: None,
     });
     let public_encoded =
         serde_json::to_value(&public_payload).expect("encode public topic payload");

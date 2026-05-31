@@ -70,6 +70,7 @@ fn ingest_chat_gossip_applies_remote_topic_message_to_local_store() {
             content_ref: sample_topic_content_ref("sha256:hello-crew", &remote.node_id()),
             local_content_cache: Some(json!({"text":"hello crew"})),
             reply_to_message_id: None,
+            agent_envelope: None,
         }),
     )
     .expect("signed event");
@@ -383,6 +384,7 @@ fn topic_backfill_response_filters_by_feed_key() {
             content_ref: sample_topic_content_ref("sha256:hello-crew", "node-local"),
             local_content_cache: Some(json!({"text":"hello crew"})),
             reply_to_message_id: None,
+            agent_envelope: None,
         }),
         10,
     )
@@ -396,6 +398,7 @@ fn topic_backfill_response_filters_by_feed_key() {
             content_ref: sample_topic_content_ref("sha256:ignore-me", "node-local"),
             local_content_cache: Some(json!({"text":"ignore me"})),
             reply_to_message_id: None,
+            agent_envelope: None,
         }),
         11,
     )
@@ -445,6 +448,7 @@ fn topic_backfill_response_advances_local_cursor() {
                 scope_hint: "group:crew-7".to_owned(),
                 gossip_kinds: vec!["messages".to_owned()],
                 provider_capabilities: None,
+                agent_envelope: None,
                 active: true,
             },
         ),
@@ -463,6 +467,7 @@ fn topic_backfill_response_advances_local_cursor() {
             content_ref: sample_topic_content_ref("sha256:cursor-me", &remote.node_id()),
             local_content_cache: Some(json!({"text":"cursor me"})),
             reply_to_message_id: None,
+            agent_envelope: None,
         }),
     )
     .expect("remote event");

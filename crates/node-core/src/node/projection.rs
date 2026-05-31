@@ -408,6 +408,7 @@ impl Node {
                     &payload.feed_key,
                     &scope_hint,
                     &event.author_node_id,
+                    payload.agent_envelope.as_ref(),
                     &payload.content_ref,
                     payload.local_content_cache.as_ref(),
                     payload.reply_to_message_id.as_deref(),

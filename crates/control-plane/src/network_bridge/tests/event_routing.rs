@@ -533,6 +533,7 @@ fn private_dm_topic_agent_event_exposes_direct_message_content() {
             content_ref: sample_topic_content_ref("sha256:dm-message", &remote.node_id()),
             local_content_cache: Some(dm_content),
             reply_to_message_id: None,
+            agent_envelope: None,
         }),
     )
     .expect("signed event");
@@ -612,6 +613,7 @@ fn inbound_private_dm_topic_is_projected_to_local_dm_store() {
             content_ref: sample_topic_content_ref("sha256:dm-message", &remote.node_id()),
             local_content_cache: Some(dm_content),
             reply_to_message_id: None,
+            agent_envelope: None,
         }),
     )
     .expect("signed event");

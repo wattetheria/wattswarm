@@ -375,6 +375,7 @@ impl NetworkBridgeService {
                         provider_capabilities: Some(
                             crate::types::TopicProviderCapabilities::local_history_provider(),
                         ),
+                        agent_envelope: None,
                         active: true,
                     },
                 ),

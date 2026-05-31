@@ -38,8 +38,9 @@ mod artifacts;
 mod task_flow;
 
 pub use artifacts::{
-    emit_topic_message_with_content, fetch_checkpoint_artifact_json, fetch_evidence_artifact,
-    fetch_json_content_artifact_via_iroh, fetch_json_content_artifact_via_iroh_with_local_peer_id,
+    emit_topic_message_with_content, emit_topic_message_with_content_and_agent_envelope,
+    fetch_checkpoint_artifact_json, fetch_evidence_artifact, fetch_json_content_artifact_via_iroh,
+    fetch_json_content_artifact_via_iroh_with_local_peer_id,
     fetch_latest_round_checkpoint_artifact, fetch_round_checkpoint_artifact,
     fetch_snapshot_artifact_json, fetch_task_detail_artifact, list_artifacts_needing_repair,
     load_peer_metadata_record_for_transport_peer_id_state, materialize_candidate_output_artifact,

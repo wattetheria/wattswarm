@@ -642,11 +642,12 @@ pub(super) fn topic_message_agent_event(
     if !topic_message_requires_reply(&topic_message.content) {
         return Ok(None);
     }
-    Ok(Some(build_agent_event(
+    Ok(Some(build_agent_event_with_agent_envelope(
         wattswarm_protocol::types::AgentEventType::TopicMessageRequiresReply,
         wattswarm_protocol::types::AgentEventSourceKind::TopicMessage,
         Some(event.author_node_id.clone()),
         None,
+        payload.agent_envelope.clone(),
         json!({
             "message_id": &event.event_id,
             "network_id": &payload.network_id,
@@ -665,6 +666,7 @@ pub(super) fn topic_message_agent_event(
     )))
 }
 
+#[cfg(test)]
 pub(super) fn build_agent_event(
     event_type: wattswarm_protocol::types::AgentEventType,
     source_kind: wattswarm_protocol::types::AgentEventSourceKind,

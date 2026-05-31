@@ -893,6 +893,8 @@ pub struct FeedSubscriptionUpdatedPayload {
     pub gossip_kinds: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_capabilities: Option<TopicProviderCapabilities>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_envelope: Option<AgentEnvelope>,
     pub active: bool,
 }
 
@@ -979,6 +981,8 @@ pub struct TopicMessagePostedPayload {
     pub local_content_cache: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reply_to_message_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_envelope: Option<AgentEnvelope>,
 }
 
 impl TopicMessagePostedPayload {
@@ -996,7 +1000,8 @@ impl Serialize for TopicMessagePostedPayload {
             self.feed_key == "wattswarm.dm" && self.local_content_cache.is_some();
         let field_count = 4
             + usize::from(include_content_cache)
-            + usize::from(self.reply_to_message_id.is_some());
+            + usize::from(self.reply_to_message_id.is_some())
+            + usize::from(self.agent_envelope.is_some());
         let mut state = serializer.serialize_struct("TopicMessagePostedPayload", field_count)?;
         state.serialize_field("network_id", &self.network_id)?;
         state.serialize_field("feed_key", &self.feed_key)?;
@@ -1007,6 +1012,9 @@ impl Serialize for TopicMessagePostedPayload {
         }
         if let Some(reply_to_message_id) = &self.reply_to_message_id {
             state.serialize_field("reply_to_message_id", reply_to_message_id)?;
+        }
+        if let Some(agent_envelope) = &self.agent_envelope {
+            state.serialize_field("agent_envelope", agent_envelope)?;
         }
         state.end()
     }

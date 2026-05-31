@@ -1,6 +1,7 @@
 use crate::control::{local_node_id, open_node};
 use crate::http::helpers::resolve_network_id;
 use crate::http::{ApiError, UiServerState, run_blocking};
+use crate::types::AgentEnvelope;
 use anyhow::{Result, anyhow};
 use axum::Json;
 use axum::extract::{Query, State};
@@ -30,6 +31,8 @@ pub(crate) struct TopicSubscriptionWriteRequest {
     subscriber_node_id: Option<String>,
     feed_key: String,
     scope_hint: String,
+    #[serde(default)]
+    agent_envelope: Option<AgentEnvelope>,
     active: bool,
 }
 
@@ -40,6 +43,8 @@ pub(crate) struct TopicMessageWriteRequest {
     scope_hint: String,
     content: Value,
     reply_to_message_id: Option<String>,
+    #[serde(default)]
+    agent_envelope: Option<AgentEnvelope>,
 }
 
 fn clamp_topic_page_limit(limit: Option<usize>) -> usize {
@@ -144,6 +149,7 @@ pub(crate) async fn topic_subscription_post(
         .filter(|value| !value.is_empty())
         .map(str::to_owned);
     let active = req.active;
+    let agent_envelope = req.agent_envelope;
     if feed_key.is_empty() {
         return Err(anyhow!("feed_key is required").into());
     }
@@ -166,6 +172,7 @@ pub(crate) async fn topic_subscription_post(
                     gossip_kinds: vec!["messages".to_owned()],
                     provider_capabilities: active
                         .then(crate::types::TopicProviderCapabilities::local_history_provider),
+                    agent_envelope,
                     active,
                 },
             ),
@@ -205,6 +212,7 @@ pub(crate) async fn topic_message_post(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_owned);
+    let agent_envelope = req.agent_envelope;
     let content = req.content;
     if feed_key.is_empty() {
         return Err(anyhow!("feed_key is required").into());
@@ -216,7 +224,7 @@ pub(crate) async fn topic_message_post(
         let mut node = open_node(&state_clone.state_dir, &state_clone.db_path)?;
         let network_id = network_id.unwrap_or_else(|| resolve_network_id(&node));
         let created_at = chrono::Utc::now().timestamp_millis().max(0) as u64;
-        let event = crate::control::emit_topic_message_with_content(
+        let event = crate::control::emit_topic_message_with_content_and_agent_envelope(
             &mut node,
             &state_clone.state_dir,
             &network_id,
@@ -224,6 +232,7 @@ pub(crate) async fn topic_message_post(
             &scope_hint,
             content,
             reply_to_message_id,
+            agent_envelope,
             created_at,
         )?;
         let _ = crate::control::topic_interpretation::process_topic_interpretation_for_topic(

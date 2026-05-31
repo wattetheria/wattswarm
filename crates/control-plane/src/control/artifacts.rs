@@ -157,6 +157,30 @@ pub fn emit_topic_message_with_content(
     reply_to_message_id: Option<String>,
     created_at: u64,
 ) -> Result<crate::types::Event> {
+    emit_topic_message_with_content_and_agent_envelope(
+        node,
+        state_dir,
+        network_id,
+        feed_key,
+        scope_hint,
+        content,
+        reply_to_message_id,
+        None,
+        created_at,
+    )
+}
+
+pub fn emit_topic_message_with_content_and_agent_envelope(
+    node: &mut Node,
+    state_dir: &Path,
+    network_id: &str,
+    feed_key: &str,
+    scope_hint: &str,
+    content: Value,
+    reply_to_message_id: Option<String>,
+    agent_envelope: Option<crate::types::AgentEnvelope>,
+    created_at: u64,
+) -> Result<crate::types::Event> {
     let content_ref = materialize_json_content_artifact(
         state_dir,
         ArtifactKind::TopicMessage,
@@ -173,6 +197,7 @@ pub fn emit_topic_message_with_content(
             content_ref: content_ref.clone(),
             local_content_cache: Some(content.clone()),
             reply_to_message_id,
+            agent_envelope,
         }),
         created_at,
     )?;

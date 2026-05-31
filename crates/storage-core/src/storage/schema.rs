@@ -386,6 +386,14 @@ fn migrate_peer_dm_messages_local_trim_product_columns(conn: &Connection) -> Res
 }
 
 fn migrate_topic_messages_content_ref_schema(conn: &Connection) -> Result<()> {
+    if !column_exists(conn, "topic_messages", "agent_envelope_json") {
+        conn.execute_batch(
+            "
+            ALTER TABLE topic_messages
+            ADD COLUMN agent_envelope_json TEXT;
+            ",
+        )?;
+    }
     if !column_exists(conn, "topic_messages", "content_ref_json") {
         conn.execute_batch(
             "
@@ -1127,6 +1135,7 @@ impl PgStore {
                 feed_key TEXT NOT NULL,
                 scope_hint TEXT NOT NULL,
                 author_node_id TEXT NOT NULL,
+                agent_envelope_json TEXT,
                 content_ref_json TEXT,
                 content_json TEXT NOT NULL DEFAULT 'null',
                 content_resolved_at TIMESTAMPTZ,

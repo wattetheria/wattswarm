@@ -63,6 +63,7 @@ fn dynamic_subscription_scopes_merge_with_configured_scopes() {
                 scope_hint: "region:sol-1".to_owned(),
                 gossip_kinds: vec!["events".to_owned()],
                 provider_capabilities: None,
+                agent_envelope: None,
                 active: true,
             },
         ),
@@ -93,6 +94,7 @@ fn publish_pending_updates_subscribes_runtime_for_local_feed_subscription() {
                 scope_hint: "node:lab-9".to_owned(),
                 gossip_kinds: vec!["events".to_owned()],
                 provider_capabilities: None,
+                agent_envelope: None,
                 active: true,
             },
         ),
@@ -140,6 +142,7 @@ fn feed_subscription_updates_publish_on_global_control_scope() {
                 scope_hint: "group:crew-7".to_owned(),
                 gossip_kinds: vec!["events".to_owned()],
                 provider_capabilities: None,
+                agent_envelope: None,
                 active: true,
             },
         ),
@@ -188,6 +191,7 @@ fn remote_feed_subscription_adds_relay_scope_without_local_subscription() {
         scope_hint: "group:crew-7".to_owned(),
         gossip_kinds: vec!["events".to_owned()],
         provider_capabilities: None,
+        agent_envelope: None,
         active: true,
     };
 
@@ -270,6 +274,7 @@ fn remote_feed_unsubscribe_keeps_local_scope_subscription() {
         scope_hint: "group:crew-7".to_owned(),
         gossip_kinds: vec!["events".to_owned()],
         provider_capabilities: None,
+        agent_envelope: None,
         active: true,
     };
     service
@@ -307,6 +312,7 @@ fn publish_pending_updates_unsubscribes_scope_when_local_subscription_is_disable
                 scope_hint: "region:sol-8".to_owned(),
                 gossip_kinds: vec!["events".to_owned()],
                 provider_capabilities: None,
+                agent_envelope: None,
                 active: true,
             },
         ),
@@ -323,6 +329,7 @@ fn publish_pending_updates_unsubscribes_scope_when_local_subscription_is_disable
                 scope_hint: "region:sol-8".to_owned(),
                 gossip_kinds: vec!["events".to_owned()],
                 provider_capabilities: None,
+                agent_envelope: None,
                 active: false,
             },
         ),

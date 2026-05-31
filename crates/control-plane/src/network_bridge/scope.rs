@@ -85,6 +85,7 @@ pub(super) fn remote_feed_subscription_payloads_for_relay(
             scope_hint: subscription.scope_hint,
             gossip_kinds: subscription.gossip_kinds,
             provider_capabilities: subscription.provider_capabilities,
+            agent_envelope: None,
             active: true,
         });
     }

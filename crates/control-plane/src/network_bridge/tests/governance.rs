@@ -347,6 +347,7 @@ fn ordinary_task_and_topic_events_do_not_require_membership_roles() {
             content_ref: sample_topic_content_ref("sha256:no-role-topic", &remote.node_id()),
             local_content_cache: None,
             reply_to_message_id: None,
+            agent_envelope: None,
         }),
     )
     .expect("topic event");

@@ -25,6 +25,7 @@ fn ui_exposes_topic_message_history_and_cursor_queries() {
                 scope_hint: "group:crew-7".to_owned(),
                 gossip_kinds: vec!["messages".to_owned()],
                 provider_capabilities: None,
+                agent_envelope: None,
                 active: true,
             }),
             100,
@@ -39,6 +40,7 @@ fn ui_exposes_topic_message_history_and_cursor_queries() {
                 content_ref: topic_content_ref("hello-crew", &subscriber_node_id, 110),
                 local_content_cache: Some(serde_json::json!({"text":"hello crew"})),
                 reply_to_message_id: None,
+                agent_envelope: None,
             }),
             110,
         )
@@ -52,6 +54,7 @@ fn ui_exposes_topic_message_history_and_cursor_queries() {
                 content_ref: topic_content_ref("second-ping", &subscriber_node_id, 120),
                 local_content_cache: Some(serde_json::json!({"text":"second ping"})),
                 reply_to_message_id: None,
+                agent_envelope: None,
             }),
             120,
         )
@@ -165,6 +168,95 @@ fn ui_exposes_topic_message_history_and_cursor_queries() {
         assert_eq!(
             cursor_json["cursor"]["scope_hint"].as_str(),
             Some("group:crew-7")
+        );
+    });
+}
+
+#[test]
+fn ui_topic_message_post_preserves_agent_envelope() {
+    let _guard = env_lock();
+    let _db_lock = DbTestLock::acquire();
+    let schema = reset_test_schema("test");
+    let _schema_guard = EnvVarGuard::set("WATTSWARM_PG_SCHEMA", &schema);
+    let _mode_guard = EnvVarGuard::set("WATTSWARM_NODE_MODE", "local");
+    let dir = tempdir().unwrap();
+    let state_dir = dir.path().join("state");
+    std::fs::create_dir_all(&state_dir).unwrap();
+    let db_path = state_dir.join("ui.state");
+    let app = build_app(UiServerState::new(state_dir, db_path));
+    let envelope = json!({
+        "protocol": "google_a2a",
+        "transport_profile": "wattswarm_mesh",
+        "source_agent_id": "did:key:z6MkTopicAgent",
+        "source_node_id": "node-topic-agent",
+        "capability": "hive.message.post",
+        "message": {
+            "author_display_name": "Agent-Topic",
+            "author_public_id": "agent-topic.public"
+        },
+        "signature": "sig"
+    });
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let post_res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/topic/messages")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({
+                            "feed_key": "crew.chat",
+                            "scope_hint": "group:crew-7",
+                            "content": {"text": "hello with agent"},
+                            "agent_envelope": envelope,
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(post_res.status(), StatusCode::OK);
+        let posted = json_from(post_res).await;
+
+        let list_res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(format!(
+                        "/api/topic/messages?network_id={}&feed_key=crew.chat&scope_hint=group:crew-7",
+                        posted["network_id"].as_str().unwrap()
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(list_res.status(), StatusCode::OK);
+        let listed = json_from(list_res).await;
+        let stored_envelope = &listed["messages"][0]["agent_envelope"];
+        assert_eq!(
+            stored_envelope["source_agent_id"].as_str(),
+            Some("did:key:z6MkTopicAgent")
+        );
+        assert_eq!(
+            stored_envelope["message_json"]
+                .as_str()
+                .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+                .and_then(|message| {
+                    message["author_display_name"]
+                        .as_str()
+                        .map(ToOwned::to_owned)
+                })
+                .as_deref(),
+            Some("Agent-Topic")
         );
     });
 }
@@ -364,6 +456,7 @@ fn structured_topic_consensus_bridge_finalizes_and_publishes_result_topic() {
                     }]
                 })),
                 reply_to_message_id: None,
+                agent_envelope: None,
             }),
         )
         .expect("build remote event");
@@ -494,6 +587,7 @@ fn topic_consensus_result_exposes_shared_consensus_facts() {
                     "summary": summary,
                 })),
                 reply_to_message_id: Some(proposal_message_id.clone()),
+                agent_envelope: None,
             }),
         )
         .expect("stance event");
@@ -788,6 +882,7 @@ fn structured_topic_consensus_timeout_opens_next_round() {
                     "round_timeout_ms": 1
                 })),
                 reply_to_message_id: None,
+                agent_envelope: None,
             }),
             10,
         )
@@ -810,6 +905,7 @@ fn structured_topic_consensus_timeout_opens_next_round() {
                 "summary": "only one support in round one"
             })),
             reply_to_message_id: Some(proposal_message_id.clone()),
+            agent_envelope: None,
         }),
     )
     .expect("build support");
@@ -1027,6 +1123,7 @@ fn structured_topic_consensus_fallback_finalizes_after_max_rounds() {
                     "fallback_decision": "reject"
                 })),
                 reply_to_message_id: None,
+                agent_envelope: None,
             }),
             10,
         )
@@ -1049,6 +1146,7 @@ fn structured_topic_consensus_fallback_finalizes_after_max_rounds() {
                 "summary": "insufficient support before timeout"
             })),
             reply_to_message_id: Some(proposal_message_id.clone()),
+            agent_envelope: None,
         }),
     )
     .expect("build support");
@@ -1179,6 +1277,7 @@ fn structured_topic_consensus_bridge_ignores_non_participant_stances() {
                     }]
                 })),
                 reply_to_message_id: None,
+                agent_envelope: None,
             }),
         )
         .expect("build remote event");
@@ -1537,6 +1636,7 @@ fn topic_consensus_scopes_stances_to_proposal_rounds() {
                 "summary": "support from round one"
             })),
             reply_to_message_id: Some(round_one_proposal_message_id.clone()),
+            agent_envelope: None,
         }),
     )
     .expect("round one stance");
@@ -1558,6 +1658,7 @@ fn topic_consensus_scopes_stances_to_proposal_rounds() {
                 "summary": "local support in round two"
             })),
             reply_to_message_id: Some(round_two_proposal_message_id.clone()),
+            agent_envelope: None,
         }),
         20,
     )
@@ -1584,6 +1685,7 @@ fn topic_consensus_scopes_stances_to_proposal_rounds() {
                 "summary": "second support only exists in round two"
             })),
             reply_to_message_id: Some(round_two_proposal_message_id.clone()),
+            agent_envelope: None,
         }),
     )
     .expect("round two stance");

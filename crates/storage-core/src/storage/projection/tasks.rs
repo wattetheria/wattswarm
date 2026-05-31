@@ -531,6 +531,7 @@ impl PgStore {
         feed_key: &str,
         scope_hint: &str,
         author_node_id: &str,
+        agent_envelope: Option<&AgentEnvelope>,
         content_ref: &ArtifactRef,
         content: Option<&serde_json::Value>,
         reply_to_message_id: Option<&str>,
@@ -542,16 +543,17 @@ impl PgStore {
             .lock()
             .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
         conn.execute(
-            "INSERT INTO topic_messages(org_id, message_id, network_id, feed_key, scope_hint, author_node_id, content_ref_json, content_json, content_resolved_at, reply_to_message_id, created_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8,
-                     CASE WHEN $9::bigint < 0 THEN NULL ELSE TIMESTAMPTZ 'epoch' + ($9::bigint * INTERVAL '1 millisecond') END,
-                     $10,
-                     TIMESTAMPTZ 'epoch' + ($11::bigint * INTERVAL '1 millisecond'))
+            "INSERT INTO topic_messages(org_id, message_id, network_id, feed_key, scope_hint, author_node_id, agent_envelope_json, content_ref_json, content_json, content_resolved_at, reply_to_message_id, created_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9,
+                     CASE WHEN $10::bigint < 0 THEN NULL ELSE TIMESTAMPTZ 'epoch' + ($10::bigint * INTERVAL '1 millisecond') END,
+                     $11,
+                     TIMESTAMPTZ 'epoch' + ($12::bigint * INTERVAL '1 millisecond'))
              ON CONFLICT(org_id, message_id) DO UPDATE SET
                network_id = excluded.network_id,
                feed_key = excluded.feed_key,
                scope_hint = excluded.scope_hint,
                author_node_id = excluded.author_node_id,
+               agent_envelope_json = excluded.agent_envelope_json,
                content_ref_json = excluded.content_ref_json,
                content_json = excluded.content_json,
                content_resolved_at = excluded.content_resolved_at,
@@ -564,6 +566,7 @@ impl PgStore {
                 feed_key,
                 canonical_scope_hint,
                 author_node_id,
+                agent_envelope.map(serde_json::to_string).transpose()?,
                 serde_json::to_string(content_ref)?,
                 serde_json::to_string(content.unwrap_or(&serde_json::Value::Null))?,
                 content.map(|_| created_at as i64).unwrap_or(-1),
@@ -591,7 +594,7 @@ impl PgStore {
         let has_anchor = before_created_at.is_some();
         let before_created_at = before_created_at.unwrap_or(u64::MAX) as i64;
         let mut stmt = conn.prepare(
-            "SELECT message_id, network_id, author_node_id, content_ref_json, content_json, reply_to_message_id,
+            "SELECT message_id, network_id, author_node_id, agent_envelope_json, content_ref_json, content_json, reply_to_message_id,
                     CAST(EXTRACT(EPOCH FROM created_at) * 1000 AS BIGINT),
                     CASE WHEN content_resolved_at IS NULL THEN NULL ELSE CAST(EXTRACT(EPOCH FROM content_resolved_at) * 1000 AS BIGINT) END
              FROM topic_messages
@@ -620,23 +623,35 @@ impl PgStore {
                 limit as i64
             ],
             |r| {
-                let content_ref_json: String = r.get(3)?;
-                let content_json: String = r.get(4)?;
-                let created_at_ms: i64 = r.get(6)?;
+                let content_ref_json: String = r.get(4)?;
+                let content_json: String = r.get(5)?;
+                let agent_envelope_json: Option<String> = r.get(3)?;
+                let created_at_ms: i64 = r.get(7)?;
                 Ok(TopicMessageRow {
                     message_id: r.get(0)?,
                     network_id: r.get(1)?,
                     feed_key: feed_key.to_owned(),
                     scope_hint: canonical_scope_hint.clone(),
                     author_node_id: r.get(2)?,
+                    agent_envelope: agent_envelope_json
+                        .as_deref()
+                        .map(serde_json::from_str)
+                        .transpose()
+                        .map_err(|e| {
+                            pg::Error::FromSqlConversionFailure(
+                                0,
+                                pg::types::Type::Text,
+                                Box::new(e),
+                            )
+                        })?,
                     content_ref: serde_json::from_str(&content_ref_json).map_err(|e| {
                         pg::Error::FromSqlConversionFailure(0, pg::types::Type::Text, Box::new(e))
                     })?,
                     content: serde_json::from_str(&content_json).map_err(|e| {
                         pg::Error::FromSqlConversionFailure(0, pg::types::Type::Text, Box::new(e))
                     })?,
-                    content_resolved_at: r.get::<_, Option<i64>>(7)?.map(|value| value as u64),
-                    reply_to_message_id: r.get(5)?,
+                    content_resolved_at: r.get::<_, Option<i64>>(8)?.map(|value| value as u64),
+                    reply_to_message_id: r.get(6)?,
                     created_at: created_at_ms as u64,
                 })
             },
@@ -664,15 +679,16 @@ impl PgStore {
             .lock()
             .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
         let mut stmt = conn.prepare(
-            "SELECT network_id, feed_key, scope_hint, author_node_id, content_ref_json, content_json,
+            "SELECT network_id, feed_key, scope_hint, author_node_id, agent_envelope_json, content_ref_json, content_json,
                     reply_to_message_id, CAST(EXTRACT(EPOCH FROM created_at) * 1000 AS BIGINT),
                     CASE WHEN content_resolved_at IS NULL THEN NULL ELSE CAST(EXTRACT(EPOCH FROM content_resolved_at) * 1000 AS BIGINT) END
              FROM topic_messages
              WHERE org_id = $1 AND message_id = $2",
         )?;
         let mut rows = stmt.query_map(params![self.org_id(), message_id], |row| {
-            let content_ref_json: String = row.get(4)?;
-            let content_json: String = row.get(5)?;
+            let agent_envelope_json: Option<String> = row.get(4)?;
+            let content_ref_json: String = row.get(5)?;
+            let content_json: String = row.get(6)?;
             let scope_hint: String = row.get(2)?;
             let feed_key: String = row.get(1)?;
             Ok(TopicMessageRow {
@@ -681,15 +697,26 @@ impl PgStore {
                 feed_key,
                 scope_hint,
                 author_node_id: row.get(3)?,
+                agent_envelope: agent_envelope_json
+                    .as_deref()
+                    .map(serde_json::from_str)
+                    .transpose()
+                    .map_err(|error| {
+                        pg::Error::FromSqlConversionFailure(
+                            0,
+                            pg::types::Type::Text,
+                            Box::new(error),
+                        )
+                    })?,
                 content_ref: serde_json::from_str(&content_ref_json).map_err(|error| {
                     pg::Error::FromSqlConversionFailure(0, pg::types::Type::Text, Box::new(error))
                 })?,
                 content: serde_json::from_str(&content_json).map_err(|error| {
                     pg::Error::FromSqlConversionFailure(0, pg::types::Type::Text, Box::new(error))
                 })?,
-                content_resolved_at: row.get::<_, Option<i64>>(8)?.map(|value| value as u64),
-                reply_to_message_id: row.get(6)?,
-                created_at: row.get::<_, i64>(7)? as u64,
+                content_resolved_at: row.get::<_, Option<i64>>(9)?.map(|value| value as u64),
+                reply_to_message_id: row.get(7)?,
+                created_at: row.get::<_, i64>(8)? as u64,
             })
         })?;
         let Some(row) = rows.next() else {
