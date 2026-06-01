@@ -650,11 +650,14 @@ fn topic_message_payload_roundtrip_preserves_inline_content_cache() {
         agent_envelope: None,
     });
     let public_encoded =
-        serde_json::to_value(&public_payload).expect("encode public topic payload");
-    assert!(
-        public_encoded
-            .get("payload")
-            .and_then(|payload| payload.get("local_content_cache"))
-            .is_none()
+        serde_json::to_string(&public_payload).expect("encode public topic payload");
+    let public_decoded: EventPayload =
+        serde_json::from_str(&public_encoded).expect("decode public topic payload");
+    let EventPayload::TopicMessagePosted(public_decoded) = public_decoded else {
+        panic!("expected public topic message payload");
+    };
+    assert_eq!(
+        public_decoded.local_content_cache,
+        Some(serde_json::json!({"text": "public chat"}))
     );
 }

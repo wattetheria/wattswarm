@@ -333,48 +333,46 @@ fn migrate_peer_relationships_local_trim_signature_column(conn: &Connection) -> 
 }
 
 fn migrate_peer_dm_messages_local_trim_product_columns(conn: &Connection) -> Result<()> {
-    if column_exists(conn, "peer_dm_messages_local", "content_json") {
+    if !column_exists(conn, "peer_dm_messages_local", "content_json") {
+        conn.execute_batch(
+            "ALTER TABLE peer_dm_messages_local
+             ADD COLUMN content_json TEXT;",
+        )?;
+    }
+    if column_exists(conn, "peer_dm_messages_local", "agent_envelope_json") {
         let mut stmt = conn.prepare(
-            "SELECT scope_id, message_id, a2a_protocol, content_json
+            "SELECT scope_id, message_id, agent_envelope_json
              FROM peer_dm_messages_local
-             WHERE agent_envelope_json IS NULL
-               AND content_json IS NOT NULL",
+             WHERE content_json IS NULL
+               AND agent_envelope_json IS NOT NULL",
         )?;
         let rows = stmt.query_map([], |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
                 row.get::<_, String>(2)?,
-                row.get::<_, String>(3)?,
             ))
         })?;
         for row in rows {
-            let (scope_id, message_id, a2a_protocol, content_json) = row?;
-            let content_value = serde_json::from_str::<serde_json::Value>(&content_json)
-                .unwrap_or_else(|_| serde_json::Value::String(content_json.clone()));
-            let envelope_json = serde_json::json!({
-                "protocol": a2a_protocol,
-                "message": {
-                    "content": content_value,
-                }
-            })
-            .to_string();
+            let (scope_id, message_id, envelope_json) = row?;
+            let Ok(envelope_value) = serde_json::from_str::<serde_json::Value>(&envelope_json)
+            else {
+                continue;
+            };
+            let Some(content_value) = envelope_value.pointer("/message/content").cloned() else {
+                continue;
+            };
             conn.execute(
                 "UPDATE peer_dm_messages_local
-                 SET agent_envelope_json = $3
+                 SET content_json = $3
                  WHERE scope_id = $1
                    AND message_id = $2
-                   AND agent_envelope_json IS NULL",
-                params![scope_id, message_id, envelope_json],
+                   AND content_json IS NULL",
+                params![scope_id, message_id, content_value.to_string()],
             )?;
         }
     }
-    for column in [
-        "content_json",
-        "agent_signature",
-        "encrypted_body",
-        "content_encoding",
-    ] {
+    for column in ["agent_signature", "encrypted_body", "content_encoding"] {
         if column_exists(conn, "peer_dm_messages_local", column) {
             conn.execute_batch(&format!(
                 "ALTER TABLE peer_dm_messages_local
@@ -859,6 +857,7 @@ impl PgStore {
                 direction TEXT NOT NULL,
                 delivery_state TEXT NOT NULL,
                 a2a_protocol TEXT NOT NULL,
+                content_json TEXT,
                 agent_envelope_json TEXT,
                 created_at TIMESTAMPTZ NOT NULL,
                 acknowledged_at TIMESTAMPTZ,

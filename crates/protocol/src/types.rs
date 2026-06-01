@@ -996,8 +996,7 @@ impl Serialize for TopicMessagePostedPayload {
     where
         S: Serializer,
     {
-        let include_content_cache =
-            self.feed_key == "wattswarm.dm" && self.local_content_cache.is_some();
+        let include_content_cache = self.local_content_cache.is_some();
         let field_count = 4
             + usize::from(include_content_cache)
             + usize::from(self.reply_to_message_id.is_some())

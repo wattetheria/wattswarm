@@ -546,6 +546,19 @@ pub(super) fn save_dm_message(
                 &content,
             ))
         });
+    let canonical_content = if content.is_null() {
+        existing
+            .as_ref()
+            .map(|record| record.content.clone())
+            .or_else(|| {
+                agent_envelope
+                    .as_ref()
+                    .map(peer_dm_content_from_control_envelope)
+            })
+            .unwrap_or(content)
+    } else {
+        content
+    };
     let record = crate::control::PeerDmMessageRecord {
         thread_id: thread_id.to_owned(),
         message_id: message_id.to_owned(),
@@ -554,11 +567,7 @@ pub(super) fn save_dm_message(
         direction,
         delivery_state,
         a2a_protocol: a2a_protocol.to_owned(),
-        content: agent_envelope
-            .as_ref()
-            .map(peer_dm_content_from_control_envelope)
-            .or_else(|| existing.as_ref().map(|record| record.content.clone()))
-            .unwrap_or(content),
+        content: canonical_content,
         agent_envelope,
         created_at: existing.as_ref().map_or(now, |record| record.created_at),
         acknowledged_at: acknowledged_at

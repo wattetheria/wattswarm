@@ -595,7 +595,7 @@ fn inbound_private_dm_topic_is_projected_to_local_dm_store() {
             "message": {
                 "content": {
                     "type": "text",
-                    "text": "hello from remote"
+                    "text": "wrong envelope fallback"
                 },
                 "message_id": message_id
             },
@@ -666,6 +666,14 @@ fn inbound_private_dm_topic_is_projected_to_local_dm_store() {
     assert_eq!(
         messages[0].content["text"].as_str(),
         Some("hello from remote")
+    );
+    assert_ne!(
+        messages[0].content["text"].as_str(),
+        messages[0]
+            .agent_envelope
+            .as_ref()
+            .and_then(|envelope| envelope.message.pointer("/content/text"))
+            .and_then(serde_json::Value::as_str)
     );
 }
 

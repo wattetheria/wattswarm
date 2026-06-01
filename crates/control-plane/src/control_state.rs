@@ -1300,9 +1300,11 @@ pub fn load_peer_dm_message_records_state(
                 direction: peer_dm_direction_from_str(&row.direction),
                 delivery_state: peer_dm_delivery_state_from_str(&row.delivery_state),
                 a2a_protocol: row.a2a_protocol,
-                content: agent_envelope
-                    .as_ref()
-                    .map(peer_dm_content_from_envelope)
+                content: row
+                    .content_json
+                    .as_deref()
+                    .and_then(|value| serde_json::from_str::<serde_json::Value>(value).ok())
+                    .or_else(|| agent_envelope.as_ref().map(peer_dm_content_from_envelope))
                     .unwrap_or_else(|| json!({})),
                 agent_envelope,
                 created_at: row.created_at,
@@ -1327,6 +1329,7 @@ pub fn save_peer_dm_message_record_state(
             direction: record.direction.as_str().to_owned(),
             delivery_state: record.delivery_state.as_str().to_owned(),
             a2a_protocol: record.a2a_protocol.clone(),
+            content_json: Some(record.content.to_string()),
             agent_envelope_json: record
                 .agent_envelope
                 .as_ref()

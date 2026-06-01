@@ -330,6 +330,7 @@ pub struct LocalPeerDmMessageRow {
     pub direction: String,
     pub delivery_state: String,
     pub a2a_protocol: String,
+    pub content_json: Option<String>,
     pub agent_envelope_json: Option<String>,
     pub created_at: u64,
     pub acknowledged_at: Option<u64>,

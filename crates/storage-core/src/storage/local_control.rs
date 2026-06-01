@@ -974,6 +974,7 @@ impl PgStore {
                     direction,
                     delivery_state,
                     a2a_protocol,
+                    content_json,
                     agent_envelope_json,
                     (EXTRACT(EPOCH FROM created_at) * 1000)::BIGINT AS created_at_ms,
                     (EXTRACT(EPOCH FROM acknowledged_at) * 1000)::BIGINT AS acknowledged_at_ms
@@ -990,9 +991,10 @@ impl PgStore {
                 direction: r.get(4)?,
                 delivery_state: r.get(5)?,
                 a2a_protocol: r.get(6)?,
-                agent_envelope_json: r.get(7)?,
-                created_at: r.get::<_, i64>(8)? as u64,
-                acknowledged_at: r.get::<_, Option<i64>>(9)?.map(|value| value as u64),
+                content_json: r.get(7)?,
+                agent_envelope_json: r.get(8)?,
+                created_at: r.get::<_, i64>(9)? as u64,
+                acknowledged_at: r.get::<_, Option<i64>>(10)?.map(|value| value as u64),
             })
         })?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
@@ -1011,12 +1013,12 @@ impl PgStore {
         conn.execute(
             "INSERT INTO peer_dm_messages_local(
                 scope_id, thread_id, message_id, remote_node_id, message_kind, direction,
-                delivery_state, a2a_protocol, agent_envelope_json, created_at, acknowledged_at
+                delivery_state, a2a_protocol, content_json, agent_envelope_json, created_at, acknowledged_at
              ) VALUES (
                 $1, $2, $3, $4, $5, $6,
-                $7, $8, $9,
-                TIMESTAMPTZ 'epoch' + ($10::bigint * INTERVAL '1 millisecond'),
-                CASE WHEN $11::bigint < 0::bigint THEN NULL ELSE TIMESTAMPTZ 'epoch' + ($11::bigint * INTERVAL '1 millisecond') END
+                $7, $8, $9, $10,
+                TIMESTAMPTZ 'epoch' + ($11::bigint * INTERVAL '1 millisecond'),
+                CASE WHEN $12::bigint < 0::bigint THEN NULL ELSE TIMESTAMPTZ 'epoch' + ($12::bigint * INTERVAL '1 millisecond') END
              )
              ON CONFLICT(scope_id, message_id) DO UPDATE SET
                 thread_id = excluded.thread_id,
@@ -1025,6 +1027,7 @@ impl PgStore {
                 direction = excluded.direction,
                 delivery_state = excluded.delivery_state,
                 a2a_protocol = excluded.a2a_protocol,
+                content_json = excluded.content_json,
                 agent_envelope_json = excluded.agent_envelope_json,
                 acknowledged_at = excluded.acknowledged_at",
             params![
@@ -1036,6 +1039,7 @@ impl PgStore {
                 &row.direction,
                 &row.delivery_state,
                 &row.a2a_protocol,
+                row.content_json,
                 row.agent_envelope_json,
                 row.created_at as i64,
                 row.acknowledged_at.map(|value| value as i64).unwrap_or(-1)

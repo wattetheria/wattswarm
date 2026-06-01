@@ -635,10 +635,16 @@ fn local_control_peer_metadata_and_relationship_roundtrip() {
                     direction: "outbound".to_owned(),
                     delivery_state: "delivered".to_owned(),
                     a2a_protocol: "google_a2a".to_owned(),
+                    content_json: Some(
+                        serde_json::json!({
+                            "text": "hello canonical"
+                        })
+                        .to_string(),
+                    ),
                     agent_envelope_json: Some(
                         serde_json::json!({
                             "protocol": "google_a2a",
-                            "message": {"content": {"text":"hello"}}
+                            "message": {"content": {"text":"hello envelope"}}
                         })
                         .to_string(),
                     ),
@@ -661,6 +667,10 @@ fn local_control_peer_metadata_and_relationship_roundtrip() {
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].message_id, "msg-1");
         assert_eq!(messages[0].delivery_state, "delivered");
+        assert_eq!(
+            messages[0].content_json.as_deref(),
+            Some("{\"text\":\"hello canonical\"}")
+        );
 
         store
             .upsert_local_data_plane_status(

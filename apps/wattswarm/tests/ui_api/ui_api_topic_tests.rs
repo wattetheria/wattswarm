@@ -241,6 +241,10 @@ fn ui_topic_message_post_preserves_agent_envelope() {
             .unwrap();
         assert_eq!(list_res.status(), StatusCode::OK);
         let listed = json_from(list_res).await;
+        assert_eq!(
+            listed["messages"][0]["content"],
+            json!({"text": "hello with agent"})
+        );
         let stored_envelope = &listed["messages"][0]["agent_envelope"];
         assert_eq!(
             stored_envelope["source_agent_id"].as_str(),
