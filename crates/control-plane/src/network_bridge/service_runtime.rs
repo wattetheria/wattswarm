@@ -468,11 +468,7 @@ impl NetworkBridgeService {
                             .object("event", Some(ingested_event.event_id.clone()))
                             .source_node_id(Some(propagation_source.to_string()))
                             .scope(&envelope.scope)
-                            .details(json!({
-                                "event_kind": format!("{:?}", ingested_event.event_kind),
-                                "author_node_id": ingested_event.author_node_id,
-                                "created_at": ingested_event.created_at,
-                            })),
+                            .details(Value::Object(event_diagnostic_details(&ingested_event))),
                         );
                         if let Err(err) = self.maybe_sync_candidate_output(node, &ingested_event) {
                             eprintln!(
@@ -526,6 +522,20 @@ impl NetworkBridgeService {
                     GossipMessage::Summary(summary) => {
                         self.record_peer_scope_activity(propagation_source.clone(), &summary.scope);
                         apply_summary_announcement(node, &summary)?;
+                        diagnostics::record_diagnostic(
+                            self.state_dir.as_deref(),
+                            diagnostics::DiagnosticEvent::new(
+                                "info",
+                                "gossip",
+                                "summary.ingest.live",
+                                "ok",
+                                format!("live summary ingested: {}", summary.summary_kind),
+                            )
+                            .object("summary", Some(summary.summary_id.clone()))
+                            .source_node_id(Some(propagation_source.to_string()))
+                            .scope(&summary.scope)
+                            .details(Value::Object(summary_diagnostic_details(&summary))),
+                        );
                         if summary.summary_kind == AGENT_PAYMENT_SUMMARY_KIND
                             && let Some(state_dir) = &self.state_dir
                         {
@@ -889,6 +899,25 @@ impl NetworkBridgeService {
                 let action = control_peer_relationship_action(request.action);
                 let local_node_id = self.local_peer_id().to_string();
                 let now = observed_at_ms();
+                diagnostics::record_diagnostic(
+                    self.state_dir.as_deref(),
+                    diagnostics::DiagnosticEvent::new(
+                        "info",
+                        "transport",
+                        "peer_relationship.request",
+                        "received",
+                        "peer relationship request received",
+                    )
+                    .object("peer_relationship", Some(format!("{request_id:?}")))
+                    .source_node_id(Some(peer.to_string()))
+                    .details(json!({
+                        "request_id": format!("{request_id:?}"),
+                        "source_node_id": &request.source_node_id,
+                        "target_node_id": &request.target_node_id,
+                        "action": request.action,
+                        "agent_envelope": &request.agent_envelope,
+                    })),
+                );
                 let (response, tick) = if request.source_node_id != peer.to_string() {
                     let error = format!(
                         "peer relationship request source_node_id mismatch: payload={} transport={peer}",
@@ -1152,6 +1181,28 @@ impl NetworkBridgeService {
                 let action = pending.action;
                 let expected_action = wire_peer_relationship_action(action);
                 let local_node_id = self.local_peer_id().to_string();
+                diagnostics::record_diagnostic(
+                    self.state_dir.as_deref(),
+                    diagnostics::DiagnosticEvent::new(
+                        "info",
+                        "transport",
+                        "peer_relationship.response",
+                        "received",
+                        "peer relationship response received",
+                    )
+                    .object("peer_relationship", Some(format!("{request_id:?}")))
+                    .source_node_id(Some(peer.to_string()))
+                    .details(json!({
+                        "request_id": format!("{request_id:?}"),
+                        "source_node_id": &response.source_node_id,
+                        "target_node_id": &response.target_node_id,
+                        "action": response.action,
+                        "applied": response.applied,
+                        "relationship_state": &response.relationship_state,
+                        "detail": &response.detail,
+                        "agent_envelope": &response.agent_envelope,
+                    })),
+                );
                 if pending.peer != peer {
                     return Ok(NetworkBridgeTick::PeerRelationshipFailed {
                         peer: peer.clone(),

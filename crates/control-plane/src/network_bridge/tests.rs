@@ -11,7 +11,7 @@ use crate::types::{
     VoteRevealPayload,
 };
 use crate::{node::Node, task_template::sample_contract};
-use serde_json::json;
+use serde_json::{Map, Value, json};
 use std::env;
 use std::fs;
 use std::io::{Read, Write};
@@ -72,6 +72,205 @@ fn sample_topic_content_ref(digest: &str, producer: &str) -> crate::types::Artif
         created_at: 10,
         producer: producer.to_owned(),
     }
+}
+
+fn sample_protocol_agent_envelope(capability: &str) -> wattswarm_protocol::types::AgentEnvelope {
+    wattswarm_protocol::types::AgentEnvelope {
+        protocol: "google_a2a".to_owned(),
+        source_agent_id: Some("agent-source".to_owned()),
+        target_agent_id: Some("agent-target".to_owned()),
+        source_node_id: Some("node-source".to_owned()),
+        target_node_id: Some("node-target".to_owned()),
+        capability: Some(capability.to_owned()),
+        message_json: json!({
+            "message_id": "msg-1",
+            "body": "diagnostic envelope"
+        })
+        .to_string(),
+        extensions_json: None,
+        signature: Some("sig".to_owned()),
+        ..wattswarm_protocol::types::AgentEnvelope::default()
+    }
+}
+
+fn diagnostic_event_from_payload(payload: crate::types::EventPayload) -> crate::types::Event {
+    let event_kind = payload.kind();
+    crate::types::Event {
+        event_id: format!("evt-{event_kind:?}"),
+        protocol_version: "1".to_owned(),
+        event_kind,
+        task_id: payload.task_id().map(ToOwned::to_owned),
+        epoch: 1,
+        author_node_id: "node-source".to_owned(),
+        created_at: 100,
+        payload,
+        signature_hex: "sig".to_owned(),
+    }
+}
+
+fn diagnostic_agent_envelope(details: &Map<String, Value>) -> &Value {
+    details
+        .get("agent_envelope")
+        .expect("diagnostic agent envelope")
+}
+
+#[test]
+fn event_diagnostics_include_agent_envelope_for_all_network_payloads() {
+    let envelope = sample_protocol_agent_envelope("network.event");
+    let content_ref = sample_topic_content_ref("sha256:topic", "node-source");
+    let payloads = vec![
+        crate::types::EventPayload::TaskClaimed(crate::types::ClaimPayload {
+            task_id: "task-1".to_owned(),
+            role: crate::types::ClaimRole::Propose,
+            claimer_node_id: "node-source".to_owned(),
+            execution_id: "exec-1".to_owned(),
+            lease_until: 200,
+            agent_envelope: Some(envelope.clone()),
+        }),
+        crate::types::EventPayload::CandidateProposed(crate::types::CandidateProposedPayload {
+            task_id: "task-1".to_owned(),
+            candidate: crate::types::Candidate {
+                candidate_id: "candidate-1".to_owned(),
+                execution_id: "exec-1".to_owned(),
+                output_ref: content_ref.clone(),
+                output: json!({"ok": true}),
+                evidence_inline: Vec::new(),
+                evidence_refs: Vec::new(),
+            },
+            agent_envelope: Some(envelope.clone()),
+        }),
+        crate::types::EventPayload::DecisionFinalized(crate::types::DecisionFinalizedPayload {
+            task_id: "task-1".to_owned(),
+            epoch: 1,
+            candidate_id: "candidate-1".to_owned(),
+            winning_candidate_hash: "hash".to_owned(),
+            finality_proof: crate::types::FinalityProof {
+                threshold: 1,
+                signatures: Vec::new(),
+            },
+            agent_envelope: Some(envelope.clone()),
+        }),
+        crate::types::EventPayload::TaskError(crate::types::TaskErrorPayload {
+            task_id: "task-1".to_owned(),
+            reason: crate::types::TaskErrorReason::Other,
+            reason_codes: Vec::new(),
+            custom_reason_namespace: None,
+            custom_reason_code: None,
+            custom_reason_message: None,
+            message: "failed".to_owned(),
+            agent_envelope: Some(envelope.clone()),
+        }),
+        crate::types::EventPayload::TaskRetryScheduled(crate::types::TaskRetryScheduledPayload {
+            task_id: "task-1".to_owned(),
+            attempt: 2,
+            run_at: 300,
+            agent_envelope: Some(envelope.clone()),
+        }),
+        crate::types::EventPayload::FeedSubscriptionUpdated(
+            crate::types::FeedSubscriptionUpdatedPayload {
+                network_id: "mainnet:watt-etheria".to_owned(),
+                subscriber_node_id: "node-source".to_owned(),
+                feed_key: "germany-economy".to_owned(),
+                scope_hint: "group:germany-economy".to_owned(),
+                gossip_kinds: vec!["messages".to_owned()],
+                provider_capabilities: None,
+                agent_envelope: Some(envelope.clone()),
+                active: true,
+            },
+        ),
+        crate::types::EventPayload::TaskAnnounced(crate::types::TaskAnnouncedPayload {
+            network_id: "mainnet:watt-etheria".to_owned(),
+            task_id: "task-1".to_owned(),
+            announcement_id: "ann-1".to_owned(),
+            feed_key: "tasks".to_owned(),
+            scope_hint: "global".to_owned(),
+            summary: json!({"title": "task"}),
+            detail_ref: None,
+            agent_envelope: Some(envelope.clone()),
+        }),
+        crate::types::EventPayload::TopicMessagePosted(crate::types::TopicMessagePostedPayload {
+            network_id: "mainnet:watt-etheria".to_owned(),
+            feed_key: "germany-economy".to_owned(),
+            scope_hint: "group:germany-economy".to_owned(),
+            content_ref,
+            local_content_cache: Some(json!({"text": "hello"})),
+            reply_to_message_id: None,
+            agent_envelope: Some(envelope.clone()),
+        }),
+    ];
+
+    for payload in payloads {
+        let details = event_diagnostic_details(&diagnostic_event_from_payload(payload));
+        let diagnostic_envelope = diagnostic_agent_envelope(&details);
+        assert_eq!(
+            diagnostic_envelope["source_agent_id"],
+            json!("agent-source")
+        );
+        assert_eq!(diagnostic_envelope["capability"], json!("network.event"));
+    }
+}
+
+#[test]
+fn topic_message_diagnostics_include_embedded_dm_agent_envelope() {
+    let embedded_envelope = json!({
+        "protocol": "google_a2a",
+        "source_agent_id": "agent-dm-source",
+        "target_agent_id": "agent-dm-target",
+        "source_node_id": "node-source",
+        "target_node_id": "node-target",
+        "capability": "social.dm.send",
+        "message": {"content": "hello"}
+    });
+    let event = diagnostic_event_from_payload(crate::types::EventPayload::TopicMessagePosted(
+        crate::types::TopicMessagePostedPayload {
+            network_id: "mainnet:watt-etheria".to_owned(),
+            feed_key: crate::control::PRIVATE_DM_FEED_KEY.to_owned(),
+            scope_hint: "node:node-target".to_owned(),
+            content_ref: sample_topic_content_ref("sha256:dm", "node-source"),
+            local_content_cache: Some(json!({
+                "kind": "direct_message",
+                "agent_envelope": embedded_envelope,
+            })),
+            reply_to_message_id: None,
+            agent_envelope: None,
+        },
+    ));
+
+    let details = event_diagnostic_details(&event);
+
+    assert_eq!(
+        diagnostic_agent_envelope(&details)["source_agent_id"],
+        json!("agent-dm-source")
+    );
+}
+
+#[test]
+fn summary_diagnostics_include_agent_envelope_from_payload() {
+    let envelope = json!({
+        "protocol": "google_a2a",
+        "source_agent_id": "agent-payment-source",
+        "target_agent_id": "agent-payment-target",
+        "capability": "payment.agent_message",
+        "message": {"payment_id": "pay-1"}
+    });
+    let summary = SummaryAnnouncement {
+        summary_id: "payment:pay-1".to_owned(),
+        source_node_id: "node-source".to_owned(),
+        scope: SwarmScope::Node("node-target".to_owned()),
+        summary_kind: AGENT_PAYMENT_SUMMARY_KIND.to_owned(),
+        artifact_path: None,
+        payload: json!({
+            "message_kind": "payment_request",
+            "agent_envelope": envelope,
+        }),
+    };
+
+    let details = summary_diagnostic_details(&summary);
+
+    assert_eq!(
+        diagnostic_agent_envelope(&details)["source_agent_id"],
+        json!("agent-payment-source")
+    );
 }
 
 fn read_http_request(stream: &mut std::net::TcpStream) -> String {

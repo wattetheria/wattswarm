@@ -470,7 +470,22 @@ impl NetworkBridgeService {
 
     pub fn publish_summary(&mut self, summary: SummaryAnnouncement) -> Result<()> {
         self.runtime
-            .publish_gossip(&GossipMessage::Summary(summary))
+            .publish_gossip(&GossipMessage::Summary(summary.clone()))?;
+        diagnostics::record_diagnostic(
+            self.state_dir.as_deref(),
+            diagnostics::DiagnosticEvent::new(
+                "info",
+                "gossip",
+                "publish.summary",
+                "ok",
+                format!("published local summary: {}", summary.summary_kind),
+            )
+            .object("summary", Some(summary.summary_id.clone()))
+            .source_node_id(Some(summary.source_node_id.clone()))
+            .scope(&summary.scope)
+            .details(Value::Object(summary_diagnostic_details(&summary))),
+        );
+        Ok(())
     }
 
     pub fn publish_checkpoint(

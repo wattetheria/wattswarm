@@ -195,6 +195,9 @@ fn event_diagnostic_details(event: &crate::types::Event) -> Map<String, Value> {
         "payload_kind".to_owned(),
         json!(format!("{:?}", event.payload.kind())),
     );
+    if let Some(agent_envelope) = event_payload_agent_envelope(&event.payload) {
+        details.insert("agent_envelope".to_owned(), agent_envelope);
+    }
     if let crate::types::EventPayload::FeedSubscriptionUpdated(payload) = &event.payload {
         details.insert("target_scope_hint".to_owned(), json!(payload.scope_hint));
         details.insert("feed_key".to_owned(), json!(payload.feed_key));
@@ -204,6 +207,65 @@ fn event_diagnostic_details(event: &crate::types::Event) -> Map<String, Value> {
         );
         details.insert("gossip_kinds".to_owned(), json!(payload.gossip_kinds));
         details.insert("active".to_owned(), json!(payload.active));
+    }
+    details
+}
+
+fn event_payload_agent_envelope(payload: &crate::types::EventPayload) -> Option<Value> {
+    match payload {
+        crate::types::EventPayload::TaskClaimed(payload) => payload
+            .agent_envelope
+            .as_ref()
+            .map(|envelope| json!(envelope)),
+        crate::types::EventPayload::CandidateProposed(payload) => payload
+            .agent_envelope
+            .as_ref()
+            .map(|envelope| json!(envelope)),
+        crate::types::EventPayload::DecisionFinalized(payload) => payload
+            .agent_envelope
+            .as_ref()
+            .map(|envelope| json!(envelope)),
+        crate::types::EventPayload::TaskError(payload) => payload
+            .agent_envelope
+            .as_ref()
+            .map(|envelope| json!(envelope)),
+        crate::types::EventPayload::TaskRetryScheduled(payload) => payload
+            .agent_envelope
+            .as_ref()
+            .map(|envelope| json!(envelope)),
+        crate::types::EventPayload::FeedSubscriptionUpdated(payload) => payload
+            .agent_envelope
+            .as_ref()
+            .map(|envelope| json!(envelope)),
+        crate::types::EventPayload::TaskAnnounced(payload) => payload
+            .agent_envelope
+            .as_ref()
+            .map(|envelope| json!(envelope)),
+        crate::types::EventPayload::TopicMessagePosted(payload) => payload
+            .agent_envelope
+            .as_ref()
+            .map(|envelope| json!(envelope))
+            .or_else(|| {
+                payload
+                    .local_content_cache
+                    .as_ref()
+                    .and_then(|content| content.get("agent_envelope").cloned())
+            }),
+        _ => None,
+    }
+}
+
+fn summary_diagnostic_details(summary: &SummaryAnnouncement) -> Map<String, Value> {
+    let mut details = Map::new();
+    details.insert("summary_id".to_owned(), json!(summary.summary_id));
+    details.insert("source_node_id".to_owned(), json!(summary.source_node_id));
+    details.insert("summary_kind".to_owned(), json!(summary.summary_kind));
+    details.insert("scope".to_owned(), json!(summary.scope));
+    if let Some(artifact_path) = &summary.artifact_path {
+        details.insert("artifact_path".to_owned(), json!(artifact_path));
+    }
+    if let Some(agent_envelope) = summary.payload.get("agent_envelope") {
+        details.insert("agent_envelope".to_owned(), agent_envelope.clone());
     }
     details
 }
