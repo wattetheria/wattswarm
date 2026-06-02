@@ -691,6 +691,13 @@ fn ui_root_page_serves_startup_view_and_diagnostics_route_redirects_legacy_conso
         assert!(diagnostics_html.contains(
             r#"if (activeMode === "backfill") return text.includes("backfill") && !isError(row);"#
         ));
+        assert!(diagnostics_html.contains(
+            r#"if (activeMode === "callback") return text.includes("callback") && !isError(row);"#
+        ));
+        assert!(
+            diagnostics_html
+                .contains(r#"qs("diagnosticCount").textContent = String(visible.length);"#)
+        );
         assert!(!diagnostics_html.contains("Local Peer"));
         assert!(!diagnostics_html.contains("Connected Peers"));
         assert!(!diagnostics_html.contains("peer id"));
@@ -770,6 +777,46 @@ fn ui_diagnostics_api_lists_wattswarm_network_diagnostics() {
             payload["network_service_status"].as_str(),
             Some("stopped")
         );
+    });
+}
+
+#[test]
+fn ui_diagnostics_api_applies_limit_after_mode_filter() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let dir = tempdir().unwrap();
+        let state_dir = dir.path().join("state");
+        std::fs::create_dir_all(state_dir.join("diagnostics")).unwrap();
+        std::fs::write(
+            state_dir.join("diagnostics/wattswarm_node.jsonl"),
+            r#"{"id":"older-error","timestamp_ms":1,"level":"error","component":"wattswarm.network_bridge","category":"callback","phase":"delivery.callback","status":"failed","message":"older callback failed","object_kind":"event","object_id":"event-1","source_node_id":"peer-a","details":{}}
+{"id":"older-info","timestamp_ms":2,"level":"info","component":"wattswarm.network_bridge","category":"gossip","phase":"publish.event","status":"ok","message":"published local event","object_kind":"event","object_id":"event-2","source_node_id":"peer-a","details":{}}
+{"id":"newer-warn","timestamp_ms":3,"level":"warn","component":"wattswarm.network_bridge","category":"backfill","phase":"request.timeout","status":"failed","message":"backfill request timed out","object_kind":"backfill","object_id":"event-3","source_node_id":"peer-b","details":{}}
+{"id":"newest-info","timestamp_ms":4,"level":"info","component":"wattswarm.network_bridge","category":"gossip","phase":"publish.event","status":"ok","message":"newest healthy event","object_kind":"event","object_id":"event-4","source_node_id":"peer-c","details":{}}"#,
+        )
+        .unwrap();
+        let db_path = state_dir.join("ui.state");
+        let app = build_app(UiServerState::new(state_dir, db_path));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/diagnostics?mode=errors&limit=2")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let payload = json_from(response).await;
+        let diagnostics = payload["diagnostics"].as_array().unwrap();
+        assert_eq!(diagnostics.len(), 2);
+        assert_eq!(diagnostics[0]["id"].as_str(), Some("newer-warn"));
+        assert_eq!(diagnostics[1]["id"].as_str(), Some("older-error"));
     });
 }
 

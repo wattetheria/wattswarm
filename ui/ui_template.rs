@@ -365,6 +365,7 @@ pub const INDEX_HTML: &str = r#"<!DOCTYPE html>
         ["sourceNodeId", "source_node_id"],
       ];
       params.set("limit", qs("limit").value || "200");
+      if (activeMode !== "all") params.set("mode", activeMode);
       for (const [id, key] of fields) {
         const value = qs(id).value.trim();
         if (value) params.set(key, value);
@@ -423,19 +424,20 @@ pub const INDEX_HTML: &str = r#"<!DOCTYPE html>
       if (activeMode === "agent-events") return isAgentEvent(row);
       const text = diagnosticText(row);
       if (activeMode === "backfill") return text.includes("backfill") && !isError(row);
+      if (activeMode === "callback") return text.includes("callback") && !isError(row);
       return text.includes(activeMode);
     }
 
     function render(payload, rows) {
       const snapshot = payload.snapshot || {};
+      const visible = safeArray(rows).filter(modeMatches);
       qs("generatedAt").textContent = `Refreshed ${formatTime(payload.generated_at || new Date().toISOString())}`;
       qs("serviceState").textContent = payload.network_service_started ? "running" : "stopped";
       qs("irohEndpoint").textContent = compact(snapshot.local_iroh_endpoint_id || "-", 24);
       qs("knownIrohContacts").textContent = String(snapshot.known_iroh_contacts || 0);
       qs("scopeCount").textContent = String(safeArray(snapshot.subscribed_scopes).length);
-      qs("diagnosticCount").textContent = String(safeArray(rows).length);
+      qs("diagnosticCount").textContent = String(visible.length);
 
-      const visible = safeArray(rows).filter(modeMatches);
       const list = qs("diagnosticsList");
       if (!visible.length) {
         list.innerHTML = `<div class="empty">No network diagnostics recorded for the current filters.</div>`;
@@ -498,7 +500,9 @@ pub const INDEX_HTML: &str = r#"<!DOCTYPE html>
         document.querySelectorAll("[data-mode]").forEach((item) => {
           item.classList.toggle("active", item === button);
         });
-        render(lastPayload || { diagnostics: [], snapshot: null }, lastRows);
+        refreshDiagnostics().catch((error) => {
+          qs("diagnosticsList").innerHTML = `<div class="empty">${escapeHtml(error.message)}</div>`;
+        });
       });
     });
 

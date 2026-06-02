@@ -55,6 +55,7 @@ pub struct DiagnosticFilter {
     pub level: Option<String>,
     pub component: Option<String>,
     pub category: Option<String>,
+    pub mode: Option<String>,
     pub phase: Option<String>,
     pub event_id: Option<String>,
     pub object_id: Option<String>,
@@ -248,6 +249,7 @@ fn matches_filter(entry: &DiagnosticEntry, filter: &DiagnosticFilter) -> bool {
     matches_text(&entry.level, filter.level.as_deref())
         && matches_text(&entry.component, filter.component.as_deref())
         && matches_text(&entry.category, filter.category.as_deref())
+        && matches_mode(entry, filter.mode.as_deref())
         && matches_text(&entry.phase, filter.phase.as_deref())
         && matches_optional(entry.event_id.as_deref(), filter.event_id.as_deref())
         && matches_optional(entry.object_id.as_deref(), filter.object_id.as_deref())
@@ -263,6 +265,54 @@ fn matches_text(value: &str, expected: Option<&str>) -> bool {
         .map(str::trim)
         .filter(|expected| !expected.is_empty())
         .is_none_or(|expected| value.eq_ignore_ascii_case(expected))
+}
+
+fn matches_mode(entry: &DiagnosticEntry, mode: Option<&str>) -> bool {
+    let Some(mode) = mode.map(str::trim).filter(|mode| !mode.is_empty()) else {
+        return true;
+    };
+    match mode.to_lowercase().as_str() {
+        "all" => true,
+        "errors" => diagnostic_is_error(entry),
+        "transport" => entry.category.eq_ignore_ascii_case("transport"),
+        "gossip" => entry.category.eq_ignore_ascii_case("gossip"),
+        "agent-events" => diagnostic_is_agent_event(entry),
+        "backfill" => diagnostic_text(entry).contains("backfill") && !diagnostic_is_error(entry),
+        "callback" => diagnostic_text(entry).contains("callback") && !diagnostic_is_error(entry),
+        other => diagnostic_text(entry).contains(other),
+    }
+}
+
+fn diagnostic_is_error(entry: &DiagnosticEntry) -> bool {
+    let text = format!("{} {}", entry.level, entry.status).to_lowercase();
+    text.contains("error") || text.contains("fail") || text.contains("warn")
+}
+
+fn diagnostic_is_agent_event(entry: &DiagnosticEntry) -> bool {
+    entry.category.eq_ignore_ascii_case("agent_event")
+        || entry
+            .object_kind
+            .as_deref()
+            .is_some_and(|kind| kind.eq_ignore_ascii_case("agent_event"))
+}
+
+fn diagnostic_text(entry: &DiagnosticEntry) -> String {
+    let details = entry.details.as_object();
+    [
+        Some(entry.category.as_str()),
+        Some(entry.phase.as_str()),
+        Some(entry.component.as_str()),
+        entry.object_kind.as_deref(),
+        Some(entry.message.as_str()),
+        details.and_then(|details| details.get("event_type").and_then(Value::as_str)),
+        details.and_then(|details| details.get("feed_key").and_then(Value::as_str)),
+        details.and_then(|details| details.get("payload_kind").and_then(Value::as_str)),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>()
+    .join(" ")
+    .to_lowercase()
 }
 
 fn matches_optional(value: Option<&str>, expected: Option<&str>) -> bool {
