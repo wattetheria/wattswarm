@@ -6,224 +6,410 @@ pub const INDEX_HTML: &str = r#"<!DOCTYPE html>
   <title>WattSwarm Network Diagnostics</title>
   <style>
     :root {
-      --bg: #f0e8d8;
-      --ink: #1e1a16;
-      --card: #fff6e8;
-      --card-2: #efe2cf;
-      --accent: #d46a1f;
-      --blue: #1f7fd4;
-      --line: #2b2520;
-      --muted: #5f5549;
-      --ok: #2b8a3e;
-      --warn: #a35b00;
-      --bad: #9f1f1f;
+      --bg: #f4f6f8;
+      --surface: #ffffff;
+      --surface-alt: #f7f8fa;
+      --surface-inset: #fbfcfd;
+      --ink: #111827;
+      --muted: #6b7280;
+      --faint: #9aa1ac;
+      --line: #e9ebf0;
+      --line-soft: #eef0f4;
+      --line-strong: #d6dae1;
+      --green: #16a34a;
+      --green-soft: #e9f7ee;
+      --green-ink: #166534;
+      --red: #dc2626;
+      --red-soft: #fdecec;
+      --red-ink: #991b1b;
+      --blue: #2563eb;
+      --blue-soft: #eef4ff;
+      --blue-ink: #1e40af;
+      --amber: #b45309;
+      --amber-soft: #fef3e2;
+      --amber-ink: #92400e;
+      --radius-sm: 6px;
+      --radius: 8px;
+      --radius-lg: 12px;
+      --shadow-sm: 0 1px 2px rgba(16, 24, 40, 0.04), 0 1px 3px rgba(16, 24, 40, 0.06);
+      --shadow-md: 0 4px 12px rgba(16, 24, 40, 0.08);
+      --accent: #16a34a;
+      --accent-strong: #14532d;
+      --accent-soft: #e9f7ee;
+      --accent-contrast: #ffffff;
     }
+    :root[data-theme="teal"] { --accent: #0d9488; --accent-strong: #115e59; --accent-soft: #e4f5f3; --accent-contrast: #ffffff; }
+    :root[data-theme="emerald"] { --accent: #10b981; --accent-strong: #065f46; --accent-soft: #e7f8f1; --accent-contrast: #ffffff; }
+    :root[data-theme="forest"] { --accent: #16a34a; --accent-strong: #14532d; --accent-soft: #e9f7ee; --accent-contrast: #ffffff; }
+    :root[data-theme="blue-royal"] { --accent: #2563eb; --accent-strong: #1e3a8a; --accent-soft: #eff4ff; --accent-contrast: #ffffff; }
+    :root[data-theme="blue-sky"] { --accent: #0284c7; --accent-strong: #075985; --accent-soft: #e8f7fe; --accent-contrast: #ffffff; }
+    :root[data-theme="indigo"] { --accent: #4f46e5; --accent-strong: #3730a3; --accent-soft: #eef0fe; --accent-contrast: #ffffff; }
+
     * { box-sizing: border-box; }
     body {
       margin: 0;
-      font-family: "IBM Plex Mono", "Fira Code", "JetBrains Mono", monospace;
-      background:
-        linear-gradient(90deg, rgba(30,26,22,0.05) 1px, transparent 1px),
-        linear-gradient(rgba(30,26,22,0.05) 1px, transparent 1px),
-        var(--bg);
-      background-size: 12px 12px, 12px 12px, auto;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Inter", "Helvetica Neue", Arial, sans-serif;
+      background: var(--bg);
       color: var(--ink);
+      -webkit-font-smoothing: antialiased;
+      text-rendering: optimizeLegibility;
     }
     .wrap {
       max-width: 1560px;
       margin: 0 auto;
-      padding: 20px;
-    }
-    .head, .panel {
-      border: 3px solid var(--line);
-      background: var(--card);
-      box-shadow: 8px 8px 0 var(--line);
-      padding: 16px;
+      padding: 24px;
     }
     .head {
       display: flex;
       justify-content: space-between;
       gap: 16px;
-      align-items: end;
-      margin-bottom: 18px;
+      align-items: flex-end;
+      margin-bottom: 22px;
+      padding: 8px 2px 0;
+    }
+    .head-actions {
+      display: flex;
+      align-items: center;
+      gap: 16px;
     }
     h1 {
       margin: 0;
-      font-size: 24px;
-      letter-spacing: 1px;
-      text-transform: uppercase;
+      font-size: 1.6rem;
+      font-weight: 600;
+      letter-spacing: -0.02em;
+      line-height: 1.1;
     }
     h2 {
-      margin: 0 0 10px;
-      font-size: 14px;
+      margin: 0 0 14px;
+      font-size: 0.74rem;
+      font-weight: 600;
       text-transform: uppercase;
-      letter-spacing: .6px;
-      color: var(--accent);
+      letter-spacing: 0.06em;
+      color: var(--accent-strong);
     }
     .hint {
       color: var(--muted);
-      font-size: 13px;
+      font-size: 0.9rem;
       margin-top: 6px;
-      line-height: 1.35;
+      line-height: 1.5;
+      max-width: 70rem;
     }
     .timestamp {
-      color: var(--muted);
-      font-size: 13px;
+      color: var(--faint);
+      font-size: 0.8rem;
       white-space: nowrap;
     }
+    .theme-picker {
+      display: flex;
+      align-items: center;
+      gap: 0.55rem;
+      padding: 0.4rem 0.6rem;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      background: var(--surface);
+    }
+    .theme-picker-label {
+      color: var(--faint);
+      font-size: 0.64rem;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+    }
+    .theme-swatches {
+      display: flex;
+      gap: 0.35rem;
+    }
+    .theme-swatch {
+      width: 1.25rem;
+      height: 1.25rem;
+      min-height: 0;
+      padding: 0;
+      border: 1px solid rgba(17, 24, 39, 0.12);
+      border-radius: var(--radius-sm);
+      background: var(--sw, #888);
+      cursor: pointer;
+      transition: transform 0.12s ease, box-shadow 0.12s ease;
+    }
+    .theme-swatch:hover { transform: translateY(-1px); box-shadow: var(--shadow-sm); }
+    .theme-swatch.active { outline: 2px solid var(--accent); outline-offset: 2px; }
+
     .grid {
       display: grid;
       gap: 14px;
       grid-template-columns: repeat(5, minmax(150px, 1fr));
-      margin-bottom: 16px;
+      margin-bottom: 18px;
     }
     .metric {
-      border: 2px solid var(--line);
-      background: var(--card-2);
-      padding: 12px;
+      border: 1px solid var(--line);
+      border-left: 3px solid var(--accent);
+      border-radius: var(--radius-lg);
+      background: var(--surface);
+      box-shadow: var(--shadow-sm);
+      padding: 14px 16px;
       min-width: 0;
     }
     .label {
-      color: var(--muted);
-      font-size: 12px;
+      color: var(--faint);
+      font-size: 0.7rem;
       text-transform: uppercase;
-      letter-spacing: .6px;
-      font-weight: 800;
+      letter-spacing: 0.05em;
+      font-weight: 600;
     }
     .value {
       margin-top: 6px;
-      font-size: 18px;
-      font-weight: 900;
+      font-size: 1.4rem;
+      font-weight: 600;
+      letter-spacing: -0.01em;
       overflow-wrap: anywhere;
+    }
+    .panel {
+      border: 1px solid var(--line);
+      border-radius: var(--radius-lg);
+      background: var(--surface);
+      box-shadow: var(--shadow-sm);
+      padding: 20px;
     }
     .filters {
       display: grid;
-      gap: 10px;
+      gap: 12px;
       grid-template-columns: minmax(220px, 1.5fr) repeat(5, minmax(130px, .7fr)) minmax(86px, .35fr) repeat(2, minmax(108px, .35fr));
       align-items: end;
-      margin-bottom: 14px;
+      margin-bottom: 16px;
     }
     label {
       display: grid;
-      gap: 5px;
+      gap: 6px;
       color: var(--muted);
-      font-size: 12px;
-      font-weight: 800;
+      font-size: 0.72rem;
+      font-weight: 600;
       text-transform: uppercase;
-      letter-spacing: .5px;
+      letter-spacing: 0.04em;
     }
     input, select, button {
       font: inherit;
-      min-height: 38px;
-      border-radius: 0;
-      border: 2px solid var(--line);
     }
     input, select {
       width: 100%;
-      padding: 8px;
-      background: #fff;
+      min-height: 2.4rem;
+      padding: 0.55rem 0.7rem;
+      border-radius: var(--radius);
+      border: 1px solid var(--line-strong);
+      background: var(--surface);
       color: var(--ink);
+      transition: border-color 0.12s ease, box-shadow 0.12s ease;
+    }
+    input::placeholder { color: var(--faint); }
+    input:hover, select:hover { border-color: var(--muted); }
+    input:focus, select:focus {
+      outline: none;
+      border-color: var(--accent);
+      box-shadow: 0 0 0 3px var(--accent-soft);
     }
     button {
-      padding: 8px 10px;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 2.4rem;
+      padding: 0.55rem 0.95rem;
+      border: 1px solid transparent;
+      border-radius: var(--radius);
       background: var(--accent);
-      color: #fff;
+      color: var(--accent-contrast);
       cursor: pointer;
-      text-transform: uppercase;
-      letter-spacing: .4px;
-      font-weight: 800;
+      font-weight: 600;
+      font-size: 0.86rem;
+      transition: filter 0.12s ease;
     }
+    button:hover { filter: brightness(0.95); }
     button.secondary {
-      background: var(--card-2);
+      background: var(--surface);
       color: var(--ink);
+      border: 1px solid var(--line-strong);
     }
+    button.secondary:hover { background: var(--surface-alt); filter: none; }
+
+    .select-shell { position: relative; width: 100%; min-width: 0; }
+    .select-shell > select.select-native {
+      position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px;
+      border: 0; clip: rect(0 0 0 0); clip-path: inset(50%); overflow: hidden;
+      white-space: nowrap; pointer-events: none;
+    }
+    .select-trigger {
+      display: flex; align-items: center; justify-content: space-between; gap: 0.5rem;
+      width: 100%; min-height: 2.4rem; padding: 0.55rem 0.7rem;
+      border: 1px solid var(--line-strong); border-radius: var(--radius);
+      background: var(--surface); color: var(--ink); font: inherit; font-weight: 400;
+      text-transform: none; letter-spacing: 0; text-align: left; cursor: pointer;
+      transition: border-color 0.12s ease, box-shadow 0.12s ease;
+    }
+    .select-trigger:hover { border-color: var(--muted); filter: none; background: var(--surface); }
+    .select-shell.open .select-trigger {
+      outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft);
+    }
+    .select-value { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .select-value.placeholder { color: var(--faint); }
+    .select-arrow { flex: 0 0 auto; color: var(--faint); font-size: 0.7rem; line-height: 1; transition: transform 0.15s ease; }
+    .select-shell.open .select-arrow { transform: rotate(180deg); color: var(--accent); }
+    .select-popup {
+      position: absolute; z-index: 60; top: calc(100% + 4px); left: 0; width: 100%;
+      min-width: max-content; max-height: 16rem; overflow-y: auto; padding: 0.25rem;
+      border: 1px solid var(--line); border-radius: var(--radius);
+      background: var(--surface); box-shadow: var(--shadow-md);
+    }
+    .select-popup.up { top: auto; bottom: calc(100% + 4px); }
+    .select-popup[hidden] { display: none; }
+    .select-option {
+      display: flex; align-items: center; justify-content: space-between; gap: 0.6rem;
+      padding: 0.5rem 0.6rem; border-radius: var(--radius-sm); color: var(--ink);
+      font-size: 0.88rem; line-height: 1.3; cursor: pointer; white-space: nowrap;
+    }
+    .select-option:hover, .select-option.focused { background: var(--surface-alt); }
+    .select-option.selected { background: var(--accent-soft); color: var(--accent-strong); font-weight: 600; }
+    .select-option.selected::after { content: "\2713"; color: var(--accent); font-size: 0.85rem; }
+
     .tabs {
       display: flex;
       flex-wrap: wrap;
       gap: 8px;
-      margin-bottom: 14px;
+      margin-bottom: 16px;
     }
     .tab {
-      min-height: 34px;
-      background: var(--card-2);
-      color: var(--ink);
+      min-height: 2.1rem;
+      padding: 0.4rem 0.85rem;
+      background: var(--surface);
+      color: var(--muted);
+      border: 1px solid var(--line-strong);
+      border-radius: 999px;
+      font-weight: 500;
     }
-    .tab.active {
-      background: var(--blue);
-      color: #fff;
-    }
+    .tab:hover { background: var(--surface-alt); color: var(--ink); filter: none; }
+    .tab.active { background: var(--accent); color: var(--accent-contrast); border-color: var(--accent); }
     .list {
       display: grid;
       gap: 10px;
     }
     .row {
-      border: 2px solid var(--line);
-      background: #fffdf8;
-      padding: 10px;
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: var(--surface);
+      padding: 14px;
       display: grid;
-      gap: 6px;
+      gap: 8px;
+      transition: border-color 0.12s ease, box-shadow 0.12s ease;
     }
+    .row:hover { border-color: var(--line-strong); box-shadow: var(--shadow-sm); }
     .row-head {
       display: flex;
       justify-content: space-between;
-      gap: 10px;
+      gap: 12px;
       align-items: start;
+      flex-wrap: wrap;
     }
     .row-title {
-      font-weight: 900;
+      flex: 1 1 20rem;
+      min-width: 0;
+      font-weight: 600;
       overflow-wrap: anywhere;
+      word-break: break-word;
+      display: -webkit-box;
+      -webkit-box-orient: vertical;
+      -webkit-line-clamp: 2;
+      line-clamp: 2;
+      overflow: hidden;
     }
     .pills {
       display: flex;
       gap: 6px;
       flex-wrap: wrap;
       justify-content: end;
+      flex: 0 0 auto;
     }
     .pill {
-      border: 1px solid var(--line);
-      background: var(--card-2);
-      padding: 2px 6px;
+      display: inline-flex;
+      align-items: center;
+      border: 1px solid transparent;
+      border-radius: 999px;
+      background: var(--surface-alt);
+      padding: 0.15rem 0.55rem;
       color: var(--muted);
-      font-size: 11px;
-      text-transform: uppercase;
+      font-size: 0.72rem;
+      font-weight: 600;
       white-space: nowrap;
     }
-    .pill.ok { color: var(--ok); }
-    .pill.warn { color: var(--warn); }
-    .pill.error, .pill.failed { color: var(--bad); }
+    .pill.info { color: var(--blue-ink); background: var(--blue-soft); }
+    .pill.debug { color: var(--muted); background: var(--surface-alt); }
+    .pill.ok, .pill.settled, .pill.ready { color: var(--green-ink); background: var(--green-soft); }
+    .pill.warn { color: var(--amber-ink); background: var(--amber-soft); }
+    .pill.error, .pill.failed { color: var(--red-ink); background: var(--red-soft); }
     .meta {
       display: flex;
       flex-wrap: wrap;
-      gap: 6px 12px;
+      gap: 0.4rem;
+      color: var(--faint);
+      font-size: 0.76rem;
+    }
+    .meta > span {
+      display: inline-flex;
+      align-items: center;
+      max-width: 100%;
+      padding: 0.12rem 0.5rem;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      background: var(--surface-alt);
       color: var(--muted);
-      font-size: 12px;
+      font-weight: 500;
+      overflow-wrap: anywhere;
+      word-break: break-word;
     }
     details {
-      border-top: 1px solid rgba(43, 37, 32, .25);
-      padding-top: 6px;
+      border-top: 1px solid var(--line-soft);
+      padding-top: 8px;
     }
     summary {
-      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      gap: 0.3rem;
+      width: fit-content;
+      padding: 0.25rem 0.6rem;
+      border: 1px solid var(--line-strong);
+      border-radius: var(--radius-sm);
+      background: var(--surface-alt);
       color: var(--muted);
-      font-size: 12px;
-      text-transform: uppercase;
+      font-size: 0.74rem;
+      font-weight: 600;
+      cursor: pointer;
+      list-style: none;
+      user-select: none;
     }
+    summary::-webkit-details-marker { display: none; }
+    summary::before { content: "\25B8"; color: var(--faint); font-size: 0.7rem; }
+    details[open] > summary { color: var(--accent-strong); border-color: var(--accent); background: var(--accent-soft); }
+    details[open] > summary::before { content: "\25BE"; color: var(--accent); }
     pre {
-      margin: 8px 0 0;
+      margin: 10px 0 0;
+      background: var(--surface-alt);
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      padding: 0.85rem;
       white-space: pre-wrap;
       word-break: break-word;
-      font-size: 12px;
+      font-family: ui-monospace, "SF Mono", "SFMono-Regular", Menlo, Consolas, monospace;
+      font-size: 0.78rem;
+      line-height: 1.5;
       max-height: 280px;
       overflow: auto;
     }
     .empty {
-      border: 2px dashed var(--line);
-      padding: 14px;
+      border: 1px dashed var(--line-strong);
+      border-radius: var(--radius);
+      padding: 1rem;
       color: var(--muted);
-      background: #fffdf8;
+      background: var(--surface-alt);
+      font-size: 0.88rem;
     }
     @media (max-width: 1100px) {
-      .head { align-items: start; flex-direction: column; }
+      .head { align-items: stretch; flex-direction: column; }
+      .head-actions { justify-content: space-between; }
       .grid, .filters { grid-template-columns: 1fr; }
       .row-head { flex-direction: column; }
       .pills { justify-content: start; }
@@ -234,10 +420,23 @@ pub const INDEX_HTML: &str = r#"<!DOCTYPE html>
   <div class="wrap">
     <header class="head">
       <div>
-        <h1>WattSwarm Network Diagnostics</h1>
+        <h1>WattSwarm network diagnostics</h1>
         <div class="hint">Iroh transport, gossip publish and ingest, subscribed scopes, backfill, callback delivery, and node network state.</div>
       </div>
-      <div id="generatedAt" class="timestamp">Not refreshed</div>
+      <div class="head-actions">
+        <div class="theme-picker" aria-label="Accent color theme">
+          <span class="theme-picker-label">Theme</span>
+          <div class="theme-swatches" role="group" aria-label="Choose accent color">
+            <button class="theme-swatch" type="button" data-theme-swatch="teal" style="--sw:#0d9488" title="Teal" aria-label="Teal theme"></button>
+            <button class="theme-swatch" type="button" data-theme-swatch="emerald" style="--sw:#10b981" title="Emerald" aria-label="Emerald theme"></button>
+            <button class="theme-swatch" type="button" data-theme-swatch="forest" style="--sw:#16a34a" title="Forest" aria-label="Forest theme"></button>
+            <button class="theme-swatch" type="button" data-theme-swatch="blue-royal" style="--sw:#2563eb" title="Royal blue" aria-label="Royal blue theme"></button>
+            <button class="theme-swatch" type="button" data-theme-swatch="blue-sky" style="--sw:#0284c7" title="Sky blue" aria-label="Sky blue theme"></button>
+            <button class="theme-swatch" type="button" data-theme-swatch="indigo" style="--sw:#4f46e5" title="Indigo" aria-label="Indigo theme"></button>
+          </div>
+        </div>
+        <div id="generatedAt" class="timestamp">Not refreshed</div>
+      </div>
     </header>
 
     <section class="grid" aria-label="Network diagnostic summary">
@@ -321,6 +520,150 @@ pub const INDEX_HTML: &str = r#"<!DOCTYPE html>
     let lastRows = [];
     let activeMode = "all";
 
+    const STORAGE_KEY = "wattswarm-console";
+    const themeOptions = ["teal", "emerald", "forest", "blue-royal", "blue-sky", "indigo"];
+    const defaultTheme = "forest";
+
+    function readStoredSettings() {
+      try { return JSON.parse(localStorage.getItem(STORAGE_KEY) || "{}") || {}; }
+      catch (_) { return {}; }
+    }
+    function applyTheme(theme) {
+      const next = themeOptions.includes(theme) ? theme : defaultTheme;
+      document.documentElement.setAttribute("data-theme", next);
+      document.querySelectorAll("[data-theme-swatch]").forEach((swatch) => {
+        const active = swatch.dataset.themeSwatch === next;
+        swatch.classList.toggle("active", active);
+        if (active) swatch.setAttribute("aria-current", "true");
+        else swatch.removeAttribute("aria-current");
+      });
+    }
+    function saveTheme(theme) {
+      const saved = readStoredSettings();
+      saved.theme = theme;
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(saved));
+    }
+    function initThemePicker() {
+      applyTheme(readStoredSettings().theme || defaultTheme);
+      document.querySelectorAll("[data-theme-swatch]").forEach((swatch) => {
+        swatch.addEventListener("click", () => {
+          const theme = swatch.dataset.themeSwatch;
+          applyTheme(theme);
+          saveTheme(theme);
+        });
+      });
+    }
+
+    const nativeSelectValue = Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, "value");
+    function enhanceAllSelects() { document.querySelectorAll("select").forEach(enhanceSelect); }
+    function enhanceSelect(select) {
+      if (!select || select.dataset.enhanced === "1") return;
+      select.dataset.enhanced = "1";
+      select.classList.add("select-native");
+      const shell = document.createElement("div");
+      shell.className = "select-shell";
+      select.parentNode.insertBefore(shell, select);
+      shell.appendChild(select);
+      const trigger = document.createElement("button");
+      trigger.type = "button";
+      trigger.className = "select-trigger";
+      trigger.setAttribute("aria-haspopup", "listbox");
+      trigger.setAttribute("aria-expanded", "false");
+      trigger.innerHTML = '<span class="select-value"></span><span class="select-arrow" aria-hidden="true">▾</span>';
+      const popup = document.createElement("div");
+      popup.className = "select-popup";
+      popup.setAttribute("role", "listbox");
+      popup.hidden = true;
+      shell.appendChild(trigger);
+      shell.appendChild(popup);
+      const valueEl = trigger.querySelector(".select-value");
+      let focusedIndex = -1;
+      function rebuildOptions() {
+        popup.innerHTML = "";
+        Array.from(select.options).forEach((opt, index) => {
+          const item = document.createElement("div");
+          item.className = "select-option";
+          item.setAttribute("role", "option");
+          item.dataset.index = String(index);
+          item.textContent = opt.textContent;
+          item.addEventListener("mousedown", (event) => { event.preventDefault(); choose(index); });
+          popup.appendChild(item);
+        });
+        syncFromSelect();
+      }
+      function syncFromSelect() {
+        const opt = select.options[select.selectedIndex];
+        valueEl.textContent = opt ? opt.textContent : "";
+        valueEl.classList.toggle("placeholder", !opt || opt.value === "");
+        Array.from(popup.children).forEach((item) => {
+          const isSel = Number(item.dataset.index) === select.selectedIndex;
+          item.classList.toggle("selected", isSel);
+          item.setAttribute("aria-selected", isSel ? "true" : "false");
+        });
+      }
+      function choose(index) {
+        if (index !== select.selectedIndex) {
+          nativeSelectValue.set.call(select, select.options[index] ? select.options[index].value : "");
+          syncFromSelect();
+          select.dispatchEvent(new Event("change", { bubbles: true }));
+        }
+        close();
+        trigger.focus();
+      }
+      function setFocused(index) {
+        const items = popup.children;
+        if (!items.length) return;
+        focusedIndex = Math.max(0, Math.min(index, items.length - 1));
+        Array.from(items).forEach((item, i) => item.classList.toggle("focused", i === focusedIndex));
+        items[focusedIndex].scrollIntoView({ block: "nearest" });
+      }
+      function open() {
+        document.querySelectorAll(".select-shell.open").forEach((other) => {
+          if (other !== shell) other.dispatchEvent(new CustomEvent("select-close"));
+        });
+        shell.classList.add("open");
+        popup.hidden = false;
+        trigger.setAttribute("aria-expanded", "true");
+        popup.classList.toggle("up", trigger.getBoundingClientRect().bottom + 260 > window.innerHeight);
+        setFocused(select.selectedIndex < 0 ? 0 : select.selectedIndex);
+      }
+      function close() {
+        shell.classList.remove("open");
+        popup.hidden = true;
+        popup.classList.remove("up");
+        trigger.setAttribute("aria-expanded", "false");
+        Array.from(popup.children).forEach((item) => item.classList.remove("focused"));
+      }
+      function toggle() { if (shell.classList.contains("open")) close(); else open(); }
+      shell.addEventListener("select-close", close);
+      trigger.addEventListener("click", toggle);
+      trigger.addEventListener("keydown", (event) => {
+        const isOpen = shell.classList.contains("open");
+        if (!isOpen && (event.key === "ArrowDown" || event.key === "ArrowUp" || event.key === "Enter" || event.key === " ")) {
+          event.preventDefault(); open(); return;
+        }
+        if (!isOpen) return;
+        if (event.key === "ArrowDown") { event.preventDefault(); setFocused(focusedIndex + 1); }
+        else if (event.key === "ArrowUp") { event.preventDefault(); setFocused(focusedIndex - 1); }
+        else if (event.key === "Enter" || event.key === " ") { event.preventDefault(); if (focusedIndex >= 0) choose(focusedIndex); }
+        else if (event.key === "Escape") { event.preventDefault(); close(); }
+        else if (event.key === "Tab") { close(); }
+      });
+      Object.defineProperty(select, "value", {
+        configurable: true,
+        get() { return nativeSelectValue.get.call(this); },
+        set(v) { nativeSelectValue.set.call(this, v); syncFromSelect(); },
+      });
+      select.addEventListener("change", syncFromSelect);
+      new MutationObserver(rebuildOptions).observe(select, { childList: true });
+      rebuildOptions();
+    }
+    document.addEventListener("click", (event) => {
+      document.querySelectorAll(".select-shell.open").forEach((shell) => {
+        if (!shell.contains(event.target)) shell.dispatchEvent(new CustomEvent("select-close"));
+      });
+    });
+
     function qs(id) {
       return document.getElementById(id);
     }
@@ -352,6 +695,21 @@ pub const INDEX_HTML: &str = r#"<!DOCTYPE html>
       }
       const parsed = Date.parse(value);
       return Number.isNaN(parsed) ? String(value) : new Date(parsed).toLocaleString();
+    }
+
+    const TITLE_MAX = 160;
+    function conciseTitle(row) {
+      const raw = String(row.message || row.phase || "diagnostic");
+      if (raw.length <= TITLE_MAX && !raw.includes("\n")) return raw;
+      const phase = String(row.phase || "").trim();
+      if (phase) {
+        const label = phase.replace(/[._]+/g, " ").trim();
+        const details = diagnosticDetails(row);
+        const eventType = details.event_type || row.event_type || "";
+        return eventType ? `${label}: ${eventType}` : label;
+      }
+      const firstLine = raw.split(/\r?\n/)[0];
+      return firstLine.length > TITLE_MAX ? `${firstLine.slice(0, TITLE_MAX - 1)}…` : firstLine;
     }
 
     function queryParams() {
@@ -464,7 +822,7 @@ pub const INDEX_HTML: &str = r#"<!DOCTYPE html>
         return `
           <article class="row">
             <div class="row-head">
-              <div class="row-title">${escapeHtml(row.message || row.phase || "diagnostic")}</div>
+              <div class="row-title">${escapeHtml(conciseTitle(row))}</div>
               <div class="pills">
                 <span class="pill ${escapeHtml(String(row.level || "").toLowerCase())}">${escapeHtml(row.level || "info")}</span>
                 <span class="pill ${escapeHtml(String(status).toLowerCase())}">${escapeHtml(status)}</span>
@@ -505,6 +863,9 @@ pub const INDEX_HTML: &str = r#"<!DOCTYPE html>
         });
       });
     });
+
+    initThemePicker();
+    enhanceAllSelects();
 
     refreshDiagnostics().catch((error) => {
       qs("diagnosticsList").innerHTML = `<div class="empty">${escapeHtml(error.message)}</div>`;

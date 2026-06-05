@@ -56,6 +56,26 @@ fn backfill_request_validate_enforces_bounds() {
 }
 
 #[test]
+fn inbound_backfill_peer_uses_transport_remote_identity() {
+    let remote_peer = NetworkNodeId::random();
+    let local_peer = NetworkNodeId::random();
+    let request = RawBackfillRequest {
+        scope: SwarmScope::Global,
+        from_event_seq: 0,
+        limit: 1,
+        feed_key: None,
+        known_event_ids: Vec::new(),
+    };
+
+    assert_eq!(
+        request
+            .inbound_peer(&remote_peer, &local_peer)
+            .expect("inbound peer"),
+        remote_peer
+    );
+}
+
+#[test]
 fn backfill_response_validate_enforces_bounds() {
     let response = RawBackfillResponse {
         scope: SwarmScope::Global,

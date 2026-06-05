@@ -87,6 +87,47 @@ fn peer_backfill_cursor_is_tracked_per_scope_and_feed() {
 }
 
 #[test]
+fn inbound_backfill_authorization_keeps_global_open_and_requires_scoped_activity() {
+    let peer = random_network_node_id();
+    let served_scope = SwarmScope::Group("crew-7".to_owned());
+    let unserved_scope = SwarmScope::Group("private-7".to_owned());
+    let mut service = NetworkBridgeService::new(
+        NetworkP2pNode::generate(NetworkP2pConfig::default()).expect("node"),
+        &[SwarmScope::Global, served_scope.clone()],
+        &NetworkProtocolParams::default(),
+    )
+    .expect("service");
+    let global_request = BackfillRequest {
+        scope: SwarmScope::Global,
+        from_event_seq: 0,
+        limit: 8,
+        feed_key: None,
+        known_event_ids: Vec::new(),
+    };
+    let served_request = BackfillRequest {
+        scope: served_scope.clone(),
+        from_event_seq: 0,
+        limit: 8,
+        feed_key: None,
+        known_event_ids: Vec::new(),
+    };
+    let unserved_request = BackfillRequest {
+        scope: unserved_scope.clone(),
+        from_event_seq: 0,
+        limit: 8,
+        feed_key: None,
+        known_event_ids: Vec::new(),
+    };
+
+    assert!(service.inbound_backfill_authorized(&peer, &global_request));
+    assert!(service.inbound_backfill_authorized(&peer, &served_request));
+    assert!(!service.inbound_backfill_authorized(&peer, &unserved_request));
+
+    service.record_peer_scope_activity(peer.clone(), &unserved_scope);
+    assert!(service.inbound_backfill_authorized(&peer, &unserved_request));
+}
+
+#[test]
 fn peer_sync_state_persists_scope_cursor_and_remote_heads() {
     let dir = temp_startup_dir("peer-sync-state-persist");
     let peer = random_network_node_id();

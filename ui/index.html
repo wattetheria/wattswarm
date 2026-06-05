@@ -5,12 +5,44 @@
   <meta name="viewport" content="width=device-width,initial-scale=1" />
   <title>WattSwarm Dashboard</title>
   <style>
-    body { margin: 0; font-family: "IBM Plex Mono", monospace; background: #f4efe4; color: #1f1a16; }
-    .wrap { max-width: 980px; margin: 0 auto; padding: 24px; }
-    .card { border: 3px solid #1f1a16; background: #fff9ef; box-shadow: 8px 8px 0 #1f1a16; padding: 18px; }
-    h1 { margin: 0 0 10px; font-size: 24px; text-transform: uppercase; }
-    p { margin: 6px 0; line-height: 1.5; }
-    code { background: #f0e3ce; padding: 2px 6px; border: 1px solid #8f816d; }
+    :root {
+      --bg: #f4f6f8;
+      --surface: #ffffff;
+      --surface-alt: #f7f8fa;
+      --ink: #111827;
+      --muted: #6b7280;
+      --line: #e9ebf0;
+      --accent-strong: #14532d;
+      --radius: 8px;
+      --radius-lg: 12px;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Inter", "Helvetica Neue", Arial, sans-serif;
+      background: var(--bg);
+      color: var(--ink);
+      -webkit-font-smoothing: antialiased;
+    }
+    .wrap { max-width: 980px; margin: 0 auto; padding: 32px 24px; }
+    .card {
+      border: 1px solid var(--line);
+      border-radius: var(--radius-lg);
+      background: var(--surface);
+      box-shadow: 0 1px 2px rgba(16, 24, 40, 0.04), 0 1px 3px rgba(16, 24, 40, 0.06);
+      padding: 24px;
+    }
+    h1 { margin: 0 0 10px; font-size: 1.5rem; font-weight: 600; letter-spacing: -0.02em; }
+    p { margin: 8px 0; line-height: 1.6; color: var(--muted); }
+    code {
+      background: var(--surface-alt);
+      padding: 2px 7px;
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      font-family: ui-monospace, "SF Mono", "SFMono-Regular", Menlo, Consolas, monospace;
+      font-size: 0.86em;
+      color: var(--accent-strong);
+    }
   </style>
 </head>
 <body>

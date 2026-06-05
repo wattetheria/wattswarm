@@ -43,12 +43,20 @@ impl RawBackfillRequest {
 }
 
 pub(super) trait InboundControlPeer {
-    fn inbound_peer(&self, fallback: &NetworkNodeId) -> Result<NetworkNodeId>;
+    fn inbound_peer(
+        &self,
+        remote_peer: &NetworkNodeId,
+        fallback: &NetworkNodeId,
+    ) -> Result<NetworkNodeId>;
 }
 
 impl InboundControlPeer for RawBackfillRequest {
-    fn inbound_peer(&self, fallback: &NetworkNodeId) -> Result<NetworkNodeId> {
-        Ok(fallback.clone())
+    fn inbound_peer(
+        &self,
+        remote_peer: &NetworkNodeId,
+        _fallback: &NetworkNodeId,
+    ) -> Result<NetworkNodeId> {
+        Ok(remote_peer.clone())
     }
 }
 
@@ -135,7 +143,11 @@ impl RawPeerRelationshipRequest {
 }
 
 impl InboundControlPeer for RawPeerRelationshipRequest {
-    fn inbound_peer(&self, _fallback: &NetworkNodeId) -> Result<NetworkNodeId> {
+    fn inbound_peer(
+        &self,
+        _remote_peer: &NetworkNodeId,
+        _fallback: &NetworkNodeId,
+    ) -> Result<NetworkNodeId> {
         NetworkNodeId::new(self.source_node_id.clone())
     }
 }
@@ -328,7 +340,11 @@ impl RawContactMaterialRequest {
 }
 
 impl InboundControlPeer for RawContactMaterialRequest {
-    fn inbound_peer(&self, _fallback: &NetworkNodeId) -> Result<NetworkNodeId> {
+    fn inbound_peer(
+        &self,
+        _remote_peer: &NetworkNodeId,
+        _fallback: &NetworkNodeId,
+    ) -> Result<NetworkNodeId> {
         NetworkNodeId::new(self.source_node_id.clone())
     }
 }

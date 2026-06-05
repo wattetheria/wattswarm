@@ -6,32 +6,55 @@ pub const STARTUP_HTML: &str = r#"<!DOCTYPE html>
   <title>WattSwarm Startup</title>
   <style>
     :root {
-      --bg: #f0e8d8;
-      --ink: #1e1a16;
-      --card: #fff6e8;
-      --line: #2b2520;
-      --accent: #d46a1f;
-      --accent-2: #1f7fd4;
-      --soft: #f7eee0;
-      --ok: #2b8a3e;
-      --warn: #a35b00;
-      --err: #9f1f1f;
+      --bg: #f4f6f8;
+      --surface: #ffffff;
+      --surface-alt: #f7f8fa;
+      --surface-inset: #fbfcfd;
+      --ink: #111827;
+      --muted: #6b7280;
+      --faint: #9aa1ac;
+      --line: #e9ebf0;
+      --line-soft: #eef0f4;
+      --line-strong: #d6dae1;
+      --green: #16a34a;
+      --green-soft: #e9f7ee;
+      --green-ink: #166534;
+      --red: #dc2626;
+      --red-soft: #fdecec;
+      --red-ink: #991b1b;
+      --amber: #b45309;
+      --amber-soft: #fef3e2;
+      --amber-ink: #92400e;
+      --radius-sm: 6px;
+      --radius: 8px;
+      --radius-lg: 12px;
+      --shadow-sm: 0 1px 2px rgba(16, 24, 40, 0.04), 0 1px 3px rgba(16, 24, 40, 0.06);
+      --shadow-md: 0 4px 12px rgba(16, 24, 40, 0.08);
+      --accent: #16a34a;
+      --accent-strong: #14532d;
+      --accent-soft: #e9f7ee;
+      --accent-contrast: #ffffff;
     }
+    :root[data-theme="teal"] { --accent: #0d9488; --accent-strong: #115e59; --accent-soft: #e4f5f3; --accent-contrast: #ffffff; }
+    :root[data-theme="emerald"] { --accent: #10b981; --accent-strong: #065f46; --accent-soft: #e7f8f1; --accent-contrast: #ffffff; }
+    :root[data-theme="forest"] { --accent: #16a34a; --accent-strong: #14532d; --accent-soft: #e9f7ee; --accent-contrast: #ffffff; }
+    :root[data-theme="blue-royal"] { --accent: #2563eb; --accent-strong: #1e3a8a; --accent-soft: #eff4ff; --accent-contrast: #ffffff; }
+    :root[data-theme="blue-sky"] { --accent: #0284c7; --accent-strong: #075985; --accent-soft: #e8f7fe; --accent-contrast: #ffffff; }
+    :root[data-theme="indigo"] { --accent: #4f46e5; --accent-strong: #3730a3; --accent-soft: #eef0fe; --accent-contrast: #ffffff; }
+
     * { box-sizing: border-box; }
     body {
       margin: 0;
-      font-family: "IBM Plex Mono", "Fira Code", "JetBrains Mono", monospace;
-      background:
-        linear-gradient(90deg, rgba(30,26,22,0.05) 1px, transparent 1px),
-        linear-gradient(rgba(30,26,22,0.05) 1px, transparent 1px),
-        var(--bg);
-      background-size: 12px 12px, 12px 12px, auto;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Inter", "Helvetica Neue", Arial, sans-serif;
+      background: var(--bg);
       color: var(--ink);
+      -webkit-font-smoothing: antialiased;
+      text-rendering: optimizeLegibility;
     }
     .wrap {
       max-width: 1360px;
       margin: 0 auto;
-      padding: 20px;
+      padding: 24px;
     }
     .layout {
       display: grid;
@@ -40,16 +63,17 @@ pub const STARTUP_HTML: &str = r#"<!DOCTYPE html>
       align-items: stretch;
     }
     .panel {
-      border: 3px solid var(--line);
-      background: var(--card);
-      box-shadow: 8px 8px 0 var(--line);
-      padding: 16px;
+      border: 1px solid var(--line);
+      border-radius: var(--radius-lg);
+      background: var(--surface);
+      box-shadow: var(--shadow-sm);
+      padding: 20px;
     }
     .section-grid {
       display: grid;
       grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
       grid-auto-rows: 1fr;
-      gap: 14px;
+      gap: 16px;
     }
     .section-grid > .panel {
       height: 100%;
@@ -62,12 +86,14 @@ pub const STARTUP_HTML: &str = r#"<!DOCTYPE html>
     }
     .hero-actions {
       display: grid;
-      gap: 8px;
+      gap: 10px;
+      justify-items: end;
       min-width: 310px;
     }
     .hero-actions .hint {
       margin: 0;
       max-width: 360px;
+      text-align: right;
     }
     .action-row {
       display: flex;
@@ -77,54 +103,72 @@ pub const STARTUP_HTML: &str = r#"<!DOCTYPE html>
     }
     h1 {
       margin: 0;
-      font-size: 22px;
-      letter-spacing: 1px;
-      text-transform: uppercase;
+      font-size: 1.5rem;
+      font-weight: 600;
+      letter-spacing: -0.02em;
+      line-height: 1.1;
     }
     h2 {
       margin: 0 0 8px;
-      font-size: 14px;
+      font-size: 0.74rem;
+      font-weight: 600;
       text-transform: uppercase;
-      color: var(--accent);
+      letter-spacing: 0.06em;
+      color: var(--accent-strong);
     }
     h3 {
       margin: 0 0 10px;
-      font-size: 12px;
+      font-size: 0.7rem;
+      font-weight: 600;
       text-transform: uppercase;
-      color: #5e5448;
+      letter-spacing: 0.05em;
+      color: var(--faint);
     }
     .hint {
       margin-top: 6px;
-      font-size: 12px;
-      color: #5f5549;
+      font-size: 0.84rem;
+      color: var(--muted);
       line-height: 1.6;
     }
     .field {
       display: grid;
       gap: 6px;
-      margin-top: 10px;
+      margin-top: 12px;
     }
     .field label {
-      font-size: 12px;
+      font-size: 0.72rem;
+      font-weight: 600;
       text-transform: uppercase;
-      color: #4c4339;
+      letter-spacing: 0.04em;
+      color: var(--muted);
     }
     input, select, textarea {
       width: 100%;
-      border: 2px solid var(--line);
-      background: #fff;
+      min-height: 2.4rem;
+      border: 1px solid var(--line-strong);
+      background: var(--surface);
       color: var(--ink);
       font: inherit;
-      padding: 9px;
-      border-radius: 0;
+      padding: 0.55rem 0.7rem;
+      border-radius: var(--radius);
+      transition: border-color 0.12s ease, box-shadow 0.12s ease;
+    }
+    input::placeholder, textarea::placeholder { color: var(--faint); }
+    input:hover, textarea:hover, select:hover { border-color: var(--muted); }
+    input:focus, select:focus, textarea:focus {
+      outline: none;
+      border-color: var(--accent);
+      box-shadow: 0 0 0 3px var(--accent-soft);
     }
     textarea {
       min-height: 110px;
       resize: vertical;
+      line-height: 1.5;
     }
     input[readonly] {
-      background: #f6efe3;
-      color: #5f5549;
+      background: var(--surface-alt);
+      color: var(--muted);
+      border-style: dashed;
     }
     .row {
       display: flex;
@@ -135,116 +179,182 @@ pub const STARTUP_HTML: &str = r#"<!DOCTYPE html>
       display: grid;
       grid-template-columns: repeat(3, minmax(0, 1fr));
       gap: 8px;
-      margin-top: 10px;
+      margin-top: 12px;
     }
     button {
-      border: 2px solid var(--line);
+      border: 1px solid transparent;
       background: var(--accent);
-      color: #fff;
+      color: var(--accent-contrast);
       font: inherit;
-      padding: 9px 12px;
+      font-weight: 600;
+      font-size: 0.86rem;
+      padding: 0.55rem 0.95rem;
+      min-height: 2.4rem;
+      border-radius: var(--radius);
       cursor: pointer;
-      text-transform: uppercase;
-      letter-spacing: .4px;
+      transition: filter 0.12s ease, background 0.12s ease;
     }
-    button.alt { background: var(--accent-2); }
-    button.ghost { background: #efe2cf; color: var(--ink); }
-    button.mode {
-      background: #f1e4d0;
+    button:hover { filter: brightness(0.95); }
+    button.alt {
+      background: var(--surface);
       color: var(--ink);
+      border: 1px solid var(--line-strong);
     }
+    button.alt:hover { background: var(--surface-alt); filter: none; }
+    button.ghost {
+      background: var(--surface-alt);
+      color: var(--muted);
+      border: 1px solid var(--line);
+    }
+    button.ghost:hover { color: var(--ink); filter: none; }
+    button.mode {
+      background: var(--surface);
+      color: var(--muted);
+      border: 1px solid var(--line-strong);
+    }
+    button.mode:hover { background: var(--surface-alt); color: var(--ink); filter: none; }
     button.mode.active {
-      background: var(--accent-2);
-      color: #fff;
+      background: var(--accent);
+      color: var(--accent-contrast);
+      border-color: var(--accent);
     }
     .meta {
       display: grid;
       gap: 8px;
-      margin-top: 10px;
-      padding: 10px;
-      background: var(--soft);
-      border: 2px solid var(--line);
+      margin-top: 12px;
+      padding: 12px;
+      background: var(--surface-inset);
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
     }
     .meta-line {
       display: flex;
       align-items: center;
       gap: 12px;
-      font-size: 12px;
-      text-transform: uppercase;
+      font-size: 0.76rem;
       min-width: 0;
     }
     .meta-line span {
       flex: 0 0 92px;
+      color: var(--faint);
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
     }
     .meta-line code {
       display: block;
       flex: 1 1 auto;
       min-width: 0;
       width: 100%;
-      background: #fff;
-      border: 1px solid #8c7f71;
-      padding: 0 4px;
+      background: var(--surface);
+      border: 1px solid var(--line);
+      border-radius: var(--radius-sm);
+      padding: 0.2rem 0.5rem;
+      font-family: ui-monospace, "SF Mono", "SFMono-Regular", Menlo, Consolas, monospace;
+      color: var(--ink);
       overflow: hidden;
       text-overflow: ellipsis;
       white-space: nowrap;
     }
     .monitor {
       position: sticky;
-      top: 20px;
+      top: 24px;
       display: grid;
       gap: 12px;
+      align-content: start;
     }
     .monitor-block {
-      border: 2px solid var(--line);
-      background: #fff;
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: var(--surface);
+      overflow: hidden;
     }
     .monitor-label {
-      padding: 8px 10px;
-      border-bottom: 2px solid var(--line);
-      background: var(--soft);
-      font-size: 12px;
+      padding: 0.6rem 0.8rem;
+      border-bottom: 1px solid var(--line);
+      background: var(--surface-alt);
+      font-size: 0.7rem;
+      font-weight: 600;
       text-transform: uppercase;
-      color: #423930;
+      letter-spacing: 0.05em;
+      color: var(--muted);
     }
     pre {
       margin: 0;
-      padding: 10px;
+      padding: 0.85rem;
       min-height: 160px;
       max-height: 320px;
       overflow: auto;
       white-space: pre-wrap;
       word-break: break-word;
-      font-size: 12px;
-      background: #fffdf8;
+      font-family: ui-monospace, "SF Mono", "SFMono-Regular", Menlo, Consolas, monospace;
+      font-size: 0.78rem;
+      line-height: 1.5;
+      background: var(--surface);
+      color: var(--ink);
     }
     .pill {
       position: fixed;
-      top: 10px;
-      right: 10px;
+      top: 14px;
+      right: 14px;
       z-index: 9999;
-      border: 3px solid var(--line);
-      box-shadow: 4px 4px 0 var(--line);
-      background: #efe2cf;
-      color: var(--ink);
-      padding: 6px 10px;
-      font-size: 12px;
-      text-transform: uppercase;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      box-shadow: var(--shadow-md);
+      background: var(--surface);
+      color: var(--muted);
+      padding: 0.35rem 0.8rem;
+      font-size: 0.74rem;
+      font-weight: 600;
+      letter-spacing: 0.02em;
     }
-    .pill.ok { background: #cfe8d4; color: var(--ok); }
-    .pill.warn { background: #efe1cc; color: var(--warn); }
-    .pill.err { background: #f5d5d5; color: var(--err); }
+    .pill.ok { background: var(--green-soft); color: var(--green-ink); border-color: transparent; }
+    .pill.warn { background: var(--amber-soft); color: var(--amber-ink); border-color: transparent; }
+    .pill.err { background: var(--red-soft); color: var(--red-ink); border-color: transparent; }
     .links {
       display: flex;
       gap: 10px;
       flex-wrap: wrap;
-      margin-top: 12px;
-      font-size: 12px;
+      margin-top: 14px;
+      font-size: 0.84rem;
     }
     .links a {
-      color: var(--accent-2);
+      color: var(--accent-strong);
+      font-weight: 500;
       text-decoration: none;
-      border-bottom: 1px solid currentColor;
+      border-bottom: 1px solid var(--accent-soft);
     }
+    .links a:hover { border-bottom-color: currentColor; }
+    .theme-picker {
+      display: flex;
+      align-items: center;
+      gap: 0.55rem;
+      padding: 0.4rem 0.6rem;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      background: var(--surface);
+    }
+    .theme-picker-label {
+      color: var(--faint);
+      font-size: 0.64rem;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+    }
+    .theme-swatches { display: flex; gap: 0.35rem; }
+    .theme-swatch {
+      width: 1.25rem;
+      height: 1.25rem;
+      min-height: 0;
+      padding: 0;
+      border: 1px solid rgba(17, 24, 39, 0.12);
+      border-radius: var(--radius-sm);
+      background: var(--sw, #888);
+      cursor: pointer;
+      transition: transform 0.12s ease, box-shadow 0.12s ease;
+    }
+    .theme-swatch:hover { transform: translateY(-1px); box-shadow: var(--shadow-sm); filter: none; }
+    .theme-swatch.active { outline: 2px solid var(--accent); outline-offset: 2px; }
     .hidden {
       display: none;
     }
@@ -263,7 +373,9 @@ pub const STARTUP_HTML: &str = r#"<!DOCTYPE html>
       }
       .hero-actions {
         min-width: 0;
+        justify-items: start;
       }
+      .hero-actions .hint { text-align: left; }
       .action-row {
         justify-content: flex-start;
       }
@@ -285,7 +397,7 @@ pub const STARTUP_HTML: &str = r#"<!DOCTYPE html>
   <div class="wrap">
     <div class="panel hero-panel">
       <div>
-        <h1>WattSwarm Startup</h1>
+        <h1>WattSwarm startup</h1>
         <div class="hint">
           First-run configuration for the local node. Only required startup fields are shown here.
           Required startup settings stay here. Deeper tuning and gateway deployment still stay in CLI or compose.
@@ -295,6 +407,17 @@ pub const STARTUP_HTML: &str = r#"<!DOCTYPE html>
         </div>
       </div>
       <div class="hero-actions">
+        <div class="theme-picker" aria-label="Accent color theme">
+          <span class="theme-picker-label">Theme</span>
+          <div class="theme-swatches" role="group" aria-label="Choose accent color">
+            <button class="theme-swatch" type="button" data-theme-swatch="teal" style="--sw:#0d9488" title="Teal" aria-label="Teal theme"></button>
+            <button class="theme-swatch" type="button" data-theme-swatch="emerald" style="--sw:#10b981" title="Emerald" aria-label="Emerald theme"></button>
+            <button class="theme-swatch" type="button" data-theme-swatch="forest" style="--sw:#16a34a" title="Forest" aria-label="Forest theme"></button>
+            <button class="theme-swatch" type="button" data-theme-swatch="blue-royal" style="--sw:#2563eb" title="Royal blue" aria-label="Royal blue theme"></button>
+            <button class="theme-swatch" type="button" data-theme-swatch="blue-sky" style="--sw:#0284c7" title="Sky blue" aria-label="Sky blue theme"></button>
+            <button class="theme-swatch" type="button" data-theme-swatch="indigo" style="--sw:#4f46e5" title="Indigo" aria-label="Indigo theme"></button>
+          </div>
+        </div>
         <div class="hint">Saving writes wattswarm startup only. Agent and model configuration lives in Wattetheria.</div>
         <div class="action-row">
           <button type="button" onclick="saveStartupConfig()">save startup config</button>
@@ -383,6 +506,39 @@ Those stay in CLI, compose, or config files for advanced operators.</pre>
     const responseOut = document.getElementById('responseOut');
     const statusPill = document.getElementById('statusPill');
     let startupConfig = null;
+
+    const STORAGE_KEY = "wattswarm-console";
+    const themeOptions = ["teal", "emerald", "forest", "blue-royal", "blue-sky", "indigo"];
+    const defaultTheme = "forest";
+    function readStoredSettings() {
+      try { return JSON.parse(localStorage.getItem(STORAGE_KEY) || "{}") || {}; }
+      catch (_) { return {}; }
+    }
+    function applyTheme(theme) {
+      const next = themeOptions.includes(theme) ? theme : defaultTheme;
+      document.documentElement.setAttribute("data-theme", next);
+      document.querySelectorAll("[data-theme-swatch]").forEach((swatch) => {
+        const active = swatch.dataset.themeSwatch === next;
+        swatch.classList.toggle("active", active);
+        if (active) swatch.setAttribute("aria-current", "true");
+        else swatch.removeAttribute("aria-current");
+      });
+    }
+    function saveTheme(theme) {
+      const saved = readStoredSettings();
+      saved.theme = theme;
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(saved));
+    }
+    function initThemePicker() {
+      applyTheme(readStoredSettings().theme || defaultTheme);
+      document.querySelectorAll("[data-theme-swatch]").forEach((swatch) => {
+        swatch.addEventListener("click", () => {
+          const theme = swatch.dataset.themeSwatch;
+          applyTheme(theme);
+          saveTheme(theme);
+        });
+      });
+    }
 
     function setStatus(kind, text) {
       statusPill.className = `pill ${kind || ''}`.trim();
@@ -489,6 +645,8 @@ Those stay in CLI, compose, or config files for advanced operators.</pre>
       syncFormFromConfig(data.config);
       setStatus('ok', 'saved');
     }
+
+    initThemePicker();
 
     Promise.all([refreshNodeStatus(), refreshStartupConfig()]).catch((err) => {
       setStatus('err', 'bootstrap-failed');

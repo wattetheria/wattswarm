@@ -209,6 +209,70 @@ fn remote_feed_subscription_adds_relay_scope_without_local_subscription() {
 }
 
 #[test]
+fn remote_feed_subscription_gossip_authorizes_peer_for_target_scope_backfill() {
+    let local = NodeIdentity::random();
+    let remote = NodeIdentity::random();
+    let membership = membership_with_roles(&[local.node_id(), remote.node_id()]);
+    let mut node =
+        Node::new(local, PgStore::open_in_memory().expect("store"), membership).expect("node");
+    let mut service = NetworkBridgeService::new(
+        NetworkP2pNode::generate(NetworkP2pConfig {
+            listen_addrs: vec!["127.0.0.1:0".to_owned()],
+            enable_local_discovery: false,
+            ..NetworkP2pConfig::default()
+        })
+        .expect("network node"),
+        &[SwarmScope::Global],
+        &NetworkProtocolParams::default(),
+    )
+    .expect("service");
+    let propagation_source = random_network_node_id();
+    let target_scope = SwarmScope::Group("crew-7".to_owned());
+    let event = build_event_for_external(
+        &remote,
+        1,
+        100,
+        crate::types::EventPayload::FeedSubscriptionUpdated(
+            crate::types::FeedSubscriptionUpdatedPayload {
+                network_id: "default".to_owned(),
+                subscriber_node_id: remote.node_id(),
+                feed_key: "market.relay".to_owned(),
+                scope_hint: "group:crew-7".to_owned(),
+                gossip_kinds: vec!["events".to_owned()],
+                provider_capabilities: None,
+                agent_envelope: None,
+                active: true,
+            },
+        ),
+    )
+    .expect("subscription event");
+
+    service
+        .handle_runtime_event(
+            &mut node,
+            Ok(NetworkRuntimeEvent::Gossip {
+                propagation_source: propagation_source.clone(),
+                message: GossipMessage::Event(EventEnvelope {
+                    scope: SwarmScope::Global,
+                    event,
+                    content_source_node_id: None,
+                }),
+            }),
+        )
+        .expect("ingest subscription");
+
+    let request = BackfillRequest {
+        scope: target_scope.clone(),
+        from_event_seq: 0,
+        limit: 8,
+        feed_key: None,
+        known_event_ids: Vec::new(),
+    };
+    assert!(service.peer_has_scope_activity(&propagation_source, &target_scope));
+    assert!(service.inbound_backfill_authorized(&propagation_source, &request));
+}
+
+#[test]
 fn startup_restores_remote_feed_subscription_relay_scopes() {
     let node = Node::open_in_memory_with_roles(&[]).expect("node");
     let local_node_id = node.node_id();

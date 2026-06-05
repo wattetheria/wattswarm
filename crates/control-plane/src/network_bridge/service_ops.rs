@@ -458,6 +458,35 @@ impl NetworkBridgeService {
         self.persist_peer_sync_state();
     }
 
+    pub(crate) fn peer_has_scope_activity(&self, peer: &NetworkNodeId, scope: &SwarmScope) -> bool {
+        self.peer_sync_state
+            .get(peer)
+            .is_some_and(|state| state.known_scopes.contains(scope))
+    }
+
+    pub(crate) fn serves_backfill_scope(&self, scope: &SwarmScope) -> bool {
+        *scope == SwarmScope::Global
+            || self.subscribed_scope_kinds.contains_key(scope)
+            || self.relay_scope_kinds.contains_key(scope)
+    }
+
+    pub(crate) fn inbound_backfill_authorized(
+        &self,
+        peer: &NetworkNodeId,
+        request: &BackfillRequest,
+    ) -> bool {
+        if request.scope == SwarmScope::Global {
+            return true;
+        }
+        if self.serves_backfill_scope(&request.scope) {
+            return true;
+        }
+        if self.peer_has_scope_activity(peer, &request.scope) {
+            return true;
+        }
+        false
+    }
+
     pub(crate) fn scope_traffic_mut(&mut self, scope: &SwarmScope) -> &mut ScopeTrafficStats {
         self.scope_traffic.entry(scope.clone()).or_default()
     }

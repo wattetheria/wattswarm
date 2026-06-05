@@ -835,66 +835,78 @@ impl SubstrateRuntime {
             &self.state_dir,
             self.local_peer_id.as_str(),
             kind,
-            Some(move |request: IrohControlStreamRequest| {
-                if request.kind != kind {
-                    return IrohControlStreamResponse {
-                        ok: false,
-                        error: Some(format!(
-                            "unexpected iroh control request kind {}",
-                            request.kind
-                        )),
-                        payload: Vec::new(),
-                    };
-                }
-                let decoded = match serde_json::from_slice::<Req>(&request.payload) {
-                    Ok(decoded) => decoded,
-                    Err(err) => {
+            Some(
+                move |remote_peer_id: String, request: IrohControlStreamRequest| {
+                    if request.kind != kind {
                         return IrohControlStreamResponse {
                             ok: false,
-                            error: Some(format!("decode iroh control request: {err}")),
+                            error: Some(format!(
+                                "unexpected iroh control request kind {}",
+                                request.kind
+                            )),
                             payload: Vec::new(),
                         };
                     }
-                };
-                let peer = match decoded.inbound_peer(&local_peer_id) {
-                    Ok(peer) => peer,
-                    Err(err) => {
+                    let decoded = match serde_json::from_slice::<Req>(&request.payload) {
+                        Ok(decoded) => decoded,
+                        Err(err) => {
+                            return IrohControlStreamResponse {
+                                ok: false,
+                                error: Some(format!("decode iroh control request: {err}")),
+                                payload: Vec::new(),
+                            };
+                        }
+                    };
+                    let remote_peer = match NetworkNodeId::new(remote_peer_id) {
+                        Ok(peer) => peer,
+                        Err(err) => {
+                            return IrohControlStreamResponse {
+                                ok: false,
+                                error: Some(format!("resolve iroh remote peer: {err}")),
+                                payload: Vec::new(),
+                            };
+                        }
+                    };
+                    let peer = match decoded.inbound_peer(&remote_peer, &local_peer_id) {
+                        Ok(peer) => peer,
+                        Err(err) => {
+                            return IrohControlStreamResponse {
+                                ok: false,
+                                error: Some(format!("resolve iroh control peer: {err}")),
+                                payload: Vec::new(),
+                            };
+                        }
+                    };
+                    let (response_tx, response_rx) = mpsc::channel::<Resp>();
+                    let event = build_event(peer, decoded, response_tx);
+                    if pending_tx.send(event).is_err() {
                         return IrohControlStreamResponse {
                             ok: false,
-                            error: Some(format!("resolve iroh control peer: {err}")),
+                            error: Some("control dispatch channel unavailable".to_owned()),
                             payload: Vec::new(),
                         };
                     }
-                };
-                let (response_tx, response_rx) = mpsc::channel::<Resp>();
-                let event = build_event(peer, decoded, response_tx);
-                if pending_tx.send(event).is_err() {
-                    return IrohControlStreamResponse {
-                        ok: false,
-                        error: Some("control dispatch channel unavailable".to_owned()),
-                        payload: Vec::new(),
-                    };
-                }
-                match response_rx.recv_timeout(timeout) {
-                    Ok(response) => match serde_json::to_vec(&response) {
-                        Ok(payload) => IrohControlStreamResponse {
-                            ok: true,
-                            error: None,
-                            payload,
+                    match response_rx.recv_timeout(timeout) {
+                        Ok(response) => match serde_json::to_vec(&response) {
+                            Ok(payload) => IrohControlStreamResponse {
+                                ok: true,
+                                error: None,
+                                payload,
+                            },
+                            Err(err) => IrohControlStreamResponse {
+                                ok: false,
+                                error: Some(format!("encode iroh control response: {err}")),
+                                payload: Vec::new(),
+                            },
                         },
                         Err(err) => IrohControlStreamResponse {
                             ok: false,
-                            error: Some(format!("encode iroh control response: {err}")),
+                            error: Some(format!("wait for iroh control response: {err}")),
                             payload: Vec::new(),
                         },
-                    },
-                    Err(err) => IrohControlStreamResponse {
-                        ok: false,
-                        error: Some(format!("wait for iroh control response: {err}")),
-                        payload: Vec::new(),
-                    },
-                }
-            }),
+                    }
+                },
+            ),
         )
     }
 

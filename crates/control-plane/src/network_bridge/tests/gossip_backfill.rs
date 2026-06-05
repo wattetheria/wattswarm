@@ -256,7 +256,8 @@ fn iroh_backfill_stream_repairs_missed_global_event_and_ingest_is_idempotent() {
         &peer_b,
         IROH_CONTROL_KIND_BACKFILL,
         Some(
-            move |request: wattswarm_network_transport_iroh::IrohControlStreamRequest| {
+            move |_remote_peer_id: String,
+                  request: wattswarm_network_transport_iroh::IrohControlStreamRequest| {
                 if request.kind != IROH_CONTROL_KIND_BACKFILL {
                     return wattswarm_network_transport_iroh::IrohControlStreamResponse {
                         ok: false,

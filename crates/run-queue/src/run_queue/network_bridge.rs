@@ -11,7 +11,7 @@
 //!    `REMOTE_DISPATCHED` status), write the result back into the run_steps
 //!    table so the run-queue aggregation can finalize.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde_json::{Value, json};
 use std::io::Write;
 use std::path::Path;
@@ -46,6 +46,31 @@ fn resolve_run_queue(state_dir: &Path) -> Option<PgRunQueue> {
     let node = crate::control::open_node(state_dir, db_path).ok()?;
     let org_id = node.store.org_id().to_owned();
     Some(queue.for_org(org_id))
+}
+
+fn ensure_author_confirmed_execution_set_member(
+    members: &[crate::control::storage::ExecutionSetMemberRow],
+    task_id: &str,
+    author_node_id: &str,
+) -> Result<()> {
+    if members.is_empty() {
+        anyhow::bail!(
+            "run_queue_bridge: execution set membership for {task_id} is not confirmed; \
+             deferring remote result from {author_node_id}"
+        );
+    }
+
+    if members
+        .iter()
+        .any(|m| m.participant_node_id == author_node_id && m.status == "confirmed")
+    {
+        return Ok(());
+    }
+
+    anyhow::bail!(
+        "run_queue_bridge: author {author_node_id} is not a confirmed \
+         execution set member for {task_id}; rejecting result"
+    );
 }
 
 /// Complete a REMOTE_DISPATCHED step with the remote candidate result.
@@ -95,24 +120,12 @@ fn complete_remote_step(
     // Verify the author is a confirmed execution set member using the
     // node-core PgStore which owns the execution_set_projection table.
     let execution_set_id = format!("remote-bridge:{task_id}");
-    if let Ok(node) =
-        crate::control::open_node(state_dir, std::path::Path::new(&queue.database_url))
-    {
-        let members = node
-            .store
-            .list_execution_set_members(task_id, &execution_set_id)?;
-        let is_confirmed_member = members
-            .iter()
-            .any(|m| m.participant_node_id == author_node_id);
-        if !is_confirmed_member && !members.is_empty() {
-            anyhow::bail!(
-                "run_queue_bridge: author {author_node_id} is not a confirmed \
-                 execution set member for {task_id}; rejecting result"
-            );
-        }
-        // If members is empty, execution set wasn't yet confirmed — accept
-        // the result (early arrival before confirmation gossip).
-    }
+    let node = crate::control::open_node(state_dir, std::path::Path::new(&queue.database_url))
+        .context("run_queue_bridge: open node to verify execution set membership")?;
+    let members = node
+        .store
+        .list_execution_set_members(task_id, &execution_set_id)?;
+    ensure_author_confirmed_execution_set_member(&members, task_id, author_node_id)?;
 
     tx.execute(
         "UPDATE run_steps
@@ -228,6 +241,59 @@ pub fn process_pending_bridge_tasks(
             .and_then(|mut f| f.write_all(retry_content.as_bytes()));
     }
     Ok(processed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn execution_set_member(
+        participant_node_id: &str,
+        status: &str,
+    ) -> crate::control::storage::ExecutionSetMemberRow {
+        crate::control::storage::ExecutionSetMemberRow {
+            task_id: "task-1".to_owned(),
+            execution_set_id: "remote-bridge:task-1".to_owned(),
+            participant_node_id: participant_node_id.to_owned(),
+            role_hint: "executor".to_owned(),
+            scope_hint: "global".to_owned(),
+            status: status.to_owned(),
+            confirmed_by_node_id: Some("coordinator".to_owned()),
+            updated_at: 1,
+        }
+    }
+
+    #[test]
+    fn remote_result_author_membership_requires_confirmed_member() {
+        assert!(
+            ensure_author_confirmed_execution_set_member(
+                &[execution_set_member("node-a", "confirmed")],
+                "task-1",
+                "node-a",
+            )
+            .is_ok()
+        );
+
+        let empty_err = ensure_author_confirmed_execution_set_member(&[], "task-1", "node-a")
+            .expect_err("empty membership must defer remote result");
+        assert!(empty_err.to_string().contains("is not confirmed"));
+
+        let pending_err = ensure_author_confirmed_execution_set_member(
+            &[execution_set_member("node-a", "accepted")],
+            "task-1",
+            "node-a",
+        )
+        .expect_err("unconfirmed member must not complete remote result");
+        assert!(pending_err.to_string().contains("not a confirmed"));
+
+        let outsider_err = ensure_author_confirmed_execution_set_member(
+            &[execution_set_member("node-b", "confirmed")],
+            "task-1",
+            "node-a",
+        )
+        .expect_err("non-member must not complete remote result");
+        assert!(outsider_err.to_string().contains("not a confirmed"));
+    }
 }
 
 /// Process pending run-queue results written by the coordinator-side gossip hook.

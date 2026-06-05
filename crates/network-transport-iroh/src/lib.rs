@@ -145,7 +145,7 @@ pub struct IrohControlStreamResponse {
 }
 
 type ControlStreamHandler =
-    Arc<dyn Fn(IrohControlStreamRequest) -> IrohControlStreamResponse + Send + Sync>;
+    Arc<dyn Fn(String, IrohControlStreamRequest) -> IrohControlStreamResponse + Send + Sync>;
 type ControlStreamHandlers = Arc<Mutex<HashMap<String, ControlStreamHandler>>>;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -490,6 +490,7 @@ async fn serve_incoming_control_stream_request(
     connection: Connection,
 ) -> Result<()> {
     async {
+        let remote_peer_id = connection.remote_id().to_string();
         let (mut send, mut recv) = connection.accept_bi().await?;
         let request_bytes = recv.read_to_end(MAX_CONTROL_REQUEST_BYTES).await?;
         let request: IrohControlStreamRequest = serde_json::from_slice(&request_bytes)?;
@@ -500,7 +501,7 @@ async fn serve_incoming_control_stream_request(
             .get(&request_kind)
             .cloned()
         {
-            Some(handler) => handler(request),
+            Some(handler) => handler(remote_peer_id, request),
             None => IrohControlStreamResponse {
                 ok: false,
                 error: Some(format!(
@@ -1013,7 +1014,7 @@ pub fn set_local_control_stream_handler_for_network_peer_id<H>(
     handler: Option<H>,
 ) -> Result<()>
 where
-    H: Fn(IrohControlStreamRequest) -> IrohControlStreamResponse + Send + Sync + 'static,
+    H: Fn(String, IrohControlStreamRequest) -> IrohControlStreamResponse + Send + Sync + 'static,
 {
     let handler = handler.map(|handler| Arc::new(handler) as ControlStreamHandler);
     ensure_local_iroh_data_plane_for_network_peer_id(state_dir, network_peer_id)?
@@ -1032,7 +1033,10 @@ pub fn install_local_contact_material_control_handler_for_network_peer_id(
         &network_peer_id.clone(),
         IROH_CONTROL_KIND_CONTACT_MATERIAL,
         Some(
-            move |request: IrohControlStreamRequest| match request.kind.as_str() {
+            move |_remote_peer_id: String, request: IrohControlStreamRequest| match request
+                .kind
+                .as_str()
+            {
                 IROH_CONTROL_KIND_CONTACT_MATERIAL => {
                     match export_local_contact_material_for_network_peer_id(
                         &state_dir,
@@ -1500,14 +1504,16 @@ mod tests {
             &peer_b,
             "echo.v1",
             Some(
-                |request: IrohControlStreamRequest| IrohControlStreamResponse {
-                    ok: true,
-                    error: None,
-                    payload: format!("{}:", request.kind)
-                        .into_bytes()
-                        .into_iter()
-                        .chain(request.payload)
-                        .collect(),
+                |_remote_peer_id: String, request: IrohControlStreamRequest| {
+                    IrohControlStreamResponse {
+                        ok: true,
+                        error: None,
+                        payload: format!("{}:", request.kind)
+                            .into_bytes()
+                            .into_iter()
+                            .chain(request.payload)
+                            .collect(),
+                    }
                 },
             ),
         )

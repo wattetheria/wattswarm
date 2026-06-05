@@ -405,6 +405,7 @@ impl NetworkBridgeService {
                                 &node.node_id(),
                                 payload,
                             )? {
+                                self.record_peer_scope_activity(propagation_source.clone(), &scope);
                                 let _ = self.request_backfill_scopes_for_peer_now(
                                     &propagation_source,
                                     node,
@@ -593,13 +594,23 @@ impl NetworkBridgeService {
                 request,
                 request_id,
             } => {
-                let response = backfill_response_for_request(
-                    node,
-                    &self.local_peer_id().to_string(),
-                    &request,
-                    self.runtime.config().max_backfill_events,
-                    self.runtime.config().max_backfill_events_hard_limit,
-                )?;
+                let response = if self.inbound_backfill_authorized(&peer, &request) {
+                    backfill_response_for_request(
+                        node,
+                        &self.local_peer_id().to_string(),
+                        &request,
+                        self.runtime.config().max_backfill_events,
+                        self.runtime.config().max_backfill_events_hard_limit,
+                    )?
+                } else {
+                    crate::network_p2p::BackfillResponse {
+                        scope: request.scope.clone(),
+                        next_from_event_seq: request.from_event_seq,
+                        feed_key: request.feed_key.clone(),
+                        head_event_ids: Vec::new(),
+                        events: Vec::new(),
+                    }
+                };
                 let events = response.events.len();
                 match self.runtime.send_backfill_response(request_id, response) {
                     Ok(()) => Ok(NetworkBridgeTick::BackfillServed { peer, events }),
@@ -682,6 +693,7 @@ impl NetworkBridgeService {
                         if let Some(scope) =
                             self.apply_remote_feed_subscription_for_relay(&node.node_id(), payload)?
                         {
+                            self.record_peer_scope_activity(peer.clone(), &scope);
                             let _ =
                                 self.request_backfill_scopes_for_peer_now(&peer, node, &[scope])?;
                         }
