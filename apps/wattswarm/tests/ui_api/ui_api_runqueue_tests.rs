@@ -220,7 +220,6 @@ fn ui_rejects_lan_run_submit_when_only_local_executors_are_available() {
                     .header("content-type", "application/json")
                     .body(Body::from(
                         serde_json::to_vec(&json!({
-                            "display_name": "Captain Aurora",
                             "network_mode": "lan",
                             "bootstrap_contacts": []
                         }))

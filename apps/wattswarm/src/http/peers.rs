@@ -435,7 +435,6 @@ mod tests {
         save_startup_config(
             &startup_config_path(&state_dir),
             &StartupConfig {
-                display_name: "Node Agent".to_owned(),
                 latitude: None,
                 longitude: None,
                 network_mode: NetworkMode::Wan,

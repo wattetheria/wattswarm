@@ -1366,7 +1366,6 @@ fn free_chat_is_interpreted_then_sedimented_into_topic_consensus() {
                     .header("content-type", "application/json")
                     .body(Body::from(
                         serde_json::to_vec(&json!({
-                            "display_name": "Captain Aurora",
                             "network_mode": "local",
                             "bootstrap_contacts": [],
                             "core_agent": {
@@ -1764,7 +1763,6 @@ fn topic_interpretation_receives_prior_deliberations_from_topic_consensus_histor
                     .header("content-type", "application/json")
                     .body(Body::from(
                         serde_json::to_vec(&json!({
-                            "display_name": "Captain Aurora",
                             "network_mode": "local",
                             "bootstrap_contacts": [],
                             "core_agent": {

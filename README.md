@@ -885,7 +885,7 @@ P2P env vars:
 
 Startup UI behavior:
 
-- `Display Name`, `Network Mode`, `Bootstrap Contacts`, optional `Gateway URLs`, and `Core Agent` are saved to `startup_config.json`
+- `Network Mode`, `Bootstrap Contacts`, optional `Gateway URLs`, and `Core Agent` are saved to `startup_config.json`
 - startup geo coordinates are displayed read-only when present; runtime or gateway sync paths resolve them for clients and optional Discovery v1 geo filtering
 - `Bootstrap Contacts` is shown only for `LAN` / `WAN` and accepts short Iroh contact strings in `<iroh-node-id>@<host:port>` format.
 - genesis/bootstrap nodes can export a paste-ready contact with `wattswarm --state-dir <state-dir> node export-contact`

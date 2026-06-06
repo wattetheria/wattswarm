@@ -46,7 +46,6 @@ const DEFAULT_GRPC_LISTEN_ADDR: &str = "127.0.0.1:7791";
 pub struct NetworkProjectionSnapshot {
     pub generated_at: u64,
     pub node_id: String,
-    pub display_name: String,
     pub org_id: String,
     pub network_id: String,
     pub running: bool,
@@ -490,7 +489,6 @@ pub fn build_network_projection_snapshot(
     Ok(NetworkProjectionSnapshot {
         generated_at: now_ms(),
         node_id: node.node_id(),
-        display_name: startup.display_name,
         org_id: node.store.org_id().to_owned(),
         network_id: resolve_network_id(&node),
         running,

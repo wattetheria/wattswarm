@@ -14,7 +14,6 @@ fn configured_node_mode_requires_explicit_selection() {
     fs::write(
         state_dir.join("startup_config.json"),
         serde_json::to_vec(&json!({
-            "display_name": "Node Agent",
             "network_mode": "wan",
             "bootstrap_contacts": [],
             "core_agent": {

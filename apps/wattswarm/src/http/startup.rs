@@ -14,7 +14,6 @@ use serde_json::{Value, json};
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct StartupConfigSaveRequest {
-    display_name: String,
     network_mode: crate::startup_config::NetworkMode,
     #[serde(default)]
     bootstrap_contacts: Vec<String>,
@@ -55,7 +54,6 @@ pub(crate) async fn startup_config_save(
         crate::startup_config::NetworkMode::Local => (Vec::new(), Vec::new()),
     };
     let payload = StartupConfig {
-        display_name: req.display_name,
         latitude: existing.latitude,
         longitude: existing.longitude,
         network_mode: req.network_mode,

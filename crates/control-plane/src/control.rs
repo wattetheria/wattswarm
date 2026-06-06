@@ -955,7 +955,6 @@ mod tests {
         fs::write(
             &startup_config_path,
             serde_json::to_vec(&serde_json::json!({
-                "display_name": "Node Agent",
                 "network_mode": "wan",
                 "bootstrap_contacts": [
                     "{\"transport\":\"iroh_direct\",\"peer_id\":\"node-a\",\"metadata\":{\"route\":\"iroh_direct\",\"generated_at\":1,\"endpoint_id\":\"node-a\",\"alpn\":\"/wattswarm/iroh/1\",\"listen_addrs\":[\"13.55.201.222:4001\"],\"capabilities\":{\"supports_iroh_direct\":true,\"supports_streaming\":true,\"max_recommended_inline_bytes\":16384,\"preferred_data_route\":\"iroh_direct\"}},\"extra\":{\"endpoint_id\":\"node-a\",\"alpn\":\"/wattswarm/iroh/1\",\"direct_addrs\":[\"13.55.201.222:4001\"],\"relay_urls\":[]}}"

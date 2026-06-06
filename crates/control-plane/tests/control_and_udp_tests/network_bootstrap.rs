@@ -352,7 +352,6 @@ fn open_node_network_mode_auto_syncs_signed_bundle_from_join_manifest() {
     fs::write(
         state_dir.join("startup_config.json"),
         json!({
-            "display_name": "Existing Node",
             "latitude": 37.0,
             "longitude": -122.0,
             "network_mode": "wan",
@@ -374,10 +373,7 @@ fn open_node_network_mode_auto_syncs_signed_bundle_from_join_manifest() {
     let startup_config: serde_json::Value =
         serde_json::from_slice(&fs::read(state_dir.join("startup_config.json")).unwrap()).unwrap();
     assert_eq!(startup_config["network_mode"].as_str(), Some("wan"));
-    assert_eq!(
-        startup_config["display_name"].as_str(),
-        Some("Existing Node")
-    );
+    assert!(startup_config["display_name"].is_null());
     assert_eq!(startup_config["latitude"].as_f64(), Some(37.0));
     assert_eq!(startup_config["longitude"].as_f64(), Some(-122.0));
     assert_eq!(

@@ -74,8 +74,6 @@ impl Default for CoreAgentConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct StartupConfig {
-    #[serde(default = "default_display_name")]
-    pub display_name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub latitude: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -93,7 +91,6 @@ pub struct StartupConfig {
 impl Default for StartupConfig {
     fn default() -> Self {
         Self {
-            display_name: default_display_name(),
             latitude: None,
             longitude: None,
             network_mode: NetworkMode::default(),
@@ -102,10 +99,6 @@ impl Default for StartupConfig {
             core_agent: CoreAgentConfig::default(),
         }
     }
-}
-
-fn default_display_name() -> String {
-    "Node Agent".to_owned()
 }
 
 fn default_core_agent_provider() -> String {
@@ -118,7 +111,6 @@ fn default_core_agent_base_url() -> String {
 
 impl StartupConfig {
     pub fn normalized(mut self) -> Self {
-        self.display_name = self.display_name.trim().to_owned();
         self.latitude = normalize_latitude(self.latitude);
         self.longitude = normalize_longitude(self.longitude);
         self.bootstrap_contacts = normalize_bootstrap_contacts(&self.bootstrap_contacts);
@@ -136,9 +128,6 @@ impl StartupConfig {
             .to_owned();
         self.core_agent.model = self.core_agent.model.trim().to_owned();
         self.core_agent.api_key = self.core_agent.api_key.trim().to_owned();
-        if self.display_name.is_empty() {
-            self.display_name = default_display_name();
-        }
         if self.core_agent.provider.is_empty() {
             self.core_agent.provider = default_core_agent_provider();
         }
@@ -151,9 +140,6 @@ impl StartupConfig {
     }
 
     pub fn validate(&self) -> Result<()> {
-        if self.display_name.trim().is_empty() {
-            bail!("display_name is required");
-        }
         if let Some(latitude) = self.latitude
             && !(-90.0..=90.0).contains(&latitude)
         {
@@ -320,7 +306,6 @@ mod tests {
     #[test]
     fn validates_url_modes_require_base_url() {
         let config = StartupConfig {
-            display_name: "Node A".to_owned(),
             network_mode: NetworkMode::Lan,
             core_agent: CoreAgentConfig {
                 mode: CoreAgentMode::LocalUrl,
@@ -335,7 +320,6 @@ mod tests {
     #[test]
     fn validates_cloud_mode_requires_provider_model_and_key() {
         let config = StartupConfig {
-            display_name: "Node A".to_owned(),
             network_mode: NetworkMode::Wan,
             core_agent: CoreAgentConfig {
                 mode: CoreAgentMode::CloudApiKey,
@@ -350,7 +334,6 @@ mod tests {
     #[test]
     fn validates_without_public_id_field() {
         let config = StartupConfig {
-            display_name: "Node A".to_owned(),
             network_mode: NetworkMode::Local,
             core_agent: CoreAgentConfig::default(),
             ..StartupConfig::default()
@@ -481,7 +464,6 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = startup_config_path(dir.path());
         let existing = StartupConfig {
-            display_name: "Sydney Node".to_owned(),
             network_mode: NetworkMode::Wan,
             gateway_urls: vec!["https://gateway.example.com".to_owned()],
             latitude: Some(1.0),
@@ -494,7 +476,6 @@ mod tests {
 
         assert!(updated);
         let saved = load_startup_config(&path).unwrap();
-        assert_eq!(saved.display_name, "Sydney Node");
         assert_eq!(saved.network_mode, NetworkMode::Wan);
         assert_eq!(
             saved.gateway_urls,

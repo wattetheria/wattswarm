@@ -62,7 +62,6 @@ fn ui_startup_config_roundtrips_network_settings_without_agent_binding() {
                     .header("content-type", "application/json")
                     .body(Body::from(
                         serde_json::to_vec(&json!({
-                            "display_name": "Captain Aurora",
                             "network_mode": "lan",
                             "bootstrap_contacts": [
                                 lan_contact
@@ -95,10 +94,7 @@ fn ui_startup_config_roundtrips_network_settings_without_agent_binding() {
             .unwrap();
         assert_eq!(get_saved_res.status(), StatusCode::OK);
         let get_saved_json = json_from(get_saved_res).await;
-        assert_eq!(
-            get_saved_json["config"]["display_name"].as_str(),
-            Some("Captain Aurora")
-        );
+        assert!(get_saved_json["config"]["display_name"].is_null());
         assert_eq!(
             get_saved_json["config"]["bootstrap_contacts"][0].as_str(),
             Some(lan_contact)
@@ -121,7 +117,6 @@ fn ui_startup_config_roundtrips_network_settings_without_agent_binding() {
                     .header("content-type", "application/json")
                     .body(Body::from(
                         serde_json::to_vec(&json!({
-                            "display_name": "Captain Aurora",
                             "network_mode": "wan",
                             "bootstrap_contacts": [
                                 "iroh-contact-should-be-automatic"
@@ -160,7 +155,6 @@ fn ui_startup_config_roundtrips_network_settings_without_agent_binding() {
                     .header("content-type", "application/json")
                     .body(Body::from(
                         serde_json::to_vec(&json!({
-                            "display_name": "Captain Aurora",
                             "network_mode": "local",
                             "bootstrap_contacts": [
                                 "iroh-contact-should-be-cleared"
@@ -293,7 +287,6 @@ fn ui_startup_config_save_preserves_managed_geo_coordinates() {
     std::fs::write(
         state_dir.join("startup_config.json"),
         serde_json::to_vec(&json!({
-            "display_name": "Node Agent",
             "network_mode": "wan",
             "latitude": 37.0,
             "longitude": -122.0
@@ -317,7 +310,6 @@ fn ui_startup_config_save_preserves_managed_geo_coordinates() {
                     .header("content-type", "application/json")
                     .body(Body::from(
                         serde_json::to_vec(&json!({
-                            "display_name": "Node Agent",
                             "network_mode": "wan",
                             "latitude": 0.0,
                             "longitude": 0.0
@@ -371,7 +363,6 @@ fn ui_startup_config_save_updates_existing_runtime_node_mode() {
                     .header("content-type", "application/json")
                     .body(Body::from(
                         serde_json::to_vec(&json!({
-                            "display_name": "Captain Aurora",
                             "network_mode": "local",
                             "bootstrap_contacts": []
                         }))
@@ -431,7 +422,6 @@ fn ui_startup_config_still_accepts_legacy_core_agent_binding_payload() {
                     .header("content-type", "application/json")
                     .body(Body::from(
                         serde_json::to_vec(&json!({
-                            "display_name": "Legacy Node",
                             "network_mode": "local",
                             "bootstrap_contacts": [],
                             "core_agent": {

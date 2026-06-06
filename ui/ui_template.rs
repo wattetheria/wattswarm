@@ -3,7 +3,7 @@ pub const INDEX_HTML: &str = r#"<!DOCTYPE html>
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>WattSwarm Network Diagnostics</title>
+  <title>Wattswarm Network Diagnostics</title>
   <style>
     :root {
       --bg: #f4f6f8;
@@ -420,7 +420,7 @@ pub const INDEX_HTML: &str = r#"<!DOCTYPE html>
   <div class="wrap">
     <header class="head">
       <div>
-        <h1>WattSwarm network diagnostics</h1>
+        <h1>Wattswarm network diagnostics</h1>
         <div class="hint">Iroh transport, gossip publish and ingest, subscribed scopes, backfill, callback delivery, and node network state.</div>
       </div>
       <div class="head-actions">
