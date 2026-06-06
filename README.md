@@ -1023,6 +1023,16 @@ The swarm dashboard is not a random toy loop: it drives real WattSwarm task life
 
 ## Build & Test
 
+The default `watt-did` dependency resolves from GitHub so CI can build the workspace without
+neighboring local checkouts. Cargo is configured to fetch git dependencies through the git CLI so
+normal GitHub credentials and CI checkout credentials are respected.
+
+For local cross-repo development with `../watt-did`, pass the local patch config explicitly:
+
+```bash
+cargo --config .cargo/config.local.toml.example check -p wattswarm-control-plane
+```
+
 ```bash
 cargo fmt --all
 cargo clippy --workspace --all-targets -- -D warnings

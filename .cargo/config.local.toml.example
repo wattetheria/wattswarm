@@ -1,0 +1,2 @@
+[patch."https://github.com/wattetheria/watt-did.git"]
+watt-did = { path = "../watt-did" }
