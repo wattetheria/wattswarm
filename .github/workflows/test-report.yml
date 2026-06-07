@@ -40,6 +40,16 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Checkout watt-did
+        uses: actions/checkout@v4
+        with:
+          repository: wattetheria/watt-did
+          path: deps/watt-did
+          token: ${{ secrets.CROSS_REPO_TOKEN }}
+
+      - name: Prepare workspace dependencies
+        run: ln -sfn "$GITHUB_WORKSPACE/deps/watt-did" "$GITHUB_WORKSPACE/../watt-did"
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
@@ -87,6 +97,16 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Checkout watt-did
+        uses: actions/checkout@v4
+        with:
+          repository: wattetheria/watt-did
+          path: deps/watt-did
+          token: ${{ secrets.CROSS_REPO_TOKEN }}
+
+      - name: Prepare workspace dependencies
+        run: ln -sfn "$GITHUB_WORKSPACE/deps/watt-did" "$GITHUB_WORKSPACE/../watt-did"
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
