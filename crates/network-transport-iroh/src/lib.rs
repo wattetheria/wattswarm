@@ -34,6 +34,7 @@ pub const DEFAULT_IROH_CONTROL_ALPN: &str = "/wattswarm/iroh-control/1";
 pub const IROH_CONTROL_KIND_CONTACT_MATERIAL: &str = "contact_material.v1";
 pub const WATTSWARM_IROH_GOSSIP_TOPIC_PREFIX: &str = "wattswarm:iroh-gossip-topic:v1";
 pub const ENV_IROH_RELAY_URLS: &str = "WATTSWARM_IROH_RELAY_URLS";
+pub const ENV_IROH_BIND_ADDR: &str = "WATTSWARM_IROH_BIND_ADDR";
 pub const ENV_IROH_PUBLISH_DIRECT_ADDRS: &str = "WATTSWARM_IROH_PUBLISH_DIRECT_ADDRS";
 pub const ENV_IROH_DATA_PLANE_START_TIMEOUT_MS: &str = "WATTSWARM_IROH_DATA_PLANE_START_TIMEOUT_MS";
 const MAX_FETCH_REQUEST_BYTES: usize = 64 * 1024;
@@ -65,7 +66,7 @@ pub fn blob_hash_for_bytes(bytes: impl AsRef<[u8]>) -> IrohBlobHash {
 fn parse_relay_urls(raw: &str) -> Result<Vec<RelayUrl>> {
     let mut urls = Vec::new();
     for value in raw
-        .split(|ch| matches!(ch, ',' | '\n' | '\r'))
+        .split([',', '\n', '\r'])
         .map(str::trim)
         .filter(|value| !value.is_empty())
     {
@@ -78,16 +79,52 @@ fn parse_relay_urls(raw: &str) -> Result<Vec<RelayUrl>> {
     Ok(urls)
 }
 
-fn parse_bool_env(key: &str, raw: Option<&str>, default: bool) -> Result<bool> {
+fn parse_optional_socket_addr_env(key: &str, raw: Option<&str>) -> Result<Option<SocketAddr>> {
     let Some(raw) = raw else {
-        return Ok(default);
+        return Ok(None);
     };
-    match raw.trim().to_ascii_lowercase().as_str() {
-        "" => Ok(default),
-        "1" | "true" | "yes" | "on" => Ok(true),
-        "0" | "false" | "no" | "off" => Ok(false),
-        value => bail!("{key} must be a boolean value, got {value}"),
+    let value = raw.trim();
+    if value.is_empty() {
+        return Ok(None);
     }
+    value
+        .parse::<SocketAddr>()
+        .map(Some)
+        .with_context(|| format!("{key} must be a socket address, got {value}"))
+}
+
+fn parse_direct_addr_publish_env(raw: Option<&str>) -> Result<Vec<String>> {
+    let Some(raw) = raw else {
+        return Ok(Vec::new());
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty()
+        || matches!(
+            trimmed.to_ascii_lowercase().as_str(),
+            "0" | "false" | "no" | "off" | "1" | "true" | "yes" | "on"
+        )
+    {
+        return Ok(Vec::new());
+    }
+    let mut addrs = Vec::new();
+    for value in trimmed
+        .split([',', '\n', '\r'])
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        let addr = value
+            .parse::<SocketAddr>()
+            .with_context(|| {
+                format!(
+                    "{ENV_IROH_PUBLISH_DIRECT_ADDRS} must be false or a list of socket addresses, got {value}"
+                )
+            })?;
+        let normalized = addr.to_string();
+        if !addrs.contains(&normalized) {
+            addrs.push(normalized);
+        }
+    }
+    Ok(addrs)
 }
 
 fn parse_positive_u64_env(key: &str, raw: Option<&str>, default: u64) -> Result<u64> {
@@ -273,39 +310,35 @@ struct IrohDataPlaneService {
 struct IrohEndpointOptions {
     relay_urls: Vec<RelayUrl>,
     published_relay_urls: Vec<String>,
-    publish_direct_addrs: bool,
+    bind_addr: Option<SocketAddr>,
+    published_direct_addrs: Vec<String>,
 }
 
 impl IrohEndpointOptions {
     fn from_env() -> Result<Self> {
         Self::from_raw_env(
             std::env::var(ENV_IROH_RELAY_URLS).ok().as_deref(),
+            std::env::var(ENV_IROH_BIND_ADDR).ok().as_deref(),
             std::env::var(ENV_IROH_PUBLISH_DIRECT_ADDRS).ok().as_deref(),
         )
     }
 
-    fn from_raw_env(relay_urls: Option<&str>, publish_direct_addrs: Option<&str>) -> Result<Self> {
+    fn from_raw_env(
+        relay_urls: Option<&str>,
+        bind_addr: Option<&str>,
+        publish_direct_addrs: Option<&str>,
+    ) -> Result<Self> {
         let relay_urls = parse_relay_urls(relay_urls.unwrap_or_default())?;
         Ok(Self {
-            published_relay_urls: relay_urls
-                .iter()
-                .map(|url| normalize_public_relay_url(url))
-                .collect(),
+            published_relay_urls: relay_urls.iter().map(normalize_public_relay_url).collect(),
             relay_urls,
-            publish_direct_addrs: parse_bool_env(
-                ENV_IROH_PUBLISH_DIRECT_ADDRS,
-                publish_direct_addrs,
-                true,
-            )?,
+            bind_addr: parse_optional_socket_addr_env(ENV_IROH_BIND_ADDR, bind_addr)?,
+            published_direct_addrs: parse_direct_addr_publish_env(publish_direct_addrs)?,
         })
     }
 
-    fn published_direct_addrs(&self, observed_direct_addrs: Vec<String>) -> Vec<String> {
-        if self.publish_direct_addrs {
-            observed_direct_addrs
-        } else {
-            Vec::new()
-        }
+    fn published_direct_addrs(&self, _observed_direct_addrs: Vec<String>) -> Vec<String> {
+        self.published_direct_addrs.clone()
     }
 
     fn published_relay_urls(&self, observed_relay_urls: Vec<String>) -> Vec<String> {
@@ -631,6 +664,9 @@ impl IrohDataPlaneService {
             .build()?;
         let endpoint_future = || async {
             let mut builder = Endpoint::builder(presets::N0).secret_key(secret_key);
+            if let Some(bind_addr) = endpoint_options.bind_addr {
+                builder = builder.clear_ip_transports().bind_addr(bind_addr)?;
+            }
             if !endpoint_options.relay_urls.is_empty() {
                 builder =
                     builder.relay_mode(RelayMode::custom(endpoint_options.relay_urls.clone()));
@@ -1224,6 +1260,7 @@ mod tests {
     fn iroh_endpoint_options_parse_custom_relay_and_publish_flag() {
         let options = IrohEndpointOptions::from_raw_env(
             Some("https://relay.wattetheria.com/, https://relay.wattetheria.com"),
+            None,
             Some("false"),
         )
         .expect("endpoint options");
@@ -1236,18 +1273,49 @@ mod tests {
             options.published_direct_addrs(vec!["10.0.0.1:1234".to_owned()]),
             Vec::<String>::new()
         );
-        assert!(!options.publish_direct_addrs);
+        assert!(options.published_direct_addrs.is_empty());
     }
 
     #[test]
-    fn iroh_endpoint_options_keep_direct_addrs_by_default() {
-        let options = IrohEndpointOptions::from_raw_env(None, None).expect("endpoint options");
+    fn iroh_endpoint_options_hide_direct_addrs_by_default() {
+        let options =
+            IrohEndpointOptions::from_raw_env(None, None, None).expect("endpoint options");
 
         assert_eq!(
             options.published_direct_addrs(vec!["10.0.0.1:1234".to_owned()]),
-            vec!["10.0.0.1:1234".to_owned()]
+            Vec::<String>::new()
         );
-        assert!(options.publish_direct_addrs);
+        assert!(options.published_direct_addrs.is_empty());
+    }
+
+    #[test]
+    fn iroh_endpoint_options_parse_fixed_bind_addr() {
+        let options = IrohEndpointOptions::from_raw_env(None, Some("0.0.0.0:4002"), Some("true"))
+            .expect("endpoint options");
+
+        assert_eq!(
+            options.bind_addr,
+            Some("0.0.0.0:4002".parse().expect("socket addr"))
+        );
+        assert!(options.published_direct_addrs.is_empty());
+    }
+
+    #[test]
+    fn iroh_endpoint_options_publish_direct_addrs_uses_explicit_addrs() {
+        let options = IrohEndpointOptions::from_raw_env(
+            None,
+            None,
+            Some("203.0.113.10:4002, 203.0.113.10:4002\n192.168.1.20:4002"),
+        )
+        .expect("endpoint options");
+
+        assert_eq!(
+            options.published_direct_addrs(vec!["172.20.0.4:4002".to_owned()]),
+            vec![
+                "203.0.113.10:4002".to_owned(),
+                "192.168.1.20:4002".to_owned()
+            ]
+        );
     }
 
     #[test]

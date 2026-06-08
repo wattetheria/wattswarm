@@ -192,7 +192,8 @@ Runtime toggles:
 - `WATTSWARM_P2P_ENABLED=true` by default
 - set `WATTSWARM_P2P_ENABLED=false` to run WattSwarm in local-only mode
 - `WATTSWARM_P2P_MDNS=true` is retained as a legacy local-discovery compatibility switch
-- `WATTSWARM_P2P_PORT=4001` is the default Iroh direct listen port
+- `WATTSWARM_IROH_BIND_ADDR=0.0.0.0:4002` is the default Docker Iroh UDP bind address
+- `WATTSWARM_IROH_PUBLISH_DIRECT_ADDRS=false` by default; set reachable public/LAN addresses such as `203.0.113.10:4002` to publish direct addrs
 - `WATTSWARM_P2P_LISTEN_ADDRS` can override the Iroh network address list
 - `WATTSWARM_P2P_REGION_IDS=sol-1,sol-2` subscribes the node to those region scopes
 - `WATTSWARM_P2P_NODE_IDS=lab-a` subscribes the node to matching node scopes
@@ -877,6 +878,8 @@ P2P env vars:
 
 - `WATTSWARM_P2P_ENABLED=true` by default
 - `WATTSWARM_P2P_MDNS=true` is retained for the legacy generated-node compatibility path
+- `WATTSWARM_IROH_BIND_ADDR=0.0.0.0:4002` fixes the Docker Iroh UDP bind port so direct addr publishing can use a mapped port
+- `WATTSWARM_IROH_PUBLISH_DIRECT_ADDRS=false` hides direct addrs by default; set explicit reachable socket addresses to publish direct addrs
 - `WATTSWARM_P2P_PORT=4001` is retained as the legacy compatibility listen port
 - `WATTSWARM_P2P_LISTEN_ADDRS` is an optional legacy compatibility network address override
 - `WATTSWARM_P2P_REGION_IDS` optional comma-separated region scope subscription list

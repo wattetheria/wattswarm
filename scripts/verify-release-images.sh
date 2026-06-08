@@ -47,7 +47,9 @@ require_text "$COMPOSE_FILE" "WATTSWARM_STATE_DIR: /var/lib/wattswarm" "compose 
 require_text "$COMPOSE_FILE" "WATTSWARM_STORE_NAME: wattswarm.state" "compose must keep the expected store name"
 require_text "$COMPOSE_FILE" "github_token:" "compose must declare the GitHub token build secret"
 require_text "$COMPOSE_FILE" "environment: GITHUB_TOKEN" "compose must source the build secret from GITHUB_TOKEN"
-require_text "$COMPOSE_FILE" 'WATTSWARM_IROH_PUBLISH_DIRECT_ADDRS: ${WATTSWARM_IROH_PUBLISH_DIRECT_ADDRS:-true}' "compose must default direct Iroh address publishing on"
+require_text "$COMPOSE_FILE" 'WATTSWARM_IROH_BIND_ADDR: ${WATTSWARM_IROH_BIND_ADDR:-0.0.0.0:4002}' "compose must default Iroh to a fixed UDP bind port"
+require_text "$COMPOSE_FILE" 'WATTSWARM_IROH_PUBLISH_DIRECT_ADDRS: ${WATTSWARM_IROH_PUBLISH_DIRECT_ADDRS:-false}' "compose must default direct Iroh address publishing off"
+require_text "$COMPOSE_FILE" '${WATTSWARM_IROH_HOST_PORT:-4002}:${WATTSWARM_IROH_CONTAINER_PORT:-4002}/udp' "compose must expose the fixed Iroh UDP port"
 require_text "$COMPOSE_FILE" 'entrypoint: ["/app/target/release/wattswarm-runtime"]' "runtime service must override the shared image entrypoint"
 require_text "$COMPOSE_FILE" 'entrypoint: ["/app/target/release/wattswarm"]' "worker service must override the shared image entrypoint"
 
