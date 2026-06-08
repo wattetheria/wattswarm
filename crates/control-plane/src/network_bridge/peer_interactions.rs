@@ -593,6 +593,9 @@ pub(super) fn save_inbound_private_dm_topic_message(
     if remote_node_id.is_empty() {
         return Ok(None);
     }
+    if remote_node_id == local_node_id.trim() {
+        return Ok(None);
+    }
     let thread_id = content
         .get("thread_id")
         .and_then(Value::as_str)

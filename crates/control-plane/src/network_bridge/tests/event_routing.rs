@@ -712,6 +712,62 @@ fn inbound_private_dm_topic_is_projected_to_local_dm_store() {
 }
 
 #[test]
+fn inbound_private_dm_topic_skips_local_author_echo() {
+    let state_dir = temp_startup_dir("inbound-private-dm-self-echo");
+    let local = crate::control::load_local_identity(&state_dir).expect("local identity");
+    let local_node_id = local.node_id();
+    let result = save_inbound_private_dm_topic_message(
+        &state_dir,
+        &local_node_id,
+        &local_node_id,
+        "self-echo-event",
+        &json!({
+            "kind": "direct_message",
+            "thread_id": "dm:self-echo",
+            "message_id": "dm-self-echo",
+            "content": "local echo should not be stored"
+        }),
+        123,
+    )
+    .expect("self echo projection is ignored");
+
+    assert!(result.is_none());
+    let threads =
+        crate::control::load_peer_dm_thread_records_state(&state_dir).expect("load dm threads");
+    assert!(threads.is_empty());
+}
+
+#[test]
+fn inbound_private_dm_topic_message_direct_projection_still_saves_remote_author() {
+    let state_dir = temp_startup_dir("inbound-private-dm-direct-projection");
+    let local = crate::control::load_local_identity(&state_dir).expect("local identity");
+    let local_node_id = local.node_id();
+    let remote_node_id = random_network_node_id().to_string();
+    let result = save_inbound_private_dm_topic_message(
+        &state_dir,
+        &local_node_id,
+        &remote_node_id,
+        "remote-dm-event",
+        &json!({
+            "kind": "direct_message",
+            "thread_id": "dm:remote",
+            "message_id": "dm-remote",
+            "content": "remote message should be stored"
+        }),
+        456,
+    )
+    .expect("remote projection is stored")
+    .expect("remote projection result");
+
+    assert_eq!(result.remote_node_id, remote_node_id);
+    assert_eq!(result.message_id, "dm-remote");
+    let messages = crate::control::load_peer_dm_message_records_state(&state_dir, "dm:remote")
+        .expect("load dm messages");
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0].remote_node_id, remote_node_id);
+}
+
+#[test]
 fn payment_update_allowed_actions_follow_message_kind() {
     assert_eq!(
         payment_allowed_actions("payment_request"),
