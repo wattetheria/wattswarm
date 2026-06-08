@@ -513,14 +513,29 @@ fn topic_message_requires_reply_excludes_consensus_kinds() {
 fn private_dm_topic_agent_event_exposes_direct_message_content() {
     let local = NodeIdentity::random();
     let remote = NodeIdentity::random();
-    let membership = membership_with_roles(&[local.node_id(), remote.node_id()]);
+    let local_node_id = local.node_id();
+    let remote_node_id = remote.node_id();
+    let membership = membership_with_roles(&[local_node_id.clone(), remote_node_id.clone()]);
     let mut node =
         Node::new(local, PgStore::open_in_memory().expect("store"), membership).expect("node");
     let dm_content = json!({
         "kind": "direct_message",
         "thread_id": "dm-thread",
         "message_id": "dm-message",
-        "content": "hello private dm"
+        "content": "hello private dm",
+        "agent_envelope": {
+            "protocol": "google_a2a",
+            "source_agent_id": "did:key:remote",
+            "target_agent_id": "did:key:local",
+            "source_node_id": remote_node_id,
+            "target_node_id": local_node_id,
+            "capability": "social.dm.send",
+            "message": {
+                "content": "hello private dm",
+                "message_id": "dm-message"
+            },
+            "signature": "sig"
+        }
     });
     let remote_event = build_event_for_external(
         &remote,
@@ -559,6 +574,25 @@ fn private_dm_topic_agent_event_exposes_direct_message_content() {
     assert_eq!(
         agent_event.payload["topic_content"]["message_id"].as_str(),
         Some("dm-message")
+    );
+    let agent_envelope = agent_event
+        .agent_envelope
+        .as_ref()
+        .expect("embedded dm envelope is promoted to agent event");
+    assert_eq!(agent_envelope.capability.as_deref(), Some("social.dm.send"));
+    assert_eq!(
+        agent_envelope.source_node_id.as_deref(),
+        Some(remote_node_id.as_str())
+    );
+    assert_eq!(
+        agent_envelope.target_node_id.as_deref(),
+        Some(local_node_id.as_str())
+    );
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&agent_envelope.message_json)
+            .expect("agent envelope message json parses")["content"]
+            .as_str(),
+        Some("hello private dm")
     );
 }
 

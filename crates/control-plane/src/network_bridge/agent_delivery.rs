@@ -422,6 +422,27 @@ fn topic_message_agent_content(feed_key: &str, content: &Value) -> Value {
     content.clone()
 }
 
+fn embedded_topic_agent_envelope(
+    content: &Value,
+) -> Result<Option<wattswarm_protocol::types::AgentEnvelope>> {
+    let Some(envelope) = content.get("agent_envelope") else {
+        return Ok(None);
+    };
+    serde_json::from_value(envelope.clone())
+        .map(Some)
+        .context("decode embedded topic agent_envelope")
+}
+
+fn topic_message_agent_envelope(
+    payload: &crate::types::TopicMessagePostedPayload,
+    content: &Value,
+) -> Result<Option<wattswarm_protocol::types::AgentEnvelope>> {
+    if payload.agent_envelope.is_some() {
+        return Ok(payload.agent_envelope.clone());
+    }
+    embedded_topic_agent_envelope(content)
+}
+
 fn verified_context_for_event_envelope(
     envelope: Option<&wattswarm_protocol::types::AgentEnvelope>,
     author_node_id: &str,
@@ -642,12 +663,13 @@ pub(super) fn topic_message_agent_event(
     if !topic_message_requires_reply(&topic_message.content) {
         return Ok(None);
     }
+    let agent_envelope = topic_message_agent_envelope(payload, &topic_message.content)?;
     Ok(Some(build_agent_event_with_agent_envelope(
         wattswarm_protocol::types::AgentEventType::TopicMessageRequiresReply,
         wattswarm_protocol::types::AgentEventSourceKind::TopicMessage,
         Some(event.author_node_id.clone()),
         None,
-        payload.agent_envelope.clone(),
+        agent_envelope,
         json!({
             "message_id": &event.event_id,
             "network_id": &payload.network_id,
