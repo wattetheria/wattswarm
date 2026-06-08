@@ -723,6 +723,32 @@ pub(super) fn save_agent_payment_summary(
     Ok(record)
 }
 
+pub(super) fn save_agent_payment_event(
+    state_dir: &Path,
+    remote_node_id: &str,
+    event_id: &str,
+    payload: &crate::types::AgentPaymentPostedPayload,
+) -> Result<crate::control::AgentPaymentRecord> {
+    let payment_id = payload
+        .payment
+        .get("payment_id")
+        .and_then(Value::as_str)
+        .unwrap_or("payment");
+    let summary = SummaryAnnouncement {
+        summary_id: format!("payment:{payment_id}:{event_id}"),
+        source_node_id: remote_node_id.to_owned(),
+        scope: SwarmScope::Node(payload.remote_node_id.clone()),
+        summary_kind: AGENT_PAYMENT_SUMMARY_KIND.to_owned(),
+        artifact_path: None,
+        payload: json!({
+            "message_kind": payload.message_kind,
+            "payment": payload.payment,
+            "agent_envelope": payload.agent_envelope,
+        }),
+    };
+    save_agent_payment_summary(state_dir, remote_node_id, &summary)
+}
+
 pub(super) fn verify_protocol_agent_envelope_for_source(
     envelope: &wattswarm_protocol::types::AgentEnvelope,
     expected_source_node_id: Option<&str>,
@@ -824,6 +850,7 @@ pub(super) fn payment_allowed_actions(message_kind: &str) -> Vec<String> {
 }
 
 pub(super) fn process_pending_network_commands(
+    node: &mut Node,
     service: &mut NetworkBridgeService,
     state_dir: &Path,
 ) -> Result<u64> {
@@ -876,6 +903,20 @@ pub(super) fn process_pending_network_commands(
                 agent_envelope,
                 ..
             } => {
+                let protocol_envelope = raw_agent_envelope_to_protocol(&agent_envelope);
+                node.emit_at(
+                    0,
+                    crate::types::EventPayload::AgentPaymentPosted(
+                        crate::types::AgentPaymentPostedPayload {
+                            network_id: current_network_context_id(node),
+                            remote_node_id: remote_node_id.clone(),
+                            message_kind: message_kind.clone(),
+                            payment: payment.clone(),
+                            agent_envelope: protocol_envelope,
+                        },
+                    ),
+                    observed_at_ms(),
+                )?;
                 let mut summary = build_agent_payment_summary(
                     &remote_node_id,
                     &message_kind,
@@ -883,7 +924,8 @@ pub(super) fn process_pending_network_commands(
                     agent_envelope,
                 );
                 summary.source_node_id = service.local_peer_id().to_string();
-                service.publish_summary(summary).map(|_| ())
+                let _ = service.publish_summary(summary);
+                Ok(())
             }
         };
         match result {

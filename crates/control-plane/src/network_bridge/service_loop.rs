@@ -533,7 +533,7 @@ fn run_background_network_service_with_hook(
             }
         }
         let processed_pending_commands =
-            match process_pending_network_commands(&mut service, state_dir) {
+            match process_pending_network_commands(&mut node, &mut service, state_dir) {
                 Ok(count) => count,
                 Err(err) => {
                     eprintln!("network bridge pending command processing failed: {err}");

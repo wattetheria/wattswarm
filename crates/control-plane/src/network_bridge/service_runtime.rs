@@ -73,6 +73,47 @@ impl NetworkBridgeService {
         }
     }
 
+    fn deliver_topic_message_agent_event(
+        &self,
+        node: &Node,
+        event: &crate::types::Event,
+        payload: &crate::types::TopicMessagePostedPayload,
+    ) {
+        if event.author_node_id == node.node_id() {
+            return;
+        }
+        let Some(state_dir) = &self.state_dir else {
+            return;
+        };
+        if let Ok(Some(agent_event)) = topic_message_agent_event(node, event, payload) {
+            let _ = deliver_agent_event_to_local_executor(
+                state_dir,
+                self.db_path.as_deref(),
+                &agent_event,
+            );
+        }
+    }
+
+    fn save_agent_payment_event_if_applicable(&self, node: &Node, event: &crate::types::Event) {
+        if event.author_node_id == node.node_id() {
+            return;
+        }
+        let crate::types::EventPayload::AgentPaymentPosted(payload) = &event.payload else {
+            return;
+        };
+        let Some(state_dir) = &self.state_dir else {
+            return;
+        };
+        if let Err(err) =
+            save_agent_payment_event(state_dir, &event.author_node_id, &event.event_id, payload)
+        {
+            eprintln!(
+                "agent payment event projection failed for {}: {err}",
+                event.event_id
+            );
+        }
+    }
+
     pub(crate) fn process_runtime_event(
         &mut self,
         node: &mut Node,
@@ -441,6 +482,7 @@ impl NetworkBridgeService {
                             log_run_queue_events_if_applicable(node, state_dir, &ingested_event);
                         }
                         self.deliver_task_lifecycle_agent_event(node, &ingested_event);
+                        self.save_agent_payment_event_if_applicable(node, &ingested_event);
                         self.record_scope_event_ingested(&envelope.scope);
                         Ok(NetworkBridgeTick::EventIngested {
                             peer: propagation_source,
@@ -503,16 +545,7 @@ impl NetworkBridgeService {
                                 &ingested_event,
                                 payload,
                             );
-                            if let Some(state_dir) = &self.state_dir
-                                && let Ok(Some(event)) =
-                                    topic_message_agent_event(node, &ingested_event, payload)
-                            {
-                                let _ = deliver_agent_event_to_local_executor(
-                                    state_dir,
-                                    self.db_path.as_deref(),
-                                    &event,
-                                );
-                            }
+                            self.deliver_topic_message_agent_event(node, &ingested_event, payload);
                         }
                         self.record_scope_event_ingested(&envelope.scope);
                         Ok(NetworkBridgeTick::EventIngested {
@@ -720,6 +753,7 @@ impl NetworkBridgeService {
                         );
                     }
                     self.deliver_task_lifecycle_agent_event(node, &envelope.event);
+                    self.save_agent_payment_event_if_applicable(node, &envelope.event);
                     if let Err(err) = self.maybe_sync_topic_message_content(
                         node,
                         &envelope.event,
@@ -738,6 +772,7 @@ impl NetworkBridgeService {
                             &envelope.event,
                             payload,
                         );
+                        self.deliver_topic_message_agent_event(node, &envelope.event, payload);
                     }
                 }
                 maybe_record_topic_cursor_for_response(

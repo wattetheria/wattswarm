@@ -1,5 +1,5 @@
 use wattswarm_protocol::types::{
-    AgentEnvelope, ArtifactRef, BudgetMode, CheckpointCreatedPayload,
+    AgentEnvelope, AgentPaymentPostedPayload, ArtifactRef, BudgetMode, CheckpointCreatedPayload,
     DEFAULT_CONTROL_BACKFILL_RETRY_SECS, DEFAULT_CONTROL_MAX_DRIFT_BEFORE_SNAPSHOT,
     DEFAULT_CONTROL_RANGE_LIMIT, DEFAULT_CONTROL_STATUS_INTERVAL_SECS, EventKind, EventPayload,
     EventRevokedPayload, ExecutionIntentDeclaredPayload, ExecutionSetConfirmedPayload,
@@ -118,6 +118,16 @@ fn event_payload_kind_and_task_id_cover_task_and_non_task_variants() {
     });
     assert_eq!(topic_message_payload.kind(), EventKind::TopicMessagePosted);
     assert_eq!(topic_message_payload.task_id(), None);
+
+    let payment_payload = EventPayload::AgentPaymentPosted(AgentPaymentPostedPayload {
+        network_id: "default".to_owned(),
+        remote_node_id: "node-payment-target".to_owned(),
+        message_kind: "payment_request".to_owned(),
+        payment: serde_json::json!({"payment_id":"payment-1"}),
+        agent_envelope: AgentEnvelope::default(),
+    });
+    assert_eq!(payment_payload.kind(), EventKind::AgentPaymentPosted);
+    assert_eq!(payment_payload.task_id(), None);
 }
 
 #[test]

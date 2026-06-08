@@ -415,6 +415,7 @@ impl Node {
                     event.created_at,
                 )?;
             }
+            EventPayload::AgentPaymentPosted(_) => {}
             EventPayload::MembershipUpdated(payload) => {
                 self.store
                     .put_membership(&serde_json::to_string(&payload.new_membership)?)?;

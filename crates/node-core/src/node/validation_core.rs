@@ -143,6 +143,9 @@ impl Node {
             EventPayload::TopicMessagePosted(payload) => {
                 self.validate_topic_message_posted(payload)
             }
+            EventPayload::AgentPaymentPosted(payload) => {
+                self.validate_agent_payment_posted(event, payload)
+            }
             EventPayload::MembershipUpdated(payload) => {
                 self.validate_membership_update(event, payload)
             }
@@ -196,6 +199,7 @@ impl Node {
             EventPayload::ExecutionIntentDeclared(p) => (None, Some(&p.participant_node_id)),
             EventPayload::ExecutionSetConfirmed(p) => (None, Some(&p.confirmed_by_node_id)),
             EventPayload::TopicMessagePosted(_) => (None, None),
+            EventPayload::AgentPaymentPosted(_) => (None, None),
             EventPayload::MembershipUpdated(_) => (Some(Role::Finalizer), None),
             EventPayload::PolicyTuned(_) => (Some(Role::Finalizer), None),
             EventPayload::AdvisoryCreated(_) => (Some(Role::Committer), None),
@@ -426,6 +430,42 @@ impl Node {
             payload.scope().as_ref(),
             "topic message network_id mismatch",
             "topic message scope_hint invalid",
+        )
+    }
+
+    fn validate_agent_payment_posted(
+        &self,
+        event: &Event,
+        payload: &crate::types::AgentPaymentPostedPayload,
+    ) -> Result<()> {
+        if payload.network_id.trim().is_empty()
+            || payload.remote_node_id.trim().is_empty()
+            || payload.message_kind.trim().is_empty()
+        {
+            return Err(SwarmError::InvalidEvent("agent payment fields required".into()).into());
+        }
+        if payload
+            .payment
+            .get("payment_id")
+            .and_then(serde_json::Value::as_str)
+            .is_none_or(|payment_id| payment_id.trim().is_empty())
+        {
+            return Err(
+                SwarmError::InvalidEvent("agent payment payment_id required".into()).into(),
+            );
+        }
+        if let Some(source_node_id) = payload.agent_envelope.source_node_id.as_deref()
+            && source_node_id != event.author_node_id
+        {
+            return Err(
+                SwarmError::InvalidEvent("agent payment envelope source mismatch".into()).into(),
+            );
+        }
+        self.validate_network_substrate_scope(
+            &payload.network_id,
+            Some(&payload.scope()),
+            "agent payment network_id mismatch",
+            "agent payment scope invalid",
         )
     }
 

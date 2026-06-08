@@ -991,6 +991,22 @@ impl TopicMessagePostedPayload {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AgentPaymentPostedPayload {
+    #[serde(default = "default_network_context_id")]
+    pub network_id: String,
+    pub remote_node_id: String,
+    pub message_kind: String,
+    pub payment: Value,
+    pub agent_envelope: AgentEnvelope,
+}
+
+impl AgentPaymentPostedPayload {
+    pub fn scope(&self) -> ScopeHint {
+        ScopeHint::Node(self.remote_node_id.clone())
+    }
+}
+
 impl Serialize for TopicMessagePostedPayload {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
@@ -1252,6 +1268,7 @@ pub enum EventPayload {
     ExecutionIntentDeclared(ExecutionIntentDeclaredPayload),
     ExecutionSetConfirmed(ExecutionSetConfirmedPayload),
     TopicMessagePosted(TopicMessagePostedPayload),
+    AgentPaymentPosted(AgentPaymentPostedPayload),
     MembershipUpdated(MembershipUpdatedPayload),
     PolicyTuned(PolicyTunedPayload),
     AdvisoryCreated(AdvisoryCreatedPayload),
@@ -1292,6 +1309,7 @@ pub enum EventKind {
     ExecutionIntentDeclared,
     ExecutionSetConfirmed,
     TopicMessagePosted,
+    AgentPaymentPosted,
     MembershipUpdated,
     PolicyTuned,
     AdvisoryCreated,
@@ -1343,6 +1361,7 @@ impl EventPayload {
             Self::ExecutionIntentDeclared(_) => EventKind::ExecutionIntentDeclared,
             Self::ExecutionSetConfirmed(_) => EventKind::ExecutionSetConfirmed,
             Self::TopicMessagePosted(_) => EventKind::TopicMessagePosted,
+            Self::AgentPaymentPosted(_) => EventKind::AgentPaymentPosted,
             Self::MembershipUpdated(_) => EventKind::MembershipUpdated,
             Self::PolicyTuned(_) => EventKind::PolicyTuned,
             Self::AdvisoryCreated(_) => EventKind::AdvisoryCreated,
@@ -1383,6 +1402,7 @@ impl EventPayload {
             Self::ExecutionIntentDeclared(p) => Some(&p.task_id),
             Self::ExecutionSetConfirmed(p) => Some(&p.task_id),
             Self::TopicMessagePosted(_) => None,
+            Self::AgentPaymentPosted(_) => None,
             Self::MembershipUpdated(_) => None,
             Self::PolicyTuned(_) => None,
             Self::AdvisoryCreated(_) => None,
@@ -1405,7 +1425,9 @@ impl EventPayload {
             Self::ExecutionIntentDeclared(_) | Self::ExecutionSetConfirmed(_) => {
                 TaskDisseminationLayer::ExecutionCoordination
             }
-            Self::TopicMessagePosted(_) => TaskDisseminationLayer::Process,
+            Self::TopicMessagePosted(_) | Self::AgentPaymentPosted(_) => {
+                TaskDisseminationLayer::Process
+            }
             Self::TaskClaimed(_)
             | Self::TaskClaimRenewed(_)
             | Self::TaskClaimReleased(_)

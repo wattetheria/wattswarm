@@ -107,9 +107,10 @@ use peer_interactions::{
     attach_agent_envelope_to_relationship, control_peer_relationship_action,
     optional_verified_agent_context_for_protocol_source, payload_with_verified_agent_context,
     peer_dm_thread_id, process_pending_network_commands, raw_agent_envelope_to_protocol,
-    save_agent_payment_summary, save_dm_message, save_inbound_private_dm_topic_message,
-    upsert_dm_thread, verify_agent_envelope_signature_for_source,
-    verify_protocol_agent_envelope_for_source, wire_peer_relationship_action,
+    save_agent_payment_event, save_agent_payment_summary, save_dm_message,
+    save_inbound_private_dm_topic_message, upsert_dm_thread,
+    verify_agent_envelope_signature_for_source, verify_protocol_agent_envelope_for_source,
+    wire_peer_relationship_action,
 };
 use publish::GlobalPublishRateGuard;
 use scope::{
@@ -179,6 +180,7 @@ fn network_id_for_network_substrate_event(event: &crate::types::Event) -> Option
         crate::types::EventPayload::ExecutionIntentDeclared(payload) => Some(&payload.network_id),
         crate::types::EventPayload::ExecutionSetConfirmed(payload) => Some(&payload.network_id),
         crate::types::EventPayload::TopicMessagePosted(payload) => Some(&payload.network_id),
+        crate::types::EventPayload::AgentPaymentPosted(payload) => Some(&payload.network_id),
         _ => None,
     }
 }
@@ -251,6 +253,9 @@ fn event_payload_agent_envelope(payload: &crate::types::EventPayload) -> Option<
                     .as_ref()
                     .and_then(|content| content.get("agent_envelope").cloned())
             }),
+        crate::types::EventPayload::AgentPaymentPosted(payload) => {
+            Some(json!(payload.agent_envelope))
+        }
         _ => None,
     }
 }

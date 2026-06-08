@@ -712,6 +712,272 @@ fn inbound_private_dm_topic_is_projected_to_local_dm_store() {
 }
 
 #[test]
+fn backfill_private_dm_topic_delivers_local_agent_event() {
+    let _env_lock = lock_env_test_mutex();
+    let _relay_urls = EnvVarGuard::set(
+        wattswarm_network_transport_iroh::ENV_IROH_RELAY_URLS,
+        Some("https://relay.wattetheria.com"),
+    );
+    let state_dir = temp_startup_dir("backfill-private-dm-agent-event");
+    let db_path = state_dir.join("ui.state");
+    let local = crate::control::load_local_identity(&state_dir).expect("local identity");
+    let remote = NodeIdentity::random();
+    let membership = membership_with_roles(&[local.node_id(), remote.node_id()]);
+    let mut node = Node::new(
+        local.clone(),
+        PgStore::open(&db_path).expect("store"),
+        membership,
+    )
+    .expect("node");
+    let thread_id = crate::control::private_dm_thread_id(&local.node_id(), &remote.node_id());
+    let message_id = "dm-message-backfill-1";
+    let message_text = "hello from remote backfill";
+    let dm_content = json!({
+        "kind": "direct_message",
+        "thread_id": thread_id,
+        "message_id": message_id,
+        "content": {
+            "type": "text",
+            "text": message_text
+        },
+        "agent_envelope": {
+            "protocol": "google_a2a",
+            "source_agent_id": "did:key:remote",
+            "target_agent_id": "did:key:local",
+            "source_node_id": remote.node_id(),
+            "target_node_id": local.node_id(),
+            "capability": "social.dm.send",
+            "message": {
+                "content": {
+                    "type": "text",
+                    "text": message_text
+                },
+                "message_id": message_id
+            },
+            "signature": "sig"
+        }
+    });
+    let remote_event = build_event_for_external(
+        &remote,
+        1,
+        10,
+        crate::types::EventPayload::TopicMessagePosted(crate::types::TopicMessagePostedPayload {
+            network_id: "default".to_owned(),
+            feed_key: crate::control::PRIVATE_DM_FEED_KEY.to_owned(),
+            scope_hint: crate::control::private_dm_scope_hint(&local.node_id(), &remote.node_id()),
+            content_ref: sample_topic_content_ref("sha256:dm-message-backfill", &remote.node_id()),
+            local_content_cache: Some(dm_content),
+            reply_to_message_id: None,
+            agent_envelope: None,
+        }),
+    )
+    .expect("signed event");
+    let scope = SwarmScope::Group(crate::control::private_dm_group_id(
+        &local.node_id(),
+        &remote.node_id(),
+    ));
+    let mut service = NetworkBridgeService::new(
+        NetworkP2pNode::generate(NetworkP2pConfig::default()).expect("p2p node"),
+        &[SwarmScope::Global, scope.clone()],
+        &NetworkProtocolParams::default(),
+    )
+    .expect("service");
+    service.set_state_dir(state_dir.clone(), db_path.clone());
+    let request_id = BackfillRequestId::new(77);
+
+    let tick = service
+        .process_runtime_event(
+            &mut node,
+            NetworkRuntimeEvent::BackfillResponse {
+                peer: random_network_node_id(),
+                request_id,
+                response: crate::network_p2p::BackfillResponse {
+                    scope: scope.clone(),
+                    next_from_event_seq: 1,
+                    feed_key: Some(crate::control::PRIVATE_DM_FEED_KEY.to_owned()),
+                    head_event_ids: vec![remote_event.event_id.clone()],
+                    events: vec![EventEnvelope {
+                        scope,
+                        event: remote_event.clone(),
+                        content_source_node_id: None,
+                    }],
+                },
+            },
+        )
+        .expect("process backfill response");
+
+    assert!(matches!(
+        tick,
+        NetworkBridgeTick::BackfillApplied {
+            request_id: applied_request,
+            events: 1,
+            ..
+        } if applied_request == request_id
+    ));
+    let threads =
+        crate::control::load_peer_dm_thread_records_state(&state_dir).expect("load dm threads");
+    let thread = threads
+        .iter()
+        .find(|record| record.remote_node_id == remote.node_id())
+        .expect("backfilled dm thread projected");
+    let messages =
+        crate::control::load_peer_dm_message_records_state(&state_dir, &thread.thread_id)
+            .expect("load dm messages");
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0].message_id, message_id);
+    assert_eq!(messages[0].content["text"].as_str(), Some(message_text));
+
+    let records =
+        crate::control::load_agent_event_records_state(&state_dir).expect("agent event records");
+    assert_eq!(records.len(), 1);
+    assert_eq!(
+        records[0].event_type,
+        wattswarm_protocol::types::AgentEventType::TopicMessageRequiresReply
+    );
+    assert_eq!(
+        records[0].target_executor.as_deref(),
+        Some(CORE_AGENT_EXECUTOR_NAME)
+    );
+    assert_eq!(
+        records[0].payload["feed_key"].as_str(),
+        Some(crate::control::PRIVATE_DM_FEED_KEY)
+    );
+    assert_eq!(
+        records[0].payload["topic_content"]["kind"].as_str(),
+        Some("direct_message")
+    );
+    assert_eq!(
+        records[0].payload["topic_content"]["message_id"].as_str(),
+        Some(message_id)
+    );
+    assert_eq!(
+        records[0].payload["content"]["text"].as_str(),
+        Some(message_text)
+    );
+    assert_eq!(
+        records[0]
+            .agent_envelope
+            .as_ref()
+            .and_then(|envelope| envelope.capability.as_deref()),
+        Some("social.dm.send")
+    );
+}
+
+#[test]
+fn backfill_self_authored_private_dm_topic_skips_agent_event() {
+    let _env_lock = lock_env_test_mutex();
+    let _relay_urls = EnvVarGuard::set(
+        wattswarm_network_transport_iroh::ENV_IROH_RELAY_URLS,
+        Some("https://relay.wattetheria.com"),
+    );
+    let state_dir = temp_startup_dir("backfill-self-dm-agent-event");
+    let db_path = state_dir.join("ui.state");
+    let local = crate::control::load_local_identity(&state_dir).expect("local identity");
+    let remote = NodeIdentity::random();
+    let membership = membership_with_roles(&[local.node_id(), remote.node_id()]);
+    let mut node = Node::new(
+        local.clone(),
+        PgStore::open(&db_path).expect("store"),
+        membership,
+    )
+    .expect("node");
+    let thread_id = crate::control::private_dm_thread_id(&local.node_id(), &remote.node_id());
+    let message_id = "dm-message-self-backfill-1";
+    let message_text = "local outbound message should not trigger reply";
+    let dm_content = json!({
+        "kind": "direct_message",
+        "thread_id": thread_id,
+        "message_id": message_id,
+        "content": {
+            "type": "text",
+            "text": message_text
+        },
+        "agent_envelope": {
+            "protocol": "google_a2a",
+            "source_agent_id": "did:key:local",
+            "target_agent_id": "did:key:remote",
+            "source_node_id": local.node_id(),
+            "target_node_id": remote.node_id(),
+            "capability": "social.dm.send",
+            "message": {
+                "content": {
+                    "type": "text",
+                    "text": message_text
+                },
+                "message_id": message_id
+            },
+            "signature": "sig"
+        }
+    });
+    let local_event = build_event_for_external(
+        &local,
+        1,
+        10,
+        crate::types::EventPayload::TopicMessagePosted(crate::types::TopicMessagePostedPayload {
+            network_id: "default".to_owned(),
+            feed_key: crate::control::PRIVATE_DM_FEED_KEY.to_owned(),
+            scope_hint: crate::control::private_dm_scope_hint(&local.node_id(), &remote.node_id()),
+            content_ref: sample_topic_content_ref(
+                "sha256:dm-message-self-backfill",
+                &local.node_id(),
+            ),
+            local_content_cache: Some(dm_content),
+            reply_to_message_id: None,
+            agent_envelope: None,
+        }),
+    )
+    .expect("signed event");
+    let scope = SwarmScope::Group(crate::control::private_dm_group_id(
+        &local.node_id(),
+        &remote.node_id(),
+    ));
+    let mut service = NetworkBridgeService::new(
+        NetworkP2pNode::generate(NetworkP2pConfig::default()).expect("p2p node"),
+        &[SwarmScope::Global, scope.clone()],
+        &NetworkProtocolParams::default(),
+    )
+    .expect("service");
+    service.set_state_dir(state_dir.clone(), db_path);
+    let request_id = BackfillRequestId::new(78);
+
+    let tick = service
+        .process_runtime_event(
+            &mut node,
+            NetworkRuntimeEvent::BackfillResponse {
+                peer: random_network_node_id(),
+                request_id,
+                response: crate::network_p2p::BackfillResponse {
+                    scope: scope.clone(),
+                    next_from_event_seq: 1,
+                    feed_key: Some(crate::control::PRIVATE_DM_FEED_KEY.to_owned()),
+                    head_event_ids: vec![local_event.event_id.clone()],
+                    events: vec![EventEnvelope {
+                        scope,
+                        event: local_event,
+                        content_source_node_id: None,
+                    }],
+                },
+            },
+        )
+        .expect("process backfill response");
+
+    assert!(matches!(
+        tick,
+        NetworkBridgeTick::BackfillApplied {
+            request_id: applied_request,
+            events: 1,
+            ..
+        } if applied_request == request_id
+    ));
+    let threads =
+        crate::control::load_peer_dm_thread_records_state(&state_dir).expect("load dm threads");
+    assert!(threads.is_empty());
+    let records =
+        crate::control::load_agent_event_records_state(&state_dir).expect("agent event records");
+    assert!(records.is_empty());
+}
+
+#[test]
 fn inbound_private_dm_topic_skips_local_author_echo() {
     let state_dir = temp_startup_dir("inbound-private-dm-self-echo");
     let local = crate::control::load_local_identity(&state_dir).expect("local identity");
@@ -788,6 +1054,356 @@ fn payment_update_allowed_actions_follow_message_kind() {
     assert!(payment_allowed_actions("payment_settled").is_empty());
     assert!(payment_allowed_actions("payment_rejected").is_empty());
     assert!(payment_allowed_actions("payment_cancelled").is_empty());
+}
+
+fn test_payment_envelope(
+    source_node_id: &str,
+    target_node_id: &str,
+) -> wattswarm_protocol::types::AgentEnvelope {
+    wattswarm_protocol::types::AgentEnvelope {
+        protocol: "google_a2a".to_owned(),
+        source_agent_id: Some("did:key:remote-payment-agent".to_owned()),
+        target_agent_id: Some("did:key:local-payment-agent".to_owned()),
+        source_node_id: Some(source_node_id.to_owned()),
+        target_node_id: Some(target_node_id.to_owned()),
+        capability: Some("agent.payment".to_owned()),
+        message_json: json!({
+            "payment_id": "payment-backfill-1",
+            "message_kind": "payment_request"
+        })
+        .to_string(),
+        extensions_json: None,
+        signature: None,
+        ..wattswarm_protocol::types::AgentEnvelope::default()
+    }
+}
+
+fn test_payment_payload(
+    local_node_id: &str,
+    remote_node_id: &str,
+) -> crate::types::AgentPaymentPostedPayload {
+    crate::types::AgentPaymentPostedPayload {
+        network_id: "default".to_owned(),
+        remote_node_id: local_node_id.to_owned(),
+        message_kind: "payment_request".to_owned(),
+        payment: json!({
+            "payment_id": "payment-backfill-1",
+            "amount": "12.50",
+            "currency": "USDC"
+        }),
+        agent_envelope: test_payment_envelope(remote_node_id, local_node_id),
+    }
+}
+
+fn test_raw_payment_envelope(source_node_id: &str, target_node_id: &str) -> RawAgentEnvelope {
+    RawAgentEnvelope {
+        protocol: "google_a2a".to_owned(),
+        transport_profile: Some("wattswarm_mesh".to_owned()),
+        source_agent_id: Some("did:key:local-payment-agent".to_owned()),
+        target_agent_id: Some("did:key:remote-payment-agent".to_owned()),
+        source_node_id: Some(source_node_id.to_owned()),
+        target_node_id: Some(target_node_id.to_owned()),
+        capability: Some("agent.payment".to_owned()),
+        source_agent_card: None,
+        message_json: json!({
+            "payment_id": "payment-outbound-1",
+            "message_kind": "payment_request"
+        })
+        .to_string(),
+        extensions_json: None,
+        signature: None,
+    }
+}
+
+#[test]
+fn pending_agent_payment_command_records_reliable_event() {
+    let _env_lock = lock_env_test_mutex();
+    let _relay_urls = EnvVarGuard::set(
+        wattswarm_network_transport_iroh::ENV_IROH_RELAY_URLS,
+        Some("https://relay.wattetheria.com"),
+    );
+    let state_dir = temp_startup_dir("pending-payment-event");
+    let db_path = state_dir.join("ui.state");
+    let local = crate::control::load_local_identity(&state_dir).expect("local identity");
+    let remote = NodeIdentity::random();
+    let membership = membership_with_roles(&[local.node_id(), remote.node_id()]);
+    let mut node = Node::new(
+        local.clone(),
+        PgStore::open(&db_path).expect("store"),
+        membership,
+    )
+    .expect("node");
+    let mut service = NetworkBridgeService::new(
+        NetworkP2pNode::generate(NetworkP2pConfig::default()).expect("p2p node"),
+        &[SwarmScope::Global, SwarmScope::Node(remote.node_id())],
+        &NetworkProtocolParams::default(),
+    )
+    .expect("service");
+    service.set_state_dir(state_dir.clone(), db_path);
+    super::super::peer_interactions::enqueue_agent_payment_command(
+        &state_dir,
+        &remote.node_id(),
+        "payment_request",
+        json!({
+            "payment_id": "payment-outbound-1",
+            "amount": "12.50",
+            "currency": "USDC"
+        }),
+        test_raw_payment_envelope(&local.node_id(), &remote.node_id()),
+    )
+    .expect("enqueue payment command");
+
+    let processed = super::super::peer_interactions::process_pending_network_commands(
+        &mut node,
+        &mut service,
+        &state_dir,
+    )
+    .expect("process pending payment command");
+
+    assert_eq!(processed, 1);
+    let rows = node.store.load_events_page(0, 10).expect("load events");
+    let payment_events = rows
+        .iter()
+        .filter_map(|(_, event)| match &event.payload {
+            crate::types::EventPayload::AgentPaymentPosted(payload) => Some(payload),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(payment_events.len(), 1);
+    assert_eq!(payment_events[0].remote_node_id, remote.node_id());
+    assert_eq!(payment_events[0].message_kind, "payment_request");
+    assert_eq!(
+        payment_events[0].payment["payment_id"].as_str(),
+        Some("payment-outbound-1")
+    );
+}
+
+#[test]
+fn live_agent_payment_event_delivers_local_agent_event() {
+    let _env_lock = lock_env_test_mutex();
+    let _relay_urls = EnvVarGuard::set(
+        wattswarm_network_transport_iroh::ENV_IROH_RELAY_URLS,
+        Some("https://relay.wattetheria.com"),
+    );
+    let state_dir = temp_startup_dir("live-payment-agent-event");
+    let db_path = state_dir.join("ui.state");
+    let local = crate::control::load_local_identity(&state_dir).expect("local identity");
+    let remote = NodeIdentity::random();
+    let membership = membership_with_roles(&[local.node_id(), remote.node_id()]);
+    let mut node = Node::new(
+        local.clone(),
+        PgStore::open(&db_path).expect("store"),
+        membership,
+    )
+    .expect("node");
+    let payment_event = build_event_for_external(
+        &remote,
+        1,
+        10,
+        crate::types::EventPayload::AgentPaymentPosted(test_payment_payload(
+            &local.node_id(),
+            &remote.node_id(),
+        )),
+    )
+    .expect("payment event");
+    let scope = SwarmScope::Node(local.node_id());
+    let mut service = NetworkBridgeService::new(
+        NetworkP2pNode::generate(NetworkP2pConfig::default()).expect("p2p node"),
+        &[SwarmScope::Global, scope.clone()],
+        &NetworkProtocolParams::default(),
+    )
+    .expect("service");
+    service.set_state_dir(state_dir.clone(), db_path);
+
+    service
+        .process_runtime_event(
+            &mut node,
+            NetworkRuntimeEvent::Gossip {
+                propagation_source: random_network_node_id(),
+                message: GossipMessage::Event(EventEnvelope {
+                    scope,
+                    event: payment_event,
+                    content_source_node_id: None,
+                }),
+            },
+        )
+        .expect("process live payment event");
+
+    let payments =
+        crate::control::load_agent_payment_records_state(&state_dir).expect("load payments");
+    assert_eq!(payments.len(), 1);
+    assert_eq!(payments[0].payment_id, "payment-backfill-1");
+    assert_eq!(payments[0].message_kind, "payment_request");
+    assert_eq!(payments[0].remote_node_id, remote.node_id());
+    let records =
+        crate::control::load_agent_event_records_state(&state_dir).expect("agent event records");
+    assert_eq!(records.len(), 1);
+    assert_eq!(
+        records[0].event_type,
+        wattswarm_protocol::types::AgentEventType::PaymentRequest
+    );
+    assert_eq!(
+        records[0].payload["message_kind"].as_str(),
+        Some("payment_request")
+    );
+}
+
+#[test]
+fn backfill_agent_payment_event_delivers_local_agent_event() {
+    let _env_lock = lock_env_test_mutex();
+    let _relay_urls = EnvVarGuard::set(
+        wattswarm_network_transport_iroh::ENV_IROH_RELAY_URLS,
+        Some("https://relay.wattetheria.com"),
+    );
+    let state_dir = temp_startup_dir("backfill-payment-agent-event");
+    let db_path = state_dir.join("ui.state");
+    let local = crate::control::load_local_identity(&state_dir).expect("local identity");
+    let remote = NodeIdentity::random();
+    let membership = membership_with_roles(&[local.node_id(), remote.node_id()]);
+    let mut node = Node::new(
+        local.clone(),
+        PgStore::open(&db_path).expect("store"),
+        membership,
+    )
+    .expect("node");
+    let payment_event = build_event_for_external(
+        &remote,
+        1,
+        10,
+        crate::types::EventPayload::AgentPaymentPosted(test_payment_payload(
+            &local.node_id(),
+            &remote.node_id(),
+        )),
+    )
+    .expect("payment event");
+    let scope = SwarmScope::Node(local.node_id());
+    let mut service = NetworkBridgeService::new(
+        NetworkP2pNode::generate(NetworkP2pConfig::default()).expect("p2p node"),
+        &[SwarmScope::Global, scope.clone()],
+        &NetworkProtocolParams::default(),
+    )
+    .expect("service");
+    service.set_state_dir(state_dir.clone(), db_path);
+    let request_id = BackfillRequestId::new(79);
+
+    let tick = service
+        .process_runtime_event(
+            &mut node,
+            NetworkRuntimeEvent::BackfillResponse {
+                peer: random_network_node_id(),
+                request_id,
+                response: crate::network_p2p::BackfillResponse {
+                    scope: scope.clone(),
+                    next_from_event_seq: 1,
+                    feed_key: None,
+                    head_event_ids: vec![payment_event.event_id.clone()],
+                    events: vec![EventEnvelope {
+                        scope,
+                        event: payment_event,
+                        content_source_node_id: None,
+                    }],
+                },
+            },
+        )
+        .expect("process payment backfill");
+
+    assert!(matches!(
+        tick,
+        NetworkBridgeTick::BackfillApplied {
+            request_id: applied_request,
+            events: 1,
+            ..
+        } if applied_request == request_id
+    ));
+    let payments =
+        crate::control::load_agent_payment_records_state(&state_dir).expect("load payments");
+    assert_eq!(payments.len(), 1);
+    assert_eq!(payments[0].payment_id, "payment-backfill-1");
+    assert_eq!(payments[0].message_kind, "payment_request");
+    assert_eq!(payments[0].remote_node_id, remote.node_id());
+    let records =
+        crate::control::load_agent_event_records_state(&state_dir).expect("agent event records");
+    assert_eq!(records.len(), 1);
+    assert_eq!(
+        records[0].event_type,
+        wattswarm_protocol::types::AgentEventType::PaymentRequest
+    );
+    assert_eq!(
+        records[0].dedupe_key.as_deref(),
+        Some("payment:payment-backfill-1:payment_request")
+    );
+}
+
+#[test]
+fn agent_payment_event_and_summary_share_agent_event_dedupe() {
+    let _env_lock = lock_env_test_mutex();
+    let _relay_urls = EnvVarGuard::set(
+        wattswarm_network_transport_iroh::ENV_IROH_RELAY_URLS,
+        Some("https://relay.wattetheria.com"),
+    );
+    let state_dir = temp_startup_dir("payment-event-summary-dedupe");
+    let db_path = state_dir.join("ui.state");
+    let local = crate::control::load_local_identity(&state_dir).expect("local identity");
+    let remote = NodeIdentity::random();
+    let membership = membership_with_roles(&[local.node_id(), remote.node_id()]);
+    let mut node = Node::new(
+        local.clone(),
+        PgStore::open(&db_path).expect("store"),
+        membership,
+    )
+    .expect("node");
+    let payment_payload = test_payment_payload(&local.node_id(), &remote.node_id());
+    let payment_event = build_event_for_external(
+        &remote,
+        1,
+        10,
+        crate::types::EventPayload::AgentPaymentPosted(payment_payload.clone()),
+    )
+    .expect("payment event");
+    let scope = SwarmScope::Node(local.node_id());
+    let mut service = NetworkBridgeService::new(
+        NetworkP2pNode::generate(NetworkP2pConfig::default()).expect("p2p node"),
+        &[SwarmScope::Global, scope.clone()],
+        &NetworkProtocolParams::default(),
+    )
+    .expect("service");
+    service.set_state_dir(state_dir.clone(), db_path);
+
+    service
+        .process_runtime_event(
+            &mut node,
+            NetworkRuntimeEvent::Gossip {
+                propagation_source: random_network_node_id(),
+                message: GossipMessage::Event(EventEnvelope {
+                    scope: scope.clone(),
+                    event: payment_event,
+                    content_source_node_id: None,
+                }),
+            },
+        )
+        .expect("process live payment event");
+    let summary = crate::network_p2p::SummaryAnnouncement {
+        summary_id: "payment:payment-backfill-1:legacy-summary".to_owned(),
+        source_node_id: remote.node_id(),
+        scope,
+        summary_kind: AGENT_PAYMENT_SUMMARY_KIND.to_owned(),
+        artifact_path: None,
+        payload: json!({
+            "message_kind": payment_payload.message_kind,
+            "payment": payment_payload.payment,
+            "agent_envelope": payment_payload.agent_envelope,
+        }),
+    };
+    save_agent_payment_summary(&state_dir, &remote.node_id(), &summary)
+        .expect("process legacy summary");
+
+    let records =
+        crate::control::load_agent_event_records_state(&state_dir).expect("agent event records");
+    assert_eq!(records.len(), 1);
+    assert_eq!(
+        records[0].dedupe_key.as_deref(),
+        Some("payment:payment-backfill-1:payment_request")
+    );
 }
 
 #[test]

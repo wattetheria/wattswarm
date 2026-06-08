@@ -162,6 +162,9 @@ pub(super) fn event_scope(node: &Node, event: &crate::types::Event) -> Result<Sw
         crate::types::EventPayload::TopicMessagePosted(payload) => {
             Ok(scope_from_optional_hint(payload.scope()))
         }
+        crate::types::EventPayload::AgentPaymentPosted(payload) => {
+            Ok(SwarmScope::Node(payload.remote_node_id.clone()))
+        }
         crate::types::EventPayload::MembershipUpdated(_)
         | crate::types::EventPayload::PolicyTuned(_)
         | crate::types::EventPayload::CheckpointCreated(_)
