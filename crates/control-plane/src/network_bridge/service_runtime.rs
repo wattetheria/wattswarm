@@ -57,11 +57,40 @@ impl NetworkBridgeService {
                     );
                 }
             }
+            crate::types::EventPayload::TaskClaimDecided(payload) => {
+                if let Ok(agent_event) = task_claim_decision_agent_event(node, event, payload) {
+                    let _ = deliver_agent_event_to_local_executor(
+                        state_dir,
+                        self.db_path.as_deref(),
+                        &agent_event,
+                    );
+                }
+            }
             crate::types::EventPayload::CandidateProposed(_)
+            | crate::types::EventPayload::TaskCompleted(_)
             | crate::types::EventPayload::DecisionFinalized(_)
             | crate::types::EventPayload::TaskError(_)
             | crate::types::EventPayload::TaskRetryScheduled(_) => {
                 if let Ok(Some(agent_event)) = task_result_agent_event(node, event) {
+                    let _ = deliver_agent_event_to_local_executor(
+                        state_dir,
+                        self.db_path.as_deref(),
+                        &agent_event,
+                    );
+                }
+            }
+            crate::types::EventPayload::TaskCompletionDecided(payload) => {
+                if let Ok(agent_event) = task_completion_decision_agent_event(node, event, payload)
+                {
+                    let _ = deliver_agent_event_to_local_executor(
+                        state_dir,
+                        self.db_path.as_deref(),
+                        &agent_event,
+                    );
+                }
+            }
+            crate::types::EventPayload::TaskSettled(payload) => {
+                if let Ok(agent_event) = task_settled_agent_event(node, event, payload) {
                     let _ = deliver_agent_event_to_local_executor(
                         state_dir,
                         self.db_path.as_deref(),

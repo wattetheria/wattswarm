@@ -23,10 +23,10 @@ use crate::types::{
     EpochEndReason, Event, EventPayload, EvidenceAddedPayload, EvidenceAvailablePayload,
     ExecutionIntentDeclaredPayload, ExecutionSetConfirmedPayload, ExecutionSetMember, KnowledgeHit,
     KnowledgeHitType, Membership, MembershipUpdatedPayload, Role, SeedBundle, SeedConstraints,
-    SignatureEnvelope, TaskAnnouncedPayload, TaskContract, TaskErrorPayload,
-    TaskRetryScheduledPayload, TaskTerminalState, UnsignedEvent, VerificationStatus,
-    VerifierResult, VerifierResultSubmittedPayload, VoteChoice, VoteCommitPayload,
-    VoteRevealPayload,
+    SignatureEnvelope, TaskAnnouncedPayload, TaskClaimDecidedPayload, TaskCompletedPayload,
+    TaskCompletionDecidedPayload, TaskContract, TaskErrorPayload, TaskRetryScheduledPayload,
+    TaskSettledPayload, TaskTerminalState, UnsignedEvent, VerificationStatus, VerifierResult,
+    VerifierResultSubmittedPayload, VoteChoice, VoteCommitPayload, VoteRevealPayload,
 };
 use anyhow::{Context, Result, anyhow};
 use base64::Engine;

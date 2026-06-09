@@ -274,8 +274,10 @@ fn cli_node_exports_and_stores_bootstrap_contacts() {
     let genesis_state_dir = dir.path().join("genesis");
     let joining_state_dir = dir.path().join("joining");
     let schema = CliSchemaGuard::new();
+    let bootstrap_addr = "127.0.0.1:7777";
 
     let output = cmd(schema.as_str())
+        .env("WATTSWARM_IROH_PUBLISH_DIRECT_ADDRS", bootstrap_addr)
         .args([
             "--state-dir",
             genesis_state_dir.to_str().unwrap(),
@@ -291,9 +293,10 @@ fn cli_node_exports_and_stores_bootstrap_contacts() {
     let contact = contact.trim();
     let (node_id, addr) = contact.split_once('@').unwrap();
     assert!(!node_id.is_empty());
-    assert!(addr.parse::<std::net::SocketAddr>().is_ok());
+    assert_eq!(addr, bootstrap_addr);
 
     let json_output = cmd(schema.as_str())
+        .env("WATTSWARM_IROH_PUBLISH_DIRECT_ADDRS", bootstrap_addr)
         .args([
             "--state-dir",
             genesis_state_dir.to_str().unwrap(),

@@ -216,6 +216,16 @@ pub fn build_app(state: UiServerState) -> Router {
         .route("/api/task/announce", post(tasks::task_announce))
         .route("/api/task/claim", post(tasks::task_claim))
         .route(
+            "/api/task/claim-decision",
+            post(tasks::task_claim_decision),
+        )
+        .route("/api/task/complete", post(tasks::task_complete))
+        .route(
+            "/api/task/completion-decision",
+            post(tasks::task_completion_decision),
+        )
+        .route("/api/task/settle", post(tasks::task_settle))
+        .route(
             "/api/task/propose-candidate",
             post(tasks::task_propose_candidate),
         )

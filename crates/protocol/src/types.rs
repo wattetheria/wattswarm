@@ -200,6 +200,10 @@ fn is_zero_u8(value: &u8) -> bool {
     *value == 0
 }
 
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentEventType {
@@ -208,7 +212,10 @@ pub enum AgentEventType {
     PaymentRequest,
     PaymentUpdate,
     TaskClaimReceived,
+    TaskClaimDecisionReceived,
     TaskResultReceived,
+    TaskCompletionDecisionReceived,
+    TaskSettledReceived,
     TopicMessageRequiresReply,
     ThirdPartyResult,
 }
@@ -662,6 +669,52 @@ pub struct ClaimReleasePayload {
     pub role: ClaimRole,
     pub claimer_node_id: String,
     pub execution_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskClaimDecidedPayload {
+    pub task_id: String,
+    pub execution_id: String,
+    pub claimer_node_id: String,
+    pub approved: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_envelope: Option<AgentEnvelope>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TaskCompletedPayload {
+    pub task_id: String,
+    pub execution_id: String,
+    pub completed_by_node_id: String,
+    pub output: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_envelope: Option<AgentEnvelope>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskCompletionDecidedPayload {
+    pub task_id: String,
+    pub execution_id: String,
+    pub approved: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub retry_requested: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_envelope: Option<AgentEnvelope>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TaskSettledPayload {
+    pub task_id: String,
+    pub execution_id: String,
+    pub settled_by_node_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub receipt: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_envelope: Option<AgentEnvelope>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1247,6 +1300,10 @@ pub enum EventPayload {
     TaskClaimed(ClaimPayload),
     TaskClaimRenewed(ClaimRenewPayload),
     TaskClaimReleased(ClaimReleasePayload),
+    TaskClaimDecided(TaskClaimDecidedPayload),
+    TaskCompleted(TaskCompletedPayload),
+    TaskCompletionDecided(TaskCompletionDecidedPayload),
+    TaskSettled(TaskSettledPayload),
     CandidateProposed(CandidateProposedPayload),
     EvidenceAdded(EvidenceAddedPayload),
     EvidenceAvailable(EvidenceAvailablePayload),
@@ -1288,6 +1345,10 @@ pub enum EventKind {
     TaskClaimed,
     TaskClaimRenewed,
     TaskClaimReleased,
+    TaskClaimDecided,
+    TaskCompleted,
+    TaskCompletionDecided,
+    TaskSettled,
     CandidateProposed,
     EvidenceAdded,
     EvidenceAvailable,
@@ -1340,6 +1401,10 @@ impl EventPayload {
             Self::TaskClaimed(_) => EventKind::TaskClaimed,
             Self::TaskClaimRenewed(_) => EventKind::TaskClaimRenewed,
             Self::TaskClaimReleased(_) => EventKind::TaskClaimReleased,
+            Self::TaskClaimDecided(_) => EventKind::TaskClaimDecided,
+            Self::TaskCompleted(_) => EventKind::TaskCompleted,
+            Self::TaskCompletionDecided(_) => EventKind::TaskCompletionDecided,
+            Self::TaskSettled(_) => EventKind::TaskSettled,
             Self::CandidateProposed(_) => EventKind::CandidateProposed,
             Self::EvidenceAdded(_) => EventKind::EvidenceAdded,
             Self::EvidenceAvailable(_) => EventKind::EvidenceAvailable,
@@ -1381,6 +1446,10 @@ impl EventPayload {
             Self::TaskClaimed(p) => Some(&p.task_id),
             Self::TaskClaimRenewed(p) => Some(&p.task_id),
             Self::TaskClaimReleased(p) => Some(&p.task_id),
+            Self::TaskClaimDecided(p) => Some(&p.task_id),
+            Self::TaskCompleted(p) => Some(&p.task_id),
+            Self::TaskCompletionDecided(p) => Some(&p.task_id),
+            Self::TaskSettled(p) => Some(&p.task_id),
             Self::CandidateProposed(p) => Some(&p.task_id),
             Self::EvidenceAdded(p) => Some(&p.task_id),
             Self::EvidenceAvailable(p) => Some(&p.task_id),
@@ -1431,6 +1500,10 @@ impl EventPayload {
             Self::TaskClaimed(_)
             | Self::TaskClaimRenewed(_)
             | Self::TaskClaimReleased(_)
+            | Self::TaskClaimDecided(_)
+            | Self::TaskCompleted(_)
+            | Self::TaskCompletionDecided(_)
+            | Self::TaskSettled(_)
             | Self::CandidateProposed(_)
             | Self::EvidenceAdded(_)
             | Self::EvidenceAvailable(_)

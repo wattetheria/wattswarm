@@ -295,7 +295,7 @@ fn route_task_result_to_wattswarm(
                 .to_string(),
             ));
         }
-        "inspect_task" => {
+        "human_review" => {
             return Ok((
                 200,
                 json!({
@@ -322,7 +322,7 @@ fn route_task_claim_to_wattswarm(
 ) -> Result<(i64, String)> {
     let task_id = required_event_payload_string(&event.payload, "task_id", &event.event_type)?;
     match decision.action.as_str() {
-        "decide_claim" | "inspect_task" => Ok((
+        "decide_claim" | "human_review" => Ok((
             200,
             json!({
                 "ok": true,
@@ -489,10 +489,62 @@ pub(super) fn task_claim_agent_event(
         payload.agent_envelope.clone(),
         payload_value,
         false,
-        vec!["inspect_task".to_owned(), "decide_claim".to_owned()],
+        vec!["human_review".to_owned(), "decide_claim".to_owned()],
         Some(payload.task_id.clone()),
         Some(format!(
             "task_claim:{}:{}",
+            payload.task_id, payload.execution_id
+        )),
+    ))
+}
+
+pub(super) fn task_claim_decision_agent_event(
+    node: &Node,
+    event: &crate::types::Event,
+    payload: &crate::types::TaskClaimDecidedPayload,
+) -> Result<wattswarm_protocol::types::AgentEvent> {
+    let verified_context = verified_context_for_event_envelope(
+        payload.agent_envelope.as_ref(),
+        &event.author_node_id,
+    )?;
+    let task_inputs = node
+        .task_view(&payload.task_id)?
+        .map(|task| task.contract.inputs)
+        .unwrap_or(Value::Null);
+    let payload_value = payload_with_verified_agent_context(
+        json!({
+            "event_id": &event.event_id,
+            "event_kind": "task_claim_decided",
+            "task_id": &payload.task_id,
+            "execution_id": &payload.execution_id,
+            "claimer_node_id": &payload.claimer_node_id,
+            "approved": payload.approved,
+            "reason": &payload.reason,
+            "task_inputs": task_inputs,
+            "created_at": event.created_at,
+        }),
+        verified_context.as_ref(),
+    )?;
+    let actions = if payload.approved {
+        vec!["complete_mission".to_owned(), "ignore".to_owned()]
+    } else {
+        vec!["ignore".to_owned(), "human_review".to_owned()]
+    };
+    Ok(build_agent_event_with_agent_envelope(
+        wattswarm_protocol::types::AgentEventType::TaskClaimDecisionReceived,
+        wattswarm_protocol::types::AgentEventSourceKind::TaskLifecycle,
+        Some(event.author_node_id.clone()),
+        payload
+            .agent_envelope
+            .as_ref()
+            .and_then(|envelope| envelope.target_agent_id.clone()),
+        payload.agent_envelope.clone(),
+        payload_value,
+        false,
+        actions,
+        Some(payload.task_id.clone()),
+        Some(format!(
+            "task_claim_decision:{}:{}",
             payload.task_id, payload.execution_id
         )),
     ))
@@ -503,6 +555,47 @@ pub(super) fn task_result_agent_event(
     event: &crate::types::Event,
 ) -> Result<Option<wattswarm_protocol::types::AgentEvent>> {
     match &event.payload {
+        crate::types::EventPayload::TaskCompleted(payload) => {
+            let verified_context = verified_context_for_event_envelope(
+                payload.agent_envelope.as_ref(),
+                &event.author_node_id,
+            )?;
+            let payload_value = payload_with_verified_agent_context(
+                json!({
+                    "event_id": &event.event_id,
+                    "event_kind": "task_completed",
+                    "task_id": &payload.task_id,
+                    "execution_id": &payload.execution_id,
+                    "completed_by_node_id": &payload.completed_by_node_id,
+                    "output": &payload.output,
+                    "created_at": event.created_at,
+                }),
+                verified_context.as_ref(),
+            )?;
+            Ok(Some(build_agent_event_with_agent_envelope(
+                wattswarm_protocol::types::AgentEventType::TaskResultReceived,
+                wattswarm_protocol::types::AgentEventSourceKind::TaskLifecycle,
+                Some(event.author_node_id.clone()),
+                payload
+                    .agent_envelope
+                    .as_ref()
+                    .and_then(|envelope| envelope.target_agent_id.clone()),
+                payload.agent_envelope.clone(),
+                payload_value,
+                false,
+                vec![
+                    "human_review".to_owned(),
+                    "accept_result".to_owned(),
+                    "reject_result".to_owned(),
+                    "request_retry".to_owned(),
+                ],
+                Some(payload.task_id.clone()),
+                Some(format!(
+                    "task_completed:{}:{}",
+                    payload.task_id, payload.execution_id
+                )),
+            )))
+        }
         crate::types::EventPayload::CandidateProposed(payload) => {
             let verified_context = verified_context_for_event_envelope(
                 payload.agent_envelope.as_ref(),
@@ -535,7 +628,7 @@ pub(super) fn task_result_agent_event(
                 payload_value,
                 false,
                 vec![
-                    "inspect_task".to_owned(),
+                    "human_review".to_owned(),
                     "accept_result".to_owned(),
                     "reject_result".to_owned(),
                     "request_retry".to_owned(),
@@ -572,7 +665,7 @@ pub(super) fn task_result_agent_event(
                 payload.agent_envelope.clone(),
                 payload_value,
                 false,
-                vec!["inspect_task".to_owned(), "accept_result".to_owned()],
+                vec!["human_review".to_owned(), "accept_result".to_owned()],
                 Some(payload.task_id.clone()),
                 Some(format!(
                     "task_result:{}:finalized:{}",
@@ -608,7 +701,7 @@ pub(super) fn task_result_agent_event(
                 payload.agent_envelope.clone(),
                 payload_value,
                 false,
-                vec!["inspect_task".to_owned(), "request_retry".to_owned()],
+                vec!["human_review".to_owned(), "request_retry".to_owned()],
                 Some(payload.task_id.clone()),
                 Some(format!(
                     "task_result:{}:error:{}",
@@ -640,7 +733,7 @@ pub(super) fn task_result_agent_event(
                 payload.agent_envelope.clone(),
                 payload_value,
                 false,
-                vec!["inspect_task".to_owned()],
+                vec!["human_review".to_owned()],
                 Some(payload.task_id.clone()),
                 Some(format!(
                     "task_result:{}:retry:{}",
@@ -650,6 +743,99 @@ pub(super) fn task_result_agent_event(
         }
         _ => Ok(None),
     }
+}
+
+pub(super) fn task_completion_decision_agent_event(
+    node: &Node,
+    event: &crate::types::Event,
+    payload: &crate::types::TaskCompletionDecidedPayload,
+) -> Result<wattswarm_protocol::types::AgentEvent> {
+    let verified_context = verified_context_for_event_envelope(
+        payload.agent_envelope.as_ref(),
+        &event.author_node_id,
+    )?;
+    let task_inputs = node
+        .task_view(&payload.task_id)?
+        .map(|task| task.contract.inputs)
+        .unwrap_or(Value::Null);
+    let payload_value = payload_with_verified_agent_context(
+        json!({
+            "event_id": &event.event_id,
+            "event_kind": "task_completion_decided",
+            "task_id": &payload.task_id,
+            "execution_id": &payload.execution_id,
+            "approved": payload.approved,
+            "retry_requested": payload.retry_requested,
+            "reason": &payload.reason,
+            "task_inputs": task_inputs,
+            "created_at": event.created_at,
+        }),
+        verified_context.as_ref(),
+    )?;
+    Ok(build_agent_event_with_agent_envelope(
+        wattswarm_protocol::types::AgentEventType::TaskCompletionDecisionReceived,
+        wattswarm_protocol::types::AgentEventSourceKind::TaskLifecycle,
+        Some(event.author_node_id.clone()),
+        payload
+            .agent_envelope
+            .as_ref()
+            .and_then(|envelope| envelope.target_agent_id.clone()),
+        payload.agent_envelope.clone(),
+        payload_value,
+        false,
+        vec!["ignore".to_owned(), "human_review".to_owned()],
+        Some(payload.task_id.clone()),
+        Some(format!(
+            "task_completion_decision:{}:{}",
+            payload.task_id, payload.execution_id
+        )),
+    ))
+}
+
+pub(super) fn task_settled_agent_event(
+    node: &Node,
+    event: &crate::types::Event,
+    payload: &crate::types::TaskSettledPayload,
+) -> Result<wattswarm_protocol::types::AgentEvent> {
+    let verified_context = verified_context_for_event_envelope(
+        payload.agent_envelope.as_ref(),
+        &event.author_node_id,
+    )?;
+    let task_inputs = node
+        .task_view(&payload.task_id)?
+        .map(|task| task.contract.inputs)
+        .unwrap_or(Value::Null);
+    let payload_value = payload_with_verified_agent_context(
+        json!({
+            "event_id": &event.event_id,
+            "event_kind": "task_settled",
+            "task_id": &payload.task_id,
+            "execution_id": &payload.execution_id,
+            "settled_by_node_id": &payload.settled_by_node_id,
+            "receipt": &payload.receipt,
+            "task_inputs": task_inputs,
+            "created_at": event.created_at,
+        }),
+        verified_context.as_ref(),
+    )?;
+    Ok(build_agent_event_with_agent_envelope(
+        wattswarm_protocol::types::AgentEventType::TaskSettledReceived,
+        wattswarm_protocol::types::AgentEventSourceKind::TaskLifecycle,
+        Some(event.author_node_id.clone()),
+        payload
+            .agent_envelope
+            .as_ref()
+            .and_then(|envelope| envelope.target_agent_id.clone()),
+        payload.agent_envelope.clone(),
+        payload_value,
+        false,
+        vec!["ignore".to_owned()],
+        Some(payload.task_id.clone()),
+        Some(format!(
+            "task_settled:{}:{}",
+            payload.task_id, payload.execution_id
+        )),
+    ))
 }
 
 pub(super) fn topic_message_agent_event(

@@ -59,6 +59,66 @@ fn task_claim_agent_event_uses_generic_task_schema() {
 }
 
 #[test]
+fn task_claim_decision_agent_event_prompts_approved_claimer_to_complete() {
+    let mut node = Node::open_in_memory_with_roles(&[Role::Proposer]).expect("node");
+    let policy_hash = node
+        .policy_registry()
+        .binding_for("vp.schema_only.v1", json!({}))
+        .expect("policy")
+        .policy_hash;
+    let mut contract = sample_contract("mission-claim-decision", policy_hash);
+    contract.inputs = json!({
+        "kind": "wattetheria_mission",
+        "mission_id": "mission-claim-decision",
+        "agent_did": "claimer-agent"
+    });
+    node.submit_task(contract, 7, 50).expect("submit task");
+    let event = crate::types::Event {
+        event_id: "evt-claim-decision".to_owned(),
+        protocol_version: "1".to_owned(),
+        event_kind: crate::types::EventKind::TaskClaimDecided,
+        task_id: Some("mission-claim-decision".to_owned()),
+        epoch: 7,
+        author_node_id: "publisher-node".to_owned(),
+        created_at: 55,
+        payload: crate::types::EventPayload::TaskClaimDecided(
+            crate::types::TaskClaimDecidedPayload {
+                task_id: "mission-claim-decision".to_owned(),
+                execution_id: "exec-1".to_owned(),
+                claimer_node_id: "claimer-node".to_owned(),
+                approved: true,
+                reason: None,
+                agent_envelope: None,
+            },
+        ),
+        signature_hex: "sig".to_owned(),
+    };
+    let crate::types::EventPayload::TaskClaimDecided(payload) = &event.payload else {
+        panic!("expected claim decision payload");
+    };
+    let agent_event =
+        task_claim_decision_agent_event(&node, &event, payload).expect("agent event");
+
+    assert_eq!(
+        agent_event.event_type,
+        wattswarm_protocol::types::AgentEventType::TaskClaimDecisionReceived
+    );
+    assert_eq!(
+        agent_event.payload["event_kind"].as_str(),
+        Some("task_claim_decided")
+    );
+    assert_eq!(agent_event.payload["approved"].as_bool(), Some(true));
+    assert!(agent_event
+        .allowed_actions
+        .iter()
+        .any(|action| action == "complete_mission"));
+    assert!(!agent_event
+        .allowed_actions
+        .iter()
+        .any(|action| action == "inspect_task"));
+}
+
+#[test]
 fn backfill_task_claimed_delivers_local_agent_event() {
     let state_dir = temp_startup_dir("backfill-task-claim-agent-event");
     let publisher_identity = NodeIdentity::random();
@@ -180,7 +240,7 @@ fn deliver_agent_event_writes_local_diagnostics() {
         None,
         json!({"task_id": "task-1"}),
         false,
-        vec!["inspect_task".to_owned()],
+        vec!["human_review".to_owned()],
         Some("task-1".to_owned()),
         Some("task_claim:task-1:exec-1".to_owned()),
     );
@@ -260,7 +320,7 @@ fn deliver_agent_event_retries_callback_timeout_before_marking_delivered() {
         None,
         json!({"task_id": "task-retry"}),
         false,
-        vec!["inspect_task".to_owned()],
+        vec!["human_review".to_owned()],
         Some("task-retry".to_owned()),
         Some("task_claim:task-retry:exec-1".to_owned()),
     );
@@ -343,7 +403,7 @@ fn deliver_agent_event_marks_callback_ack_error_as_failed_with_body() {
         None,
         json!({"task_id": "task-ack-error"}),
         false,
-        vec!["inspect_task".to_owned()],
+        vec!["human_review".to_owned()],
         Some("task-ack-error".to_owned()),
         Some("task_claim:task-ack-error:exec-1".to_owned()),
     );
@@ -415,6 +475,69 @@ fn task_result_agent_event_supports_retry_updates() {
 }
 
 #[test]
+fn task_result_agent_event_supports_ordinary_task_completed() {
+    let identity = NodeIdentity::random();
+    let node_id = identity.node_id();
+    let membership = membership_with_roles(std::slice::from_ref(&node_id));
+    let store = PgStore::open_in_memory().expect("store");
+    let mut node = Node::new(identity.clone(), store, membership).expect("node");
+    let policy_hash = node
+        .policy_registry()
+        .binding_for("vp.schema_only.v1", json!({}))
+        .expect("policy binding")
+        .policy_hash;
+    let mut contract = sample_contract("task-completed-ordinary", policy_hash);
+    contract.inputs = json!({
+        "kind": "wattetheria_mission",
+        "mission_id": "task-completed-ordinary"
+    });
+    node.submit_task(contract, 1, 10).expect("submit task");
+
+    let event = build_event_for_external(
+        &identity,
+        1,
+        20,
+        crate::types::EventPayload::TaskCompleted(crate::types::TaskCompletedPayload {
+            task_id: "task-completed-ordinary".to_owned(),
+            execution_id: "exec-completed".to_owned(),
+            completed_by_node_id: node_id,
+            output: json!({
+                "kind": "mission_completed",
+                "mission_id": "task-completed-ordinary",
+                "result": {"ok": true}
+            }),
+            agent_envelope: None,
+        }),
+    )
+    .expect("event");
+
+    let agent_event = task_result_agent_event(&node, &event)
+        .expect("build task result event")
+        .expect("task result event");
+
+    assert_eq!(
+        agent_event.event_type,
+        wattswarm_protocol::types::AgentEventType::TaskResultReceived
+    );
+    assert_eq!(
+        agent_event.payload["event_kind"].as_str(),
+        Some("task_completed")
+    );
+    assert_eq!(
+        agent_event.payload["output"]["mission_id"].as_str(),
+        Some("task-completed-ordinary")
+    );
+    assert!(agent_event
+        .allowed_actions
+        .iter()
+        .any(|action| action == "accept_result"));
+    assert!(!agent_event
+        .allowed_actions
+        .iter()
+        .any(|action| action == "inspect_task"));
+}
+
+#[test]
 fn task_result_agent_event_uses_generic_task_actions() {
     let identity = NodeIdentity::random();
     let node_id = identity.node_id();
@@ -474,7 +597,7 @@ fn task_result_agent_event_uses_generic_task_actions() {
     assert_eq!(
         agent_event.allowed_actions,
         vec![
-            "inspect_task".to_owned(),
+            "human_review".to_owned(),
             "accept_result".to_owned(),
             "reject_result".to_owned(),
             "request_retry".to_owned()

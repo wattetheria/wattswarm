@@ -51,6 +51,10 @@ impl Node {
                     &claim.execution_id,
                 )?;
             }
+            EventPayload::TaskClaimDecided(_)
+            | EventPayload::TaskCompleted(_)
+            | EventPayload::TaskCompletionDecided(_)
+            | EventPayload::TaskSettled(_) => {}
             EventPayload::CandidateProposed(payload) => {
                 let mut candidate = payload.candidate.clone();
                 if !candidate.has_resolved_output()

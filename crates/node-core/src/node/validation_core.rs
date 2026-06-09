@@ -86,6 +86,16 @@ impl Node {
             EventPayload::TaskClaimed(claim) => self.validate_claimed(event, claim),
             EventPayload::TaskClaimRenewed(claim) => self.validate_claim_renewed(event, claim),
             EventPayload::TaskClaimReleased(claim) => self.validate_claim_released(claim),
+            EventPayload::TaskClaimDecided(payload) => {
+                self.require_task(&payload.task_id).map(|_| ())
+            }
+            EventPayload::TaskCompleted(payload) => {
+                self.require_task(&payload.task_id).map(|_| ())
+            }
+            EventPayload::TaskCompletionDecided(payload) => {
+                self.require_task(&payload.task_id).map(|_| ())
+            }
+            EventPayload::TaskSettled(payload) => self.require_task(&payload.task_id).map(|_| ()),
             EventPayload::CandidateProposed(payload) => {
                 self.validate_candidate_proposed(event, payload)
             }
@@ -178,6 +188,10 @@ impl Node {
             EventPayload::TaskClaimed(p) => (None, Some(&p.claimer_node_id)),
             EventPayload::TaskClaimRenewed(p) => (None, Some(&p.claimer_node_id)),
             EventPayload::TaskClaimReleased(p) => (None, Some(&p.claimer_node_id)),
+            EventPayload::TaskClaimDecided(_) => (None, None),
+            EventPayload::TaskCompleted(p) => (None, Some(&p.completed_by_node_id)),
+            EventPayload::TaskCompletionDecided(_) => (None, None),
+            EventPayload::TaskSettled(p) => (None, Some(&p.settled_by_node_id)),
             EventPayload::CandidateProposed(_) => (None, None),
             EventPayload::EvidenceAdded(_) => (None, None),
             EventPayload::EvidenceAvailable(_) => (None, None),

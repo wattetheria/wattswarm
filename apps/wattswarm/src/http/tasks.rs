@@ -60,6 +60,50 @@ pub(crate) struct TaskClaimRequest {
 }
 
 #[derive(Debug, Deserialize)]
+pub(crate) struct TaskClaimDecisionRequest {
+    task_id: String,
+    execution_id: String,
+    claimer_node_id: String,
+    approved: bool,
+    #[serde(default)]
+    reason: Option<String>,
+    #[serde(default)]
+    agent_envelope: Option<AgentEnvelope>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct TaskCompleteRequest {
+    task_id: String,
+    execution_id: String,
+    output: Value,
+    #[serde(default)]
+    agent_envelope: Option<AgentEnvelope>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct TaskCompletionDecisionRequest {
+    task_id: String,
+    execution_id: String,
+    approved: bool,
+    #[serde(default)]
+    retry_requested: bool,
+    #[serde(default)]
+    reason: Option<String>,
+    #[serde(default)]
+    agent_envelope: Option<AgentEnvelope>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct TaskSettleRequest {
+    task_id: String,
+    execution_id: String,
+    #[serde(default)]
+    receipt: Option<Value>,
+    #[serde(default)]
+    agent_envelope: Option<AgentEnvelope>,
+}
+
+#[derive(Debug, Deserialize)]
 pub(crate) struct TaskProposeCandidateRequest {
     task_id: String,
     output: Value,
@@ -320,6 +364,130 @@ pub(crate) async fn task_claim(
             "subscribed": subscription_feed_key.is_some(),
             "subscription_feed_key": subscription_feed_key,
             "subscription_scope_hint": subscription_scope_hint
+        }))
+    })
+    .await?;
+    Ok(Json(response))
+}
+
+pub(crate) async fn task_claim_decision(
+    State(state): State<UiServerState>,
+    Json(req): Json<TaskClaimDecisionRequest>,
+) -> Result<Json<Value>, ApiError> {
+    let state_clone = state.clone();
+    let response = run_blocking(move || -> Result<Value> {
+        let mut node = open_node(&state_clone.state_dir, &state_clone.db_path)?;
+        let task = node
+            .task_view(&req.task_id)?
+            .ok_or_else(|| anyhow!("task not found: {}", req.task_id))?;
+        let now = chrono::Utc::now().timestamp_millis().max(0) as u64;
+        node.decide_task_claim_with_agent_envelope(
+            &req.task_id,
+            &req.execution_id,
+            &req.claimer_node_id,
+            req.approved,
+            req.reason.clone(),
+            req.agent_envelope,
+            task.epoch,
+            now,
+        )?;
+        Ok(json!({
+            "ok": true,
+            "task_id": req.task_id,
+            "execution_id": req.execution_id,
+            "claimer_node_id": req.claimer_node_id,
+            "approved": req.approved,
+        }))
+    })
+    .await?;
+    Ok(Json(response))
+}
+
+pub(crate) async fn task_complete(
+    State(state): State<UiServerState>,
+    Json(req): Json<TaskCompleteRequest>,
+) -> Result<Json<Value>, ApiError> {
+    let state_clone = state.clone();
+    let response = run_blocking(move || -> Result<Value> {
+        let mut node = open_node(&state_clone.state_dir, &state_clone.db_path)?;
+        let task = node
+            .task_view(&req.task_id)?
+            .ok_or_else(|| anyhow!("task not found: {}", req.task_id))?;
+        let now = chrono::Utc::now().timestamp_millis().max(0) as u64;
+        node.complete_task_with_agent_envelope(
+            &req.task_id,
+            &req.execution_id,
+            req.output,
+            req.agent_envelope,
+            task.epoch,
+            now,
+        )?;
+        Ok(json!({
+            "ok": true,
+            "task_id": req.task_id,
+            "execution_id": req.execution_id,
+        }))
+    })
+    .await?;
+    Ok(Json(response))
+}
+
+pub(crate) async fn task_completion_decision(
+    State(state): State<UiServerState>,
+    Json(req): Json<TaskCompletionDecisionRequest>,
+) -> Result<Json<Value>, ApiError> {
+    let state_clone = state.clone();
+    let response = run_blocking(move || -> Result<Value> {
+        let mut node = open_node(&state_clone.state_dir, &state_clone.db_path)?;
+        let task = node
+            .task_view(&req.task_id)?
+            .ok_or_else(|| anyhow!("task not found: {}", req.task_id))?;
+        let now = chrono::Utc::now().timestamp_millis().max(0) as u64;
+        node.decide_task_completion_with_agent_envelope(
+            &req.task_id,
+            &req.execution_id,
+            req.approved,
+            req.retry_requested,
+            req.reason.clone(),
+            req.agent_envelope,
+            task.epoch,
+            now,
+        )?;
+        Ok(json!({
+            "ok": true,
+            "task_id": req.task_id,
+            "execution_id": req.execution_id,
+            "approved": req.approved,
+            "retry_requested": req.retry_requested,
+        }))
+    })
+    .await?;
+    Ok(Json(response))
+}
+
+pub(crate) async fn task_settle(
+    State(state): State<UiServerState>,
+    Json(req): Json<TaskSettleRequest>,
+) -> Result<Json<Value>, ApiError> {
+    let state_clone = state.clone();
+    let response = run_blocking(move || -> Result<Value> {
+        let mut node = open_node(&state_clone.state_dir, &state_clone.db_path)?;
+        let task = node
+            .task_view(&req.task_id)?
+            .ok_or_else(|| anyhow!("task not found: {}", req.task_id))?;
+        let now = chrono::Utc::now().timestamp_millis().max(0) as u64;
+        node.settle_task_with_agent_envelope(
+            &req.task_id,
+            &req.execution_id,
+            req.receipt,
+            req.agent_envelope,
+            task.epoch,
+            now,
+        )?;
+        Ok(json!({
+            "ok": true,
+            "task_id": req.task_id,
+            "execution_id": req.execution_id,
         }))
     })
     .await?;

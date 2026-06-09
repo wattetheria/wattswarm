@@ -79,7 +79,9 @@ pub use summary::{
 use agent_delivery::{build_agent_event, topic_message_requires_reply};
 use agent_delivery::{
     build_agent_event_with_agent_envelope, deliver_agent_event_to_local_executor,
-    task_claim_agent_event, task_result_agent_event, topic_message_agent_event,
+    task_claim_agent_event, task_claim_decision_agent_event,
+    task_completion_decision_agent_event, task_result_agent_event, task_settled_agent_event,
+    topic_message_agent_event,
 };
 use backfill::{
     BACKFILL_KNOWN_EVENT_IDS_LIMIT, recent_backfill_lane_event_ids, should_publish_summaries,
@@ -216,6 +218,22 @@ fn event_diagnostic_details(event: &crate::types::Event) -> Map<String, Value> {
 fn event_payload_agent_envelope(payload: &crate::types::EventPayload) -> Option<Value> {
     match payload {
         crate::types::EventPayload::TaskClaimed(payload) => payload
+            .agent_envelope
+            .as_ref()
+            .map(|envelope| json!(envelope)),
+        crate::types::EventPayload::TaskClaimDecided(payload) => payload
+            .agent_envelope
+            .as_ref()
+            .map(|envelope| json!(envelope)),
+        crate::types::EventPayload::TaskCompleted(payload) => payload
+            .agent_envelope
+            .as_ref()
+            .map(|envelope| json!(envelope)),
+        crate::types::EventPayload::TaskCompletionDecided(payload) => payload
+            .agent_envelope
+            .as_ref()
+            .map(|envelope| json!(envelope)),
+        crate::types::EventPayload::TaskSettled(payload) => payload
             .agent_envelope
             .as_ref()
             .map(|envelope| json!(envelope)),

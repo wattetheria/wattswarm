@@ -398,6 +398,102 @@ impl Node {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn decide_task_claim_with_agent_envelope(
+        &mut self,
+        task_id: &str,
+        execution_id: &str,
+        claimer_node_id: &str,
+        approved: bool,
+        reason: Option<String>,
+        agent_envelope: Option<AgentEnvelope>,
+        epoch: u64,
+        created_at: u64,
+    ) -> Result<Event> {
+        self.emit_at(
+            epoch,
+            EventPayload::TaskClaimDecided(TaskClaimDecidedPayload {
+                task_id: task_id.to_owned(),
+                execution_id: execution_id.to_owned(),
+                claimer_node_id: claimer_node_id.to_owned(),
+                approved,
+                reason,
+                agent_envelope,
+            }),
+            created_at,
+        )
+    }
+
+    pub fn complete_task_with_agent_envelope(
+        &mut self,
+        task_id: &str,
+        execution_id: &str,
+        output: Value,
+        agent_envelope: Option<AgentEnvelope>,
+        epoch: u64,
+        created_at: u64,
+    ) -> Result<Event> {
+        self.emit_at(
+            epoch,
+            EventPayload::TaskCompleted(TaskCompletedPayload {
+                task_id: task_id.to_owned(),
+                execution_id: execution_id.to_owned(),
+                completed_by_node_id: self.node_id(),
+                output,
+                agent_envelope,
+            }),
+            created_at,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn decide_task_completion_with_agent_envelope(
+        &mut self,
+        task_id: &str,
+        execution_id: &str,
+        approved: bool,
+        retry_requested: bool,
+        reason: Option<String>,
+        agent_envelope: Option<AgentEnvelope>,
+        epoch: u64,
+        created_at: u64,
+    ) -> Result<Event> {
+        self.emit_at(
+            epoch,
+            EventPayload::TaskCompletionDecided(TaskCompletionDecidedPayload {
+                task_id: task_id.to_owned(),
+                execution_id: execution_id.to_owned(),
+                approved,
+                retry_requested,
+                reason,
+                agent_envelope,
+            }),
+            created_at,
+        )
+    }
+
+    pub fn settle_task_with_agent_envelope(
+        &mut self,
+        task_id: &str,
+        execution_id: &str,
+        receipt: Option<Value>,
+        agent_envelope: Option<AgentEnvelope>,
+        epoch: u64,
+        created_at: u64,
+    ) -> Result<Event> {
+        self.emit_at(
+            epoch,
+            EventPayload::TaskSettled(TaskSettledPayload {
+                task_id: task_id.to_owned(),
+                execution_id: execution_id.to_owned(),
+                settled_by_node_id: self.node_id(),
+                receipt,
+                agent_envelope,
+            }),
+            created_at,
+        )
+    }
+
     pub fn propose_candidate(
         &mut self,
         task_id: &str,
