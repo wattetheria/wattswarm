@@ -515,6 +515,39 @@ fn migrate_candidates_content_ref_schema(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+fn migrate_penalized_nodes_network_ban_schema(conn: &Connection) -> Result<()> {
+    if !column_exists(conn, "penalized_nodes", "network_ban") {
+        conn.execute_batch(
+            "
+            ALTER TABLE penalized_nodes
+            ADD COLUMN network_ban BOOLEAN NOT NULL DEFAULT FALSE;
+            ",
+        )?;
+    }
+    if !column_exists(conn, "penalized_nodes", "network_ban_until") {
+        conn.execute_batch(
+            "
+            ALTER TABLE penalized_nodes
+            ADD COLUMN network_ban_until BIGINT;
+            ",
+        )?;
+    }
+    conn.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS network_ban_windows (
+            org_id TEXT NOT NULL DEFAULT '__unset_org__',
+            node_id TEXT NOT NULL,
+            starts_at BIGINT NOT NULL,
+            until_ms BIGINT,
+            reason TEXT NOT NULL,
+            penalized_by_node_id TEXT NOT NULL,
+            PRIMARY KEY(org_id, node_id, starts_at)
+        );
+        ",
+    )?;
+    Ok(())
+}
+
 fn migrate_executor_registry_local_scope_schema(conn: &Connection) -> Result<()> {
     if column_exists(conn, "executor_registry_local", "scope_id") {
         return Ok(());
@@ -1376,8 +1409,20 @@ impl PgStore {
                 node_id TEXT PRIMARY KEY,
                 reason TEXT NOT NULL,
                 block_summaries BOOLEAN NOT NULL DEFAULT TRUE,
+                network_ban BOOLEAN NOT NULL DEFAULT FALSE,
+                network_ban_until BIGINT,
                 penalized_by_node_id TEXT NOT NULL,
                 penalized_at TIMESTAMPTZ NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS network_ban_windows (
+                org_id TEXT NOT NULL DEFAULT '__unset_org__',
+                node_id TEXT NOT NULL,
+                starts_at BIGINT NOT NULL,
+                until_ms BIGINT,
+                reason TEXT NOT NULL,
+                penalized_by_node_id TEXT NOT NULL,
+                PRIMARY KEY(org_id, node_id, starts_at)
             );
 
             CREATE TABLE IF NOT EXISTS imported_decision_memory (
@@ -1961,6 +2006,7 @@ impl PgStore {
             migrate_peer_dm_messages_local_trim_product_columns(&conn)?;
             migrate_topic_messages_content_ref_schema(&conn)?;
             migrate_candidates_content_ref_schema(&conn)?;
+            migrate_penalized_nodes_network_ban_schema(&conn)?;
             ensure_discovered_peers_local_scope_index(&conn)?;
             Ok(())
         })();

@@ -39,6 +39,7 @@ use wattswarm_storage_core::types::ArtifactRef;
 
 static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 const TEST_DB_LOCK_KEY: i64 = 1_987_654_321;
+const TEST_IROH_DIRECT_ADDR: &str = "127.0.0.1:7777";
 static TEST_SCHEMA_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 fn env_lock() -> std::sync::MutexGuard<'static, ()> {
@@ -507,6 +508,8 @@ fn network_discovery_auto_announces_local_record_to_bootnode() {
     let _db_lock = DbTestLock::acquire();
     let schema = reset_test_schema("ui_discovery_auto_announce");
     let _schema_guard = EnvVarGuard::set("WATTSWARM_PG_SCHEMA", &schema);
+    let _iroh_addr_guard =
+        EnvVarGuard::set("WATTSWARM_IROH_PUBLISH_DIRECT_ADDRS", TEST_IROH_DIRECT_ADDR);
 
     let dir = tempdir().expect("tempdir");
     let state_dir = dir.path().join("state");
@@ -550,7 +553,12 @@ fn network_discovery_auto_announces_local_record_to_bootnode() {
     );
     assert_eq!(record.body.ttl_ms, DEFAULT_RECORD_TTL_MS);
     assert!(record.body.capabilities.contains("wattswarm.node"));
-    assert!(record.body.transport_contact.is_some());
+    let contact = record
+        .body
+        .transport_contact
+        .as_ref()
+        .expect("transport contact");
+    assert_eq!(contact.metadata.listen_addrs, vec![TEST_IROH_DIRECT_ADDR]);
 }
 
 #[test]
@@ -640,6 +648,8 @@ fn network_discovery_periodic_announce_refreshes_bootnode_records() {
     let _db_lock = DbTestLock::acquire();
     let schema = reset_test_schema("ui_discovery_periodic_announce");
     let _schema_guard = EnvVarGuard::set("WATTSWARM_PG_SCHEMA", &schema);
+    let _iroh_addr_guard =
+        EnvVarGuard::set("WATTSWARM_IROH_PUBLISH_DIRECT_ADDRS", TEST_IROH_DIRECT_ADDR);
 
     let dir = tempdir().expect("tempdir");
     let state_dir = dir.path().join("state");
@@ -676,7 +686,12 @@ fn network_discovery_periodic_announce_refreshes_bootnode_records() {
         record.verify().expect("verify discovery record");
         assert_eq!(record.body.ttl_ms, DEFAULT_RECORD_TTL_MS);
         assert!(record.body.capabilities.contains("wattswarm.node"));
-        assert!(record.body.transport_contact.is_some());
+        let contact = record
+            .body
+            .transport_contact
+            .as_ref()
+            .expect("transport contact");
+        assert_eq!(contact.metadata.listen_addrs, vec![TEST_IROH_DIRECT_ADDR]);
     }
 }
 

@@ -228,20 +228,162 @@ impl PgStore {
         penalized_by_node_id: &str,
         penalized_at: u64,
     ) -> Result<()> {
+        self.put_node_penalty_with_network_ban(
+            node_id,
+            reason,
+            block_summaries,
+            false,
+            None,
+            penalized_by_node_id,
+            penalized_at,
+        )
+    }
+
+    pub fn put_node_penalty_with_network_ban(
+        &self,
+        node_id: &str,
+        reason: &str,
+        block_summaries: bool,
+        network_ban: bool,
+        network_ban_until: Option<u64>,
+        penalized_by_node_id: &str,
+        penalized_at: u64,
+    ) -> Result<()> {
         let conn = self
             .conn
             .lock()
             .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
-        conn.execute(
-            "INSERT INTO penalized_nodes(node_id, reason, block_summaries, penalized_by_node_id, penalized_at)
-             VALUES ($1, $2, $3, $4, TIMESTAMPTZ 'epoch' + ($5::bigint * INTERVAL '1 millisecond'))
+        const CONFLICT_SQL: &str = "
              ON CONFLICT(node_id) DO UPDATE SET
                reason = excluded.reason,
                block_summaries = excluded.block_summaries,
+               network_ban = penalized_nodes.network_ban OR excluded.network_ban,
+               network_ban_until = CASE
+                 WHEN (penalized_nodes.network_ban = TRUE AND penalized_nodes.network_ban_until IS NULL)
+                   OR (excluded.network_ban = TRUE AND excluded.network_ban_until IS NULL)
+                   THEN NULL
+                 WHEN penalized_nodes.network_ban = TRUE AND excluded.network_ban = TRUE
+                   THEN GREATEST(penalized_nodes.network_ban_until, excluded.network_ban_until)
+                 WHEN excluded.network_ban = TRUE
+                   THEN excluded.network_ban_until
+                 ELSE penalized_nodes.network_ban_until
+               END,
                penalized_by_node_id = excluded.penalized_by_node_id,
-               penalized_at = excluded.penalized_at",
-            params![node_id, reason, block_summaries, penalized_by_node_id, penalized_at as i64],
-        )?;
+               penalized_at = excluded.penalized_at";
+        if let Some(network_ban_until) = network_ban_until {
+            conn.execute(
+                &format!(
+                    "INSERT INTO penalized_nodes(
+                 node_id,
+                 reason,
+                 block_summaries,
+                 network_ban,
+                 network_ban_until,
+                 penalized_by_node_id,
+                 penalized_at
+             )
+             VALUES (
+                 $1,
+                 $2,
+                 $3,
+                 $4,
+                 $5,
+                 $6,
+                 TIMESTAMPTZ 'epoch' + ($7::bigint * INTERVAL '1 millisecond')
+             ){CONFLICT_SQL}"
+                ),
+                params![
+                    node_id,
+                    reason,
+                    block_summaries,
+                    network_ban,
+                    network_ban_until as i64,
+                    penalized_by_node_id,
+                    penalized_at as i64
+                ],
+            )?;
+        } else {
+            conn.execute(
+                &format!(
+                    "INSERT INTO penalized_nodes(
+                 node_id,
+                 reason,
+                 block_summaries,
+                 network_ban,
+                 network_ban_until,
+                 penalized_by_node_id,
+                 penalized_at
+             )
+             VALUES (
+                 $1,
+                 $2,
+                 $3,
+                 $4,
+                 NULL,
+                 $5,
+                 TIMESTAMPTZ 'epoch' + ($6::bigint * INTERVAL '1 millisecond')
+             ){CONFLICT_SQL}"
+                ),
+                params![
+                    node_id,
+                    reason,
+                    block_summaries,
+                    network_ban,
+                    penalized_by_node_id,
+                    penalized_at as i64
+                ],
+            )?;
+        }
+        if network_ban {
+            if let Some(network_ban_until) = network_ban_until {
+                conn.execute(
+                    "INSERT INTO network_ban_windows(
+                         org_id,
+                         node_id,
+                         starts_at,
+                         until_ms,
+                         reason,
+                         penalized_by_node_id
+                     )
+                     VALUES ($1, $2, $3, $4, $5, $6)
+                     ON CONFLICT(org_id, node_id, starts_at) DO UPDATE SET
+                       until_ms = excluded.until_ms,
+                       reason = excluded.reason,
+                       penalized_by_node_id = excluded.penalized_by_node_id",
+                    params![
+                        self.org_id(),
+                        node_id,
+                        penalized_at as i64,
+                        network_ban_until as i64,
+                        reason,
+                        penalized_by_node_id
+                    ],
+                )?;
+            } else {
+                conn.execute(
+                    "INSERT INTO network_ban_windows(
+                         org_id,
+                         node_id,
+                         starts_at,
+                         until_ms,
+                         reason,
+                         penalized_by_node_id
+                     )
+                     VALUES ($1, $2, $3, NULL, $4, $5)
+                     ON CONFLICT(org_id, node_id, starts_at) DO UPDATE SET
+                       until_ms = excluded.until_ms,
+                       reason = excluded.reason,
+                       penalized_by_node_id = excluded.penalized_by_node_id",
+                    params![
+                        self.org_id(),
+                        node_id,
+                        penalized_at as i64,
+                        reason,
+                        penalized_by_node_id
+                    ],
+                )?;
+            }
+        }
         Ok(())
     }
 
@@ -253,6 +395,53 @@ impl PgStore {
         let exists = conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM penalized_nodes WHERE node_id = $1 AND block_summaries = TRUE)",
             params![node_id],
+            |r| r.get::<_, bool>(0),
+        )?;
+        Ok(exists)
+    }
+
+    pub fn is_node_network_banned(&self, node_id: &str) -> Result<bool> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
+        let exists = conn.query_row(
+            "SELECT EXISTS(
+                 SELECT 1
+                 FROM network_ban_windows
+                 WHERE org_id = $1
+                   AND node_id = $2
+                   AND (
+                     starts_at <= (EXTRACT(EPOCH FROM NOW()) * 1000)::BIGINT
+                     AND (
+                       until_ms IS NULL
+                       OR until_ms > (EXTRACT(EPOCH FROM NOW()) * 1000)::BIGINT
+                     )
+                   )
+             )",
+            params![self.org_id(), node_id],
+            |r| r.get::<_, bool>(0),
+        )?;
+        Ok(exists)
+    }
+
+    pub fn is_node_network_banned_at(&self, node_id: &str, at_ms: u64) -> Result<bool> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
+        let exists = conn.query_row(
+            "SELECT EXISTS(
+                 SELECT 1
+                 FROM network_ban_windows
+                 WHERE org_id = $1
+                   AND node_id = $2
+                   AND (
+                     until_ms IS NULL
+                     OR (starts_at <= $3 AND $3 < until_ms)
+                   )
+             )",
+            params![self.org_id(), node_id, at_ms as i64],
             |r| r.get::<_, bool>(0),
         )?;
         Ok(exists)
@@ -293,6 +482,7 @@ impl PgStore {
             "summary_revocations",
             "topic_messages",
             "topic_cursors",
+            "network_ban_windows",
         ] {
             let sql = format!("DELETE FROM {table} WHERE org_id = $1");
             conn.execute(&sql, params![&org_id])?;

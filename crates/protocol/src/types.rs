@@ -1267,6 +1267,10 @@ pub struct NodePenalizedPayload {
     pub revoked_summary_ids: Vec<String>,
     #[serde(default = "default_true")]
     pub block_summaries: bool,
+    #[serde(default)]
+    pub network_ban: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network_ban_until: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

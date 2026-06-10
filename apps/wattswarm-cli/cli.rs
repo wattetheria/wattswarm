@@ -267,6 +267,10 @@ enum GovernanceAction {
         revoked_event_ids: Vec<String>,
         #[arg(long = "revoke-summary")]
         revoked_summary_ids: Vec<String>,
+        #[arg(long = "network-ban", default_value_t = false)]
+        network_ban: bool,
+        #[arg(long = "network-ban-until")]
+        network_ban_until: Option<u64>,
         #[arg(long, default_value_t = 1)]
         epoch: u64,
     },
@@ -802,14 +806,19 @@ fn handle_governance(cmd: GovernanceCommand, state_dir: &Path, db_path: &Path) -
             reason,
             revoked_event_ids,
             revoked_summary_ids,
+            network_ban,
+            network_ban_until,
             epoch,
         } => (
             "penalize_node",
-            node.penalize_node(
+            node.penalize_node_with_options(
                 &node_id,
                 &reason,
                 revoked_event_ids,
                 revoked_summary_ids,
+                true,
+                network_ban,
+                network_ban_until,
                 epoch,
                 now,
             )?,

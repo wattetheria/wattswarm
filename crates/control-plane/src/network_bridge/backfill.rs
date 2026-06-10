@@ -152,6 +152,12 @@ pub(super) fn should_sync_event(node: &Node, event: &crate::types::Event) -> Res
     {
         return Ok(false);
     }
+    if node
+        .store
+        .is_node_network_banned_at(&event.author_node_id, event.created_at)?
+    {
+        return Ok(false);
+    }
     if matches!(
         event.payload,
         crate::types::EventPayload::EventRevoked(_)

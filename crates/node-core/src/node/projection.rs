@@ -517,10 +517,12 @@ impl Node {
                     .revoke_imported_task_outcomes_by_summary(&payload.target_summary_id)?;
             }
             EventPayload::NodePenalized(payload) => {
-                self.store.put_node_penalty(
+                self.store.put_node_penalty_with_network_ban(
                     &payload.penalized_node_id,
                     &payload.reason,
                     payload.block_summaries,
+                    payload.network_ban,
+                    payload.network_ban_until,
                     &event.author_node_id,
                     event.created_at,
                 )?;

@@ -33,7 +33,7 @@ use anyhow::{Context, Result, anyhow};
 use base64::Engine;
 use chrono::Utc;
 use serde_json::Value;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 pub struct Node {
     pub identity: NodeIdentity,

@@ -1,6 +1,12 @@
 use super::*;
 use crate::types::AgentEnvelope;
 
+#[derive(Debug, Clone, Copy)]
+struct NetworkBanInterval {
+    starts_at: u64,
+    until: Option<u64>,
+}
+
 impl Node {
     pub(crate) fn current_network_context_id(&self) -> String {
         self.store
@@ -114,11 +120,24 @@ impl Node {
         self.store.clear_projection()?;
         self.store
             .put_membership(&serde_json::to_string(&self.genesis_membership)?)?;
+        let mut network_ban_intervals: HashMap<String, Vec<NetworkBanInterval>> = HashMap::new();
         for (_, event) in events {
-            if !should_apply_event_during_replay(&event, &revoked_event_ids) {
+            if !should_apply_event_during_replay(&event, &revoked_event_ids, &network_ban_intervals)
+            {
                 continue;
             }
             self.apply_to_projection(&event)?;
+            if let EventPayload::NodePenalized(payload) = &event.payload
+                && payload.network_ban
+            {
+                network_ban_intervals
+                    .entry(payload.penalized_node_id.clone())
+                    .or_default()
+                    .push(NetworkBanInterval {
+                        starts_at: event.created_at,
+                        until: payload.network_ban_until,
+                    });
+            }
         }
         Ok(())
     }
@@ -865,6 +884,31 @@ impl Node {
         epoch: u64,
         created_at: u64,
     ) -> Result<Event> {
+        self.penalize_node_with_options(
+            penalized_node_id,
+            reason,
+            revoked_event_ids,
+            revoked_summary_ids,
+            true,
+            false,
+            None,
+            epoch,
+            created_at,
+        )
+    }
+
+    pub fn penalize_node_with_options(
+        &mut self,
+        penalized_node_id: &str,
+        reason: &str,
+        revoked_event_ids: Vec<String>,
+        revoked_summary_ids: Vec<String>,
+        block_summaries: bool,
+        network_ban: bool,
+        network_ban_until: Option<u64>,
+        epoch: u64,
+        created_at: u64,
+    ) -> Result<Event> {
         self.emit_at(
             epoch,
             EventPayload::NodePenalized(crate::types::NodePenalizedPayload {
@@ -872,7 +916,9 @@ impl Node {
                 reason: reason.to_owned(),
                 revoked_event_ids,
                 revoked_summary_ids,
-                block_summaries: true,
+                block_summaries,
+                network_ban,
+                network_ban_until,
             }),
             created_at,
         )
@@ -1292,7 +1338,9 @@ fn inline_candidate_output_ref(
 fn event_requires_projection_rebuild(payload: &EventPayload) -> bool {
     match payload {
         EventPayload::EventRevoked(_) => true,
-        EventPayload::NodePenalized(payload) => !payload.revoked_event_ids.is_empty(),
+        EventPayload::NodePenalized(payload) => {
+            !payload.revoked_event_ids.is_empty() || payload.network_ban
+        }
         _ => false,
     }
 }
@@ -1313,11 +1361,26 @@ fn collect_revoked_event_ids(events: &[(u64, Event)]) -> HashSet<String> {
     revoked
 }
 
-fn should_apply_event_during_replay(event: &Event, revoked_event_ids: &HashSet<String>) -> bool {
+fn should_apply_event_during_replay(
+    event: &Event,
+    revoked_event_ids: &HashSet<String>,
+    network_ban_intervals: &HashMap<String, Vec<NetworkBanInterval>>,
+) -> bool {
     match &event.payload {
         EventPayload::EventRevoked(_)
         | EventPayload::SummaryRevoked(_)
         | EventPayload::NodePenalized(_) => true,
-        _ => !revoked_event_ids.contains(&event.event_id),
+        _ => {
+            !revoked_event_ids.contains(&event.event_id)
+                && !network_ban_intervals
+                    .get(&event.author_node_id)
+                    .is_some_and(|intervals| {
+                        intervals.iter().any(|interval| {
+                            interval.until.is_none()
+                                || (interval.starts_at <= event.created_at
+                                    && event.created_at < interval.until.unwrap_or(u64::MAX))
+                        })
+                    })
+        }
     }
 }

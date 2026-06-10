@@ -271,6 +271,8 @@ fn mainnet_governance_events_require_genesis_author() {
             revoked_event_ids: Vec::new(),
             revoked_summary_ids: vec!["summary-bad".to_owned()],
             block_summaries: true,
+            network_ban: false,
+            network_ban_until: None,
         }),
     )
     .expect("non-genesis event");
@@ -286,6 +288,8 @@ fn mainnet_governance_events_require_genesis_author() {
             revoked_event_ids: Vec::new(),
             revoked_summary_ids: vec!["summary-bad".to_owned()],
             block_summaries: true,
+            network_ban: false,
+            network_ban_until: None,
         }),
     )
     .expect("genesis event");
@@ -466,6 +470,189 @@ fn network_params_update_event_rejects_non_genesis_event_author() {
     assert!(
         err.to_string()
             .contains("mainnet governance event author must be genesis node")
+    );
+}
+
+#[test]
+fn node_network_ban_rejects_future_events_and_filters_backfill() {
+    let genesis = NodeIdentity::random();
+    let banned = NodeIdentity::random();
+    let mut source = mainnet_node(genesis.clone());
+    let mut receiver = mainnet_node_with_genesis(NodeIdentity::random(), &genesis.node_id());
+
+    let penalty_event = build_event_for_external(
+        &genesis,
+        1,
+        100,
+        crate::types::EventPayload::NodePenalized(crate::types::NodePenalizedPayload {
+            penalized_node_id: banned.node_id(),
+            reason: "malicious relay".to_owned(),
+            revoked_event_ids: Vec::new(),
+            revoked_summary_ids: Vec::new(),
+            block_summaries: true,
+            network_ban: true,
+            network_ban_until: None,
+        }),
+    )
+    .expect("penalty event");
+    source
+        .ingest_remote(penalty_event.clone())
+        .expect("source applies network ban");
+    receiver
+        .ingest_remote(penalty_event)
+        .expect("receiver applies network ban");
+    assert!(
+        receiver
+            .store
+            .is_node_network_banned(&banned.node_id())
+            .expect("network ban state")
+    );
+
+    let policy_hash = receiver
+        .policy_registry()
+        .binding_for("vp.schema_only.v1", json!({}))
+        .expect("policy binding")
+        .policy_hash;
+    let banned_event = build_event_for_external(
+        &banned,
+        1,
+        110,
+        crate::types::EventPayload::TaskCreated(sample_contract(
+            "task-banned-after-ban",
+            policy_hash,
+        )),
+    )
+    .expect("banned author event");
+    let err = receiver
+        .ingest_remote(banned_event.clone())
+        .expect_err("banned author must be rejected");
+    assert!(err.to_string().contains("author node is network banned"));
+
+    source
+        .store
+        .append_event(&banned_event)
+        .expect("insert banned event fixture");
+    let response = backfill_response_for_request(
+        &source,
+        "receiver-peer",
+        &BackfillRequest {
+            scope: SwarmScope::Global,
+            from_event_seq: 0,
+            limit: 8,
+            feed_key: None,
+            known_event_ids: Vec::new(),
+        },
+        32,
+        64,
+    )
+    .expect("global backfill response");
+    assert!(
+        response
+            .events
+            .iter()
+            .all(|envelope| envelope.event.event_id != banned_event.event_id),
+        "backfill must not serve events authored by a network-banned node"
+    );
+}
+
+#[test]
+fn temporary_node_network_ban_expires_and_filters_only_ban_window_events() {
+    let genesis = NodeIdentity::random();
+    let banned = NodeIdentity::random();
+    let mut source = mainnet_node(genesis.clone());
+    let mut receiver = mainnet_node_with_genesis(NodeIdentity::random(), &genesis.node_id());
+    let policy_hash = receiver
+        .policy_registry()
+        .binding_for("vp.schema_only.v1", json!({}))
+        .expect("policy binding")
+        .policy_hash;
+
+    let penalty_event = build_event_for_external(
+        &genesis,
+        1,
+        100,
+        crate::types::EventPayload::NodePenalized(crate::types::NodePenalizedPayload {
+            penalized_node_id: banned.node_id(),
+            reason: "temporary relay abuse".to_owned(),
+            revoked_event_ids: Vec::new(),
+            revoked_summary_ids: Vec::new(),
+            block_summaries: true,
+            network_ban: true,
+            network_ban_until: Some(200),
+        }),
+    )
+    .expect("temporary penalty event");
+    source
+        .ingest_remote(penalty_event.clone())
+        .expect("source applies temporary network ban");
+    receiver
+        .ingest_remote(penalty_event)
+        .expect("receiver applies temporary network ban");
+
+    let during_ban_event = build_event_for_external(
+        &banned,
+        1,
+        150,
+        crate::types::EventPayload::TaskCreated(sample_contract(
+            "task-temp-ban-during",
+            policy_hash.clone(),
+        )),
+    )
+    .expect("during ban event");
+    let err = receiver
+        .ingest_remote(during_ban_event.clone())
+        .expect_err("temporary ban should reject events inside the window");
+    assert!(err.to_string().contains("author node is network banned"));
+
+    let after_ban_event = build_event_for_external(
+        &banned,
+        1,
+        250,
+        crate::types::EventPayload::TaskCreated(sample_contract(
+            "task-temp-ban-after",
+            policy_hash,
+        )),
+    )
+    .expect("after ban event");
+    receiver
+        .ingest_remote(after_ban_event.clone())
+        .expect("temporary ban should allow events after expiry");
+
+    source
+        .store
+        .append_event(&during_ban_event)
+        .expect("insert during-ban event fixture");
+    source
+        .store
+        .append_event(&after_ban_event)
+        .expect("insert after-ban event fixture");
+    let response = backfill_response_for_request(
+        &source,
+        "receiver-peer",
+        &BackfillRequest {
+            scope: SwarmScope::Global,
+            from_event_seq: 0,
+            limit: 8,
+            feed_key: None,
+            known_event_ids: Vec::new(),
+        },
+        32,
+        64,
+    )
+    .expect("global backfill response");
+    assert!(
+        response
+            .events
+            .iter()
+            .all(|envelope| envelope.event.event_id != during_ban_event.event_id),
+        "backfill must not serve events created inside a temporary ban window"
+    );
+    assert!(
+        response
+            .events
+            .iter()
+            .any(|envelope| envelope.event.event_id == after_ban_event.event_id),
+        "backfill should serve events created after a temporary ban expires"
     );
 }
 

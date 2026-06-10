@@ -38,6 +38,12 @@ impl Node {
         if event.payload.task_id().map(ToOwned::to_owned) != event.task_id {
             return Err(SwarmError::InvalidEvent("task_id mismatch".into()).into());
         }
+        if self
+            .store
+            .is_node_network_banned_at(&event.author_node_id, event.created_at)?
+        {
+            return Err(SwarmError::Unauthorized("author node is network banned".into()).into());
+        }
 
         self.validate_role_permission(event)?;
 
@@ -174,7 +180,7 @@ impl Node {
             }
             EventPayload::EventRevoked(payload) => self.validate_event_revoked(event, payload),
             EventPayload::SummaryRevoked(payload) => self.validate_summary_revoked(payload),
-            EventPayload::NodePenalized(payload) => self.validate_node_penalized(payload),
+            EventPayload::NodePenalized(payload) => self.validate_node_penalized(event, payload),
         }
     }
 
@@ -713,10 +719,29 @@ impl Node {
 
     pub(crate) fn validate_node_penalized(
         &self,
+        event: &Event,
         payload: &crate::types::NodePenalizedPayload,
     ) -> Result<()> {
         if payload.penalized_node_id.trim().is_empty() {
             return Err(SwarmError::InvalidEvent("penalized_node_id required".into()).into());
+        }
+        if payload.network_ban && payload.penalized_node_id == event.author_node_id {
+            return Err(
+                SwarmError::InvalidEvent("network ban cannot target event author".into()).into(),
+            );
+        }
+        if payload.network_ban_until.is_some() && !payload.network_ban {
+            return Err(
+                SwarmError::InvalidEvent("network_ban_until requires network_ban".into()).into(),
+            );
+        }
+        if let Some(network_ban_until) = payload.network_ban_until
+            && network_ban_until <= event.created_at
+        {
+            return Err(SwarmError::InvalidEvent(
+                "network_ban_until must be after event created_at".into(),
+            )
+            .into());
         }
         if payload.reason.trim().is_empty() || payload.reason.len() > MAX_INLINE_EVIDENCE_BYTES {
             return Err(SwarmError::InvalidEvent("penalty reason must be 1..64KB".into()).into());

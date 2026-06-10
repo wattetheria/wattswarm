@@ -1,3 +1,4 @@
+use std::time::{SystemTime, UNIX_EPOCH};
 use wattswarm_storage_core::types::NetworkKind;
 use wattswarm_storage_core::types::{
     Acceptance, ArtifactRef, Assignment, Budget, BudgetMode, Candidate, CheckpointCreatedPayload,
@@ -15,6 +16,110 @@ fn open_test_store() -> PgStore {
     PgStore::open_in_memory()
         .expect("open store")
         .for_org("local:test-storage:bootstrap")
+}
+
+#[test]
+fn node_penalty_tracks_summary_block_and_network_ban_independently() {
+    let store = open_test_store();
+    store
+        .put_node_penalty("node-a", "summary spam", true, "genesis", 100)
+        .expect("put summary penalty");
+    assert!(
+        store.is_node_penalized("node-a").expect("summary block"),
+        "summary penalty should block summaries"
+    );
+    assert!(
+        !store.is_node_network_banned("node-a").expect("network ban"),
+        "plain penalty should not ban network events"
+    );
+
+    store
+        .put_node_penalty_with_network_ban("node-a", "malicious", true, true, None, "genesis", 101)
+        .expect("put network ban");
+    assert!(
+        store.is_node_network_banned("node-a").expect("network ban"),
+        "network ban should be queryable separately"
+    );
+    store
+        .put_node_penalty("node-a", "still bad", true, "genesis", 102)
+        .expect("put later summary penalty");
+    assert!(
+        store.is_node_network_banned("node-a").expect("network ban"),
+        "later plain penalties must not clear an existing network ban"
+    );
+
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock")
+        .as_millis() as u64;
+    let until_ms = now_ms + 60_000;
+    store
+        .put_node_penalty_with_network_ban(
+            "node-temp",
+            "temporary abuse",
+            true,
+            true,
+            Some(until_ms),
+            "genesis",
+            now_ms,
+        )
+        .expect("put temporary network ban");
+    assert!(
+        store
+            .is_node_network_banned("node-temp")
+            .expect("temporary active ban"),
+        "temporary future ban should be active now"
+    );
+    assert!(
+        store
+            .is_node_network_banned_at("node-temp", now_ms + 1)
+            .expect("temporary ban window"),
+        "events inside the temporary ban window should be rejected"
+    );
+    assert!(
+        !store
+            .is_node_network_banned_at("node-temp", until_ms + 1)
+            .expect("temporary ban expiry"),
+        "events after the temporary ban window should be allowed"
+    );
+
+    store
+        .put_node_penalty_with_network_ban(
+            "node-window",
+            "first",
+            true,
+            true,
+            Some(200),
+            "genesis",
+            100,
+        )
+        .expect("put first temporary window");
+    store
+        .put_node_penalty_with_network_ban(
+            "node-window",
+            "second",
+            true,
+            true,
+            Some(400),
+            "genesis",
+            300,
+        )
+        .expect("put second temporary window");
+    assert!(
+        store
+            .is_node_network_banned_at("node-window", 150)
+            .expect("first window")
+    );
+    assert!(
+        !store
+            .is_node_network_banned_at("node-window", 250)
+            .expect("between windows")
+    );
+    assert!(
+        store
+            .is_node_network_banned_at("node-window", 350)
+            .expect("second window")
+    );
 }
 
 fn sample_topic_content_ref(digest: &str, producer: &str) -> ArtifactRef {

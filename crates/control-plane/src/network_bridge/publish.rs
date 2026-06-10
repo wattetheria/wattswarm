@@ -43,6 +43,9 @@ pub fn publish_pending_scoped_updates(
     local_node_id: &str,
     from_event_seq: u64,
 ) -> Result<u64> {
+    if node.store.is_node_network_banned(local_node_id)? {
+        return Ok(from_event_seq);
+    }
     let rows = node
         .store
         .load_events_page(from_event_seq, AUTO_PUBLISH_BATCH_LIMIT)?;

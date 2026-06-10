@@ -103,9 +103,20 @@ fn event_payload_kind_and_task_id_cover_task_and_non_task_variants() {
         revoked_event_ids: vec!["event-1".to_owned()],
         revoked_summary_ids: vec!["summary-1".to_owned()],
         block_summaries: true,
+        network_ban: true,
+        network_ban_until: Some(123_456),
     });
     assert_eq!(penalized_payload.kind(), EventKind::NodePenalized);
     assert_eq!(penalized_payload.task_id(), None);
+
+    let legacy_penalty: NodePenalizedPayload = serde_json::from_value(serde_json::json!({
+        "penalized_node_id": "node-old",
+        "reason": "legacy penalty",
+        "block_summaries": true
+    }))
+    .expect("legacy penalty payload");
+    assert!(!legacy_penalty.network_ban);
+    assert_eq!(legacy_penalty.network_ban_until, None);
 
     let topic_message_payload = EventPayload::TopicMessagePosted(TopicMessagePostedPayload {
         network_id: "default".to_owned(),

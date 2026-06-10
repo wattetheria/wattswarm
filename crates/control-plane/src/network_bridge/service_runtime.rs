@@ -322,7 +322,9 @@ impl NetworkBridgeService {
                     eprintln!("contact material request failed for {peer}: {err}");
                 }
                 let _ = self.request_backfill_for_peer_now(&peer, node)?;
-                if !node.store.is_node_penalized(&node.node_id())? {
+                if !node.store.is_node_penalized(&node.node_id())?
+                    && !node.store.is_node_network_banned(&node.node_id())?
+                {
                     for entry in node
                         .store
                         .list_local_reputation_snapshots(self.summary_reputation_limit)?

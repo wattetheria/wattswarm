@@ -3,7 +3,7 @@ use predicates::prelude::*;
 use std::process::Stdio;
 use std::sync::{Mutex, OnceLock};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tempfile::tempdir;
 use uuid::Uuid;
 use wattswarm::cli::sample_contract;
@@ -817,6 +817,13 @@ fn cli_governance_commands_require_mainnet_genesis_and_emit_events() {
             "\"event_kind\": \"SummaryRevoked\"",
         ));
 
+    let network_ban_until = (SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock")
+        .as_millis() as u64
+        + 60_000)
+        .to_string();
+
     cmd(schema.as_str())
         .args([
             "--state-dir",
@@ -833,6 +840,9 @@ fn cli_governance_commands_require_mainnet_genesis_and_emit_events() {
             "event-bad",
             "--revoke-summary",
             "summary-bad",
+            "--network-ban",
+            "--network-ban-until",
+            network_ban_until.as_str(),
         ])
         .assert()
         .success()

@@ -321,10 +321,12 @@ pub(super) fn mirror_summary_controls_to_parent_network(
             Ok(true)
         }
         crate::types::EventPayload::NodePenalized(payload) => {
-            parent_store.put_node_penalty(
+            parent_store.put_node_penalty_with_network_ban(
                 &payload.penalized_node_id,
                 &payload.reason,
                 payload.block_summaries,
+                payload.network_ban,
+                payload.network_ban_until,
                 &event.author_node_id,
                 event.created_at,
             )?;
