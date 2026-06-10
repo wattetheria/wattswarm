@@ -1,6 +1,7 @@
 use anyhow::{Context, Result, anyhow, bail};
 use iroh::EndpointId;
 use iroh_gossip::api::{Event as IrohGossipEvent, GossipSender};
+use iroh_gossip::proto::MIN_MAX_MESSAGE_SIZE;
 use n0_future::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -18,7 +19,8 @@ use wattswarm_network_transport_core::{
 };
 use wattswarm_network_transport_iroh::{
     DEFAULT_IROH_CONTROL_ALPN, IrohControlStreamRequest, IrohControlStreamResponse,
-    derive_gossip_topic_id, export_local_contact_material_for_network_peer_id,
+    IrohGossipRuntimeConfig, derive_gossip_topic_id,
+    export_local_contact_material_for_network_peer_id_with_gossip_config,
     install_local_contact_material_control_handler_for_network_peer_id,
     local_endpoint_id_from_state_dir, local_gossip_for_network_peer_id,
     register_remote_contact_material_for_network_peer_id,

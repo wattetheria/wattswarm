@@ -437,6 +437,19 @@ impl Node {
                     );
                 }
             }
+            EventPayload::NetworkParamsUpdated(payload) => {
+                self.store.put_signed_network_protocol_params(
+                    &payload.signed_params.network_id,
+                    &payload.signed_params,
+                )?;
+                let (_, head_hash) = self
+                    .store
+                    .network_control_head(&payload.signed_params.network_id)?;
+                if head_hash.as_deref() != Some(payload.control_record.control_hash.as_str()) {
+                    self.store
+                        .append_network_control_record(&payload.control_record)?;
+                }
+            }
             EventPayload::AdvisoryCreated(payload) => {
                 self.store.put_advisory_created(
                     &payload.advisory_id,

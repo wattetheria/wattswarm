@@ -204,12 +204,12 @@ impl NetworkP2pConfig {
             listen_addrs: config.listen_addrs,
             bootstrap_peers: config.bootstrap_peers,
             enable_local_discovery: false,
-            max_established_per_peer: 64,
-            gossip_mesh_d: 0,
-            gossip_mesh_d_low: 0,
-            gossip_mesh_d_high: 0,
-            gossip_mesh_heartbeat_ms: 0,
-            gossip_mesh_max_transmit_size: 0,
+            max_established_per_peer: config.max_established_per_peer,
+            gossip_mesh_d: config.gossip_mesh_d,
+            gossip_mesh_d_low: config.gossip_mesh_d_low,
+            gossip_mesh_d_high: config.gossip_mesh_d_high,
+            gossip_mesh_heartbeat_ms: config.gossip_mesh_heartbeat_ms,
+            gossip_mesh_max_transmit_size: config.gossip_mesh_max_transmit_size,
             max_backfill_events: config.max_backfill_events,
             max_backfill_events_hard_limit: config.max_backfill_events_hard_limit,
         }
@@ -221,6 +221,12 @@ impl NetworkP2pConfig {
             protocol_version: self.protocol_version.clone(),
             listen_addrs: self.listen_addrs.clone(),
             bootstrap_peers: self.bootstrap_peers.clone(),
+            max_established_per_peer: self.max_established_per_peer,
+            gossip_mesh_d: self.gossip_mesh_d,
+            gossip_mesh_d_low: self.gossip_mesh_d_low,
+            gossip_mesh_d_high: self.gossip_mesh_d_high,
+            gossip_mesh_heartbeat_ms: self.gossip_mesh_heartbeat_ms,
+            gossip_mesh_max_transmit_size: self.gossip_mesh_max_transmit_size,
             max_backfill_events: self.max_backfill_events,
             max_backfill_events_hard_limit: self.max_backfill_events_hard_limit,
             control_request_timeout_ms: 30_000,
@@ -857,7 +863,24 @@ mod tests {
         });
         assert_eq!(config.namespace.network, "swarmnet");
         assert_eq!(config.protocol_version, "/swarmnet/1");
+        assert_eq!(config.max_established_per_peer, 4);
+        assert_eq!(config.gossip_mesh_d, 9);
+        assert_eq!(config.gossip_mesh_d_low, 7);
+        assert_eq!(config.gossip_mesh_d_high, 12);
+        assert_eq!(config.gossip_mesh_heartbeat_ms, 2500);
+        assert_eq!(config.gossip_mesh_max_transmit_size, 1024 * 1024);
         assert_eq!(config.max_backfill_events, 1024);
+        assert_eq!(config.max_backfill_events_hard_limit, 4096);
+
+        let substrate = config.as_substrate();
+        assert_eq!(substrate.max_established_per_peer, 4);
+        assert_eq!(substrate.gossip_mesh_d, 9);
+        assert_eq!(substrate.gossip_mesh_d_low, 7);
+        assert_eq!(substrate.gossip_mesh_d_high, 12);
+        assert_eq!(substrate.gossip_mesh_heartbeat_ms, 2500);
+        assert_eq!(substrate.gossip_mesh_max_transmit_size, 1024 * 1024);
+        assert_eq!(substrate.max_backfill_events, 1024);
+        assert_eq!(substrate.max_backfill_events_hard_limit, 4096);
     }
 
     #[test]

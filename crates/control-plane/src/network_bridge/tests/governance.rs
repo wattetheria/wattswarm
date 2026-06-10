@@ -311,6 +311,199 @@ fn mainnet_governance_events_require_genesis_author() {
 }
 
 #[test]
+fn network_params_update_event_syncs_over_global_backfill_and_updates_control_log() {
+    let genesis = NodeIdentity::random();
+    let network_id = "mainnet-auth-test";
+    let mut source = mainnet_node(genesis.clone());
+    let mut receiver = mainnet_node_with_genesis(NodeIdentity::random(), &genesis.node_id());
+    let authority_set = crate::types::AuthoritySet::genesis(&genesis.node_id());
+    source
+        .store
+        .put_network_authority_set(network_id, &genesis, &authority_set)
+        .expect("source authority set");
+    receiver
+        .store
+        .put_network_authority_set(network_id, &genesis, &authority_set)
+        .expect("receiver authority set");
+    source
+        .store
+        .ensure_bootstrap_signed_network_protocol_params(network_id, &genesis)
+        .expect("source v1 params");
+    receiver
+        .store
+        .ensure_bootstrap_signed_network_protocol_params(network_id, &genesis)
+        .expect("receiver v1 params");
+
+    let params = crate::types::NetworkProtocolParams {
+        max_established_per_peer: 4,
+        gossip_mesh_d: 8,
+        gossip_mesh_d_low: 5,
+        gossip_mesh_d_high: 16,
+        ..crate::types::NetworkProtocolParams::default()
+    };
+    let signed = source
+        .store
+        .put_network_protocol_params(network_id, &genesis, &params)
+        .expect("source signs v2 params");
+    let record =
+        build_test_network_params_updated_record(&source.store, network_id, &genesis, &signed);
+    let event = build_event_for_external(
+        &genesis,
+        1,
+        200,
+        crate::types::EventPayload::NetworkParamsUpdated(
+            crate::types::NetworkParamsUpdatedPayload {
+                signed_params: signed.clone(),
+                control_record: record.clone(),
+            },
+        ),
+    )
+    .expect("network params event");
+    source
+        .ingest_remote(event)
+        .expect("source appends network params event");
+
+    let response = backfill_response_for_request(
+        &source,
+        "receiver-peer",
+        &BackfillRequest {
+            scope: SwarmScope::Global,
+            from_event_seq: 0,
+            limit: 8,
+            feed_key: None,
+            known_event_ids: Vec::new(),
+        },
+        32,
+        64,
+    )
+    .expect("global backfill response");
+    assert_eq!(response.events.len(), 1);
+    assert!(matches!(
+        response.events[0].event.payload,
+        crate::types::EventPayload::NetworkParamsUpdated(_)
+    ));
+
+    let applied =
+        ingest_backfill_response(&mut receiver, &response).expect("receiver applies event");
+    assert_eq!(applied, 1);
+    let verified = receiver
+        .store
+        .load_verified_network_protocol_params()
+        .expect("receiver verified params");
+    assert_eq!(verified.signed.params_hash, signed.params_hash);
+    assert_eq!(verified.signed.params.max_established_per_peer, 4);
+    assert_eq!(verified.signed.params.gossip_mesh_d_high, 16);
+    let records = receiver
+        .store
+        .load_network_control_range(network_id, 1, 8)
+        .expect("receiver control log");
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].control_hash, record.control_hash);
+
+    receiver
+        .replay_rebuild_projection()
+        .expect("projection replay remains idempotent");
+    let records_after_replay = receiver
+        .store
+        .load_network_control_range(network_id, 1, 8)
+        .expect("receiver control log after replay");
+    assert_eq!(records_after_replay.len(), 1);
+}
+
+#[test]
+fn network_params_update_event_rejects_non_genesis_event_author() {
+    let genesis = NodeIdentity::random();
+    let non_genesis = NodeIdentity::random();
+    let network_id = "mainnet-auth-test";
+    let source = mainnet_node(genesis.clone());
+    let mut receiver = mainnet_node_with_genesis(NodeIdentity::random(), &genesis.node_id());
+    let authority_set = crate::types::AuthoritySet::genesis(&genesis.node_id());
+    source
+        .store
+        .put_network_authority_set(network_id, &genesis, &authority_set)
+        .expect("source authority set");
+    receiver
+        .store
+        .put_network_authority_set(network_id, &genesis, &authority_set)
+        .expect("receiver authority set");
+    source
+        .store
+        .ensure_bootstrap_signed_network_protocol_params(network_id, &genesis)
+        .expect("source v1 params");
+    receiver
+        .store
+        .ensure_bootstrap_signed_network_protocol_params(network_id, &genesis)
+        .expect("receiver v1 params");
+    let signed = source
+        .store
+        .put_network_protocol_params(
+            network_id,
+            &genesis,
+            &crate::types::NetworkProtocolParams {
+                max_established_per_peer: 4,
+                ..crate::types::NetworkProtocolParams::default()
+            },
+        )
+        .expect("source signs v2 params");
+    let record =
+        build_test_network_params_updated_record(&source.store, network_id, &genesis, &signed);
+    let event = build_event_for_external(
+        &non_genesis,
+        1,
+        200,
+        crate::types::EventPayload::NetworkParamsUpdated(
+            crate::types::NetworkParamsUpdatedPayload {
+                signed_params: signed,
+                control_record: record,
+            },
+        ),
+    )
+    .expect("non-genesis event");
+
+    let err = receiver
+        .ingest_remote(event)
+        .expect_err("non-genesis author must be rejected");
+    assert!(
+        err.to_string()
+            .contains("mainnet governance event author must be genesis node")
+    );
+}
+
+fn build_test_network_params_updated_record(
+    store: &PgStore,
+    network_id: &str,
+    signer: &NodeIdentity,
+    signed: &crate::types::SignedNetworkProtocolParamsEnvelope,
+) -> crate::types::NetworkControlRecord {
+    let (head_seq, prev_control_hash) = store
+        .network_control_head(network_id)
+        .expect("control head");
+    let payload = json!({ "signed_params": signed });
+    let payload_hash =
+        crate::storage::network_control_payload_hash(&payload).expect("payload hash");
+    let mut record = crate::types::NetworkControlRecord {
+        network_id: network_id.to_owned(),
+        control_seq: head_seq + 1,
+        prev_control_hash,
+        control_hash: String::new(),
+        kind: crate::types::NetworkControlKind::NetworkParamsUpdated,
+        payload_hash,
+        payload,
+        authority_set_id: 0,
+        signatures: Vec::new(),
+        created_at: 200,
+        activation: None,
+    };
+    record.control_hash =
+        crate::storage::network_control_record_hash(&record).expect("control hash");
+    record.signatures.push(crate::types::AuthoritySignature {
+        signer_node_id: signer.node_id(),
+        signature_hex: signer.sign_bytes(record.control_hash.as_bytes()),
+    });
+    record
+}
+
+#[test]
 fn ordinary_task_and_topic_events_do_not_require_membership_roles() {
     let local = NodeIdentity::random();
     let remote = NodeIdentity::random();

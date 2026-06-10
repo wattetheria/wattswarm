@@ -210,6 +210,7 @@ impl TopicCatalog {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct SubstrateConfig {
     pub namespace: TopicNamespace,
     pub protocol_version: String,
@@ -217,6 +218,12 @@ pub struct SubstrateConfig {
     pub listen_addrs: Vec<String>,
     #[serde(default)]
     pub bootstrap_peers: Vec<String>,
+    pub max_established_per_peer: u32,
+    pub gossip_mesh_d: usize,
+    pub gossip_mesh_d_low: usize,
+    pub gossip_mesh_d_high: usize,
+    pub gossip_mesh_heartbeat_ms: u64,
+    pub gossip_mesh_max_transmit_size: usize,
     pub max_backfill_events: usize,
     pub max_backfill_events_hard_limit: usize,
     pub control_request_timeout_ms: u64,
@@ -229,6 +236,12 @@ impl Default for SubstrateConfig {
             protocol_version: "wattswarm/iroh/1".to_owned(),
             listen_addrs: Vec::new(),
             bootstrap_peers: Vec::new(),
+            max_established_per_peer: 2,
+            gossip_mesh_d: 6,
+            gossip_mesh_d_low: 4,
+            gossip_mesh_d_high: 12,
+            gossip_mesh_heartbeat_ms: 1_000,
+            gossip_mesh_max_transmit_size: 512 * 1024,
             max_backfill_events: 512,
             max_backfill_events_hard_limit: 8192,
             control_request_timeout_ms: DEFAULT_SUBSTRATE_CONTROL_REQUEST_TIMEOUT_MS,
@@ -240,6 +253,30 @@ impl SubstrateConfig {
     pub fn validate(&self) -> Result<()> {
         if self.protocol_version.trim().is_empty() {
             bail!("network protocol version cannot be empty");
+        }
+        if self.max_established_per_peer == 0 {
+            bail!("max_established_per_peer must be > 0");
+        }
+        if self.gossip_mesh_d == 0 {
+            bail!("gossip_mesh_d must be > 0");
+        }
+        if self.gossip_mesh_d_low == 0 {
+            bail!("gossip_mesh_d_low must be > 0");
+        }
+        if self.gossip_mesh_d_high == 0 {
+            bail!("gossip_mesh_d_high must be > 0");
+        }
+        if self.gossip_mesh_d_low > self.gossip_mesh_d {
+            bail!("gossip_mesh_d_low must be <= gossip_mesh_d");
+        }
+        if self.gossip_mesh_d > self.gossip_mesh_d_high {
+            bail!("gossip_mesh_d must be <= gossip_mesh_d_high");
+        }
+        if self.gossip_mesh_heartbeat_ms == 0 {
+            bail!("gossip_mesh_heartbeat_ms must be > 0");
+        }
+        if self.gossip_mesh_max_transmit_size < MIN_MAX_MESSAGE_SIZE {
+            bail!("gossip_mesh_max_transmit_size must be >= {MIN_MAX_MESSAGE_SIZE}");
         }
         if self.max_backfill_events == 0 {
             bail!("max_backfill_events must be > 0");
@@ -254,6 +291,16 @@ impl SubstrateConfig {
             Self::parse_bootstrap_peer(peer)?;
         }
         Ok(())
+    }
+
+    pub(crate) fn iroh_gossip_runtime_config(&self) -> IrohGossipRuntimeConfig {
+        IrohGossipRuntimeConfig {
+            max_message_size: self.gossip_mesh_max_transmit_size,
+            active_view_capacity: self.gossip_mesh_d,
+            passive_view_capacity: self.gossip_mesh_d_high,
+            shuffle_active_view_count: self.gossip_mesh_d_low,
+            maintenance_interval: Duration::from_millis(self.gossip_mesh_heartbeat_ms),
+        }
     }
 
     pub fn parse_listen_addrs(&self) -> Result<Vec<NetworkAddress>> {

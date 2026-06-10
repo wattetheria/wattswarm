@@ -89,9 +89,7 @@ impl Node {
             EventPayload::TaskClaimDecided(payload) => {
                 self.require_task(&payload.task_id).map(|_| ())
             }
-            EventPayload::TaskCompleted(payload) => {
-                self.require_task(&payload.task_id).map(|_| ())
-            }
+            EventPayload::TaskCompleted(payload) => self.require_task(&payload.task_id).map(|_| ()),
             EventPayload::TaskCompletionDecided(payload) => {
                 self.require_task(&payload.task_id).map(|_| ())
             }
@@ -160,6 +158,9 @@ impl Node {
                 self.validate_membership_update(event, payload)
             }
             EventPayload::PolicyTuned(payload) => self.validate_policy_tuned(payload),
+            EventPayload::NetworkParamsUpdated(payload) => {
+                self.validate_network_params_updated(event, payload)
+            }
             EventPayload::AdvisoryCreated(payload) => self.validate_advisory_created(payload),
             EventPayload::AdvisoryApproved(payload) => {
                 self.validate_advisory_approved(event, payload)
@@ -216,6 +217,7 @@ impl Node {
             EventPayload::AgentPaymentPosted(_) => (None, None),
             EventPayload::MembershipUpdated(_) => (Some(Role::Finalizer), None),
             EventPayload::PolicyTuned(_) => (Some(Role::Finalizer), None),
+            EventPayload::NetworkParamsUpdated(_) => (None, None),
             EventPayload::AdvisoryCreated(_) => (Some(Role::Committer), None),
             EventPayload::AdvisoryApproved(_) => (Some(Role::Finalizer), None),
             EventPayload::AdvisoryApplied(_) => (Some(Role::Committer), None),
@@ -249,6 +251,7 @@ impl Node {
         if !matches!(
             event.payload,
             EventPayload::MembershipUpdated(_)
+                | EventPayload::NetworkParamsUpdated(_)
                 | EventPayload::EventRevoked(_)
                 | EventPayload::SummaryRevoked(_)
                 | EventPayload::NodePenalized(_)
@@ -265,6 +268,59 @@ impl Node {
             .into());
         }
         Ok(true)
+    }
+
+    fn validate_network_params_updated(
+        &self,
+        event: &Event,
+        payload: &NetworkParamsUpdatedPayload,
+    ) -> Result<()> {
+        if event.author_node_id != payload.signed_params.signed_by {
+            return Err(SwarmError::Unauthorized(
+                "network params event author must match signed params signer".into(),
+            )
+            .into());
+        }
+        if payload.control_record.kind != NetworkControlKind::NetworkParamsUpdated {
+            return Err(SwarmError::InvalidEvent(
+                "network params control record kind mismatch".into(),
+            )
+            .into());
+        }
+        if payload.control_record.network_id != payload.signed_params.network_id {
+            return Err(SwarmError::InvalidEvent(
+                "network params control record network_id mismatch".into(),
+            )
+            .into());
+        }
+        let record_signed_params = payload
+            .control_record
+            .payload
+            .get("signed_params")
+            .ok_or_else(|| {
+                SwarmError::InvalidEvent(
+                    "network params control payload missing signed_params".into(),
+                )
+            })?;
+        let record_signed_params: crate::types::SignedNetworkProtocolParamsEnvelope =
+            serde_json::from_value(record_signed_params.clone()).map_err(|err| {
+                SwarmError::InvalidEvent(format!(
+                    "network params control payload invalid signed_params: {err}"
+                ))
+            })?;
+        if record_signed_params != payload.signed_params {
+            return Err(SwarmError::InvalidEvent(
+                "network params control payload signed_params mismatch".into(),
+            )
+            .into());
+        }
+        self.store.validate_signed_network_protocol_params(
+            &payload.signed_params.network_id,
+            &payload.signed_params,
+        )?;
+        self.store
+            .validate_network_control_record(&payload.control_record)?;
+        Ok(())
     }
 
     fn validate_feed_subscription_updated(

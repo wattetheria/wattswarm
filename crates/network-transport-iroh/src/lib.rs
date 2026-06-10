@@ -9,8 +9,11 @@ use iroh::{
 use iroh_blobs::{
     BlobFormat, BlobsProtocol, Hash as IrohBlobHash, HashAndFormat, store::fs::FsStore,
 };
-use iroh_gossip::Gossip;
 use iroh_gossip::TopicId as IrohGossipTopicId;
+use iroh_gossip::{
+    Gossip,
+    proto::{HyparviewConfig, PlumtreeConfig},
+};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::HashMap;
@@ -42,8 +45,50 @@ const MAX_FETCH_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_CONTROL_REQUEST_BYTES: usize = 1024 * 1024;
 const MAX_CONTROL_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_GOSSIP_MESSAGE_BYTES: usize = 512 * 1024;
+const DEFAULT_GOSSIP_ACTIVE_VIEW_CAPACITY: usize = 6;
+const DEFAULT_GOSSIP_PASSIVE_VIEW_CAPACITY: usize = 12;
+const DEFAULT_GOSSIP_SHUFFLE_ACTIVE_VIEW_COUNT: usize = 4;
+const DEFAULT_GOSSIP_MAINTENANCE_INTERVAL_MS: u64 = 1_000;
 const DEFAULT_IROH_DATA_PLANE_START_TIMEOUT_MS: u64 = 120_000;
 const DEFAULT_IROH_CONTROL_STREAM_TIMEOUT_MS: u64 = 30_000;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IrohGossipRuntimeConfig {
+    pub max_message_size: usize,
+    pub active_view_capacity: usize,
+    pub passive_view_capacity: usize,
+    pub shuffle_active_view_count: usize,
+    pub maintenance_interval: Duration,
+}
+
+impl Default for IrohGossipRuntimeConfig {
+    fn default() -> Self {
+        Self {
+            max_message_size: MAX_GOSSIP_MESSAGE_BYTES,
+            active_view_capacity: DEFAULT_GOSSIP_ACTIVE_VIEW_CAPACITY,
+            passive_view_capacity: DEFAULT_GOSSIP_PASSIVE_VIEW_CAPACITY,
+            shuffle_active_view_count: DEFAULT_GOSSIP_SHUFFLE_ACTIVE_VIEW_COUNT,
+            maintenance_interval: Duration::from_millis(DEFAULT_GOSSIP_MAINTENANCE_INTERVAL_MS),
+        }
+    }
+}
+
+impl IrohGossipRuntimeConfig {
+    fn membership_config(&self) -> HyparviewConfig {
+        let mut config = HyparviewConfig::default();
+        config.active_view_capacity = self.active_view_capacity;
+        config.passive_view_capacity = self.passive_view_capacity;
+        config.shuffle_active_view_count = self.shuffle_active_view_count;
+        config.shuffle_interval = self.maintenance_interval;
+        config
+    }
+
+    fn broadcast_config(&self) -> PlumtreeConfig {
+        let mut config = PlumtreeConfig::default();
+        config.cache_evict_interval = self.maintenance_interval;
+        config
+    }
+}
 
 pub fn derive_gossip_topic_id(
     network_id: &str,
@@ -294,6 +339,7 @@ struct IrohDataPlaneService {
     endpoint: Endpoint,
     router: Router,
     gossip: Gossip,
+    gossip_config: IrohGossipRuntimeConfig,
     blob_store: FsStore,
     adapter: IrohTransportAdapter,
     endpoint_options: IrohEndpointOptions,
@@ -644,7 +690,11 @@ fn serve_fetch_request(
 }
 
 impl IrohDataPlaneService {
-    fn new(state_dir: &Path, network_peer_id: &str) -> Result<Arc<Self>> {
+    fn new(
+        state_dir: &Path,
+        network_peer_id: &str,
+        gossip_config: IrohGossipRuntimeConfig,
+    ) -> Result<Arc<Self>> {
         let secret_key = load_secret_key_from_state_dir(state_dir)?;
         let endpoint_id = endpoint_id_from_secret_key(&secret_key);
         if !network_peer_id_matches_endpoint_id(network_peer_id, endpoint_id) {
@@ -683,7 +733,9 @@ impl IrohDataPlaneService {
             let blob_store = FsStore::load(iroh_blob_store_path(state_dir)).await?;
             let blobs = BlobsProtocol::new(&blob_store, None);
             let gossip = Gossip::builder()
-                .max_message_size(MAX_GOSSIP_MESSAGE_BYTES)
+                .max_message_size(gossip_config.max_message_size)
+                .membership_config(gossip_config.membership_config())
+                .broadcast_config(gossip_config.broadcast_config())
                 .spawn(endpoint.clone());
             let router = Router::builder(endpoint.clone())
                 .accept(
@@ -710,6 +762,7 @@ impl IrohDataPlaneService {
             endpoint,
             router,
             gossip,
+            gossip_config,
             blob_store,
             adapter,
             endpoint_options,
@@ -981,6 +1034,20 @@ fn ensure_local_iroh_data_plane_for_network_peer_id(
     state_dir: &Path,
     network_peer_id: &str,
 ) -> Result<Arc<IrohDataPlaneService>> {
+    ensure_local_iroh_data_plane_for_network_peer_id_with_gossip_config(
+        state_dir,
+        network_peer_id,
+        IrohGossipRuntimeConfig::default(),
+        false,
+    )
+}
+
+fn ensure_local_iroh_data_plane_for_network_peer_id_with_gossip_config(
+    state_dir: &Path,
+    network_peer_id: &str,
+    gossip_config: IrohGossipRuntimeConfig,
+    require_config_match: bool,
+) -> Result<Arc<IrohDataPlaneService>> {
     let mut services = local_iroh_data_planes()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -991,9 +1058,15 @@ fn ensure_local_iroh_data_plane_for_network_peer_id(
                 state_dir.display()
             );
         }
+        if require_config_match && existing.gossip_config != gossip_config {
+            bail!(
+                "iroh data plane already exists for {} with different gossip runtime config",
+                state_dir.display()
+            );
+        }
         return Ok(existing.clone());
     }
-    let service = IrohDataPlaneService::new(state_dir, network_peer_id)?;
+    let service = IrohDataPlaneService::new(state_dir, network_peer_id, gossip_config)?;
     services.insert(state_dir.to_path_buf(), service.clone());
     Ok(service)
 }
@@ -1005,6 +1078,21 @@ pub fn export_local_contact_material_for_network_peer_id(
 ) -> Result<TransportContactMaterial> {
     ensure_local_iroh_data_plane_for_network_peer_id(state_dir, network_peer_id)?
         .export_contact_material(generated_at)
+}
+
+pub fn export_local_contact_material_for_network_peer_id_with_gossip_config(
+    state_dir: &Path,
+    network_peer_id: &str,
+    generated_at: u64,
+    gossip_config: IrohGossipRuntimeConfig,
+) -> Result<TransportContactMaterial> {
+    ensure_local_iroh_data_plane_for_network_peer_id_with_gossip_config(
+        state_dir,
+        network_peer_id,
+        gossip_config,
+        true,
+    )?
+    .export_contact_material(generated_at)
 }
 
 pub fn fetch_direct_data_for_network_peer_id(
@@ -1254,6 +1342,32 @@ mod tests {
         let extra: IrohTransportMaterial =
             serde_json::from_value(material.extra.clone()).expect("extra");
         assert_eq!(extra.direct_addrs, vec!["127.0.0.1:7777".to_owned()]);
+    }
+
+    #[test]
+    fn local_data_plane_applies_gossip_runtime_config() {
+        let dir = tempdir().expect("tempdir");
+        seed_state_dir(dir.path(), [31u8; 32]);
+        let endpoint_id = local_endpoint_id_from_state_dir(dir.path()).expect("endpoint id");
+        let config = IrohGossipRuntimeConfig {
+            max_message_size: 1024,
+            active_view_capacity: 3,
+            passive_view_capacity: 8,
+            shuffle_active_view_count: 2,
+            maintenance_interval: Duration::from_millis(250),
+        };
+
+        let service = ensure_local_iroh_data_plane_for_network_peer_id_with_gossip_config(
+            dir.path(),
+            &endpoint_id.to_string(),
+            config.clone(),
+            true,
+        )
+        .expect("data plane");
+
+        assert_eq!(service.gossip.max_message_size(), 1024);
+        assert_eq!(service.gossip_config, config);
+        shutdown_local_iroh_data_plane(dir.path());
     }
 
     #[test]

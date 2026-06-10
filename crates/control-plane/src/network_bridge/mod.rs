@@ -79,9 +79,8 @@ pub use summary::{
 use agent_delivery::{build_agent_event, topic_message_requires_reply};
 use agent_delivery::{
     build_agent_event_with_agent_envelope, deliver_agent_event_to_local_executor,
-    task_claim_agent_event, task_claim_decision_agent_event,
-    task_completion_decision_agent_event, task_result_agent_event, task_settled_agent_event,
-    topic_message_agent_event,
+    task_claim_agent_event, task_claim_decision_agent_event, task_completion_decision_agent_event,
+    task_result_agent_event, task_settled_agent_event, topic_message_agent_event,
 };
 use backfill::{
     BACKFILL_KNOWN_EVENT_IDS_LIMIT, recent_backfill_lane_event_ids, should_publish_summaries,

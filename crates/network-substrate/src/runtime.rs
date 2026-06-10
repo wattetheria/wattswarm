@@ -150,16 +150,19 @@ pub struct SubstrateRuntime {
     control_rx: Receiver<SubstrateRuntimeEvent>,
     pending_events: VecDeque<SubstrateRuntimeEvent>,
     remote_contacts: HashMap<String, TransportContactMaterial>,
+    established_per_peer: HashMap<NetworkNodeId, u32>,
+    suppressed_established_per_peer: HashMap<NetworkNodeId, u32>,
     counters: IrohRuntimeCounters,
     next_request_id: u64,
 }
 
 impl SubstrateRuntime {
     pub fn new(node: SubstrateNode) -> Result<Self> {
-        let local_contact = export_local_contact_material_for_network_peer_id(
+        let local_contact = export_local_contact_material_for_network_peer_id_with_gossip_config(
             node.state_dir(),
             node.local_peer_id.as_str(),
             unix_timestamp_millis() / 1000,
+            node.config.iroh_gossip_runtime_config(),
         )?;
         install_local_contact_material_control_handler_for_network_peer_id(
             node.state_dir(),
@@ -188,6 +191,8 @@ impl SubstrateRuntime {
             control_rx,
             pending_events: VecDeque::new(),
             remote_contacts: HashMap::new(),
+            established_per_peer: HashMap::new(),
+            suppressed_established_per_peer: HashMap::new(),
             counters: IrohRuntimeCounters::default(),
             next_request_id: 1,
         };
@@ -386,6 +391,13 @@ impl SubstrateRuntime {
             payload: payload.to_vec(),
         };
         let bytes = message.encode_json()?;
+        if bytes.len() > self.config.gossip_mesh_max_transmit_size {
+            bail!(
+                "gossip message size {} exceeds configured max {}",
+                bytes.len(),
+                self.config.gossip_mesh_max_transmit_size
+            );
+        }
         let subscription = self.subscription_for(scope, kind)?;
         self.ensure_gossip_topic(subscription.clone())?;
         let topic = self
@@ -726,6 +738,13 @@ impl SubstrateRuntime {
                     delivered_from,
                     bytes,
                 } => {
+                    if bytes.len() > self.config.gossip_mesh_max_transmit_size {
+                        self.counters.malformed_gossip_notifications = self
+                            .counters
+                            .malformed_gossip_notifications
+                            .saturating_add(1);
+                        continue;
+                    }
                     let message = RawGossipMessage::decode_json(&bytes)?;
                     if message.scope != subscription.scope || message.kind != subscription.kind {
                         self.counters.scope_kind_mismatch_drops =
@@ -739,26 +758,59 @@ impl SubstrateRuntime {
                         });
                 }
                 IrohGossipInbound::NeighborUp { peer } => {
+                    let peer = NetworkNodeId::new(peer)?;
+                    let established = self.established_per_peer.get(&peer).copied().unwrap_or(0);
+                    if established >= self.config.max_established_per_peer {
+                        self.suppressed_established_per_peer
+                            .entry(peer)
+                            .and_modify(|count| *count = count.saturating_add(1))
+                            .or_insert(1);
+                        self.counters.request_limit_drops =
+                            self.counters.request_limit_drops.saturating_add(1);
+                        continue;
+                    }
+                    let next_established = established.saturating_add(1);
+                    self.established_per_peer
+                        .insert(peer.clone(), next_established);
                     let remote_addr = self
                         .remote_contacts
                         .get(peer.as_str())
                         .and_then(|contact| contact.metadata.listen_addrs.first())
                         .and_then(|addr| NetworkAddress::new(addr.clone()).ok())
                         .unwrap_or_else(|| {
-                            NetworkAddress::new(peer.clone())
+                            NetworkAddress::new(peer.to_string())
                                 .expect("iroh node id is a network address")
                         });
                     self.pending_events
                         .push_back(SubstrateRuntimeEvent::ConnectionEstablished {
-                            peer: NetworkNodeId::new(peer)?,
+                            peer,
                             remote_addr,
                         });
                 }
                 IrohGossipInbound::NeighborDown { peer } => {
+                    let peer = NetworkNodeId::new(peer)?;
+                    if let Some(suppressed) = self.suppressed_established_per_peer.get_mut(&peer) {
+                        *suppressed = suppressed.saturating_sub(1);
+                        if *suppressed == 0 {
+                            self.suppressed_established_per_peer.remove(&peer);
+                        }
+                        continue;
+                    }
+                    let remaining_established = match self.established_per_peer.get_mut(&peer) {
+                        Some(established) => {
+                            *established = established.saturating_sub(1);
+                            let remaining = *established;
+                            if remaining == 0 {
+                                self.established_per_peer.remove(&peer);
+                            }
+                            remaining
+                        }
+                        None => 0,
+                    };
                     self.pending_events
                         .push_back(SubstrateRuntimeEvent::ConnectionClosed {
-                            peer: NetworkNodeId::new(peer)?,
-                            remaining_established: 0,
+                            peer,
+                            remaining_established,
                         });
                 }
                 IrohGossipInbound::Malformed {
@@ -1041,5 +1093,108 @@ impl Drop for SubstrateRuntime {
             }
             Err(_) => drop(runtime),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn runtime_for_test(config: SubstrateConfig) -> SubstrateRuntime {
+        let (gossip_tx, gossip_rx) = mpsc::channel();
+        let (control_tx, control_rx) = mpsc::channel();
+        let state_dir = std::env::temp_dir().join(format!(
+            "wattswarm-substrate-runtime-test-{}",
+            unix_timestamp_millis()
+        ));
+        SubstrateRuntime {
+            config,
+            runtime: Some(Runtime::new().expect("tokio runtime")),
+            state_dir,
+            local_peer_id: NetworkNodeId::random(),
+            local_endpoint_id: "local".to_owned(),
+            local_listen_addrs: Vec::new(),
+            subscriptions: HashSet::new(),
+            gossip_topics: HashMap::new(),
+            gossip_tx,
+            gossip_rx,
+            control_tx,
+            control_rx,
+            pending_events: VecDeque::new(),
+            remote_contacts: HashMap::new(),
+            established_per_peer: HashMap::new(),
+            suppressed_established_per_peer: HashMap::new(),
+            counters: IrohRuntimeCounters::default(),
+            next_request_id: 1,
+        }
+    }
+
+    #[test]
+    fn neighbor_events_respect_max_established_per_peer() {
+        let peer = NetworkNodeId::random();
+        let mut runtime = runtime_for_test(SubstrateConfig {
+            max_established_per_peer: 1,
+            ..SubstrateConfig::default()
+        });
+
+        runtime
+            .gossip_tx
+            .send(IrohGossipInbound::NeighborUp {
+                peer: peer.to_string(),
+            })
+            .unwrap();
+        runtime
+            .gossip_tx
+            .send(IrohGossipInbound::NeighborUp {
+                peer: peer.to_string(),
+            })
+            .unwrap();
+
+        match runtime.try_next_event().unwrap() {
+            Some(SubstrateRuntimeEvent::ConnectionEstablished { peer: got, .. }) => {
+                assert_eq!(got, peer)
+            }
+            other => panic!("expected first connection, got {other:?}"),
+        }
+        assert!(runtime.try_next_event().unwrap().is_none());
+        assert_eq!(runtime.counters.request_limit_drops, 1);
+
+        runtime
+            .gossip_tx
+            .send(IrohGossipInbound::NeighborDown {
+                peer: peer.to_string(),
+            })
+            .unwrap();
+        assert!(runtime.try_next_event().unwrap().is_none());
+
+        runtime
+            .gossip_tx
+            .send(IrohGossipInbound::NeighborDown {
+                peer: peer.to_string(),
+            })
+            .unwrap();
+        match runtime.try_next_event().unwrap() {
+            Some(SubstrateRuntimeEvent::ConnectionClosed {
+                peer: got,
+                remaining_established,
+            }) => {
+                assert_eq!(got, peer);
+                assert_eq!(remaining_established, 0);
+            }
+            other => panic!("expected final disconnection, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn publish_rejects_oversized_gossip_payload() {
+        let mut runtime = runtime_for_test(SubstrateConfig {
+            gossip_mesh_max_transmit_size: MIN_MAX_MESSAGE_SIZE,
+            ..SubstrateConfig::default()
+        });
+
+        let err = runtime
+            .publish(&SwarmScope::Global, GossipKind::Events, &[b'x'; 1024])
+            .expect_err("oversized publish must fail");
+        assert!(err.to_string().contains("exceeds configured max"));
     }
 }

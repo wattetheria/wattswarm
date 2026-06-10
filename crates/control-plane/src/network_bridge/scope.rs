@@ -167,6 +167,7 @@ pub(super) fn event_scope(node: &Node, event: &crate::types::Event) -> Result<Sw
         }
         crate::types::EventPayload::MembershipUpdated(_)
         | crate::types::EventPayload::PolicyTuned(_)
+        | crate::types::EventPayload::NetworkParamsUpdated(_)
         | crate::types::EventPayload::CheckpointCreated(_)
         | crate::types::EventPayload::AdvisoryCreated(_)
         | crate::types::EventPayload::AdvisoryApproved(_)

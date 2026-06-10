@@ -56,6 +56,83 @@ fn backfill_request_validate_enforces_bounds() {
 }
 
 #[test]
+fn substrate_config_validate_enforces_network_protocol_bounds() {
+    let config = SubstrateConfig::default();
+    config.validate().unwrap();
+
+    assert!(
+        SubstrateConfig {
+            max_established_per_peer: 0,
+            ..config.clone()
+        }
+        .validate()
+        .is_err()
+    );
+    assert!(
+        SubstrateConfig {
+            gossip_mesh_d: 0,
+            ..config.clone()
+        }
+        .validate()
+        .is_err()
+    );
+    assert!(
+        SubstrateConfig {
+            gossip_mesh_d_low: config.gossip_mesh_d + 1,
+            ..config.clone()
+        }
+        .validate()
+        .is_err()
+    );
+    assert!(
+        SubstrateConfig {
+            gossip_mesh_d_high: config.gossip_mesh_d - 1,
+            ..config.clone()
+        }
+        .validate()
+        .is_err()
+    );
+    assert!(
+        SubstrateConfig {
+            gossip_mesh_heartbeat_ms: 0,
+            ..config.clone()
+        }
+        .validate()
+        .is_err()
+    );
+    assert!(
+        SubstrateConfig {
+            gossip_mesh_max_transmit_size: MIN_MAX_MESSAGE_SIZE - 1,
+            ..config
+        }
+        .validate()
+        .is_err()
+    );
+}
+
+#[test]
+fn substrate_config_maps_gossip_runtime_config() {
+    let config = SubstrateConfig {
+        gossip_mesh_d: 9,
+        gossip_mesh_d_low: 3,
+        gossip_mesh_d_high: 15,
+        gossip_mesh_heartbeat_ms: 2_500,
+        gossip_mesh_max_transmit_size: 1024 * 1024,
+        ..SubstrateConfig::default()
+    };
+
+    let runtime_config = config.iroh_gossip_runtime_config();
+    assert_eq!(runtime_config.max_message_size, 1024 * 1024);
+    assert_eq!(runtime_config.active_view_capacity, 9);
+    assert_eq!(runtime_config.shuffle_active_view_count, 3);
+    assert_eq!(runtime_config.passive_view_capacity, 15);
+    assert_eq!(
+        runtime_config.maintenance_interval,
+        Duration::from_millis(2_500)
+    );
+}
+
+#[test]
 fn inbound_backfill_peer_uses_transport_remote_identity() {
     let remote_peer = NetworkNodeId::random();
     let local_peer = NetworkNodeId::random();

@@ -4,6 +4,10 @@ fn should_record_backfill_response_diagnostic(events_applied: usize) -> bool {
     events_applied > 0
 }
 
+fn is_missing_iroh_contact_material_error(error: &str) -> bool {
+    error.starts_with("missing iroh contact material for ")
+}
+
 impl NetworkBridgeService {
     fn save_inbound_private_dm_topic_if_applicable(
         &self,
@@ -824,6 +828,18 @@ impl NetworkBridgeService {
             } => {
                 self.mark_backfill_failed(peer.clone(), request_id);
                 self.mark_peer_control_stream_failed(peer.clone());
+                if is_missing_iroh_contact_material_error(&error) {
+                    if self.state_dir.is_some()
+                        && let Err(err) = self.request_peer_contact_material(&peer.to_string())
+                    {
+                        eprintln!("contact material request failed for {peer}: {err}");
+                    }
+                    return Ok(NetworkBridgeTick::TransportNotice {
+                        detail: format!(
+                            "backfill_waiting_for_contact_material peer={peer} request_id={request_id:?}"
+                        ),
+                    });
+                }
                 Ok(NetworkBridgeTick::BackfillFailed {
                     peer,
                     request_id,
@@ -945,6 +961,7 @@ impl NetworkBridgeService {
                         );
                     }
                 }
+                let _ = self.request_backfill_for_peer_now(&peer, node)?;
                 Ok(NetworkBridgeTick::TransportNotice {
                     detail: format!("contact_material_updated peer={peer}"),
                 })

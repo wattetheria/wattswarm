@@ -1198,6 +1198,60 @@ impl PgStore {
         Ok(signed)
     }
 
+    pub fn validate_signed_network_protocol_params(
+        &self,
+        network_id: &str,
+        signed: &SignedNetworkProtocolParamsEnvelope,
+    ) -> Result<()> {
+        let genesis_node_id = self.network_genesis_node_id(network_id)?;
+        verify_network_protocol_params(network_id, &genesis_node_id, signed)
+    }
+
+    pub fn put_signed_network_protocol_params(
+        &self,
+        network_id: &str,
+        signed: &SignedNetworkProtocolParamsEnvelope,
+    ) -> Result<()> {
+        let genesis_node_id = self.network_genesis_node_id(network_id)?;
+        verify_network_protocol_params(network_id, &genesis_node_id, signed)?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
+        let current_json: Option<String> = conn
+            .query_row(
+                "SELECT params_json FROM network_params WHERE network_id = $1",
+                params![network_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        match current_json {
+            Some(json) if !json.trim().is_empty() && json.trim() != "{}" => {
+                let current: SignedNetworkProtocolParamsEnvelope = serde_json::from_str(&json)?;
+                verify_network_protocol_params(network_id, &genesis_node_id, &current)?;
+                if current.params_hash == signed.params_hash {
+                    return Ok(());
+                }
+                if signed.version <= current.version {
+                    anyhow::bail!("network params update is stale");
+                }
+                if signed.prev_hash.as_deref() != Some(current.params_hash.as_str()) {
+                    anyhow::bail!("network params prev_hash mismatch");
+                }
+            }
+            Some(_) | None => {
+                if signed.version != 1 {
+                    anyhow::bail!("network params update requires existing previous version");
+                }
+            }
+        }
+        conn.execute(
+            "UPDATE network_params SET params_json = $1, updated_at = NOW() WHERE network_id = $2",
+            params![serde_json::to_string(signed)?, network_id],
+        )?;
+        Ok(())
+    }
+
     pub fn import_network_bootstrap_bundle(&self, bundle: &NetworkBootstrapBundle) -> Result<()> {
         let network = &bundle.topology.network;
         let org = &bundle.topology.org;

@@ -1191,6 +1191,12 @@ pub struct PolicyTunedPayload {
     pub advisory_id: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct NetworkParamsUpdatedPayload {
+    pub signed_params: SignedNetworkProtocolParamsEnvelope,
+    pub control_record: NetworkControlRecord,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AdvisoryCreatedPayload {
     pub advisory_id: String,
@@ -1328,6 +1334,7 @@ pub enum EventPayload {
     AgentPaymentPosted(AgentPaymentPostedPayload),
     MembershipUpdated(MembershipUpdatedPayload),
     PolicyTuned(PolicyTunedPayload),
+    NetworkParamsUpdated(NetworkParamsUpdatedPayload),
     AdvisoryCreated(AdvisoryCreatedPayload),
     AdvisoryApproved(AdvisoryApprovedPayload),
     AdvisoryApplied(AdvisoryAppliedPayload),
@@ -1373,6 +1380,7 @@ pub enum EventKind {
     AgentPaymentPosted,
     MembershipUpdated,
     PolicyTuned,
+    NetworkParamsUpdated,
     AdvisoryCreated,
     AdvisoryApproved,
     AdvisoryApplied,
@@ -1429,6 +1437,7 @@ impl EventPayload {
             Self::AgentPaymentPosted(_) => EventKind::AgentPaymentPosted,
             Self::MembershipUpdated(_) => EventKind::MembershipUpdated,
             Self::PolicyTuned(_) => EventKind::PolicyTuned,
+            Self::NetworkParamsUpdated(_) => EventKind::NetworkParamsUpdated,
             Self::AdvisoryCreated(_) => EventKind::AdvisoryCreated,
             Self::AdvisoryApproved(_) => EventKind::AdvisoryApproved,
             Self::AdvisoryApplied(_) => EventKind::AdvisoryApplied,
@@ -1474,6 +1483,7 @@ impl EventPayload {
             Self::AgentPaymentPosted(_) => None,
             Self::MembershipUpdated(_) => None,
             Self::PolicyTuned(_) => None,
+            Self::NetworkParamsUpdated(_) => None,
             Self::AdvisoryCreated(_) => None,
             Self::AdvisoryApproved(_) => None,
             Self::AdvisoryApplied(_) => None,
@@ -1522,6 +1532,7 @@ impl EventPayload {
             Self::CheckpointCreated(_) => TaskDisseminationLayer::Checkpoint,
             Self::MembershipUpdated(_)
             | Self::PolicyTuned(_)
+            | Self::NetworkParamsUpdated(_)
             | Self::AdvisoryCreated(_)
             | Self::AdvisoryApproved(_)
             | Self::AdvisoryApplied(_)

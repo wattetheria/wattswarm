@@ -96,8 +96,7 @@ fn task_claim_decision_agent_event_prompts_approved_claimer_to_complete() {
     let crate::types::EventPayload::TaskClaimDecided(payload) = &event.payload else {
         panic!("expected claim decision payload");
     };
-    let agent_event =
-        task_claim_decision_agent_event(&node, &event, payload).expect("agent event");
+    let agent_event = task_claim_decision_agent_event(&node, &event, payload).expect("agent event");
 
     assert_eq!(
         agent_event.event_type,
@@ -108,14 +107,18 @@ fn task_claim_decision_agent_event_prompts_approved_claimer_to_complete() {
         Some("task_claim_decided")
     );
     assert_eq!(agent_event.payload["approved"].as_bool(), Some(true));
-    assert!(agent_event
-        .allowed_actions
-        .iter()
-        .any(|action| action == "complete_mission"));
-    assert!(!agent_event
-        .allowed_actions
-        .iter()
-        .any(|action| action == "inspect_task"));
+    assert!(
+        agent_event
+            .allowed_actions
+            .iter()
+            .any(|action| action == "complete_mission")
+    );
+    assert!(
+        !agent_event
+            .allowed_actions
+            .iter()
+            .any(|action| action == "inspect_task")
+    );
 }
 
 #[test]
@@ -527,14 +530,18 @@ fn task_result_agent_event_supports_ordinary_task_completed() {
         agent_event.payload["output"]["mission_id"].as_str(),
         Some("task-completed-ordinary")
     );
-    assert!(agent_event
-        .allowed_actions
-        .iter()
-        .any(|action| action == "accept_result"));
-    assert!(!agent_event
-        .allowed_actions
-        .iter()
-        .any(|action| action == "inspect_task"));
+    assert!(
+        agent_event
+            .allowed_actions
+            .iter()
+            .any(|action| action == "accept_result")
+    );
+    assert!(
+        !agent_event
+            .allowed_actions
+            .iter()
+            .any(|action| action == "inspect_task")
+    );
 }
 
 #[test]
