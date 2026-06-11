@@ -1014,6 +1014,79 @@ fn network_discovery_bootnode_accepts_signed_records_and_filters_queries() {
 }
 
 #[test]
+fn network_discovery_bootnode_recovers_from_corrupt_records_file() {
+    let _guard = env_lock();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let dir = tempdir().unwrap();
+        let state_dir = dir.path().join("state");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        let records_path = state_dir.join("discovery_records_v1.json");
+        std::fs::write(
+            &records_path,
+            "[{\"body\":{\"protocol_version\":\"wattswarm-discovery/1\"",
+        )
+        .unwrap();
+        let db_path = state_dir.join("ui.state");
+        let app = build_app(UiServerState::new(state_dir.clone(), db_path));
+
+        let nearby_res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/network/discovery/nearby?network_id=mainnet:test&latitude=37.77&longitude=-122.42&radius_km=50&limit=10")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(nearby_res.status(), StatusCode::OK);
+        let nearby_json = json_from(nearby_res).await;
+        assert_eq!(nearby_json["records"].as_array().map(Vec::len), Some(0));
+        assert!(!records_path.exists());
+        assert!(state_dir.join("discovery_records_v1.json.corrupt").exists());
+
+        let identity = NodeIdentity::from_seed([92; 32]);
+        let now_ms = chrono::Utc::now().timestamp_millis().max(0) as u64;
+        let node_id = identity.node_id();
+        let body = DiscoveryNodeRecordBody::new(
+            "mainnet:test",
+            node_id.clone(),
+            node_id.clone(),
+            1,
+            now_ms,
+        );
+        let record = SignedDiscoveryNodeRecord::sign(body, &identity).unwrap();
+        let announce_res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/network/discovery/records")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&record).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(announce_res.status(), StatusCode::OK);
+
+        let saved: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&records_path).unwrap()).unwrap();
+        assert_eq!(saved[0]["body"]["node_id"].as_str(), Some(node_id.as_str()));
+        let leftover_tmp = std::fs::read_dir(&state_dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .any(|entry| entry.file_name().to_string_lossy().ends_with(".tmp"));
+        assert!(!leftover_tmp, "atomic save must not leave temp files");
+    });
+}
+
+#[test]
 fn ui_exposes_network_join_manifest() {
     let _guard = env_lock();
     let _db_lock = DbTestLock::acquire();

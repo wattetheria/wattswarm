@@ -347,6 +347,85 @@ fn legacy_bigint_bool_columns_are_migrated_to_boolean() {
 }
 
 #[test]
+fn legacy_network_ban_windows_are_migrated_to_org_scoped_primary_key() {
+    with_test_schema(|| {
+        let conn = open_test_connection();
+        conn.execute_batch(
+            "
+            DROP TABLE IF EXISTS network_ban_windows;
+            CREATE TABLE network_ban_windows (
+                node_id TEXT NOT NULL,
+                starts_at BIGINT NOT NULL,
+                until_ms BIGINT,
+                reason TEXT NOT NULL,
+                penalized_by_node_id TEXT NOT NULL,
+                PRIMARY KEY(node_id, starts_at)
+            );
+            INSERT INTO network_ban_windows(
+                node_id,
+                starts_at,
+                until_ms,
+                reason,
+                penalized_by_node_id
+            )
+            VALUES ('node-a', 100, 200, 'legacy', 'genesis');
+            ",
+        )
+        .expect("create legacy network ban windows table");
+
+        let store = PgStore::open("legacy-network-ban-windows-migration.state")
+            .expect("open store")
+            .for_org("local:test-storage:bootstrap");
+
+        assert!(
+            !store
+                .is_node_network_banned_at("node-a", 150)
+                .expect("query migrated network ban windows"),
+            "legacy unset-org rows should not leak into the configured org"
+        );
+        store
+            .put_node_penalty_with_network_ban(
+                "node-a",
+                "org-scoped",
+                true,
+                true,
+                Some(300),
+                "genesis",
+                100,
+            )
+            .expect("insert org-scoped network ban window");
+        assert!(
+            store
+                .is_node_network_banned_at("node-a", 150)
+                .expect("query org-scoped network ban window"),
+            "org-scoped network ban should be readable after legacy migration"
+        );
+
+        let org_id_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*)
+                 FROM information_schema.columns
+                 WHERE table_schema = current_schema()
+                   AND table_name = 'network_ban_windows'
+                   AND column_name = 'org_id'",
+                wattswarm_storage_core::params![],
+                |row| row.get(0),
+            )
+            .expect("query org_id column count");
+        assert_eq!(org_id_count, 1);
+
+        let rows_for_node: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM network_ban_windows WHERE node_id = $1 AND starts_at = $2",
+                wattswarm_storage_core::params!["node-a", 100_i64],
+                |row| row.get(0),
+            )
+            .expect("query migrated and org-scoped rows");
+        assert_eq!(rows_for_node, 2);
+    });
+}
+
+#[test]
 fn legacy_discovered_peers_rows_are_migrated_to_scope_and_real_node_id() {
     with_test_schema(|| {
         let conn = open_test_connection();

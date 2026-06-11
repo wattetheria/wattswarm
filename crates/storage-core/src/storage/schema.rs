@@ -545,6 +545,23 @@ fn migrate_penalized_nodes_network_ban_schema(conn: &Connection) -> Result<()> {
         );
         ",
     )?;
+    if !column_exists(conn, "network_ban_windows", "org_id") {
+        conn.execute_batch(
+            "
+            ALTER TABLE network_ban_windows
+            ADD COLUMN org_id TEXT NOT NULL DEFAULT '__unset_org__';
+            ",
+        )?;
+    }
+    conn.execute_batch(
+        "
+        ALTER TABLE network_ban_windows
+        DROP CONSTRAINT IF EXISTS network_ban_windows_pkey;
+        ALTER TABLE network_ban_windows
+        ADD CONSTRAINT network_ban_windows_pkey
+        PRIMARY KEY(org_id, node_id, starts_at);
+        ",
+    )?;
     Ok(())
 }
 

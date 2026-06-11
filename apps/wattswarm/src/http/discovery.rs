@@ -217,14 +217,35 @@ fn load_discovery_records(state_dir: &FsPath, now_ms: u64) -> Result<DiscoveryRo
     let Ok(bytes) = fs::read(&path) else {
         return Ok(table);
     };
-    let records: Vec<SignedDiscoveryNodeRecord> = serde_json::from_slice(&bytes)
-        .with_context(|| format!("parse discovery records at {}", path.display()))?;
+    let records: Vec<SignedDiscoveryNodeRecord> = match serde_json::from_slice(&bytes) {
+        Ok(records) => records,
+        Err(error) => {
+            quarantine_corrupt_discovery_records(&path, &error);
+            return Ok(table);
+        }
+    };
     for record in records {
         if record.verify_fresh_at(now_ms).is_ok() {
             let _ = table.announce_record(record, now_ms)?;
         }
     }
     Ok(table)
+}
+
+fn quarantine_corrupt_discovery_records(path: &FsPath, error: &serde_json::Error) {
+    let mut quarantine_path = path.as_os_str().to_owned();
+    quarantine_path.push(".corrupt");
+    eprintln!(
+        "wattswarm discovery records at {} are corrupt ({error}); quarantining to {} and starting with an empty table",
+        path.display(),
+        std::path::Path::new(&quarantine_path).display()
+    );
+    if let Err(rename_error) = fs::rename(path, &quarantine_path) {
+        eprintln!(
+            "wattswarm failed to quarantine corrupt discovery records at {}: {rename_error}",
+            path.display()
+        );
+    }
 }
 
 fn save_discovery_records(
@@ -235,7 +256,16 @@ fn save_discovery_records(
     fs::create_dir_all(state_dir)?;
     let path = discovery_records_path(state_dir);
     let records = table.active_records(now_ms, usize::MAX);
-    fs::write(path, serde_json::to_vec_pretty(&records)?)?;
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let tmp_path = state_dir.join(format!(
+        ".{DISCOVERY_RECORDS_FILE}.{}.{nonce}.tmp",
+        std::process::id()
+    ));
+    fs::write(&tmp_path, serde_json::to_vec_pretty(&records)?)?;
+    fs::rename(&tmp_path, path)?;
     Ok(())
 }
 
