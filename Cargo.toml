@@ -24,10 +24,12 @@ anyhow = "1.0"
 axum = "0.7"
 base64 = "0.22"
 bs58 = "0.5"
+chacha20poly1305 = "0.10"
 chrono = { version = "0.4", features = ["serde", "clock"] }
 clap = { version = "4.5", features = ["derive"] }
 ed25519-dalek = { version = "2.1", features = ["rand_core"] }
 hex = "0.4"
+hkdf = "0.12"
 iroh-blobs = "0.99"
 iroh-gossip = "0.97"
 n0-future = "0.3"
@@ -41,6 +43,7 @@ sha2 = "0.10"
 thiserror = "2.0"
 tokio = { version = "1.42", features = ["macros", "rt-multi-thread", "net"] }
 uuid = { version = "1.11", features = ["v4", "serde"] }
+x25519-dalek = { version = "2.0", features = ["static_secrets"] }
 
 assert_cmd = "2.0"
 predicates = "3.1"

@@ -360,10 +360,38 @@ struct IrohEndpointOptions {
     published_direct_addrs: Vec<String>,
 }
 
+/// Relay URLs persisted by the control plane in `startup_config.json`,
+/// refreshed from the network join manifest on node startup. A non-empty
+/// persisted list takes priority over `WATTSWARM_IROH_RELAY_URLS`; the env
+/// variable remains the fallback seed for nodes that have not synced a
+/// join manifest yet (for example the genesis node itself).
+fn startup_config_relay_urls(state_dir: &Path) -> Option<String> {
+    #[derive(Deserialize)]
+    struct StartupConfigRelayUrls {
+        #[serde(default)]
+        relay_urls: Vec<String>,
+    }
+    let bytes = fs::read(state_dir.join("startup_config.json")).ok()?;
+    let config: StartupConfigRelayUrls = serde_json::from_slice(&bytes).ok()?;
+    let urls: Vec<String> = config
+        .relay_urls
+        .iter()
+        .map(|url| url.trim().to_owned())
+        .filter(|url| !url.is_empty())
+        .collect();
+    if urls.is_empty() {
+        None
+    } else {
+        Some(urls.join(","))
+    }
+}
+
 impl IrohEndpointOptions {
-    fn from_env() -> Result<Self> {
+    fn resolve(state_dir: &Path) -> Result<Self> {
+        let relay_urls_raw = startup_config_relay_urls(state_dir)
+            .or_else(|| std::env::var(ENV_IROH_RELAY_URLS).ok());
         Self::from_raw_env(
-            std::env::var(ENV_IROH_RELAY_URLS).ok().as_deref(),
+            relay_urls_raw.as_deref(),
             std::env::var(ENV_IROH_BIND_ADDR).ok().as_deref(),
             std::env::var(ENV_IROH_PUBLISH_DIRECT_ADDRS).ok().as_deref(),
         )
@@ -707,7 +735,7 @@ impl IrohDataPlaneService {
         // internal redb file lock and emit a misleading "router timed out" error.
         let data_plane_lock = acquire_data_plane_sentinel_lock(state_dir)?;
         let adapter = IrohTransportAdapter::from_endpoint_id(endpoint_id, network_peer_id);
-        let endpoint_options = IrohEndpointOptions::from_env()?;
+        let endpoint_options = IrohEndpointOptions::resolve(state_dir)?;
         let runtime = RuntimeBuilder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
@@ -1388,6 +1416,56 @@ mod tests {
             Vec::<String>::new()
         );
         assert!(options.published_direct_addrs.is_empty());
+    }
+
+    #[test]
+    fn startup_config_relay_urls_prefers_persisted_non_empty_list() {
+        let dir = tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("startup_config.json"),
+            r#"{"network_mode":"wan","relay_urls":[" https://relay.wattetheria.com/ ", "", "https://relay2.wattetheria.com"]}"#,
+        )
+        .expect("write startup config");
+
+        assert_eq!(
+            startup_config_relay_urls(dir.path()),
+            Some("https://relay.wattetheria.com/,https://relay2.wattetheria.com".to_owned())
+        );
+    }
+
+    #[test]
+    fn startup_config_relay_urls_ignores_missing_empty_or_invalid_config() {
+        let dir = tempdir().expect("tempdir");
+        assert_eq!(startup_config_relay_urls(dir.path()), None);
+
+        let path = dir.path().join("startup_config.json");
+        std::fs::write(&path, r#"{"network_mode":"wan"}"#).expect("write config");
+        assert_eq!(startup_config_relay_urls(dir.path()), None);
+
+        std::fs::write(&path, r#"{"relay_urls":[]}"#).expect("write config");
+        assert_eq!(startup_config_relay_urls(dir.path()), None);
+
+        std::fs::write(&path, r#"{"relay_urls":["  "]}"#).expect("write config");
+        assert_eq!(startup_config_relay_urls(dir.path()), None);
+
+        std::fs::write(&path, "not-json").expect("write config");
+        assert_eq!(startup_config_relay_urls(dir.path()), None);
+    }
+
+    #[test]
+    fn iroh_endpoint_options_resolve_uses_startup_config_relay_urls() {
+        let dir = tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("startup_config.json"),
+            r#"{"relay_urls":["https://relay2.wattetheria.com/"]}"#,
+        )
+        .expect("write startup config");
+
+        let options = IrohEndpointOptions::resolve(dir.path()).expect("resolve options");
+        assert_eq!(
+            options.published_relay_urls,
+            vec!["https://relay2.wattetheria.com".to_owned()]
+        );
     }
 
     #[test]

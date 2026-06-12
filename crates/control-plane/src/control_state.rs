@@ -160,6 +160,18 @@ pub struct PeerMetadataRecord {
 }
 
 impl PeerMetadataRecord {
+    pub fn private_message_public_key_b64(&self) -> Option<String> {
+        self.contact_material
+            .as_ref()
+            .and_then(|material| material.get("encryption"))
+            .and_then(|encryption| encryption.get("private_message"))
+            .and_then(|private_message| private_message.get("public_key_b64"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+    }
+
     pub fn contact_material_transport_peer_id(&self) -> Option<String> {
         self.contact_material
             .as_ref()
@@ -226,6 +238,106 @@ impl PeerMetadataRecord {
             }
         })
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PrivateHiveKeyRecord {
+    pub feed_key: String,
+    pub scope_hint: String,
+    pub group_id: String,
+    pub epoch: u64,
+    pub shared_secret_b64: String,
+    pub updated_at: u64,
+}
+
+pub fn load_or_create_private_message_keypair_state(
+    state_dir: &Path,
+) -> Result<crate::crypto::PrivateMessageKeypair> {
+    let path = crate::control::private_message_keypair_path(state_dir);
+    if path.exists() {
+        let raw = fs::read_to_string(&path)
+            .with_context(|| format!("read private message keypair at {}", path.display()))?;
+        let keypair = serde_json::from_str::<crate::crypto::PrivateMessageKeypair>(&raw)
+            .with_context(|| format!("parse private message keypair at {}", path.display()))?;
+        let public =
+            crate::crypto::private_message_public_key_from_secret(&keypair.secret_key_b64)?;
+        if public != keypair.public_key_b64 {
+            bail!("private message keypair public key mismatch");
+        }
+        return Ok(keypair);
+    }
+    let keypair = crate::crypto::generate_private_message_keypair();
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(&path, serde_json::to_vec_pretty(&keypair)?)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = fs::metadata(&path)?.permissions();
+        perms.set_mode(0o600);
+        fs::set_permissions(&path, perms)?;
+    }
+    Ok(keypair)
+}
+
+pub fn load_private_hive_key_records_state(state_dir: &Path) -> Result<Vec<PrivateHiveKeyRecord>> {
+    let path = crate::control::private_hive_keys_path(state_dir);
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let raw = fs::read_to_string(&path)
+        .with_context(|| format!("read private hive keys at {}", path.display()))?;
+    if raw.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    serde_json::from_str(&raw)
+        .with_context(|| format!("parse private hive keys at {}", path.display()))
+}
+
+pub fn save_private_hive_key_records_state(
+    state_dir: &Path,
+    records: &[PrivateHiveKeyRecord],
+) -> Result<()> {
+    let path = crate::control::private_hive_keys_path(state_dir);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(&path, serde_json::to_vec_pretty(records)?)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = fs::metadata(&path)?.permissions();
+        perms.set_mode(0o600);
+        fs::set_permissions(&path, perms)?;
+    }
+    Ok(())
+}
+
+pub fn upsert_private_hive_key_record_state(
+    state_dir: &Path,
+    record: PrivateHiveKeyRecord,
+) -> Result<()> {
+    let mut records = load_private_hive_key_records_state(state_dir)?;
+    if let Some(existing) = records
+        .iter_mut()
+        .find(|entry| entry.feed_key == record.feed_key && entry.scope_hint == record.scope_hint)
+    {
+        *existing = record;
+    } else {
+        records.push(record);
+    }
+    save_private_hive_key_records_state(state_dir, &records)
+}
+
+pub fn find_private_hive_key_record_state(
+    state_dir: &Path,
+    feed_key: &str,
+    scope_hint: &str,
+) -> Result<Option<PrivateHiveKeyRecord>> {
+    Ok(load_private_hive_key_records_state(state_dir)?
+        .into_iter()
+        .find(|entry| entry.feed_key == feed_key && entry.scope_hint == scope_hint))
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]

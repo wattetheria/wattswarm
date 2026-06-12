@@ -7,6 +7,7 @@ use axum::Json;
 use axum::extract::{Query, State};
 use serde::Deserialize;
 use serde_json::{Value, json};
+use uuid::Uuid;
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct TopicMessagesQuery {
@@ -161,6 +162,41 @@ pub(crate) async fn topic_subscription_post(
         let subscriber_node_id = subscriber_node_id.unwrap_or_else(|| node.node_id());
         let network_id = network_id.unwrap_or_else(|| resolve_network_id(&node));
         let created_at = chrono::Utc::now().timestamp_millis().max(0) as u64;
+        let private_hive_key_share = if active
+            && crate::control::is_private_hive_route(&feed_key, &scope_hint)
+            && agent_envelope
+                .as_ref()
+                .and_then(|envelope| envelope.capability.as_deref())
+                == Some("hive.create")
+        {
+            let existing = crate::control::find_private_hive_key_record_state(
+                &state_clone.state_dir,
+                &feed_key,
+                &scope_hint,
+            )?;
+            let record = existing.unwrap_or_else(|| crate::control::PrivateHiveKeyRecord {
+                feed_key: feed_key.clone(),
+                scope_hint: scope_hint.clone(),
+                group_id: crate::control::private_hive_group_id(&feed_key, &scope_hint),
+                epoch: 1,
+                shared_secret_b64: crate::crypto::generate_private_group_secret_b64(),
+                updated_at: created_at,
+            });
+            crate::control::upsert_private_hive_key_record_state(
+                &state_clone.state_dir,
+                record.clone(),
+            )?;
+            Some(json!({
+                "kind": "private_hive_key_share",
+                "feed_key": record.feed_key,
+                "scope_hint": record.scope_hint,
+                "group_id": record.group_id,
+                "epoch": record.epoch,
+                "shared_secret_b64": record.shared_secret_b64,
+            }))
+        } else {
+            None
+        };
         let event = node.emit_at(
             1,
             crate::types::EventPayload::FeedSubscriptionUpdated(
@@ -187,6 +223,7 @@ pub(crate) async fn topic_subscription_post(
             "scope_hint": scope_hint,
             "gossip_kinds": ["messages"],
             "active": active,
+            "private_hive_key_share": private_hive_key_share,
         }))
     })
     .await?;
@@ -224,6 +261,37 @@ pub(crate) async fn topic_message_post(
         let mut node = open_node(&state_clone.state_dir, &state_clone.db_path)?;
         let network_id = network_id.unwrap_or_else(|| resolve_network_id(&node));
         let created_at = chrono::Utc::now().timestamp_millis().max(0) as u64;
+        let original_content = content;
+        let mut local_content_override = None;
+        let content = if crate::control::is_private_hive_route(&feed_key, &scope_hint) {
+            let key = crate::control::find_private_hive_key_record_state(
+                &state_clone.state_dir,
+                &feed_key,
+                &scope_hint,
+            )?
+            .ok_or_else(|| anyhow!("missing private hive key for encrypted topic message"))?;
+            let private_message_id = format!("private-hive-msg-{}", Uuid::new_v4());
+            let encrypted = crate::crypto::encrypt_private_group_content(
+                &key.shared_secret_b64,
+                &key.group_id,
+                key.epoch,
+                &serde_json::to_vec(&original_content)?,
+                &crate::control::private_hive_encryption_aad(
+                    &feed_key,
+                    &scope_hint,
+                    &private_message_id,
+                ),
+            )?;
+            local_content_override = Some(original_content.clone());
+            json!({
+                "kind": "private_encrypted",
+                "private_kind": "hive_message",
+                "message_id": private_message_id,
+                "encrypted": encrypted,
+            })
+        } else {
+            original_content
+        };
         let event = crate::control::emit_topic_message_with_content_and_agent_envelope(
             &mut node,
             &state_clone.state_dir,
@@ -235,6 +303,13 @@ pub(crate) async fn topic_message_post(
             agent_envelope,
             created_at,
         )?;
+        if let Some(local_content) = local_content_override {
+            let _ = node.store.update_topic_message_content(
+                &event.event_id,
+                &local_content,
+                created_at,
+            );
+        }
         let _ = crate::control::topic_interpretation::process_topic_interpretation_for_topic(
             &mut node,
             &state_clone.state_dir,

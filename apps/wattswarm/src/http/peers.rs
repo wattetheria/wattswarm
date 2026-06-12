@@ -187,6 +187,28 @@ pub(crate) async fn peer_dm_messages_send(
         let message_id = format!("dm-msg-{}", Uuid::new_v4());
         let now = chrono::Utc::now().timestamp_millis().max(0) as u64;
         let control_envelope = raw_agent_envelope_to_interaction(&agent_envelope);
+        let private_message_keypair =
+            crate::control::load_or_create_private_message_keypair_state(&state_clone.state_dir)?;
+        let recipient_public_key_b64 = load_peer_metadata_records_state(&state_clone.state_dir)?
+            .into_iter()
+            .find(|record| record.node_id == remote_node_id)
+            .and_then(|record| record.private_message_public_key_b64())
+            .ok_or_else(|| anyhow!("missing peer private message encryption key"))?;
+        let private_plaintext = serde_json::to_vec(&json!({
+            "content": content.clone(),
+            "agent_envelope": control_envelope.clone(),
+        }))?;
+        let encrypted = crate::crypto::encrypt_private_message(
+            &private_message_keypair.secret_key_b64,
+            &recipient_public_key_b64,
+            &private_plaintext,
+            &crate::control::private_dm_encryption_aad(
+                &local_node_id,
+                &remote_node_id,
+                &thread_id,
+                &message_id,
+            ),
+        )?;
         let participants = {
             let mut members = vec![local_node_id.clone(), remote_node_id.clone()];
             members.sort();
@@ -222,8 +244,7 @@ pub(crate) async fn peer_dm_messages_send(
                 "message_id": message_id,
                 "participants": participants,
                 "remote_node_id": remote_node_id,
-                "content": content.clone(),
-                "agent_envelope": control_envelope.clone(),
+                "encrypted": encrypted,
             }),
             None,
             now.saturating_add(1),

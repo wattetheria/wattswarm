@@ -1174,6 +1174,8 @@ pub struct NetworkJoinManifest {
     pub gateway_urls: Vec<String>,
     #[serde(default)]
     pub discovery_urls: Vec<String>,
+    #[serde(default)]
+    pub relay_urls: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

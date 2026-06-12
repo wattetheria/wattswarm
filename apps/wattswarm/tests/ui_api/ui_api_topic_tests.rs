@@ -364,6 +364,124 @@ fn ui_accepts_topic_subscription_and_message_writes() {
 }
 
 #[test]
+fn private_hive_topic_messages_publish_encrypted_network_payloads() {
+    let _guard = env_lock();
+    let _db_lock = DbTestLock::acquire();
+    let schema = reset_test_schema("test");
+    let _schema_guard = EnvVarGuard::set("WATTSWARM_PG_SCHEMA", &schema);
+    let dir = tempdir().unwrap();
+    let state_dir = dir.path().join("state");
+    std::fs::create_dir_all(&state_dir).unwrap();
+    let db_path = state_dir.join("ui.state");
+    let app = build_app(UiServerState::new(state_dir.clone(), db_path.clone()));
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let event_id = runtime.block_on(async {
+        let subscription_res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/topic/subscriptions")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({
+                            "feed_key": "private.hive",
+                            "scope_hint": "group:dm-private-hive",
+                            "active": true,
+                            "agent_envelope": {
+                                "protocol": "google_a2a",
+                                "source_agent_id": "agent-owner",
+                                "target_agent_id": "agent-owner",
+                                "capability": "hive.create",
+                                "message_json": "{}"
+                            }
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(subscription_res.status(), StatusCode::OK);
+        let subscription_json = json_from(subscription_res).await;
+        assert_eq!(
+            subscription_json["private_hive_key_share"]["kind"].as_str(),
+            Some("private_hive_key_share")
+        );
+
+        let message_res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/topic/messages")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({
+                            "feed_key": "private.hive",
+                            "scope_hint": "group:dm-private-hive",
+                            "content": {"text": "private hive hello"}
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(message_res.status(), StatusCode::OK);
+        let message_json = json_from(message_res).await;
+        let event_id = message_json["event_id"].as_str().expect("event id").to_owned();
+
+        let messages_res = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/topic/messages?feed_key=private.hive&scope_hint=group:dm-private-hive&limit=5")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(messages_res.status(), StatusCode::OK);
+        let messages_json = json_from(messages_res).await;
+        assert_eq!(
+            messages_json["messages"][0]["content"]["text"].as_str(),
+            Some("private hive hello")
+        );
+        event_id
+    });
+
+    let node = open_node(&state_dir, &db_path).expect("open node");
+    let event = node
+        .store
+        .load_all_events()
+        .expect("load events")
+        .into_iter()
+        .map(|(_, event)| event)
+        .find(|event| event.event_id == event_id)
+        .expect("topic message event");
+    let EventPayload::TopicMessagePosted(payload) = event.payload else {
+        panic!("expected topic message event");
+    };
+    let content = payload.local_content_cache.expect("network content");
+    assert_eq!(
+        content["kind"].as_str(),
+        Some("private_encrypted"),
+        "network payload must be encrypted: {content}"
+    );
+    assert!(content["encrypted"].as_object().is_some());
+    assert!(
+        !serde_json::to_string(&content)
+            .unwrap()
+            .contains("private hive hello")
+    );
+}
+
+#[test]
 fn structured_topic_consensus_bridge_finalizes_and_publishes_result_topic() {
     let _guard = env_lock();
     let _db_lock = DbTestLock::acquire();

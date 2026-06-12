@@ -332,6 +332,10 @@ fn open_node_network_mode_auto_syncs_signed_bundle_from_join_manifest() {
             "https://bootstrap.wattetheria.com/api/network/discovery/".to_owned(),
             "https://bootstrap.wattetheria.com/api/network/discovery".to_owned(),
         ],
+        relay_urls: vec![
+            "https://relay.wattetheria.com/".to_owned(),
+            "https://relay2.wattetheria.com".to_owned(),
+        ],
     };
     let bootstrap_stub = BootstrapBundleStub::start_with_manifest(bundle.clone(), Some(manifest));
     let _local_schema_guard = EnvVarGuard::set("WATTSWARM_PG_SCHEMA", &local_schema);
@@ -399,6 +403,13 @@ fn open_node_network_mode_auto_syncs_signed_bundle_from_join_manifest() {
         Some("https://gateway.wattetheria.com")
     );
     assert_eq!(
+        startup_config["relay_urls"],
+        json!([
+            "https://relay.wattetheria.com",
+            "https://relay2.wattetheria.com"
+        ])
+    );
+    assert_eq!(
         wattswarm_control_plane::load_discovery_bootnode_urls_state(&state_dir)
             .expect("load discovery urls"),
         vec!["https://bootstrap.wattetheria.com/api/network/discovery".to_owned()]
@@ -460,6 +471,7 @@ fn open_node_network_mode_rejects_join_manifest_params_hash_mismatch() {
         bootstrap_contacts: Vec::new(),
         gateway_urls: Vec::new(),
         discovery_urls: Vec::new(),
+        relay_urls: Vec::new(),
     };
     let bootstrap_stub = BootstrapBundleStub::start_with_manifest(bundle, Some(manifest));
     let _local_schema_guard = EnvVarGuard::set("WATTSWARM_PG_SCHEMA", &local_schema);
@@ -564,6 +576,157 @@ fn open_node_on_network_id_joins_and_binds_subnet_overlay() {
             .node_has_network_membership(&joined_node_id, &mainnet.network.network_id)
             .expect("parent membership")
     );
+
+    cleanup_dir(&dir);
+}
+
+#[test]
+fn join_manifest_without_relay_urls_field_deserializes_to_empty() {
+    let manifest: NetworkJoinManifest = serde_json::from_str(
+        r#"{"network_id":"mainnet:wattetheria","genesis_node_id":"genesis","params_hash":"hash"}"#,
+    )
+    .expect("deserialize legacy manifest");
+    assert!(manifest.relay_urls.is_empty());
+}
+
+fn relay_refresh_manifest(relay_urls: Vec<String>) -> NetworkJoinManifest {
+    NetworkJoinManifest {
+        network_id: "mainnet:wattetheria".to_owned(),
+        genesis_node_id: "genesis-node".to_owned(),
+        params_hash: "params-hash".to_owned(),
+        bootstrap_urls: Vec::new(),
+        bootstrap_contacts: Vec::new(),
+        gateway_urls: Vec::new(),
+        discovery_urls: Vec::new(),
+        relay_urls,
+    }
+}
+
+fn write_relay_refresh_startup_config(state_dir: &std::path::Path) {
+    fs::create_dir_all(state_dir).expect("create state dir");
+    fs::write(
+        state_dir.join("startup_config.json"),
+        json!({
+            "network_mode": "wan",
+            "latitude": 37.0,
+            "relay_urls": ["https://old-relay.example"]
+        })
+        .to_string(),
+    )
+    .expect("write startup config");
+}
+
+#[test]
+fn refresh_relay_urls_overwrites_startup_config_from_join_manifest() {
+    let _guard = env_lock();
+    let stub = JoinManifestStub::start(relay_refresh_manifest(vec![
+        "https://relay.wattetheria.com/".to_owned(),
+        " https://relay2.wattetheria.com ".to_owned(),
+    ]));
+    let _mode_guard = EnvVarGuard::remove("WATTSWARM_NODE_MODE");
+    let _manifest_guard =
+        EnvVarGuard::set("WATTSWARM_NETWORK_JOIN_MANIFEST_URLS", &stub.manifest_url());
+    let dir = temp_test_dir("refresh-relay-urls-overwrite");
+    let state_dir = dir.join("state");
+    write_relay_refresh_startup_config(&state_dir);
+
+    let changed =
+        wattswarm_control_plane::refresh_startup_config_relay_urls_from_join_manifest(&state_dir)
+            .expect("refresh relay urls");
+    assert!(changed);
+    let startup_config: serde_json::Value =
+        serde_json::from_slice(&fs::read(state_dir.join("startup_config.json")).unwrap()).unwrap();
+    assert_eq!(
+        startup_config["relay_urls"],
+        json!([
+            "https://relay.wattetheria.com",
+            "https://relay2.wattetheria.com"
+        ])
+    );
+    assert_eq!(startup_config["network_mode"].as_str(), Some("wan"));
+    assert_eq!(startup_config["latitude"].as_f64(), Some(37.0));
+
+    let unchanged =
+        wattswarm_control_plane::refresh_startup_config_relay_urls_from_join_manifest(&state_dir)
+            .expect("refresh relay urls again");
+    assert!(!unchanged, "identical relay set must not rewrite the file");
+
+    cleanup_dir(&dir);
+}
+
+#[test]
+fn refresh_relay_urls_keeps_local_value_when_manifest_has_none() {
+    let _guard = env_lock();
+    let stub = JoinManifestStub::start(relay_refresh_manifest(Vec::new()));
+    let _mode_guard = EnvVarGuard::remove("WATTSWARM_NODE_MODE");
+    let _manifest_guard =
+        EnvVarGuard::set("WATTSWARM_NETWORK_JOIN_MANIFEST_URLS", &stub.manifest_url());
+    let dir = temp_test_dir("refresh-relay-urls-empty-manifest");
+    let state_dir = dir.join("state");
+    write_relay_refresh_startup_config(&state_dir);
+
+    let changed =
+        wattswarm_control_plane::refresh_startup_config_relay_urls_from_join_manifest(&state_dir)
+            .expect("refresh relay urls");
+    assert!(!changed);
+    let startup_config: serde_json::Value =
+        serde_json::from_slice(&fs::read(state_dir.join("startup_config.json")).unwrap()).unwrap();
+    assert_eq!(
+        startup_config["relay_urls"],
+        json!(["https://old-relay.example"])
+    );
+
+    cleanup_dir(&dir);
+}
+
+#[test]
+fn refresh_relay_urls_keeps_local_value_when_endpoint_unreachable() {
+    let _guard = env_lock();
+    let unreachable = {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("reserve port");
+        let port = listener.local_addr().expect("local addr").port();
+        drop(listener);
+        format!("http://127.0.0.1:{port}/.well-known/wattswarm/join.json")
+    };
+    let _mode_guard = EnvVarGuard::remove("WATTSWARM_NODE_MODE");
+    let _manifest_guard = EnvVarGuard::set("WATTSWARM_NETWORK_JOIN_MANIFEST_URLS", &unreachable);
+    let dir = temp_test_dir("refresh-relay-urls-unreachable");
+    let state_dir = dir.join("state");
+    write_relay_refresh_startup_config(&state_dir);
+
+    let result =
+        wattswarm_control_plane::refresh_startup_config_relay_urls_from_join_manifest(&state_dir);
+    assert!(
+        result.is_err(),
+        "unreachable endpoint must surface an error"
+    );
+    let startup_config: serde_json::Value =
+        serde_json::from_slice(&fs::read(state_dir.join("startup_config.json")).unwrap()).unwrap();
+    assert_eq!(
+        startup_config["relay_urls"],
+        json!(["https://old-relay.example"])
+    );
+
+    cleanup_dir(&dir);
+}
+
+#[test]
+fn refresh_relay_urls_is_noop_for_local_mode() {
+    let _guard = env_lock();
+    let _mode_guard = EnvVarGuard::set("WATTSWARM_NODE_MODE", "local");
+    let _manifest_guard = EnvVarGuard::set(
+        "WATTSWARM_NETWORK_JOIN_MANIFEST_URLS",
+        "http://127.0.0.1:1/.well-known/wattswarm/join.json",
+    );
+    let dir = temp_test_dir("refresh-relay-urls-local-mode");
+    let state_dir = dir.join("state");
+    fs::create_dir_all(&state_dir).expect("create state dir");
+
+    let changed =
+        wattswarm_control_plane::refresh_startup_config_relay_urls_from_join_manifest(&state_dir)
+            .expect("refresh relay urls in local mode");
+    assert!(!changed);
+    assert!(!state_dir.join("startup_config.json").exists());
 
     cleanup_dir(&dir);
 }

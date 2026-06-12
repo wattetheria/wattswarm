@@ -409,7 +409,9 @@ fn topic_message_kind(content: &Value) -> Option<&str> {
 pub(super) fn topic_message_requires_reply(content: &Value) -> bool {
     !matches!(
         topic_message_kind(content),
-        Some("proposal" | "stance" | "interpreted_stance" | "consensus_result")
+        Some(
+            "proposal" | "stance" | "interpreted_stance" | "consensus_result" | "private_encrypted"
+        )
     )
 }
 

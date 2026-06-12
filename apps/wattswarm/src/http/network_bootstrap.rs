@@ -77,6 +77,7 @@ pub(crate) async fn network_join_manifest(
             bootstrap_contacts,
             gateway_urls: split_public_manifest_values(ENV_PUBLIC_GATEWAY_URLS),
             discovery_urls: split_public_manifest_values(ENV_PUBLIC_DISCOVERY_URLS),
+            relay_urls,
         })
     })
     .await?;

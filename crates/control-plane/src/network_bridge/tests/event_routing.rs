@@ -1139,7 +1139,7 @@ fn inbound_private_dm_topic_message_direct_projection_still_saves_remote_author(
     let local = crate::control::load_local_identity(&state_dir).expect("local identity");
     let local_node_id = local.node_id();
     let remote_node_id = random_network_node_id().to_string();
-    let result = save_inbound_private_dm_topic_message(
+    let projection = save_inbound_private_dm_topic_message(
         &state_dir,
         &local_node_id,
         &remote_node_id,
@@ -1155,12 +1155,87 @@ fn inbound_private_dm_topic_message_direct_projection_still_saves_remote_author(
     .expect("remote projection is stored")
     .expect("remote projection result");
 
-    assert_eq!(result.remote_node_id, remote_node_id);
-    assert_eq!(result.message_id, "dm-remote");
+    assert_eq!(
+        projection.topic_content["content"].as_str(),
+        Some("remote message should be stored")
+    );
     let messages = crate::control::load_peer_dm_message_records_state(&state_dir, "dm:remote")
         .expect("load dm messages");
     assert_eq!(messages.len(), 1);
     assert_eq!(messages[0].remote_node_id, remote_node_id);
+    assert_eq!(messages[0].message_id, "dm-remote");
+}
+
+#[test]
+fn inbound_private_dm_topic_message_decrypts_before_projection() {
+    let state_dir = temp_startup_dir("inbound-private-dm-encrypted-projection");
+    let local = crate::control::load_local_identity(&state_dir).expect("local identity");
+    let local_node_id = local.node_id();
+    let local_keypair =
+        crate::control::load_or_create_private_message_keypair_state(&state_dir).expect("keypair");
+    let remote_node_id = random_network_node_id().to_string();
+    let remote_keypair = crate::crypto::generate_private_message_keypair();
+    let thread_id = "dm:encrypted";
+    let message_id = "dm-encrypted";
+    let private_payload = json!({
+        "content": {"text": "encrypted hello"},
+        "agent_envelope": {
+            "protocol": "google_a2a",
+            "source_agent_id": "agent-remote",
+            "target_agent_id": "agent-local",
+            "capability": "social.dm.send",
+            "message_json": "{\"content\":{\"text\":\"encrypted hello\"}}"
+        }
+    });
+    let encrypted = crate::crypto::encrypt_private_message(
+        &remote_keypair.secret_key_b64,
+        &local_keypair.public_key_b64,
+        &serde_json::to_vec(&private_payload).expect("encode private dm payload"),
+        &crate::control::private_dm_encryption_aad(
+            &remote_node_id,
+            &local_node_id,
+            thread_id,
+            message_id,
+        ),
+    )
+    .expect("encrypt inbound dm");
+
+    let projection = save_inbound_private_dm_topic_message(
+        &state_dir,
+        &local_node_id,
+        &remote_node_id,
+        "remote-encrypted-dm-event",
+        &json!({
+            "kind": "direct_message",
+            "thread_id": thread_id,
+            "message_id": message_id,
+            "encrypted": encrypted
+        }),
+        789,
+    )
+    .expect("remote encrypted projection is stored")
+    .expect("remote encrypted projection result");
+
+    assert!(projection.topic_content["encrypted"].is_null());
+    assert_eq!(
+        projection.topic_content["content"]["text"].as_str(),
+        Some("encrypted hello")
+    );
+    let messages = crate::control::load_peer_dm_message_records_state(&state_dir, thread_id)
+        .expect("load encrypted dm messages");
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0].remote_node_id, remote_node_id);
+    assert_eq!(
+        messages[0].content["text"].as_str(),
+        Some("encrypted hello")
+    );
+    assert_eq!(
+        messages[0]
+            .agent_envelope
+            .as_ref()
+            .map(|envelope| envelope.capability.as_deref()),
+        Some(Some("social.dm.send"))
+    );
 }
 
 #[test]

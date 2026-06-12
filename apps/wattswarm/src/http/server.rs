@@ -26,6 +26,15 @@ pub fn run(state_dir: PathBuf, db_path: PathBuf, listen: String) -> Result<()> {
             crate::udp_announce::maybe_start_listener(state_dir.clone(), id.clone());
         }
     }
+    if network_enabled {
+        // Refresh once per process start, before the network service builds the
+        // iroh endpoint, so a restart picks up the network's current relay set.
+        match crate::control::refresh_startup_config_relay_urls_from_join_manifest(&state_dir) {
+            Ok(true) => eprintln!("wattswarm relay urls refreshed from join manifest"),
+            Ok(false) => {}
+            Err(error) => eprintln!("wattswarm relay urls refresh skipped: {error:#}"),
+        }
+    }
     let network_started = crate::network_bridge::maybe_start_background_network_service_with_hook(
         state_dir.clone(),
         db_path.clone(),

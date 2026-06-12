@@ -23,7 +23,7 @@ impl NetworkBridgeService {
         };
         match node.store.get_topic_message(&event.event_id) {
             Ok(Some(topic_message)) => {
-                if let Err(err) = save_inbound_private_dm_topic_message(
+                match save_inbound_private_dm_topic_message(
                     state_dir,
                     &node.node_id(),
                     &event.author_node_id,
@@ -31,10 +31,20 @@ impl NetworkBridgeService {
                     &topic_message.content,
                     event.created_at,
                 ) {
-                    eprintln!(
-                        "inbound private dm projection failed for {}: {err}",
-                        event.event_id
-                    );
+                    Ok(Some(projection)) => {
+                        let _ = node.store.update_topic_message_content(
+                            &event.event_id,
+                            &projection.topic_content,
+                            event.created_at,
+                        );
+                    }
+                    Ok(None) => {}
+                    Err(err) => {
+                        eprintln!(
+                            "inbound private dm projection failed for {}: {err}",
+                            event.event_id
+                        );
+                    }
                 }
             }
             Ok(None) => {}
@@ -45,6 +55,71 @@ impl NetworkBridgeService {
                 );
             }
         }
+    }
+
+    fn decrypt_private_hive_topic_if_applicable(
+        &self,
+        node: &Node,
+        event: &crate::types::Event,
+        payload: &crate::types::TopicMessagePostedPayload,
+    ) {
+        if !crate::control::is_private_hive_route(&payload.feed_key, &payload.scope_hint) {
+            return;
+        }
+        let Some(state_dir) = &self.state_dir else {
+            return;
+        };
+        let Ok(Some(topic_message)) = node.store.get_topic_message(&event.event_id) else {
+            return;
+        };
+        if topic_message.content.get("kind").and_then(Value::as_str) != Some("private_encrypted")
+            || topic_message
+                .content
+                .get("private_kind")
+                .and_then(Value::as_str)
+                != Some("hive_message")
+        {
+            return;
+        }
+        let Some(message_id) = topic_message
+            .content
+            .get("message_id")
+            .and_then(Value::as_str)
+        else {
+            return;
+        };
+        let Ok(Some(key)) = crate::control::find_private_hive_key_record_state(
+            state_dir,
+            &payload.feed_key,
+            &payload.scope_hint,
+        ) else {
+            return;
+        };
+        let Some(encrypted) = topic_message.content.get("encrypted") else {
+            return;
+        };
+        let Ok(encrypted) = serde_json::from_value::<crate::crypto::PrivateGroupEncryptedPayload>(
+            encrypted.clone(),
+        ) else {
+            return;
+        };
+        let Ok(plaintext) = crate::crypto::decrypt_private_group_content(
+            &key.shared_secret_b64,
+            &encrypted,
+            &crate::control::private_hive_encryption_aad(
+                &payload.feed_key,
+                &payload.scope_hint,
+                message_id,
+            ),
+        ) else {
+            return;
+        };
+        let Ok(content) = serde_json::from_slice::<Value>(&plaintext) else {
+            return;
+        };
+        let _ =
+            node.store
+                .update_topic_message_content(&event.event_id, &content, event.created_at);
     }
 
     fn deliver_task_lifecycle_agent_event(&self, node: &Node, event: &crate::types::Event) {
@@ -580,6 +655,11 @@ impl NetworkBridgeService {
                                 &ingested_event,
                                 payload,
                             );
+                            self.decrypt_private_hive_topic_if_applicable(
+                                node,
+                                &ingested_event,
+                                payload,
+                            );
                             self.deliver_topic_message_agent_event(node, &ingested_event, payload);
                         }
                         self.record_scope_event_ingested(&envelope.scope);
@@ -803,6 +883,11 @@ impl NetworkBridgeService {
                         &envelope.event.payload
                     {
                         self.save_inbound_private_dm_topic_if_applicable(
+                            node,
+                            &envelope.event,
+                            payload,
+                        );
+                        self.decrypt_private_hive_topic_if_applicable(
                             node,
                             &envelope.event,
                             payload,

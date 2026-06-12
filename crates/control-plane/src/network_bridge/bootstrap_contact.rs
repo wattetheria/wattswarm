@@ -6,6 +6,8 @@ pub(super) fn build_contact_material(
 ) -> Result<RawContactMaterial> {
     let generated_at = observed_at_ms();
     let identity = crate::control::load_local_identity(state_dir)?;
+    let private_message_keypair =
+        crate::control::load_or_create_private_message_keypair_state(state_dir)?;
     let iroh_contact =
         export_local_contact_material_for_network_peer_id(state_dir, local_peer_id, generated_at)?;
     let material = json!({
@@ -15,6 +17,14 @@ pub(super) fn build_contact_material(
         "generated_at": generated_at,
         "transports": [iroh_contact],
         "recommended_routes": crate::control::recommended_data_routes(Some(&iroh_contact.metadata.capabilities)),
+        "encryption": {
+            "private_message": {
+                "scheme": "wattswarm.private.dm.v1",
+                "key_agreement": "x25519",
+                "cipher": "chacha20poly1305",
+                "public_key_b64": private_message_keypair.public_key_b64,
+            }
+        },
     });
     let signature = identity.sign_bytes(&serde_json::to_vec(&material)?);
     Ok(RawContactMaterial {

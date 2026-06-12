@@ -451,6 +451,85 @@ impl Drop for BootstrapBundleStub {
     }
 }
 
+/// Minimal HTTP stub that serves only the network join manifest route.
+struct JoinManifestStub {
+    addr: SocketAddr,
+    stop: Arc<AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl JoinManifestStub {
+    fn start(manifest: NetworkJoinManifest) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind join manifest stub");
+        listener
+            .set_nonblocking(true)
+            .expect("set join manifest stub nonblocking");
+        let addr = listener
+            .local_addr()
+            .expect("join manifest stub local addr");
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_flag = Arc::clone(&stop);
+        let manifest_body = serde_json::to_string(&manifest).expect("serialize join manifest");
+
+        let handle = thread::spawn(move || {
+            while !stop_flag.load(Ordering::Relaxed) {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let request = read_http_request(&mut stream);
+                        if request.is_empty() {
+                            continue;
+                        }
+                        let request = String::from_utf8_lossy(&request);
+                        let line = request.lines().next().unwrap_or_default();
+                        let (status, status_text, payload) =
+                            if line.starts_with("GET /.well-known/wattswarm/join.json ") {
+                                (200, "OK", manifest_body.clone())
+                            } else {
+                                (404, "Not Found", "{}".to_owned())
+                            };
+                        let response = format!(
+                            "HTTP/1.1 {} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            status,
+                            status_text,
+                            payload.len(),
+                            payload
+                        );
+                        let _ = stream.write_all(response.as_bytes());
+                        let _ = stream.flush();
+                    }
+                    Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        Self {
+            addr,
+            stop,
+            handle: Some(handle),
+        }
+    }
+
+    fn manifest_url(&self) -> String {
+        format!(
+            "http://127.0.0.1:{}/.well-known/wattswarm/join.json",
+            self.addr.port()
+        )
+    }
+}
+
+impl Drop for JoinManifestStub {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        let _ = TcpStream::connect(self.addr);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
 impl RuntimeStub {
     fn start(profiles: &[&str]) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind runtime stub");

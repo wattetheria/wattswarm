@@ -82,6 +82,44 @@ pub fn private_dm_thread_id(local_node_id: &str, remote_node_id: &str) -> String
     format!("dm:{}", &digest[..24])
 }
 
+pub fn private_dm_encryption_aad(
+    sender_node_id: &str,
+    recipient_node_id: &str,
+    thread_id: &str,
+    message_id: &str,
+) -> Vec<u8> {
+    format!(
+        "wattswarm-private-dm-v1\0{}\0{}\0{}\0{}",
+        sender_node_id.trim(),
+        recipient_node_id.trim(),
+        thread_id.trim(),
+        message_id.trim()
+    )
+    .into_bytes()
+}
+
+pub fn is_private_hive_route(feed_key: &str, scope_hint: &str) -> bool {
+    feed_key.trim() != PRIVATE_DM_FEED_KEY && scope_hint.trim().starts_with("group:dm-")
+}
+
+pub fn private_hive_group_id(feed_key: &str, scope_hint: &str) -> String {
+    let scope = scope_hint
+        .trim()
+        .strip_prefix("group:")
+        .unwrap_or(scope_hint.trim());
+    format!("{}:{}", feed_key.trim(), scope)
+}
+
+pub fn private_hive_encryption_aad(feed_key: &str, scope_hint: &str, message_id: &str) -> Vec<u8> {
+    format!(
+        "wattswarm-private-hive-gss-v1\0{}\0{}\0{}",
+        feed_key.trim(),
+        scope_hint.trim(),
+        message_id.trim()
+    )
+    .into_bytes()
+}
+
 pub fn executor_registry_path(state_dir: &Path) -> PathBuf {
     state_dir.join("executors.json")
 }
@@ -92,6 +130,14 @@ pub fn node_state_path(state_dir: &Path) -> PathBuf {
 
 pub fn discovered_peers_path(state_dir: &Path) -> PathBuf {
     state_dir.join("discovered_peers.json")
+}
+
+pub fn private_message_keypair_path(state_dir: &Path) -> PathBuf {
+    state_dir.join("private_message_keypair.json")
+}
+
+pub fn private_hive_keys_path(state_dir: &Path) -> PathBuf {
+    state_dir.join("private_hive_keys.json")
 }
 
 pub fn discovery_bootnode_urls_path(state_dir: &Path) -> PathBuf {
@@ -500,7 +546,10 @@ fn persist_join_manifest_startup_config(
     if !manifest.discovery_urls.is_empty() {
         let _ = save_discovery_bootnode_urls_state(state_dir, &manifest.discovery_urls)?;
     }
-    if manifest.bootstrap_contacts.is_empty() && manifest.gateway_urls.is_empty() {
+    if manifest.bootstrap_contacts.is_empty()
+        && manifest.gateway_urls.is_empty()
+        && manifest.relay_urls.is_empty()
+    {
         return Ok(());
     }
     fs::create_dir_all(state_dir)?;
@@ -525,10 +574,87 @@ fn persist_join_manifest_startup_config(
     }
     changed |= replace_manifest_bootstrap_contacts(&mut value, &manifest.bootstrap_contacts);
     changed |= replace_manifest_values(&mut value, "gateway_urls", &manifest.gateway_urls, true);
+    if !manifest.relay_urls.is_empty() {
+        changed |= replace_manifest_values(&mut value, "relay_urls", &manifest.relay_urls, true);
+    }
     if changed {
         fs::write(&path, serde_json::to_vec_pretty(&value)?)?;
     }
     Ok(())
+}
+
+/// Refresh the locally persisted relay URLs from the network join manifest.
+///
+/// Runs once per process startup so an already-joined node picks up the
+/// network's current relay set on restart. The fetched list overwrites the
+/// `relay_urls` field in `startup_config.json`; fetch failures leave the
+/// local value untouched and must not block node startup.
+pub fn refresh_startup_config_relay_urls_from_join_manifest(state_dir: &Path) -> Result<bool> {
+    let mode = configured_node_mode(state_dir)?;
+    if !matches!(mode, Some(NodeMode::Network) | Some(NodeMode::Lan)) {
+        return Ok(false);
+    }
+    let endpoints = join_manifest_endpoint_candidates(matches!(mode, Some(NodeMode::Network)));
+    if endpoints.is_empty() {
+        return Ok(false);
+    }
+    let mut last_err = None;
+    for endpoint in endpoints {
+        match retry_runtime_probe(|| fetch_network_join_manifest(&endpoint)) {
+            Ok(manifest) => {
+                if manifest.relay_urls.is_empty() {
+                    // The manifest endpoint reports no relay set (for example an
+                    // older genesis version); keep the local value.
+                    return Ok(false);
+                }
+                return persist_startup_config_relay_urls(state_dir, &manifest.relay_urls);
+            }
+            Err(err) => {
+                last_err = Some(err.context(format!("fetch join manifest from {endpoint}")));
+            }
+        }
+    }
+    Err(last_err.unwrap_or_else(|| anyhow!("no reachable join manifest endpoint")))
+}
+
+fn persist_startup_config_relay_urls(state_dir: &Path, relay_urls: &[String]) -> Result<bool> {
+    let mut seen = BTreeSet::new();
+    let sanitized: Vec<String> = relay_urls
+        .iter()
+        .map(|url| url.trim().trim_end_matches('/').to_owned())
+        .filter(|url| !url.is_empty())
+        .filter(|url| seen.insert(url.clone()))
+        .collect();
+    if sanitized.is_empty() {
+        return Ok(false);
+    }
+    fs::create_dir_all(state_dir)?;
+    let path = state_dir.join("startup_config.json");
+    let mut value = if path.exists() {
+        serde_json::from_slice::<Value>(&fs::read(&path)?)
+            .with_context(|| format!("parse startup config at {}", path.display()))?
+    } else {
+        json!({})
+    };
+    if !value.is_object() {
+        value = json!({});
+    }
+    let next = json!(sanitized);
+    if value.get("relay_urls") == Some(&next) {
+        return Ok(false);
+    }
+    value["relay_urls"] = next;
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let tmp_path = state_dir.join(format!(
+        ".startup_config.json.{}.{nonce}.tmp",
+        std::process::id()
+    ));
+    fs::write(&tmp_path, serde_json::to_vec_pretty(&value)?)?;
+    fs::rename(&tmp_path, &path)?;
+    Ok(true)
 }
 
 fn try_sync_network_bootstrap_bundle_from_join_manifest(

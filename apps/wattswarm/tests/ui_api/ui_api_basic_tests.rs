@@ -475,16 +475,50 @@ fn peer_dm_send_uses_private_group_topic_messages() {
     let schema = reset_test_schema("test");
     let _schema_guard = EnvVarGuard::set("WATTSWARM_PG_SCHEMA", &schema);
     let _mode_guard = EnvVarGuard::set("WATTSWARM_NODE_MODE", "local");
+    let dir = tempdir().unwrap();
+    let state_dir = dir.path().join("state");
+    std::fs::create_dir_all(&state_dir).unwrap();
+    let db_path = state_dir.join("ui.state");
+    open_node(&state_dir, &db_path).expect("initialize local node");
+    let remote_keypair = wattswarm::crypto::generate_private_message_keypair();
+    wattswarm::control::save_peer_metadata_record_state(
+        &state_dir,
+        &wattswarm::control::PeerMetadataRecord {
+            node_id: "node-beta".to_owned(),
+            network_id: None,
+            params_version: None,
+            params_hash: None,
+            agent_version_raw: None,
+            agent_version_prefix: None,
+            protocol_version: None,
+            observed_addr: None,
+            listen_addrs: Vec::new(),
+            protocols: Vec::new(),
+            handshake_status: "identified".to_owned(),
+            last_error: None,
+            contact_material: Some(json!({
+                "encryption": {
+                    "private_message": {
+                        "scheme": "wattswarm.private.dm.v1",
+                        "key_agreement": "x25519",
+                        "cipher": "chacha20poly1305",
+                        "public_key_b64": remote_keypair.public_key_b64,
+                    }
+                }
+            })),
+            contact_material_signature: None,
+            contact_material_updated_at: Some(1),
+            first_identified_at: 1,
+            last_identified_at: 1,
+        },
+    )
+    .expect("save peer encryption metadata");
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .unwrap();
     runtime.block_on(async {
-        let dir = tempdir().unwrap();
-        let state_dir = dir.path().join("state");
-        std::fs::create_dir_all(&state_dir).unwrap();
-        let db_path = state_dir.join("ui.state");
-        let app = build_app(UiServerState::new(state_dir, db_path));
+        let app = build_app(UiServerState::new(state_dir.clone(), db_path.clone()));
 
         let up_res = app
             .clone()
@@ -524,8 +558,9 @@ fn peer_dm_send_uses_private_group_topic_messages() {
             )
             .await
             .unwrap();
-        assert_eq!(send_res.status(), StatusCode::OK);
+        let send_status = send_res.status();
         let send_json = json_from(send_res).await;
+        assert_eq!(send_status, StatusCode::OK, "send response: {send_json}");
         assert_eq!(send_json["ok"].as_bool(), Some(true));
         assert_eq!(send_json["queued"].as_bool(), Some(false));
         assert_eq!(send_json["feed_key"].as_str(), Some("wattswarm.dm"));
@@ -562,6 +597,17 @@ fn peer_dm_send_uses_private_group_topic_messages() {
         assert_eq!(
             topic_json["messages"][0]["content"]["thread_id"].as_str(),
             Some(thread_id)
+        );
+        assert!(
+            topic_json["messages"][0]["content"]["encrypted"]
+                .as_object()
+                .is_some()
+        );
+        assert!(topic_json["messages"][0]["content"]["content"].is_null());
+        assert!(
+            !serde_json::to_string(&topic_json["messages"][0]["content"])
+                .unwrap()
+                .contains("hello private group")
         );
 
         let other_network_topic_res = app
@@ -1109,6 +1155,10 @@ fn ui_exposes_network_join_manifest() {
         "WATTSWARM_PUBLIC_DISCOVERY_URLS",
         "https://bootstrap.wattetheria.com/api/network/discovery",
     );
+    let _relay_guard = EnvVarGuard::set(
+        "WATTSWARM_IROH_RELAY_URLS",
+        "https://relay.wattetheria.com,https://relay2.wattetheria.com",
+    );
     let dir = tempdir().unwrap();
     let state_dir = dir.path().join("state");
     std::fs::create_dir_all(&state_dir).unwrap();
@@ -1176,6 +1226,14 @@ fn ui_exposes_network_join_manifest() {
         assert_eq!(
             json["discovery_urls"][0].as_str(),
             Some("https://bootstrap.wattetheria.com/api/network/discovery")
+        );
+        assert_eq!(
+            json["relay_urls"][0].as_str(),
+            Some("https://relay.wattetheria.com")
+        );
+        assert_eq!(
+            json["relay_urls"][1].as_str(),
+            Some("https://relay2.wattetheria.com")
         );
         assert!(json.get("servicenet_urls").is_none());
     });

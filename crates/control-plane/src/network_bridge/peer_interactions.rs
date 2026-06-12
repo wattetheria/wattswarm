@@ -577,6 +577,10 @@ pub(super) fn save_dm_message(
     Ok(record)
 }
 
+pub(super) struct InboundPrivateDmProjection {
+    pub topic_content: Value,
+}
+
 pub(super) fn save_inbound_private_dm_topic_message(
     state_dir: &Path,
     local_node_id: &str,
@@ -584,7 +588,7 @@ pub(super) fn save_inbound_private_dm_topic_message(
     event_id: &str,
     content: &Value,
     created_at: u64,
-) -> Result<Option<crate::control::PeerDmMessageRecord>> {
+) -> Result<Option<InboundPrivateDmProjection>> {
     let kind = content.get("kind").and_then(Value::as_str).map(str::trim);
     if kind != Some("direct_message") {
         return Ok(None);
@@ -609,10 +613,51 @@ pub(super) fn save_inbound_private_dm_topic_message(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .unwrap_or(event_id);
-    let message_content = content.get("content").cloned().unwrap_or(Value::Null);
-    let parsed_envelope = content.get("agent_envelope").cloned().and_then(|value| {
-        serde_json::from_value::<crate::control::AgentInteractionEnvelope>(value).ok()
-    });
+    let (message_content, parsed_envelope, topic_content) = if let Some(encrypted) =
+        content.get("encrypted")
+    {
+        let encrypted =
+            serde_json::from_value::<crate::crypto::PrivateEncryptedPayload>(encrypted.clone())
+                .context("decode private dm encrypted payload")?;
+        let keypair = crate::control::load_or_create_private_message_keypair_state(state_dir)?;
+        let plaintext = crate::crypto::decrypt_private_message(
+            &keypair.secret_key_b64,
+            &encrypted,
+            &crate::control::private_dm_encryption_aad(
+                remote_node_id,
+                local_node_id,
+                &thread_id,
+                message_id,
+            ),
+        )?;
+        let private_payload: Value =
+            serde_json::from_slice(&plaintext).context("decode private dm plaintext")?;
+        let message_content = private_payload
+            .get("content")
+            .cloned()
+            .unwrap_or(Value::Null);
+        let parsed_envelope = private_payload
+            .get("agent_envelope")
+            .cloned()
+            .and_then(|value| {
+                serde_json::from_value::<crate::control::AgentInteractionEnvelope>(value).ok()
+            });
+        let mut topic_content = content.clone();
+        if let Some(object) = topic_content.as_object_mut() {
+            object.remove("encrypted");
+            object.insert("content".to_owned(), message_content.clone());
+            if let Some(envelope) = parsed_envelope.as_ref() {
+                object.insert("agent_envelope".to_owned(), serde_json::to_value(envelope)?);
+            }
+        }
+        (message_content, parsed_envelope, topic_content)
+    } else {
+        let message_content = content.get("content").cloned().unwrap_or(Value::Null);
+        let parsed_envelope = content.get("agent_envelope").cloned().and_then(|value| {
+            serde_json::from_value::<crate::control::AgentInteractionEnvelope>(value).ok()
+        });
+        (message_content, parsed_envelope, content.clone())
+    };
     let a2a_protocol = parsed_envelope
         .as_ref()
         .map(|envelope| envelope.protocol.trim())
@@ -635,6 +680,8 @@ pub(super) fn save_inbound_private_dm_topic_message(
         Some(created_at),
     )?;
 
+    maybe_store_private_hive_key_share(state_dir, &message_content, created_at)?;
+
     let record = crate::control::PeerDmMessageRecord {
         thread_id,
         message_id: message_id.to_owned(),
@@ -649,7 +696,70 @@ pub(super) fn save_inbound_private_dm_topic_message(
         acknowledged_at: Some(created_at),
     };
     crate::control::save_peer_dm_message_record_state(state_dir, &record)?;
-    Ok(Some(record))
+    Ok(Some(InboundPrivateDmProjection { topic_content }))
+}
+
+fn maybe_store_private_hive_key_share(
+    state_dir: &Path,
+    content: &Value,
+    created_at: u64,
+) -> Result<()> {
+    let key_payload =
+        if content.get("kind").and_then(Value::as_str) == Some("private_hive_key_share") {
+            content
+        } else if let Some(payload) = content.get("private_hive_key") {
+            payload
+        } else {
+            return Ok(());
+        };
+    let Some(feed_key) = key_payload
+        .get("feed_key")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(());
+    };
+    let Some(scope_hint) = key_payload
+        .get("scope_hint")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(());
+    };
+    let Some(shared_secret_b64) = key_payload
+        .get("shared_secret_b64")
+        .or_else(|| key_payload.get("group_key_b64"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(());
+    };
+    let epoch = key_payload
+        .get("epoch")
+        .or_else(|| key_payload.get("secret_epoch"))
+        .and_then(Value::as_u64)
+        .unwrap_or(1);
+    let group_id = key_payload
+        .get("group_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .unwrap_or_else(|| crate::control::private_hive_group_id(feed_key, scope_hint));
+    crate::control::upsert_private_hive_key_record_state(
+        state_dir,
+        crate::control::PrivateHiveKeyRecord {
+            feed_key: feed_key.to_owned(),
+            scope_hint: scope_hint.to_owned(),
+            group_id,
+            epoch,
+            shared_secret_b64: shared_secret_b64.to_owned(),
+            updated_at: created_at,
+        },
+    )
 }
 
 pub(super) fn save_agent_payment_summary(
