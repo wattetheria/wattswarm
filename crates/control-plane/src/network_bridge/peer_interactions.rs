@@ -433,8 +433,38 @@ pub(super) fn attach_agent_envelope_to_relationship(
     else {
         return Ok(());
     };
-    record.agent_envelope = Some(raw_agent_envelope_to_control_record(envelope));
+    let incoming_envelope = raw_agent_envelope_to_control_record(envelope);
+    record.agent_envelope = Some(relationship_agent_envelope_for_update(
+        record.agent_envelope.as_ref(),
+        incoming_envelope,
+    ));
     crate::control::save_peer_relationship_record_state(state_dir, &record)
+}
+
+fn relationship_agent_envelope_for_update(
+    existing: Option<&crate::control::AgentInteractionEnvelope>,
+    incoming: crate::control::AgentInteractionEnvelope,
+) -> crate::control::AgentInteractionEnvelope {
+    if let Some(existing) = existing
+        && relationship_envelope_has_visible_message(existing)
+        && !relationship_envelope_has_visible_message(&incoming)
+    {
+        return existing.clone();
+    }
+    incoming
+}
+
+fn relationship_envelope_has_visible_message(
+    envelope: &crate::control::AgentInteractionEnvelope,
+) -> bool {
+    ["text", "payload", "message"].iter().any(|key| {
+        envelope
+            .message
+            .get(key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .is_some_and(|value| !value.is_empty())
+    })
 }
 
 pub fn default_agent_envelope(
@@ -1272,6 +1302,119 @@ mod tests {
             payload_with_verified_agent_context(json!({"summary_id": "s"}), None).expect("payload");
         assert!(payload.get(VERIFIED_AGENT_CONTEXT_PAYLOAD_KEY).is_none());
         assert_eq!(payload.get("summary_id").and_then(Value::as_str), Some("s"));
+    }
+
+    #[test]
+    fn relationship_agent_envelope_preserves_existing_visible_message_over_retry_metadata() {
+        let existing = crate::control::AgentInteractionEnvelope {
+            protocol: "google_a2a".to_owned(),
+            capability: Some("social.friend.request".to_owned()),
+            message: json!({
+                "action": "request",
+                "payload": "Hello from the original friend request",
+                "request_id": "request-1"
+            }),
+            signature: Some("original-signature".to_owned()),
+            ..Default::default()
+        };
+        let incoming = crate::control::AgentInteractionEnvelope {
+            protocol: "google_a2a".to_owned(),
+            capability: Some("social.friend.request".to_owned()),
+            message: json!({
+                "action": "request",
+                "retry": true,
+                "request_id": "request-1"
+            }),
+            signature: Some("retry-signature".to_owned()),
+            ..Default::default()
+        };
+
+        let merged = relationship_agent_envelope_for_update(Some(&existing), incoming);
+
+        assert_eq!(
+            merged.message.get("payload").and_then(Value::as_str),
+            Some("Hello from the original friend request")
+        );
+        assert_eq!(merged.signature.as_deref(), Some("original-signature"));
+    }
+
+    #[test]
+    fn relationship_agent_envelope_uses_incoming_visible_message() {
+        let existing = crate::control::AgentInteractionEnvelope {
+            protocol: "google_a2a".to_owned(),
+            capability: Some("social.friend.request".to_owned()),
+            message: json!({
+                "action": "request",
+                "retry": true,
+                "request_id": "request-1"
+            }),
+            signature: Some("retry-signature".to_owned()),
+            ..Default::default()
+        };
+        let incoming = crate::control::AgentInteractionEnvelope {
+            protocol: "google_a2a".to_owned(),
+            capability: Some("social.friend.request".to_owned()),
+            message: json!({
+                "action": "request",
+                "text": "Fresh request message",
+                "request_id": "request-1"
+            }),
+            signature: Some("fresh-signature".to_owned()),
+            ..Default::default()
+        };
+
+        let merged = relationship_agent_envelope_for_update(Some(&existing), incoming);
+
+        assert_eq!(
+            merged.message.get("text").and_then(Value::as_str),
+            Some("Fresh request message")
+        );
+        assert_eq!(merged.signature.as_deref(), Some("fresh-signature"));
+    }
+
+    #[test]
+    fn attach_agent_envelope_persists_relationship_message() {
+        let state_dir = std::env::temp_dir().join(format!(
+            "wattswarm-peer-envelope-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&state_dir).expect("create temp state dir");
+        let remote_node_id = "remote-node";
+        crate::control::apply_peer_relationship_action_state(
+            &state_dir,
+            remote_node_id,
+            crate::control::PeerRelationshipAction::Request,
+            crate::control::PeerRelationshipInitiator::Local,
+        )
+        .expect("create local relationship record");
+        let envelope = default_agent_envelope(
+            "local-node",
+            remote_node_id,
+            "social.friend.request",
+            json!({
+                "action": "request",
+                "payload": "hello from original request",
+                "request_id": "request-1"
+            }),
+        );
+
+        attach_agent_envelope_to_relationship(&state_dir, remote_node_id, &envelope)
+            .expect("attach agent envelope");
+
+        let record = crate::control::load_peer_relationship_records_state(&state_dir)
+            .expect("load relationship records")
+            .into_iter()
+            .find(|record| record.remote_node_id == remote_node_id)
+            .expect("relationship record exists");
+        assert_eq!(
+            record.agent_envelope.and_then(|envelope| envelope
+                .message
+                .get("payload")
+                .and_then(Value::as_str)
+                .map(str::to_owned)),
+            Some("hello from original request".to_owned())
+        );
+        let _ = std::fs::remove_dir_all(state_dir);
     }
 
     #[test]

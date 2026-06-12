@@ -22,7 +22,7 @@ use wattswarm_network_transport_iroh::{
     IrohGossipRuntimeConfig, derive_gossip_topic_id,
     export_local_contact_material_for_network_peer_id_with_gossip_config,
     install_local_contact_material_control_handler_for_network_peer_id,
-    local_endpoint_id_from_state_dir, local_gossip_for_network_peer_id,
+    local_endpoint_id_from_state_dir, local_gossip_for_network_peer_id, local_iroh_home_relay_urls,
     register_remote_contact_material_for_network_peer_id,
     send_control_stream_request_for_network_peer_id_with_timeout,
     set_local_control_stream_handler_for_network_peer_id, shutdown_local_iroh_data_plane,

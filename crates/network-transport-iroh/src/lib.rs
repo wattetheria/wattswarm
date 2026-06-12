@@ -1296,6 +1296,29 @@ pub fn fetch_remote_blob_bytes_for_network_peer_id(
         .fetch_blob_bytes(remote_contact, reference)
 }
 
+/// Current home relay URLs observed on the local iroh endpoint.
+///
+/// Returns an empty list when no data plane is running for `state_dir` or the
+/// endpoint has not attached to a relay yet. Read-only: never creates a data
+/// plane.
+pub fn local_iroh_home_relay_urls(state_dir: &Path) -> Vec<String> {
+    let service = {
+        let services = local_iroh_data_planes()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        services.get(state_dir).cloned()
+    };
+    let Some(service) = service else {
+        return Vec::new();
+    };
+    service
+        .endpoint
+        .addr()
+        .relay_urls()
+        .map(normalize_public_relay_url)
+        .collect()
+}
+
 pub fn shutdown_local_iroh_data_plane(state_dir: &Path) {
     let service = {
         let mut services = local_iroh_data_planes()
@@ -1416,6 +1439,12 @@ mod tests {
             Vec::<String>::new()
         );
         assert!(options.published_direct_addrs.is_empty());
+    }
+
+    #[test]
+    fn local_iroh_home_relay_urls_is_empty_without_data_plane() {
+        let dir = tempdir().expect("tempdir");
+        assert!(local_iroh_home_relay_urls(dir.path()).is_empty());
     }
 
     #[test]

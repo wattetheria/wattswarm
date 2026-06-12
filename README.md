@@ -177,7 +177,7 @@ flowchart LR
     U["Task / Topic Source"] --> A["Node A
 Coordinator node + local Wattswarm store"]
 
-    subgraph N["Decentralized Network Overlay"]
+    subgraph N["P2P Network Overlay"]
         N1["LAN / WAN
 Iroh contact material"]
         N2["Iroh endpoint

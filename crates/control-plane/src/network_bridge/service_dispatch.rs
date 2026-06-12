@@ -42,6 +42,9 @@ impl NetworkBridgeService {
                 }),
             )
         });
+        if action == crate::control::PeerRelationshipAction::Request {
+            attach_agent_envelope_to_relationship(&state_dir, &remote_node_id, &envelope)?;
+        }
         if action == crate::control::PeerRelationshipAction::Accept
             && relationship_record.relationship_state
                 == crate::control::PeerRelationshipState::Accepted

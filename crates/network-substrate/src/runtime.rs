@@ -280,7 +280,7 @@ impl SubstrateRuntime {
             nat_status: "iroh-direct".to_owned(),
             nat_public_address: None,
             nat_confidence: 0,
-            relay_reservations: Vec::new(),
+            relay_reservations: local_iroh_home_relay_urls(&self.state_dir),
             peer_health: Vec::new(),
             dropped_malformed_gossip: self.counters.malformed_gossip_notifications,
             invalid_control_payloads: self.counters.invalid_control_payloads,

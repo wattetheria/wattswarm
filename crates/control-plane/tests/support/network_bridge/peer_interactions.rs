@@ -40,10 +40,32 @@ pub fn two_nodes_execute_peer_relationship_request_and_accept_over_network() {
 
     let remote_b = service_b.local_peer_id().to_string();
     let remote_a = service_a.local_peer_id().to_string();
+    let request_envelope = default_agent_envelope(
+        &remote_a,
+        &remote_b,
+        "social.friend.request",
+        json!({
+            "action": "request",
+            "payload": "hello from node a",
+            "request_id": "request-1"
+        }),
+    );
 
     service_a
-        .send_peer_relationship_action(&remote_b, PeerRelationshipAction::Request, None)
+        .send_peer_relationship_action(
+            &remote_b,
+            PeerRelationshipAction::Request,
+            Some(request_envelope),
+        )
         .expect("send relationship request");
+    assert_eq!(
+        relationship_message_for(&dir_a, &remote_b).and_then(|message| message
+            .get("payload")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned)),
+        Some("hello from node a".to_owned()),
+        "outbound request should persist its agent envelope in the sender relationship view"
+    );
 
     let mut last_tick_a = None;
     let mut last_tick_b = None;

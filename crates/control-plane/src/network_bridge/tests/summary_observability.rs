@@ -659,7 +659,6 @@ fn observability_snapshot_reports_network_and_sync_health() {
     assert_eq!(snapshot.nat_status, "iroh-direct");
     assert_eq!(snapshot.nat_public_address, None);
     assert_eq!(snapshot.nat_confidence, 0);
-    assert!(snapshot.relay_reservations.is_empty());
     assert_eq!(snapshot.peer_health.len(), 1);
     assert!(snapshot.peer_health[0].connected);
     assert!(!snapshot.peer_health[0].blacklisted);
@@ -1025,7 +1024,7 @@ fn latest_connected_peer_ids_uses_runtime_observability_snapshot() {
             nat_status: "unknown".to_owned(),
             nat_public_address: None,
             nat_confidence: 0,
-            relay_reservations: Vec::new(),
+            relay_reservations: vec!["https://relay2.wattetheria.com".to_owned()],
             peer_health: vec![
                 NetworkBridgePeerHealth {
                     network_peer_id: "peer-connected".to_owned(),
@@ -1086,6 +1085,12 @@ fn latest_connected_peer_ids_uses_runtime_observability_snapshot() {
     assert_eq!(
         latest_connected_peer_ids(&dir),
         Some(vec!["peer-connected".to_owned()])
+    );
+    assert_eq!(
+        latest_network_observability_snapshot(&dir)
+            .expect("stored observability snapshot")
+            .relay_reservations,
+        vec!["https://relay2.wattetheria.com".to_owned()]
     );
 
     clear_latest_network_observability_snapshot(&dir);

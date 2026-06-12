@@ -17,8 +17,8 @@ use wattswarm_control_plane::control::{
 use wattswarm_control_plane::crypto::{NodeIdentity, sha256_hex};
 use wattswarm_control_plane::network_bridge::{
     NetworkBridgeService, NetworkBridgeTick, build_knowledge_summary_for_task_type,
-    build_reputation_summary_for_runtime, latest_connected_peer_ids, publish_pending_global_events,
-    publish_pending_scoped_updates,
+    build_reputation_summary_for_runtime, default_agent_envelope, latest_connected_peer_ids,
+    publish_pending_global_events, publish_pending_scoped_updates,
 };
 use wattswarm_control_plane::network_p2p::{
     GossipKind, NetworkAddress, NetworkP2pConfig, NetworkP2pNode, PeerHandshakeMetadata,
@@ -400,6 +400,14 @@ fn relationship_state_for(path: &Path, remote_node_id: &str) -> Option<PeerRelat
         .into_iter()
         .find(|record| record.remote_node_id == remote_node_id)
         .map(|record| record.relationship_state)
+}
+
+fn relationship_message_for(path: &Path, remote_node_id: &str) -> Option<serde_json::Value> {
+    load_peer_relationship_records_state(path)
+        .expect("load peer relationships")
+        .into_iter()
+        .find(|record| record.remote_node_id == remote_node_id)
+        .and_then(|record| record.agent_envelope.map(|envelope| envelope.message))
 }
 
 fn dm_thread_id(local_node_id: &str, remote_node_id: &str) -> String {
