@@ -1190,6 +1190,12 @@ fn inbound_private_dm_topic_message_direct_projection_still_saves_remote_author(
     assert_eq!(messages.len(), 1);
     assert_eq!(messages[0].remote_node_id, remote_node_id);
     assert_eq!(messages[0].message_id, "dm-remote");
+    let threads =
+        crate::control::load_peer_dm_thread_records_state(&state_dir).expect("load dm threads");
+    assert_eq!(threads.len(), 1);
+    assert_eq!(threads[0].created_at, 456);
+    assert!(threads[0].updated_at >= threads[0].created_at);
+    assert_eq!(threads[0].last_message_at, Some(456));
 }
 
 #[test]

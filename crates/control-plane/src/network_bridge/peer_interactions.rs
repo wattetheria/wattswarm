@@ -527,21 +527,26 @@ pub(super) fn upsert_dm_thread(
             }
         })
         .unwrap_or(session_state);
+    let merged_relationship_established_at = relationship_established_at.or_else(|| {
+        existing
+            .as_ref()
+            .and_then(|record| record.relationship_established_at)
+    });
+    let merged_last_message_at =
+        last_message_at.or_else(|| existing.as_ref().and_then(|record| record.last_message_at));
     let record = crate::control::PeerDmThreadRecord {
         remote_node_id: remote_node_id.to_owned(),
         thread_id: thread_id.to_owned(),
         thread_kind: crate::control::PeerDmThreadKind::Direct,
         session_state: merged_session_state,
-        relationship_established_at: relationship_established_at.or_else(|| {
-            existing
-                .as_ref()
-                .and_then(|record| record.relationship_established_at)
-        }),
+        relationship_established_at: merged_relationship_established_at,
         created_at: existing.as_ref().map_or(now, |record| record.created_at),
-        updated_at: now,
-        last_message_at: last_message_at
-            .or_else(|| existing.as_ref().and_then(|record| record.last_message_at)),
-    };
+        updated_at: existing
+            .as_ref()
+            .map_or(now, |record| record.updated_at.max(now)),
+        last_message_at: merged_last_message_at,
+    }
+    .normalized_lifetime();
     crate::control::save_peer_dm_thread_record_state(state_dir, &record)?;
     Ok(record)
 }

@@ -612,6 +612,21 @@ pub struct PeerDmThreadRecord {
     pub last_message_at: Option<u64>,
 }
 
+impl PeerDmThreadRecord {
+    pub fn normalized_lifetime(mut self) -> Self {
+        if let Some(relationship_established_at) = self.relationship_established_at {
+            self.created_at = self.created_at.min(relationship_established_at);
+            self.updated_at = self.updated_at.max(relationship_established_at);
+        }
+        if let Some(last_message_at) = self.last_message_at {
+            self.created_at = self.created_at.min(last_message_at);
+            self.updated_at = self.updated_at.max(last_message_at);
+        }
+        self.updated_at = self.updated_at.max(self.created_at);
+        self
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PeerDmMessageRecord {
     pub thread_id: String,
@@ -1357,15 +1372,18 @@ pub fn load_peer_dm_thread_records_state(state_dir: &Path) -> Result<Vec<PeerDmT
     Ok(store
         .list_local_peer_dm_threads(&scope_id)?
         .into_iter()
-        .map(|row| PeerDmThreadRecord {
-            remote_node_id: row.remote_node_id,
-            thread_id: row.thread_id,
-            thread_kind: peer_dm_thread_kind_from_str(&row.thread_kind),
-            session_state: peer_dm_session_state_from_str(&row.session_state),
-            relationship_established_at: row.relationship_established_at,
-            created_at: row.created_at,
-            updated_at: row.updated_at,
-            last_message_at: row.last_message_at,
+        .map(|row| {
+            PeerDmThreadRecord {
+                remote_node_id: row.remote_node_id,
+                thread_id: row.thread_id,
+                thread_kind: peer_dm_thread_kind_from_str(&row.thread_kind),
+                session_state: peer_dm_session_state_from_str(&row.session_state),
+                relationship_established_at: row.relationship_established_at,
+                created_at: row.created_at,
+                updated_at: row.updated_at,
+                last_message_at: row.last_message_at,
+            }
+            .normalized_lifetime()
         })
         .collect())
 }
@@ -1375,11 +1393,12 @@ pub fn save_peer_dm_thread_record_state(
     record: &PeerDmThreadRecord,
 ) -> Result<()> {
     let scope_id = local_control_scope_id(state_dir);
+    let record = record.clone().normalized_lifetime();
     local_control_store(state_dir)?.upsert_local_peer_dm_thread(
         &scope_id,
         &crate::storage::LocalPeerDmThreadRow {
-            remote_node_id: record.remote_node_id.clone(),
-            thread_id: record.thread_id.clone(),
+            remote_node_id: record.remote_node_id,
+            thread_id: record.thread_id,
             thread_kind: record.thread_kind.as_str().to_owned(),
             session_state: record.session_state.as_str().to_owned(),
             relationship_established_at: record.relationship_established_at,
@@ -1910,6 +1929,42 @@ mod tests {
                     .starts_with(".node_state.json.")
             });
         assert!(!leftover_tmp);
+        fs::remove_dir_all(&state_dir).expect("remove state dir");
+    }
+
+    #[test]
+    fn load_peer_dm_threads_normalizes_legacy_lifetime() {
+        let state_dir = std::env::temp_dir().join(format!(
+            "wattswarm-peer-dm-thread-lifetime-test-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        fs::create_dir_all(&state_dir).expect("create state dir");
+        let scope_id = local_control_scope_id(&state_dir);
+        local_control_store(&state_dir)
+            .expect("open local control store")
+            .upsert_local_peer_dm_thread(
+                &scope_id,
+                &crate::storage::LocalPeerDmThreadRow {
+                    remote_node_id: "remote-node".to_owned(),
+                    thread_id: "dm:legacy".to_owned(),
+                    thread_kind: "direct".to_owned(),
+                    session_state: "ready".to_owned(),
+                    relationship_established_at: Some(150),
+                    created_at: 200,
+                    updated_at: 220,
+                    last_message_at: Some(100),
+                },
+            )
+            .expect("seed legacy dm thread");
+
+        let rows =
+            load_peer_dm_thread_records_state(&state_dir).expect("load normalized dm threads");
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].created_at, 100);
+        assert_eq!(rows[0].updated_at, 220);
+        assert_eq!(rows[0].last_message_at, Some(100));
+        assert_eq!(rows[0].relationship_established_at, Some(150));
         fs::remove_dir_all(&state_dir).expect("remove state dir");
     }
 }
