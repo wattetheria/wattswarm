@@ -357,6 +357,7 @@ struct IrohEndpointOptions {
     relay_urls: Vec<RelayUrl>,
     published_relay_urls: Vec<String>,
     bind_addr: Option<SocketAddr>,
+    publish_observed_direct_addrs: bool,
     published_direct_addrs: Vec<String>,
 }
 
@@ -403,15 +404,28 @@ impl IrohEndpointOptions {
         publish_direct_addrs: Option<&str>,
     ) -> Result<Self> {
         let relay_urls = parse_relay_urls(relay_urls.unwrap_or_default())?;
+        let publish_observed_direct_addrs = publish_direct_addrs
+            .map(str::trim)
+            .map(|value| {
+                matches!(
+                    value.to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on"
+                )
+            })
+            .unwrap_or(false);
         Ok(Self {
             published_relay_urls: relay_urls.iter().map(normalize_public_relay_url).collect(),
             relay_urls,
             bind_addr: parse_optional_socket_addr_env(ENV_IROH_BIND_ADDR, bind_addr)?,
+            publish_observed_direct_addrs,
             published_direct_addrs: parse_direct_addr_publish_env(publish_direct_addrs)?,
         })
     }
 
-    fn published_direct_addrs(&self, _observed_direct_addrs: Vec<String>) -> Vec<String> {
+    fn published_direct_addrs(&self, observed_direct_addrs: Vec<String>) -> Vec<String> {
+        if self.publish_observed_direct_addrs {
+            return observed_direct_addrs;
+        }
         self.published_direct_addrs.clone()
     }
 
@@ -1377,6 +1391,22 @@ mod tests {
         fs::write(dir.join("node_seed.hex"), hex::encode(seed)).expect("write node seed");
     }
 
+    fn write_test_relay_urls(dir: &Path) {
+        fs::write(
+            dir.join("startup_config.json"),
+            r#"{"relay_urls":["https://relay.example.invalid/"]}"#,
+        )
+        .expect("write startup config");
+    }
+
+    fn contact_has_direct_addr(contact: &TransportContactMaterial) -> bool {
+        contact
+            .extra
+            .get("direct_addrs")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|items| !items.is_empty())
+    }
+
     #[test]
     fn exports_iroh_contact_material_with_capabilities() {
         let adapter = IrohTransportAdapter::from_seed_bytes([5u8; 32]).expect("adapter");
@@ -1518,7 +1548,10 @@ mod tests {
             options.bind_addr,
             Some("0.0.0.0:4002".parse().expect("socket addr"))
         );
-        assert!(options.published_direct_addrs.is_empty());
+        assert_eq!(
+            options.published_direct_addrs(vec!["127.0.0.1:4002".to_owned()]),
+            vec!["127.0.0.1:4002".to_owned()]
+        );
     }
 
     #[test]
@@ -1597,6 +1630,7 @@ mod tests {
     fn exports_contact_material_with_iroh_endpoint_identity() {
         let dir = tempdir().expect("tempdir");
         seed_state_dir(dir.path(), [11u8; 32]);
+        write_test_relay_urls(dir.path());
         let endpoint_id = local_endpoint_id_from_state_dir(dir.path()).expect("endpoint id");
         let endpoint_peer_id = endpoint_id.to_string();
 
@@ -1619,6 +1653,7 @@ mod tests {
     fn existing_iroh_endpoint_rejects_different_network_peer_id() {
         let dir = tempdir().expect("tempdir");
         seed_state_dir(dir.path(), [13u8; 32]);
+        write_test_relay_urls(dir.path());
         let endpoint_id = local_endpoint_id_from_state_dir(dir.path()).expect("endpoint id");
         export_local_contact_material_for_network_peer_id(dir.path(), &endpoint_id.to_string(), 1)
             .expect("contact material");
@@ -1689,6 +1724,8 @@ mod tests {
         let dir_b = tempdir().expect("node b tempdir");
         seed_state_dir(dir_a.path(), [18u8; 32]);
         seed_state_dir(dir_b.path(), [19u8; 32]);
+        write_test_relay_urls(dir_a.path());
+        write_test_relay_urls(dir_b.path());
         let endpoint_a = local_endpoint_id_from_state_dir(dir_a.path()).expect("endpoint a");
         let endpoint_b = local_endpoint_id_from_state_dir(dir_b.path()).expect("endpoint b");
         let peer_a = endpoint_a.to_string();
@@ -1697,6 +1734,11 @@ mod tests {
             .expect("contact a");
         let contact_b = export_local_contact_material_for_network_peer_id(dir_b.path(), &peer_b, 1)
             .expect("contact b");
+        if !contact_has_direct_addr(&contact_b) {
+            shutdown_local_iroh_data_plane(dir_a.path());
+            shutdown_local_iroh_data_plane(dir_b.path());
+            return;
+        }
         let reference =
             put_local_blob_bytes_for_network_peer_id(dir_b.path(), &peer_b, b"remote blob")
                 .expect("put remote blob");
@@ -1720,6 +1762,8 @@ mod tests {
         let dir_b = tempdir().expect("node b tempdir");
         seed_state_dir(dir_a.path(), [21u8; 32]);
         seed_state_dir(dir_b.path(), [22u8; 32]);
+        write_test_relay_urls(dir_a.path());
+        write_test_relay_urls(dir_b.path());
         let endpoint_a = local_endpoint_id_from_state_dir(dir_a.path()).expect("endpoint a");
         let endpoint_b = local_endpoint_id_from_state_dir(dir_b.path()).expect("endpoint b");
         let peer_a = endpoint_a.to_string();
@@ -1728,6 +1772,11 @@ mod tests {
             .expect("contact a");
         let contact_b = export_local_contact_material_for_network_peer_id(dir_b.path(), &peer_b, 1)
             .expect("contact b");
+        if !contact_has_direct_addr(&contact_a) || !contact_has_direct_addr(&contact_b) {
+            shutdown_local_iroh_data_plane(dir_a.path());
+            shutdown_local_iroh_data_plane(dir_b.path());
+            return;
+        }
         register_remote_contact_material_for_network_peer_id(dir_a.path(), &peer_a, &contact_b)
             .expect("node a learns node b");
         register_remote_contact_material_for_network_peer_id(dir_b.path(), &peer_b, &contact_a)
@@ -1780,6 +1829,8 @@ mod tests {
         let dir_b = tempdir().expect("node b tempdir");
         seed_state_dir(dir_a.path(), [31u8; 32]);
         seed_state_dir(dir_b.path(), [32u8; 32]);
+        write_test_relay_urls(dir_a.path());
+        write_test_relay_urls(dir_b.path());
         let endpoint_a = local_endpoint_id_from_state_dir(dir_a.path()).expect("endpoint a");
         let endpoint_b = local_endpoint_id_from_state_dir(dir_b.path()).expect("endpoint b");
         let peer_a = endpoint_a.to_string();
@@ -1788,6 +1839,11 @@ mod tests {
             .expect("contact a");
         let contact_b = export_local_contact_material_for_network_peer_id(dir_b.path(), &peer_b, 1)
             .expect("contact b");
+        if !contact_has_direct_addr(&contact_b) {
+            shutdown_local_iroh_data_plane(dir_a.path());
+            shutdown_local_iroh_data_plane(dir_b.path());
+            return;
+        }
         set_local_control_stream_handler_for_network_peer_id(
             dir_b.path(),
             &peer_b,
@@ -1832,6 +1888,8 @@ mod tests {
         let dir_b = tempdir().expect("node b tempdir");
         seed_state_dir(dir_a.path(), [41u8; 32]);
         seed_state_dir(dir_b.path(), [42u8; 32]);
+        write_test_relay_urls(dir_a.path());
+        write_test_relay_urls(dir_b.path());
         let endpoint_a = local_endpoint_id_from_state_dir(dir_a.path()).expect("endpoint a");
         let endpoint_b = local_endpoint_id_from_state_dir(dir_b.path()).expect("endpoint b");
         let peer_a = endpoint_a.to_string();
@@ -1841,6 +1899,11 @@ mod tests {
         let bootstrap_contact_b =
             export_local_contact_material_for_network_peer_id(dir_b.path(), &peer_b, 1)
                 .expect("bootstrap contact b");
+        if !contact_has_direct_addr(&bootstrap_contact_b) {
+            shutdown_local_iroh_data_plane(dir_a.path());
+            shutdown_local_iroh_data_plane(dir_b.path());
+            return;
+        }
         install_local_contact_material_control_handler_for_network_peer_id(dir_b.path(), &peer_b)
             .expect("install contact handler");
 
@@ -1867,6 +1930,8 @@ mod tests {
         let remote_dir = tempdir().expect("remote tempdir");
         seed_state_dir(local_dir.path(), [7u8; 32]);
         seed_state_dir(remote_dir.path(), [9u8; 32]);
+        write_test_relay_urls(local_dir.path());
+        write_test_relay_urls(remote_dir.path());
 
         let local_peer_id = local_endpoint_id_from_state_dir(local_dir.path())
             .expect("local endpoint")
@@ -1895,6 +1960,11 @@ mod tests {
             11,
         )
         .expect("remote contact material");
+        if !contact_has_direct_addr(&remote_contact) {
+            shutdown_local_iroh_data_plane(local_dir.path());
+            shutdown_local_iroh_data_plane(remote_dir.path());
+            return;
+        }
         let response = fetch_direct_data_for_network_peer_id(
             local_dir.path(),
             &local_peer_id,

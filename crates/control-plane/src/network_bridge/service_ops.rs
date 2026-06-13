@@ -341,15 +341,23 @@ impl NetworkBridgeService {
     }
 
     pub(crate) fn scopes_to_request_for_peer(&self, peer: &NetworkNodeId) -> Vec<SwarmScope> {
+        let scopes = self.backfill_scopes();
+        let global_scope = scopes
+            .iter()
+            .any(|scope| *scope == SwarmScope::Global)
+            .then_some(SwarmScope::Global);
         let Some(state) = self.peer_sync_state.get(peer) else {
-            return self.backfill_scopes();
+            return global_scope.into_iter().collect();
         };
         if state.known_scopes.is_empty() {
-            return self.backfill_scopes();
+            return global_scope.into_iter().collect();
         }
-        let mut scopes = self.backfill_scopes();
-        scopes.sort_by_key(|scope| !state.known_scopes.contains(scope));
-        scopes
+        let mut requested = scopes
+            .into_iter()
+            .filter(|scope| *scope != SwarmScope::Global && state.known_scopes.contains(scope))
+            .collect::<Vec<_>>();
+        requested.extend(global_scope);
+        requested
     }
 
     pub(crate) fn backfill_scopes(&self) -> Vec<SwarmScope> {

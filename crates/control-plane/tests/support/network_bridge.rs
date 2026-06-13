@@ -1,9 +1,11 @@
 #![allow(dead_code, unused_imports)]
 
-use serde_json::json;
+use serde_json::{Value, json};
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 use wattswarm_artifact_store::{ArtifactKind, ArtifactStore};
 use wattswarm_control_plane::control::{
@@ -28,8 +30,10 @@ use wattswarm_control_plane::node::Node;
 use wattswarm_control_plane::storage::PgStore;
 use wattswarm_control_plane::task_template::sample_contract;
 use wattswarm_control_plane::types::{
-    EventPayload, FeedSubscriptionUpdatedPayload, Membership, Role,
+    CheckpointCreatedPayload, EventPayload, FeedSubscriptionUpdatedPayload, Membership, Role,
 };
+use wattswarm_network_transport_core::TransportContactMaterial;
+use wattswarm_network_transport_iroh::export_local_contact_material_for_network_peer_id;
 use wattswarm_protocol::types::NetworkProtocolParams;
 
 #[path = "network_bridge/anti_entropy.rs"]
@@ -147,13 +151,18 @@ fn make_bootstrap_service_with_params(
     params: &NetworkProtocolParams,
     bootstrap_peers: &[String],
 ) -> NetworkBridgeService {
+    let bootstrap_peers = bootstrap_peers
+        .iter()
+        .filter(|peer| peer.contains('@'))
+        .cloned()
+        .collect::<Vec<_>>();
     make_service_with_config(
         scopes,
         params,
         NetworkP2pConfig {
             listen_addrs: vec!["127.0.0.1:0".to_owned()],
             enable_local_discovery: false,
-            bootstrap_peers: bootstrap_peers.to_vec(),
+            bootstrap_peers,
             ..NetworkP2pConfig::default()
         },
     )
@@ -165,12 +174,23 @@ fn make_service_with_config(
     config: NetworkP2pConfig,
 ) -> NetworkBridgeService {
     let config = NetworkP2pConfig { ..config }.apply_protocol_params(params);
-    NetworkBridgeService::new(
-        NetworkP2pNode::generate(config).expect("network node"),
+    let seed: [u8; 32] = rand::random();
+    let state_dir = std::env::temp_dir().join(format!("wattswarm-iroh-node-{}", hex::encode(seed)));
+    ensure_test_relay_urls(&state_dir);
+    unsafe {
+        std::env::set_var(
+            wattswarm_network_transport_iroh::ENV_IROH_PUBLISH_DIRECT_ADDRS,
+            "true",
+        );
+    }
+    let service = NetworkBridgeService::new(
+        NetworkP2pNode::from_iroh_state_dir(config, state_dir.clone(), seed).expect("network node"),
         scopes,
         params,
     )
-    .expect("network service")
+    .expect("network service");
+    remember_service_state_dir(&service, state_dir);
+    service
 }
 
 fn make_service_with_config_and_state_dir(
@@ -181,16 +201,100 @@ fn make_service_with_config_and_state_dir(
 ) -> NetworkBridgeService {
     let config = NetworkP2pConfig { ..config }.apply_protocol_params(params);
     let identity = ensure_seeded_test_dir(state_dir);
+    ensure_test_relay_urls(state_dir);
+    unsafe {
+        std::env::set_var(
+            wattswarm_network_transport_iroh::ENV_IROH_PUBLISH_DIRECT_ADDRS,
+            "true",
+        );
+    }
     let db_path = state_dir.join("ui.state");
     let mut service = NetworkBridgeService::new(
-        NetworkP2pNode::from_ed25519_secret_bytes(config, identity.secret_bytes())
-            .expect("seeded network node"),
+        NetworkP2pNode::from_iroh_state_dir(
+            config,
+            state_dir.to_path_buf(),
+            identity.secret_bytes(),
+        )
+        .expect("seeded network node"),
         scopes,
         params,
     )
     .expect("network service");
+    remember_service_state_dir(&service, state_dir.to_path_buf());
     service.set_state_dir(state_dir.to_path_buf(), db_path.to_path_buf());
     service
+}
+
+fn service_state_dirs() -> &'static Mutex<HashMap<String, PathBuf>> {
+    static STATE_DIRS: OnceLock<Mutex<HashMap<String, PathBuf>>> = OnceLock::new();
+    STATE_DIRS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn remember_service_state_dir(service: &NetworkBridgeService, state_dir: PathBuf) {
+    service_state_dirs()
+        .lock()
+        .expect("service state dirs")
+        .insert(service.local_peer_id().to_string(), state_dir);
+}
+
+fn state_dir_for_service(service: &NetworkBridgeService) -> PathBuf {
+    service_state_dirs()
+        .lock()
+        .expect("service state dirs")
+        .get(&service.local_peer_id().to_string())
+        .cloned()
+        .expect("service state dir")
+}
+
+fn test_contact_generated_at_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time")
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX)
+}
+
+fn service_contact_material(
+    service: &mut NetworkBridgeService,
+    node: &mut Node,
+) -> TransportContactMaterial {
+    let state_dir = state_dir_for_service(service);
+    let peer_id = service.local_peer_id().to_string();
+    let ready = wait_until(scaled_timeout(Duration::from_secs(5)), || {
+        let _ = pump_once(service, node);
+        export_local_contact_material_for_network_peer_id(
+            &state_dir,
+            &peer_id,
+            test_contact_generated_at_ms(),
+        )
+        .is_ok()
+    });
+    assert!(ready, "service should expose iroh contact material");
+    export_local_contact_material_for_network_peer_id(
+        &state_dir,
+        &peer_id,
+        test_contact_generated_at_ms(),
+    )
+    .expect("iroh contact material")
+}
+
+fn ensure_test_relay_urls(state_dir: &Path) {
+    fs::create_dir_all(state_dir).expect("test state dir");
+    let path = state_dir.join("startup_config.json");
+    let mut value = fs::read(&path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+        .unwrap_or_else(|| json!({}));
+    if value.get("relay_urls").is_some() {
+        return;
+    }
+    value["relay_urls"] = json!(["https://relay.example.invalid/"]);
+    fs::write(
+        path,
+        serde_json::to_vec(&value).expect("startup config json"),
+    )
+    .expect("write startup config relay urls");
 }
 
 fn pump_once(service: &mut NetworkBridgeService, node: &mut Node) -> Option<NetworkBridgeTick> {
@@ -375,8 +479,12 @@ fn iroh_peer_addr(service: &NetworkBridgeService) -> NetworkAddress {
 }
 
 fn bootstrap_peer_addr(service: &mut NetworkBridgeService, node: &mut Node) -> String {
-    wait_for_listen_addrs(service, node);
-    iroh_peer_addr(service).to_string()
+    let _ = service_contact_material(service, node);
+    service
+        .listen_addrs()
+        .first()
+        .map(|addr| format!("{}@{}", service.local_peer_id(), addr))
+        .unwrap_or_default()
 }
 
 fn connect_services(
@@ -385,12 +493,20 @@ fn connect_services(
     receiver: &mut NetworkBridgeService,
     receiver_node: &mut Node,
 ) {
-    wait_for_listen_addrs(dialer, dialer_node);
-    wait_for_listen_addrs(receiver, receiver_node);
-    let receiver_addr = iroh_peer_addr(receiver);
-    let dialer_addr = iroh_peer_addr(dialer);
-    dialer.dial(receiver_addr).expect("dial peer");
-    receiver.dial(dialer_addr).expect("dial reciprocal peer");
+    let receiver_contact = service_contact_material(receiver, receiver_node);
+    let dialer_contact = service_contact_material(dialer, dialer_node);
+    dialer
+        .upsert_remote_contact_material(receiver.local_peer_id().to_string(), receiver_contact)
+        .expect("dialer remote contact material");
+    receiver
+        .upsert_remote_contact_material(dialer.local_peer_id().to_string(), dialer_contact)
+        .expect("receiver remote contact material");
+    dialer
+        .run_reconnect_supervision()
+        .expect("dialer reconnect supervision");
+    receiver
+        .run_reconnect_supervision()
+        .expect("receiver reconnect supervision");
     wait_for_connected_pair(dialer, dialer_node, receiver, receiver_node);
 }
 

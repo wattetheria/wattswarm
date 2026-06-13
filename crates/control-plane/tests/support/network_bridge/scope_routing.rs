@@ -18,6 +18,9 @@ pub fn region_scoped_backfill_only_reaches_region_subscribers() {
         make_service_with_scopes(&[SwarmScope::Global, SwarmScope::Region("sol-1".to_owned())]);
     let mut service_c = make_service_with_scopes(&[SwarmScope::Global]);
 
+    connect_services(&mut service_a, &mut node_a, &mut service_b, &mut node_b);
+    connect_services(&mut service_a, &mut node_a, &mut service_c, &mut node_c);
+
     let policy_hash = node_a
         .policy_registry()
         .binding_for("vp.schema_only.v1", json!({}))
@@ -28,11 +31,16 @@ pub fn region_scoped_backfill_only_reaches_region_subscribers() {
     contract.inputs = json!({"prompt":"region sync", "swarm_scope":"region:sol-1"});
     node_a.submit_task(contract, 1, 100).expect("submit task");
 
-    connect_services(&mut service_a, &mut node_a, &mut service_b, &mut node_b);
-    connect_services(&mut service_a, &mut node_a, &mut service_c, &mut node_c);
-
+    let mut last_published_seq = 0;
     let mut region_synced = false;
     for _ in 0..4_096 {
+        last_published_seq = publish_pending_scoped_updates(
+            &mut service_a,
+            &node_a,
+            &node_a.node_id(),
+            last_published_seq,
+        )
+        .expect("publish pending scoped");
         let _ = pump_once(&mut service_a, &mut node_a);
         let _ = pump_once(&mut service_b, &mut node_b);
         let _ = pump_once(&mut service_c, &mut node_c);
@@ -305,14 +313,16 @@ pub fn subnet_nodes_sync_and_mainnet_overlay_stays_isolated() {
         .dial(iroh_peer_addr(&mainnet_c))
         .expect("dial mainnet overlay");
 
-    let policy_hash = node_a
-        .policy_registry()
-        .binding_for("vp.schema_only.v1", json!({}))
-        .expect("policy binding")
-        .policy_hash;
-    let mut contract = sample_contract("task-subnet-overlay", policy_hash);
-    contract.inputs = json!({"prompt":"subnet only"});
-    node_a.submit_task(contract, 1, 100).expect("submit task");
+    let event = node_a
+        .emit_at(
+            1,
+            EventPayload::CheckpointCreated(CheckpointCreatedPayload {
+                checkpoint_id: "cp-subnet-overlay".to_owned(),
+                up_to_seq: 0,
+            }),
+            100,
+        )
+        .expect("emit checkpoint");
 
     let mut last_published_seq = 0;
     let subnet_synced = wait_until(scaled_timeout(Duration::from_secs(10)), || {
@@ -327,16 +337,23 @@ pub fn subnet_nodes_sync_and_mainnet_overlay_stays_isolated() {
         let _ = pump_once(&mut subnet_b, &mut node_b);
         let _ = pump_once(&mut mainnet_c, &mut node_c);
         node_b
-            .task_view("task-subnet-overlay")
-            .expect("subnet task view")
-            .is_some()
+            .store
+            .load_all_events()
+            .expect("load subnet events")
+            .into_iter()
+            .any(|(_, candidate)| candidate.event_id == event.event_id)
     });
-    assert!(subnet_synced, "subnet peer should receive subnet task");
+    assert!(
+        subnet_synced,
+        "subnet peer should receive subnet control event"
+    );
     assert!(
         node_c
-            .task_view("task-subnet-overlay")
-            .expect("mainnet task view")
-            .is_none(),
-        "mainnet overlay must not receive subnet task"
+            .store
+            .load_all_events()
+            .expect("load mainnet events")
+            .into_iter()
+            .all(|(_, candidate)| candidate.event_id != event.event_id),
+        "mainnet overlay must not receive subnet control event"
     );
 }

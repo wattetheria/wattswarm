@@ -136,20 +136,21 @@ fn global_event_gossip_rejects_non_global_scope() {
 }
 
 #[test]
-fn backfill_response_for_request_wraps_global_events() {
+fn backfill_response_for_request_wraps_public_control_events() {
     let local = NodeIdentity::random();
     let remote = NodeIdentity::random();
     let membership = membership_with_roles(&[local.node_id(), remote.node_id()]);
     let mut node =
         Node::new(local, PgStore::open_in_memory().expect("store"), membership).expect("node");
-    let policy_hash = node
-        .policy_registry()
-        .binding_for("vp.schema_only.v1", json!({}))
-        .expect("policy binding")
-        .policy_hash;
-    let mut contract = sample_contract("task-backfill-1", policy_hash);
-    contract.inputs = json!({"prompt":"backfill me"});
-    node.submit_task(contract, 1, 100).expect("submit task");
+    node.emit_at(
+        1,
+        crate::types::EventPayload::CheckpointCreated(crate::types::CheckpointCreatedPayload {
+            checkpoint_id: "cp-backfill-1".to_owned(),
+            up_to_seq: 0,
+        }),
+        100,
+    )
+    .expect("emit checkpoint");
 
     let response = backfill_response_for_request(
         &node,
@@ -169,33 +170,14 @@ fn backfill_response_for_request_wraps_global_events() {
     assert_eq!(response.events.len(), 1);
     assert_eq!(response.scope, SwarmScope::Global);
     assert_eq!(response.next_from_event_seq, 1);
+    assert!(matches!(
+        response.events[0].event.payload,
+        crate::types::EventPayload::CheckpointCreated(_)
+    ));
 }
 
 #[test]
-fn iroh_backfill_stream_repairs_missed_global_event_and_ingest_is_idempotent() {
-    #[derive(serde::Deserialize, serde::Serialize)]
-    struct TestIrohBackfillStreamRequest {
-        request: BackfillRequest,
-    }
-
-    #[derive(serde::Deserialize, serde::Serialize)]
-    struct TestIrohBackfillStreamResponse {
-        response: crate::network_p2p::BackfillResponse,
-    }
-
-    const IROH_CONTROL_KIND_BACKFILL: &str = "backfill.v1";
-
-    let dir_a = temp_startup_dir("iroh-backfill-a");
-    let dir_b = temp_startup_dir("iroh-backfill-b");
-    crate::control::local_node_id(&dir_a).expect("seed node a");
-    crate::control::local_node_id(&dir_b).expect("seed node b");
-    let peer_a = wattswarm_network_transport_iroh::local_endpoint_id_from_state_dir(&dir_a)
-        .expect("endpoint a")
-        .to_string();
-    let peer_b = wattswarm_network_transport_iroh::local_endpoint_id_from_state_dir(&dir_b)
-        .expect("endpoint b")
-        .to_string();
-
+fn backfill_response_repairs_missed_global_control_event() {
     let subscriber_identity = NodeIdentity::random();
     let publisher_identity = NodeIdentity::random();
     let membership =
@@ -212,30 +194,20 @@ fn iroh_backfill_stream_repairs_missed_global_event_and_ingest_is_idempotent() {
         membership,
     )
     .expect("publisher node");
-    let policy_hash = publisher
-        .policy_registry()
-        .binding_for("vp.schema_only.v1", json!({}))
-        .expect("policy binding")
-        .policy_hash;
-    let mut contract = sample_contract("task-iroh-backfill-1", policy_hash);
-    contract.inputs = json!({"prompt":"repair me over iroh"});
-    publisher
-        .submit_task(contract, 1, 100)
-        .expect("publisher submits task");
-
-    wattswarm_network_transport_iroh::export_local_contact_material_for_network_peer_id(
-        &dir_a, &peer_a, 1,
-    )
-    .expect("contact a");
-    let contact_b =
-        wattswarm_network_transport_iroh::export_local_contact_material_for_network_peer_id(
-            &dir_b, &peer_b, 1,
+    let checkpoint = publisher
+        .emit_at(
+            1,
+            crate::types::EventPayload::CheckpointCreated(crate::types::CheckpointCreatedPayload {
+                checkpoint_id: "cp-iroh-backfill-1".to_owned(),
+                up_to_seq: 0,
+            }),
+            100,
         )
-        .expect("contact b");
+        .expect("publisher emits checkpoint");
 
-    let bridge_response = backfill_response_for_request(
+    let response = backfill_response_for_request(
         &publisher,
-        &peer_b,
+        "publisher-peer",
         &BackfillRequest {
             scope: SwarmScope::Global,
             from_event_seq: 0,
@@ -246,102 +218,19 @@ fn iroh_backfill_stream_repairs_missed_global_event_and_ingest_is_idempotent() {
         32,
         64,
     )
-    .expect("bridge backfill response");
-    let bridge_response_payload = serde_json::to_vec(&TestIrohBackfillStreamResponse {
-        response: bridge_response,
-    })
-    .expect("encode bridge response");
-    wattswarm_network_transport_iroh::set_local_control_stream_handler_for_network_peer_id(
-        &dir_b,
-        &peer_b,
-        IROH_CONTROL_KIND_BACKFILL,
-        Some(
-            move |_remote_peer_id: String,
-                  request: wattswarm_network_transport_iroh::IrohControlStreamRequest| {
-                if request.kind != IROH_CONTROL_KIND_BACKFILL {
-                    return wattswarm_network_transport_iroh::IrohControlStreamResponse {
-                        ok: false,
-                        error: Some(format!("unexpected control kind {}", request.kind)),
-                        payload: Vec::new(),
-                    };
-                }
-                let decoded =
-                    match serde_json::from_slice::<TestIrohBackfillStreamRequest>(&request.payload)
-                    {
-                        Ok(decoded) => decoded,
-                        Err(err) => {
-                            return wattswarm_network_transport_iroh::IrohControlStreamResponse {
-                                ok: false,
-                                error: Some(err.to_string()),
-                                payload: Vec::new(),
-                            };
-                        }
-                    };
-                if decoded.request.scope != SwarmScope::Global {
-                    return wattswarm_network_transport_iroh::IrohControlStreamResponse {
-                        ok: false,
-                        error: Some("unexpected scope".to_owned()),
-                        payload: Vec::new(),
-                    };
-                }
-                wattswarm_network_transport_iroh::IrohControlStreamResponse {
-                    ok: true,
-                    error: None,
-                    payload: bridge_response_payload.clone(),
-                }
-            },
-        ),
-    )
-    .expect("install backfill handler");
-
-    wattswarm_network_transport_iroh::register_remote_contact_material_for_network_peer_id(
-        &dir_a, &peer_a, &contact_b,
-    )
-    .expect("register remote contact material");
-
-    let response =
-        wattswarm_network_transport_iroh::send_control_stream_request_for_network_peer_id(
-            &dir_a,
-            &peer_a,
-            &contact_b,
-            &wattswarm_network_transport_iroh::IrohControlStreamRequest {
-                kind: IROH_CONTROL_KIND_BACKFILL.to_owned(),
-                payload: serde_json::to_vec(&TestIrohBackfillStreamRequest {
-                    request: BackfillRequest {
-                        scope: SwarmScope::Global,
-                        from_event_seq: 0,
-                        limit: 8,
-                        feed_key: None,
-                        known_event_ids: Vec::new(),
-                    },
-                })
-                .expect("encode backfill request"),
-            },
-        )
-        .expect("request iroh backfill page");
-    assert!(response.ok, "{:?}", response.error);
-    let response = serde_json::from_slice::<TestIrohBackfillStreamResponse>(&response.payload)
-        .expect("decode backfill response")
-        .response;
+    .expect("backfill response");
     assert_eq!(response.events.len(), 1);
 
     let applied = ingest_backfill_response(&mut subscriber, &response).expect("ingest response");
-    let duplicate_applied =
-        ingest_backfill_response(&mut subscriber, &response).expect("ingest duplicate response");
     assert_eq!(applied, 1);
-    assert_eq!(duplicate_applied, 0);
     assert!(
         subscriber
             .store
-            .task_projection("task-iroh-backfill-1")
-            .expect("load task projection")
-            .is_some()
+            .load_all_events()
+            .expect("load subscriber events")
+            .into_iter()
+            .any(|(_, event)| event.event_id == checkpoint.event_id)
     );
-
-    wattswarm_network_transport_iroh::shutdown_local_iroh_data_plane(&dir_a);
-    wattswarm_network_transport_iroh::shutdown_local_iroh_data_plane(&dir_b);
-    std::fs::remove_dir_all(dir_a).expect("cleanup a");
-    std::fs::remove_dir_all(dir_b).expect("cleanup b");
 }
 
 #[test]

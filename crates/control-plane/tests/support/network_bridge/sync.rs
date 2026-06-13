@@ -1,6 +1,6 @@
 use super::*;
 
-pub fn two_nodes_sync_global_event_over_iroh() {
+pub fn two_nodes_sync_global_control_event_over_iroh() {
     let identity_a = NodeIdentity::random();
     let identity_b = NodeIdentity::random();
     let membership = membership_with_roles(&[identity_a.node_id(), identity_b.node_id()]);
@@ -11,14 +11,16 @@ pub fn two_nodes_sync_global_event_over_iroh() {
 
     connect_services(&mut service_a, &mut node_a, &mut service_b, &mut node_b);
 
-    let policy_hash = node_a
-        .policy_registry()
-        .binding_for("vp.schema_only.v1", json!({}))
-        .expect("policy binding")
-        .policy_hash;
-    let mut contract = sample_contract("task-network-gossip", policy_hash);
-    contract.inputs = json!({"prompt":"ship this over gossip"});
-    node_a.submit_task(contract, 1, 100).expect("submit task");
+    let event = node_a
+        .emit_at(
+            1,
+            EventPayload::CheckpointCreated(CheckpointCreatedPayload {
+                checkpoint_id: "cp-network-gossip".to_owned(),
+                up_to_seq: 0,
+            }),
+            100,
+        )
+        .expect("emit checkpoint");
     let last_published_seq = 0;
     let mut published = false;
     for _ in 0..4_096 {
@@ -39,7 +41,7 @@ pub fn two_nodes_sync_global_event_over_iroh() {
     }
     assert!(
         published,
-        "local event should auto-publish over bridge helper"
+        "local control event should auto-publish over bridge helper"
     );
 
     let mut last_tick_a = None;
@@ -54,9 +56,11 @@ pub fn two_nodes_sync_global_event_over_iroh() {
             panic!("backfill failed on service B: {error}");
         }
         if node_b
-            .task_view("task-network-gossip")
-            .expect("task view")
-            .is_some()
+            .store
+            .load_all_events()
+            .expect("load node b events")
+            .into_iter()
+            .any(|(_, candidate)| candidate.event_id == event.event_id)
         {
             return true;
         }
@@ -67,17 +71,8 @@ pub fn two_nodes_sync_global_event_over_iroh() {
     let node_b_events = node_b.store.load_all_events().expect("load node b events");
     assert!(
         synced,
-        "node B should ingest the task over iroh gossip; node_b_events={} last_tick_a={last_tick_a:?} last_tick_b={last_tick_b:?}",
+        "node B should ingest the control event over iroh gossip; node_b_events={} last_tick_a={last_tick_a:?} last_tick_b={last_tick_b:?}",
         node_b_events.len()
-    );
-
-    let task = node_b
-        .task_view("task-network-gossip")
-        .expect("task view")
-        .expect("task exists");
-    assert_eq!(
-        task.contract.inputs["prompt"],
-        json!("ship this over gossip")
     );
 }
 
@@ -208,7 +203,7 @@ pub fn two_nodes_sync_topic_message_content_over_iroh() {
     cleanup_dir(&dir_b);
 }
 
-pub fn global_task_detail_sync_excludes_process_firehose() {
+pub fn global_publish_excludes_task_and_process_firehose() {
     let identity_a = NodeIdentity::random();
     let identity_b = NodeIdentity::random();
     let membership = membership_with_roles(&[identity_a.node_id(), identity_b.node_id()]);
@@ -239,7 +234,7 @@ pub fn global_task_detail_sync_excludes_process_firehose() {
         .expect("claim task");
 
     let mut last_published_seq = 0;
-    let synced = wait_until(scaled_timeout(Duration::from_secs(10)), || {
+    for _ in 0..128 {
         last_published_seq = publish_pending_global_events(
             &mut service_a,
             &node_a,
@@ -249,12 +244,15 @@ pub fn global_task_detail_sync_excludes_process_firehose() {
         .expect("publish pending");
         let _ = pump_once(&mut service_a, &mut node_a);
         let _ = pump_once(&mut service_b, &mut node_b);
+        std::thread::yield_now();
+    }
+    assert!(
         node_b
             .task_view("task-global-process-filter")
             .expect("task view")
-            .is_some()
-    });
-    assert!(synced, "remote node should receive task detail layer");
+            .is_none(),
+        "global dissemination should not replay task detail traffic"
+    );
     assert!(
         node_b
             .store
@@ -274,14 +272,16 @@ pub fn two_nodes_backfill_missing_events_over_request_response() {
     let mut service_a = make_service();
     let mut service_b = make_service();
 
-    let policy_hash = node_a
-        .policy_registry()
-        .binding_for("vp.schema_only.v1", json!({}))
-        .expect("policy binding")
-        .policy_hash;
-    let mut contract = sample_contract("task-network-backfill", policy_hash);
-    contract.inputs = json!({"prompt":"recover me via backfill"});
-    node_a.submit_task(contract, 1, 100).expect("submit task");
+    let event = node_a
+        .emit_at(
+            1,
+            EventPayload::CheckpointCreated(CheckpointCreatedPayload {
+                checkpoint_id: "cp-network-backfill".to_owned(),
+                up_to_seq: 0,
+            }),
+            100,
+        )
+        .expect("emit checkpoint");
 
     connect_services(&mut service_b, &mut node_b, &mut service_a, &mut node_a);
 
@@ -295,24 +295,17 @@ pub fn two_nodes_backfill_missing_events_over_request_response() {
             panic!("backfill failed on service B: {error}");
         }
         if node_b
-            .task_view("task-network-backfill")
-            .expect("task view")
-            .is_some()
+            .store
+            .load_all_events()
+            .expect("load node b events")
+            .into_iter()
+            .any(|(_, candidate)| candidate.event_id == event.event_id)
         {
             return true;
         }
         false
     });
     assert!(synced);
-
-    let task = node_b
-        .task_view("task-network-backfill")
-        .expect("task view")
-        .expect("task exists");
-    assert_eq!(
-        task.contract.inputs["prompt"],
-        json!("recover me via backfill")
-    );
 }
 
 pub fn connected_peer_helper_syncs_over_lan_state() {
@@ -336,14 +329,16 @@ pub fn connected_peer_helper_syncs_over_lan_state() {
 
     connect_services(&mut service_b, &mut node_b, &mut service_a, &mut node_a);
 
-    let policy_hash = node_a
-        .policy_registry()
-        .binding_for("vp.schema_only.v1", json!({}))
-        .expect("policy binding")
-        .policy_hash;
-    let mut contract = sample_contract("task-network-lan", policy_hash);
-    contract.inputs = json!({"prompt":"lan discovery sync"});
-    node_a.submit_task(contract, 1, 100).expect("submit task");
+    let event = node_a
+        .emit_at(
+            1,
+            EventPayload::CheckpointCreated(CheckpointCreatedPayload {
+                checkpoint_id: "cp-network-lan".to_owned(),
+                up_to_seq: 0,
+            }),
+            100,
+        )
+        .expect("emit checkpoint");
 
     let mut last_published_seq = 0;
     let mut synced = false;
@@ -360,9 +355,11 @@ pub fn connected_peer_helper_syncs_over_lan_state() {
         last_tick_a = pump_once(&mut service_a, &mut node_a);
         last_tick_b = pump_once(&mut service_b, &mut node_b);
         if node_b
-            .task_view("task-network-lan")
-            .expect("task view")
-            .is_some()
+            .store
+            .load_all_events()
+            .expect("load node b events")
+            .into_iter()
+            .any(|(_, candidate)| candidate.event_id == event.event_id)
         {
             synced = true;
             break;

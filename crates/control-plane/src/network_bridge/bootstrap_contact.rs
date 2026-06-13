@@ -259,12 +259,15 @@ impl NetworkBridgeService {
                     let remote_network_peer_id = iroh_contact_network_peer_id(&contact)?;
                     self.remember_peer_address_from_contact(&remote_network_peer_id, &contact);
                     self.runtime
-                        .upsert_remote_contact_material(remote_network_peer_id, contact)
+                        .upsert_remote_contact_material(remote_network_peer_id.clone(), contact)
                         .with_context(|| {
                             format!(
                                 "register startup bootstrap contact material for {remote_node_id}"
                             )
                         })?;
+                    if let Ok(peer) = NetworkNodeId::new(remote_network_peer_id) {
+                        self.schedule_peer_reconnect(peer);
+                    }
                 }
             }
         }
@@ -288,7 +291,10 @@ impl NetworkBridgeService {
                     self.remember_peer_address_from_contact(&remote_network_peer_id, &contact);
                     let _ = self
                         .runtime
-                        .upsert_remote_contact_material(remote_network_peer_id, contact)?;
+                        .upsert_remote_contact_material(remote_network_peer_id.clone(), contact)?;
+                    if let Ok(peer) = NetworkNodeId::new(remote_network_peer_id) {
+                        self.schedule_peer_reconnect(peer);
+                    }
                 }
             }
         }

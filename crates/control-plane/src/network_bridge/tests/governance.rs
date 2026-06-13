@@ -618,6 +618,27 @@ fn temporary_node_network_ban_expires_and_filters_only_ban_window_events() {
         .ingest_remote(after_ban_event.clone())
         .expect("temporary ban should allow events after expiry");
 
+    let during_ban_control_event = build_event_for_external(
+        &banned,
+        2,
+        150,
+        crate::types::EventPayload::CheckpointCreated(crate::types::CheckpointCreatedPayload {
+            checkpoint_id: "cp-temp-ban-during".to_owned(),
+            up_to_seq: 0,
+        }),
+    )
+    .expect("during ban control event");
+    let after_ban_control_event = build_event_for_external(
+        &banned,
+        3,
+        250,
+        crate::types::EventPayload::CheckpointCreated(crate::types::CheckpointCreatedPayload {
+            checkpoint_id: "cp-temp-ban-after".to_owned(),
+            up_to_seq: 0,
+        }),
+    )
+    .expect("after ban control event");
+
     source
         .store
         .append_event(&during_ban_event)
@@ -626,6 +647,14 @@ fn temporary_node_network_ban_expires_and_filters_only_ban_window_events() {
         .store
         .append_event(&after_ban_event)
         .expect("insert after-ban event fixture");
+    source
+        .store
+        .append_event(&during_ban_control_event)
+        .expect("insert during-ban control event fixture");
+    source
+        .store
+        .append_event(&after_ban_control_event)
+        .expect("insert after-ban control event fixture");
     let response = backfill_response_for_request(
         &source,
         "receiver-peer",
@@ -644,14 +673,14 @@ fn temporary_node_network_ban_expires_and_filters_only_ban_window_events() {
         response
             .events
             .iter()
-            .all(|envelope| envelope.event.event_id != during_ban_event.event_id),
+            .all(|envelope| envelope.event.event_id != during_ban_control_event.event_id),
         "backfill must not serve events created inside a temporary ban window"
     );
     assert!(
         response
             .events
             .iter()
-            .any(|envelope| envelope.event.event_id == after_ban_event.event_id),
+            .any(|envelope| envelope.event.event_id == after_ban_control_event.event_id),
         "backfill should serve events created after a temporary ban expires"
     );
 }

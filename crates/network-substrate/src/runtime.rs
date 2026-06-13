@@ -326,7 +326,7 @@ impl SubstrateRuntime {
             &contact,
         )?;
         self.remote_contacts.insert(remote_network_peer_id, contact);
-        self.join_gossip_topics_with_bootstrap_contacts()?;
+        self.schedule_gossip_bootstrap_join()?;
         Ok(true)
     }
 
@@ -345,7 +345,7 @@ impl SubstrateRuntime {
         if !self.remote_contacts.contains_key(peer.as_str()) {
             return Ok(false);
         }
-        self.join_gossip_topics_with_bootstrap_contacts()?;
+        self.schedule_gossip_bootstrap_join()?;
         Ok(true)
     }
 
@@ -444,7 +444,7 @@ impl SubstrateRuntime {
         Ok(())
     }
 
-    fn join_gossip_topics_with_bootstrap_contacts(&self) -> Result<()> {
+    fn schedule_gossip_bootstrap_join(&self) -> Result<()> {
         if self.gossip_topics.is_empty() {
             return Ok(());
         }
@@ -456,12 +456,13 @@ impl SubstrateRuntime {
         if bootstrap.is_empty() {
             return Ok(());
         }
+        let timeout = Duration::from_millis(DEFAULT_GOSSIP_BOOTSTRAP_TIMEOUT_MS);
         for topic in self.gossip_topics.values() {
-            self.block_on_gossip_bootstrap(
-                "join iroh gossip bootstrap peers",
-                topic.sender.join_peers(bootstrap.clone()),
-            )?
-            .map_err(|err| anyhow!("join iroh gossip peers: {err}"))?;
+            let sender = topic.sender.clone();
+            let peers = bootstrap.clone();
+            self.runtime().spawn(async move {
+                let _ = tokio::time::timeout(timeout, sender.join_peers(peers)).await;
+            });
         }
         Ok(())
     }
@@ -991,17 +992,12 @@ impl SubstrateRuntime {
             .try_into()
             .map_err(|_| anyhow!("iroh gossip topic id must be 32 bytes"))?;
         let topic_id = iroh_gossip::TopicId::from_bytes(topic_id_bytes);
-        let bootstrap = self
-            .remote_contacts
-            .values()
-            .map(contact_endpoint_id)
-            .collect::<Result<Vec<_>>>()?;
         let gossip =
             local_gossip_for_network_peer_id(&self.state_dir, self.local_peer_id.as_str())?;
         let topic = self
             .block_on_gossip_bootstrap(
                 "subscribe iroh gossip topic",
-                gossip.subscribe(topic_id, bootstrap),
+                gossip.subscribe(topic_id, Vec::new()),
             )?
             .map_err(|err| anyhow!("subscribe iroh gossip topic: {err}"))?;
         let (sender, mut receiver) = topic.split();
@@ -1060,6 +1056,7 @@ impl SubstrateRuntime {
         });
         self.gossip_topics
             .insert(subscription, IrohGossipTopicHandle { sender, task });
+        self.schedule_gossip_bootstrap_join()?;
         Ok(())
     }
 

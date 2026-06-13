@@ -8,6 +8,20 @@ fn is_missing_iroh_contact_material_error(error: &str) -> bool {
     error.starts_with("missing iroh contact material for ")
 }
 
+fn peer_metadata_needs_private_message_contact_material(
+    state_dir: &Path,
+    peer: &NetworkNodeId,
+) -> bool {
+    crate::control::load_peer_metadata_records_state(state_dir)
+        .ok()
+        .and_then(|records| {
+            records
+                .into_iter()
+                .find(|record| record.node_id == peer.to_string())
+        })
+        .is_some_and(|record| record.private_message_public_key_b64().is_none())
+}
+
 impl NetworkBridgeService {
     fn save_inbound_private_dm_topic_if_applicable(
         &self,
@@ -287,7 +301,7 @@ impl NetworkBridgeService {
                             .map_or(now, |entry| entry.first_identified_at),
                         last_identified_at: now,
                     };
-                    missing_contact_material = record.contact_material.is_none();
+                    missing_contact_material = record.private_message_public_key_b64().is_none();
                     let _ = crate::control::save_peer_metadata_record_state(state_dir, &record);
                 }
                 if missing_contact_material
@@ -541,6 +555,15 @@ impl NetworkBridgeService {
                     eprintln!(
                         "relay contact material bootstrap failed for {propagation_source}: {err}"
                     );
+                }
+                if let Some(state_dir) = self.state_dir.clone()
+                    && peer_metadata_needs_private_message_contact_material(
+                        &state_dir,
+                        &propagation_source,
+                    )
+                    && let Err(err) = self.probe_peer_contact_material(&propagation_source)
+                {
+                    eprintln!("contact material probe failed for {propagation_source}: {err}");
                 }
                 match message {
                     GossipMessage::Event(envelope) => {
@@ -1098,6 +1121,10 @@ impl NetworkBridgeService {
                         "agent_envelope": &request.agent_envelope,
                     })),
                 );
+                let local_contact_material = self
+                    .state_dir
+                    .as_deref()
+                    .and_then(|state_dir| build_contact_material(state_dir, &local_node_id).ok());
                 let (response, tick) = if request.source_node_id != peer.to_string() {
                     let error = format!(
                         "peer relationship request source_node_id mismatch: payload={} transport={peer}",
@@ -1119,6 +1146,7 @@ impl NetworkBridgeService {
                                     "detail": error,
                                 }),
                             )),
+                            contact_material: local_contact_material.clone(),
                             relationship_state: None,
                             detail: Some(error.clone()),
                             updated_at: now,
@@ -1150,6 +1178,7 @@ impl NetworkBridgeService {
                                     "detail": error,
                                 }),
                             )),
+                            contact_material: local_contact_material.clone(),
                             relationship_state: None,
                             detail: Some(error.clone()),
                             updated_at: now,
@@ -1161,6 +1190,13 @@ impl NetworkBridgeService {
                         },
                     )
                 } else if let Some(state_dir) = self.state_dir.clone() {
+                    if let Some(contact_material) = request.contact_material.as_ref() {
+                        upsert_contact_material_for_peer(
+                            &state_dir,
+                            &request.source_node_id,
+                            contact_material,
+                        )?;
+                    }
                     if let Some(agent_envelope) = request.agent_envelope.as_ref() {
                         verify_agent_envelope_signature_for_source(
                             agent_envelope,
@@ -1252,6 +1288,7 @@ impl NetworkBridgeService {
                                             "relationship_state": record.relationship_state.as_str(),
                                         }),
                                     )),
+                                    contact_material: local_contact_material.clone(),
                                     relationship_state: Some(
                                         record.relationship_state.as_str().to_owned(),
                                     ),
@@ -1284,6 +1321,7 @@ impl NetworkBridgeService {
                                             "detail": error,
                                         }),
                                     )),
+                                    contact_material: local_contact_material.clone(),
                                     relationship_state: None,
                                     detail: Some(error.clone()),
                                     updated_at: now,
@@ -1316,6 +1354,7 @@ impl NetworkBridgeService {
                                     "detail": error,
                                 }),
                             )),
+                            contact_material: local_contact_material.clone(),
                             relationship_state: None,
                             detail: Some(error.clone()),
                             updated_at: now,
@@ -1406,6 +1445,16 @@ impl NetworkBridgeService {
                         ),
                     });
                 }
+                let state_dir = self.state_dir.clone();
+                if let (Some(state_dir), Some(contact_material)) =
+                    (state_dir.as_ref(), response.contact_material.as_ref())
+                {
+                    upsert_contact_material_for_peer(
+                        state_dir,
+                        &pending.remote_node_id,
+                        contact_material,
+                    )?;
+                }
                 if !response.applied {
                     return Ok(NetworkBridgeTick::PeerRelationshipFailed {
                         peer,
@@ -1415,7 +1464,7 @@ impl NetworkBridgeService {
                             .unwrap_or_else(|| "peer relationship action rejected".to_owned()),
                     });
                 }
-                let Some(state_dir) = self.state_dir.clone() else {
+                let Some(state_dir) = state_dir else {
                     return Ok(NetworkBridgeTick::PeerRelationshipFailed {
                         peer,
                         action,

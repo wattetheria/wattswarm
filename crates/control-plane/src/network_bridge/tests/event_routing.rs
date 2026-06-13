@@ -178,8 +178,21 @@ fn backfill_task_claimed_delivers_local_agent_event() {
         }),
     )
     .expect("claim event");
+    let service_seed = [141u8; 32];
+    fs::write(state_dir.join("node_seed.hex"), hex::encode(service_seed)).expect("write node seed");
+    fs::write(
+        state_dir.join("startup_config.json"),
+        serde_json::to_vec(&json!({"relay_urls":["https://relay.example.invalid/"]}))
+            .expect("startup config json"),
+    )
+    .expect("write startup config");
     let mut service = NetworkBridgeService::new(
-        NetworkP2pNode::generate(NetworkP2pConfig::default()).expect("p2p node"),
+        NetworkP2pNode::from_iroh_state_dir(
+            NetworkP2pConfig::default(),
+            state_dir.clone(),
+            service_seed,
+        )
+        .expect("p2p node"),
         &[SwarmScope::Global, scope.clone()],
         &NetworkProtocolParams::default(),
     )
@@ -785,8 +798,21 @@ fn inbound_private_dm_topic_is_projected_to_local_dm_store() {
         &local.node_id(),
         &remote.node_id(),
     ));
+    let service_seed = [142u8; 32];
+    fs::write(state_dir.join("node_seed.hex"), hex::encode(service_seed)).expect("write node seed");
+    fs::write(
+        state_dir.join("startup_config.json"),
+        serde_json::to_vec(&json!({"relay_urls":["https://relay.example.invalid/"]}))
+            .expect("startup config json"),
+    )
+    .expect("write startup config");
     let mut service = NetworkBridgeService::new(
-        NetworkP2pNode::generate(NetworkP2pConfig::default()).expect("p2p node"),
+        NetworkP2pNode::from_iroh_state_dir(
+            NetworkP2pConfig::default(),
+            state_dir.clone(),
+            service_seed,
+        )
+        .expect("p2p node"),
         &[SwarmScope::Global, scope.clone()],
         &NetworkProtocolParams::default(),
     )

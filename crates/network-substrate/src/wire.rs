@@ -125,6 +125,8 @@ pub struct RawPeerRelationshipRequest {
     pub action: RawPeerRelationshipAction,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_envelope: Option<RawAgentEnvelope>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub contact_material: Option<RawContactMaterial>,
 }
 
 impl RawPeerRelationshipRequest {
@@ -137,6 +139,9 @@ impl RawPeerRelationshipRequest {
         }
         if let Some(envelope) = &self.agent_envelope {
             envelope.validate()?;
+        }
+        if let Some(contact_material) = &self.contact_material {
+            contact_material.validate()?;
         }
         Ok(())
     }
@@ -161,6 +166,8 @@ pub struct RawPeerRelationshipResponse {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_envelope: Option<RawAgentEnvelope>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub contact_material: Option<RawContactMaterial>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub relationship_state: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
@@ -177,6 +184,9 @@ impl RawPeerRelationshipResponse {
         }
         if let Some(envelope) = &self.agent_envelope {
             envelope.validate()?;
+        }
+        if let Some(contact_material) = &self.contact_material {
+            contact_material.validate()?;
         }
         if let Some(detail) = &self.detail {
             validate_max_bytes(

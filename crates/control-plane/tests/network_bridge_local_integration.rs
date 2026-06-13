@@ -11,15 +11,15 @@ fn network_bridge_local_test_guard() -> MutexGuard<'static, ()> {
 }
 
 #[test]
-fn two_nodes_sync_global_event_over_iroh() {
+fn two_nodes_sync_global_control_event_over_iroh() {
     let _guard = network_bridge_local_test_guard();
-    support::network_bridge::two_nodes_sync_global_event_over_iroh();
+    support::network_bridge::two_nodes_sync_global_control_event_over_iroh();
 }
 
 #[test]
-fn global_task_detail_sync_excludes_process_firehose() {
+fn global_publish_excludes_task_and_process_firehose() {
     let _guard = network_bridge_local_test_guard();
-    support::network_bridge::global_task_detail_sync_excludes_process_firehose();
+    support::network_bridge::global_publish_excludes_task_and_process_firehose();
 }
 
 #[test]

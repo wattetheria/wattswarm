@@ -57,6 +57,7 @@ impl NetworkBridgeService {
                 relationship_record.updated_at,
             )?;
         }
+        let contact_material = build_contact_material(&state_dir, &local_node_id)?;
         let request_id = self.runtime.send_peer_relationship_request(
             &peer,
             PeerRelationshipRequest {
@@ -64,6 +65,7 @@ impl NetworkBridgeService {
                 target_node_id: remote_node_id.clone(),
                 action: wire_peer_relationship_action(action),
                 agent_envelope: Some(envelope),
+                contact_material: Some(contact_material),
             },
         )?;
         self.pending_relationship_requests.insert(

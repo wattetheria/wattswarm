@@ -83,8 +83,8 @@ use agent_delivery::{
     task_result_agent_event, task_settled_agent_event, topic_message_agent_event,
 };
 use backfill::{
-    BACKFILL_KNOWN_EVENT_IDS_LIMIT, recent_backfill_lane_event_ids, should_publish_summaries,
-    should_sync_event,
+    BACKFILL_KNOWN_EVENT_IDS_LIMIT, allows_public_control_dissemination,
+    recent_backfill_lane_event_ids, should_publish_summaries, should_sync_event,
 };
 use bootstrap_contact::{
     build_contact_material, candidate_peer_addrs, iroh_contact_network_peer_id,
@@ -1094,6 +1094,21 @@ impl NetworkBridgeService {
 
     pub fn listen_addrs(&self) -> &[NetworkAddress] {
         self.runtime.listen_addrs()
+    }
+
+    pub fn upsert_remote_contact_material(
+        &mut self,
+        remote_network_peer_id: impl Into<String>,
+        contact: TransportContactMaterial,
+    ) -> Result<bool> {
+        let remote_network_peer_id = remote_network_peer_id.into();
+        let peer = NetworkNodeId::new(remote_network_peer_id.clone())?;
+        let updated = self
+            .runtime
+            .upsert_remote_contact_material(remote_network_peer_id, contact.clone())?;
+        self.remember_peer_address_from_contact(peer.as_str(), &contact);
+        self.schedule_peer_reconnect(peer);
+        Ok(updated)
     }
 
     pub fn subscribed_scopes(&self) -> &[SwarmScope] {

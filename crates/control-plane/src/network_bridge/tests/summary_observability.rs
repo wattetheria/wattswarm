@@ -888,15 +888,23 @@ fn publish_pending_global_events_publishes_local_rows_and_skips_remote_rows() {
     let membership = membership_with_roles(&[local_node_id.clone(), remote.node_id()]);
     let mut node =
         Node::new(local, PgStore::open_in_memory().expect("store"), membership).expect("node");
-    let policy_hash = node
-        .policy_registry()
-        .binding_for("vp.schema_only.v1", json!({}))
-        .expect("policy binding")
-        .policy_hash;
-    let mut local_contract = sample_contract("task-publish-local", policy_hash.clone());
-    local_contract.inputs = json!({"prompt":"publish me"});
-    node.submit_task(local_contract, 1, 100)
-        .expect("local task");
+    node.emit_at(
+        1,
+        crate::types::EventPayload::FeedSubscriptionUpdated(
+            crate::types::FeedSubscriptionUpdatedPayload {
+                network_id: DEFAULT_NETWORK_CONTEXT_ID.to_owned(),
+                subscriber_node_id: local_node_id.clone(),
+                feed_key: "market.publish".to_owned(),
+                scope_hint: "global".to_owned(),
+                gossip_kinds: vec!["events".to_owned()],
+                provider_capabilities: None,
+                agent_envelope: None,
+                active: true,
+            },
+        ),
+        100,
+    )
+    .expect("local subscription event");
 
     let remote_event = build_event_for_external(
         &remote,
@@ -904,85 +912,33 @@ fn publish_pending_global_events_publishes_local_rows_and_skips_remote_rows() {
         101,
         crate::types::EventPayload::CheckpointCreated(crate::types::CheckpointCreatedPayload {
             checkpoint_id: "cp-remote".to_owned(),
-            up_to_seq: 1,
+            up_to_seq: 0,
         }),
     )
     .expect("remote event");
     node.ingest_remote(remote_event).expect("ingest remote");
 
+    let service_dir = temp_startup_dir("summary-publish-service");
+    let service_seed = [131u8; 32];
+    fs::write(service_dir.join("node_seed.hex"), hex::encode(service_seed))
+        .expect("write node seed");
+    fs::write(
+        service_dir.join("startup_config.json"),
+        serde_json::to_vec(&json!({"relay_urls":["https://relay.example.invalid/"]}))
+            .expect("startup config json"),
+    )
+    .expect("write startup config");
     let mut service = NetworkBridgeService::new(
-        NetworkP2pNode::generate(NetworkP2pConfig {
-            listen_addrs: vec!["127.0.0.1:0".to_owned()],
-            enable_local_discovery: false,
-            ..NetworkP2pConfig::default()
-        })
+        NetworkP2pNode::from_iroh_state_dir(
+            NetworkP2pConfig::default(),
+            service_dir.clone(),
+            service_seed,
+        )
         .expect("network node"),
         &[SwarmScope::Global],
         &NetworkProtocolParams::default(),
     )
     .expect("network service");
-    let mut peer_node = Node::open_in_memory_with_roles(&[Role::Proposer]).expect("peer node");
-    let mut peer_service = NetworkBridgeService::new(
-        NetworkP2pNode::generate(NetworkP2pConfig {
-            listen_addrs: vec!["127.0.0.1:0".to_owned()],
-            enable_local_discovery: false,
-            ..NetworkP2pConfig::default()
-        })
-        .expect("peer network node"),
-        &[SwarmScope::Global],
-        &NetworkProtocolParams::default(),
-    )
-    .expect("peer network service");
-
-    let listen_deadline = Instant::now() + Duration::from_secs(5);
-    while Instant::now() < listen_deadline {
-        let _ = service.try_tick(&mut node).expect("service tick");
-        let _ = peer_service
-            .try_tick(&mut peer_node)
-            .expect("peer service tick");
-        if !service.listen_addrs().is_empty() && !peer_service.listen_addrs().is_empty() {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(1));
-    }
-    assert!(!service.listen_addrs().is_empty());
-    assert!(!peer_service.listen_addrs().is_empty());
-    let peer_addr = NetworkAddress::new(format!(
-        "{}@{}",
-        peer_service.local_peer_id(),
-        peer_service.listen_addrs()[0]
-    ))
-    .expect("peer dial addr");
-    let service_addr = NetworkAddress::new(format!(
-        "{}@{}",
-        service.local_peer_id(),
-        service.listen_addrs()[0]
-    ))
-    .expect("service dial addr");
-    service.dial(peer_addr).expect("dial peer");
-    peer_service
-        .dial(service_addr)
-        .expect("dial reciprocal peer");
-    let mut service_connected = false;
-    let mut peer_connected = false;
-    let connect_deadline = Instant::now() + Duration::from_secs(10);
-    while Instant::now() < connect_deadline {
-        let tick = service.try_tick(&mut node).expect("service tick");
-        if matches!(tick, Some(NetworkBridgeTick::Connected { .. })) {
-            service_connected = true;
-        }
-        let peer_tick = peer_service
-            .try_tick(&mut peer_node)
-            .expect("peer service tick");
-        if matches!(peer_tick, Some(NetworkBridgeTick::Connected { .. })) {
-            peer_connected = true;
-        }
-        if service_connected && peer_connected {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(1));
-    }
-    assert!(service_connected && peer_connected);
 
     let mut last = 0;
     let publish_deadline = Instant::now() + Duration::from_secs(10);
@@ -993,12 +949,12 @@ fn publish_pending_global_events_publishes_local_rows_and_skips_remote_rows() {
             break;
         }
         let _ = service.try_tick(&mut node).expect("service tick");
-        let _ = peer_service
-            .try_tick(&mut peer_node)
-            .expect("peer service tick");
         std::thread::sleep(Duration::from_millis(1));
     }
     assert_eq!(last, 2);
+
+    wattswarm_network_transport_iroh::shutdown_local_iroh_data_plane(&service_dir);
+    fs::remove_dir_all(service_dir).expect("cleanup service dir");
 }
 
 #[test]

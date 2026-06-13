@@ -419,6 +419,7 @@ fn signed_discovery_record_for_test_at(
     ttl_ms: u64,
 ) -> SignedDiscoveryNodeRecord {
     let identity = NodeIdentity::from_seed(seed);
+    ensure_test_relay_urls(state_dir);
     let peer_id = wattswarm_network_transport_iroh::local_endpoint_id_from_state_dir(state_dir)
         .expect("endpoint id")
         .to_string();
@@ -440,4 +441,21 @@ fn signed_discovery_record_for_test_at(
     });
     body.transport_contact = Some(contact);
     SignedDiscoveryNodeRecord::sign(body, &identity).expect("signed discovery record")
+}
+
+fn ensure_test_relay_urls(state_dir: &Path) {
+    let path = state_dir.join("startup_config.json");
+    let mut value = fs::read(&path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+        .unwrap_or_else(|| json!({}));
+    if value.get("relay_urls").is_some() {
+        return;
+    }
+    value["relay_urls"] = json!(["https://relay.example.invalid/"]);
+    fs::write(
+        path,
+        serde_json::to_vec(&value).expect("startup config json"),
+    )
+    .expect("write startup config relay urls");
 }

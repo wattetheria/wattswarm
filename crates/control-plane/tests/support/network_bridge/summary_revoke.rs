@@ -101,8 +101,9 @@ pub fn revoked_event_propagates_and_removes_remote_projection_state() {
     let membership = membership_with_roles(&[identity_a.node_id(), identity_b.node_id()]);
     let mut node_a = make_node(identity_a, membership.clone());
     let mut node_b = make_node(identity_b, membership);
-    let mut service_a = make_service();
-    let mut service_b = make_service();
+    let revoke_scope = SwarmScope::Node("revocation-network".to_owned());
+    let mut service_a = make_service_with_scopes(&[SwarmScope::Global, revoke_scope.clone()]);
+    let mut service_b = make_service_with_scopes(&[SwarmScope::Global, revoke_scope]);
 
     connect_services(&mut service_a, &mut node_a, &mut service_b, &mut node_b);
 
@@ -112,7 +113,9 @@ pub fn revoked_event_propagates_and_removes_remote_projection_state() {
         .expect("policy binding")
         .policy_hash;
     let mut contract = sample_contract("task-revocation-network", policy_hash);
-    contract.inputs = json!({"prompt":"revoke over network"});
+    contract.task_type = "node:revocation-network:swarm".to_owned();
+    contract.inputs =
+        json!({"prompt":"revoke over network", "swarm_scope":"node:revocation-network"});
     let created = node_a.submit_task(contract, 1, 100).expect("submit task");
 
     let mut last_published_seq = 0;

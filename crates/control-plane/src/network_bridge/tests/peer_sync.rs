@@ -776,6 +776,12 @@ fn peer_identified_event_persists_peer_metadata_locally() {
 #[test]
 fn build_contact_material_accepts_iroh_endpoint_network_peer_id() {
     let dir = temp_startup_dir("iroh-contact-material");
+    std::fs::write(
+        dir.join("startup_config.json"),
+        serde_json::to_vec(&json!({"relay_urls":["https://relay.example.invalid/"]}))
+            .expect("startup config json"),
+    )
+    .expect("write startup config");
     crate::control::local_node_id(&dir).expect("create local identity");
     let endpoint_id = wattswarm_network_transport_iroh::local_endpoint_id_from_state_dir(&dir)
         .expect("endpoint id")
@@ -801,6 +807,106 @@ fn build_contact_material_accepts_iroh_endpoint_network_peer_id() {
 }
 
 #[test]
+fn peer_relationship_response_persists_private_message_contact_material() {
+    let local_dir = temp_startup_dir("relationship-contact-local");
+    let remote_dir = temp_startup_dir("relationship-contact-remote");
+    let local_seed = [111u8; 32];
+    let remote_seed = [112u8; 32];
+    std::fs::write(local_dir.join("node_seed.hex"), hex::encode(local_seed))
+        .expect("write local seed");
+    std::fs::write(remote_dir.join("node_seed.hex"), hex::encode(remote_seed))
+        .expect("write remote seed");
+    for dir in [&local_dir, &remote_dir] {
+        std::fs::write(
+            dir.join("startup_config.json"),
+            serde_json::to_vec(&json!({"relay_urls":["https://relay.example.invalid/"]}))
+                .expect("startup config json"),
+        )
+        .expect("write startup config");
+    }
+
+    let local_endpoint =
+        wattswarm_network_transport_iroh::local_endpoint_id_from_state_dir(&local_dir)
+            .expect("local endpoint")
+            .to_string();
+    let remote_endpoint =
+        wattswarm_network_transport_iroh::local_endpoint_id_from_state_dir(&remote_dir)
+            .expect("remote endpoint")
+            .to_string();
+    let remote_peer = NetworkNodeId::new(remote_endpoint.clone()).expect("remote peer");
+    let remote_contact =
+        build_contact_material(&remote_dir, &remote_endpoint).expect("remote contact material");
+
+    crate::control::apply_peer_relationship_action_state(
+        &local_dir,
+        &remote_endpoint,
+        crate::control::PeerRelationshipAction::Request,
+        crate::control::PeerRelationshipInitiator::Local,
+    )
+    .expect("local relationship request");
+
+    let mut service = NetworkBridgeService::new(
+        NetworkP2pNode::from_iroh_state_dir(
+            NetworkP2pConfig::default(),
+            local_dir.clone(),
+            local_seed,
+        )
+        .expect("node"),
+        &[SwarmScope::Global],
+        &NetworkProtocolParams::default(),
+    )
+    .expect("service");
+    service.set_state_dir(local_dir.clone(), local_dir.join("ui.state"));
+    let request_id = PeerRelationshipRequestId::new(7);
+    service.pending_relationship_requests.insert(
+        request_id,
+        PendingPeerRelationshipRequest {
+            peer: remote_peer.clone(),
+            remote_node_id: remote_endpoint.clone(),
+            action: crate::control::PeerRelationshipAction::Request,
+        },
+    );
+
+    let tick = service
+        .process_runtime_event(
+            &mut crate::control::open_node(&local_dir, &local_dir.join("ui.state"))
+                .expect("open node"),
+            NetworkRuntimeEvent::PeerRelationshipResponse {
+                peer: remote_peer,
+                request_id,
+                response: PeerRelationshipResponse {
+                    source_node_id: remote_endpoint.clone(),
+                    target_node_id: local_endpoint,
+                    action: RawPeerRelationshipAction::Request,
+                    applied: true,
+                    agent_envelope: None,
+                    contact_material: Some(remote_contact),
+                    relationship_state: Some("requested".to_owned()),
+                    detail: None,
+                    updated_at: observed_at_ms(),
+                },
+            },
+        )
+        .expect("process response");
+
+    assert!(matches!(
+        tick,
+        NetworkBridgeTick::PeerRelationshipUpdated { .. }
+    ));
+    let peer_metadata = crate::control::load_peer_metadata_records_state(&local_dir)
+        .expect("peer metadata")
+        .into_iter()
+        .find(|record| record.node_id == remote_endpoint)
+        .expect("remote metadata");
+    assert!(peer_metadata.private_message_public_key_b64().is_some());
+
+    wattswarm_network_transport_iroh::shutdown_local_iroh_data_plane(&local_dir);
+    wattswarm_network_transport_iroh::shutdown_local_iroh_data_plane(&remote_dir);
+    std::fs::remove_dir_all(local_dir).expect("cleanup local");
+    std::fs::remove_dir_all(remote_dir).expect("cleanup remote");
+}
+
+#[test]
 fn set_state_dir_loads_persisted_iroh_contact_material_into_runtime() {
     let local_dir = temp_startup_dir("iroh-contact-load-local");
     let remote_dir = temp_startup_dir("iroh-contact-load-remote");
@@ -810,6 +916,20 @@ fn set_state_dir_loads_persisted_iroh_contact_material_into_runtime() {
         .expect("write local seed");
     std::fs::write(remote_dir.join("node_seed.hex"), hex::encode(remote_seed))
         .expect("write remote seed");
+    std::fs::write(
+        remote_dir.join("startup_config.json"),
+        serde_json::to_vec(&json!({"relay_urls":["https://relay.example.invalid/"]}))
+            .expect("startup config json"),
+    )
+    .expect("write remote startup config");
+    for dir in [&local_dir, &remote_dir] {
+        std::fs::write(
+            dir.join("startup_config.json"),
+            serde_json::to_vec(&json!({"relay_urls":["https://relay.example.invalid/"]}))
+                .expect("startup config json"),
+        )
+        .expect("write startup config");
+    }
     let remote_endpoint =
         wattswarm_network_transport_iroh::local_endpoint_id_from_state_dir(&remote_dir)
             .expect("remote endpoint")
@@ -881,6 +1001,12 @@ fn set_state_dir_loads_startup_iroh_bootstrap_contacts_into_runtime() {
         .expect("write local seed");
     std::fs::write(remote_dir.join("node_seed.hex"), hex::encode(remote_seed))
         .expect("write remote seed");
+    std::fs::write(
+        remote_dir.join("startup_config.json"),
+        serde_json::to_vec(&json!({"relay_urls":["https://relay.example.invalid/"]}))
+            .expect("startup config json"),
+    )
+    .expect("write remote startup config");
     let remote_endpoint =
         wattswarm_network_transport_iroh::local_endpoint_id_from_state_dir(&remote_dir)
             .expect("remote endpoint")
@@ -895,6 +1021,7 @@ fn set_state_dir_loads_startup_iroh_bootstrap_contacts_into_runtime() {
         local_dir.join("startup_config.json"),
         serde_json::to_vec(&json!({
             "network_mode": "wan",
+            "relay_urls":["https://relay.example.invalid/"],
             "bootstrap_contacts": [serde_json::to_string(&remote_contact).expect("contact json")]
         }))
         .expect("startup config json"),
@@ -939,6 +1066,12 @@ fn reconnect_supervision_redials_remembered_peer_address() {
         .expect("write local seed");
     std::fs::write(remote_dir.join("node_seed.hex"), hex::encode(remote_seed))
         .expect("write remote seed");
+    std::fs::write(
+        remote_dir.join("startup_config.json"),
+        serde_json::to_vec(&json!({"relay_urls":["https://relay.example.invalid/"]}))
+            .expect("startup config json"),
+    )
+    .expect("write remote startup config");
     let remote_endpoint =
         wattswarm_network_transport_iroh::local_endpoint_id_from_state_dir(&remote_dir)
             .expect("remote endpoint")
@@ -1045,6 +1178,12 @@ fn reconnect_supervision_probes_relay_only_bootstrap_contact() {
         .expect("write local seed");
     std::fs::write(remote_dir.join("node_seed.hex"), hex::encode(remote_seed))
         .expect("write remote seed");
+    std::fs::write(
+        remote_dir.join("startup_config.json"),
+        serde_json::to_vec(&json!({"relay_urls":["https://relay.example.invalid/"]}))
+            .expect("startup config json"),
+    )
+    .expect("write remote startup config");
     let remote_endpoint =
         wattswarm_network_transport_iroh::local_endpoint_id_from_state_dir(&remote_dir)
             .expect("remote endpoint")
@@ -1062,6 +1201,7 @@ fn reconnect_supervision_probes_relay_only_bootstrap_contact() {
         local_dir.join("startup_config.json"),
         serde_json::to_vec(&json!({
             "network_mode": "wan",
+            "relay_urls":["https://relay.example.invalid/"],
             "bootstrap_contacts": [json!({
                 "node_id": remote_endpoint,
                 "peer_id": remote_contact.peer_id,
@@ -1086,7 +1226,7 @@ fn reconnect_supervision_probes_relay_only_bootstrap_contact() {
     service.set_state_dir(local_dir.clone(), local_dir.join("ui.state"));
 
     assert_eq!(service.known_remote_contact_count(), 1);
-    assert_eq!(service.reconnect_attempts_for_peer(&peer), None);
+    assert_eq!(service.reconnect_attempts_for_peer(&peer), Some(0));
     let attempts = service
         .run_reconnect_supervision()
         .expect("run reconnect supervision");

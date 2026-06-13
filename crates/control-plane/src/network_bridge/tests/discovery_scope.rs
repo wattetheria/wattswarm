@@ -14,6 +14,7 @@ fn discovery_bootnode_record_registers_iroh_contact_inside_radius_without_markin
         local_dir.join("startup_config.json"),
         serde_json::to_vec(&json!({
             "network_mode": "wan",
+            "relay_urls": ["https://relay.example.invalid/"],
             "latitude": 0.0,
             "longitude": 0.0,
             "nearby_radius_km": 20.0
@@ -87,7 +88,8 @@ fn discovery_bootnode_record_accepts_candidate_without_local_geo() {
     fs::write(
         local_dir.join("startup_config.json"),
         serde_json::to_vec(&json!({
-            "network_mode": "wan"
+            "network_mode": "wan",
+            "relay_urls": ["https://relay.example.invalid/"]
         }))
         .expect("startup config json"),
     )
@@ -157,6 +159,7 @@ fn discovery_bootnode_record_rejects_self_stale_and_out_of_radius_records() {
         local_dir.join("startup_config.json"),
         serde_json::to_vec(&json!({
             "network_mode": "wan",
+            "relay_urls": ["https://relay.example.invalid/"],
             "latitude": 0.0,
             "longitude": 0.0,
             "nearby_radius_km": 5.0
@@ -547,11 +550,25 @@ fn discovery_bootnode_query_failure_logging_suppresses_repeated_endpoint_failure
 }
 
 #[test]
-fn scopes_to_request_for_peer_falls_back_to_all_scopes_until_peer_is_profiled() {
+fn scopes_to_request_for_peer_limits_unknown_peers_to_public_control_scope() {
+    let local_dir = temp_startup_dir("scope-request-unknown");
+    let local_seed = [121u8; 32];
+    fs::write(local_dir.join("node_seed.hex"), hex::encode(local_seed)).expect("write local seed");
+    fs::write(
+        local_dir.join("startup_config.json"),
+        serde_json::to_vec(&json!({"relay_urls":["https://relay.example.invalid/"]}))
+            .expect("startup config json"),
+    )
+    .expect("write startup config");
     let peer = random_network_node_id();
     let target_scope = SwarmScope::Region("sol-1".to_owned());
     let service = NetworkBridgeService::new(
-        NetworkP2pNode::generate(NetworkP2pConfig::default()).expect("node"),
+        NetworkP2pNode::from_iroh_state_dir(
+            NetworkP2pConfig::default(),
+            local_dir.clone(),
+            local_seed,
+        )
+        .expect("iroh node"),
         &[SwarmScope::Global, target_scope.clone()],
         &NetworkProtocolParams::default(),
     )
@@ -559,17 +576,33 @@ fn scopes_to_request_for_peer_falls_back_to_all_scopes_until_peer_is_profiled() 
 
     assert_eq!(
         service.scopes_to_request_for_peer(&peer),
-        vec![SwarmScope::Global, target_scope]
+        vec![SwarmScope::Global]
     );
+    wattswarm_network_transport_iroh::shutdown_local_iroh_data_plane(&local_dir);
+    fs::remove_dir_all(local_dir).expect("cleanup local");
 }
 
 #[test]
-fn scopes_to_request_for_peer_prioritizes_known_scopes_without_dropping_subscriptions() {
+fn scopes_to_request_for_peer_only_requests_known_scopes_plus_public_control() {
+    let local_dir = temp_startup_dir("scope-request-known");
+    let local_seed = [122u8; 32];
+    fs::write(local_dir.join("node_seed.hex"), hex::encode(local_seed)).expect("write local seed");
+    fs::write(
+        local_dir.join("startup_config.json"),
+        serde_json::to_vec(&json!({"relay_urls":["https://relay.example.invalid/"]}))
+            .expect("startup config json"),
+    )
+    .expect("write startup config");
     let peer = random_network_node_id();
     let target_scope = SwarmScope::Region("sol-1".to_owned());
     let other_scope = SwarmScope::Node("lab-1".to_owned());
     let mut service = NetworkBridgeService::new(
-        NetworkP2pNode::generate(NetworkP2pConfig::default()).expect("node"),
+        NetworkP2pNode::from_iroh_state_dir(
+            NetworkP2pConfig::default(),
+            local_dir.clone(),
+            local_seed,
+        )
+        .expect("iroh node"),
         &[
             SwarmScope::Global,
             target_scope.clone(),
@@ -584,8 +617,10 @@ fn scopes_to_request_for_peer_prioritizes_known_scopes_without_dropping_subscrip
 
     assert_eq!(
         service.scopes_to_request_for_peer(&peer),
-        vec![target_scope, SwarmScope::Global, other_scope]
+        vec![target_scope, SwarmScope::Global]
     );
+    wattswarm_network_transport_iroh::shutdown_local_iroh_data_plane(&local_dir);
+    fs::remove_dir_all(local_dir).expect("cleanup local");
 }
 
 #[test]
@@ -736,7 +771,7 @@ fn backfill_response_skips_network_substrate_events_for_other_networks() {
 }
 
 #[test]
-fn global_backfill_skips_task_process_layer_events() {
+fn global_backfill_skips_task_and_business_events() {
     let mut node = Node::open_in_memory_with_roles(&[Role::Proposer]).expect("node");
     let policy_hash = node
         .policy_registry()
@@ -772,17 +807,21 @@ fn global_backfill_skips_task_process_layer_events() {
     .expect("backfill response");
 
     assert!(
-        response.events.iter().any(|envelope| matches!(
-            envelope.event.payload,
-            crate::types::EventPayload::TaskCreated(_)
-        )),
-        "global backfill should still include task detail events"
+        response.events.is_empty(),
+        "global backfill should not return task events for unscoped catch-up"
     );
     assert!(
         response.events.iter().all(|envelope| {
             !matches!(
                 envelope.event.payload,
-                crate::types::EventPayload::TaskClaimed(_)
+                crate::types::EventPayload::TaskCreated(_)
+                    | crate::types::EventPayload::TaskAnnounced(_)
+                    | crate::types::EventPayload::ExecutionIntentDeclared(_)
+                    | crate::types::EventPayload::ExecutionSetConfirmed(_)
+                    | crate::types::EventPayload::TopicMessagePosted(_)
+                    | crate::types::EventPayload::AgentPaymentPosted(_)
+                    | crate::types::EventPayload::TaskCompleted(_)
+                    | crate::types::EventPayload::TaskClaimed(_)
                     | crate::types::EventPayload::TaskClaimRenewed(_)
                     | crate::types::EventPayload::TaskClaimReleased(_)
                     | crate::types::EventPayload::CandidateProposed(_)
@@ -796,6 +835,6 @@ fn global_backfill_skips_task_process_layer_events() {
                     | crate::types::EventPayload::TaskRetryScheduled(_)
             )
         }),
-        "global backfill should suppress task process traffic"
+        "global backfill should suppress task and business traffic"
     );
 }

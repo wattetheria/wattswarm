@@ -21,10 +21,27 @@ fn event_matches_backfill_lane(
     if event_scope(node, event)? != *scope {
         return Ok(false);
     }
-    if *scope == SwarmScope::Global && !event.payload.allows_global_dissemination() {
+    if *scope == SwarmScope::Global && !allows_public_control_dissemination(&event.payload) {
         return Ok(false);
     }
     Ok(true)
+}
+
+pub(super) fn allows_public_control_dissemination(payload: &crate::types::EventPayload) -> bool {
+    matches!(
+        payload,
+        crate::types::EventPayload::FeedSubscriptionUpdated(_)
+            | crate::types::EventPayload::MembershipUpdated(_)
+            | crate::types::EventPayload::PolicyTuned(_)
+            | crate::types::EventPayload::NetworkParamsUpdated(_)
+            | crate::types::EventPayload::CheckpointCreated(_)
+            | crate::types::EventPayload::AdvisoryCreated(_)
+            | crate::types::EventPayload::AdvisoryApproved(_)
+            | crate::types::EventPayload::AdvisoryApplied(_)
+            | crate::types::EventPayload::EventRevoked(_)
+            | crate::types::EventPayload::SummaryRevoked(_)
+            | crate::types::EventPayload::NodePenalized(_)
+    )
 }
 
 pub(super) fn recent_backfill_lane_event_ids(

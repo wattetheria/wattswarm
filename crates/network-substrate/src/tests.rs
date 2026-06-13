@@ -195,6 +195,7 @@ fn raw_control_request_and_response_validate_payloads() {
         target_node_id: "node-b".to_owned(),
         action: RawPeerRelationshipAction::Request,
         agent_envelope: None,
+        contact_material: None,
     });
     assert!(invalid_request.validate(10, 20).is_err());
 
@@ -220,6 +221,7 @@ fn control_payload_validation_rejects_oversized_json() {
             message_json: oversized,
             ..RawAgentEnvelope::default()
         }),
+        contact_material: None,
     };
     assert!(request.validate().is_err());
 }
@@ -253,6 +255,13 @@ fn peer_relationship_wire_supports_agent_envelope_roundtrip() {
         target_node_id: "node-b".to_owned(),
         action: RawPeerRelationshipAction::Request,
         agent_envelope: Some(envelope.clone()),
+        contact_material: Some(RawContactMaterial {
+            material_json:
+                "{\"node_id\":\"node-a\",\"encryption\":{\"private_message\":{\"public_key_b64\":\"key-a\"}}}"
+                    .to_owned(),
+            signature: Some("sig-contact".to_owned()),
+            generated_at: 42,
+        }),
     };
     let response = RawPeerRelationshipResponse {
         source_node_id: "node-b".to_owned(),
@@ -260,6 +269,13 @@ fn peer_relationship_wire_supports_agent_envelope_roundtrip() {
         action: RawPeerRelationshipAction::Accept,
         applied: true,
         agent_envelope: Some(envelope),
+        contact_material: Some(RawContactMaterial {
+            material_json:
+                "{\"node_id\":\"node-b\",\"encryption\":{\"private_message\":{\"public_key_b64\":\"key-b\"}}}"
+                    .to_owned(),
+            signature: None,
+            generated_at: 43,
+        }),
         relationship_state: Some("accepted".to_owned()),
         detail: None,
         updated_at: 42,
@@ -278,10 +294,24 @@ fn peer_relationship_wire_supports_agent_envelope_roundtrip() {
         Some("agent-a")
     );
     assert_eq!(
+        request_roundtrip
+            .contact_material
+            .as_ref()
+            .map(|entry| entry.generated_at),
+        Some(42)
+    );
+    assert_eq!(
         response_roundtrip
             .agent_envelope
             .as_ref()
             .and_then(|entry| entry.capability.as_deref()),
         Some("peer.relationship.request")
+    );
+    assert_eq!(
+        response_roundtrip
+            .contact_material
+            .as_ref()
+            .map(|entry| entry.generated_at),
+        Some(43)
     );
 }

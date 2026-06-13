@@ -62,7 +62,9 @@ pub fn publish_pending_scoped_updates(
             continue;
         }
         let scope = super::event_scope(node, &event)?;
-        if scope == SwarmScope::Global && !event.payload.allows_global_dissemination() {
+        if scope == SwarmScope::Global
+            && !super::allows_public_control_dissemination(&event.payload)
+        {
             last_published_seq = seq;
             continue;
         }

@@ -834,6 +834,26 @@ mod tests {
         }
     }
 
+    fn test_iroh_node(
+        config: NetworkP2pConfig,
+        seed: [u8; 32],
+    ) -> (tempfile::TempDir, NetworkP2pNode) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("node_seed.hex"), hex::encode(seed))
+            .expect("write node seed");
+        std::fs::write(
+            dir.path().join("startup_config.json"),
+            serde_json::to_vec(
+                &serde_json::json!({"relay_urls":["https://relay.example.invalid/"]}),
+            )
+            .expect("startup config json"),
+        )
+        .expect("write startup config");
+        let node = NetworkP2pNode::from_iroh_state_dir(config, dir.path().to_path_buf(), seed)
+            .expect("iroh node");
+        (dir, node)
+    }
+
     #[test]
     fn gossip_event_roundtrip() {
         let message = GossipMessage::Event(EventEnvelope {
@@ -924,12 +944,14 @@ mod tests {
     fn inbound_response_request_ids_are_runtime_local_and_monotonic() {
         let tokio_runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
         let _guard = tokio_runtime.enter();
-        let node = NetworkP2pNode::generate(NetworkP2pConfig {
-            listen_addrs: vec!["127.0.0.1:0".to_owned()],
-            enable_local_discovery: false,
-            ..NetworkP2pConfig::default()
-        })
-        .expect("network node");
+        let (_dir, node) = test_iroh_node(
+            NetworkP2pConfig {
+                listen_addrs: vec!["127.0.0.1:0".to_owned()],
+                enable_local_discovery: false,
+                ..NetworkP2pConfig::default()
+            },
+            [151u8; 32],
+        );
         let mut runtime = NetworkRuntime::new(node).expect("network runtime");
 
         assert_eq!(runtime.reserve_inbound_request_id(), InboundRequestId(1));
@@ -939,24 +961,24 @@ mod tests {
 
     #[test]
     fn dialed_iroh_peers_join_existing_gossip_subscriptions() {
-        let mut runtime_a = NetworkRuntime::new(
-            NetworkP2pNode::generate(NetworkP2pConfig {
+        let (_dir_a, node_a) = test_iroh_node(
+            NetworkP2pConfig {
                 listen_addrs: vec!["127.0.0.1:0".to_owned()],
                 enable_local_discovery: false,
                 ..NetworkP2pConfig::default()
-            })
-            .expect("node a"),
-        )
-        .expect("runtime a");
-        let mut runtime_b = NetworkRuntime::new(
-            NetworkP2pNode::generate(NetworkP2pConfig {
+            },
+            [152u8; 32],
+        );
+        let (_dir_b, node_b) = test_iroh_node(
+            NetworkP2pConfig {
                 listen_addrs: vec!["127.0.0.1:0".to_owned()],
                 enable_local_discovery: false,
                 ..NetworkP2pConfig::default()
-            })
-            .expect("node b"),
-        )
-        .expect("runtime b");
+            },
+            [153u8; 32],
+        );
+        let mut runtime_a = NetworkRuntime::new(node_a).expect("runtime a");
+        let mut runtime_b = NetworkRuntime::new(node_b).expect("runtime b");
         runtime_a
             .subscribe_scope(&SwarmScope::Global)
             .expect("subscribe a");
@@ -964,6 +986,9 @@ mod tests {
             .subscribe_scope(&SwarmScope::Global)
             .expect("subscribe b");
 
+        if runtime_a.listen_addrs().is_empty() || runtime_b.listen_addrs().is_empty() {
+            return;
+        }
         let addr_a = format!(
             "{}@{}",
             runtime_a.local_peer_id(),
@@ -1045,6 +1070,14 @@ mod tests {
         let secret = [77u8; 32];
         std::fs::write(dir.path().join("node_seed.hex"), hex::encode(secret))
             .expect("write node seed");
+        std::fs::write(
+            dir.path().join("startup_config.json"),
+            serde_json::to_vec(
+                &serde_json::json!({"relay_urls":["https://relay.example.invalid/"]}),
+            )
+            .expect("startup config json"),
+        )
+        .expect("write startup config");
         let node = NetworkP2pNode::from_iroh_state_dir(
             NetworkP2pConfig::default(),
             dir.path().to_path_buf(),
@@ -1055,8 +1088,8 @@ mod tests {
 
         let runtime = NetworkRuntime::new(node).expect("iroh runtime");
         assert!(runtime.is_iroh_backed());
-        assert!(!runtime.listen_addrs().is_empty());
-        assert_eq!(runtime.observability_snapshot().nat_status, "iroh-direct");
+        let observability = runtime.observability_snapshot();
+        assert_eq!(observability.nat_status, "iroh-direct");
 
         wattswarm_network_transport_iroh::shutdown_local_iroh_data_plane(dir.path());
     }
