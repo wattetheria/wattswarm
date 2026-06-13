@@ -1,11 +1,15 @@
 use anyhow::Result;
+#[cfg(not(test))]
+use anyhow::anyhow;
 use axum::Json;
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use clap::Parser;
-use serde_json::json;
+use serde_json::{Value, json};
 use std::sync::Arc;
+#[cfg(not(test))]
+use std::time::Duration;
 use wattswarm::crypto::sha256_hex;
 use wattswarm::policy::PolicyRegistry;
 use wattswarm::runtime::{
@@ -13,6 +17,12 @@ use wattswarm::runtime::{
 };
 use wattswarm::types::{AgentEventCallbackRequest, AgentEventCallbackResponse};
 use wattswarm::types::{ArtifactRef, InlineEvidence, VerificationStatus};
+
+const BRAIN_PROVIDER_KIND_ENV: &str = "WATTETHERIA_BRAIN_PROVIDER_KIND";
+const BRAIN_BASE_URL_ENV: &str = "WATTETHERIA_BRAIN_BASE_URL";
+const BRAIN_MODEL_ENV: &str = "WATTETHERIA_BRAIN_MODEL";
+const BRAIN_API_KEY_ENV_NAME_ENV: &str = "WATTETHERIA_BRAIN_API_KEY_ENV";
+const DEFAULT_BRAIN_API_KEY_ENV: &str = "WATTETHERIA_BRAIN_API_KEY";
 
 #[derive(Parser, Debug)]
 #[command(name = "wattswarm-runtime")]
@@ -28,12 +38,24 @@ struct Args {
     profiles: String,
     #[arg(long, default_value = "swarm")]
     task_types: String,
+    #[arg(long, default_value_t = 30_000)]
+    brain_agent_timeout_ms: u64,
 }
 
 #[derive(Clone)]
 struct AppState {
     capabilities: RuntimeCapabilities,
     policies: Arc<PolicyRegistry>,
+    completion_agent: Option<CompletionAgentConfig>,
+    completion_client: reqwest::Client,
+}
+
+#[derive(Clone, Debug)]
+struct CompletionAgentConfig {
+    endpoint_url: String,
+    model: String,
+    api_key: String,
+    system_prompt: String,
 }
 
 #[cfg(not(test))]
@@ -53,6 +75,11 @@ async fn main() -> Result<()> {
     let state = AppState {
         capabilities,
         policies: Arc::new(PolicyRegistry::with_builtin()),
+        completion_agent: completion_config_from_env().map_err(|(_, message)| anyhow!(message))?,
+        completion_client: reqwest::Client::builder()
+            .timeout(Duration::from_millis(args.brain_agent_timeout_ms.max(1)))
+            .build()
+            .context("build completion agent client")?,
     };
 
     let app = Router::new()
@@ -120,7 +147,11 @@ async fn execute(
         .get("prompt")
         .and_then(|v| v.as_str())
         .unwrap_or("no-prompt");
-    let answer = format!("{}::{}", req.profile, prompt);
+    let answer = if let Some(config) = state.completion_agent.as_ref() {
+        call_completion_agent(&state, config, &req).await?
+    } else {
+        format!("{}::{}", req.profile, prompt)
+    };
     let evidence_payload = format!("{}|{}|{}", req.task_id, req.execution_id, answer);
     let evidence_digest = format!("sha256:{}", sha256_hex(evidence_payload.as_bytes()));
     let now_ms = chrono::Utc::now().timestamp_millis().max(0) as u64;
@@ -149,6 +180,174 @@ async fn execute(
     };
 
     Ok(Json(response))
+}
+
+#[cfg(not(test))]
+fn completion_config_from_env() -> Result<Option<CompletionAgentConfig>, (StatusCode, String)> {
+    completion_config_from_lookup(|key| std::env::var(key).ok())
+}
+
+fn completion_config_from_lookup<F>(
+    lookup: F,
+) -> Result<Option<CompletionAgentConfig>, (StatusCode, String)>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    let Some(provider) = lookup(BRAIN_PROVIDER_KIND_ENV).and_then(|value| non_empty_string(&value))
+    else {
+        return Ok(None);
+    };
+    if provider != "openai-compatible" {
+        return Ok(None);
+    }
+
+    let Some(base_url) = lookup(BRAIN_BASE_URL_ENV).and_then(|value| non_empty_string(&value))
+    else {
+        return Ok(None);
+    };
+    let model = lookup(BRAIN_MODEL_ENV)
+        .and_then(|value| non_empty_string(&value))
+        .ok_or_else(|| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("{BRAIN_MODEL_ENV} is required for Wattetheria brain runtime completion"),
+            )
+        })?;
+    let api_key_env = lookup(BRAIN_API_KEY_ENV_NAME_ENV)
+        .and_then(|value| non_empty_string(&value))
+        .unwrap_or_else(|| DEFAULT_BRAIN_API_KEY_ENV.to_owned());
+    let api_key = lookup(&api_key_env)
+        .and_then(|value| non_empty_string(&value))
+        .ok_or_else(|| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("{api_key_env} is required for Wattetheria brain runtime completion"),
+            )
+        })?;
+
+    Ok(Some(CompletionAgentConfig {
+        endpoint_url: completion_endpoint_url(&base_url),
+        model,
+        api_key,
+        system_prompt: default_completion_system_prompt(),
+    }))
+}
+
+fn completion_endpoint_url(base_url: &str) -> String {
+    let trimmed = base_url.trim().trim_end_matches('/');
+    if trimmed.ends_with("/chat/completions") {
+        trimmed.to_owned()
+    } else {
+        format!("{trimmed}/chat/completions")
+    }
+}
+
+fn default_completion_system_prompt() -> String {
+    "You are a runtime brain agent. Complete the task using the provided task inputs. Return a concise final answer.".to_owned()
+}
+
+fn non_empty_string(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_owned())
+}
+
+fn task_prompt(req: &ExecuteRequest) -> String {
+    req.inputs
+        .get("prompt")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            req.task_contract
+                .inputs
+                .get("prompt")
+                .and_then(Value::as_str)
+        })
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("Complete the task.")
+        .to_owned()
+}
+
+fn build_completion_user_prompt(req: &ExecuteRequest) -> String {
+    let task_prompt = task_prompt(req);
+    let inputs_json = serde_json::to_string_pretty(&req.inputs).unwrap_or_else(|_| "{}".to_owned());
+    format!(
+        "Task ID: {}\nTask type: {}\nProfile: {}\nStage: {}\nAttempt: {}\n\nTask prompt:\n{}\n\nTask inputs JSON:\n{}",
+        req.task_id,
+        req.task_type,
+        req.profile,
+        req.stage,
+        req.attempt_id,
+        task_prompt,
+        inputs_json
+    )
+}
+
+async fn call_completion_agent(
+    state: &AppState,
+    config: &CompletionAgentConfig,
+    req: &ExecuteRequest,
+) -> Result<String, (StatusCode, String)> {
+    let body = json!({
+        "model": config.model,
+        "messages": [
+            {"role": "system", "content": config.system_prompt},
+            {"role": "user", "content": build_completion_user_prompt(req)}
+        ],
+        "temperature": 0.2
+    });
+    let builder = state
+        .completion_client
+        .post(&config.endpoint_url)
+        .bearer_auth(&config.api_key)
+        .json(&body);
+    let response = builder.send().await.map_err(|err| {
+        (
+            StatusCode::BAD_GATEWAY,
+            format!("completion agent request failed: {err}"),
+        )
+    })?;
+    let status = response.status();
+    let response_body = response.text().await.map_err(|err| {
+        (
+            StatusCode::BAD_GATEWAY,
+            format!("completion agent response body failed: {err}"),
+        )
+    })?;
+    if !status.is_success() {
+        return Err((
+            StatusCode::BAD_GATEWAY,
+            format!("completion agent returned {status}: {response_body}"),
+        ));
+    }
+    let value: Value = serde_json::from_str(&response_body).map_err(|err| {
+        (
+            StatusCode::BAD_GATEWAY,
+            format!("completion agent response decode failed: {err}"),
+        )
+    })?;
+    completion_text_from_response(&value).ok_or_else(|| {
+        (
+            StatusCode::BAD_GATEWAY,
+            "completion agent response missing completion text".to_owned(),
+        )
+    })
+}
+
+fn completion_text_from_response(value: &Value) -> Option<String> {
+    value
+        .get("choices")
+        .and_then(Value::as_array)
+        .and_then(|choices| choices.first())
+        .and_then(|choice| {
+            choice
+                .get("message")
+                .and_then(|message| message.get("content"))
+                .and_then(Value::as_str)
+                .or_else(|| choice.get("text").and_then(Value::as_str))
+        })
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
 }
 
 fn execute_topic_interpretation(
@@ -409,6 +608,8 @@ mod tests {
                 model_id: "swarm-model-v1".to_owned(),
             },
             policies: Arc::new(PolicyRegistry::with_builtin()),
+            completion_agent: None,
+            completion_client: reqwest::Client::new(),
         }
     }
 
@@ -455,6 +656,68 @@ mod tests {
     }
 
     #[test]
+    fn completion_endpoint_url_uses_brain_base_url_as_api_root() {
+        assert_eq!(
+            completion_endpoint_url("http://runtime:8787/v1/"),
+            "http://runtime:8787/v1/chat/completions"
+        );
+        assert_eq!(
+            completion_endpoint_url("http://runtime:8787/v1/chat/completions"),
+            "http://runtime:8787/v1/chat/completions"
+        );
+    }
+
+    #[test]
+    fn completion_config_from_lookup_uses_wattetheria_brain_env() {
+        let config = completion_config_from_lookup(|key| match key {
+            BRAIN_PROVIDER_KIND_ENV => Some("openai-compatible".to_owned()),
+            BRAIN_BASE_URL_ENV => Some("http://host.docker.internal:8642/v1".to_owned()),
+            BRAIN_MODEL_ENV => Some("hermes-agent".to_owned()),
+            BRAIN_API_KEY_ENV_NAME_ENV => Some(DEFAULT_BRAIN_API_KEY_ENV.to_owned()),
+            DEFAULT_BRAIN_API_KEY_ENV => Some("test-key".to_owned()),
+            _ => None,
+        })
+        .expect("completion config ok")
+        .expect("completion config present");
+
+        assert_eq!(
+            config.endpoint_url,
+            "http://host.docker.internal:8642/v1/chat/completions"
+        );
+        assert_eq!(config.model, "hermes-agent");
+        assert_eq!(config.api_key, "test-key");
+    }
+
+    #[test]
+    fn completion_config_from_lookup_requires_token_when_brain_base_url_is_set() {
+        let err = completion_config_from_lookup(|key| match key {
+            BRAIN_PROVIDER_KIND_ENV => Some("openai-compatible".to_owned()),
+            BRAIN_BASE_URL_ENV => Some("http://host.docker.internal:8642/v1".to_owned()),
+            BRAIN_MODEL_ENV => Some("hermes-agent".to_owned()),
+            _ => None,
+        })
+        .expect_err("missing token should fail");
+
+        assert_eq!(err.0, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(err.1.contains(DEFAULT_BRAIN_API_KEY_ENV));
+    }
+
+    #[test]
+    fn completion_config_from_lookup_requires_model_when_brain_base_url_is_set() {
+        let err = completion_config_from_lookup(|key| match key {
+            BRAIN_PROVIDER_KIND_ENV => Some("openai-compatible".to_owned()),
+            BRAIN_BASE_URL_ENV => Some("http://host.docker.internal:8642/v1".to_owned()),
+            BRAIN_API_KEY_ENV_NAME_ENV => Some(DEFAULT_BRAIN_API_KEY_ENV.to_owned()),
+            DEFAULT_BRAIN_API_KEY_ENV => Some("test-key".to_owned()),
+            _ => None,
+        })
+        .expect_err("missing model should fail");
+
+        assert_eq!(err.0, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(err.1.contains(BRAIN_MODEL_ENV));
+    }
+
+    #[test]
     fn split_csv_trims_and_drops_empty_items() {
         assert_eq!(
             split_csv(" swarm , , default,verify "),
@@ -482,6 +745,95 @@ mod tests {
                 .producer
                 .contains("swarm-runtime/swarm-model-v1")
         );
+    }
+
+    #[tokio::test]
+    async fn execute_uses_configured_completion_agent() {
+        use axum::Router;
+        use axum::http::HeaderMap;
+        use axum::routing::post;
+        use std::sync::Mutex;
+
+        async fn completion_stub(
+            headers: HeaderMap,
+            State(requests): State<Arc<Mutex<Vec<(Value, Option<String>)>>>>,
+            Json(req): Json<Value>,
+        ) -> Json<Value> {
+            let auth = headers
+                .get(axum::http::header::AUTHORIZATION)
+                .and_then(|value| value.to_str().ok())
+                .map(ToOwned::to_owned);
+            requests.lock().expect("requests lock").push((req, auth));
+            Json(json!({
+                "choices": [{
+                    "message": {
+                        "content": "agent completion answer"
+                    }
+                }]
+            }))
+        }
+
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let app = Router::new()
+            .route("/v1/chat/completions", post(completion_stub))
+            .with_state(requests.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind completion stub");
+        let addr = listener.local_addr().expect("completion stub addr");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve completion stub");
+        });
+
+        let mut state = sample_state();
+        state.completion_agent = Some(
+            completion_config_from_lookup(|key| match key {
+                BRAIN_PROVIDER_KIND_ENV => Some("openai-compatible".to_owned()),
+                BRAIN_BASE_URL_ENV => Some(format!("http://{addr}/v1")),
+                BRAIN_MODEL_ENV => Some("agent-model".to_owned()),
+                BRAIN_API_KEY_ENV_NAME_ENV => Some("TEST_BRAIN_API_KEY".to_owned()),
+                "TEST_BRAIN_API_KEY" => Some("test-key".to_owned()),
+                _ => None,
+            })
+            .expect("completion config ok")
+            .expect("completion config present"),
+        );
+        let policy = sample_policy_binding(&state);
+        let mut req = sample_execute_request(policy.policy_hash);
+        req.inputs = json!({
+            "prompt": "summarize the swarm result",
+            "context": {"round": 2}
+        });
+
+        let Json(resp) = execute(State(state), Json(req)).await.expect("execute ok");
+        assert_eq!(
+            resp.candidate_output["answer"],
+            json!("agent completion answer")
+        );
+        let captured = requests.lock().expect("requests lock");
+        let (sent, auth) = captured.first().expect("completion request");
+        assert_eq!(auth.as_deref(), Some("Bearer test-key"));
+        assert_eq!(sent["model"], json!("agent-model"));
+        let user_prompt = sent["messages"][1]["content"]
+            .as_str()
+            .expect("user prompt");
+        assert!(user_prompt.contains("Task ID: task-1"));
+        assert!(user_prompt.contains("summarize the swarm result"));
+        assert!(user_prompt.contains("\"round\": 2"));
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn execute_falls_back_when_brain_config_is_unset() {
+        let state = sample_state();
+        let policy = sample_policy_binding(&state);
+        let req = sample_execute_request(policy.policy_hash);
+
+        let Json(resp) = execute(State(state), Json(req)).await.expect("execute ok");
+        assert_eq!(resp.candidate_output["answer"], json!("default::hello"));
     }
 
     #[tokio::test]

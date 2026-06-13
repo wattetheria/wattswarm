@@ -933,7 +933,7 @@ fn backfill_private_dm_topic_delivers_local_agent_event() {
         &remote.node_id(),
     ));
     let mut service = NetworkBridgeService::new(
-        NetworkP2pNode::generate(NetworkP2pConfig::default()).expect("p2p node"),
+        test_network_node(NetworkP2pConfig::default()).expect("p2p node"),
         &[SwarmScope::Global, scope.clone()],
         &NetworkProtocolParams::default(),
     )
@@ -1088,7 +1088,7 @@ fn backfill_self_authored_private_dm_topic_skips_agent_event() {
         &remote.node_id(),
     ));
     let mut service = NetworkBridgeService::new(
-        NetworkP2pNode::generate(NetworkP2pConfig::default()).expect("p2p node"),
+        test_network_node(NetworkP2pConfig::default()).expect("p2p node"),
         &[SwarmScope::Global, scope.clone()],
         &NetworkProtocolParams::default(),
     )
@@ -1371,7 +1371,7 @@ fn pending_agent_payment_command_records_reliable_event() {
     )
     .expect("node");
     let mut service = NetworkBridgeService::new(
-        NetworkP2pNode::generate(NetworkP2pConfig::default()).expect("p2p node"),
+        test_network_node(NetworkP2pConfig::default()).expect("p2p node"),
         &[SwarmScope::Global, SwarmScope::Node(remote.node_id())],
         &NetworkProtocolParams::default(),
     )
@@ -1445,7 +1445,7 @@ fn live_agent_payment_event_delivers_local_agent_event() {
     .expect("payment event");
     let scope = SwarmScope::Node(local.node_id());
     let mut service = NetworkBridgeService::new(
-        NetworkP2pNode::generate(NetworkP2pConfig::default()).expect("p2p node"),
+        test_network_node(NetworkP2pConfig::default()).expect("p2p node"),
         &[SwarmScope::Global, scope.clone()],
         &NetworkProtocolParams::default(),
     )
@@ -1515,7 +1515,7 @@ fn backfill_agent_payment_event_delivers_local_agent_event() {
     .expect("payment event");
     let scope = SwarmScope::Node(local.node_id());
     let mut service = NetworkBridgeService::new(
-        NetworkP2pNode::generate(NetworkP2pConfig::default()).expect("p2p node"),
+        test_network_node(NetworkP2pConfig::default()).expect("p2p node"),
         &[SwarmScope::Global, scope.clone()],
         &NetworkProtocolParams::default(),
     )
@@ -1599,7 +1599,7 @@ fn agent_payment_event_and_summary_share_agent_event_dedupe() {
     .expect("payment event");
     let scope = SwarmScope::Node(local.node_id());
     let mut service = NetworkBridgeService::new(
-        NetworkP2pNode::generate(NetworkP2pConfig::default()).expect("p2p node"),
+        test_network_node(NetworkP2pConfig::default()).expect("p2p node"),
         &[SwarmScope::Global, scope.clone()],
         &NetworkProtocolParams::default(),
     )

@@ -142,6 +142,7 @@ fn run_discovery_bootnode_announce(state_dir: &std::path::Path, db_path: &std::p
 pub fn build_app(state: UiServerState) -> Router {
     Router::new()
         .route("/", get(pages::index))
+        .route("/favicon.png", get(pages::favicon_png))
         .route("/diagnostics", get(pages::diagnostics_page))
         .route("/console", get(pages::legacy_console_redirect))
         .route("/swarm", get(pages::swarm_page))

@@ -3,7 +3,8 @@ pub const STARTUP_HTML: &str = r#"<!DOCTYPE html>
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>Wattswarm Startup</title>
+  <title>Wattswarm Console</title>
+  <link rel="icon" type="image/png" sizes="64x64" href="/favicon.png">
   <style>
     :root {
       --bg: #f4f6f8;
@@ -397,11 +398,10 @@ pub const STARTUP_HTML: &str = r#"<!DOCTYPE html>
   <div class="wrap">
     <div class="panel hero-panel">
       <div>
-        <h1>Wattswarm startup</h1>
-        <div class="hint">
-          First-run configuration for the local node. Only required startup fields are shown here.
-          Required startup settings stay here. Deeper tuning and gateway deployment still stay in CLI or compose.
-        </div>
+        <h1>Wattswarm Console</h1>
+         <div class="hint">
+           Configure your wattswarm node and monitor networks.
+         </div>
         <div class="links">
           <a href="/diagnostics">Open Network Diagnostics</a>
         </div>
@@ -418,9 +418,8 @@ pub const STARTUP_HTML: &str = r#"<!DOCTYPE html>
             <button class="theme-swatch" type="button" data-theme-swatch="indigo" style="--sw:#4f46e5" title="Indigo" aria-label="Indigo theme"></button>
           </div>
         </div>
-        <div class="hint">Saving writes wattswarm startup only. Agent and model configuration lives in Wattetheria.</div>
         <div class="action-row">
-          <button type="button" onclick="saveStartupConfig()">save startup config</button>
+          <button type="button" onclick="saveStartupConfig()">save config</button>
           <button type="button" class="alt" onclick="refreshStartupConfig()">reload</button>
           <button type="button" class="ghost" onclick="refreshNodeStatus()">refresh node</button>
         </div>

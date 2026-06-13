@@ -5377,6 +5377,7 @@ dependencies = [
  "axum",
  "chrono",
  "clap",
+ "reqwest",
  "serde_json",
  "tokio",
  "wattswarm",

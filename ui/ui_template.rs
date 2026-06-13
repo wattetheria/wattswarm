@@ -420,7 +420,7 @@ pub const INDEX_HTML: &str = r#"<!DOCTYPE html>
   <div class="wrap">
     <header class="head">
       <div>
-        <h1>Wattswarm network diagnostics</h1>
+        <h1>Wattswarm Network Diagnostics</h1>
         <div class="hint">Iroh transport, gossip publish and ingest, subscribed scopes, backfill, callback delivery, and node network state.</div>
       </div>
       <div class="head-actions">

@@ -76,7 +76,7 @@ fn ingest_chat_gossip_applies_remote_topic_message_to_local_store() {
     .expect("signed event");
 
     let mut service = NetworkBridgeService::new(
-        NetworkP2pNode::generate(NetworkP2pConfig {
+        test_network_node(NetworkP2pConfig {
             listen_addrs: vec!["127.0.0.1:0".to_owned()],
             bootstrap_peers: Vec::new(),
             enable_local_discovery: false,

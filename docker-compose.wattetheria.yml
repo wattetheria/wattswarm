@@ -5,7 +5,8 @@
 #   docker compose -f docker-compose.yml -f docker-compose.wattetheria.yml up -d
 #
 # This adds a shared external network and enables the gRPC sync service
-# that Wattetheria connects to. Does NOT modify the base compose file.
+# that Wattetheria connects to. It also lets the runtime reuse the
+# Wattetheria deploy env written into the shared Wattetheria state volume.
 
 services:
   kernel:
@@ -22,6 +23,20 @@ services:
       - default
 
   runtime:
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        set -a
+        [ -f /var/lib/wattetheria/deploy/.env ] && . /var/lib/wattetheria/deploy/.env
+        set +a
+        if [ "$#" -eq 1 ]; then
+          exec /bin/sh -c "$1"
+        fi
+        exec /app/target/release/wattswarm-runtime "$@"
+      - --
+    volumes:
+      - wattetheria_state:/var/lib/wattetheria:ro
     networks:
       - default
 
@@ -32,3 +47,8 @@ services:
 networks:
   watt-net:
     external: true
+
+volumes:
+  wattetheria_state:
+    external: true
+    name: wattetheria_wattetheria_state

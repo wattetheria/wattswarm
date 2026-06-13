@@ -6,6 +6,8 @@ fn smarter_backfill_prefers_peer_with_known_scope_activity() {
     let dir_b = temp_startup_dir("backfill-peer-b");
     std::fs::write(dir_a.join("node_seed.hex"), hex::encode([41_u8; 32])).expect("write seed a");
     std::fs::write(dir_b.join("node_seed.hex"), hex::encode([42_u8; 32])).expect("write seed b");
+    ensure_test_relay_urls(&dir_a);
+    ensure_test_relay_urls(&dir_b);
     let node_a = NetworkNodeId::new(
         wattswarm_network_transport_iroh::local_endpoint_id_from_state_dir(&dir_a)
             .expect("node a endpoint")
@@ -23,7 +25,7 @@ fn smarter_backfill_prefers_peer_with_known_scope_activity() {
     let now = Instant::now();
 
     let mut service = NetworkBridgeService::new(
-        NetworkP2pNode::generate(NetworkP2pConfig::default()).expect("node"),
+        test_network_node(NetworkP2pConfig::default()).expect("node"),
         &[SwarmScope::Global, target_scope.clone()],
         &NetworkProtocolParams::default(),
     )
@@ -92,7 +94,7 @@ fn inbound_backfill_authorization_keeps_global_open_and_requires_scoped_activity
     let served_scope = SwarmScope::Group("crew-7".to_owned());
     let unserved_scope = SwarmScope::Group("private-7".to_owned());
     let mut service = NetworkBridgeService::new(
-        NetworkP2pNode::generate(NetworkP2pConfig::default()).expect("node"),
+        test_network_node(NetworkP2pConfig::default()).expect("node"),
         &[SwarmScope::Global, served_scope.clone()],
         &NetworkProtocolParams::default(),
     )
@@ -133,7 +135,7 @@ fn peer_sync_state_persists_scope_cursor_and_remote_heads() {
     let peer = random_network_node_id();
     let scope = SwarmScope::Group("crew-7".to_owned());
     let mut service = NetworkBridgeService::new(
-        NetworkP2pNode::generate(NetworkP2pConfig::default()).expect("node"),
+        test_network_node(NetworkP2pConfig::default()).expect("node"),
         &[SwarmScope::Global],
         &NetworkProtocolParams::default(),
     )
@@ -150,7 +152,7 @@ fn peer_sync_state_persists_scope_cursor_and_remote_heads() {
     );
 
     let mut reloaded = NetworkBridgeService::new(
-        NetworkP2pNode::generate(NetworkP2pConfig::default()).expect("node"),
+        test_network_node(NetworkP2pConfig::default()).expect("node"),
         &[SwarmScope::Global],
         &NetworkProtocolParams::default(),
     )
@@ -208,7 +210,7 @@ fn peer_sync_state_migrates_legacy_json_to_db() {
     .expect("write legacy peer sync JSON");
 
     let mut service = NetworkBridgeService::new(
-        NetworkP2pNode::generate(NetworkP2pConfig::default()).expect("node"),
+        test_network_node(NetworkP2pConfig::default()).expect("node"),
         &[SwarmScope::Global],
         &NetworkProtocolParams::default(),
     )
@@ -236,7 +238,7 @@ fn connection_closed_with_remaining_established_keeps_peer_state() {
     let peer = random_network_node_id();
     let mut node = Node::open_in_memory_with_roles(&[Role::Proposer]).expect("node");
     let mut service = NetworkBridgeService::new(
-        NetworkP2pNode::generate(NetworkP2pConfig::default()).expect("node"),
+        test_network_node(NetworkP2pConfig::default()).expect("node"),
         &[SwarmScope::Global],
         &NetworkProtocolParams::default(),
     )
@@ -266,7 +268,7 @@ fn connection_closed_with_zero_remaining_preserves_peer_sync_state() {
     let peer = random_network_node_id();
     let mut node = Node::open_in_memory_with_roles(&[Role::Proposer]).expect("node");
     let mut service = NetworkBridgeService::new(
-        NetworkP2pNode::generate(NetworkP2pConfig::default()).expect("node"),
+        test_network_node(NetworkP2pConfig::default()).expect("node"),
         &[SwarmScope::Global],
         &NetworkProtocolParams::default(),
     )
@@ -297,7 +299,7 @@ fn stale_backfill_requests_expire_and_release_peer_slot() {
     let state_dir = temp_startup_dir("backfill-timeout-release");
     let peer = random_network_node_id();
     let mut service = NetworkBridgeService::new(
-        NetworkP2pNode::generate(NetworkP2pConfig::default()).expect("node"),
+        test_network_node(NetworkP2pConfig::default()).expect("node"),
         &[SwarmScope::Global],
         &NetworkProtocolParams::default(),
     )
@@ -328,7 +330,7 @@ fn backfill_requests_respect_remaining_peer_slots() {
     let peer = random_network_node_id();
     let node = Node::open_in_memory_with_roles(&[Role::Proposer]).expect("node");
     let mut service = NetworkBridgeService::new(
-        NetworkP2pNode::generate(NetworkP2pConfig::default()).expect("node"),
+        test_network_node(NetworkP2pConfig::default()).expect("node"),
         &[SwarmScope::Global, SwarmScope::Group("crew-a".to_owned())],
         &NetworkProtocolParams::default(),
     )
@@ -371,7 +373,7 @@ fn connection_established_diagnostics_skip_duplicate_peer_events() {
     let address = "203.0.113.10:4001".parse::<NetworkAddress>().expect("addr");
     let mut node = Node::open_in_memory_with_roles(&[Role::Proposer]).expect("node");
     let mut service = NetworkBridgeService::new(
-        NetworkP2pNode::generate(NetworkP2pConfig::default()).expect("node"),
+        test_network_node(NetworkP2pConfig::default()).expect("node"),
         &[SwarmScope::Global],
         &NetworkProtocolParams::default(),
     )
@@ -422,7 +424,7 @@ fn connection_established_persists_relay_contact_material_from_configured_relay(
     let peer = random_network_node_id();
     let mut node = Node::open_in_memory_with_roles(&[Role::Proposer]).expect("node");
     let mut service = NetworkBridgeService::new(
-        NetworkP2pNode::generate(NetworkP2pConfig::default()).expect("node"),
+        test_network_node(NetworkP2pConfig::default()).expect("node"),
         &[SwarmScope::Global],
         &NetworkProtocolParams::default(),
     )
@@ -494,7 +496,7 @@ fn gossip_from_peer_persists_relay_contact_material_from_configured_relay() {
     )
     .expect("signed event");
     let mut service = NetworkBridgeService::new(
-        NetworkP2pNode::generate(NetworkP2pConfig::default()).expect("node"),
+        test_network_node(NetworkP2pConfig::default()).expect("node"),
         &[SwarmScope::Global, SwarmScope::Group("crew-7".to_owned())],
         &NetworkProtocolParams::default(),
     )
@@ -532,7 +534,7 @@ fn connection_closed_diagnostics_skip_duplicate_peer_events() {
     let peer = random_network_node_id();
     let mut node = Node::open_in_memory_with_roles(&[Role::Proposer]).expect("node");
     let mut service = NetworkBridgeService::new(
-        NetworkP2pNode::generate(NetworkP2pConfig::default()).expect("node"),
+        test_network_node(NetworkP2pConfig::default()).expect("node"),
         &[SwarmScope::Global],
         &NetworkProtocolParams::default(),
     )
@@ -692,7 +694,7 @@ fn peer_discovered_event_persists_wan_source_into_local_registry() {
     let dir = temp_startup_dir("peer-discovered-persist");
     let mut node = Node::open_in_memory_with_roles(&[Role::Proposer]).expect("node");
     let mut service = NetworkBridgeService::new(
-        NetworkP2pNode::generate(NetworkP2pConfig::default()).expect("node"),
+        test_network_node(NetworkP2pConfig::default()).expect("node"),
         &[SwarmScope::Global],
         &NetworkProtocolParams::default(),
     )
@@ -730,7 +732,7 @@ fn peer_identified_event_persists_peer_metadata_locally() {
     let dir = temp_startup_dir("peer-identified-metadata");
     let mut node = Node::open_in_memory_with_roles(&[Role::Proposer]).expect("node");
     let mut service = NetworkBridgeService::new(
-        NetworkP2pNode::generate(NetworkP2pConfig::default()).expect("node"),
+        test_network_node(NetworkP2pConfig::default()).expect("node"),
         &[SwarmScope::Global],
         &NetworkProtocolParams::default(),
     )

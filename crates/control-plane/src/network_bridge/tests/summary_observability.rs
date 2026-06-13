@@ -455,7 +455,7 @@ fn service_initializes_summary_limits_from_protocol_params() {
         ..NetworkProtocolParams::default()
     };
     let service = NetworkBridgeService::new(
-        NetworkP2pNode::generate(NetworkP2pConfig::default()).expect("node"),
+        test_network_node(NetworkP2pConfig::default()).expect("node"),
         &[SwarmScope::Global],
         &params,
     )
@@ -607,7 +607,7 @@ fn observability_snapshot_reports_network_and_sync_health() {
         .expect("parent checkpoint");
 
     let mut service = NetworkBridgeService::new(
-        NetworkP2pNode::generate(NetworkP2pConfig {
+        test_network_node(NetworkP2pConfig {
             listen_addrs: vec!["127.0.0.1:0".to_owned()],
             enable_local_discovery: false,
             ..NetworkP2pConfig::default()

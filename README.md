@@ -1,10 +1,10 @@
-# wattswarm
+# Wattswarm
 
-WattSwarm is an open-source coordination kernel for agent networks. It provides
+Wattswarm is an open-source coordination kernel for agent networks. It provides
 the shared runtime layer for multi-agent task execution, verification, voting,
 consensus, event replay, and node-to-node synchronization.
 
-You bring one or more agent runtimes. WattSwarm handles the kernel concerns:
+You bring one or more agent runtimes. Wattswarm handles the kernel concerns:
 task lifecycle, executor registry, PostgreSQL-backed state, run queue scheduling,
 auditable events, P2P propagation, and finalized decisions.
 
@@ -46,7 +46,7 @@ The fastest way to run the full local stack is Docker Compose:
 docker compose up -d --build
 ```
 
-This starts PostgreSQL, the WattSwarm kernel UI, the reference runtime, and a
+This starts PostgreSQL, the Wattswarm kernel UI, the reference runtime, and a
 worker process.
 
 Default local entry points:
@@ -62,7 +62,7 @@ For a guided first task, use the
 
 ## Core Boundary
 
-WattSwarm is a kernel-first project.
+Wattswarm is a kernel-first project.
 
 - Kernel/core: `crates/node-core`, `crates/storage-core`, `crates/policy-engine`,
   `crates/protocol`, `crates/crypto`, `crates/runtime-client`
@@ -71,8 +71,8 @@ WattSwarm is a kernel-first project.
   `crates/network-transport-iroh`
 - Artifact storage: `crates/artifact-store`
 - Network-to-kernel bridge: `crates/control-plane/src/network_bridge/mod.rs`
-- CLI and HTTP/UI app: `apps/wattswarm`
-- Reference runtime: `apps/wattswarm-runtime`
+- CLI and HTTP/UI app: `apps/Wattswarm`
+- Reference runtime: `apps/Wattswarm-runtime`
 - UI assets: `ui/*`
 
 The UI is optional. The kernel can be operated through the CLI and HTTP APIs.
@@ -282,7 +282,7 @@ Node state is intentionally local.
 
 ## CLI Overview
 
-The CLI binary is `wattswarm`.
+The CLI binary is `Wattswarm`.
 
 Common command groups:
 
@@ -309,7 +309,7 @@ kernel:
 - `POST /execute`
 - `POST /verify`
 
-The reference runtime lives in `apps/wattswarm-runtime`. Custom runtimes should
+The reference runtime lives in `apps/Wattswarm-runtime`. Custom runtimes should
 follow the [Runtime executor API](https://mx-6c34bcc6.mintlify.app/api/runtime-overview).
 
 ## Multi-Agent Run Queue
@@ -356,8 +356,8 @@ Report output is written under `target/test-report/`.
 
 ```text
 apps/
-  wattswarm/           CLI, HTTP API, UI server
-  wattswarm-runtime/   Reference executor runtime
+  Wattswarm/           CLI, HTTP API, UI server
+  Wattswarm-runtime/   Reference executor runtime
 crates/
   artifact-store/      Node-local artifact/object storage
   control-plane/       Kernel orchestration and network bridge
@@ -376,7 +376,7 @@ ui/                    Built-in console and swarm dashboard assets
 
 ## Star History
 
-[![Star History Chart](https://api.star-history.com/svg?repos=wattetheria/wattswarm&type=Date)](https://www.star-history.com/#wattetheria/wattswarm&Date)
+[![Star History Chart](https://api.star-history.com/image?repos=wattetheria/wattswarm&type=Date)](https://star-history.com/#wattetheria/wattswarm&Date)
 
 ## License
 

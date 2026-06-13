@@ -52,6 +52,13 @@ fn temp_startup_dir(prefix: &str) -> PathBuf {
     dir
 }
 
+fn test_network_node(config: NetworkP2pConfig) -> Result<NetworkP2pNode> {
+    let seed: [u8; 32] = rand::random();
+    let state_dir = temp_startup_dir("iroh-node");
+    ensure_test_relay_urls(&state_dir);
+    NetworkP2pNode::from_iroh_state_dir(config, state_dir, seed)
+}
+
 fn random_network_node_id() -> NetworkNodeId {
     let uuid = Uuid::new_v4();
     let mut bytes = [0_u8; 32];
