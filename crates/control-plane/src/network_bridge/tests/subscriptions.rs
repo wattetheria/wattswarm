@@ -202,7 +202,7 @@ fn remote_feed_subscription_adds_relay_scope_without_local_subscription() {
     let scope = SwarmScope::Group("crew-7".to_owned());
     assert_eq!(relayed_scope, Some(scope.clone()));
     assert!(!service.subscribed_scopes().contains(&scope));
-    assert!(service.backfill_scopes().contains(&scope));
+    assert!(!service.backfill_scopes().contains(&scope));
     let relay_kinds = service.relay_gossip_kinds(&scope);
     assert!(relay_kinds.contains(&GossipKind::Events));
     assert!(!relay_kinds.contains(&GossipKind::Messages));
@@ -307,7 +307,7 @@ fn startup_restores_remote_feed_subscription_relay_scopes() {
     let scope = SwarmScope::Group("crew-7".to_owned());
     assert_eq!(restored, vec![scope.clone()]);
     assert!(!service.subscribed_scopes().contains(&scope));
-    assert!(service.backfill_scopes().contains(&scope));
+    assert!(!service.backfill_scopes().contains(&scope));
     let relay_kinds = service.relay_gossip_kinds(&scope);
     assert!(relay_kinds.contains(&GossipKind::Events));
     assert!(!relay_kinds.contains(&GossipKind::Messages));

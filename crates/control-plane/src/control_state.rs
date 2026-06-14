@@ -1366,26 +1366,39 @@ pub fn save_peer_relationship_record_state(
     )
 }
 
+fn peer_dm_thread_record_from_row(row: crate::storage::LocalPeerDmThreadRow) -> PeerDmThreadRecord {
+    PeerDmThreadRecord {
+        remote_node_id: row.remote_node_id,
+        thread_id: row.thread_id,
+        thread_kind: peer_dm_thread_kind_from_str(&row.thread_kind),
+        session_state: peer_dm_session_state_from_str(&row.session_state),
+        relationship_established_at: row.relationship_established_at,
+        created_at: row.created_at,
+        updated_at: row.updated_at,
+        last_message_at: row.last_message_at,
+    }
+    .normalized_lifetime()
+}
+
 pub fn load_peer_dm_thread_records_state(state_dir: &Path) -> Result<Vec<PeerDmThreadRecord>> {
     let store = local_control_store(state_dir)?;
     let scope_id = local_control_scope_id(state_dir);
     Ok(store
         .list_local_peer_dm_threads(&scope_id)?
         .into_iter()
-        .map(|row| {
-            PeerDmThreadRecord {
-                remote_node_id: row.remote_node_id,
-                thread_id: row.thread_id,
-                thread_kind: peer_dm_thread_kind_from_str(&row.thread_kind),
-                session_state: peer_dm_session_state_from_str(&row.session_state),
-                relationship_established_at: row.relationship_established_at,
-                created_at: row.created_at,
-                updated_at: row.updated_at,
-                last_message_at: row.last_message_at,
-            }
-            .normalized_lifetime()
-        })
+        .map(peer_dm_thread_record_from_row)
         .collect())
+}
+
+pub fn load_peer_dm_thread_record_for_remote_state(
+    state_dir: &Path,
+    remote_node_id: &str,
+) -> Result<Option<PeerDmThreadRecord>> {
+    let store = local_control_store(state_dir)?;
+    let scope_id = local_control_scope_id(state_dir);
+    Ok(store
+        .get_local_peer_dm_thread_for_remote(&scope_id, remote_node_id)?
+        .map(peer_dm_thread_record_from_row))
 }
 
 pub fn save_peer_dm_thread_record_state(

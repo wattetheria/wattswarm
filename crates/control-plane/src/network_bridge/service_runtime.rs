@@ -140,6 +140,10 @@ impl NetworkBridgeService {
         let Some(state_dir) = &self.state_dir else {
             return;
         };
+        let local_node_id = node.node_id();
+        if !EventRelevanceFilter::should_deliver(node, state_dir, &local_node_id, event) {
+            return;
+        }
         match &event.payload {
             crate::types::EventPayload::TaskClaimed(payload) => {
                 if let Ok(agent_event) = task_claim_agent_event(node, event, payload) {
@@ -207,6 +211,10 @@ impl NetworkBridgeService {
         let Some(state_dir) = &self.state_dir else {
             return;
         };
+        let local_node_id = node.node_id();
+        if !EventRelevanceFilter::should_deliver(node, state_dir, &local_node_id, event) {
+            return;
+        }
         if let Ok(Some(agent_event)) = topic_message_agent_event(node, event, payload) {
             let _ = deliver_agent_event_to_local_executor(
                 state_dir,

@@ -915,6 +915,48 @@ impl PgStore {
             .map_err(Into::into)
     }
 
+    pub fn get_local_peer_dm_thread_for_remote(
+        &self,
+        scope_id: &str,
+        remote_node_id: &str,
+    ) -> Result<Option<LocalPeerDmThreadRow>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
+        conn.query_row(
+            "SELECT remote_node_id,
+                    thread_id,
+                    thread_kind,
+                    session_state,
+                    (EXTRACT(EPOCH FROM relationship_established_at) * 1000)::BIGINT AS relationship_established_at_ms,
+                    (EXTRACT(EPOCH FROM created_at) * 1000)::BIGINT AS created_at_ms,
+                    (EXTRACT(EPOCH FROM updated_at) * 1000)::BIGINT AS updated_at_ms,
+                    (EXTRACT(EPOCH FROM last_message_at) * 1000)::BIGINT AS last_message_at_ms
+             FROM peer_dm_threads_local
+             WHERE scope_id = $1 AND remote_node_id = $2
+             ORDER BY updated_at DESC, thread_id ASC
+             LIMIT 1",
+            params![scope_id, remote_node_id],
+            |r| {
+                Ok(LocalPeerDmThreadRow {
+                    remote_node_id: r.get(0)?,
+                    thread_id: r.get(1)?,
+                    thread_kind: r.get(2)?,
+                    session_state: r.get(3)?,
+                    relationship_established_at: r
+                        .get::<_, Option<i64>>(4)?
+                        .map(|value| value as u64),
+                    created_at: r.get::<_, i64>(5)? as u64,
+                    updated_at: r.get::<_, i64>(6)? as u64,
+                    last_message_at: r.get::<_, Option<i64>>(7)?.map(|value| value as u64),
+                })
+            },
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
     pub fn upsert_local_peer_dm_thread(
         &self,
         scope_id: &str,

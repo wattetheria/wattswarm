@@ -251,27 +251,35 @@ impl NetworkBridgeService {
                 break;
             }
             let scope_hint = scope_hint_label(&scope);
-            let from_event_seq = self
-                .peer_sync_state
-                .get(peer)
-                .map_or(0, |state| state.backfill_cursor(&scope, None));
-            let known_event_ids =
-                recent_backfill_lane_event_ids(node, &scope, None, BACKFILL_KNOWN_EVENT_IDS_LIMIT)?;
-            let request_id = self.runtime.send_backfill_request(
-                peer,
-                BackfillRequest {
-                    scope: scope.clone(),
-                    from_event_seq,
-                    limit: BACKFILL_BATCH_EVENTS,
-                    feed_key: None,
-                    known_event_ids,
-                },
-            )?;
-            self.peer_sync_state
-                .entry(peer.clone())
-                .or_insert_with(|| PeerSyncState::new(now))
-                .record_pending_backfill(request_id, scope.clone(), None, now);
-            requests_sent += 1;
+            let request_scope_history =
+                scope == SwarmScope::Global || self.subscribed_scope_kinds.contains_key(&scope);
+            if request_scope_history {
+                let from_event_seq = self
+                    .peer_sync_state
+                    .get(peer)
+                    .map_or(0, |state| state.backfill_cursor(&scope, None));
+                let known_event_ids = recent_backfill_lane_event_ids(
+                    node,
+                    &scope,
+                    None,
+                    BACKFILL_KNOWN_EVENT_IDS_LIMIT,
+                )?;
+                let request_id = self.runtime.send_backfill_request(
+                    peer,
+                    BackfillRequest {
+                        scope: scope.clone(),
+                        from_event_seq,
+                        limit: BACKFILL_BATCH_EVENTS,
+                        feed_key: None,
+                        known_event_ids,
+                    },
+                )?;
+                self.peer_sync_state
+                    .entry(peer.clone())
+                    .or_insert_with(|| PeerSyncState::new(now))
+                    .record_pending_backfill(request_id, scope.clone(), None, now);
+                requests_sent += 1;
+            }
             for subscription in active_subscriptions
                 .iter()
                 .filter(|subscription| subscription.scope_hint == scope_hint)
@@ -361,13 +369,7 @@ impl NetworkBridgeService {
     }
 
     pub(crate) fn backfill_scopes(&self) -> Vec<SwarmScope> {
-        let mut scopes = self.subscribed_scopes.clone();
-        for scope in self.relay_scope_kinds.keys() {
-            if !scopes.contains(scope) {
-                scopes.push(scope.clone());
-            }
-        }
-        scopes
+        self.subscribed_scopes.clone()
     }
 
     pub(crate) fn preferred_backfill_peer_for_scope(

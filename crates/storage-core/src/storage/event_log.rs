@@ -118,6 +118,24 @@ impl PgStore {
         self.load_events_from(0)
     }
 
+    pub fn task_created_by_node_id(&self, task_id: &str) -> Result<Option<String>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
+        conn.query_row(
+            "SELECT author_node_id
+             FROM events
+             WHERE org_id = $1 AND task_id = $2 AND event_kind = 'TaskCreated'
+             ORDER BY created_at ASC, seq ASC
+             LIMIT 1",
+            params![self.org_id(), task_id],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
     pub fn event_seq_for_event_id(&self, event_id: &str) -> Result<Option<u64>> {
         let conn = self
             .conn

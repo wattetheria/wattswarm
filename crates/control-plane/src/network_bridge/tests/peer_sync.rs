@@ -1068,6 +1068,7 @@ fn reconnect_supervision_redials_remembered_peer_address() {
         .expect("write local seed");
     std::fs::write(remote_dir.join("node_seed.hex"), hex::encode(remote_seed))
         .expect("write remote seed");
+    ensure_test_relay_urls(&local_dir);
     std::fs::write(
         remote_dir.join("startup_config.json"),
         serde_json::to_vec(&json!({"relay_urls":["https://relay.example.invalid/"]}))
@@ -1119,6 +1120,7 @@ fn reconnect_supervision_abandons_stale_peer_until_rediscovered() {
         .expect("write local seed");
     std::fs::write(remote_dir.join("node_seed.hex"), hex::encode(remote_seed))
         .expect("write remote seed");
+    ensure_test_relay_urls(&local_dir);
     let remote_endpoint =
         wattswarm_network_transport_iroh::local_endpoint_id_from_state_dir(&remote_dir)
             .expect("remote endpoint")
@@ -1252,7 +1254,7 @@ fn reconnect_supervision_probes_relay_only_bootstrap_contact() {
 }
 
 #[test]
-fn urgent_backfill_request_bypasses_retry_delay_for_relay_scope() {
+fn urgent_backfill_request_bypasses_retry_delay_for_local_scope() {
     let node = Node::open_in_memory_with_roles(&[Role::Proposer]).expect("node");
     let local_dir = temp_startup_dir("urgent-backfill-local");
     let remote_dir = temp_startup_dir("urgent-backfill-remote");
@@ -1262,6 +1264,7 @@ fn urgent_backfill_request_bypasses_retry_delay_for_relay_scope() {
         .expect("write local seed");
     std::fs::write(remote_dir.join("node_seed.hex"), hex::encode(remote_seed))
         .expect("write remote seed");
+    ensure_test_relay_urls(&local_dir);
     let remote_endpoint =
         wattswarm_network_transport_iroh::local_endpoint_id_from_state_dir(&remote_dir)
             .expect("remote endpoint")
@@ -1284,6 +1287,7 @@ fn urgent_backfill_request_bypasses_retry_delay_for_relay_scope() {
         .expect("dial peer");
     service.connected_peers.insert(peer.clone());
     let scope = SwarmScope::Group("crew-urgent".to_owned());
+    service.subscribe_scope(&scope).expect("subscribe scope");
     let mut state = PeerSyncState::new(Instant::now());
     state.next_retry_at = Instant::now() + Duration::from_secs(60);
     state.known_scopes.insert(scope.clone());
@@ -1315,7 +1319,7 @@ fn urgent_backfill_request_bypasses_retry_delay_for_relay_scope() {
 }
 
 #[test]
-fn anti_entropy_requests_relay_scope_backfill() {
+fn anti_entropy_skips_relay_only_scope_backfill() {
     let node = Node::open_in_memory_with_roles(&[Role::Proposer]).expect("node");
     let local_dir = temp_startup_dir("relay-anti-entropy-local");
     let remote_dir = temp_startup_dir("relay-anti-entropy-remote");
@@ -1325,6 +1329,7 @@ fn anti_entropy_requests_relay_scope_backfill() {
         .expect("write local seed");
     std::fs::write(remote_dir.join("node_seed.hex"), hex::encode(remote_seed))
         .expect("write remote seed");
+    ensure_test_relay_urls(&local_dir);
     let remote_endpoint =
         wattswarm_network_transport_iroh::local_endpoint_id_from_state_dir(&remote_dir)
             .expect("remote endpoint")
@@ -1351,7 +1356,7 @@ fn anti_entropy_requests_relay_scope_backfill() {
         .relay_scope_kinds
         .insert(scope.clone(), HashSet::from([GossipKind::Events]));
     let mut state = PeerSyncState::new(Instant::now());
-    state.known_scopes.insert(scope);
+    state.known_scopes.insert(scope.clone());
     service.peer_sync_state.insert(peer.clone(), state);
 
     assert_eq!(
@@ -1360,13 +1365,13 @@ fn anti_entropy_requests_relay_scope_backfill() {
             .expect("run anti-entropy for relay scope"),
         1
     );
+    let state = service.peer_sync_state.get(&peer).expect("peer sync state");
+    assert_eq!(state.inflight_backfills(), 1);
     assert!(
-        service
-            .peer_sync_state
-            .get(&peer)
-            .expect("peer sync state")
-            .inflight_backfills()
-            >= 1
+        state
+            .inflight_backfill_requests
+            .values()
+            .all(|pending| pending.scope != scope)
     );
 
     wattswarm_network_transport_iroh::shutdown_local_iroh_data_plane(&local_dir);

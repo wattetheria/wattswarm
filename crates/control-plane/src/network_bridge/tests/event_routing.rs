@@ -121,6 +121,33 @@ fn task_claim_decision_agent_event_prompts_approved_claimer_to_complete() {
     );
 }
 
+fn test_event_routing_service(
+    state_dir: &Path,
+    seed: [u8; 32],
+    scopes: &[SwarmScope],
+) -> NetworkBridgeService {
+    fs::write(state_dir.join("node_seed.hex"), hex::encode(seed)).expect("write node seed");
+    fs::write(
+        state_dir.join("startup_config.json"),
+        serde_json::to_vec(&json!({"relay_urls":["https://relay.example.invalid/"]}))
+            .expect("startup config json"),
+    )
+    .expect("write startup config");
+    let mut service = NetworkBridgeService::new(
+        NetworkP2pNode::from_iroh_state_dir(
+            NetworkP2pConfig::default(),
+            state_dir.to_path_buf(),
+            seed,
+        )
+        .expect("p2p node"),
+        scopes,
+        &NetworkProtocolParams::default(),
+    )
+    .expect("service");
+    service.set_state_dir(state_dir.to_path_buf(), state_dir.join("control.sqlite"));
+    service
+}
+
 #[test]
 fn backfill_task_claimed_delivers_local_agent_event() {
     let state_dir = temp_startup_dir("backfill-task-claim-agent-event");
@@ -178,26 +205,11 @@ fn backfill_task_claimed_delivers_local_agent_event() {
         }),
     )
     .expect("claim event");
-    let service_seed = [141u8; 32];
-    fs::write(state_dir.join("node_seed.hex"), hex::encode(service_seed)).expect("write node seed");
-    fs::write(
-        state_dir.join("startup_config.json"),
-        serde_json::to_vec(&json!({"relay_urls":["https://relay.example.invalid/"]}))
-            .expect("startup config json"),
-    )
-    .expect("write startup config");
-    let mut service = NetworkBridgeService::new(
-        NetworkP2pNode::from_iroh_state_dir(
-            NetworkP2pConfig::default(),
-            state_dir.clone(),
-            service_seed,
-        )
-        .expect("p2p node"),
+    let mut service = test_event_routing_service(
+        &state_dir,
+        [141u8; 32],
         &[SwarmScope::Global, scope.clone()],
-        &NetworkProtocolParams::default(),
-    )
-    .expect("service");
-    service.set_state_dir(state_dir.clone(), state_dir.join("control.sqlite"));
+    );
     let peer = random_network_node_id();
     let request_id = BackfillRequestId::new(42);
 
@@ -244,6 +256,478 @@ fn backfill_task_claimed_delivers_local_agent_event() {
     );
     assert_eq!(records[0].agent_envelope, Some(agent_envelope));
     assert!(records[0].payload.get("agent_envelope").is_none());
+}
+
+#[test]
+fn backfill_unrelated_task_claim_skips_local_agent_event() {
+    let state_dir = temp_startup_dir("backfill-unrelated-task-claim-agent-event");
+    let local_identity = NodeIdentity::random();
+    let publisher_identity = NodeIdentity::random();
+    let claimer_identity = NodeIdentity::random();
+    let membership = membership_with_roles(&[
+        local_identity.node_id(),
+        publisher_identity.node_id(),
+        claimer_identity.node_id(),
+    ]);
+    let mut local_node = Node::new(
+        local_identity,
+        PgStore::open_in_memory().expect("local store"),
+        membership.clone(),
+    )
+    .expect("local node");
+    let mut publisher = Node::new(
+        publisher_identity.clone(),
+        PgStore::open_in_memory().expect("publisher store"),
+        membership,
+    )
+    .expect("publisher node");
+    let policy_hash = publisher
+        .policy_registry()
+        .binding_for("vp.schema_only.v1", json!({}))
+        .expect("policy")
+        .policy_hash;
+    let task_id = "task-backfill-unrelated-claim";
+    let scope = SwarmScope::Group(task_id.to_owned());
+    let mut contract = sample_contract(task_id, policy_hash);
+    contract.inputs = json!({
+        "kind": "generic_task",
+        "agent_did": "publisher-agent",
+        "swarm_scope": scope_hint_label(&scope)
+    });
+    publisher
+        .submit_task(contract, 1, 100)
+        .expect("submit task");
+    let task_created_event = publisher
+        .store
+        .load_all_events()
+        .expect("publisher events")
+        .into_iter()
+        .find_map(|(_, event)| {
+            matches!(event.payload, crate::types::EventPayload::TaskCreated(_)).then_some(event)
+        })
+        .expect("task created event");
+    let claim_event = build_event_for_external(
+        &claimer_identity,
+        1,
+        110,
+        crate::types::EventPayload::TaskClaimed(crate::types::ClaimPayload {
+            task_id: task_id.to_owned(),
+            role: crate::types::ClaimRole::Propose,
+            claimer_node_id: claimer_identity.node_id(),
+            execution_id: format!("exec-{task_id}"),
+            lease_until: 500,
+            agent_envelope: None,
+        }),
+    )
+    .expect("claim event");
+    let mut service = test_event_routing_service(
+        &state_dir,
+        [142u8; 32],
+        &[SwarmScope::Global, scope.clone()],
+    );
+    let request_id = BackfillRequestId::new(43);
+
+    let tick = service
+        .process_runtime_event(
+            &mut local_node,
+            NetworkRuntimeEvent::BackfillResponse {
+                peer: random_network_node_id(),
+                request_id,
+                response: crate::network_p2p::BackfillResponse {
+                    scope: scope.clone(),
+                    next_from_event_seq: 2,
+                    feed_key: None,
+                    head_event_ids: vec![
+                        task_created_event.event_id.clone(),
+                        claim_event.event_id.clone(),
+                    ],
+                    events: vec![
+                        EventEnvelope {
+                            scope: scope.clone(),
+                            event: task_created_event,
+                            content_source_node_id: None,
+                        },
+                        EventEnvelope {
+                            scope,
+                            event: claim_event,
+                            content_source_node_id: None,
+                        },
+                    ],
+                },
+            },
+        )
+        .expect("process unrelated backfill response");
+
+    assert!(matches!(
+        tick,
+        NetworkBridgeTick::BackfillApplied {
+            request_id: applied_request,
+            events: 2,
+            ..
+        } if applied_request == request_id
+    ));
+    let records =
+        crate::control::load_agent_event_records_state(&state_dir).expect("agent event records");
+    assert!(records.is_empty(), "{records:?}");
+}
+
+#[test]
+fn backfill_completion_decision_delivers_to_local_claimer_without_target_envelope() {
+    let state_dir = temp_startup_dir("backfill-completion-decision-local-claimer");
+    let claimer_identity = NodeIdentity::random();
+    let publisher_identity = NodeIdentity::random();
+    let membership =
+        membership_with_roles(&[claimer_identity.node_id(), publisher_identity.node_id()]);
+    let mut local_node = Node::new(
+        claimer_identity.clone(),
+        PgStore::open_in_memory().expect("local store"),
+        membership.clone(),
+    )
+    .expect("local node");
+    let mut publisher = Node::new(
+        publisher_identity.clone(),
+        PgStore::open_in_memory().expect("publisher store"),
+        membership,
+    )
+    .expect("publisher node");
+    let policy_hash = publisher
+        .policy_registry()
+        .binding_for("vp.schema_only.v1", json!({}))
+        .expect("policy")
+        .policy_hash;
+    let task_id = "task-backfill-completion-decision";
+    let execution_id = format!("exec-{task_id}");
+    let scope = SwarmScope::Group(task_id.to_owned());
+    let mut contract = sample_contract(task_id, policy_hash);
+    contract.inputs = json!({
+        "kind": "generic_task",
+        "agent_did": "publisher-agent",
+        "swarm_scope": scope_hint_label(&scope)
+    });
+    publisher
+        .submit_task(contract, 1, 100)
+        .expect("submit task");
+    let task_created_event = publisher
+        .store
+        .load_all_events()
+        .expect("publisher events")
+        .into_iter()
+        .find_map(|(_, event)| {
+            matches!(event.payload, crate::types::EventPayload::TaskCreated(_)).then_some(event)
+        })
+        .expect("task created event");
+    let local_claim_event = build_event_for_external(
+        &claimer_identity,
+        1,
+        105,
+        crate::types::EventPayload::TaskClaimed(crate::types::ClaimPayload {
+            task_id: task_id.to_owned(),
+            role: crate::types::ClaimRole::Propose,
+            claimer_node_id: claimer_identity.node_id(),
+            execution_id: execution_id.clone(),
+            lease_until: 500,
+            agent_envelope: None,
+        }),
+    )
+    .expect("local claim event");
+    local_node
+        .store
+        .append_event(&local_claim_event)
+        .expect("seed local claim event");
+    local_node
+        .store
+        .upsert_lease(
+            task_id,
+            "propose",
+            &claimer_identity.node_id(),
+            &execution_id,
+            500,
+        )
+        .expect("seed local claim projection");
+    let completion_decision_event = build_event_for_external(
+        &publisher_identity,
+        1,
+        120,
+        crate::types::EventPayload::TaskCompletionDecided(
+            crate::types::TaskCompletionDecidedPayload {
+                task_id: task_id.to_owned(),
+                execution_id,
+                approved: true,
+                retry_requested: false,
+                reason: None,
+                agent_envelope: None,
+            },
+        ),
+    )
+    .expect("completion decision event");
+    let mut service = test_event_routing_service(
+        &state_dir,
+        [145u8; 32],
+        &[SwarmScope::Global, scope.clone()],
+    );
+    let request_id = BackfillRequestId::new(46);
+
+    service
+        .process_runtime_event(
+            &mut local_node,
+            NetworkRuntimeEvent::BackfillResponse {
+                peer: random_network_node_id(),
+                request_id,
+                response: crate::network_p2p::BackfillResponse {
+                    scope: scope.clone(),
+                    next_from_event_seq: 2,
+                    feed_key: None,
+                    head_event_ids: vec![
+                        task_created_event.event_id.clone(),
+                        completion_decision_event.event_id.clone(),
+                    ],
+                    events: vec![
+                        EventEnvelope {
+                            scope: scope.clone(),
+                            event: task_created_event,
+                            content_source_node_id: None,
+                        },
+                        EventEnvelope {
+                            scope,
+                            event: completion_decision_event,
+                            content_source_node_id: None,
+                        },
+                    ],
+                },
+            },
+        )
+        .expect("process completion decision backfill response");
+
+    let records =
+        crate::control::load_agent_event_records_state(&state_dir).expect("agent event records");
+    assert_eq!(records.len(), 1);
+    assert_eq!(
+        records[0].event_type,
+        wattswarm_protocol::types::AgentEventType::TaskCompletionDecisionReceived
+    );
+    assert_eq!(records[0].payload["task_id"].as_str(), Some(task_id));
+}
+
+#[test]
+fn backfill_unsubscribed_topic_message_skips_local_agent_event() {
+    let state_dir = temp_startup_dir("backfill-unsubscribed-topic-agent-event");
+    let local = NodeIdentity::random();
+    let remote = NodeIdentity::random();
+    let local_node_id = local.node_id();
+    let remote_node_id = remote.node_id();
+    let membership = membership_with_roles(&[local_node_id.clone(), remote_node_id.clone()]);
+    let mut node =
+        Node::new(local, PgStore::open_in_memory().expect("store"), membership).expect("node");
+    let scope = SwarmScope::Group("crew-7".to_owned());
+    let agent_envelope = wattswarm_protocol::types::AgentEnvelope {
+        protocol: "google_a2a".to_owned(),
+        source_agent_id: Some("did:key:remote".to_owned()),
+        target_agent_id: Some("did:key:local".to_owned()),
+        source_node_id: Some(remote_node_id.clone()),
+        target_node_id: Some(local_node_id.clone()),
+        capability: Some("social.topic.reply".to_owned()),
+        message_json: json!({"text": "hello crew"}).to_string(),
+        ..wattswarm_protocol::types::AgentEnvelope::default()
+    };
+    let remote_event = build_event_for_external(
+        &remote,
+        1,
+        10,
+        crate::types::EventPayload::TopicMessagePosted(crate::types::TopicMessagePostedPayload {
+            network_id: "default".to_owned(),
+            feed_key: "crew.chat".to_owned(),
+            scope_hint: scope_hint_label(&scope),
+            content_ref: sample_topic_content_ref("sha256:crew-message", &remote.node_id()),
+            local_content_cache: Some(json!({"text": "hello crew"})),
+            reply_to_message_id: None,
+            agent_envelope: Some(agent_envelope),
+        }),
+    )
+    .expect("topic event");
+    let mut service = test_event_routing_service(
+        &state_dir,
+        [143u8; 32],
+        &[SwarmScope::Global, scope.clone()],
+    );
+    let request_id = BackfillRequestId::new(44);
+
+    service
+        .process_runtime_event(
+            &mut node,
+            NetworkRuntimeEvent::BackfillResponse {
+                peer: random_network_node_id(),
+                request_id,
+                response: crate::network_p2p::BackfillResponse {
+                    scope: scope.clone(),
+                    next_from_event_seq: 1,
+                    feed_key: None,
+                    head_event_ids: vec![remote_event.event_id.clone()],
+                    events: vec![EventEnvelope {
+                        scope,
+                        event: remote_event,
+                        content_source_node_id: None,
+                    }],
+                },
+            },
+        )
+        .expect("process topic backfill response");
+
+    let records =
+        crate::control::load_agent_event_records_state(&state_dir).expect("agent event records");
+    assert!(records.is_empty(), "{records:?}");
+}
+
+#[test]
+fn backfill_subscribed_topic_message_delivers_local_agent_event() {
+    let state_dir = temp_startup_dir("backfill-subscribed-topic-agent-event");
+    let local = NodeIdentity::random();
+    let remote = NodeIdentity::random();
+    let local_node_id = local.node_id();
+    let membership = membership_with_roles(&[local_node_id.clone(), remote.node_id()]);
+    let mut node =
+        Node::new(local, PgStore::open_in_memory().expect("store"), membership).expect("node");
+    let scope = SwarmScope::Group("crew-7".to_owned());
+    node.store
+        .upsert_feed_subscription(
+            "default",
+            &local_node_id,
+            "crew.chat",
+            &scope_hint_label(&scope),
+            &["messages".to_owned()],
+            true,
+            1,
+        )
+        .expect("local topic subscription");
+    let remote_event = build_event_for_external(
+        &remote,
+        1,
+        10,
+        crate::types::EventPayload::TopicMessagePosted(crate::types::TopicMessagePostedPayload {
+            network_id: "default".to_owned(),
+            feed_key: "crew.chat".to_owned(),
+            scope_hint: scope_hint_label(&scope),
+            content_ref: sample_topic_content_ref("sha256:crew-message", &remote.node_id()),
+            local_content_cache: Some(json!({"text": "hello crew"})),
+            reply_to_message_id: None,
+            agent_envelope: None,
+        }),
+    )
+    .expect("topic event");
+    let mut service = test_event_routing_service(
+        &state_dir,
+        [144u8; 32],
+        &[SwarmScope::Global, scope.clone()],
+    );
+    let request_id = BackfillRequestId::new(45);
+
+    service
+        .process_runtime_event(
+            &mut node,
+            NetworkRuntimeEvent::BackfillResponse {
+                peer: random_network_node_id(),
+                request_id,
+                response: crate::network_p2p::BackfillResponse {
+                    scope: scope.clone(),
+                    next_from_event_seq: 1,
+                    feed_key: None,
+                    head_event_ids: vec![remote_event.event_id.clone()],
+                    events: vec![EventEnvelope {
+                        scope,
+                        event: remote_event,
+                        content_source_node_id: None,
+                    }],
+                },
+            },
+        )
+        .expect("process topic backfill response");
+
+    let records =
+        crate::control::load_agent_event_records_state(&state_dir).expect("agent event records");
+    assert_eq!(records.len(), 1);
+    assert_eq!(
+        records[0].event_type,
+        wattswarm_protocol::types::AgentEventType::TopicMessageRequiresReply
+    );
+    assert_eq!(records[0].payload["feed_key"].as_str(), Some("crew.chat"));
+}
+
+#[test]
+fn backfill_encrypted_private_hive_topic_skips_local_agent_event() {
+    let state_dir = temp_startup_dir("backfill-encrypted-private-hive-topic-agent-event");
+    let local = NodeIdentity::random();
+    let remote = NodeIdentity::random();
+    let local_node_id = local.node_id();
+    let membership = membership_with_roles(&[local_node_id.clone(), remote.node_id()]);
+    let mut node =
+        Node::new(local, PgStore::open_in_memory().expect("store"), membership).expect("node");
+    let scope = SwarmScope::Group("dm-private-hive-7".to_owned());
+    let feed_key = "private.hive.crew";
+    node.store
+        .upsert_feed_subscription(
+            "default",
+            &local_node_id,
+            feed_key,
+            &scope_hint_label(&scope),
+            &["messages".to_owned()],
+            true,
+            1,
+        )
+        .expect("local private hive subscription");
+    let remote_event = build_event_for_external(
+        &remote,
+        1,
+        10,
+        crate::types::EventPayload::TopicMessagePosted(crate::types::TopicMessagePostedPayload {
+            network_id: "default".to_owned(),
+            feed_key: feed_key.to_owned(),
+            scope_hint: scope_hint_label(&scope),
+            content_ref: sample_topic_content_ref("sha256:private-hive-message", &remote.node_id()),
+            local_content_cache: Some(json!({
+                "kind": "private_encrypted",
+                "private_kind": "hive_message",
+                "message_id": "private-hive-message-1",
+                "encrypted": {
+                    "version": "test",
+                    "nonce_b64": "AA==",
+                    "ciphertext_b64": "AA=="
+                }
+            })),
+            reply_to_message_id: None,
+            agent_envelope: None,
+        }),
+    )
+    .expect("private hive topic event");
+    let mut service = test_event_routing_service(
+        &state_dir,
+        [146u8; 32],
+        &[SwarmScope::Global, scope.clone()],
+    );
+    let request_id = BackfillRequestId::new(47);
+
+    service
+        .process_runtime_event(
+            &mut node,
+            NetworkRuntimeEvent::BackfillResponse {
+                peer: random_network_node_id(),
+                request_id,
+                response: crate::network_p2p::BackfillResponse {
+                    scope: scope.clone(),
+                    next_from_event_seq: 1,
+                    feed_key: Some(feed_key.to_owned()),
+                    head_event_ids: vec![remote_event.event_id.clone()],
+                    events: vec![EventEnvelope {
+                        scope,
+                        event: remote_event,
+                        content_source_node_id: None,
+                    }],
+                },
+            },
+        )
+        .expect("process private hive backfill response");
+
+    let records =
+        crate::control::load_agent_event_records_state(&state_dir).expect("agent event records");
+    assert!(records.is_empty(), "{records:?}");
 }
 
 #[test]

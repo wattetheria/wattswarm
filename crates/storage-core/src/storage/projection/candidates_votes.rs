@@ -338,6 +338,28 @@ impl PgStore {
         .map_err(Into::into)
     }
 
+    pub fn get_candidate_proposer_by_execution(
+        &self,
+        task_id: &str,
+        execution_id: &str,
+    ) -> Result<Option<String>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
+        conn.query_row(
+            "SELECT proposer_node_id
+             FROM candidates
+             WHERE org_id = $1 AND task_id = $2 AND execution_id = $3
+             ORDER BY candidate_id ASC
+             LIMIT 1",
+            params![self.org_id(), task_id, execution_id],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
     pub fn list_candidates_for_task(&self, task_id: &str) -> Result<Vec<TaskCandidateRow>> {
         let conn = self
             .conn

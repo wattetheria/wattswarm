@@ -4,6 +4,7 @@ mod backfill;
 mod bootstrap_contact;
 mod diagnostics;
 mod discovery_bootnode;
+mod event_relevance;
 mod peer_interactions;
 mod publish;
 mod scope;
@@ -101,6 +102,7 @@ use discovery_bootnode::{
 use discovery_bootnode::{
     discovery_bootnode_failure_log_decision, reset_discovery_bootnode_failure_log_state,
 };
+use event_relevance::EventRelevanceFilter;
 #[cfg(test)]
 use peer_interactions::payment_allowed_actions;
 use peer_interactions::{
