@@ -73,7 +73,10 @@ pub fn publish_pending_scoped_updates(
         if let crate::types::EventPayload::FeedSubscriptionUpdated(payload) = &event.payload
             && payload.subscriber_node_id == local_node_id
         {
-            let subscription_scope = super::feed_subscription_target_scope(payload);
+            let Some(subscription_scope) = super::feed_subscription_target_scope(payload) else {
+                last_published_seq = seq;
+                continue;
+            };
             let gossip_kinds = super::feed_subscription_gossip_kinds(&payload.gossip_kinds);
             if payload.active {
                 service.subscribe_scope_kinds(&subscription_scope, &gossip_kinds)?;

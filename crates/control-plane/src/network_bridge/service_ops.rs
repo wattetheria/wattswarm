@@ -475,9 +475,7 @@ impl NetworkBridgeService {
     }
 
     pub(crate) fn serves_backfill_scope(&self, scope: &SwarmScope) -> bool {
-        *scope == SwarmScope::Global
-            || self.subscribed_scope_kinds.contains_key(scope)
-            || self.relay_scope_kinds.contains_key(scope)
+        *scope == SwarmScope::Global || self.subscribed_scope_kinds.contains_key(scope)
     }
 
     pub(crate) fn inbound_backfill_authorized(

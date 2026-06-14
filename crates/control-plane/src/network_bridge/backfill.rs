@@ -129,6 +129,9 @@ pub fn ingest_backfill_response(node: &mut Node, response: &BackfillResponse) ->
         if envelope.scope != response.scope {
             return Err(anyhow!("backfill response scope mismatch"));
         }
+        if !event_matches_signed_scope(&envelope.event, &response.scope) {
+            continue;
+        }
         if let Some(feed_key) = &response.feed_key {
             let crate::types::EventPayload::TopicMessagePosted(payload) = &envelope.event.payload
             else {

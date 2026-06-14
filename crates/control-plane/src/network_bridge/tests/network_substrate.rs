@@ -76,6 +76,31 @@ fn mismatched_network_id_is_rejected_for_network_substrate_events() {
 }
 
 #[test]
+fn discovery_gossip_kind_is_rejected_until_transport_kind_exists() {
+    let mut node = Node::open_in_memory_with_roles(&[]).expect("node");
+    let subscriber_node_id = node.node_id();
+
+    let result = node.emit_at(
+        1,
+        crate::types::EventPayload::FeedSubscriptionUpdated(
+            crate::types::FeedSubscriptionUpdatedPayload {
+                network_id: "default".to_owned(),
+                subscriber_node_id,
+                feed_key: "market.invalid".to_owned(),
+                scope_hint: "region:sol-1".to_owned(),
+                gossip_kinds: vec!["discovery".to_owned()],
+                provider_capabilities: None,
+                agent_envelope: None,
+                active: true,
+            },
+        ),
+        100,
+    );
+
+    assert!(result.is_err());
+}
+
+#[test]
 fn network_substrate_projection_canonicalizes_scope_hints() {
     let mut node = Node::open_in_memory_with_roles(&[]).expect("node");
     let subscriber_node_id = node.node_id();

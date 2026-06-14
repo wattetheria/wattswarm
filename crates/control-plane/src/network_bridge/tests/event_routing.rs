@@ -19,6 +19,7 @@ fn task_claim_agent_event_uses_generic_task_schema() {
         protocol_version: "1".to_owned(),
         event_kind: crate::types::EventKind::TaskClaimed,
         task_id: Some("task-1".to_owned()),
+        swarm_scope: "global".to_owned(),
         epoch: 7,
         author_node_id: "peer-a".to_owned(),
         created_at: 55,
@@ -78,6 +79,7 @@ fn task_claim_decision_agent_event_prompts_approved_claimer_to_complete() {
         protocol_version: "1".to_owned(),
         event_kind: crate::types::EventKind::TaskClaimDecided,
         task_id: Some("mission-claim-decision".to_owned()),
+        swarm_scope: "global".to_owned(),
         epoch: 7,
         author_node_id: "publisher-node".to_owned(),
         created_at: 55,
@@ -148,6 +150,24 @@ fn test_event_routing_service(
     service
 }
 
+fn build_event_for_external_with_scope(
+    identity: &NodeIdentity,
+    epoch: u64,
+    created_at: u64,
+    scope: &SwarmScope,
+    payload: crate::types::EventPayload,
+) -> anyhow::Result<crate::types::Event> {
+    let unsigned = crate::types::UnsignedEvent::from_payload_with_scope(
+        crate::constants::LOCAL_PROTOCOL_VERSION.to_owned(),
+        identity.node_id(),
+        epoch,
+        created_at,
+        scope_hint_label(scope),
+        payload,
+    );
+    identity.sign_unsigned_event(&unsigned)
+}
+
 #[test]
 fn backfill_task_claimed_delivers_local_agent_event() {
     let state_dir = temp_startup_dir("backfill-task-claim-agent-event");
@@ -191,10 +211,11 @@ fn backfill_task_claimed_delivers_local_agent_event() {
         signature: None,
         ..wattswarm_protocol::types::AgentEnvelope::default()
     };
-    let claim_event = build_event_for_external(
+    let claim_event = build_event_for_external_with_scope(
         &claimer_identity,
         1,
         110,
+        &scope,
         crate::types::EventPayload::TaskClaimed(crate::types::ClaimPayload {
             task_id: task_id.to_owned(),
             role: crate::types::ClaimRole::Propose,
@@ -306,10 +327,11 @@ fn backfill_unrelated_task_claim_skips_local_agent_event() {
             matches!(event.payload, crate::types::EventPayload::TaskCreated(_)).then_some(event)
         })
         .expect("task created event");
-    let claim_event = build_event_for_external(
+    let claim_event = build_event_for_external_with_scope(
         &claimer_identity,
         1,
         110,
+        &scope,
         crate::types::EventPayload::TaskClaimed(crate::types::ClaimPayload {
             task_id: task_id.to_owned(),
             role: crate::types::ClaimRole::Propose,
@@ -416,10 +438,11 @@ fn backfill_completion_decision_delivers_to_local_claimer_without_target_envelop
             matches!(event.payload, crate::types::EventPayload::TaskCreated(_)).then_some(event)
         })
         .expect("task created event");
-    let local_claim_event = build_event_for_external(
+    let local_claim_event = build_event_for_external_with_scope(
         &claimer_identity,
         1,
         105,
+        &scope,
         crate::types::EventPayload::TaskClaimed(crate::types::ClaimPayload {
             task_id: task_id.to_owned(),
             role: crate::types::ClaimRole::Propose,
@@ -444,10 +467,11 @@ fn backfill_completion_decision_delivers_to_local_claimer_without_target_envelop
             500,
         )
         .expect("seed local claim projection");
-    let completion_decision_event = build_event_for_external(
+    let completion_decision_event = build_event_for_external_with_scope(
         &publisher_identity,
         1,
         120,
+        &scope,
         crate::types::EventPayload::TaskCompletionDecided(
             crate::types::TaskCompletionDecidedPayload {
                 task_id: task_id.to_owned(),
@@ -946,6 +970,7 @@ fn task_result_agent_event_supports_retry_updates() {
         protocol_version: "1".to_owned(),
         event_kind: crate::types::EventKind::TaskRetryScheduled,
         task_id: Some("task-1".to_owned()),
+        swarm_scope: "global".to_owned(),
         epoch: 7,
         author_node_id: "peer-a".to_owned(),
         created_at: 99,

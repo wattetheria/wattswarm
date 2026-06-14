@@ -328,6 +328,50 @@ fn ingest_backfill_response_rejects_scope_mismatch() {
 }
 
 #[test]
+fn ingest_backfill_response_skips_feed_subscription_wrong_lane() {
+    let mut node = Node::open_in_memory_with_roles(&[]).expect("node");
+    let remote = NodeIdentity::random();
+    let response = crate::network_p2p::BackfillResponse {
+        scope: SwarmScope::Global,
+        next_from_event_seq: 1,
+        feed_key: None,
+        head_event_ids: Vec::new(),
+        events: vec![EventEnvelope {
+            scope: SwarmScope::Global,
+            event: build_event_for_external(
+                &remote,
+                1,
+                10,
+                crate::types::EventPayload::FeedSubscriptionUpdated(
+                    crate::types::FeedSubscriptionUpdatedPayload {
+                        network_id: "default".to_owned(),
+                        subscriber_node_id: remote.node_id(),
+                        feed_key: "market.relay".to_owned(),
+                        scope_hint: "group:crew-7".to_owned(),
+                        gossip_kinds: vec!["events".to_owned()],
+                        provider_capabilities: None,
+                        agent_envelope: None,
+                        active: true,
+                    },
+                ),
+            )
+            .expect("event"),
+            content_source_node_id: None,
+        }],
+    };
+
+    let applied = ingest_backfill_response(&mut node, &response).expect("ingest response");
+
+    assert_eq!(applied, 0);
+    assert!(
+        node.store
+            .get_feed_subscription("default", &remote.node_id(), "market.relay")
+            .expect("load subscription")
+            .is_none()
+    );
+}
+
+#[test]
 fn topic_backfill_response_filters_by_feed_key() {
     let mut node = Node::open_in_memory_with_roles(&[Role::Proposer]).expect("node");
     node.emit_at(

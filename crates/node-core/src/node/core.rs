@@ -78,16 +78,59 @@ impl Node {
     }
 
     pub fn emit_at(&mut self, epoch: u64, payload: EventPayload, created_at: u64) -> Result<Event> {
-        let unsigned = UnsignedEvent::from_payload(
+        let swarm_scope = self.event_swarm_scope_hint(&payload)?.canonical();
+        let unsigned = UnsignedEvent::from_payload_with_scope(
             LOCAL_PROTOCOL_VERSION.to_owned(),
             self.node_id(),
             epoch,
             created_at,
+            swarm_scope,
             payload,
         );
         let event = self.identity.sign_unsigned_event(&unsigned)?;
         self.ingest(event.clone())?;
         Ok(event)
+    }
+
+    pub(crate) fn event_swarm_scope_hint(&self, payload: &EventPayload) -> Result<ScopeHint> {
+        match payload {
+            EventPayload::TaskCreated(contract) => Ok(task_contract_swarm_scope_hint(contract)),
+            EventPayload::FeedSubscriptionUpdated(payload) => payload.scope().ok_or_else(|| {
+                SwarmError::InvalidEvent("feed subscription scope_hint invalid".into()).into()
+            }),
+            EventPayload::TaskAnnounced(payload) => payload.scope().ok_or_else(|| {
+                SwarmError::InvalidEvent("task announcement scope_hint invalid".into()).into()
+            }),
+            EventPayload::ExecutionIntentDeclared(payload) => payload.scope().ok_or_else(|| {
+                SwarmError::InvalidEvent("execution intent scope_hint invalid".into()).into()
+            }),
+            EventPayload::ExecutionSetConfirmed(payload) => payload.scope().ok_or_else(|| {
+                SwarmError::InvalidEvent("execution set scope_hint invalid".into()).into()
+            }),
+            EventPayload::TopicMessagePosted(payload) => payload.scope().ok_or_else(|| {
+                SwarmError::InvalidEvent("topic message scope_hint invalid".into()).into()
+            }),
+            EventPayload::AgentPaymentPosted(payload) => Ok(payload.scope()),
+            EventPayload::MembershipUpdated(_)
+            | EventPayload::PolicyTuned(_)
+            | EventPayload::NetworkParamsUpdated(_)
+            | EventPayload::CheckpointCreated(_)
+            | EventPayload::AdvisoryCreated(_)
+            | EventPayload::AdvisoryApproved(_)
+            | EventPayload::AdvisoryApplied(_)
+            | EventPayload::EventRevoked(_)
+            | EventPayload::SummaryRevoked(_)
+            | EventPayload::NodePenalized(_) => Ok(ScopeHint::Global),
+            _ => {
+                let Some(task_id) = payload.task_id() else {
+                    return Err(SwarmError::InvalidEvent("event scope unavailable".into()).into());
+                };
+                let Some(task) = self.task_view(task_id)? else {
+                    return Err(SwarmError::InvalidEvent("task scope unavailable".into()).into());
+                };
+                Ok(task_contract_swarm_scope_hint(&task.contract))
+            }
+        }
     }
 
     pub fn ingest(&mut self, event: Event) -> Result<()> {

@@ -1568,6 +1568,8 @@ pub struct Event {
     pub protocol_version: String,
     pub event_kind: EventKind,
     pub task_id: Option<String>,
+    #[serde(default = "default_swarm_scope_hint")]
+    pub swarm_scope: String,
     pub epoch: u64,
     pub author_node_id: String,
     pub created_at: u64,
@@ -1580,6 +1582,7 @@ pub struct UnsignedEvent {
     pub protocol_version: String,
     pub event_kind: EventKind,
     pub task_id: Option<String>,
+    pub swarm_scope: String,
     pub epoch: u64,
     pub author_node_id: String,
     pub created_at: u64,
@@ -1594,10 +1597,30 @@ impl UnsignedEvent {
         created_at: u64,
         payload: EventPayload,
     ) -> Self {
+        let swarm_scope = static_event_payload_scope_label(&payload);
+        Self::from_payload_with_scope(
+            protocol_version,
+            author_node_id,
+            epoch,
+            created_at,
+            swarm_scope,
+            payload,
+        )
+    }
+
+    pub fn from_payload_with_scope(
+        protocol_version: String,
+        author_node_id: String,
+        epoch: u64,
+        created_at: u64,
+        swarm_scope: String,
+        payload: EventPayload,
+    ) -> Self {
         Self {
             protocol_version,
             event_kind: payload.kind(),
             task_id: payload.task_id().map(ToOwned::to_owned),
+            swarm_scope,
             epoch,
             author_node_id,
             created_at,
@@ -1766,6 +1789,10 @@ pub enum ScopeHint {
     Group(String),
 }
 
+fn default_swarm_scope_hint() -> String {
+    ScopeHint::Global.canonical()
+}
+
 impl ScopeHint {
     pub fn from_kind_id(kind: &str, id: &str) -> Option<Self> {
         let kind = kind.trim();
@@ -1825,6 +1852,90 @@ impl ScopeHint {
 
     pub fn parse_with_prefix_fallback(raw: &str) -> Option<Self> {
         Self::parse_prefix(raw).or_else(|| Self::parse(raw))
+    }
+}
+
+fn scope_hint_from_value(value: &Value) -> Option<ScopeHint> {
+    match value {
+        Value::String(raw) => ScopeHint::parse_with_prefix_fallback(raw),
+        Value::Object(obj) => {
+            let kind = obj.get("kind").and_then(Value::as_str)?;
+            let id = obj.get("id").and_then(Value::as_str).unwrap_or_default();
+            ScopeHint::from_kind_id(kind, id)
+        }
+        _ => None,
+    }
+}
+
+pub fn task_contract_swarm_scope_hint(contract: &TaskContract) -> ScopeHint {
+    contract
+        .inputs
+        .get("swarm_scope")
+        .and_then(scope_hint_from_value)
+        .or_else(|| ScopeHint::parse_with_prefix_fallback(&contract.task_type))
+        .unwrap_or(ScopeHint::Global)
+}
+
+pub fn static_event_payload_scope_hint(payload: &EventPayload) -> Option<ScopeHint> {
+    match payload {
+        EventPayload::TaskCreated(contract) => Some(task_contract_swarm_scope_hint(contract)),
+        EventPayload::FeedSubscriptionUpdated(payload) => payload.scope(),
+        EventPayload::TaskAnnounced(payload) => payload.scope(),
+        EventPayload::ExecutionIntentDeclared(payload) => payload.scope(),
+        EventPayload::ExecutionSetConfirmed(payload) => payload.scope(),
+        EventPayload::TopicMessagePosted(payload) => payload.scope(),
+        EventPayload::AgentPaymentPosted(payload) => Some(payload.scope()),
+        EventPayload::MembershipUpdated(_)
+        | EventPayload::PolicyTuned(_)
+        | EventPayload::NetworkParamsUpdated(_)
+        | EventPayload::CheckpointCreated(_)
+        | EventPayload::AdvisoryCreated(_)
+        | EventPayload::AdvisoryApproved(_)
+        | EventPayload::AdvisoryApplied(_)
+        | EventPayload::EventRevoked(_)
+        | EventPayload::SummaryRevoked(_)
+        | EventPayload::NodePenalized(_) => Some(ScopeHint::Global),
+        EventPayload::TaskClaimed(_)
+        | EventPayload::TaskClaimRenewed(_)
+        | EventPayload::TaskClaimReleased(_)
+        | EventPayload::TaskClaimDecided(_)
+        | EventPayload::TaskCompleted(_)
+        | EventPayload::TaskCompletionDecided(_)
+        | EventPayload::TaskSettled(_)
+        | EventPayload::CandidateProposed(_)
+        | EventPayload::EvidenceAdded(_)
+        | EventPayload::EvidenceAvailable(_)
+        | EventPayload::VerifierResultSubmitted(_)
+        | EventPayload::VoteCommit(_)
+        | EventPayload::VoteReveal(_)
+        | EventPayload::DecisionCommitted(_)
+        | EventPayload::DecisionFinalized(_)
+        | EventPayload::TaskError(_)
+        | EventPayload::TaskRetryScheduled(_)
+        | EventPayload::TaskExpired(_)
+        | EventPayload::EpochEnded(_)
+        | EventPayload::TaskStopped(_)
+        | EventPayload::TaskSuspended(_)
+        | EventPayload::TaskKilled(_)
+        | EventPayload::TaskFeedbackReported(_)
+        | EventPayload::ReuseRejectRecorded(_) => None,
+    }
+}
+
+pub fn static_event_payload_scope_label(payload: &EventPayload) -> String {
+    match payload {
+        EventPayload::FeedSubscriptionUpdated(payload) => {
+            normalized_scope_hint(&payload.scope_hint)
+        }
+        EventPayload::TaskAnnounced(payload) => normalized_scope_hint(&payload.scope_hint),
+        EventPayload::ExecutionIntentDeclared(payload) => {
+            normalized_scope_hint(&payload.scope_hint)
+        }
+        EventPayload::ExecutionSetConfirmed(payload) => normalized_scope_hint(&payload.scope_hint),
+        EventPayload::TopicMessagePosted(payload) => normalized_scope_hint(&payload.scope_hint),
+        _ => static_event_payload_scope_hint(payload)
+            .unwrap_or(ScopeHint::Global)
+            .canonical(),
     }
 }
 

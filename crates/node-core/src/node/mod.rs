@@ -23,11 +23,12 @@ use crate::types::{
     EpochEndReason, Event, EventPayload, EvidenceAddedPayload, EvidenceAvailablePayload,
     ExecutionIntentDeclaredPayload, ExecutionSetConfirmedPayload, ExecutionSetMember, KnowledgeHit,
     KnowledgeHitType, Membership, MembershipUpdatedPayload, NetworkControlKind,
-    NetworkParamsUpdatedPayload, Role, SeedBundle, SeedConstraints, SignatureEnvelope,
+    NetworkParamsUpdatedPayload, Role, ScopeHint, SeedBundle, SeedConstraints, SignatureEnvelope,
     TaskAnnouncedPayload, TaskClaimDecidedPayload, TaskCompletedPayload,
     TaskCompletionDecidedPayload, TaskContract, TaskErrorPayload, TaskRetryScheduledPayload,
     TaskSettledPayload, TaskTerminalState, UnsignedEvent, VerificationStatus, VerifierResult,
     VerifierResultSubmittedPayload, VoteChoice, VoteCommitPayload, VoteRevealPayload,
+    task_contract_swarm_scope_hint,
 };
 use anyhow::{Context, Result, anyhow};
 use base64::Engine;

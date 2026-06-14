@@ -872,6 +872,7 @@ fn sample_event(
         protocol_version: protocol_version.to_owned(),
         event_kind: payload.kind(),
         task_id: payload.task_id().map(ToOwned::to_owned),
+        swarm_scope: "global".to_owned(),
         epoch,
         author_node_id: author_node_id.to_owned(),
         created_at,

@@ -575,26 +575,19 @@ impl NetworkBridgeService {
                 }
                 match message {
                     GossipMessage::Event(envelope) => {
+                        if !event_matches_signed_scope(&envelope.event, &envelope.scope) {
+                            return Ok(NetworkBridgeTick::TransportNotice {
+                                detail: format!(
+                                    "gossip_event_dropped peer={propagation_source} reason=signed_scope_mismatch event={}",
+                                    envelope.event.event_id
+                                ),
+                            });
+                        }
                         self.record_peer_scope_activity(
                             propagation_source.clone(),
                             &envelope.scope,
                         );
                         let ingested_event = ingest_event_envelope(node, &envelope)?;
-                        if let crate::types::EventPayload::FeedSubscriptionUpdated(payload) =
-                            &ingested_event.payload
-                        {
-                            if let Some(scope) = self.apply_remote_feed_subscription_for_relay(
-                                &node.node_id(),
-                                payload,
-                            )? {
-                                self.record_peer_scope_activity(propagation_source.clone(), &scope);
-                                let _ = self.request_backfill_scopes_for_peer_now(
-                                    &propagation_source,
-                                    node,
-                                    &[scope],
-                                )?;
-                            }
-                        }
                         diagnostics::record_diagnostic(
                             self.state_dir.as_deref(),
                             diagnostics::DiagnosticEvent::new(
@@ -866,16 +859,8 @@ impl NetworkBridgeService {
                     );
                 }
                 for envelope in &response.events {
-                    if let crate::types::EventPayload::FeedSubscriptionUpdated(payload) =
-                        &envelope.event.payload
-                    {
-                        if let Some(scope) =
-                            self.apply_remote_feed_subscription_for_relay(&node.node_id(), payload)?
-                        {
-                            self.record_peer_scope_activity(peer.clone(), &scope);
-                            let _ =
-                                self.request_backfill_scopes_for_peer_now(&peer, node, &[scope])?;
-                        }
+                    if !event_matches_signed_scope(&envelope.event, &response.scope) {
+                        continue;
                     }
                     diagnostics::record_diagnostic(
                         self.state_dir.as_deref(),

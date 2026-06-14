@@ -107,6 +107,7 @@ fn diagnostic_event_from_payload(payload: crate::types::EventPayload) -> crate::
         protocol_version: "1".to_owned(),
         event_kind,
         task_id: payload.task_id().map(ToOwned::to_owned),
+        swarm_scope: "global".to_owned(),
         epoch: 1,
         author_node_id: "node-source".to_owned(),
         created_at: 100,

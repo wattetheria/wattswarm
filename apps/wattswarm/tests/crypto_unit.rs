@@ -4,7 +4,8 @@ use wattswarm::crypto::{
     verify_signature, vote_commit_hash,
 };
 use wattswarm::types::{
-    ArtifactRef, Candidate, EventPayload, TaskExpiredPayload, UnsignedEvent, VoteChoice,
+    ArtifactRef, Candidate, EventPayload, FeedSubscriptionUpdatedPayload, TaskExpiredPayload,
+    UnsignedEvent, VoteChoice,
 };
 
 fn sample_output_ref(candidate_id: &str, output: &serde_json::Value) -> ArtifactRef {
@@ -91,4 +92,26 @@ fn verify_event_signature_rejects_tampered_event_id() {
 
     let digest = event_digest(&unsigned).expect("digest");
     assert_eq!(digest, original);
+}
+
+#[test]
+fn verify_event_signature_rejects_tampered_swarm_scope() {
+    let id = NodeIdentity::from_seed([12_u8; 32]);
+    let payload = EventPayload::FeedSubscriptionUpdated(FeedSubscriptionUpdatedPayload {
+        network_id: "default".to_owned(),
+        subscriber_node_id: id.node_id(),
+        feed_key: "market.alpha".to_owned(),
+        scope_hint: "group:crew-7".to_owned(),
+        gossip_kinds: vec!["events".to_owned()],
+        provider_capabilities: None,
+        agent_envelope: None,
+        active: true,
+    });
+    let unsigned = UnsignedEvent::from_payload("0.1.0".to_owned(), id.node_id(), 1, 12345, payload);
+    let mut event = id.sign_unsigned_event(&unsigned).expect("signed event");
+    assert_eq!(event.swarm_scope, "group:crew-7");
+
+    event.swarm_scope = "global".to_owned();
+
+    assert!(verify_event_signature(&event).is_err());
 }

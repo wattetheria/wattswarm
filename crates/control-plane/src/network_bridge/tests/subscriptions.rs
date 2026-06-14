@@ -171,46 +171,38 @@ fn feed_subscription_updates_route_to_target_subscription_scope() {
     };
     assert_eq!(
         feed_subscription_target_scope(payload),
-        SwarmScope::Group("crew-7".to_owned())
+        Some(SwarmScope::Group("crew-7".to_owned()))
     );
 }
 
 #[test]
-fn remote_feed_subscription_adds_relay_scope_without_local_subscription() {
-    let mut service = NetworkBridgeService::new(
-        test_network_node(NetworkP2pConfig {
-            listen_addrs: vec!["127.0.0.1:0".to_owned()],
-            enable_local_discovery: false,
-            ..NetworkP2pConfig::default()
-        })
-        .expect("network node"),
-        &[SwarmScope::Global],
-        &NetworkProtocolParams::default(),
+fn feed_subscription_updates_with_invalid_target_scope_are_unroutable() {
+    let node = Node::open_in_memory_with_roles(&[]).expect("node");
+    let remote = NodeIdentity::random();
+    let event = build_event_for_external(
+        &remote,
+        1,
+        100,
+        crate::types::EventPayload::FeedSubscriptionUpdated(
+            crate::types::FeedSubscriptionUpdatedPayload {
+                network_id: "default".to_owned(),
+                subscriber_node_id: remote.node_id(),
+                feed_key: "market.invalid".to_owned(),
+                scope_hint: "bad-scope".to_owned(),
+                gossip_kinds: vec!["events".to_owned()],
+                provider_capabilities: None,
+                agent_envelope: None,
+                active: true,
+            },
+        ),
     )
-    .expect("service");
-    let local_node_id = "local-node";
-    let payload = crate::types::FeedSubscriptionUpdatedPayload {
-        network_id: "default".to_owned(),
-        subscriber_node_id: "remote-node".to_owned(),
-        feed_key: "market.relay".to_owned(),
-        scope_hint: "group:crew-7".to_owned(),
-        gossip_kinds: vec!["events".to_owned()],
-        provider_capabilities: None,
-        agent_envelope: None,
-        active: true,
-    };
+    .expect("subscription event");
 
-    let relayed_scope = service
-        .apply_remote_feed_subscription_for_relay(local_node_id, &payload)
-        .expect("apply relay subscription");
-
-    let scope = SwarmScope::Group("crew-7".to_owned());
-    assert_eq!(relayed_scope, Some(scope.clone()));
-    assert!(!service.subscribed_scopes().contains(&scope));
-    assert!(!service.backfill_scopes().contains(&scope));
-    let relay_kinds = service.relay_gossip_kinds(&scope);
-    assert!(relay_kinds.contains(&GossipKind::Events));
-    assert!(!relay_kinds.contains(&GossipKind::Messages));
+    assert!(
+        scope::event_transport_route(&node, &event)
+            .expect("route result")
+            .is_none()
+    );
 }
 
 #[test]
@@ -278,93 +270,70 @@ fn remote_feed_subscription_gossip_authorizes_peer_for_target_scope_backfill() {
 }
 
 #[test]
-fn startup_restores_remote_feed_subscription_relay_scopes() {
-    let node = Node::open_in_memory_with_roles(&[]).expect("node");
-    let local_node_id = node.node_id();
-    node.store
-        .upsert_feed_subscription(
-            "default",
-            "remote-node",
-            "task.lifecycle.crew-7",
-            "group:crew-7",
-            &["events".to_owned()],
-            true,
-            100,
+fn remote_feed_subscription_gossip_rejects_wrong_envelope_scope() {
+    let local = NodeIdentity::random();
+    let remote = NodeIdentity::random();
+    let membership = membership_with_roles(&[local.node_id(), remote.node_id()]);
+    let mut node =
+        Node::new(local, PgStore::open_in_memory().expect("store"), membership).expect("node");
+    let mut service = NetworkBridgeService::new(
+        test_network_node(NetworkP2pConfig {
+            listen_addrs: vec!["127.0.0.1:0".to_owned()],
+            enable_local_discovery: false,
+            ..NetworkP2pConfig::default()
+        })
+        .expect("network node"),
+        &[SwarmScope::Global],
+        &NetworkProtocolParams::default(),
+    )
+    .expect("service");
+    let propagation_source = random_network_node_id();
+    let target_scope = SwarmScope::Group("crew-7".to_owned());
+    let event = build_event_for_external(
+        &remote,
+        1,
+        100,
+        crate::types::EventPayload::FeedSubscriptionUpdated(
+            crate::types::FeedSubscriptionUpdatedPayload {
+                network_id: "default".to_owned(),
+                subscriber_node_id: remote.node_id(),
+                feed_key: "market.relay".to_owned(),
+                scope_hint: "group:crew-7".to_owned(),
+                gossip_kinds: vec!["events".to_owned()],
+                provider_capabilities: None,
+                agent_envelope: None,
+                active: true,
+            },
+        ),
+    )
+    .expect("subscription event");
+
+    let tick = service
+        .handle_runtime_event(
+            &mut node,
+            Ok(NetworkRuntimeEvent::Gossip {
+                propagation_source: propagation_source.clone(),
+                message: GossipMessage::Event(EventEnvelope {
+                    scope: SwarmScope::Global,
+                    event,
+                    content_source_node_id: None,
+                }),
+            }),
         )
-        .expect("remote subscription projection");
+        .expect("handle runtime event");
 
-    let mut service = NetworkBridgeService::new(
-        test_network_node(NetworkP2pConfig {
-            listen_addrs: vec!["127.0.0.1:0".to_owned()],
-            enable_local_discovery: false,
-            ..NetworkP2pConfig::default()
-        })
-        .expect("network node"),
-        &[SwarmScope::Global],
-        &NetworkProtocolParams::default(),
-    )
-    .expect("service");
-
-    let restored = service
-        .restore_remote_feed_subscriptions_for_relay(&node, &local_node_id)
-        .expect("restore remote relay subscriptions");
-
-    let scope = SwarmScope::Group("crew-7".to_owned());
-    assert_eq!(restored, vec![scope.clone()]);
-    assert!(!service.subscribed_scopes().contains(&scope));
-    assert!(!service.backfill_scopes().contains(&scope));
-    let relay_kinds = service.relay_gossip_kinds(&scope);
-    assert!(relay_kinds.contains(&GossipKind::Events));
-    assert!(!relay_kinds.contains(&GossipKind::Messages));
-}
-
-#[test]
-fn remote_feed_unsubscribe_keeps_local_scope_subscription() {
-    let scope = SwarmScope::Group("crew-7".to_owned());
-    let mut service = NetworkBridgeService::new(
-        test_network_node(NetworkP2pConfig {
-            listen_addrs: vec!["127.0.0.1:0".to_owned()],
-            enable_local_discovery: false,
-            ..NetworkP2pConfig::default()
-        })
-        .expect("network node"),
-        &[SwarmScope::Global],
-        &NetworkProtocolParams::default(),
-    )
-    .expect("service");
-    service
-        .subscribe_scope_kinds(&scope, &[GossipKind::Events])
-        .expect("local subscribe");
-    let local_node_id = "local-node";
-    let active_payload = crate::types::FeedSubscriptionUpdatedPayload {
-        network_id: "default".to_owned(),
-        subscriber_node_id: "remote-node".to_owned(),
-        feed_key: "market.relay".to_owned(),
-        scope_hint: "group:crew-7".to_owned(),
-        gossip_kinds: vec!["events".to_owned()],
-        provider_capabilities: None,
-        agent_envelope: None,
-        active: true,
-    };
-    service
-        .apply_remote_feed_subscription_for_relay(local_node_id, &active_payload)
-        .expect("apply relay subscription");
-    let inactive_payload = crate::types::FeedSubscriptionUpdatedPayload {
-        active: false,
-        ..active_payload
-    };
-
-    service
-        .apply_remote_feed_subscription_for_relay(local_node_id, &inactive_payload)
-        .expect("remove relay subscription");
-
-    assert!(service.subscribed_scopes().contains(&scope));
+    assert!(matches!(
+        tick,
+        NetworkBridgeTick::TransportNotice { detail }
+            if detail.contains("signed_scope_mismatch")
+    ));
+    assert!(!service.peer_has_scope_activity(&propagation_source, &target_scope));
     assert!(
-        service
-            .subscribed_gossip_kinds(&scope)
-            .contains(&GossipKind::Events)
+        node.store
+            .get_feed_subscription("default", &remote.node_id(), "market.relay")
+            .expect("load subscription")
+            .is_none()
     );
-    assert!(service.relay_gossip_kinds(&scope).is_empty());
 }
 
 #[test]

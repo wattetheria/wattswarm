@@ -821,6 +821,7 @@ mod tests {
             protocol_version: "1".to_owned(),
             event_kind: EventKind::CheckpointCreated,
             task_id: Some("task-1".to_owned()),
+            swarm_scope: "global".to_owned(),
             epoch: 0,
             author_node_id: "node-1".to_owned(),
             created_at: 1,

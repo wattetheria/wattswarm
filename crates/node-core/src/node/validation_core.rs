@@ -38,6 +38,7 @@ impl Node {
         if event.payload.task_id().map(ToOwned::to_owned) != event.task_id {
             return Err(SwarmError::InvalidEvent("task_id mismatch".into()).into());
         }
+        self.validate_signed_swarm_scope(event)?;
         if self
             .store
             .is_node_network_banned_at(&event.author_node_id, event.created_at)?
@@ -182,6 +183,17 @@ impl Node {
             EventPayload::SummaryRevoked(payload) => self.validate_summary_revoked(payload),
             EventPayload::NodePenalized(payload) => self.validate_node_penalized(event, payload),
         }
+    }
+
+    fn validate_signed_swarm_scope(&self, event: &Event) -> Result<()> {
+        let Some(actual) = ScopeHint::parse_with_prefix_fallback(&event.swarm_scope) else {
+            return Err(SwarmError::InvalidEvent("event swarm_scope invalid".into()).into());
+        };
+        let expected = self.event_swarm_scope_hint(&event.payload)?;
+        if actual != expected {
+            return Err(SwarmError::InvalidEvent("event swarm_scope mismatch".into()).into());
+        }
+        Ok(())
     }
 
     pub(crate) fn validate_role_permission(&self, event: &Event) -> Result<()> {
@@ -352,7 +364,7 @@ impl Node {
         if payload.gossip_kinds.iter().any(|kind| {
             !matches!(
                 kind.as_str(),
-                "events" | "messages" | "rules" | "checkpoints" | "summaries" | "discovery"
+                "events" | "messages" | "rules" | "checkpoints" | "summaries"
             )
         }) {
             return Err(
