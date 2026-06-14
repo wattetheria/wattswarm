@@ -61,10 +61,12 @@ pub fn publish_pending_scoped_updates(
             last_published_seq = seq;
             continue;
         }
-        let scope = super::event_scope(node, &event)?;
-        if scope == SwarmScope::Global
-            && !super::allows_public_control_dissemination(&event.payload)
-        {
+        let Some(route) = super::event_transport_route(node, &event)? else {
+            last_published_seq = seq;
+            continue;
+        };
+        let scope = route.scope.clone();
+        if scope == SwarmScope::Global && !route.public_global_control {
             last_published_seq = seq;
             continue;
         }
@@ -110,6 +112,7 @@ pub fn publish_pending_scoped_updates(
             Ok(()) => {
                 let mut details = event_diagnostic_details(&event);
                 details.insert("seq".to_owned(), json!(seq));
+                details.insert("route_address".to_owned(), json!(route.address));
                 diagnostics::record_diagnostic(
                     service.state_dir.as_deref(),
                     diagnostics::DiagnosticEvent::new(

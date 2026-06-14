@@ -4,6 +4,7 @@ pub const INDEX_HTML: &str = r#"<!DOCTYPE html>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
   <title>Wattswarm Network Diagnostics</title>
+  <link rel="icon" type="image/png" sizes="64x64" href="/favicon.png">
   <style>
     :root {
       --bg: #f4f6f8;

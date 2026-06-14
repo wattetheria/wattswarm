@@ -65,9 +65,9 @@ fn group_scoped_live_sync_only_reaches_matching_group_scope() {
 }
 
 #[test]
-fn remote_subscription_turns_middle_peer_into_group_relay() {
+fn group_subscribed_middle_peer_relays_group_events() {
     let _guard = network_bridge_local_test_guard();
-    support::network_bridge::remote_subscription_turns_middle_peer_into_group_relay();
+    support::network_bridge::group_subscribed_middle_peer_relays_group_events();
 }
 
 #[test]

@@ -98,6 +98,29 @@ pub(super) fn feed_subscription_target_scope(
     scope_from_optional_hint(payload.scope())
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct EventTransportRoute {
+    pub(super) scope: SwarmScope,
+    pub(super) address: String,
+    pub(super) public_global_control: bool,
+}
+
+impl EventTransportRoute {
+    fn new(
+        scope: SwarmScope,
+        event_kind: crate::types::EventKind,
+        public_global_control: bool,
+    ) -> Result<Self> {
+        let event_kind_label = format!("{event_kind:?}");
+        let address = format!("ws.{}.{}", scope.label()?, event_kind_label);
+        Ok(Self {
+            scope,
+            address,
+            public_global_control,
+        })
+    }
+}
+
 pub(super) fn node_has_active_subscription_scope_kinds(
     node: &Node,
     node_id: &str,
@@ -146,25 +169,65 @@ pub(super) fn contract_scope(contract: &crate::types::TaskContract) -> SwarmScop
     parse_scope_hint_string(&contract.task_type).unwrap_or(SwarmScope::Global)
 }
 
-pub(super) fn event_scope(node: &Node, event: &crate::types::Event) -> Result<SwarmScope> {
+fn task_event_contract_scope(
+    node: &Node,
+    event: &crate::types::Event,
+) -> Result<Option<SwarmScope>> {
+    let Some(task_id) = event.payload.task_id().or(event.task_id.as_deref()) else {
+        return Ok(None);
+    };
+    let Some(task) = node.task_view(task_id)? else {
+        return Ok(None);
+    };
+    Ok(Some(contract_scope(&task.contract)))
+}
+
+fn route_for_scope(
+    scope: SwarmScope,
+    event_kind: crate::types::EventKind,
+    public_global_control: bool,
+) -> Result<Option<EventTransportRoute>> {
+    Ok(Some(EventTransportRoute::new(
+        scope,
+        event_kind,
+        public_global_control,
+    )?))
+}
+
+pub(super) fn event_transport_route(
+    node: &Node,
+    event: &crate::types::Event,
+) -> Result<Option<EventTransportRoute>> {
+    let event_kind = event.payload.kind();
+    // Keep every EventPayload variant classified here. The bridge may publish
+    // true public control events on Global; scoped feed/topic/execution events
+    // use their scope hint; payments use the remote node; task lifecycle events
+    // inherit the task contract scope. Missing task context is unroutable rather
+    // than falling back to Global.
     match &event.payload {
-        crate::types::EventPayload::TaskCreated(contract) => Ok(contract_scope(contract)),
-        crate::types::EventPayload::FeedSubscriptionUpdated(_) => Ok(SwarmScope::Global),
+        crate::types::EventPayload::TaskCreated(contract) => {
+            route_for_scope(contract_scope(contract), event_kind, false)
+        }
+        crate::types::EventPayload::FeedSubscriptionUpdated(payload) => {
+            route_for_scope(feed_subscription_target_scope(payload), event_kind, false)
+        }
         crate::types::EventPayload::TaskAnnounced(payload) => {
-            Ok(scope_from_optional_hint(payload.scope()))
+            route_for_scope(scope_from_optional_hint(payload.scope()), event_kind, false)
         }
         crate::types::EventPayload::ExecutionIntentDeclared(payload) => {
-            Ok(scope_from_optional_hint(payload.scope()))
+            route_for_scope(scope_from_optional_hint(payload.scope()), event_kind, false)
         }
         crate::types::EventPayload::ExecutionSetConfirmed(payload) => {
-            Ok(scope_from_optional_hint(payload.scope()))
+            route_for_scope(scope_from_optional_hint(payload.scope()), event_kind, false)
         }
         crate::types::EventPayload::TopicMessagePosted(payload) => {
-            Ok(scope_from_optional_hint(payload.scope()))
+            route_for_scope(scope_from_optional_hint(payload.scope()), event_kind, false)
         }
-        crate::types::EventPayload::AgentPaymentPosted(payload) => {
-            Ok(SwarmScope::Node(payload.remote_node_id.clone()))
-        }
+        crate::types::EventPayload::AgentPaymentPosted(payload) => route_for_scope(
+            SwarmScope::Node(payload.remote_node_id.clone()),
+            event_kind,
+            false,
+        ),
         crate::types::EventPayload::MembershipUpdated(_)
         | crate::types::EventPayload::PolicyTuned(_)
         | crate::types::EventPayload::NetworkParamsUpdated(_)
@@ -174,14 +237,44 @@ pub(super) fn event_scope(node: &Node, event: &crate::types::Event) -> Result<Sw
         | crate::types::EventPayload::AdvisoryApplied(_)
         | crate::types::EventPayload::EventRevoked(_)
         | crate::types::EventPayload::SummaryRevoked(_)
-        | crate::types::EventPayload::NodePenalized(_) => Ok(SwarmScope::Global),
-        _ => {
-            if let Some(task_id) = event.task_id.as_deref()
-                && let Some(task) = node.task_view(task_id)?
-            {
-                return Ok(contract_scope(&task.contract));
-            }
-            Ok(SwarmScope::Global)
+        | crate::types::EventPayload::NodePenalized(_) => {
+            route_for_scope(SwarmScope::Global, event_kind, true)
+        }
+        crate::types::EventPayload::TaskClaimed(_)
+        | crate::types::EventPayload::TaskClaimRenewed(_)
+        | crate::types::EventPayload::TaskClaimReleased(_)
+        | crate::types::EventPayload::TaskClaimDecided(_)
+        | crate::types::EventPayload::TaskCompleted(_)
+        | crate::types::EventPayload::TaskCompletionDecided(_)
+        | crate::types::EventPayload::TaskSettled(_)
+        | crate::types::EventPayload::CandidateProposed(_)
+        | crate::types::EventPayload::EvidenceAdded(_)
+        | crate::types::EventPayload::EvidenceAvailable(_)
+        | crate::types::EventPayload::VerifierResultSubmitted(_)
+        | crate::types::EventPayload::VoteCommit(_)
+        | crate::types::EventPayload::VoteReveal(_)
+        | crate::types::EventPayload::DecisionCommitted(_)
+        | crate::types::EventPayload::DecisionFinalized(_)
+        | crate::types::EventPayload::TaskError(_)
+        | crate::types::EventPayload::TaskRetryScheduled(_)
+        | crate::types::EventPayload::TaskExpired(_)
+        | crate::types::EventPayload::EpochEnded(_)
+        | crate::types::EventPayload::TaskStopped(_)
+        | crate::types::EventPayload::TaskSuspended(_)
+        | crate::types::EventPayload::TaskKilled(_)
+        | crate::types::EventPayload::TaskFeedbackReported(_)
+        | crate::types::EventPayload::ReuseRejectRecorded(_) => {
+            let Some(scope) = task_event_contract_scope(node, event)? else {
+                return Ok(None);
+            };
+            route_for_scope(scope, event_kind, false)
         }
     }
+}
+
+#[cfg(test)]
+pub(super) fn event_scope(node: &Node, event: &crate::types::Event) -> Result<SwarmScope> {
+    event_transport_route(node, event)?
+        .map(|route| route.scope)
+        .ok_or_else(|| anyhow!("event has no transport route: {}", event.event_id))
 }

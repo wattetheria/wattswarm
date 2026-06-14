@@ -129,7 +129,7 @@ fn publish_pending_updates_subscribes_runtime_for_local_feed_subscription() {
 }
 
 #[test]
-fn feed_subscription_updates_publish_on_global_control_scope() {
+fn feed_subscription_updates_route_to_target_subscription_scope() {
     let mut node = Node::open_in_memory_with_roles(&[]).expect("node");
     let local_node_id = node.node_id();
     node.emit_at(
@@ -157,9 +157,14 @@ fn feed_subscription_updates_publish_on_global_control_scope() {
         .next()
         .expect("event");
 
+    let route = scope::event_transport_route(&node, &event)
+        .expect("event route")
+        .expect("subscription update route");
+    assert_eq!(route.scope, SwarmScope::Group("crew-7".to_owned()));
+    assert_eq!(route.address, "ws.group.crew-7.FeedSubscriptionUpdated");
     assert_eq!(
-        event_scope(&node, &event).expect("event scope"),
-        SwarmScope::Global
+        scope::event_scope(&node, &event).expect("event scope"),
+        SwarmScope::Group("crew-7".to_owned())
     );
     let crate::types::EventPayload::FeedSubscriptionUpdated(payload) = &event.payload else {
         panic!("expected subscription update");
@@ -253,7 +258,7 @@ fn remote_feed_subscription_gossip_authorizes_peer_for_target_scope_backfill() {
             Ok(NetworkRuntimeEvent::Gossip {
                 propagation_source: propagation_source.clone(),
                 message: GossipMessage::Event(EventEnvelope {
-                    scope: SwarmScope::Global,
+                    scope: target_scope.clone(),
                     event,
                     content_source_node_id: None,
                 }),

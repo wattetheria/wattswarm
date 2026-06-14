@@ -234,6 +234,71 @@ fn backfill_response_repairs_missed_global_control_event() {
 }
 
 #[test]
+fn backfill_response_scopes_feed_subscription_updates_to_target_scope() {
+    let local = NodeIdentity::random();
+    let local_node_id = local.node_id();
+    let membership = membership_with_roles(std::slice::from_ref(&local_node_id));
+    let mut node =
+        Node::new(local, PgStore::open_in_memory().expect("store"), membership).expect("node");
+    node.emit_at(
+        1,
+        crate::types::EventPayload::FeedSubscriptionUpdated(
+            crate::types::FeedSubscriptionUpdatedPayload {
+                network_id: "default".to_owned(),
+                subscriber_node_id: local_node_id,
+                feed_key: "watt.gossip.dm".to_owned(),
+                scope_hint: "group:dm-crew-7".to_owned(),
+                gossip_kinds: vec!["events".to_owned()],
+                provider_capabilities: None,
+                agent_envelope: None,
+                active: true,
+            },
+        ),
+        100,
+    )
+    .expect("emit subscription update");
+
+    let global_response = backfill_response_for_request(
+        &node,
+        "peer-local",
+        &BackfillRequest {
+            scope: SwarmScope::Global,
+            from_event_seq: 0,
+            limit: 8,
+            feed_key: None,
+            known_event_ids: Vec::new(),
+        },
+        32,
+        64,
+    )
+    .expect("global backfill response");
+    assert!(global_response.events.is_empty());
+
+    let target_scope = SwarmScope::Group("dm-crew-7".to_owned());
+    let scoped_response = backfill_response_for_request(
+        &node,
+        "peer-local",
+        &BackfillRequest {
+            scope: target_scope.clone(),
+            from_event_seq: 0,
+            limit: 8,
+            feed_key: None,
+            known_event_ids: Vec::new(),
+        },
+        32,
+        64,
+    )
+    .expect("scoped backfill response");
+
+    assert_eq!(scoped_response.events.len(), 1);
+    assert_eq!(scoped_response.events[0].scope, target_scope);
+    assert!(matches!(
+        scoped_response.events[0].event.payload,
+        crate::types::EventPayload::FeedSubscriptionUpdated(_)
+    ));
+}
+
+#[test]
 fn ingest_backfill_response_rejects_scope_mismatch() {
     let mut node = Node::open_in_memory_with_roles(&[Role::Proposer]).expect("node");
     let response = crate::network_p2p::BackfillResponse {

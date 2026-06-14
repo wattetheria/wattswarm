@@ -84,8 +84,8 @@ use agent_delivery::{
     task_result_agent_event, task_settled_agent_event, topic_message_agent_event,
 };
 use backfill::{
-    BACKFILL_KNOWN_EVENT_IDS_LIMIT, allows_public_control_dissemination,
-    recent_backfill_lane_event_ids, should_publish_summaries, should_sync_event,
+    BACKFILL_KNOWN_EVENT_IDS_LIMIT, recent_backfill_lane_event_ids, should_publish_summaries,
+    should_sync_event,
 };
 use bootstrap_contact::{
     build_contact_material, candidate_peer_addrs, iroh_contact_network_peer_id,
@@ -117,8 +117,8 @@ use peer_interactions::{
 };
 use publish::GlobalPublishRateGuard;
 use scope::{
-    dynamic_subscription_scope_kinds_for_node, event_scope, feed_subscription_target_scope,
-    merge_scopes, node_has_active_subscription_scope_kinds,
+    dynamic_subscription_scope_kinds_for_node, event_transport_route,
+    feed_subscription_target_scope, merge_scopes, node_has_active_subscription_scope_kinds,
     remote_feed_subscription_payloads_for_relay,
 };
 #[cfg(test)]

@@ -689,6 +689,15 @@ fn ui_root_page_serves_startup_view_and_diagnostics_route_redirects_legacy_conso
             .await
             .unwrap();
         assert_eq!(diagnostics_res.status(), StatusCode::OK);
+        let diagnostics_body = to_bytes(diagnostics_res.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let diagnostics_html = String::from_utf8_lossy(&diagnostics_body);
+        assert!(
+            diagnostics_html.contains(
+                r#"<link rel="icon" type="image/png" sizes="64x64" href="/favicon.png">"#
+            )
+        );
 
         let legacy_res = app
             .oneshot(

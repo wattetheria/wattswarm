@@ -203,7 +203,7 @@ pub fn group_scoped_live_sync_only_reaches_matching_group_scope() {
     );
 }
 
-pub fn remote_subscription_turns_middle_peer_into_group_relay() {
+pub fn group_subscribed_middle_peer_relays_group_events() {
     let identity_a = NodeIdentity::random();
     let identity_b = NodeIdentity::random();
     let identity_c = NodeIdentity::random();
@@ -223,35 +223,12 @@ pub fn remote_subscription_turns_middle_peer_into_group_relay() {
     connect_services(&mut service_a, &mut node_a, &mut service_c, &mut node_c);
     connect_services(&mut service_b, &mut node_b, &mut service_c, &mut node_c);
 
-    node_a
-        .emit_at(
-            1,
-            EventPayload::FeedSubscriptionUpdated(FeedSubscriptionUpdatedPayload {
-                network_id: "default".to_owned(),
-                subscriber_node_id: node_a.node_id(),
-                feed_key: "market.crew-7".to_owned(),
-                scope_hint: "group:crew-7".to_owned(),
-                gossip_kinds: vec!["events".to_owned()],
-                provider_capabilities: None,
-                agent_envelope: None,
-                active: true,
-            }),
-            100,
-        )
-        .expect("node a subscription");
-
-    let mut last_a = 0;
-    for iteration in 0..4_096 {
-        last_a = publish_pending_scoped_updates(&mut service_a, &node_a, &node_a.node_id(), last_a)
-            .expect("publish node a subscription");
-        let _ = pump_once(&mut service_a, &mut node_a);
-        let _ = pump_once(&mut service_b, &mut node_b);
-        let _ = pump_once(&mut service_c, &mut node_c);
-        if last_a > 0 && iteration > 512 {
-            break;
-        }
-        std::thread::yield_now();
-    }
+    service_a
+        .subscribe_scope_kinds(&group_scope, &[GossipKind::Events])
+        .expect("node a joins group events");
+    service_c
+        .subscribe_scope_kinds(&group_scope, &[GossipKind::Events])
+        .expect("node c relays group events");
 
     service_b
         .subscribe_scope_kinds(&group_scope, &[GossipKind::Events])
@@ -287,7 +264,7 @@ pub fn remote_subscription_turns_middle_peer_into_group_relay() {
 
     assert!(
         relayed_to_a,
-        "A and B are not directly connected, so the group event must relay through C"
+        "A and B are not directly connected, so the group event must relay through group-subscribed C"
     );
 }
 
