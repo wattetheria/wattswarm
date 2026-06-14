@@ -1,4 +1,5 @@
 use crate::node::Node;
+use crate::round_policy::RoundPolicy;
 use crate::storage::storage::TopicMessageRow;
 use anyhow::Result;
 use serde_json::{Value, json};
@@ -15,14 +16,10 @@ struct StructuredProposal {
     source_message_id: String,
     coordinator_node_id: String,
     participants: Vec<String>,
-    min_participants: usize,
-    threshold_percent: u32,
     result_feed_key: String,
     goal: Option<String>,
     round_index: u32,
-    max_rounds: u32,
-    round_timeout_ms: u64,
-    fallback_decision: Option<String>,
+    round_policy: RoundPolicy,
     created_at: u64,
 }
 
@@ -148,8 +145,6 @@ fn parse_structured_proposal(message: &TopicMessageRow) -> Option<StructuredProp
         source_message_id: message.message_id.clone(),
         coordinator_node_id,
         participants,
-        min_participants,
-        threshold_percent,
         result_feed_key,
         goal: obj
             .get("goal")
@@ -158,9 +153,14 @@ fn parse_structured_proposal(message: &TopicMessageRow) -> Option<StructuredProp
             .filter(|value| !value.is_empty())
             .map(ToOwned::to_owned),
         round_index,
-        max_rounds,
-        round_timeout_ms,
-        fallback_decision,
+        round_policy: RoundPolicy {
+            min_participants,
+            threshold_percent,
+            round_timeout_ms,
+            max_rounds,
+            fallback_decision,
+        }
+        .normalized(),
         created_at: message.created_at,
     })
 }
@@ -304,12 +304,7 @@ fn list_all_topic_messages(
 }
 
 fn threshold_count(total: usize, threshold_percent: u32) -> usize {
-    if total == 0 {
-        return 0;
-    }
-    let total = total as u64;
-    let threshold = threshold_percent.clamp(1, 100) as u64;
-    total.saturating_mul(threshold).div_ceil(100) as usize
+    crate::round_policy::threshold_count(total, threshold_percent)
 }
 
 fn proposal_round_exists(
@@ -328,9 +323,12 @@ fn resolve_required_participant_count(
     observed_stances: usize,
 ) -> usize {
     if proposal.participants.is_empty() {
-        proposal.min_participants.max(observed_stances)
+        proposal.round_policy.min_participants.max(observed_stances)
     } else {
-        proposal.min_participants.max(effective_participants.len())
+        proposal
+            .round_policy
+            .min_participants
+            .max(effective_participants.len())
     }
 }
 
@@ -339,7 +337,7 @@ fn fallback_decision(
     support_count: usize,
     reject_count: usize,
 ) -> String {
-    if let Some(value) = &proposal.fallback_decision {
+    if let Some(value) = &proposal.round_policy.fallback_decision {
         return value.clone();
     }
     match support_count.cmp(&reject_count) {
@@ -407,10 +405,10 @@ fn publish_consensus_result_message(
             "abstain_count": abstain_count,
             "required_count": required_count,
             "observed_participant_count": observed_participant_count,
-            "min_participants": proposal.min_participants,
-            "threshold_percent": proposal.threshold_percent,
+            "min_participants": proposal.round_policy.min_participants,
+            "threshold_percent": proposal.round_policy.threshold_percent,
             "round_index": proposal.round_index,
-            "max_rounds": proposal.max_rounds,
+            "max_rounds": proposal.round_policy.max_rounds,
             "fallback_applied": fallback_applied,
             "close_reason": close_reason,
             "participants": effective_participants,
@@ -456,14 +454,14 @@ fn maybe_publish_next_round_proposal(
             } else {
                 json!(proposal.participants)
             },
-            "min_participants": proposal.min_participants,
-            "threshold_percent": proposal.threshold_percent,
+            "min_participants": proposal.round_policy.min_participants,
+            "threshold_percent": proposal.round_policy.threshold_percent,
             "result_feed_key": proposal.result_feed_key.clone(),
             "coordinator_node_id": node.node_id(),
             "round_index": next_round_index,
-            "max_rounds": proposal.max_rounds,
-            "round_timeout_ms": proposal.round_timeout_ms,
-            "fallback_decision": proposal.fallback_decision.clone(),
+            "max_rounds": proposal.round_policy.max_rounds,
+            "round_timeout_ms": proposal.round_policy.round_timeout_ms,
+            "fallback_decision": proposal.round_policy.fallback_decision.clone(),
             "previous_round_proposal_message_id": proposal.source_message_id.clone(),
         }),
         Some(proposal.source_message_id.clone()),
@@ -539,7 +537,8 @@ pub fn process_structured_topic_consensus_for_topic(
 
         let total_participants =
             resolve_required_participant_count(&proposal, &effective_participants, stances.len());
-        let required_count = threshold_count(total_participants, proposal.threshold_percent);
+        let required_count =
+            threshold_count(total_participants, proposal.round_policy.threshold_percent);
         if required_count == 0 {
             continue;
         }
@@ -592,16 +591,16 @@ pub fn process_structured_topic_consensus_for_topic(
             continue;
         }
 
-        if proposal.round_timeout_ms == 0
+        if proposal.round_policy.round_timeout_ms == 0
             || observed_at
                 < proposal
                     .created_at
-                    .saturating_add(proposal.round_timeout_ms)
+                    .saturating_add(proposal.round_policy.round_timeout_ms)
         {
             continue;
         }
 
-        if proposal.round_index < proposal.max_rounds {
+        if proposal.round_index < proposal.round_policy.max_rounds {
             if maybe_publish_next_round_proposal(
                 node,
                 state_dir,
@@ -683,14 +682,16 @@ mod tests {
                 .iter()
                 .map(|value| (*value).to_owned())
                 .collect(),
-            min_participants: participants.len().max(1),
-            threshold_percent: 60,
             result_feed_key: "feed.result".to_owned(),
             goal: Some("decide".to_owned()),
             round_index: 1,
-            max_rounds: 1,
-            round_timeout_ms: 0,
-            fallback_decision: None,
+            round_policy: RoundPolicy {
+                min_participants: participants.len().max(1),
+                threshold_percent: 60,
+                round_timeout_ms: 0,
+                max_rounds: 1,
+                fallback_decision: None,
+            },
             created_at: 10,
         }
     }
@@ -719,7 +720,7 @@ mod tests {
     #[test]
     fn resolve_required_participant_count_prefers_min_participants() {
         let mut proposal = proposal_with_participants(&["node-a", "node-b"]);
-        proposal.min_participants = 3;
+        proposal.round_policy.min_participants = 3;
         let count = resolve_required_participant_count(&proposal, &["node-b".to_owned()], 1);
         assert_eq!(count, 3);
     }

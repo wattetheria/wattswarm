@@ -14,6 +14,7 @@ pub mod a2a;
 mod ap2;
 pub mod egress_agent;
 pub(crate) mod http;
+pub(crate) mod network_hooks;
 pub mod run_control;
 pub mod startup_config;
 pub mod wattetheria_sync;

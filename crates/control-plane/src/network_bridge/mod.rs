@@ -667,6 +667,9 @@ pub fn ingest_event_envelope(
 ///   (executor side: this node should pick up and execute the task)
 /// - `CandidateProposed` for `run-*` tasks → `pending_run_queue_results.jsonl`
 ///   (coordinator side: write remote result back to run_steps)
+/// - `TaskClaimed`, `TaskCompleted`, and `CandidateProposed` for any task ID →
+///   `pending_stigmergy_contributions.jsonl` (open stigmergy runs are matched
+///   later by `runs.market_task_id`, not by a task ID prefix)
 pub fn log_run_queue_events_if_applicable(
     node: &Node,
     state_dir: &Path,
@@ -713,10 +716,46 @@ pub fn log_run_queue_events_if_applicable(
             });
             append_jsonl(state_dir, "pending_bridge_tasks.jsonl", &entry);
         }
+        crate::types::EventPayload::TaskClaimed(payload) => {
+            let agent_id = payload
+                .agent_envelope
+                .as_ref()
+                .and_then(|envelope| envelope.source_agent_id.as_deref())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .unwrap_or(&payload.claimer_node_id);
+            let entry = serde_json::json!({
+                "kind": "claim",
+                "task_id": payload.task_id,
+                "agent_id": agent_id,
+                "author_node_id": event.author_node_id,
+                "claimer_node_id": payload.claimer_node_id,
+                "execution_id": payload.execution_id,
+                "received_at": chrono::Utc::now().timestamp_millis(),
+            });
+            append_jsonl(state_dir, "pending_stigmergy_contributions.jsonl", &entry);
+        }
+        crate::types::EventPayload::TaskCompleted(payload) => {
+            let agent_id = payload
+                .agent_envelope
+                .as_ref()
+                .and_then(|envelope| envelope.source_agent_id.as_deref())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .unwrap_or(&payload.completed_by_node_id);
+            let entry = serde_json::json!({
+                "kind": "completion",
+                "task_id": payload.task_id,
+                "agent_id": agent_id,
+                "author_node_id": event.author_node_id,
+                "completed_by_node_id": payload.completed_by_node_id,
+                "execution_id": payload.execution_id,
+                "output": payload.output,
+                "received_at": chrono::Utc::now().timestamp_millis(),
+            });
+            append_jsonl(state_dir, "pending_stigmergy_contributions.jsonl", &entry);
+        }
         crate::types::EventPayload::CandidateProposed(payload) => {
-            if !payload.task_id.starts_with("run-") {
-                return;
-            }
             let candidate_output = node
                 .store
                 .get_candidate_by_id(&payload.task_id, &payload.candidate.candidate_id)
@@ -724,6 +763,31 @@ pub fn log_run_queue_events_if_applicable(
                 .flatten()
                 .map(|candidate| candidate.output)
                 .unwrap_or(Value::Null);
+            let agent_id = payload
+                .agent_envelope
+                .as_ref()
+                .and_then(|envelope| envelope.source_agent_id.as_deref())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .unwrap_or(&event.author_node_id);
+            let stigmergy_entry = serde_json::json!({
+                "kind": "candidate",
+                "task_id": payload.task_id,
+                "agent_id": agent_id,
+                "candidate_id": payload.candidate.candidate_id,
+                "candidate_output": candidate_output.clone(),
+                "author_node_id": event.author_node_id,
+                "execution_id": payload.candidate.execution_id,
+                "received_at": chrono::Utc::now().timestamp_millis(),
+            });
+            append_jsonl(
+                state_dir,
+                "pending_stigmergy_contributions.jsonl",
+                &stigmergy_entry,
+            );
+            if !payload.task_id.starts_with("run-") {
+                return;
+            }
             let entry = serde_json::json!({
                 "task_id": payload.task_id,
                 "candidate_id": payload.candidate.candidate_id,

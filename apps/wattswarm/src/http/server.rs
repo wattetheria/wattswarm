@@ -39,10 +39,7 @@ pub fn run(state_dir: PathBuf, db_path: PathBuf, listen: String) -> Result<()> {
         state_dir.clone(),
         db_path.clone(),
         Some(Box::new(|node, sd| {
-            let _ = crate::run_queue::network_bridge::process_pending_bridge_tasks(node, sd);
-            let _ = crate::run_queue::network_bridge::process_pending_run_queue_results(sd);
-            let _ = crate::control::topic_interpretation::process_topic_interpretation(node, sd);
-            let _ = crate::control::topic_consensus::process_structured_topic_consensus(node, sd);
+            crate::network_hooks::run_background_post_tick(node, sd);
         })),
     )?;
     if network_started {

@@ -22,6 +22,12 @@ CREATE TABLE IF NOT EXISTS runs (
   shared_inputs_json TEXT NOT NULL,
   retry_policy_json TEXT NOT NULL,
   aggregation_policy_json TEXT NOT NULL,
+  market_task_id TEXT,
+  feed_key TEXT,
+  scope_hint TEXT,
+  round_due_at_ms BIGINT,
+  round_policy_json TEXT,
+  round_state_json TEXT,
   result_json TEXT,
   error_text TEXT,
   created_at TIMESTAMPTZ NOT NULL,
@@ -93,6 +99,42 @@ BEGIN
   ) THEN
     ALTER TABLE run_events ADD COLUMN org_id TEXT NOT NULL DEFAULT '__unset_org__';
   END IF;
+  IF NOT EXISTS (
+    SELECT 1 FROM information_schema.columns
+    WHERE table_schema = current_schema() AND table_name = 'runs' AND column_name = 'market_task_id'
+  ) THEN
+    ALTER TABLE runs ADD COLUMN market_task_id TEXT;
+  END IF;
+  IF NOT EXISTS (
+    SELECT 1 FROM information_schema.columns
+    WHERE table_schema = current_schema() AND table_name = 'runs' AND column_name = 'feed_key'
+  ) THEN
+    ALTER TABLE runs ADD COLUMN feed_key TEXT;
+  END IF;
+  IF NOT EXISTS (
+    SELECT 1 FROM information_schema.columns
+    WHERE table_schema = current_schema() AND table_name = 'runs' AND column_name = 'scope_hint'
+  ) THEN
+    ALTER TABLE runs ADD COLUMN scope_hint TEXT;
+  END IF;
+  IF NOT EXISTS (
+    SELECT 1 FROM information_schema.columns
+    WHERE table_schema = current_schema() AND table_name = 'runs' AND column_name = 'round_due_at_ms'
+  ) THEN
+    ALTER TABLE runs ADD COLUMN round_due_at_ms BIGINT;
+  END IF;
+  IF NOT EXISTS (
+    SELECT 1 FROM information_schema.columns
+    WHERE table_schema = current_schema() AND table_name = 'runs' AND column_name = 'round_policy_json'
+  ) THEN
+    ALTER TABLE runs ADD COLUMN round_policy_json TEXT;
+  END IF;
+  IF NOT EXISTS (
+    SELECT 1 FROM information_schema.columns
+    WHERE table_schema = current_schema() AND table_name = 'runs' AND column_name = 'round_state_json'
+  ) THEN
+    ALTER TABLE runs ADD COLUMN round_state_json TEXT;
+  END IF;
 END $$;
 "#,
         )?;
@@ -123,6 +165,12 @@ CREATE INDEX IF NOT EXISTS idx_run_steps_sched ON run_steps(org_id, status, next
 CREATE INDEX IF NOT EXISTS idx_run_steps_run_status ON run_steps(org_id, run_id, status);
 CREATE INDEX IF NOT EXISTS idx_run_steps_lease_until ON run_steps(org_id, lease_until);
 CREATE INDEX IF NOT EXISTS idx_run_events_run_id ON run_events(org_id, run_id, id DESC);
+CREATE INDEX IF NOT EXISTS idx_runs_stigmergy_market_task
+  ON runs(org_id, market_task_id)
+  WHERE round_policy_json IS NOT NULL AND status NOT IN ('FINALIZED', 'FAILED', 'CANCELLED');
+CREATE INDEX IF NOT EXISTS idx_runs_stigmergy_round_due
+  ON runs(org_id, round_due_at_ms)
+  WHERE round_policy_json IS NOT NULL AND status NOT IN ('FINALIZED', 'FAILED', 'CANCELLED');
 "#,
         )?;
         client.batch_execute(

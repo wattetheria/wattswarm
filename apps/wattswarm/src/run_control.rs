@@ -181,10 +181,7 @@ pub fn run_worker(
         state_dir.to_path_buf(),
         db_path.to_path_buf(),
         Some(Box::new(|node, sd| {
-            let _ = crate::run_queue::network_bridge::process_pending_bridge_tasks(node, sd);
-            let _ = crate::run_queue::network_bridge::process_pending_run_queue_results(sd);
-            let _ = crate::control::topic_interpretation::process_topic_interpretation(node, sd);
-            let _ = crate::control::topic_consensus::process_structured_topic_consensus(node, sd);
+            crate::network_hooks::run_background_post_tick(node, sd);
         })),
     );
     current_org_queue(state_dir, db_path, pg_url)?.run_worker(opts, state_dir, db_path)

@@ -1,5 +1,6 @@
 use anyhow::{Context, Result, anyhow};
 use serde_json::{Value, json};
+use wattswarm_control_plane::round_policy::RoundState;
 
 use super::queue::PgRunQueue;
 use super::status::{
@@ -33,6 +34,69 @@ impl PgRunQueue {
         let retry_json = serde_json::to_string(&spec.retry)?;
         let agg_json = serde_json::to_string(&spec.aggregation)?;
         let shared_inputs_json = serde_json::to_string(&spec.shared_inputs)?;
+        if let Some(round_policy) = spec.round_policy.clone() {
+            let round_policy_json = serde_json::to_string(&round_policy.normalized())?;
+            let round_state_json = serde_json::to_string(&RoundState::initial())?;
+            let market_task_id = spec
+                .market_task_id
+                .as_deref()
+                .map(str::trim)
+                .unwrap_or_default()
+                .to_owned();
+            let feed_key = spec
+                .feed_key
+                .as_deref()
+                .map(str::trim)
+                .unwrap_or_default()
+                .to_owned();
+            let scope_hint = spec
+                .scope_hint
+                .as_deref()
+                .map(str::trim)
+                .unwrap_or_default()
+                .to_owned();
+            tx.execute(
+                "INSERT INTO runs(
+                    org_id, run_id, status, task_type, shared_inputs_json, retry_policy_json,
+                    aggregation_policy_json, market_task_id, feed_key, scope_hint,
+                    round_policy_json, round_state_json, created_at, updated_at
+                 )
+                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,
+                         TIMESTAMPTZ 'epoch' + ($13::bigint * INTERVAL '1 millisecond'),
+                         TIMESTAMPTZ 'epoch' + ($13::bigint * INTERVAL '1 millisecond'))",
+                &[
+                    &self.org_id(),
+                    &spec.run_id,
+                    &RUN_STATUS_CREATED,
+                    &spec.task_type,
+                    &shared_inputs_json,
+                    &retry_json,
+                    &agg_json,
+                    &market_task_id,
+                    &feed_key,
+                    &scope_hint,
+                    &round_policy_json,
+                    &round_state_json,
+                    &now,
+                ],
+            )
+            .with_context(|| format!("insert stigmergy run {}", spec.run_id))?;
+            self.insert_event_tx(
+                &mut tx,
+                &spec.run_id,
+                "RUN_CREATED",
+                &json!({
+                    "run_id": spec.run_id,
+                    "execution": "stigmergy",
+                    "market_task_id": market_task_id,
+                    "feed_key": feed_key,
+                    "scope_hint": scope_hint
+                }),
+                now,
+            )?;
+            tx.commit()?;
+            return Ok(());
+        }
         tx.execute(
             "INSERT INTO runs(org_id, run_id, status, task_type, shared_inputs_json, retry_policy_json, aggregation_policy_json, created_at, updated_at)
              VALUES ($1,$2,$3,$4,$5,$6,$7,TIMESTAMPTZ 'epoch' + ($8::bigint * INTERVAL '1 millisecond'),TIMESTAMPTZ 'epoch' + ($8::bigint * INTERVAL '1 millisecond'))",
@@ -97,6 +161,69 @@ impl PgRunQueue {
             || status == RUN_STATUS_CANCELLED
             || status == RUN_STATUS_CANCELLING
         {
+            return Ok(());
+        }
+        let round_row = tx.query_one(
+            "SELECT round_policy_json, round_state_json
+             FROM runs
+             WHERE org_id = $1 AND run_id = $2
+             FOR UPDATE",
+            &[&self.org_id(), &run_id],
+        )?;
+        let round_policy_raw: Option<String> = round_row.get(0);
+        if let Some(round_policy_raw) = round_policy_raw {
+            let round_policy = serde_json::from_str::<
+                wattswarm_control_plane::round_policy::RoundPolicy,
+            >(&round_policy_raw)?
+            .normalized();
+            let round_state_raw: Option<String> = round_row.get(1);
+            let mut round_state = round_state_raw
+                .as_deref()
+                .and_then(|raw| serde_json::from_str::<RoundState>(raw).ok())
+                .unwrap_or_else(RoundState::initial);
+            if round_state.round_opened_at_ms.is_none() {
+                round_state.round_opened_at_ms = Some(now as u64);
+            }
+            let round_state_json = serde_json::to_string(&round_state)?;
+            let round_due_at_ms = round_state
+                .round_opened_at_ms
+                .map(|opened_at| opened_at.saturating_add(round_policy.round_timeout_ms))
+                .map(|value| value as i64);
+            tx.execute(
+                "UPDATE runs
+                 SET status = CASE
+                    WHEN status = $3 THEN $4
+                    ELSE status
+                 END,
+                 round_state_json = $5,
+                 round_due_at_ms = $6,
+                 started_at = COALESCE(started_at, TIMESTAMPTZ 'epoch' + ($7::bigint * INTERVAL '1 millisecond')),
+                 updated_at = TIMESTAMPTZ 'epoch' + ($7::bigint * INTERVAL '1 millisecond')
+                 WHERE org_id = $1 AND run_id = $2",
+                &[
+                    &self.org_id(),
+                    &run_id,
+                    &RUN_STATUS_CREATED,
+                    &RUN_STATUS_QUEUED,
+                    &round_state_json,
+                    &round_due_at_ms,
+                    &now,
+                ],
+            )?;
+            self.insert_event_tx(
+                &mut tx,
+                run_id,
+                "RUN_KICKOFF",
+                &json!({
+                    "run_id": run_id,
+                    "execution": "stigmergy",
+                    "round_index": round_state.round_index,
+                    "round_opened_at_ms": round_state.round_opened_at_ms,
+                    "round_due_at_ms": round_due_at_ms
+                }),
+                now,
+            )?;
+            tx.commit()?;
             return Ok(());
         }
         tx.execute(
@@ -203,6 +330,68 @@ impl PgRunQueue {
             .ok_or_else(|| anyhow!("run not found: {run_id}"))?;
         if status == RUN_STATUS_CANCELLED {
             return Err(anyhow!("run is cancelled, cannot retry: {run_id}"));
+        }
+        let round_row = tx.query_one(
+            "SELECT round_policy_json, round_state_json
+             FROM runs
+             WHERE org_id = $1 AND run_id = $2
+             FOR UPDATE",
+            &[&self.org_id(), &run_id],
+        )?;
+        let round_policy_raw: Option<String> = round_row.get(0);
+        if let Some(round_policy_raw) = round_policy_raw {
+            let round_policy = serde_json::from_str::<
+                wattswarm_control_plane::round_policy::RoundPolicy,
+            >(&round_policy_raw)?
+            .normalized();
+            let round_state_raw: Option<String> = round_row.get(1);
+            let mut round_state = round_state_raw
+                .as_deref()
+                .and_then(|raw| serde_json::from_str::<RoundState>(raw).ok())
+                .unwrap_or_else(RoundState::initial);
+            if round_state.round_opened_at_ms.is_some()
+                && round_state.round_index < round_policy.max_rounds
+            {
+                round_state.round_index = round_state.round_index.saturating_add(1);
+            }
+            round_state.round_opened_at_ms = Some(now as u64);
+            let round_due_at_ms = (now as u64).saturating_add(round_policy.round_timeout_ms) as i64;
+            let round_state_json = serde_json::to_string(&round_state)?;
+            tx.execute(
+                "UPDATE runs
+                 SET status = $3,
+                     result_json = NULL,
+                     error_text = NULL,
+                     finished_at = NULL,
+                     round_state_json = $4,
+                     round_due_at_ms = $5,
+                     updated_at = TIMESTAMPTZ 'epoch' + ($6::bigint * INTERVAL '1 millisecond')
+                 WHERE org_id = $1 AND run_id = $2",
+                &[
+                    &self.org_id(),
+                    &run_id,
+                    &RUN_STATUS_QUEUED,
+                    &round_state_json,
+                    &round_due_at_ms,
+                    &now,
+                ],
+            )?;
+            self.insert_event_tx(
+                &mut tx,
+                run_id,
+                "RUN_RETRY_REQUESTED",
+                &json!({
+                    "run_id": run_id,
+                    "execution": "stigmergy",
+                    "round_index": round_state.round_index,
+                    "round_opened_at_ms": round_state.round_opened_at_ms,
+                    "round_due_at_ms": round_due_at_ms,
+                    "steps_requeued": 0
+                }),
+                now,
+            )?;
+            tx.commit()?;
+            return Ok(());
         }
 
         let moved = tx.execute(
@@ -359,13 +548,16 @@ impl PgRunQueue {
 
 #[cfg(test)]
 mod tests {
+    use super::super::StigmergyCompletionSource;
     use super::super::status::{
-        RUN_STATUS_FAILED, RUN_STATUS_QUEUED, STEP_STATUS_FAILED, STEP_STATUS_QUEUED,
+        RUN_STATUS_FAILED, RUN_STATUS_FINALIZED, RUN_STATUS_QUEUED, STEP_STATUS_CANCELLED,
+        STEP_STATUS_CREATED, STEP_STATUS_FAILED, STEP_STATUS_QUEUED,
     };
     use super::super::types::{AggregationPolicy, RetryPolicy, RunAgentSpec, RunSubmitSpec};
     use super::*;
     use serde_json::json;
     use uuid::Uuid;
+    use wattswarm_control_plane::round_policy::RoundPolicy;
     const TEST_SCHEMA: &str = "test";
     const TEST_ORG_ID: &str = "local:test-admin:bootstrap";
     const TEST_DB_LOCK_KEY: i64 = 1_987_654_321;
@@ -433,6 +625,31 @@ mod tests {
                 weight: 1.0,
                 priority: 0,
             }],
+            market_task_id: None,
+            feed_key: None,
+            scope_hint: None,
+            round_policy: None,
+            retry: RetryPolicy::default(),
+            aggregation: AggregationPolicy::default(),
+        }
+    }
+
+    fn sample_stigmergy_spec(run_id: &str, task_id: &str) -> RunSubmitSpec {
+        RunSubmitSpec {
+            run_id: run_id.to_owned(),
+            task_type: "open_task".to_owned(),
+            shared_inputs: json!({"prompt":"decide"}),
+            agents: vec![],
+            market_task_id: Some(task_id.to_owned()),
+            feed_key: Some("tasks.open".to_owned()),
+            scope_hint: Some(format!("group:{task_id}")),
+            round_policy: Some(RoundPolicy {
+                min_participants: 2,
+                threshold_percent: 60,
+                round_timeout_ms: 1_000,
+                max_rounds: 2,
+                fallback_decision: Some("abstain".to_owned()),
+            }),
             retry: RetryPolicy::default(),
             aggregation: AggregationPolicy::default(),
         }
@@ -580,6 +797,273 @@ mod tests {
             .find(|e| e.event_type == "BROKEN_EVENT")
             .expect("broken event present");
         assert_eq!(broken.payload, json!({}));
+
+        cleanup_run(&queue, &run_id);
+    }
+
+    #[test]
+    fn stigmergy_submit_and_kickoff_start_collection_without_queueing_steps() {
+        let Some(_db_lock) = DbTestLock::acquire() else {
+            return;
+        };
+        if !reset_test_schema_or_skip() {
+            return;
+        }
+        let Some(queue) = queue_or_skip() else {
+            return;
+        };
+        queue.init_schema().expect("init schema");
+        let run_id = format!("admin-stigmergy-kickoff-{}", Uuid::new_v4().simple());
+        let task_id = format!("task-open-{}", Uuid::new_v4().simple());
+        cleanup_run(&queue, &run_id);
+        queue
+            .submit_run(sample_stigmergy_spec(&run_id, &task_id))
+            .expect("submit stigmergy run");
+
+        let mut client = queue.connect().expect("connect");
+        let row = client
+            .query_one(
+                "SELECT market_task_id, round_state_json, round_due_at_ms
+                 FROM runs WHERE org_id = $1 AND run_id = $2",
+                &[&queue.org_id(), &run_id],
+            )
+            .expect("run row");
+        assert_eq!(
+            row.get::<_, Option<String>>(0).as_deref(),
+            Some(task_id.as_str())
+        );
+        let round_state: serde_json::Value =
+            serde_json::from_str(&row.get::<_, String>(1)).expect("round state json");
+        assert_eq!(round_state["round_index"], 1);
+        assert!(round_state["round_opened_at_ms"].is_null());
+        assert_eq!(row.get::<_, Option<i64>>(2), None);
+
+        assert_eq!(
+            queue
+                .record_stigmergy_claim(&task_id, "agent-a", "node-a", "exec-a")
+                .expect("record claim"),
+            1
+        );
+        let (observed, winning, required) = queue
+            .debug_stigmergy_round_counts(&run_id, &task_id)
+            .expect("round counts");
+        assert_eq!((observed, winning, required), (1, 0, 2));
+        queue.kickoff_run(&run_id).expect("kickoff stigmergy");
+        let step_status: String = client
+            .query_one(
+                "SELECT status FROM run_steps WHERE org_id = $1 AND run_id = $2 AND agent_id = 'agent-a'",
+                &[&queue.org_id(), &run_id],
+            )
+            .expect("step row")
+            .get(0);
+        assert_eq!(step_status, STEP_STATUS_CREATED);
+        let due_after: Option<i64> = client
+            .query_one(
+                "SELECT round_due_at_ms FROM runs WHERE org_id = $1 AND run_id = $2",
+                &[&queue.org_id(), &run_id],
+            )
+            .expect("run due")
+            .get(0);
+        assert!(due_after.is_some());
+
+        cleanup_run(&queue, &run_id);
+    }
+
+    #[test]
+    fn stigmergy_completion_requires_matching_claim() {
+        let Some(_db_lock) = DbTestLock::acquire() else {
+            return;
+        };
+        if !reset_test_schema_or_skip() {
+            return;
+        }
+        let Some(queue) = queue_or_skip() else {
+            return;
+        };
+        queue.init_schema().expect("init schema");
+        let run_id = format!("admin-stigmergy-no-claim-{}", Uuid::new_v4().simple());
+        let task_id = format!("task-open-{}", Uuid::new_v4().simple());
+        cleanup_run(&queue, &run_id);
+        queue
+            .submit_run(sample_stigmergy_spec(&run_id, &task_id))
+            .expect("submit stigmergy run");
+        queue.kickoff_run(&run_id).expect("kickoff stigmergy");
+        let recorded = queue
+            .record_stigmergy_completion(
+                &task_id,
+                "agent-a",
+                "node-a",
+                "exec-a",
+                &json!({"decision":"support"}),
+                StigmergyCompletionSource::TaskCompleted,
+            )
+            .expect("completion without claim is ignored");
+        assert_eq!(recorded, 0);
+        let view = queue.run_view(&run_id).expect("view");
+        assert_eq!(view.counts.succeeded, 0);
+        assert_eq!(
+            queue
+                .record_stigmergy_claim(&task_id, "agent-a", "node-a", "exec-a")
+                .expect("claim"),
+            1
+        );
+        let mismatched = queue
+            .record_stigmergy_completion(
+                &task_id,
+                "agent-a",
+                "node-a",
+                "exec-b",
+                &json!({"decision":"support"}),
+                StigmergyCompletionSource::TaskCompleted,
+            )
+            .expect("mismatched completion is ignored");
+        assert_eq!(mismatched, 0);
+        let mut client = queue.connect().expect("connect");
+        let step_status: String = client
+            .query_one(
+                "SELECT status FROM run_steps WHERE org_id = $1 AND run_id = $2 AND agent_id = 'agent-a'",
+                &[&queue.org_id(), &run_id],
+            )
+            .expect("claimed step")
+            .get(0);
+        assert_eq!(step_status, STEP_STATUS_CREATED);
+        let events = queue.run_events(&run_id, 20).expect("events");
+        assert!(
+            events
+                .iter()
+                .any(|event| event.event_type == "STIGMERGY_CONTRIBUTION_IGNORED")
+        );
+
+        cleanup_run(&queue, &run_id);
+    }
+
+    #[test]
+    fn stigmergy_threshold_completion_finalizes_once() {
+        let Some(_db_lock) = DbTestLock::acquire() else {
+            return;
+        };
+        if !reset_test_schema_or_skip() {
+            return;
+        }
+        let Some(queue) = queue_or_skip() else {
+            return;
+        };
+        queue.init_schema().expect("init schema");
+        let run_id = format!("admin-stigmergy-finalize-{}", Uuid::new_v4().simple());
+        let task_id = format!("task-open-{}", Uuid::new_v4().simple());
+        cleanup_run(&queue, &run_id);
+        queue
+            .submit_run(sample_stigmergy_spec(&run_id, &task_id))
+            .expect("submit stigmergy run");
+        queue.kickoff_run(&run_id).expect("kickoff stigmergy");
+        assert_eq!(
+            queue
+                .record_stigmergy_claim(&task_id, "agent-c", "node-agent-c", "exec-agent-c")
+                .expect("claim incomplete participant"),
+            1
+        );
+
+        for agent in ["agent-a", "agent-b"] {
+            let node_id = format!("node-{agent}");
+            let exec_id = format!("exec-{agent}");
+            assert_eq!(
+                queue
+                    .record_stigmergy_claim(&task_id, agent, &node_id, &exec_id)
+                    .expect("claim"),
+                1
+            );
+            queue
+                .record_stigmergy_completion(
+                    &task_id,
+                    agent,
+                    &node_id,
+                    &exec_id,
+                    &json!({"decision":"support","answer":"yes"}),
+                    StigmergyCompletionSource::TaskCompleted,
+                )
+                .expect("completion");
+        }
+
+        let result = queue.run_result(&run_id).expect("result");
+        assert_eq!(result["status"], RUN_STATUS_FINALIZED);
+        assert_eq!(result["result"]["aggregation"]["final_decision"], "SUPPORT");
+        let mut client = queue.connect().expect("connect");
+        let incomplete_status: String = client
+            .query_one(
+                "SELECT status FROM run_steps WHERE org_id = $1 AND run_id = $2 AND agent_id = 'agent-c'",
+                &[&queue.org_id(), &run_id],
+            )
+            .expect("incomplete participant step")
+            .get(0);
+        assert_eq!(incomplete_status, STEP_STATUS_CANCELLED);
+        let duplicate = queue
+            .record_stigmergy_completion(
+                &task_id,
+                "agent-a",
+                "node-agent-a",
+                "exec-agent-a",
+                &json!({"decision":"support","answer":"yes"}),
+                StigmergyCompletionSource::TaskCompleted,
+            )
+            .expect("duplicate completion ignored");
+        assert_eq!(duplicate, 0);
+
+        cleanup_run(&queue, &run_id);
+    }
+
+    #[test]
+    fn stigmergy_timeout_opens_next_round_then_fallback_finalizes() {
+        let Some(_db_lock) = DbTestLock::acquire() else {
+            return;
+        };
+        if !reset_test_schema_or_skip() {
+            return;
+        }
+        let Some(queue) = queue_or_skip() else {
+            return;
+        };
+        queue.init_schema().expect("init schema");
+        let run_id = format!("admin-stigmergy-timeout-{}", Uuid::new_v4().simple());
+        let task_id = format!("task-open-{}", Uuid::new_v4().simple());
+        let mut spec = sample_stigmergy_spec(&run_id, &task_id);
+        spec.round_policy = Some(RoundPolicy {
+            min_participants: 2,
+            threshold_percent: 100,
+            round_timeout_ms: 1,
+            max_rounds: 2,
+            fallback_decision: Some("abstain".to_owned()),
+        });
+        cleanup_run(&queue, &run_id);
+        queue.submit_run(spec).expect("submit stigmergy run");
+        queue.kickoff_run(&run_id).expect("kickoff stigmergy");
+
+        let first_due = now_ms().saturating_add(10_000) as u64;
+        assert_eq!(
+            queue
+                .evaluate_open_stigmergy_rounds(first_due)
+                .expect("first timeout"),
+            1
+        );
+        let mut client = queue.connect().expect("connect");
+        let state_raw: String = client
+            .query_one(
+                "SELECT round_state_json FROM runs WHERE org_id = $1 AND run_id = $2",
+                &[&queue.org_id(), &run_id],
+            )
+            .expect("round state")
+            .get(0);
+        let state: serde_json::Value = serde_json::from_str(&state_raw).expect("state json");
+        assert_eq!(state["round_index"], 2);
+
+        assert_eq!(
+            queue
+                .evaluate_open_stigmergy_rounds(first_due.saturating_add(10))
+                .expect("second timeout"),
+            1
+        );
+        let result = queue.run_result(&run_id).expect("result");
+        assert_eq!(result["status"], RUN_STATUS_FINALIZED);
+        assert_eq!(result["result"]["aggregation"]["final_decision"], "abstain");
 
         cleanup_run(&queue, &run_id);
     }

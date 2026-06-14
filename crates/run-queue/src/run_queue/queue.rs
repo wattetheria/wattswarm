@@ -269,7 +269,59 @@ impl PgRunQueue {
         if spec.run_id.trim().is_empty() {
             return Err(anyhow!("run_id is required"));
         }
-        if spec.agents.is_empty() {
+        if spec.is_stigmergy() {
+            if spec
+                .market_task_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .is_none()
+            {
+                return Err(anyhow!("market_task_id is required for stigmergy runs"));
+            }
+            if spec
+                .feed_key
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .is_none()
+            {
+                return Err(anyhow!("feed_key is required for stigmergy runs"));
+            }
+            if spec
+                .scope_hint
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .is_none()
+            {
+                return Err(anyhow!("scope_hint is required for stigmergy runs"));
+            }
+            let policy = spec
+                .round_policy
+                .as_ref()
+                .expect("stigmergy checked by round_policy");
+            if policy.min_participants == 0 {
+                return Err(anyhow!(
+                    "round_policy.min_participants must be > 0 for stigmergy runs"
+                ));
+            }
+            if !(1..=100).contains(&policy.threshold_percent) {
+                return Err(anyhow!(
+                    "round_policy.threshold_percent must be between 1 and 100 for stigmergy runs"
+                ));
+            }
+            if policy.round_timeout_ms == 0 {
+                return Err(anyhow!(
+                    "round_policy.round_timeout_ms must be > 0 for stigmergy runs"
+                ));
+            }
+            if policy.max_rounds == 0 {
+                return Err(anyhow!(
+                    "round_policy.max_rounds must be > 0 for stigmergy runs"
+                ));
+            }
+        } else if spec.agents.is_empty() {
             return Err(anyhow!("agents cannot be empty"));
         }
         if spec.retry.max_attempts == 0 {
@@ -359,6 +411,7 @@ mod tests {
     };
     use super::super::utils::{build_step_inputs, retry_delay_ms};
     use super::PgRunQueue;
+    use wattswarm_control_plane::round_policy::RoundPolicy;
 
     fn sample_agent(agent_id: &str) -> RunAgentSpec {
         RunAgentSpec {
@@ -377,6 +430,31 @@ mod tests {
             task_type: "resume_review".to_owned(),
             shared_inputs: json!({"resume":"text"}),
             agents: vec![sample_agent("a1")],
+            market_task_id: None,
+            feed_key: None,
+            scope_hint: None,
+            round_policy: None,
+            retry: RetryPolicy::default(),
+            aggregation: AggregationPolicy::default(),
+        }
+    }
+
+    fn sample_stigmergy_spec() -> RunSubmitSpec {
+        RunSubmitSpec {
+            run_id: "run-open-1".to_owned(),
+            task_type: "open_task".to_owned(),
+            shared_inputs: json!({}),
+            agents: vec![],
+            market_task_id: Some("task-open-1".to_owned()),
+            feed_key: Some("tasks.open".to_owned()),
+            scope_hint: Some("group:task-open-1".to_owned()),
+            round_policy: Some(RoundPolicy {
+                min_participants: 2,
+                threshold_percent: 60,
+                round_timeout_ms: 1_000,
+                max_rounds: 2,
+                fallback_decision: Some("abstain".to_owned()),
+            }),
             retry: RetryPolicy::default(),
             aggregation: AggregationPolicy::default(),
         }
@@ -429,6 +507,25 @@ mod tests {
     }
 
     #[test]
+    fn validate_submit_spec_allows_stigmergy_without_agents() {
+        let queue = PgRunQueue::new("postgres://unused");
+        queue
+            .validate_submit_spec(&sample_stigmergy_spec())
+            .expect("stigmergy without agents is valid");
+    }
+
+    #[test]
+    fn validate_submit_spec_rejects_stigmergy_without_market_task() {
+        let queue = PgRunQueue::new("postgres://unused");
+        let mut spec = sample_stigmergy_spec();
+        spec.market_task_id = None;
+        let err = queue
+            .validate_submit_spec(&spec)
+            .expect_err("missing market task should fail");
+        assert!(err.to_string().contains("market_task_id is required"));
+    }
+
+    #[test]
     fn submit_spec_deserialization_applies_defaults() {
         let spec: RunSubmitSpec = serde_json::from_value(json!({
             "run_id": "run-a",
@@ -459,5 +556,26 @@ mod tests {
         );
         assert_eq!(spec.agents[0].profile, "default");
         assert_eq!(spec.agents[0].weight, 1.0);
+    }
+
+    #[test]
+    fn submit_spec_deserializes_stigmergy_without_agents() {
+        let spec: RunSubmitSpec = serde_json::from_value(json!({
+            "run_id": "run-open",
+            "market_task_id": "task-open",
+            "feed_key": "tasks.open",
+            "scope_hint": "group:task-open",
+            "round_policy": {
+                "min_participants": 2,
+                "threshold_percent": 60,
+                "round_timeout_ms": 1000,
+                "max_rounds": 2,
+                "fallback_decision": "abstain"
+            }
+        }))
+        .expect("stigmergy spec json");
+        assert!(spec.agents.is_empty());
+        assert!(spec.is_stigmergy());
+        assert_eq!(spec.market_task_id.as_deref(), Some("task-open"));
     }
 }

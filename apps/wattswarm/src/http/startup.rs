@@ -80,10 +80,7 @@ pub(crate) async fn startup_config_save(
         state.state_dir.clone(),
         state.db_path.clone(),
         Some(Box::new(|node, sd| {
-            let _ = crate::run_queue::network_bridge::process_pending_bridge_tasks(node, sd);
-            let _ = crate::run_queue::network_bridge::process_pending_run_queue_results(sd);
-            let _ = crate::control::topic_interpretation::process_topic_interpretation(node, sd);
-            let _ = crate::control::topic_consensus::process_structured_topic_consensus(node, sd);
+            crate::network_hooks::run_background_post_tick(node, sd);
         })),
     )?;
     mark_node_running_if_service_started(&state.state_dir, network_started)?;

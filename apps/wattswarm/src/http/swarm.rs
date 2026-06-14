@@ -36,7 +36,11 @@ pub(crate) async fn swarm_tick(
     let profile = req.profile.unwrap_or_else(|| "default".to_owned());
     let dashboard = tokio::task::spawn_blocking(move || -> Result<SwarmDashboardState> {
         let mut node = open_node(&state_clone.state_dir, &state_clone.db_path)?;
-        tick_real_swarm(&mut node, &state_clone.state_dir, &executor, &profile)
+        let dashboard = tick_real_swarm(&mut node, &state_clone.state_dir, &executor, &profile)?;
+        let _ = crate::run_queue::network_bridge::evaluate_open_stigmergy_rounds_for_state(
+            &state_clone.state_dir,
+        );
+        Ok(dashboard)
     })
     .await
     .map_err(|err| anyhow!("task join error: {err}"))??;

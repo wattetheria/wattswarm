@@ -28,6 +28,9 @@ use super::utils::{
 impl PgRunQueue {
     pub fn run_worker(&self, opts: WorkerOptions, state_dir: &Path, db_path: &Path) -> Result<()> {
         loop {
+            if let Err(error) = self.evaluate_open_stigmergy_rounds(now_ms() as u64) {
+                eprintln!("run_queue_worker: stigmergy round evaluation skipped: {error:#}");
+            }
             let claimed =
                 self.claim_steps(&opts.worker_id, opts.concurrency.max(1), opts.lease_ms)?;
             if claimed.is_empty() {
@@ -640,6 +643,10 @@ mod tests {
                 weight: 1.0,
                 priority: 1_000_000,
             }],
+            market_task_id: None,
+            feed_key: None,
+            scope_hint: None,
+            round_policy: None,
             retry: RetryPolicy::default(),
             aggregation: AggregationPolicy::default(),
         }
@@ -668,6 +675,10 @@ mod tests {
                     priority: 999_999,
                 },
             ],
+            market_task_id: None,
+            feed_key: None,
+            scope_hint: None,
+            round_policy: None,
             retry: RetryPolicy::default(),
             aggregation,
         }

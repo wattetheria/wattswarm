@@ -17,6 +17,7 @@ use std::io::Write;
 use std::path::Path;
 
 use super::queue::PgRunQueue;
+use super::stigmergy::StigmergyCompletionSource;
 use super::utils::STEP_STATUS_REMOTE_DISPATCHED;
 
 /// Feed key used by the run-queue coordinator when announcing tasks.
@@ -243,59 +244,6 @@ pub fn process_pending_bridge_tasks(
     Ok(processed)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn execution_set_member(
-        participant_node_id: &str,
-        status: &str,
-    ) -> crate::control::storage::ExecutionSetMemberRow {
-        crate::control::storage::ExecutionSetMemberRow {
-            task_id: "task-1".to_owned(),
-            execution_set_id: "remote-bridge:task-1".to_owned(),
-            participant_node_id: participant_node_id.to_owned(),
-            role_hint: "executor".to_owned(),
-            scope_hint: "global".to_owned(),
-            status: status.to_owned(),
-            confirmed_by_node_id: Some("coordinator".to_owned()),
-            updated_at: 1,
-        }
-    }
-
-    #[test]
-    fn remote_result_author_membership_requires_confirmed_member() {
-        assert!(
-            ensure_author_confirmed_execution_set_member(
-                &[execution_set_member("node-a", "confirmed")],
-                "task-1",
-                "node-a",
-            )
-            .is_ok()
-        );
-
-        let empty_err = ensure_author_confirmed_execution_set_member(&[], "task-1", "node-a")
-            .expect_err("empty membership must defer remote result");
-        assert!(empty_err.to_string().contains("is not confirmed"));
-
-        let pending_err = ensure_author_confirmed_execution_set_member(
-            &[execution_set_member("node-a", "accepted")],
-            "task-1",
-            "node-a",
-        )
-        .expect_err("unconfirmed member must not complete remote result");
-        assert!(pending_err.to_string().contains("not a confirmed"));
-
-        let outsider_err = ensure_author_confirmed_execution_set_member(
-            &[execution_set_member("node-b", "confirmed")],
-            "task-1",
-            "node-a",
-        )
-        .expect_err("non-member must not complete remote result");
-        assert!(outsider_err.to_string().contains("not a confirmed"));
-    }
-}
-
 /// Process pending run-queue results written by the coordinator-side gossip hook.
 /// Each line in `pending_run_queue_results.jsonl` contains a CandidateProposed
 /// result that should be written back to a REMOTE_DISPATCHED run_step.
@@ -396,4 +344,197 @@ pub fn process_pending_run_queue_results(state_dir: &Path) -> Result<u64> {
             .and_then(|mut f| f.write_all(retry_content.as_bytes()));
     }
     Ok(processed)
+}
+
+pub fn process_pending_stigmergy_contributions(state_dir: &Path) -> Result<u64> {
+    let pending_path = state_dir.join("pending_stigmergy_contributions.jsonl");
+    let processing_path = state_dir.join("pending_stigmergy_contributions.processing.jsonl");
+
+    if !processing_path.exists() {
+        if !pending_path.exists() {
+            return Ok(0);
+        }
+        std::fs::rename(&pending_path, &processing_path)?;
+    }
+
+    let content = std::fs::read_to_string(&processing_path)?;
+    if content.trim().is_empty() {
+        let _ = std::fs::remove_file(&processing_path);
+        return Ok(0);
+    }
+
+    let queue = match resolve_run_queue(state_dir) {
+        Some(q) => q,
+        None => return Ok(0),
+    };
+
+    let mut processed = 0u64;
+    let mut failed_lines = Vec::new();
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let entry: Value = match serde_json::from_str(line) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let kind = entry.get("kind").and_then(Value::as_str).unwrap_or("");
+        let task_id = entry.get("task_id").and_then(Value::as_str).unwrap_or("");
+        let agent_id = entry.get("agent_id").and_then(Value::as_str).unwrap_or("");
+        let author_node_id = entry
+            .get("author_node_id")
+            .and_then(Value::as_str)
+            .or_else(|| entry.get("claimer_node_id").and_then(Value::as_str))
+            .or_else(|| entry.get("completed_by_node_id").and_then(Value::as_str))
+            .unwrap_or("");
+        let execution_id = entry
+            .get("execution_id")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+
+        if kind.is_empty()
+            || task_id.is_empty()
+            || agent_id.is_empty()
+            || author_node_id.is_empty()
+            || execution_id.is_empty()
+        {
+            continue;
+        }
+
+        let result = match kind {
+            "claim" => {
+                queue.record_stigmergy_claim(task_id, agent_id, author_node_id, execution_id)
+            }
+            "completion" => {
+                let output = entry.get("output").cloned().unwrap_or(Value::Null);
+                queue.record_stigmergy_completion(
+                    task_id,
+                    agent_id,
+                    author_node_id,
+                    execution_id,
+                    &output,
+                    StigmergyCompletionSource::TaskCompleted,
+                )
+            }
+            "candidate" => {
+                let output = entry
+                    .get("candidate_output")
+                    .cloned()
+                    .filter(|value| !value.is_null())
+                    .or_else(|| {
+                        let candidate_id = entry.get("candidate_id").and_then(Value::as_str)?;
+                        crate::control::open_node(
+                            state_dir,
+                            std::path::Path::new(&queue.database_url),
+                        )
+                        .ok()
+                        .and_then(|node| {
+                            node.store
+                                .get_candidate_by_id(task_id, candidate_id)
+                                .ok()
+                                .flatten()
+                        })
+                        .map(|candidate| candidate.output)
+                    })
+                    .unwrap_or(Value::Null);
+                queue
+                    .record_stigmergy_claim(task_id, agent_id, author_node_id, execution_id)
+                    .and_then(|_| {
+                        queue.record_stigmergy_completion(
+                            task_id,
+                            agent_id,
+                            author_node_id,
+                            execution_id,
+                            &output,
+                            StigmergyCompletionSource::CandidateProposed,
+                        )
+                    })
+            }
+            _ => Ok(0),
+        };
+
+        match result {
+            Ok(count) => processed = processed.saturating_add(count),
+            Err(err) => {
+                eprintln!(
+                    "run_queue_bridge: failed to process stigmergy contribution for {task_id}: {err:#}"
+                );
+                failed_lines.push(line.to_owned());
+            }
+        }
+    }
+
+    let _ = std::fs::remove_file(&processing_path);
+    if !failed_lines.is_empty() {
+        let mut retry_content = failed_lines.join("\n");
+        retry_content.push('\n');
+        let _ = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&pending_path)
+            .and_then(|mut f| f.write_all(retry_content.as_bytes()));
+    }
+    Ok(processed)
+}
+
+pub fn evaluate_open_stigmergy_rounds_for_state(state_dir: &Path) -> Result<u64> {
+    let Some(queue) = resolve_run_queue(state_dir) else {
+        return Ok(0);
+    };
+    let now = chrono::Utc::now().timestamp_millis().max(0) as u64;
+    queue.evaluate_open_stigmergy_rounds(now)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn execution_set_member(
+        participant_node_id: &str,
+        status: &str,
+    ) -> crate::control::storage::ExecutionSetMemberRow {
+        crate::control::storage::ExecutionSetMemberRow {
+            task_id: "task-1".to_owned(),
+            execution_set_id: "remote-bridge:task-1".to_owned(),
+            participant_node_id: participant_node_id.to_owned(),
+            role_hint: "executor".to_owned(),
+            scope_hint: "global".to_owned(),
+            status: status.to_owned(),
+            confirmed_by_node_id: Some("coordinator".to_owned()),
+            updated_at: 1,
+        }
+    }
+
+    #[test]
+    fn remote_result_author_membership_requires_confirmed_member() {
+        assert!(
+            ensure_author_confirmed_execution_set_member(
+                &[execution_set_member("node-a", "confirmed")],
+                "task-1",
+                "node-a",
+            )
+            .is_ok()
+        );
+
+        let empty_err = ensure_author_confirmed_execution_set_member(&[], "task-1", "node-a")
+            .expect_err("empty membership must defer remote result");
+        assert!(empty_err.to_string().contains("is not confirmed"));
+
+        let pending_err = ensure_author_confirmed_execution_set_member(
+            &[execution_set_member("node-a", "accepted")],
+            "task-1",
+            "node-a",
+        )
+        .expect_err("unconfirmed member must not complete remote result");
+        assert!(pending_err.to_string().contains("not a confirmed"));
+
+        let outsider_err = ensure_author_confirmed_execution_set_member(
+            &[execution_set_member("node-b", "confirmed")],
+            "task-1",
+            "node-a",
+        )
+        .expect_err("non-member must not complete remote result");
+        assert!(outsider_err.to_string().contains("not a confirmed"));
+    }
 }

@@ -122,6 +122,75 @@ fn diagnostic_agent_envelope(details: &Map<String, Value>) -> &Value {
 }
 
 #[test]
+fn run_prefixed_task_claim_is_logged_for_stigmergy_intake() {
+    let state_dir = temp_startup_dir("run-prefixed-stigmergy-claim");
+    let node = Node::open_in_memory_with_roles(&[Role::Proposer]).expect("node");
+    let event = diagnostic_event_from_payload(crate::types::EventPayload::TaskClaimed(
+        crate::types::ClaimPayload {
+            task_id: "run-open-stigmergy-task".to_owned(),
+            role: ClaimRole::Propose,
+            claimer_node_id: "node-source".to_owned(),
+            execution_id: "exec-run-open".to_owned(),
+            lease_until: 200,
+            agent_envelope: None,
+        },
+    ));
+
+    log_run_queue_events_if_applicable(&node, &state_dir, &event);
+
+    let content = fs::read_to_string(state_dir.join("pending_stigmergy_contributions.jsonl"))
+        .expect("pending stigmergy file");
+    let entry: Value = serde_json::from_str(content.lines().next().expect("jsonl line"))
+        .expect("pending stigmergy entry");
+    assert_eq!(entry["kind"].as_str(), Some("claim"));
+    assert_eq!(entry["task_id"].as_str(), Some("run-open-stigmergy-task"));
+}
+
+#[test]
+fn run_prefixed_candidate_is_logged_for_stigmergy_and_run_queue_intake() {
+    let state_dir = temp_startup_dir("run-prefixed-stigmergy-candidate");
+    let node = Node::open_in_memory_with_roles(&[Role::Proposer]).expect("node");
+    let event = diagnostic_event_from_payload(crate::types::EventPayload::CandidateProposed(
+        crate::types::CandidateProposedPayload {
+            task_id: "run-open-stigmergy-task".to_owned(),
+            candidate: crate::types::Candidate {
+                candidate_id: "cand-run-open".to_owned(),
+                execution_id: "exec-run-open".to_owned(),
+                output_ref: sample_topic_content_ref("sha256:candidate", "node-source"),
+                output: json!({"decision": "support"}),
+                evidence_inline: Vec::new(),
+                evidence_refs: Vec::new(),
+            },
+            agent_envelope: None,
+        },
+    ));
+
+    log_run_queue_events_if_applicable(&node, &state_dir, &event);
+
+    let stigmergy_content =
+        fs::read_to_string(state_dir.join("pending_stigmergy_contributions.jsonl"))
+            .expect("pending stigmergy file");
+    let stigmergy_entry: Value =
+        serde_json::from_str(stigmergy_content.lines().next().expect("jsonl line"))
+            .expect("pending stigmergy entry");
+    assert_eq!(stigmergy_entry["kind"].as_str(), Some("candidate"));
+    assert_eq!(
+        stigmergy_entry["task_id"].as_str(),
+        Some("run-open-stigmergy-task")
+    );
+
+    let run_queue_content = fs::read_to_string(state_dir.join("pending_run_queue_results.jsonl"))
+        .expect("pending run queue file");
+    let run_queue_entry: Value =
+        serde_json::from_str(run_queue_content.lines().next().expect("jsonl line"))
+            .expect("pending run queue entry");
+    assert_eq!(
+        run_queue_entry["task_id"].as_str(),
+        Some("run-open-stigmergy-task")
+    );
+}
+
+#[test]
 fn event_diagnostics_include_agent_envelope_for_all_network_payloads() {
     let envelope = sample_protocol_agent_envelope("network.event");
     let content_ref = sample_topic_content_ref("sha256:topic", "node-source");

@@ -345,6 +345,10 @@ fn fetch_task_and_evidence_artifacts_over_iroh_when_remote_contact_material_is_a
     let schema = format!("test_{}", Uuid::new_v4().simple());
     reset_test_schema(&schema);
     let _schema_guard = EnvVarGuard::set("WATTSWARM_PG_SCHEMA", &schema);
+    let _direct_guard = EnvVarGuard::set(
+        wattswarm_network_transport_iroh::ENV_IROH_PUBLISH_DIRECT_ADDRS,
+        "true",
+    );
 
     let dir = temp_test_dir("artifact-source-iroh");
     let state_dir = dir.join("state");
@@ -558,6 +562,10 @@ fn fetch_checkpoint_and_snapshot_artifacts_over_iroh_when_remote_contact_materia
     let schema = format!("test_{}", Uuid::new_v4().simple());
     reset_test_schema(&schema);
     let _schema_guard = EnvVarGuard::set("WATTSWARM_PG_SCHEMA", &schema);
+    let _direct_guard = EnvVarGuard::set(
+        wattswarm_network_transport_iroh::ENV_IROH_PUBLISH_DIRECT_ADDRS,
+        "true",
+    );
 
     let dir = temp_test_dir("checkpoint-snapshot-iroh");
     let state_dir = dir.join("state");

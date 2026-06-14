@@ -19,12 +19,7 @@ pub(crate) async fn node_up(State(state): State<UiServerState>) -> Result<Json<V
             state_clone.state_dir.clone(),
             state_clone.db_path.clone(),
             Some(Box::new(|node, sd| {
-                let _ = crate::run_queue::network_bridge::process_pending_bridge_tasks(node, sd);
-                let _ = crate::run_queue::network_bridge::process_pending_run_queue_results(sd);
-                let _ =
-                    crate::control::topic_interpretation::process_topic_interpretation(node, sd);
-                let _ =
-                    crate::control::topic_consensus::process_structured_topic_consensus(node, sd);
+                crate::network_hooks::run_background_post_tick(node, sd);
             })),
         )?;
         if crate::network_bridge::network_enabled_from_env() {

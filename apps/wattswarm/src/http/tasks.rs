@@ -3,6 +3,7 @@ use crate::control::{
 };
 use crate::http::helpers::resolve_network_id;
 use crate::http::{ApiError, UiServerState, run_blocking};
+use crate::run_queue::{PgRunQueue, StigmergyCompletionSource};
 use crate::task_template::sample_contract;
 use crate::types::{AgentEnvelope, Candidate, ClaimRole, TaskContract};
 use anyhow::{Result, anyhow};
@@ -117,6 +118,76 @@ pub(crate) struct TaskProposeCandidateRequest {
     evidence_refs: Vec<crate::types::ArtifactRef>,
     #[serde(default)]
     agent_envelope: Option<AgentEnvelope>,
+}
+
+fn task_participant_agent_id(
+    agent_envelope: Option<&AgentEnvelope>,
+    fallback_node_id: &str,
+) -> String {
+    agent_envelope
+        .and_then(|envelope| envelope.source_agent_id.as_deref())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(fallback_node_id)
+        .to_owned()
+}
+
+fn current_org_run_queue_or_log(
+    state_dir: &std::path::Path,
+    db_path: &std::path::Path,
+) -> Option<PgRunQueue> {
+    let pg_url = crate::run_control::resolve_run_queue_pg_url(None);
+    let node = match crate::control::open_configured_node(state_dir, db_path) {
+        Ok(node) => node,
+        Err(error) => {
+            eprintln!("stigmergy local sink skipped: open node failed: {error:#}");
+            return None;
+        }
+    };
+    Some(PgRunQueue::new(pg_url).for_org(node.store.org_id().to_owned()))
+}
+
+fn record_local_stigmergy_claim_if_applicable(
+    state_dir: &std::path::Path,
+    db_path: &std::path::Path,
+    task_id: &str,
+    agent_id: &str,
+    author_node_id: &str,
+    execution_id: &str,
+) {
+    let Some(queue) = current_org_run_queue_or_log(state_dir, db_path) else {
+        return;
+    };
+    if let Err(error) =
+        queue.record_stigmergy_claim(task_id, agent_id, author_node_id, execution_id)
+    {
+        eprintln!("stigmergy local claim sink skipped for task {task_id}: {error:#}");
+    }
+}
+
+fn record_local_stigmergy_completion_if_applicable(
+    state_dir: &std::path::Path,
+    db_path: &std::path::Path,
+    task_id: &str,
+    agent_id: &str,
+    author_node_id: &str,
+    execution_id: &str,
+    output: &Value,
+    source: StigmergyCompletionSource,
+) {
+    let Some(queue) = current_org_run_queue_or_log(state_dir, db_path) else {
+        return;
+    };
+    if let Err(error) = queue.record_stigmergy_completion(
+        task_id,
+        agent_id,
+        author_node_id,
+        execution_id,
+        output,
+        source,
+    ) {
+        eprintln!("stigmergy local completion sink skipped for task {task_id}: {error:#}");
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -294,6 +365,9 @@ pub(crate) async fn task_claim(
             .execution_id
             .unwrap_or_else(|| format!("exec-p-{}", Uuid::new_v4()));
         let role = req.role.unwrap_or(ClaimRole::Propose);
+        let agent_envelope = req.agent_envelope;
+        let author_node_id = node.node_id();
+        let agent_id = task_participant_agent_id(agent_envelope.as_ref(), &author_node_id);
         let lease_ms = req
             .lease_ms
             .unwrap_or(task.contract.assignment.claim.lease_ms);
@@ -352,10 +426,18 @@ pub(crate) async fn task_claim(
             role,
             &execution_id,
             lease_until,
-            req.agent_envelope,
+            agent_envelope,
             task.epoch,
             now.saturating_add(1),
         )?;
+        record_local_stigmergy_claim_if_applicable(
+            &state_clone.state_dir,
+            &state_clone.db_path,
+            &req.task_id,
+            &agent_id,
+            &author_node_id,
+            &execution_id,
+        );
         Ok(json!({
             "ok": true,
             "task_id": req.task_id,
@@ -414,14 +496,27 @@ pub(crate) async fn task_complete(
             .task_view(&req.task_id)?
             .ok_or_else(|| anyhow!("task not found: {}", req.task_id))?;
         let now = chrono::Utc::now().timestamp_millis().max(0) as u64;
+        let agent_envelope = req.agent_envelope;
+        let author_node_id = node.node_id();
+        let agent_id = task_participant_agent_id(agent_envelope.as_ref(), &author_node_id);
         node.complete_task_with_agent_envelope(
             &req.task_id,
             &req.execution_id,
-            req.output,
-            req.agent_envelope,
+            req.output.clone(),
+            agent_envelope,
             task.epoch,
             now,
         )?;
+        record_local_stigmergy_completion_if_applicable(
+            &state_clone.state_dir,
+            &state_clone.db_path,
+            &req.task_id,
+            &agent_id,
+            &author_node_id,
+            &req.execution_id,
+            &req.output,
+            StigmergyCompletionSource::TaskCompleted,
+        );
         Ok(json!({
             "ok": true,
             "task_id": req.task_id,
@@ -516,6 +611,9 @@ pub(crate) async fn task_propose_candidate(
         let now = chrono::Utc::now().timestamp_millis().max(0) as u64;
         let execution_id = execution_id.unwrap_or_else(|| format!("exec-p-{}", Uuid::new_v4()));
         let candidate_id = candidate_id.unwrap_or_else(|| format!("cand-{execution_id}"));
+        let author_node_id = node.node_id();
+        let agent_id = task_participant_agent_id(agent_envelope.as_ref(), &author_node_id);
+        let output_for_stigmergy = output.clone();
         let output_ref = materialize_candidate_output_artifact(
             &state_clone.state_dir,
             &node.node_id(),
@@ -537,6 +635,24 @@ pub(crate) async fn task_propose_candidate(
             task.epoch,
             now,
         )?;
+        record_local_stigmergy_claim_if_applicable(
+            &state_clone.state_dir,
+            &state_clone.db_path,
+            &task_id,
+            &agent_id,
+            &author_node_id,
+            &execution_id,
+        );
+        record_local_stigmergy_completion_if_applicable(
+            &state_clone.state_dir,
+            &state_clone.db_path,
+            &task_id,
+            &agent_id,
+            &author_node_id,
+            &execution_id,
+            &output_for_stigmergy,
+            StigmergyCompletionSource::CandidateProposed,
+        );
         Ok(json!({
             "ok": true,
             "task_id": task_id,

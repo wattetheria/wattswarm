@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::collections::HashMap;
+use wattswarm_control_plane::round_policy::RoundPolicy;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RetryPolicy {
@@ -218,11 +219,26 @@ pub struct RunSubmitSpec {
     pub task_type: String,
     #[serde(default = "default_shared_inputs")]
     pub shared_inputs: Value,
+    #[serde(default)]
     pub agents: Vec<RunAgentSpec>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub market_task_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub feed_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope_hint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub round_policy: Option<RoundPolicy>,
     #[serde(default)]
     pub retry: RetryPolicy,
     #[serde(default)]
     pub aggregation: AggregationPolicy,
+}
+
+impl RunSubmitSpec {
+    pub fn is_stigmergy(&self) -> bool {
+        self.round_policy.is_some()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
