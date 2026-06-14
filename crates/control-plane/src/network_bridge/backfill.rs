@@ -123,8 +123,11 @@ pub fn backfill_response_for_request(
     })
 }
 
-pub fn ingest_backfill_response(node: &mut Node, response: &BackfillResponse) -> Result<usize> {
-    let mut applied = 0usize;
+pub(super) fn ingest_backfill_response_events(
+    node: &mut Node,
+    response: &BackfillResponse,
+) -> Result<Vec<EventEnvelope>> {
+    let mut applied = Vec::new();
     for envelope in &response.events {
         if envelope.scope != response.scope {
             return Err(anyhow!("backfill response scope mismatch"));
@@ -142,10 +145,14 @@ pub fn ingest_backfill_response(node: &mut Node, response: &BackfillResponse) ->
             }
         }
         if ingest_event_envelope(node, envelope).is_ok() {
-            applied += 1;
+            applied.push(envelope.clone());
         }
     }
     Ok(applied)
+}
+
+pub fn ingest_backfill_response(node: &mut Node, response: &BackfillResponse) -> Result<usize> {
+    Ok(ingest_backfill_response_events(node, response)?.len())
 }
 
 pub(super) fn should_publish_summaries(head_seq: u64, from_event_seq: u64) -> bool {

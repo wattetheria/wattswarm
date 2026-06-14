@@ -21,12 +21,12 @@ use anyhow::{Context, Result, anyhow, bail};
 
 use crate::constants::BACKFILL_BATCH_EVENTS;
 use crate::network_p2p::{
-    BackfillRequest, BackfillRequestId, ContactMaterialRequestId, EventEnvelope, GossipKind,
-    GossipMessage, NetworkAddress, NetworkNodeId, NetworkP2pConfig, NetworkP2pNode, NetworkRuntime,
-    NetworkRuntimeEvent, PeerHandshakeMetadata, PeerRelationshipRequest, PeerRelationshipRequestId,
-    PeerRelationshipResponse, RawAgentEnvelope, RawContactMaterial, RawContactMaterialRequest,
-    RawContactMaterialResponse, RawPeerRelationshipAction, RawSourceAgentCard, SummaryAnnouncement,
-    SwarmScope,
+    BackfillRequest, BackfillRequestId, BackfillResponse, ContactMaterialRequestId, EventEnvelope,
+    GossipKind, GossipMessage, NetworkAddress, NetworkNodeId, NetworkP2pConfig, NetworkP2pNode,
+    NetworkRuntime, NetworkRuntimeEvent, PeerHandshakeMetadata, PeerRelationshipRequest,
+    PeerRelationshipRequestId, PeerRelationshipResponse, RawAgentEnvelope, RawContactMaterial,
+    RawContactMaterialRequest, RawContactMaterialResponse, RawPeerRelationshipAction,
+    RawSourceAgentCard, SummaryAnnouncement, SwarmScope,
 };
 use crate::node::Node;
 use serde::{Deserialize, Serialize};
@@ -84,8 +84,8 @@ use agent_delivery::{
     task_result_agent_event, task_settled_agent_event, topic_message_agent_event,
 };
 use backfill::{
-    BACKFILL_KNOWN_EVENT_IDS_LIMIT, recent_backfill_lane_event_ids, should_publish_summaries,
-    should_sync_event,
+    BACKFILL_KNOWN_EVENT_IDS_LIMIT, ingest_backfill_response_events,
+    recent_backfill_lane_event_ids, should_publish_summaries, should_sync_event,
 };
 use bootstrap_contact::{
     build_contact_material, candidate_peer_addrs, iroh_contact_network_peer_id,

@@ -811,7 +811,8 @@ impl NetworkBridgeService {
                     response.feed_key.as_deref(),
                     &response.head_event_ids,
                 );
-                let events = ingest_backfill_response(node, &response)?;
+                let applied_envelopes = ingest_backfill_response_events(node, &response)?;
+                let events = applied_envelopes.len();
                 let mut unknown_empty_head = false;
                 if response.events.is_empty() {
                     for event_id in &response.head_event_ids {
@@ -858,10 +859,7 @@ impl NetworkBridgeService {
                         })),
                     );
                 }
-                for envelope in &response.events {
-                    if !event_matches_signed_scope(&envelope.event, &response.scope) {
-                        continue;
-                    }
+                for envelope in &applied_envelopes {
                     diagnostics::record_diagnostic(
                         self.state_dir.as_deref(),
                         diagnostics::DiagnosticEvent::new(
@@ -911,10 +909,17 @@ impl NetworkBridgeService {
                         self.deliver_topic_message_agent_event(node, &envelope.event, payload);
                     }
                 }
+                let applied_response = BackfillResponse {
+                    scope: response.scope.clone(),
+                    next_from_event_seq: response.next_from_event_seq,
+                    feed_key: response.feed_key.clone(),
+                    head_event_ids: response.head_event_ids.clone(),
+                    events: applied_envelopes,
+                };
                 maybe_record_topic_cursor_for_response(
                     node,
                     &node.node_id(),
-                    &response,
+                    &applied_response,
                     observed_at_ms(),
                 )?;
                 self.record_scope_backfill_applied(&response.scope, events);

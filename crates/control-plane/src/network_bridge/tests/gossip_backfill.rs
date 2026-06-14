@@ -372,6 +372,81 @@ fn ingest_backfill_response_skips_feed_subscription_wrong_lane() {
 }
 
 #[test]
+fn backfill_skipped_feed_subscription_wrong_lane_does_not_write_event_diagnostic() {
+    let state_dir = temp_startup_dir("backfill-skipped-subscription-diagnostic");
+    let local = NodeIdentity::random();
+    let remote = NodeIdentity::random();
+    let membership = membership_with_roles(&[local.node_id(), remote.node_id()]);
+    let mut node =
+        Node::new(local, PgStore::open_in_memory().expect("store"), membership).expect("node");
+    let mut service = NetworkBridgeService::new(
+        test_network_node(NetworkP2pConfig {
+            listen_addrs: vec!["127.0.0.1:0".to_owned()],
+            bootstrap_peers: Vec::new(),
+            enable_local_discovery: false,
+            ..NetworkP2pConfig::default()
+        })
+        .expect("network node"),
+        &[SwarmScope::Global],
+        &crate::types::NetworkProtocolParams::default(),
+    )
+    .expect("service");
+    service.set_state_dir(state_dir.clone(), state_dir.join("ui.state"));
+    let payload = crate::types::EventPayload::FeedSubscriptionUpdated(
+        crate::types::FeedSubscriptionUpdatedPayload {
+            network_id: "default".to_owned(),
+            subscriber_node_id: remote.node_id(),
+            feed_key: "market.relay".to_owned(),
+            scope_hint: "group:crew-7".to_owned(),
+            gossip_kinds: vec!["events".to_owned()],
+            provider_capabilities: None,
+            agent_envelope: None,
+            active: true,
+        },
+    );
+    let unsigned = crate::types::UnsignedEvent::from_payload_with_scope(
+        crate::constants::LOCAL_PROTOCOL_VERSION.to_owned(),
+        remote.node_id(),
+        1,
+        10,
+        "global".to_owned(),
+        payload,
+    );
+    let event = remote.sign_unsigned_event(&unsigned).expect("event");
+
+    let tick = service
+        .handle_runtime_event(
+            &mut node,
+            Ok(NetworkRuntimeEvent::BackfillResponse {
+                peer: random_network_node_id(),
+                request_id: BackfillRequestId::new(1),
+                response: crate::network_p2p::BackfillResponse {
+                    scope: SwarmScope::Global,
+                    next_from_event_seq: 1,
+                    feed_key: None,
+                    head_event_ids: Vec::new(),
+                    events: vec![EventEnvelope {
+                        scope: SwarmScope::Global,
+                        event,
+                        content_source_node_id: None,
+                    }],
+                },
+            }),
+        )
+        .expect("process backfill response");
+
+    assert!(matches!(
+        tick,
+        NetworkBridgeTick::BackfillApplied { events: 0, .. }
+    ));
+    assert!(node.store.load_all_events().expect("events").is_empty());
+    let diagnostics_path = state_dir.join("diagnostics/wattswarm_node.jsonl");
+    let diagnostics = fs::read_to_string(diagnostics_path).unwrap_or_default();
+    assert!(!diagnostics.contains("event.ingest.backfill"));
+    assert!(!diagnostics.contains("FeedSubscriptionUpdated"));
+}
+
+#[test]
 fn topic_backfill_response_filters_by_feed_key() {
     let mut node = Node::open_in_memory_with_roles(&[Role::Proposer]).expect("node");
     node.emit_at(

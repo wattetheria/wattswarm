@@ -63,9 +63,16 @@ pub(super) fn feed_subscription_target_scope(
 }
 
 pub(super) fn event_matches_signed_scope(event: &crate::types::Event, scope: &SwarmScope) -> bool {
-    signed_event_scope(event)
-        .as_ref()
-        .is_some_and(|signed_scope| signed_scope == scope)
+    let Some(signed_scope) = signed_event_scope(event) else {
+        return false;
+    };
+    if signed_scope != *scope {
+        return false;
+    }
+    if let Some(declared_scope) = event_payload_declared_scope(&event.payload) {
+        return declared_scope.is_some_and(|declared_scope| declared_scope == signed_scope);
+    }
+    true
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -155,6 +162,47 @@ fn route_for_scope(
 
 fn signed_event_scope(event: &crate::types::Event) -> Option<SwarmScope> {
     parse_scope_hint_string(&event.swarm_scope)
+}
+
+fn scope_hint_to_swarm_scope(scope: crate::types::ScopeHint) -> SwarmScope {
+    match scope {
+        crate::types::ScopeHint::Global => SwarmScope::Global,
+        crate::types::ScopeHint::Region(id) => SwarmScope::Region(id),
+        crate::types::ScopeHint::Node(id) => SwarmScope::Node(id),
+        crate::types::ScopeHint::Group(id) => SwarmScope::Group(id),
+    }
+}
+
+fn optional_scope_hint_to_swarm_scope(
+    scope: Option<crate::types::ScopeHint>,
+) -> Option<SwarmScope> {
+    scope.map(scope_hint_to_swarm_scope)
+}
+
+fn event_payload_declared_scope(
+    payload: &crate::types::EventPayload,
+) -> Option<Option<SwarmScope>> {
+    match payload {
+        crate::types::EventPayload::FeedSubscriptionUpdated(payload) => {
+            Some(feed_subscription_target_scope(payload))
+        }
+        crate::types::EventPayload::TaskAnnounced(payload) => {
+            Some(optional_scope_hint_to_swarm_scope(payload.scope()))
+        }
+        crate::types::EventPayload::ExecutionIntentDeclared(payload) => {
+            Some(optional_scope_hint_to_swarm_scope(payload.scope()))
+        }
+        crate::types::EventPayload::ExecutionSetConfirmed(payload) => {
+            Some(optional_scope_hint_to_swarm_scope(payload.scope()))
+        }
+        crate::types::EventPayload::TopicMessagePosted(payload) => {
+            Some(optional_scope_hint_to_swarm_scope(payload.scope()))
+        }
+        crate::types::EventPayload::AgentPaymentPosted(payload) => {
+            Some(Some(scope_hint_to_swarm_scope(payload.scope())))
+        }
+        _ => None,
+    }
 }
 
 fn is_public_global_control_event(payload: &crate::types::EventPayload) -> bool {
