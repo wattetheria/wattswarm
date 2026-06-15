@@ -38,6 +38,11 @@ impl NetworkBridgeService {
         peer_ids.dedup();
 
         let now = Instant::now();
+        let connected_peer_count = self
+            .connected_peers
+            .iter()
+            .filter(|peer| self.peer_recently_seen_at(peer, now))
+            .count();
         let mut peer_health = Vec::with_capacity(peer_ids.len());
         for peer in peer_ids {
             let traffic = traffic_scores.get(&peer);
@@ -58,12 +63,23 @@ impl NetworkBridgeService {
                 })
                 .unwrap_or_default();
             known_scopes.sort();
+            let peer_id = peer.parse::<NetworkNodeId>().ok();
+            let mesh_connected = peer_id
+                .as_ref()
+                .is_some_and(|peer_id| self.connected_peers.contains(peer_id));
+            let recently_seen = peer_id
+                .as_ref()
+                .is_some_and(|peer_id| self.peer_recently_seen_at(peer_id, now));
+            let last_seen_age_ms = sync.map(|state| {
+                now.saturating_duration_since(state.last_seen_at)
+                    .as_millis() as u64
+            });
             peer_health.push(NetworkBridgePeerHealth {
                 network_peer_id: peer.clone(),
-                connected: self
-                    .connected_peers
-                    .iter()
-                    .any(|peer_id| peer_id.to_string() == peer),
+                connected: mesh_connected && recently_seen,
+                recently_seen,
+                stale: mesh_connected && !recently_seen,
+                last_seen_age_ms,
                 score: traffic.map_or(0, |entry| entry.score),
                 blacklisted: traffic.is_some_and(|entry| entry.blacklisted),
                 reputation_tier: traffic
@@ -111,7 +127,7 @@ impl NetworkBridgeService {
                 .iter()
                 .map(scope_hint_label)
                 .collect(),
-            connected_peer_count: self.connected_peers.len(),
+            connected_peer_count,
             nat_status: runtime.nat_status,
             nat_public_address: runtime.nat_public_address,
             nat_confidence: runtime.nat_confidence,
@@ -486,6 +502,9 @@ impl NetworkBridgeService {
                 if require_known_scope && !state.known_scopes.contains(scope) {
                     return false;
                 }
+                if !state.recently_seen_at(now) {
+                    return false;
+                }
                 state.inflight_backfills() < MAX_INFLIGHT_BACKFILLS_PER_PEER
                     && state.next_retry_at <= now
                     && state.backfill_peer_available_at(now)
@@ -494,16 +513,33 @@ impl NetworkBridgeService {
                         now.duration_since(last) >= self.anti_entropy_interval
                     })
             }
-            None => !require_known_scope,
+            None => false,
         }
     }
 
-    pub(crate) fn record_peer_scope_activity(&mut self, peer: NetworkNodeId, scope: &SwarmScope) {
+    pub(crate) fn peer_recently_seen_at(&self, peer: &NetworkNodeId, now: Instant) -> bool {
+        self.peer_sync_state
+            .get(peer)
+            .is_some_and(|state| state.recently_seen_at(now))
+    }
+
+    pub(crate) fn record_peer_liveness(&mut self, peer: NetworkNodeId) {
+        let now = Instant::now();
         self.peer_sync_state
             .entry(peer)
-            .or_insert_with(|| PeerSyncState::new(Instant::now()))
-            .known_scopes
-            .insert(scope.clone());
+            .or_insert_with(|| PeerSyncState::new(now))
+            .record_seen_at(now);
+        self.persist_peer_sync_state();
+    }
+
+    pub(crate) fn record_peer_scope_activity(&mut self, peer: NetworkNodeId, scope: &SwarmScope) {
+        let now = Instant::now();
+        let state = self
+            .peer_sync_state
+            .entry(peer)
+            .or_insert_with(|| PeerSyncState::new(now));
+        state.record_seen_at(now);
+        state.known_scopes.insert(scope.clone());
         self.persist_peer_sync_state();
     }
 
@@ -565,14 +601,33 @@ impl NetworkBridgeService {
     }
 
     pub(crate) fn mark_peer_connected(&mut self, peer: NetworkNodeId) -> bool {
+        let now = Instant::now();
         let inserted = self.connected_peers.insert(peer.clone());
         self.peer_sync_state
             .entry(peer.clone())
-            .or_insert_with(|| PeerSyncState::new(Instant::now()));
+            .or_insert_with(|| PeerSyncState::new(now))
+            .record_seen_at(now);
         self.peer_reconnect_state.remove(&peer);
         self.abandoned_reconnect_peers.remove(&peer);
         self.persist_peer_sync_state();
         inserted
+    }
+
+    pub(crate) fn expire_stale_connected_peers(&mut self, now: Instant) -> usize {
+        let stale_peers = self
+            .connected_peers
+            .iter()
+            .filter(|peer| !self.peer_recently_seen_at(peer, now))
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut expired = 0usize;
+        for peer in stale_peers {
+            if self.mark_peer_disconnected(peer.clone()) {
+                self.schedule_peer_reconnect(peer);
+                expired += 1;
+            }
+        }
+        expired
     }
 
     pub(crate) fn mark_peer_disconnected(&mut self, peer: NetworkNodeId) -> bool {

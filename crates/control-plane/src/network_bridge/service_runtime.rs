@@ -772,6 +772,7 @@ impl NetworkBridgeService {
                 request,
                 request_id,
             } => {
+                self.record_peer_liveness(peer.clone());
                 let response = if self.inbound_backfill_authorized(&peer, &request) {
                     backfill_response_for_request(
                         node,
@@ -970,6 +971,7 @@ impl NetworkBridgeService {
                 request,
                 request_id,
             } => {
+                self.record_peer_liveness(peer.clone());
                 let local_node_id = self.local_peer_id().to_string();
                 let now = observed_at_ms();
                 let response = if request.source_node_id != peer.to_string() {
@@ -1014,6 +1016,7 @@ impl NetworkBridgeService {
                 request_id,
                 response,
             } => {
+                self.record_peer_liveness(peer.clone());
                 let Some(pending) = self.pending_contact_material_requests.remove(&request_id)
                 else {
                     return Ok(NetworkBridgeTick::TransportNotice {
@@ -1103,6 +1106,7 @@ impl NetworkBridgeService {
                 request,
                 request_id,
             } => {
+                self.record_peer_liveness(peer.clone());
                 let action = control_peer_relationship_action(request.action);
                 let local_node_id = self.local_peer_id().to_string();
                 let now = observed_at_ms();
@@ -1394,6 +1398,7 @@ impl NetworkBridgeService {
                 request_id,
                 response,
             } => {
+                self.record_peer_liveness(peer.clone());
                 let Some(pending) = self.pending_relationship_requests.remove(&request_id) else {
                     return Ok(NetworkBridgeTick::TransportNotice {
                         detail: format!(

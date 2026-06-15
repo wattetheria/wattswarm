@@ -532,6 +532,9 @@ fn run_background_network_service_with_hook(
         if processed_pending_commands > 0 {
             did_work = true;
         }
+        if service.expire_stale_connected_peers(Instant::now()) > 0 {
+            did_work = true;
+        }
         match service
             .run_reconnect_supervision()
             .context("network bridge run reconnect supervision")

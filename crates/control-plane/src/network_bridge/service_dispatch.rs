@@ -397,7 +397,7 @@ impl NetworkBridgeService {
         peer: &NetworkNodeId,
         remote_node_id: &str,
     ) -> Result<()> {
-        if self.connected_peers.contains(peer) {
+        if self.connected_peers.contains(peer) && self.peer_recently_seen_at(peer, Instant::now()) {
             return Ok(());
         }
         for addr in candidate_peer_addrs(state_dir, remote_node_id)? {
@@ -429,10 +429,14 @@ impl NetworkBridgeService {
         let peer = remote_node_id
             .parse::<NetworkNodeId>()
             .map_err(|err| anyhow!("parse remote_node_id as iroh node id: {err}"))?;
-        if !self.connected_peers.contains(&peer) {
+        if !self.connected_peers.contains(&peer)
+            || !self.peer_recently_seen_at(&peer, Instant::now())
+        {
             self.ensure_peer_connected(state_dir, &peer, remote_node_id)?;
         }
-        if !self.connected_peers.contains(&peer) {
+        if !self.connected_peers.contains(&peer)
+            || !self.peer_recently_seen_at(&peer, Instant::now())
+        {
             self.schedule_peer_reconnect(peer.clone());
             bail!("{operation} require a connected peer");
         }

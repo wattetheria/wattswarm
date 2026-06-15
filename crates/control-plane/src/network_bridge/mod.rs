@@ -143,6 +143,7 @@ const BACKFILL_LANE_COOLDOWN_INITIAL: Duration = BACKFILL_REQUEST_TIMEOUT;
 const BACKFILL_LANE_COOLDOWN_MAX: Duration = Duration::from_secs(300);
 const BACKFILL_PEER_COOLDOWN_INITIAL: Duration = BACKFILL_REQUEST_TIMEOUT;
 const BACKFILL_PEER_COOLDOWN_MAX: Duration = Duration::from_secs(300);
+const PEER_LAST_SEEN_TTL: Duration = Duration::from_secs(180);
 const SUMMARY_BACKPRESSURE_HIGH_WATERMARK: u64 = 256;
 const IDLE_NETWORK_SLEEP: Duration = Duration::from_millis(50);
 const ANNOUNCED_PEER_TTL: Duration = Duration::from_secs(60 * 60);
@@ -463,6 +464,7 @@ impl BackfillLaneKey {
 
 #[derive(Debug, Clone)]
 struct PeerSyncState {
+    last_seen_at: Instant,
     last_backfill_request_at: Option<Instant>,
     next_retry_at: Instant,
     known_scopes: HashSet<SwarmScope>,
@@ -587,6 +589,7 @@ impl PeerReconnectState {
 impl PeerSyncState {
     fn new(now: Instant) -> Self {
         Self {
+            last_seen_at: now,
             last_backfill_request_at: None,
             next_retry_at: now,
             known_scopes: HashSet::new(),
@@ -598,6 +601,14 @@ impl PeerSyncState {
             backfill_successes: 0,
             backfill_failures: 0,
         }
+    }
+
+    fn record_seen_at(&mut self, now: Instant) {
+        self.last_seen_at = now;
+    }
+
+    fn recently_seen_at(&self, now: Instant) -> bool {
+        now.saturating_duration_since(self.last_seen_at) <= PEER_LAST_SEEN_TTL
     }
 
     fn inflight_backfills(&self) -> usize {
@@ -1063,6 +1074,9 @@ pub struct ScopeTrafficStats {
 pub struct NetworkBridgePeerHealth {
     pub network_peer_id: String,
     pub connected: bool,
+    pub recently_seen: bool,
+    pub stale: bool,
+    pub last_seen_age_ms: Option<u64>,
     pub score: i64,
     pub blacklisted: bool,
     pub reputation_tier: String,

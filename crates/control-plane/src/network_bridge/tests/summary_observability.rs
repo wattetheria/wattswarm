@@ -661,6 +661,9 @@ fn observability_snapshot_reports_network_and_sync_health() {
     assert_eq!(snapshot.nat_confidence, 0);
     assert_eq!(snapshot.peer_health.len(), 1);
     assert!(snapshot.peer_health[0].connected);
+    assert!(snapshot.peer_health[0].recently_seen);
+    assert!(!snapshot.peer_health[0].stale);
+    assert!(snapshot.peer_health[0].last_seen_age_ms.is_some());
     assert!(!snapshot.peer_health[0].blacklisted);
     assert_eq!(snapshot.peer_health[0].score, 0);
     assert_eq!(snapshot.peer_health[0].reputation_tier, "healthy");
@@ -985,6 +988,9 @@ fn latest_connected_peer_ids_uses_runtime_observability_snapshot() {
                 NetworkBridgePeerHealth {
                     network_peer_id: "peer-connected".to_owned(),
                     connected: true,
+                    recently_seen: true,
+                    stale: false,
+                    last_seen_age_ms: Some(12),
                     score: 0,
                     blacklisted: false,
                     reputation_tier: "healthy".to_owned(),
@@ -999,6 +1005,9 @@ fn latest_connected_peer_ids_uses_runtime_observability_snapshot() {
                 NetworkBridgePeerHealth {
                     network_peer_id: "peer-disconnected".to_owned(),
                     connected: false,
+                    recently_seen: false,
+                    stale: true,
+                    last_seen_age_ms: Some(181_000),
                     score: 0,
                     blacklisted: false,
                     reputation_tier: "healthy".to_owned(),

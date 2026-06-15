@@ -21,7 +21,7 @@ fn register_contacted_peer(
         .runtime
         .upsert_remote_contact_material(peer.to_string(), contact)
         .expect("upsert contact");
-    service.connected_peers.insert(peer.clone());
+    service.mark_peer_connected(peer.clone());
     (dir, peer)
 }
 
@@ -152,6 +152,62 @@ fn scoped_backfill_requires_known_scope_but_global_allows_unknown_connected_peer
         service.preferred_backfill_peer_for_scope(&target_scope, now),
         Some(peer.clone())
     );
+
+    wattswarm_network_transport_iroh::shutdown_local_iroh_data_plane(&dir);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn stale_connected_peer_is_not_backfill_eligible_until_liveness_refresh() {
+    let mut service = NetworkBridgeService::new(
+        test_network_node(NetworkP2pConfig::default()).expect("node"),
+        &[SwarmScope::Global],
+        &NetworkProtocolParams::default(),
+    )
+    .expect("service");
+    let (dir, peer) =
+        register_contacted_peer(&mut service, "stale-connected-peer-backfill", [47_u8; 32]);
+    let now = Instant::now();
+    let mut state = PeerSyncState::new(now - PEER_LAST_SEEN_TTL - Duration::from_secs(1));
+    state.known_scopes.insert(SwarmScope::Global);
+    service.peer_sync_state.insert(peer.clone(), state);
+
+    assert_eq!(
+        service.preferred_backfill_peer_for_scope(&SwarmScope::Global, now),
+        None
+    );
+
+    service.record_peer_liveness(peer.clone());
+
+    assert_eq!(
+        service.preferred_backfill_peer_for_scope(&SwarmScope::Global, Instant::now()),
+        Some(peer.clone())
+    );
+
+    wattswarm_network_transport_iroh::shutdown_local_iroh_data_plane(&dir);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn stale_connected_peer_expires_and_becomes_reconnect_candidate() {
+    let mut service = NetworkBridgeService::new(
+        test_network_node(NetworkP2pConfig::default()).expect("node"),
+        &[SwarmScope::Global],
+        &NetworkProtocolParams::default(),
+    )
+    .expect("service");
+    let (dir, peer) =
+        register_contacted_peer(&mut service, "stale-connected-peer-expire", [48_u8; 32]);
+    let now = Instant::now();
+    service
+        .peer_sync_state
+        .get_mut(&peer)
+        .expect("peer state")
+        .last_seen_at = now - PEER_LAST_SEEN_TTL - Duration::from_secs(1);
+
+    assert_eq!(service.expire_stale_connected_peers(now), 1);
+    assert!(!service.connected_peers.contains(&peer));
+    assert_eq!(service.reconnect_attempts_for_peer(&peer), Some(0));
 
     wattswarm_network_transport_iroh::shutdown_local_iroh_data_plane(&dir);
     let _ = std::fs::remove_dir_all(dir);
