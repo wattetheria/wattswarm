@@ -150,8 +150,11 @@ pub struct SubstrateRuntime {
     control_rx: Receiver<SubstrateRuntimeEvent>,
     pending_events: VecDeque<SubstrateRuntimeEvent>,
     remote_contacts: HashMap<String, TransportContactMaterial>,
+    /// Per-peer count of gossip topic memberships. iroh-gossip multiplexes all
+    /// of a peer's topics over one endpoint connection, so a peer is surfaced as
+    /// a single logical connection: ConnectionEstablished on the 0->1 topic
+    /// transition, ConnectionClosed on the N->0 transition.
     established_per_peer: HashMap<NetworkNodeId, u32>,
-    suppressed_established_per_peer: HashMap<NetworkNodeId, u32>,
     counters: IrohRuntimeCounters,
     next_request_id: u64,
 }
@@ -192,7 +195,6 @@ impl SubstrateRuntime {
             pending_events: VecDeque::new(),
             remote_contacts: HashMap::new(),
             established_per_peer: HashMap::new(),
-            suppressed_established_per_peer: HashMap::new(),
             counters: IrohRuntimeCounters::default(),
             next_request_id: 1,
         };
@@ -760,19 +762,15 @@ impl SubstrateRuntime {
                 }
                 IrohGossipInbound::NeighborUp { peer } => {
                     let peer = NetworkNodeId::new(peer)?;
-                    let established = self.established_per_peer.get(&peer).copied().unwrap_or(0);
-                    if established >= self.config.max_established_per_peer {
-                        self.suppressed_established_per_peer
-                            .entry(peer)
-                            .and_modify(|count| *count = count.saturating_add(1))
-                            .or_insert(1);
-                        self.counters.request_limit_drops =
-                            self.counters.request_limit_drops.saturating_add(1);
+                    // Count topic memberships per peer, but surface only one
+                    // peer-level connection. iroh-gossip shares a single endpoint
+                    // connection across every topic, so additional topic
+                    // neighborships must not be reported as new connections.
+                    let established = self.established_per_peer.entry(peer.clone()).or_insert(0);
+                    *established = established.saturating_add(1);
+                    if *established > 1 {
                         continue;
                     }
-                    let next_established = established.saturating_add(1);
-                    self.established_per_peer
-                        .insert(peer.clone(), next_established);
                     let remote_addr = self
                         .remote_contacts
                         .get(peer.as_str())
@@ -790,13 +788,6 @@ impl SubstrateRuntime {
                 }
                 IrohGossipInbound::NeighborDown { peer } => {
                     let peer = NetworkNodeId::new(peer)?;
-                    if let Some(suppressed) = self.suppressed_established_per_peer.get_mut(&peer) {
-                        *suppressed = suppressed.saturating_sub(1);
-                        if *suppressed == 0 {
-                            self.suppressed_established_per_peer.remove(&peer);
-                        }
-                        continue;
-                    }
                     let remaining_established = match self.established_per_peer.get_mut(&peer) {
                         Some(established) => {
                             *established = established.saturating_sub(1);
@@ -806,12 +797,16 @@ impl SubstrateRuntime {
                             }
                             remaining
                         }
-                        None => 0,
+                        None => continue,
                     };
+                    // Keep the peer connection until it leaves its last topic.
+                    if remaining_established > 0 {
+                        continue;
+                    }
                     self.pending_events
                         .push_back(SubstrateRuntimeEvent::ConnectionClosed {
                             peer,
-                            remaining_established,
+                            remaining_established: 0,
                         });
                 }
                 IrohGossipInbound::Malformed {
@@ -1120,20 +1115,18 @@ mod tests {
             pending_events: VecDeque::new(),
             remote_contacts: HashMap::new(),
             established_per_peer: HashMap::new(),
-            suppressed_established_per_peer: HashMap::new(),
             counters: IrohRuntimeCounters::default(),
             next_request_id: 1,
         }
     }
 
     #[test]
-    fn neighbor_events_respect_max_established_per_peer() {
+    fn neighbor_events_dedupe_peer_connection_across_topics() {
         let peer = NetworkNodeId::random();
-        let mut runtime = runtime_for_test(SubstrateConfig {
-            max_established_per_peer: 1,
-            ..SubstrateConfig::default()
-        });
+        let mut runtime = runtime_for_test(SubstrateConfig::default());
 
+        // A peer joining a second topic mesh must not surface as a second
+        // connection: iroh-gossip multiplexes all topics over one connection.
         runtime
             .gossip_tx
             .send(IrohGossipInbound::NeighborUp {
@@ -1154,7 +1147,6 @@ mod tests {
             other => panic!("expected first connection, got {other:?}"),
         }
         assert!(runtime.try_next_event().unwrap().is_none());
-        assert_eq!(runtime.counters.request_limit_drops, 1);
 
         runtime
             .gossip_tx
