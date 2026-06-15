@@ -209,6 +209,7 @@ impl NetworkBridgeService {
                 .or_insert_with(|| PeerSyncState::new(now));
             if state.inflight_backfills() >= MAX_INFLIGHT_BACKFILLS_PER_PEER
                 || (!ignore_retry_delay && state.next_retry_at > now)
+                || !state.backfill_peer_available_at(now)
             {
                 return Ok(false);
             }
@@ -253,7 +254,10 @@ impl NetworkBridgeService {
             let scope_hint = scope_hint_label(&scope);
             let request_scope_history =
                 scope == SwarmScope::Global || self.subscribed_scope_kinds.contains_key(&scope);
-            if request_scope_history {
+            if request_scope_history
+                && self.peer_backfill_available(peer, now)
+                && self.peer_backfill_lane_available(peer, &scope, None, now)
+            {
                 let from_event_seq = self
                     .peer_sync_state
                     .get(peer)
@@ -286,6 +290,17 @@ impl NetworkBridgeService {
             {
                 if requests_sent >= available_slots {
                     break 'scopes;
+                }
+                if !self.peer_backfill_available(peer, now) {
+                    break 'scopes;
+                }
+                if !self.peer_backfill_lane_available(
+                    peer,
+                    &scope,
+                    Some(&subscription.feed_key),
+                    now,
+                ) {
+                    continue;
                 }
                 let from_event_seq = self.peer_sync_state.get(peer).map_or(0, |state| {
                     state.backfill_cursor(&scope, Some(&subscription.feed_key))
@@ -378,8 +393,30 @@ impl NetworkBridgeService {
         now: Instant,
     ) -> Option<NetworkNodeId> {
         let peers = self.connected_peers.iter().cloned().collect::<Vec<_>>();
-        self.best_peer_for_scope(peers.iter().cloned(), scope, now, true)
-            .or_else(|| self.best_peer_for_scope(peers.into_iter(), scope, now, false))
+        if *scope == SwarmScope::Global {
+            return self
+                .best_peer_for_scope(peers.iter().cloned(), scope, now, true)
+                .or_else(|| self.best_peer_for_scope(peers.into_iter(), scope, now, false));
+        }
+        self.best_peer_for_scope(peers.into_iter(), scope, now, true)
+    }
+
+    fn peer_backfill_available(&self, peer: &NetworkNodeId, now: Instant) -> bool {
+        self.peer_sync_state
+            .get(peer)
+            .is_none_or(|state| state.backfill_peer_available_at(now))
+    }
+
+    fn peer_backfill_lane_available(
+        &self,
+        peer: &NetworkNodeId,
+        scope: &SwarmScope,
+        feed_key: Option<&str>,
+        now: Instant,
+    ) -> bool {
+        self.peer_sync_state
+            .get(peer)
+            .is_none_or(|state| state.backfill_lane_available_at(scope, feed_key, now))
     }
 
     pub(crate) fn best_peer_for_scope<I>(
@@ -451,6 +488,8 @@ impl NetworkBridgeService {
                 }
                 state.inflight_backfills() < MAX_INFLIGHT_BACKFILLS_PER_PEER
                     && state.next_retry_at <= now
+                    && state.backfill_peer_available_at(now)
+                    && state.backfill_lane_available_at(scope, None, now)
                     && state.last_backfill_request_at.map_or(true, |last| {
                         now.duration_since(last) >= self.anti_entropy_interval
                     })
@@ -540,6 +579,7 @@ impl NetworkBridgeService {
         let removed = self.connected_peers.remove(&peer);
         if let Some(state) = self.peer_sync_state.get_mut(&peer) {
             state.inflight_backfill_requests.clear();
+            state.clear_backfill_recovery_probes();
         }
         self.pending_relationship_requests
             .retain(|_, pending| pending.peer != peer);
@@ -738,13 +778,11 @@ impl NetworkBridgeService {
         request_id: BackfillRequestId,
     ) {
         if let Some(state) = self.peer_sync_state.get_mut(&peer) {
-            let was_pending = state
-                .inflight_backfill_requests
-                .remove(&request_id)
-                .is_some();
+            let was_pending = state.record_backfill_request_completed(request_id);
             state.next_retry_at = Instant::now() + self.anti_entropy_interval;
             if was_pending {
                 state.backfill_successes = state.backfill_successes.saturating_add(1);
+                state.backfill_failures = 0;
             }
         }
         self.persist_peer_sync_state();
@@ -796,13 +834,14 @@ impl NetworkBridgeService {
         peer: NetworkNodeId,
         request_id: BackfillRequestId,
     ) {
+        let now = Instant::now();
         if let Some(state) = self.peer_sync_state.get_mut(&peer) {
             let was_pending = state
-                .inflight_backfill_requests
-                .remove(&request_id)
+                .record_backfill_request_failed_at(request_id, now)
                 .is_some();
             if was_pending {
-                state.next_retry_at = Instant::now() + self.backfill_retry_after;
+                state.record_peer_backfill_timeout_at(now);
+                state.next_retry_at = now + self.backfill_retry_after;
                 state.backfill_failures = state.backfill_failures.saturating_add(1);
             }
         }
@@ -830,15 +869,18 @@ impl NetworkBridgeService {
         if expired.is_empty() {
             return 0;
         }
+        let mut peer_cooldowns = HashMap::new();
         for (peer, request_id, scope, feed_key) in &expired {
+            let mut cooldown_event = None;
             if let Some(state) = self.peer_sync_state.get_mut(peer)
-                && state
-                    .inflight_backfill_requests
-                    .remove(request_id)
-                    .is_some()
+                && let Some(event) = state.record_backfill_request_failed_at(*request_id, now)
             {
+                peer_cooldowns
+                    .entry(peer.clone())
+                    .or_insert_with(|| state.record_peer_backfill_timeout_at(now));
                 state.next_retry_at = now + self.backfill_retry_after;
                 state.backfill_failures = state.backfill_failures.saturating_add(1);
+                cooldown_event = Some(event);
             }
             diagnostics::record_diagnostic(
                 self.state_dir.as_deref(),
@@ -856,6 +898,16 @@ impl NetworkBridgeService {
                     "request_id": request_id.to_string(),
                     "feed_key": feed_key,
                     "timeout_ms": timeout.as_millis(),
+                    "cooldown_ms": cooldown_event.map(|event| {
+                        u64::try_from(event.cooldown.as_millis()).unwrap_or(u64::MAX)
+                    }),
+                    "recovery_probe": cooldown_event.is_some_and(|event| event.was_recovery_probe),
+                    "peer_cooldown_ms": peer_cooldowns.get(peer).map(|event| {
+                        u64::try_from(event.cooldown.as_millis()).unwrap_or(u64::MAX)
+                    }),
+                    "peer_recovery_probe": peer_cooldowns
+                        .get(peer)
+                        .is_some_and(|event| event.was_recovery_probe),
                 })),
             );
         }

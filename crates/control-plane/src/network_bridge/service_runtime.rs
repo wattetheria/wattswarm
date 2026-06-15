@@ -437,6 +437,12 @@ impl NetworkBridgeService {
                 }
                 Ok(NetworkBridgeTick::Connected { peer })
             }
+            NetworkRuntimeEvent::GossipNeighborUp { peer, scope, kind } => {
+                self.record_peer_scope_activity(peer.clone(), &scope);
+                Ok(NetworkBridgeTick::TransportNotice {
+                    detail: format!("gossip_neighbor_up peer={peer} scope={scope:?} kind={kind:?}"),
+                })
+            }
             NetworkRuntimeEvent::PeerHandshakeRejected { peer, detail } => {
                 self.mark_peer_disconnected(peer.clone());
                 if let Some(state_dir) = &self.state_dir {

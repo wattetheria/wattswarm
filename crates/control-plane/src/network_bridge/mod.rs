@@ -139,6 +139,10 @@ const AGENT_PAYMENT_SUMMARY_KIND: &str = "agent_payment_session_v1";
 const CORE_AGENT_EXECUTOR_NAME: &str = "core-agent";
 const MAX_INFLIGHT_BACKFILLS_PER_PEER: usize = 8;
 const BACKFILL_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+const BACKFILL_LANE_COOLDOWN_INITIAL: Duration = BACKFILL_REQUEST_TIMEOUT;
+const BACKFILL_LANE_COOLDOWN_MAX: Duration = Duration::from_secs(300);
+const BACKFILL_PEER_COOLDOWN_INITIAL: Duration = BACKFILL_REQUEST_TIMEOUT;
+const BACKFILL_PEER_COOLDOWN_MAX: Duration = Duration::from_secs(300);
 const SUMMARY_BACKPRESSURE_HIGH_WATERMARK: u64 = 256;
 const IDLE_NETWORK_SLEEP: Duration = Duration::from_millis(50);
 const ANNOUNCED_PEER_TTL: Duration = Duration::from_secs(60 * 60);
@@ -464,9 +468,79 @@ struct PeerSyncState {
     known_scopes: HashSet<SwarmScope>,
     backfill_cursors: HashMap<BackfillLaneKey, u64>,
     remote_head_event_ids: HashMap<BackfillLaneKey, Vec<String>>,
+    backfill_lane_health: HashMap<BackfillLaneKey, BackfillCooldownHealth>,
+    backfill_peer_health: BackfillCooldownHealth,
     inflight_backfill_requests: HashMap<BackfillRequestId, PendingBackfillRequest>,
     backfill_successes: u64,
     backfill_failures: u64,
+}
+
+#[derive(Debug, Clone)]
+struct BackfillCooldownHealth {
+    cooldown_until: Option<Instant>,
+    cooldown: Duration,
+    recovery_probe_inflight: bool,
+}
+
+impl BackfillCooldownHealth {
+    fn new() -> Self {
+        Self {
+            cooldown_until: None,
+            cooldown: Duration::ZERO,
+            recovery_probe_inflight: false,
+        }
+    }
+
+    fn can_request_at(&self, now: Instant) -> bool {
+        if self.cooldown_until.is_some_and(|until| until > now) {
+            return false;
+        }
+        !self.recovery_probe_inflight
+    }
+
+    fn claim_request_at(&mut self, now: Instant) {
+        if self.cooldown_until.is_some_and(|until| until <= now) {
+            self.recovery_probe_inflight = true;
+        }
+    }
+
+    fn record_timeout_at(
+        &mut self,
+        now: Instant,
+        initial: Duration,
+        max: Duration,
+    ) -> BackfillCooldownEvent {
+        let was_recovery_probe = self.recovery_probe_inflight;
+        let previous = self.cooldown;
+        let cooldown = if previous.is_zero() {
+            initial
+        } else {
+            previous.checked_mul(2).unwrap_or(max).min(max)
+        };
+        self.cooldown = cooldown;
+        self.cooldown_until = Some(now + cooldown);
+        self.recovery_probe_inflight = false;
+        BackfillCooldownEvent {
+            cooldown,
+            was_recovery_probe,
+        }
+    }
+
+    fn clear_recovery_probe(&mut self) {
+        self.recovery_probe_inflight = false;
+    }
+
+    fn clear(&mut self) {
+        self.cooldown_until = None;
+        self.cooldown = Duration::ZERO;
+        self.recovery_probe_inflight = false;
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct BackfillCooldownEvent {
+    cooldown: Duration,
+    was_recovery_probe: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -474,6 +548,12 @@ struct PendingBackfillRequest {
     scope: SwarmScope,
     feed_key: Option<String>,
     sent_at: Instant,
+}
+
+impl PendingBackfillRequest {
+    fn lane_key(&self) -> BackfillLaneKey {
+        BackfillLaneKey::new(&self.scope, self.feed_key.as_deref())
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -512,6 +592,8 @@ impl PeerSyncState {
             known_scopes: HashSet::new(),
             backfill_cursors: HashMap::new(),
             remote_head_event_ids: HashMap::new(),
+            backfill_lane_health: HashMap::new(),
+            backfill_peer_health: BackfillCooldownHealth::new(),
             inflight_backfill_requests: HashMap::new(),
             backfill_successes: 0,
             backfill_failures: 0,
@@ -529,6 +611,11 @@ impl PeerSyncState {
         feed_key: Option<String>,
         sent_at: Instant,
     ) {
+        self.backfill_peer_health.claim_request_at(sent_at);
+        let lane = BackfillLaneKey::new(&scope, feed_key.as_deref());
+        if let Some(health) = self.backfill_lane_health.get_mut(&lane) {
+            health.claim_request_at(sent_at);
+        }
         self.inflight_backfill_requests.insert(
             request_id,
             PendingBackfillRequest {
@@ -537,6 +624,64 @@ impl PeerSyncState {
                 sent_at,
             },
         );
+    }
+
+    fn backfill_peer_available_at(&self, now: Instant) -> bool {
+        self.backfill_peer_health.can_request_at(now)
+    }
+
+    fn backfill_lane_available_at(
+        &self,
+        scope: &SwarmScope,
+        feed_key: Option<&str>,
+        now: Instant,
+    ) -> bool {
+        self.backfill_lane_health
+            .get(&BackfillLaneKey::new(scope, feed_key))
+            .is_none_or(|health| health.can_request_at(now))
+    }
+
+    fn record_backfill_request_completed(&mut self, request_id: BackfillRequestId) -> bool {
+        let Some(pending) = self.inflight_backfill_requests.remove(&request_id) else {
+            return false;
+        };
+        self.backfill_lane_health.remove(&pending.lane_key());
+        self.backfill_peer_health.clear();
+        true
+    }
+
+    fn record_backfill_request_failed_at(
+        &mut self,
+        request_id: BackfillRequestId,
+        now: Instant,
+    ) -> Option<BackfillCooldownEvent> {
+        let pending = self.inflight_backfill_requests.remove(&request_id)?;
+        let lane = pending.lane_key();
+        Some(
+            self.backfill_lane_health
+                .entry(lane)
+                .or_insert_with(BackfillCooldownHealth::new)
+                .record_timeout_at(
+                    now,
+                    BACKFILL_LANE_COOLDOWN_INITIAL,
+                    BACKFILL_LANE_COOLDOWN_MAX,
+                ),
+        )
+    }
+
+    fn record_peer_backfill_timeout_at(&mut self, now: Instant) -> BackfillCooldownEvent {
+        self.backfill_peer_health.record_timeout_at(
+            now,
+            BACKFILL_PEER_COOLDOWN_INITIAL,
+            BACKFILL_PEER_COOLDOWN_MAX,
+        )
+    }
+
+    fn clear_backfill_recovery_probes(&mut self) {
+        self.backfill_peer_health.clear_recovery_probe();
+        for health in self.backfill_lane_health.values_mut() {
+            health.clear_recovery_probe();
+        }
     }
 
     fn backfill_cursor(&self, scope: &SwarmScope, feed_key: Option<&str>) -> u64 {

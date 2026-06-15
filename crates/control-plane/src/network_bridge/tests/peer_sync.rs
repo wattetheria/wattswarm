@@ -1,5 +1,30 @@
 use super::*;
 
+fn register_contacted_peer(
+    service: &mut NetworkBridgeService,
+    label: &str,
+    seed: [u8; 32],
+) -> (PathBuf, NetworkNodeId) {
+    let dir = temp_startup_dir(label);
+    std::fs::write(dir.join("node_seed.hex"), hex::encode(seed)).expect("write seed");
+    ensure_test_relay_urls(&dir);
+    let peer = NetworkNodeId::new(
+        wattswarm_network_transport_iroh::local_endpoint_id_from_state_dir(&dir)
+            .expect("peer endpoint")
+            .to_string(),
+    )
+    .expect("peer id");
+    let contact =
+        export_local_contact_material_for_network_peer_id(&dir, peer.as_str(), observed_at_ms())
+            .expect("contact");
+    service
+        .runtime
+        .upsert_remote_contact_material(peer.to_string(), contact)
+        .expect("upsert contact");
+    service.connected_peers.insert(peer.clone());
+    (dir, peer)
+}
+
 #[test]
 fn smarter_backfill_prefers_peer_with_known_scope_activity() {
     let dir_a = temp_startup_dir("backfill-peer-a");
@@ -68,6 +93,68 @@ fn smarter_backfill_prefers_peer_with_known_scope_activity() {
     wattswarm_network_transport_iroh::shutdown_local_iroh_data_plane(&dir_b);
     let _ = std::fs::remove_dir_all(dir_a);
     let _ = std::fs::remove_dir_all(dir_b);
+}
+
+#[test]
+fn scoped_backfill_requires_known_scope_but_global_allows_unknown_connected_peer() {
+    let dir = temp_startup_dir("backfill-peer-unknown-scope");
+    std::fs::write(dir.join("node_seed.hex"), hex::encode([44_u8; 32])).expect("write seed");
+    ensure_test_relay_urls(&dir);
+    let peer = NetworkNodeId::new(
+        wattswarm_network_transport_iroh::local_endpoint_id_from_state_dir(&dir)
+            .expect("peer endpoint")
+            .to_string(),
+    )
+    .expect("peer id");
+    let contact =
+        export_local_contact_material_for_network_peer_id(&dir, peer.as_str(), observed_at_ms())
+            .expect("contact");
+    let target_scope = SwarmScope::Group("crew-7".to_owned());
+    let now = Instant::now();
+    let mut node = Node::open_in_memory_with_roles(&[Role::Proposer]).expect("node");
+
+    let mut service = NetworkBridgeService::new(
+        test_network_node(NetworkP2pConfig::default()).expect("node"),
+        &[SwarmScope::Global, target_scope.clone()],
+        &NetworkProtocolParams::default(),
+    )
+    .expect("service");
+    service
+        .runtime
+        .upsert_remote_contact_material(peer.to_string(), contact)
+        .expect("upsert contact");
+    service.connected_peers.insert(peer.clone());
+    service.peer_sync_state.insert(
+        peer.clone(),
+        PeerSyncState::new(now - Duration::from_secs(30)),
+    );
+
+    assert_eq!(
+        service.preferred_backfill_peer_for_scope(&SwarmScope::Global, now),
+        Some(peer.clone())
+    );
+    assert_eq!(
+        service.preferred_backfill_peer_for_scope(&target_scope, now),
+        None
+    );
+
+    service
+        .handle_runtime_event(
+            &mut node,
+            Ok(NetworkRuntimeEvent::GossipNeighborUp {
+                peer: peer.clone(),
+                scope: target_scope.clone(),
+                kind: GossipKind::Events,
+            }),
+        )
+        .expect("gossip neighbor up");
+    assert_eq!(
+        service.preferred_backfill_peer_for_scope(&target_scope, now),
+        Some(peer.clone())
+    );
+
+    wattswarm_network_transport_iroh::shutdown_local_iroh_data_plane(&dir);
+    let _ = std::fs::remove_dir_all(dir);
 }
 
 #[test]
@@ -388,9 +475,210 @@ fn stale_backfill_requests_expire_and_release_peer_slot() {
     let state = service.peer_sync_state.get(&peer).expect("peer state");
     assert_eq!(state.inflight_backfills(), 0);
     assert_eq!(state.backfill_failures, 1);
+    let lane = BackfillLaneKey::new(&SwarmScope::Global, None);
+    let health = state
+        .backfill_lane_health
+        .get(&lane)
+        .expect("global lane health");
+    assert_eq!(health.cooldown, BACKFILL_LANE_COOLDOWN_INITIAL);
+    assert!(health.cooldown_until.is_some());
     let raw = fs::read_to_string(state_dir.join("diagnostics/wattswarm_node.jsonl"))
         .expect("diagnostics");
     assert!(raw.contains("\"phase\":\"request.timeout\""));
+    assert!(raw.contains("\"cooldown_ms\":30000"));
+}
+
+#[test]
+fn backfill_timeout_cools_lane_and_removes_peer_from_selection_until_probe_window() {
+    let now = Instant::now();
+    let mut service = NetworkBridgeService::new(
+        test_network_node(NetworkP2pConfig::default()).expect("node"),
+        &[SwarmScope::Global],
+        &NetworkProtocolParams::default(),
+    )
+    .expect("service");
+    let (dir, peer) =
+        register_contacted_peer(&mut service, "backfill-timeout-cools-peer", [45_u8; 32]);
+    let mut state = PeerSyncState::new(now - Duration::from_secs(60));
+    state.record_pending_backfill(
+        BackfillRequestId::new(100),
+        SwarmScope::Global,
+        None,
+        now - BACKFILL_REQUEST_TIMEOUT,
+    );
+    service.peer_sync_state.insert(peer.clone(), state);
+
+    assert_eq!(
+        service.preferred_backfill_peer_for_scope(&SwarmScope::Global, now),
+        Some(peer.clone())
+    );
+    assert_eq!(
+        service.expire_stale_backfill_requests(now, Duration::from_millis(1)),
+        1
+    );
+    assert_eq!(
+        service.preferred_backfill_peer_for_scope(&SwarmScope::Global, now),
+        None
+    );
+
+    let probe_at = now + BACKFILL_LANE_COOLDOWN_INITIAL + Duration::from_millis(1);
+    assert_eq!(
+        service.preferred_backfill_peer_for_scope(&SwarmScope::Global, probe_at),
+        Some(peer.clone())
+    );
+    service
+        .peer_sync_state
+        .get_mut(&peer)
+        .expect("peer state")
+        .record_pending_backfill(
+            BackfillRequestId::new(101),
+            SwarmScope::Global,
+            None,
+            probe_at,
+        );
+    assert_eq!(
+        service.preferred_backfill_peer_for_scope(&SwarmScope::Global, probe_at),
+        None
+    );
+
+    wattswarm_network_transport_iroh::shutdown_local_iroh_data_plane(&dir);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn multi_lane_backfill_timeouts_cool_peer_once_and_allow_single_probe() {
+    let now = Instant::now() - BACKFILL_PEER_COOLDOWN_INITIAL - Duration::from_secs(1);
+    let global = SwarmScope::Global;
+    let crew_a = SwarmScope::Group("crew-a".to_owned());
+    let crew_b = SwarmScope::Group("crew-b".to_owned());
+    let node = Node::open_in_memory_with_roles(&[Role::Proposer]).expect("node");
+    let mut service = NetworkBridgeService::new(
+        test_network_node(NetworkP2pConfig::default()).expect("node"),
+        &[global.clone(), crew_a.clone(), crew_b.clone()],
+        &NetworkProtocolParams::default(),
+    )
+    .expect("service");
+    let (dir, peer) = register_contacted_peer(
+        &mut service,
+        "backfill-timeout-cools-peer-once",
+        [46_u8; 32],
+    );
+    let mut state = PeerSyncState::new(now - Duration::from_secs(60));
+    for (offset, scope) in [global.clone(), crew_a.clone(), crew_b.clone()]
+        .into_iter()
+        .enumerate()
+    {
+        state.record_pending_backfill(
+            BackfillRequestId::new(400 + offset as u64),
+            scope,
+            None,
+            now - BACKFILL_REQUEST_TIMEOUT,
+        );
+    }
+    service.peer_sync_state.insert(peer.clone(), state);
+
+    assert_eq!(
+        service.expire_stale_backfill_requests(now, Duration::from_millis(1)),
+        3
+    );
+    let state = service.peer_sync_state.get(&peer).expect("peer state");
+    assert_eq!(
+        state.backfill_peer_health.cooldown,
+        BACKFILL_PEER_COOLDOWN_INITIAL
+    );
+    assert!(state.backfill_peer_health.cooldown_until.is_some());
+    assert_eq!(
+        service.preferred_backfill_peer_for_scope(&global, now),
+        None
+    );
+
+    let probe_at = now + BACKFILL_PEER_COOLDOWN_INITIAL + Duration::from_millis(1);
+    assert_eq!(
+        service.preferred_backfill_peer_for_scope(&global, probe_at),
+        Some(peer.clone())
+    );
+    assert!(
+        service
+            .request_backfill_scopes_for_peer_now(
+                &peer,
+                &node,
+                &[global.clone(), crew_a.clone(), crew_b.clone()],
+            )
+            .expect("request probe")
+    );
+    let state = service.peer_sync_state.get(&peer).expect("peer state");
+    assert_eq!(state.inflight_backfills(), 1);
+    assert!(!state.backfill_peer_available_at(probe_at));
+
+    wattswarm_network_transport_iroh::shutdown_local_iroh_data_plane(&dir);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn failed_recovery_probe_extends_backfill_lane_cooldown() {
+    let now = Instant::now();
+    let mut state = PeerSyncState::new(now);
+    state.record_pending_backfill(
+        BackfillRequestId::new(200),
+        SwarmScope::Global,
+        None,
+        now - BACKFILL_REQUEST_TIMEOUT,
+    );
+    let first = state
+        .record_backfill_request_failed_at(BackfillRequestId::new(200), now)
+        .expect("first timeout");
+    assert_eq!(first.cooldown, BACKFILL_LANE_COOLDOWN_INITIAL);
+    assert!(!first.was_recovery_probe);
+
+    let probe_at = now + BACKFILL_LANE_COOLDOWN_INITIAL + Duration::from_millis(1);
+    state.record_pending_backfill(
+        BackfillRequestId::new(201),
+        SwarmScope::Global,
+        None,
+        probe_at,
+    );
+    let second = state
+        .record_backfill_request_failed_at(BackfillRequestId::new(201), probe_at)
+        .expect("probe timeout");
+    assert_eq!(second.cooldown, BACKFILL_LANE_COOLDOWN_INITIAL * 2);
+    assert!(second.was_recovery_probe);
+}
+
+#[test]
+fn successful_recovery_probe_clears_backfill_lane_cooldown() {
+    let now = Instant::now();
+    let mut state = PeerSyncState::new(now);
+    state.record_pending_backfill(
+        BackfillRequestId::new(300),
+        SwarmScope::Global,
+        None,
+        now - BACKFILL_REQUEST_TIMEOUT,
+    );
+    state
+        .record_backfill_request_failed_at(BackfillRequestId::new(300), now)
+        .expect("first timeout");
+    state.record_peer_backfill_timeout_at(now);
+
+    let probe_at = now + BACKFILL_LANE_COOLDOWN_INITIAL + Duration::from_millis(1);
+    state.record_pending_backfill(
+        BackfillRequestId::new(301),
+        SwarmScope::Global,
+        None,
+        probe_at,
+    );
+    assert!(
+        state
+            .backfill_lane_health
+            .contains_key(&BackfillLaneKey::new(&SwarmScope::Global, None))
+    );
+    assert!(state.record_backfill_request_completed(BackfillRequestId::new(301)));
+    assert!(state.backfill_peer_available_at(probe_at));
+    assert_eq!(state.backfill_peer_health.cooldown, Duration::ZERO);
+    assert!(
+        !state
+            .backfill_lane_health
+            .contains_key(&BackfillLaneKey::new(&SwarmScope::Global, None))
+    );
 }
 
 #[test]

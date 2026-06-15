@@ -335,6 +335,11 @@ pub enum NetworkRuntimeEvent {
         peer: NetworkNodeId,
         remote_addr: NetworkAddress,
     },
+    GossipNeighborUp {
+        peer: NetworkNodeId,
+        scope: SwarmScope,
+        kind: GossipKind,
+    },
     ConnectionClosed {
         peer: NetworkNodeId,
         remaining_established: u32,
@@ -648,6 +653,9 @@ impl NetworkRuntime {
             }
             SubstrateRuntimeEvent::ConnectionEstablished { peer, remote_addr } => {
                 NetworkRuntimeEvent::ConnectionEstablished { peer, remote_addr }
+            }
+            SubstrateRuntimeEvent::GossipNeighborUp { peer, scope, kind } => {
+                NetworkRuntimeEvent::GossipNeighborUp { peer, scope, kind }
             }
             SubstrateRuntimeEvent::ConnectionClosed {
                 peer,

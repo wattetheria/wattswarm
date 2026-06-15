@@ -19,6 +19,11 @@ pub enum SubstrateRuntimeEvent {
         peer: NetworkNodeId,
         remote_addr: NetworkAddress,
     },
+    GossipNeighborUp {
+        peer: NetworkNodeId,
+        scope: SwarmScope,
+        kind: GossipKind,
+    },
     ConnectionClosed {
         peer: NetworkNodeId,
         remaining_established: u32,
@@ -123,6 +128,7 @@ enum IrohGossipInbound {
         bytes: Vec<u8>,
     },
     NeighborUp {
+        subscription: IrohGossipSubscription,
         peer: String,
     },
     NeighborDown {
@@ -760,33 +766,36 @@ impl SubstrateRuntime {
                             message,
                         });
                 }
-                IrohGossipInbound::NeighborUp { peer } => {
+                IrohGossipInbound::NeighborUp { subscription, peer } => {
                     let peer = NetworkNodeId::new(peer)?;
+                    self.pending_events
+                        .push_back(SubstrateRuntimeEvent::GossipNeighborUp {
+                            peer: peer.clone(),
+                            scope: subscription.scope.clone(),
+                            kind: subscription.kind,
+                        });
                     // Count topic memberships per peer, but surface only one
                     // peer-level connection. iroh-gossip shares a single endpoint
                     // connection across every topic, so additional topic
                     // neighborships must not be reported as new connections.
                     let established = self.established_per_peer.entry(peer.clone()).or_insert(0);
                     *established = established.saturating_add(1);
-                    if *established > 1 {
-                        continue;
+                    if *established == 1 {
+                        let remote_addr = self
+                            .remote_contacts
+                            .get(peer.as_str())
+                            .and_then(|contact| contact.metadata.listen_addrs.first())
+                            .and_then(|addr| NetworkAddress::new(addr.clone()).ok())
+                            .unwrap_or_else(|| {
+                                NetworkAddress::new(peer.to_string())
+                                    .expect("iroh node id is a network address")
+                            });
+                        self.pending_events.push_back(
+                            SubstrateRuntimeEvent::ConnectionEstablished { peer, remote_addr },
+                        );
                     }
-                    let remote_addr = self
-                        .remote_contacts
-                        .get(peer.as_str())
-                        .and_then(|contact| contact.metadata.listen_addrs.first())
-                        .and_then(|addr| NetworkAddress::new(addr.clone()).ok())
-                        .unwrap_or_else(|| {
-                            NetworkAddress::new(peer.to_string())
-                                .expect("iroh node id is a network address")
-                        });
-                    self.pending_events
-                        .push_back(SubstrateRuntimeEvent::ConnectionEstablished {
-                            peer,
-                            remote_addr,
-                        });
                 }
-                IrohGossipInbound::NeighborDown { peer } => {
+                IrohGossipInbound::NeighborDown { peer, .. } => {
                     let peer = NetworkNodeId::new(peer)?;
                     let remaining_established = match self.established_per_peer.get_mut(&peer) {
                         Some(established) => {
@@ -1022,6 +1031,7 @@ impl SubstrateRuntime {
                     Ok(IrohGossipEvent::NeighborUp(peer)) => {
                         if inbound_tx
                             .send(IrohGossipInbound::NeighborUp {
+                                subscription: task_subscription.clone(),
                                 peer: peer.to_string(),
                             })
                             .is_err()
@@ -1124,27 +1134,61 @@ mod tests {
     fn neighbor_events_dedupe_peer_connection_across_topics() {
         let peer = NetworkNodeId::random();
         let mut runtime = runtime_for_test(SubstrateConfig::default());
+        let global_events = runtime
+            .subscription_for(&SwarmScope::Global, GossipKind::Events)
+            .expect("global subscription");
+        let group_events = runtime
+            .subscription_for(&SwarmScope::Group("crew-7".to_owned()), GossipKind::Events)
+            .expect("group subscription");
 
         // A peer joining a second topic mesh must not surface as a second
         // connection: iroh-gossip multiplexes all topics over one connection.
         runtime
             .gossip_tx
             .send(IrohGossipInbound::NeighborUp {
-                peer: peer.to_string(),
-            })
-            .unwrap();
-        runtime
-            .gossip_tx
-            .send(IrohGossipInbound::NeighborUp {
+                subscription: global_events.clone(),
                 peer: peer.to_string(),
             })
             .unwrap();
 
         match runtime.try_next_event().unwrap() {
+            Some(SubstrateRuntimeEvent::GossipNeighborUp {
+                peer: got,
+                scope,
+                kind,
+            }) => {
+                assert_eq!(got, peer);
+                assert_eq!(scope, global_events.scope);
+                assert_eq!(kind, global_events.kind);
+            }
+            other => panic!("expected first gossip neighbor, got {other:?}"),
+        }
+        match runtime.try_next_event().unwrap() {
             Some(SubstrateRuntimeEvent::ConnectionEstablished { peer: got, .. }) => {
                 assert_eq!(got, peer)
             }
             other => panic!("expected first connection, got {other:?}"),
+        }
+        assert!(runtime.try_next_event().unwrap().is_none());
+
+        runtime
+            .gossip_tx
+            .send(IrohGossipInbound::NeighborUp {
+                subscription: group_events.clone(),
+                peer: peer.to_string(),
+            })
+            .unwrap();
+        match runtime.try_next_event().unwrap() {
+            Some(SubstrateRuntimeEvent::GossipNeighborUp {
+                peer: got,
+                scope,
+                kind,
+            }) => {
+                assert_eq!(got, peer);
+                assert_eq!(scope, group_events.scope);
+                assert_eq!(kind, group_events.kind);
+            }
+            other => panic!("expected second gossip neighbor, got {other:?}"),
         }
         assert!(runtime.try_next_event().unwrap().is_none());
 
