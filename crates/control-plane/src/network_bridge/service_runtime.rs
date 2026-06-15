@@ -555,7 +555,6 @@ impl NetworkBridgeService {
                 propagation_source,
                 message,
             } => {
-                self.connected_peers.insert(propagation_source.clone());
                 if let Some(state_dir) = self.state_dir.clone()
                     && let Err(err) =
                         self.ensure_peer_relay_contact_material(&state_dir, &propagation_source)
@@ -565,6 +564,7 @@ impl NetworkBridgeService {
                     );
                 }
                 if let Some(state_dir) = self.state_dir.clone()
+                    && self.connected_peers.contains(&propagation_source)
                     && peer_metadata_needs_private_message_contact_material(
                         &state_dir,
                         &propagation_source,

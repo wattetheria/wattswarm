@@ -339,7 +339,6 @@ fn network_params_update_event_syncs_over_global_backfill_and_updates_control_lo
         .expect("receiver v1 params");
 
     let params = crate::types::NetworkProtocolParams {
-        max_established_per_peer: 4,
         gossip_mesh_d: 8,
         gossip_mesh_d_low: 5,
         gossip_mesh_d_high: 16,
@@ -395,7 +394,7 @@ fn network_params_update_event_syncs_over_global_backfill_and_updates_control_lo
         .load_verified_network_protocol_params()
         .expect("receiver verified params");
     assert_eq!(verified.signed.params_hash, signed.params_hash);
-    assert_eq!(verified.signed.params.max_established_per_peer, 4);
+    assert!(verified.signed.params_kv.is_some());
     assert_eq!(verified.signed.params.gossip_mesh_d_high, 16);
     let records = receiver
         .store

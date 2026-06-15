@@ -1,7 +1,7 @@
 use serde::ser::SerializeStruct;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 fn dedup_preserve_order<I>(values: I) -> Vec<String>
 where
@@ -1722,8 +1722,9 @@ pub struct NetworkProtocolParams {
     #[serde(default = "default_network_protocol_version")]
     pub protocol_version: String,
 
-    /// Maximum number of simultaneously established connections allowed
-    /// to the same peer.
+    /// Deprecated. Kept for legacy signed envelopes and persisted params.
+    /// Runtime connection accounting is peer-level and no longer governed
+    /// by this protocol parameter.
     #[serde(default = "default_max_established_per_peer")]
     pub max_established_per_peer: u32,
 
@@ -1776,6 +1777,8 @@ pub struct NetworkProtocolParams {
     #[serde(default = "default_summary_decision_memory_limit")]
     pub summary_decision_memory_limit: u32,
 }
+
+pub type NetworkProtocolParamsMap = BTreeMap<String, Value>;
 
 fn default_namespace_network() -> String {
     "wattswarm".to_owned()
@@ -2198,6 +2201,224 @@ impl Default for NetworkProtocolParams {
     }
 }
 
+impl NetworkProtocolParams {
+    pub fn to_kv_map(&self) -> NetworkProtocolParamsMap {
+        let mut params = NetworkProtocolParamsMap::new();
+        params.insert(
+            "namespace_network".to_owned(),
+            Value::String(self.namespace_network.clone()),
+        );
+        params.insert(
+            "protocol_version".to_owned(),
+            Value::String(self.protocol_version.clone()),
+        );
+        params.insert(
+            "anti_entropy_interval_secs".to_owned(),
+            serde_json::json!(self.anti_entropy_interval_secs),
+        );
+        params.insert(
+            "backfill_retry_after_secs".to_owned(),
+            serde_json::json!(self.backfill_retry_after_secs),
+        );
+        params.insert(
+            "gossip_mesh_d".to_owned(),
+            serde_json::json!(self.gossip_mesh_d),
+        );
+        params.insert(
+            "gossip_mesh_d_low".to_owned(),
+            serde_json::json!(self.gossip_mesh_d_low),
+        );
+        params.insert(
+            "gossip_mesh_d_high".to_owned(),
+            serde_json::json!(self.gossip_mesh_d_high),
+        );
+        params.insert(
+            "gossip_mesh_heartbeat_ms".to_owned(),
+            serde_json::json!(self.gossip_mesh_heartbeat_ms),
+        );
+        params.insert(
+            "gossip_mesh_max_transmit_size".to_owned(),
+            serde_json::json!(self.gossip_mesh_max_transmit_size),
+        );
+        params.insert(
+            "default_max_backfill_events".to_owned(),
+            serde_json::json!(self.default_max_backfill_events),
+        );
+        params.insert(
+            "max_backfill_events_hard_limit".to_owned(),
+            serde_json::json!(self.max_backfill_events_hard_limit),
+        );
+        params.insert(
+            "summary_reputation_limit".to_owned(),
+            serde_json::json!(self.summary_reputation_limit),
+        );
+        params.insert(
+            "summary_decision_memory_limit".to_owned(),
+            serde_json::json!(self.summary_decision_memory_limit),
+        );
+        params
+    }
+
+    pub fn from_kv_map(params: &NetworkProtocolParamsMap) -> Result<Self, String> {
+        let defaults = Self::default();
+        Ok(Self {
+            namespace_network: param_value(
+                params,
+                "namespace_network",
+                defaults.namespace_network,
+            )?,
+            protocol_version: param_value(params, "protocol_version", defaults.protocol_version)?,
+            max_established_per_peer: defaults.max_established_per_peer,
+            anti_entropy_interval_secs: param_value(
+                params,
+                "anti_entropy_interval_secs",
+                defaults.anti_entropy_interval_secs,
+            )?,
+            backfill_retry_after_secs: param_value(
+                params,
+                "backfill_retry_after_secs",
+                defaults.backfill_retry_after_secs,
+            )?,
+            gossip_mesh_d: param_value(params, "gossip_mesh_d", defaults.gossip_mesh_d)?,
+            gossip_mesh_d_low: param_value(
+                params,
+                "gossip_mesh_d_low",
+                defaults.gossip_mesh_d_low,
+            )?,
+            gossip_mesh_d_high: param_value(
+                params,
+                "gossip_mesh_d_high",
+                defaults.gossip_mesh_d_high,
+            )?,
+            gossip_mesh_heartbeat_ms: param_value(
+                params,
+                "gossip_mesh_heartbeat_ms",
+                defaults.gossip_mesh_heartbeat_ms,
+            )?,
+            gossip_mesh_max_transmit_size: param_value(
+                params,
+                "gossip_mesh_max_transmit_size",
+                defaults.gossip_mesh_max_transmit_size,
+            )?,
+            default_max_backfill_events: param_value(
+                params,
+                "default_max_backfill_events",
+                defaults.default_max_backfill_events,
+            )?,
+            max_backfill_events_hard_limit: param_value(
+                params,
+                "max_backfill_events_hard_limit",
+                defaults.max_backfill_events_hard_limit,
+            )?,
+            summary_reputation_limit: param_value(
+                params,
+                "summary_reputation_limit",
+                defaults.summary_reputation_limit,
+            )?,
+            summary_decision_memory_limit: param_value(
+                params,
+                "summary_decision_memory_limit",
+                defaults.summary_decision_memory_limit,
+            )?,
+        })
+    }
+
+    pub fn canonicalize_kv_map(
+        params: &NetworkProtocolParamsMap,
+    ) -> Result<NetworkProtocolParamsMap, String> {
+        let projected = Self::from_kv_map(params)?;
+        let mut canonical = params.clone();
+        canonical.remove("max_established_per_peer");
+        normalize_param(
+            &mut canonical,
+            "namespace_network",
+            projected.namespace_network,
+        );
+        normalize_param(
+            &mut canonical,
+            "protocol_version",
+            projected.protocol_version,
+        );
+        normalize_param(
+            &mut canonical,
+            "anti_entropy_interval_secs",
+            projected.anti_entropy_interval_secs,
+        );
+        normalize_param(
+            &mut canonical,
+            "backfill_retry_after_secs",
+            projected.backfill_retry_after_secs,
+        );
+        normalize_param(&mut canonical, "gossip_mesh_d", projected.gossip_mesh_d);
+        normalize_param(
+            &mut canonical,
+            "gossip_mesh_d_low",
+            projected.gossip_mesh_d_low,
+        );
+        normalize_param(
+            &mut canonical,
+            "gossip_mesh_d_high",
+            projected.gossip_mesh_d_high,
+        );
+        normalize_param(
+            &mut canonical,
+            "gossip_mesh_heartbeat_ms",
+            projected.gossip_mesh_heartbeat_ms,
+        );
+        normalize_param(
+            &mut canonical,
+            "gossip_mesh_max_transmit_size",
+            projected.gossip_mesh_max_transmit_size,
+        );
+        normalize_param(
+            &mut canonical,
+            "default_max_backfill_events",
+            projected.default_max_backfill_events,
+        );
+        normalize_param(
+            &mut canonical,
+            "max_backfill_events_hard_limit",
+            projected.max_backfill_events_hard_limit,
+        );
+        normalize_param(
+            &mut canonical,
+            "summary_reputation_limit",
+            projected.summary_reputation_limit,
+        );
+        normalize_param(
+            &mut canonical,
+            "summary_decision_memory_limit",
+            projected.summary_decision_memory_limit,
+        );
+        Ok(canonical)
+    }
+}
+
+fn param_value<T>(params: &NetworkProtocolParamsMap, key: &str, default: T) -> Result<T, String>
+where
+    T: for<'de> Deserialize<'de>,
+{
+    params
+        .get(key)
+        .cloned()
+        .map(serde_json::from_value)
+        .transpose()
+        .map_err(|err| format!("network params key {key} has invalid value: {err}"))?
+        .map_or(Ok(default), Ok)
+}
+
+fn normalize_param<T>(params: &mut NetworkProtocolParamsMap, key: &str, value: T)
+where
+    T: Serialize,
+{
+    if params.contains_key(key) {
+        params.insert(
+            key.to_owned(),
+            serde_json::to_value(value).expect("network protocol param value serializes"),
+        );
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UnsignedNetworkProtocolParamsEnvelope {
     pub network_id: String,
@@ -2208,12 +2429,23 @@ pub struct UnsignedNetworkProtocolParamsEnvelope {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UnsignedNetworkProtocolParamsKvEnvelope {
+    pub network_id: String,
+    pub version: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prev_hash: Option<String>,
+    pub params_kv: NetworkProtocolParamsMap,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SignedNetworkProtocolParamsEnvelope {
     pub network_id: String,
     pub version: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prev_hash: Option<String>,
     pub params_hash: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub params_kv: Option<NetworkProtocolParamsMap>,
     pub params: NetworkProtocolParams,
     pub signed_by: String,
     pub signature: String,
@@ -2228,4 +2460,37 @@ impl SignedNetworkProtocolParamsEnvelope {
             params: self.params.clone(),
         }
     }
+
+    pub fn unsigned_kv_payload(&self) -> Option<UnsignedNetworkProtocolParamsKvEnvelope> {
+        self.params_kv
+            .clone()
+            .map(|params_kv| UnsignedNetworkProtocolParamsKvEnvelope {
+                network_id: self.network_id.clone(),
+                version: self.version,
+                prev_hash: self.prev_hash.clone(),
+                params_kv,
+            })
+    }
+
+    pub fn effective_kv_map(&self) -> NetworkProtocolParamsMap {
+        self.params_kv
+            .clone()
+            .unwrap_or_else(|| self.params.to_kv_map())
+    }
+}
+
+pub fn network_protocol_params_kv_from_value(
+    value: Value,
+) -> Result<NetworkProtocolParamsMap, String> {
+    let Value::Object(obj) = value else {
+        return Err("network params must be a JSON object".to_owned());
+    };
+    if obj.contains_key("params_hash") && obj.contains_key("signed_by") {
+        let signed: SignedNetworkProtocolParamsEnvelope =
+            serde_json::from_value(Value::Object(obj))
+                .map_err(|err| format!("invalid signed network params envelope: {err}"))?;
+        return NetworkProtocolParams::canonicalize_kv_map(&signed.effective_kv_map());
+    }
+    let params = obj.into_iter().collect::<NetworkProtocolParamsMap>();
+    NetworkProtocolParams::canonicalize_kv_map(&params)
 }

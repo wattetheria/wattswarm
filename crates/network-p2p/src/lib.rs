@@ -240,7 +240,6 @@ impl NetworkP2pConfig {
             network_id,
         };
         self.protocol_version = params.protocol_version.clone();
-        self.max_established_per_peer = params.max_established_per_peer;
         self.gossip_mesh_d = params.gossip_mesh_d;
         self.gossip_mesh_d_low = params.gossip_mesh_d_low;
         self.gossip_mesh_d_high = params.gossip_mesh_d_high;
@@ -884,7 +883,7 @@ mod tests {
         });
         assert_eq!(config.namespace.network, "swarmnet");
         assert_eq!(config.protocol_version, "/swarmnet/1");
-        assert_eq!(config.max_established_per_peer, 4);
+        assert_eq!(config.max_established_per_peer, 2);
         assert_eq!(config.gossip_mesh_d, 9);
         assert_eq!(config.gossip_mesh_d_low, 7);
         assert_eq!(config.gossip_mesh_d_high, 12);
@@ -894,7 +893,7 @@ mod tests {
         assert_eq!(config.max_backfill_events_hard_limit, 4096);
 
         let substrate = config.as_substrate();
-        assert_eq!(substrate.max_established_per_peer, 4);
+        assert_eq!(substrate.max_established_per_peer, 2);
         assert_eq!(substrate.gossip_mesh_d, 9);
         assert_eq!(substrate.gossip_mesh_d_low, 7);
         assert_eq!(substrate.gossip_mesh_d_high, 12);

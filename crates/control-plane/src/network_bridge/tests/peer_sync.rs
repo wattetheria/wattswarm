@@ -71,6 +71,74 @@ fn smarter_backfill_prefers_peer_with_known_scope_activity() {
 }
 
 #[test]
+fn gossip_source_does_not_mark_peer_connected_for_backfill() {
+    let dir = temp_startup_dir("gossip-source-not-connected");
+    std::fs::write(dir.join("node_seed.hex"), hex::encode([43_u8; 32])).expect("write seed");
+    ensure_test_relay_urls(&dir);
+    let peer = NetworkNodeId::new(
+        wattswarm_network_transport_iroh::local_endpoint_id_from_state_dir(&dir)
+            .expect("peer endpoint")
+            .to_string(),
+    )
+    .expect("peer id");
+    let contact =
+        export_local_contact_material_for_network_peer_id(&dir, peer.as_str(), observed_at_ms())
+            .expect("contact");
+    let target_scope = SwarmScope::Group("crew-7".to_owned());
+    let remote = NodeIdentity::random();
+    let remote_event = build_event_for_external(
+        &remote,
+        1,
+        10,
+        crate::types::EventPayload::FeedSubscriptionUpdated(
+            crate::types::FeedSubscriptionUpdatedPayload {
+                network_id: "default".to_owned(),
+                subscriber_node_id: remote.node_id(),
+                feed_key: "crew.chat".to_owned(),
+                scope_hint: "group:crew-7".to_owned(),
+                gossip_kinds: vec!["events".to_owned()],
+                provider_capabilities: None,
+                agent_envelope: None,
+                active: true,
+            },
+        ),
+    )
+    .expect("signed event");
+    let mut node = Node::open_in_memory_with_roles(&[Role::Proposer]).expect("node");
+    let mut service = NetworkBridgeService::new(
+        test_network_node(NetworkP2pConfig::default()).expect("node"),
+        &[SwarmScope::Global, target_scope.clone()],
+        &NetworkProtocolParams::default(),
+    )
+    .expect("service");
+    service
+        .runtime
+        .upsert_remote_contact_material(peer.to_string(), contact)
+        .expect("upsert contact");
+
+    service
+        .handle_runtime_event(
+            &mut node,
+            Ok(NetworkRuntimeEvent::Gossip {
+                propagation_source: peer.clone(),
+                message: GossipMessage::Event(EventEnvelope {
+                    scope: target_scope.clone(),
+                    event: remote_event,
+                    content_source_node_id: None,
+                }),
+            }),
+        )
+        .expect("gossip event");
+
+    assert!(service.peer_has_scope_activity(&peer, &target_scope));
+    assert!(!service.connected_peers.contains(&peer));
+    assert_eq!(service.run_anti_entropy(&node).expect("anti entropy"), 0);
+
+    wattswarm_network_transport_iroh::shutdown_local_iroh_data_plane(&dir);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
 fn peer_backfill_cursor_is_tracked_per_scope_and_feed() {
     let scope = SwarmScope::Group("crew-7".to_owned());
     let mut state = PeerSyncState::new(Instant::now());

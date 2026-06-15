@@ -10,8 +10,8 @@ use wattswarm::cli::sample_contract;
 use wattswarm::crypto::NodeIdentity;
 use wattswarm::policy::PolicyRegistry;
 use wattswarm::types::{
-    AuthorityMember, AuthoritySet, Membership, NetworkProtocolParams, Role,
-    SignedNetworkAuthoritySetEnvelope, SignedNetworkProtocolParamsEnvelope,
+    AuthorityMember, AuthoritySet, Membership, Role, SignedNetworkAuthoritySetEnvelope,
+    SignedNetworkProtocolParamsEnvelope,
 };
 use wattswarm::{control::NodeMode, storage::PgStore};
 use wattswarm_storage_core::storage::pg::Connection;
@@ -614,10 +614,14 @@ fn cli_node_sign_network_params_updates_signed_envelope() {
     assert_eq!(first.prev_hash, None);
     assert_eq!(first.signed_by, genesis_node_id);
 
-    let params = NetworkProtocolParams {
-        max_established_per_peer: 3,
-        ..first.params.clone()
-    };
+    let mut params = serde_json::to_value(first.params.clone())
+        .unwrap()
+        .as_object()
+        .unwrap()
+        .clone();
+    params.insert("gossip_mesh_d".to_owned(), serde_json::json!(7));
+    params.insert("future_window_size".to_owned(), serde_json::json!(42));
+    params.insert("max_established_per_peer".to_owned(), serde_json::json!(3));
     let params_file = dir.path().join("network-params.json");
     std::fs::write(&params_file, serde_json::to_vec_pretty(&params).unwrap()).unwrap();
 
@@ -645,7 +649,13 @@ fn cli_node_sign_network_params_updates_signed_envelope() {
         second.prev_hash.as_deref(),
         Some(first.params_hash.as_str())
     );
-    assert_eq!(second.params.max_established_per_peer, 3);
+    assert_eq!(second.params.gossip_mesh_d, 7);
+    let second_kv = second.params_kv.as_ref().expect("kv payload");
+    assert_eq!(
+        second_kv.get("future_window_size"),
+        Some(&serde_json::json!(42))
+    );
+    assert!(!second_kv.contains_key("max_established_per_peer"));
 }
 
 #[test]

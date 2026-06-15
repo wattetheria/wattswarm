@@ -1,8 +1,10 @@
 use serde_json::json;
 use wattswarm_crypto::NodeIdentity;
+use wattswarm_crypto::sha256_hex;
 use wattswarm_storage_core::types::{
     AuthoritySet, AuthoritySignature, DEFAULT_CONTROL_RANGE_LIMIT, NetworkControlKind,
-    NetworkControlRecord, NetworkProtocolParams,
+    NetworkControlRecord, NetworkProtocolParams, SignedNetworkProtocolParamsEnvelope,
+    UnsignedNetworkProtocolParamsEnvelope,
 };
 use wattswarm_storage_core::{PgStore, network_control_payload_hash, network_control_record_hash};
 
@@ -86,6 +88,113 @@ fn imported_bootstrap_bundle_does_not_initialize_authority_set() {
     joined
         .load_latest_network_authority_set(network_id)
         .expect_err("ordinary bootstrap import does not initialize authority set");
+}
+
+#[test]
+fn signed_network_params_use_kv_payload_and_preserve_unknown_keys() {
+    let genesis = NodeIdentity::from_seed([27_u8; 32]);
+    let network_id = "mainnet-params-kv";
+    let store = PgStore::open_in_memory().expect("store");
+    store
+        .ensure_mainnet_bootstrap_network_topology(
+            network_id,
+            "Params Kv",
+            &genesis.node_id(),
+            &genesis.node_id(),
+            100,
+        )
+        .expect("topology");
+
+    let mut params_kv = NetworkProtocolParams::default().to_kv_map();
+    params_kv.insert("future_window_size".to_owned(), json!(42));
+    params_kv.insert("max_established_per_peer".to_owned(), json!(99));
+    params_kv.insert("gossip_mesh_d".to_owned(), json!(8));
+
+    let signed = store
+        .put_network_protocol_params_kv(network_id, &genesis, &params_kv)
+        .expect("signed kv params");
+    let signed_kv = signed.params_kv.as_ref().expect("kv payload");
+    assert_eq!(signed_kv.get("future_window_size"), Some(&json!(42)));
+    assert!(!signed_kv.contains_key("max_established_per_peer"));
+    assert_eq!(signed.params.gossip_mesh_d, 8);
+    assert_eq!(
+        signed.params.max_established_per_peer,
+        NetworkProtocolParams::default().max_established_per_peer
+    );
+    store
+        .validate_signed_network_protocol_params(network_id, &signed)
+        .expect("kv envelope verifies");
+}
+
+#[test]
+fn signed_network_params_reject_noncanonical_kv_payload() {
+    let genesis = NodeIdentity::from_seed([29_u8; 32]);
+    let network_id = "mainnet-params-noncanonical";
+    let store = PgStore::open_in_memory().expect("store");
+    store
+        .ensure_mainnet_bootstrap_network_topology(
+            network_id,
+            "Params Noncanonical",
+            &genesis.node_id(),
+            &genesis.node_id(),
+            100,
+        )
+        .expect("topology");
+    let mut signed = store
+        .put_network_protocol_params(network_id, &genesis, &NetworkProtocolParams::default())
+        .expect("signed params");
+    signed
+        .params_kv
+        .as_mut()
+        .expect("kv payload")
+        .insert("max_established_per_peer".to_owned(), json!(99));
+    let err = store
+        .validate_signed_network_protocol_params(network_id, &signed)
+        .expect_err("noncanonical kv is rejected");
+    assert!(
+        err.to_string()
+            .contains("network params kv payload is not canonical")
+    );
+}
+
+#[test]
+fn legacy_signed_network_params_without_kv_still_verify() {
+    let genesis = NodeIdentity::from_seed([28_u8; 32]);
+    let network_id = "mainnet-params-legacy";
+    let store = PgStore::open_in_memory().expect("store");
+    store
+        .ensure_mainnet_bootstrap_network_topology(
+            network_id,
+            "Params Legacy",
+            &genesis.node_id(),
+            &genesis.node_id(),
+            100,
+        )
+        .expect("topology");
+    let params = NetworkProtocolParams {
+        gossip_mesh_d_high: 14,
+        ..NetworkProtocolParams::default()
+    };
+    let unsigned = UnsignedNetworkProtocolParamsEnvelope {
+        network_id: network_id.to_owned(),
+        version: 1,
+        prev_hash: None,
+        params: params.clone(),
+    };
+    let params_hash = sha256_hex(&serde_json::to_vec(&unsigned).expect("legacy payload json"));
+    let signed = SignedNetworkProtocolParamsEnvelope {
+        network_id: network_id.to_owned(),
+        version: 1,
+        prev_hash: None,
+        params_hash: params_hash.clone(),
+        params_kv: None,
+        params,
+        signed_by: genesis.node_id(),
+        signature: genesis.sign_bytes(params_hash.as_bytes()),
+    };
+    store
+        .validate_signed_network_protocol_params(network_id, &signed)
+        .expect("legacy envelope verifies");
 }
 
 #[test]

@@ -11,8 +11,8 @@ use crate::startup_config::{
 pub use crate::task_template::{sample_artifact_ref, sample_contract};
 use crate::types::{
     AuthoritySet, Event, EventPayload, Membership, MembershipUpdatedPayload, NetworkKind,
-    NetworkProtocolParams, SignedNetworkAuthoritySetEnvelope, SignedNetworkProtocolParamsEnvelope,
-    TaskContract,
+    NetworkProtocolParams, NetworkProtocolParamsMap, SignedNetworkAuthoritySetEnvelope,
+    TaskContract, network_protocol_params_kv_from_value,
 };
 use anyhow::{Context, Result, anyhow};
 use clap::{Args, Parser, Subcommand};
@@ -401,9 +401,10 @@ fn handle_node(cmd: NodeCommand, state_dir: &Path, db_path: &Path) -> Result<()>
                 }
             }
             let identity = load_node_identity_seed(state_dir)?;
-            let params = load_network_protocol_params(params_file.as_deref())?;
+            let params_kv = load_network_protocol_params(params_file.as_deref())?;
             let store = crate::storage::storage::PgStore::open(db_path)?;
-            let signed = store.put_network_protocol_params(&network_id, &identity, &params)?;
+            let signed =
+                store.put_network_protocol_params_kv(&network_id, &identity, &params_kv)?;
             println!(
                 "{}",
                 serde_json::to_string_pretty(&serde_json::json!({
@@ -470,22 +471,19 @@ fn decode_hex_seed(raw: &str) -> Result<Vec<u8>> {
         .collect()
 }
 
-fn load_network_protocol_params(path: Option<&Path>) -> Result<NetworkProtocolParams> {
+fn load_network_protocol_params(path: Option<&Path>) -> Result<NetworkProtocolParamsMap> {
     let Some(path) = path else {
-        return Ok(NetworkProtocolParams::default());
+        return Ok(NetworkProtocolParams::default().to_kv_map());
     };
     let raw = fs::read(path).with_context(|| format!("read params from {}", path.display()))?;
-    serde_json::from_slice::<NetworkProtocolParams>(&raw)
-        .or_else(|_| {
-            serde_json::from_slice::<SignedNetworkProtocolParamsEnvelope>(&raw)
-                .map(|signed| signed.params)
-        })
-        .with_context(|| {
-            format!(
-                "parse network params from {}; expected NetworkProtocolParams or signed envelope",
-                path.display()
-            )
-        })
+    let value = serde_json::from_slice(&raw)
+        .with_context(|| format!("parse network params JSON from {}", path.display()))?;
+    network_protocol_params_kv_from_value(value).map_err(|err| {
+        anyhow!(
+            "parse network params from {}; expected params object or signed envelope: {err}",
+            path.display()
+        )
+    })
 }
 
 fn load_network_authority_set(

@@ -3,9 +3,11 @@ use crate::crypto::{NodeIdentity, sha256_hex, verify_signature};
 use std::collections::{HashMap, HashSet};
 use wattswarm_protocol::types::{
     AuthoritySet, DEFAULT_CONTROL_RANGE_LIMIT, NetworkBootstrapBundle, NetworkControlRecord,
-    NetworkDescriptor, NetworkKind, NetworkProtocolParams, NetworkTopology, OrgDescriptor,
-    SignedNetworkAuthoritySetEnvelope, SignedNetworkProtocolParamsEnvelope,
-    UnsignedNetworkAuthoritySetEnvelope, UnsignedNetworkProtocolParamsEnvelope,
+    NetworkDescriptor, NetworkKind, NetworkProtocolParams, NetworkProtocolParamsMap,
+    NetworkTopology, OrgDescriptor, SignedNetworkAuthoritySetEnvelope,
+    SignedNetworkProtocolParamsEnvelope, UnsignedNetworkAuthoritySetEnvelope,
+    UnsignedNetworkProtocolParamsEnvelope, UnsignedNetworkProtocolParamsKvEnvelope,
+    network_protocol_params_kv_from_value,
 };
 
 pub const DEFAULT_LOCAL_ORG_NAME: &str = "Local Bootstrap";
@@ -45,26 +47,37 @@ fn network_params_payload_hash(payload: &UnsignedNetworkProtocolParamsEnvelope) 
     Ok(sha256_hex(&serde_json::to_vec(payload)?))
 }
 
-fn sign_network_protocol_params(
+fn network_params_kv_payload_hash(
+    payload: &UnsignedNetworkProtocolParamsKvEnvelope,
+) -> Result<String> {
+    Ok(sha256_hex(&serde_json::to_vec(payload)?))
+}
+
+fn sign_network_protocol_params_kv(
     network_id: &str,
     version: u64,
     prev_hash: Option<String>,
-    params: &NetworkProtocolParams,
+    params_kv: &NetworkProtocolParamsMap,
     signer: &NodeIdentity,
 ) -> Result<SignedNetworkProtocolParamsEnvelope> {
-    let payload = UnsignedNetworkProtocolParamsEnvelope {
+    let params_kv = NetworkProtocolParams::canonicalize_kv_map(params_kv)
+        .map_err(|err| anyhow::anyhow!(err))?;
+    let params =
+        NetworkProtocolParams::from_kv_map(&params_kv).map_err(|err| anyhow::anyhow!(err))?;
+    let payload = UnsignedNetworkProtocolParamsKvEnvelope {
         network_id: network_id.to_owned(),
         version,
         prev_hash,
-        params: params.clone(),
+        params_kv,
     };
-    let params_hash = network_params_payload_hash(&payload)?;
+    let params_hash = network_params_kv_payload_hash(&payload)?;
     Ok(SignedNetworkProtocolParamsEnvelope {
         network_id: payload.network_id,
         version: payload.version,
         prev_hash: payload.prev_hash,
         params_hash: params_hash.clone(),
-        params: payload.params,
+        params_kv: Some(payload.params_kv),
+        params,
         signed_by: signer.node_id(),
         signature: signer.sign_bytes(params_hash.as_bytes()),
     })
@@ -98,7 +111,21 @@ fn verify_network_protocol_params(
     if signed.version > 1 && signed.prev_hash.as_deref().unwrap_or("").trim().is_empty() {
         anyhow::bail!("network params version > 1 requires prev_hash");
     }
-    let expected_hash = network_params_payload_hash(&signed.unsigned_payload())?;
+    let expected_hash = if let Some(payload) = signed.unsigned_kv_payload() {
+        let canonical = NetworkProtocolParams::canonicalize_kv_map(&payload.params_kv)
+            .map_err(|err| anyhow::anyhow!(err))?;
+        if canonical != payload.params_kv {
+            anyhow::bail!("network params kv payload is not canonical");
+        }
+        let projected =
+            NetworkProtocolParams::from_kv_map(&canonical).map_err(|err| anyhow::anyhow!(err))?;
+        if projected != signed.params {
+            anyhow::bail!("network params projection mismatch");
+        }
+        network_params_kv_payload_hash(&payload)?
+    } else {
+        network_params_payload_hash(&signed.unsigned_payload())?
+    };
     if signed.params_hash != expected_hash {
         anyhow::bail!("network params hash mismatch");
     }
@@ -787,12 +814,13 @@ impl PgStore {
         if signer.node_id() != genesis_node_id {
             anyhow::bail!("only the genesis node can sign bootstrap network params");
         }
-        let params = if !existing_json.trim().is_empty() && existing_json.trim() != "{}" {
-            serde_json::from_str::<NetworkProtocolParams>(&existing_json)?
+        let params_kv = if !existing_json.trim().is_empty() && existing_json.trim() != "{}" {
+            network_protocol_params_kv_from_value(serde_json::from_str(&existing_json)?)
+                .map_err(|err| anyhow::anyhow!(err))?
         } else {
-            NetworkProtocolParams::default()
+            NetworkProtocolParams::default().to_kv_map()
         };
-        let signed = sign_network_protocol_params(network_id, 1, None, &params, signer)?;
+        let signed = sign_network_protocol_params_kv(network_id, 1, None, &params_kv, signer)?;
         conn.execute(
             "UPDATE network_params SET params_json = $1, updated_at = NOW() WHERE network_id = $2",
             params![serde_json::to_string(&signed)?, network_id],
@@ -1160,6 +1188,15 @@ impl PgStore {
         signer: &NodeIdentity,
         params: &NetworkProtocolParams,
     ) -> Result<SignedNetworkProtocolParamsEnvelope> {
+        self.put_network_protocol_params_kv(network_id, signer, &params.to_kv_map())
+    }
+
+    pub fn put_network_protocol_params_kv(
+        &self,
+        network_id: &str,
+        signer: &NodeIdentity,
+        params_kv: &NetworkProtocolParamsMap,
+    ) -> Result<SignedNetworkProtocolParamsEnvelope> {
         let genesis_node_id = self.network_genesis_node_id(network_id)?;
         if signer.node_id() != genesis_node_id {
             anyhow::bail!("only the genesis node can update network params");
@@ -1189,7 +1226,8 @@ impl PgStore {
             }
             _ => (1, None),
         };
-        let signed = sign_network_protocol_params(network_id, version, prev_hash, params, signer)?;
+        let signed =
+            sign_network_protocol_params_kv(network_id, version, prev_hash, params_kv, signer)?;
         let json = serde_json::to_string(&signed)?;
         conn.execute(
             "UPDATE network_params SET params_json = $1, updated_at = NOW() WHERE network_id = $2",
