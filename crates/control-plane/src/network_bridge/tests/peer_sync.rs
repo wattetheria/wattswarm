@@ -214,6 +214,184 @@ fn stale_connected_peer_expires_and_becomes_reconnect_candidate() {
 }
 
 #[test]
+fn peer_relationship_action_allows_recently_seen_peer_without_live_connection() {
+    let local_dir = temp_startup_dir("relationship-action-contact-local");
+    let remote_dir = temp_startup_dir("relationship-action-contact-remote");
+    let local_seed = [113u8; 32];
+    let remote_seed = [114u8; 32];
+    std::fs::write(local_dir.join("node_seed.hex"), hex::encode(local_seed))
+        .expect("write local seed");
+    std::fs::write(remote_dir.join("node_seed.hex"), hex::encode(remote_seed))
+        .expect("write remote seed");
+    ensure_test_relay_urls(&local_dir);
+    ensure_test_relay_urls(&remote_dir);
+
+    let remote_endpoint =
+        wattswarm_network_transport_iroh::local_endpoint_id_from_state_dir(&remote_dir)
+            .expect("remote endpoint")
+            .to_string();
+    let peer = NetworkNodeId::new(remote_endpoint.clone()).expect("remote peer id");
+    let remote_contact = export_local_contact_material_for_network_peer_id(
+        &remote_dir,
+        &remote_endpoint,
+        observed_at_ms(),
+    )
+    .expect("remote contact");
+
+    let mut service = NetworkBridgeService::new(
+        NetworkP2pNode::from_iroh_state_dir(
+            NetworkP2pConfig::default(),
+            local_dir.clone(),
+            local_seed,
+        )
+        .expect("local node"),
+        &[SwarmScope::Global],
+        &NetworkProtocolParams::default(),
+    )
+    .expect("service");
+    service.set_state_dir(local_dir.clone(), local_dir.join("ui.state"));
+    service
+        .runtime
+        .upsert_remote_contact_material(peer.to_string(), remote_contact)
+        .expect("upsert contact");
+    assert!(!service.connected_peers.contains(&peer));
+    service.record_peer_liveness(peer.clone());
+
+    let request_id = service
+        .send_peer_relationship_action(
+            &remote_endpoint,
+            crate::control::PeerRelationshipAction::Request,
+            None,
+        )
+        .expect("relationship request should be queued through runtime contact material");
+
+    assert!(
+        service
+            .pending_relationship_requests
+            .contains_key(&request_id)
+    );
+    assert!(service.reconnect_attempts_for_peer(&peer).is_some());
+
+    wattswarm_network_transport_iroh::shutdown_local_iroh_data_plane(&local_dir);
+    wattswarm_network_transport_iroh::shutdown_local_iroh_data_plane(&remote_dir);
+    let _ = std::fs::remove_dir_all(local_dir);
+    let _ = std::fs::remove_dir_all(remote_dir);
+}
+
+#[test]
+fn queued_peer_relationship_command_remains_pending_until_runtime_ack() {
+    let local_dir = temp_startup_dir("relationship-command-pending-local");
+    let remote_dir = temp_startup_dir("relationship-command-pending-remote");
+    let local_seed = [115u8; 32];
+    let remote_seed = [116u8; 32];
+    std::fs::write(local_dir.join("node_seed.hex"), hex::encode(local_seed))
+        .expect("write local seed");
+    std::fs::write(remote_dir.join("node_seed.hex"), hex::encode(remote_seed))
+        .expect("write remote seed");
+    ensure_test_relay_urls(&local_dir);
+    ensure_test_relay_urls(&remote_dir);
+
+    let local_endpoint =
+        wattswarm_network_transport_iroh::local_endpoint_id_from_state_dir(&local_dir)
+            .expect("local endpoint")
+            .to_string();
+    let remote_endpoint =
+        wattswarm_network_transport_iroh::local_endpoint_id_from_state_dir(&remote_dir)
+            .expect("remote endpoint")
+            .to_string();
+    let peer = NetworkNodeId::new(remote_endpoint.clone()).expect("remote peer id");
+    let remote_contact = export_local_contact_material_for_network_peer_id(
+        &remote_dir,
+        &remote_endpoint,
+        observed_at_ms(),
+    )
+    .expect("remote contact");
+    let local = NodeIdentity::random();
+    let membership = membership_with_roles(&[local.node_id()]);
+    let mut node =
+        Node::new(local, PgStore::open_in_memory().expect("store"), membership).expect("node");
+    let mut service = NetworkBridgeService::new(
+        NetworkP2pNode::from_iroh_state_dir(
+            NetworkP2pConfig::default(),
+            local_dir.clone(),
+            local_seed,
+        )
+        .expect("local node"),
+        &[SwarmScope::Global],
+        &NetworkProtocolParams::default(),
+    )
+    .expect("service");
+    service.set_state_dir(local_dir.clone(), local_dir.join("ui.state"));
+    service
+        .runtime
+        .upsert_remote_contact_material(peer.to_string(), remote_contact)
+        .expect("upsert contact");
+    service.record_peer_liveness(peer);
+    let envelope = default_agent_envelope(
+        &local_endpoint,
+        &remote_endpoint,
+        "social.friend.request",
+        json!({
+            "action": "request",
+            "correlation_id": "correlation-1",
+            "request_id": "request-1"
+        }),
+    );
+    enqueue_peer_relationship_action_command(
+        &local_dir,
+        &remote_endpoint,
+        crate::control::PeerRelationshipAction::Request,
+        envelope,
+    )
+    .expect("enqueue relationship command");
+
+    let processed = process_pending_network_commands(&mut node, &mut service, &local_dir)
+        .expect("process pending commands");
+
+    assert_eq!(processed, 1);
+    assert_eq!(service.pending_relationship_requests.len(), 1);
+    let pending = std::fs::read_to_string(local_dir.join("pending_network_commands.jsonl"))
+        .expect("read pending commands");
+    assert_eq!(
+        pending
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .count(),
+        1
+    );
+    for pending in service.pending_relationship_requests.values_mut() {
+        pending.started_at_ms = (observed_at_ms() as i64).saturating_sub(40_000);
+    }
+    let pending_path = local_dir.join("pending_network_commands.jsonl");
+    let mut pending_command: serde_json::Value =
+        serde_json::from_str(pending.lines().next().expect("pending command line"))
+            .expect("pending command json");
+    pending_command["next_retry_at"] = json!(0);
+    std::fs::write(&pending_path, format!("{pending_command}\n"))
+        .expect("force pending command due");
+
+    let processed = process_pending_network_commands(&mut node, &mut service, &local_dir)
+        .expect("process stale in-flight pending command");
+
+    assert_eq!(processed, 0);
+    assert!(service.pending_relationship_requests.is_empty());
+    let pending = std::fs::read_to_string(&pending_path).expect("read pending commands");
+    let pending_command: serde_json::Value =
+        serde_json::from_str(pending.lines().next().expect("pending command line"))
+            .expect("pending command json");
+    assert_eq!(pending_command["attempts"], json!(1));
+    assert_eq!(
+        pending_command["last_error"],
+        json!("peer relationship request timed out without runtime result")
+    );
+
+    wattswarm_network_transport_iroh::shutdown_local_iroh_data_plane(&local_dir);
+    wattswarm_network_transport_iroh::shutdown_local_iroh_data_plane(&remote_dir);
+    let _ = std::fs::remove_dir_all(local_dir);
+    let _ = std::fs::remove_dir_all(remote_dir);
+}
+
+#[test]
 fn gossip_source_does_not_mark_peer_connected_for_backfill() {
     let dir = temp_startup_dir("gossip-source-not-connected");
     std::fs::write(dir.join("node_seed.hex"), hex::encode([43_u8; 32])).expect("write seed");
@@ -1272,12 +1450,23 @@ fn peer_relationship_response_persists_private_message_contact_material() {
     .expect("service");
     service.set_state_dir(local_dir.clone(), local_dir.join("ui.state"));
     let request_id = PeerRelationshipRequestId::new(7);
+    let agent_envelope = default_agent_envelope(
+        &local_endpoint,
+        &remote_endpoint,
+        "peer.relationship.request",
+        json!({
+            "action": "request",
+            "remote_node_id": remote_endpoint.clone(),
+        }),
+    );
     service.pending_relationship_requests.insert(
         request_id,
         PendingPeerRelationshipRequest {
             peer: remote_peer.clone(),
             remote_node_id: remote_endpoint.clone(),
             action: crate::control::PeerRelationshipAction::Request,
+            agent_envelope,
+            started_at_ms: observed_at_ms() as i64,
         },
     );
 

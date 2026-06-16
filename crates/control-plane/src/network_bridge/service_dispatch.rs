@@ -1,5 +1,8 @@
 use super::*;
 
+const PEER_RELATIONSHIP_CONTROL_REQUEST_TIMEOUT_MS: i64 = 30_000;
+const PEER_RELATIONSHIP_IN_FLIGHT_TIMEOUT_GRACE_MS: i64 = 5_000;
+
 impl NetworkBridgeService {
     pub fn send_peer_relationship_action(
         &mut self,
@@ -10,11 +13,8 @@ impl NetworkBridgeService {
         let Some(state_dir) = self.state_dir.clone() else {
             bail!("peer relationship actions require state_dir to be configured");
         };
-        let (remote_node_id, peer) = self.connected_peer_for_operation(
-            &state_dir,
-            remote_node_id,
-            "peer relationship actions",
-        )?;
+        let (remote_node_id, peer) =
+            self.peer_for_relationship_action(&state_dir, remote_node_id)?;
         let relationship_record = crate::control::apply_peer_relationship_action_state(
             &state_dir,
             &remote_node_id,
@@ -58,6 +58,7 @@ impl NetworkBridgeService {
             )?;
         }
         let contact_material = build_contact_material(&state_dir, &local_node_id)?;
+        let pending_agent_envelope = envelope.clone();
         let request_id = self.runtime.send_peer_relationship_request(
             &peer,
             PeerRelationshipRequest {
@@ -74,9 +75,56 @@ impl NetworkBridgeService {
                 peer,
                 remote_node_id,
                 action,
+                agent_envelope: pending_agent_envelope,
+                started_at_ms: observed_at_ms() as i64,
             },
         );
         Ok(request_id)
+    }
+
+    pub(super) fn release_stale_peer_relationship_action(
+        &mut self,
+        remote_node_id: &str,
+        action: crate::control::PeerRelationshipAction,
+        agent_envelope: &RawAgentEnvelope,
+        now_ms: i64,
+    ) -> bool {
+        let timeout_ms = PEER_RELATIONSHIP_CONTROL_REQUEST_TIMEOUT_MS
+            .saturating_add(PEER_RELATIONSHIP_IN_FLIGHT_TIMEOUT_GRACE_MS);
+        let stale_request_id =
+            self.pending_relationship_requests
+                .iter()
+                .find_map(|(request_id, pending)| {
+                    if pending.remote_node_id == remote_node_id
+                        && pending.action == action
+                        && pending.agent_envelope.message_json == agent_envelope.message_json
+                        && now_ms.saturating_sub(pending.started_at_ms) >= timeout_ms
+                    {
+                        Some(*request_id)
+                    } else {
+                        None
+                    }
+                });
+        if let Some(request_id) = stale_request_id {
+            if let Some(pending) = self.pending_relationship_requests.remove(&request_id) {
+                self.mark_peer_control_stream_failed(pending.peer);
+            }
+            return true;
+        }
+        false
+    }
+
+    pub(super) fn has_pending_peer_relationship_action(
+        &self,
+        remote_node_id: &str,
+        action: crate::control::PeerRelationshipAction,
+        agent_envelope: &RawAgentEnvelope,
+    ) -> bool {
+        self.pending_relationship_requests.values().any(|pending| {
+            pending.remote_node_id == remote_node_id
+                && pending.action == action
+                && pending.agent_envelope.message_json == agent_envelope.message_json
+        })
     }
 
     pub(crate) fn request_peer_contact_material(
@@ -439,6 +487,42 @@ impl NetworkBridgeService {
         {
             self.schedule_peer_reconnect(peer.clone());
             bail!("{operation} require a connected peer");
+        }
+        Ok((remote_node_id.to_owned(), peer))
+    }
+
+    fn peer_for_relationship_action(
+        &mut self,
+        state_dir: &Path,
+        remote_node_id: &str,
+    ) -> Result<(String, NetworkNodeId)> {
+        let remote_node_id = remote_node_id.trim();
+        if remote_node_id.is_empty() {
+            bail!("remote_node_id is required");
+        }
+        let peer = remote_node_id
+            .parse::<NetworkNodeId>()
+            .map_err(|err| anyhow!("parse remote_node_id as iroh node id: {err}"))?;
+
+        if !self.runtime.allows_outbound_backfill_to(&peer) {
+            self.ensure_peer_connected(state_dir, &peer, remote_node_id)?;
+        }
+        if !self.runtime.allows_outbound_backfill_to(&peer) {
+            self.schedule_peer_reconnect(peer.clone());
+            bail!("peer relationship actions require peer contact material");
+        }
+
+        let now = Instant::now();
+        if !self.connected_peers.contains(&peer) && !self.peer_recently_seen_at(&peer, now) {
+            self.ensure_peer_connected(state_dir, &peer, remote_node_id)?;
+        }
+        let now = Instant::now();
+        if !self.connected_peers.contains(&peer) && !self.peer_recently_seen_at(&peer, now) {
+            self.schedule_peer_reconnect(peer.clone());
+            bail!("peer relationship actions require a connected or recently seen peer");
+        }
+        if !self.connected_peers.contains(&peer) {
+            self.schedule_peer_reconnect(peer.clone());
         }
         Ok((remote_node_id.to_owned(), peer))
     }

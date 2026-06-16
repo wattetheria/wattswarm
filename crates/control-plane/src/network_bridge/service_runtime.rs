@@ -1406,6 +1406,14 @@ impl NetworkBridgeService {
                         ),
                     });
                 };
+                if let Some(state_dir) = self.state_dir.as_deref() {
+                    remove_peer_relationship_action_command(
+                        state_dir,
+                        &pending.remote_node_id,
+                        pending.action,
+                        &pending.agent_envelope,
+                    )?;
+                }
                 let action = pending.action;
                 let expected_action = wire_peer_relationship_action(action);
                 let local_node_id = self.local_peer_id().to_string();
@@ -1524,11 +1532,20 @@ impl NetworkBridgeService {
                 request_id,
                 error,
             } => {
-                let action = self
-                    .pending_relationship_requests
-                    .remove(&request_id)
+                let pending = self.pending_relationship_requests.remove(&request_id);
+                let action = pending
+                    .as_ref()
                     .map(|pending| pending.action)
                     .unwrap_or(crate::control::PeerRelationshipAction::Request);
+                if let (Some(state_dir), Some(pending)) = (self.state_dir.as_deref(), pending) {
+                    record_peer_relationship_action_command_failure(
+                        state_dir,
+                        &pending.remote_node_id,
+                        pending.action,
+                        pending.agent_envelope,
+                        &error,
+                    )?;
+                }
                 self.mark_peer_control_stream_failed(peer.clone());
                 Ok(NetworkBridgeTick::PeerRelationshipFailed {
                     peer,

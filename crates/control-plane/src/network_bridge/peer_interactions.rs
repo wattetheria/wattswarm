@@ -42,6 +42,8 @@ pub(super) struct PendingPeerRelationshipRequest {
     pub(super) peer: NetworkNodeId,
     pub(super) remote_node_id: String,
     pub(super) action: crate::control::PeerRelationshipAction,
+    pub(super) agent_envelope: RawAgentEnvelope,
+    pub(super) started_at_ms: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -131,6 +133,65 @@ impl PendingNetworkCommand {
         }
     }
 
+    fn record_in_flight_timeout(&mut self, error: &str, now_ms: i64) {
+        let attempts = self.attempts().max(1);
+        let delay = PENDING_NETWORK_COMMAND_INITIAL_RETRY_MS
+            .saturating_mul(2_i64.saturating_pow(attempts.saturating_sub(1)))
+            .min(PENDING_NETWORK_COMMAND_MAX_RETRY_MS);
+        let retry_at = Some(now_ms.saturating_add(delay));
+        match self {
+            Self::PeerRelationship {
+                next_retry_at,
+                last_error,
+                ..
+            }
+            | Self::AgentPayment {
+                next_retry_at,
+                last_error,
+                ..
+            } => {
+                *next_retry_at = retry_at;
+                *last_error = Some(error.to_owned());
+            }
+        }
+    }
+
+    fn record_dispatch_attempt(&mut self, now_ms: i64) {
+        let next_attempts = self.attempts().saturating_add(1);
+        let delay = PENDING_NETWORK_COMMAND_INITIAL_RETRY_MS
+            .saturating_mul(2_i64.saturating_pow(next_attempts.saturating_sub(1)))
+            .min(PENDING_NETWORK_COMMAND_MAX_RETRY_MS);
+        let next_retry_at = Some(now_ms.saturating_add(delay));
+        match self {
+            Self::PeerRelationship {
+                attempts,
+                next_retry_at: retry_at,
+                last_error,
+                ..
+            }
+            | Self::AgentPayment {
+                attempts,
+                next_retry_at: retry_at,
+                last_error,
+                ..
+            } => {
+                *attempts = next_attempts;
+                *retry_at = next_retry_at;
+                *last_error = None;
+            }
+        }
+    }
+
+    fn defer_in_flight(&mut self, now_ms: i64) {
+        let retry_at = Some(now_ms.saturating_add(PENDING_NETWORK_COMMAND_INITIAL_RETRY_MS));
+        match self {
+            Self::PeerRelationship { next_retry_at, .. }
+            | Self::AgentPayment { next_retry_at, .. } => {
+                *next_retry_at = retry_at;
+            }
+        }
+    }
+
     fn should_abandon(&self) -> bool {
         self.attempts() >= PENDING_NETWORK_COMMAND_MAX_ATTEMPTS
     }
@@ -156,15 +217,154 @@ fn enqueue_pending_network_command(
     Ok(())
 }
 
+fn peer_relationship_command_matches(
+    command: &PendingNetworkCommand,
+    remote_node_id: &str,
+    action: crate::control::PeerRelationshipAction,
+    agent_envelope: &RawAgentEnvelope,
+) -> bool {
+    match command {
+        PendingNetworkCommand::PeerRelationship {
+            remote_node_id: existing_remote_node_id,
+            action: existing_action,
+            agent_envelope: existing_agent_envelope,
+            ..
+        } => {
+            existing_remote_node_id == remote_node_id
+                && *existing_action == action
+                && existing_agent_envelope.message_json == agent_envelope.message_json
+        }
+        PendingNetworkCommand::AgentPayment { .. } => false,
+    }
+}
+
+fn write_pending_network_commands(
+    state_dir: &Path,
+    commands: &[PendingNetworkCommand],
+) -> Result<()> {
+    let path = pending_network_commands_path(state_dir);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    if commands.is_empty() {
+        fs::write(path, "")?;
+        return Ok(());
+    }
+    let mut content = commands
+        .iter()
+        .map(serde_json::to_string)
+        .collect::<std::result::Result<Vec<_>, _>>()?
+        .join("\n");
+    content.push('\n');
+    fs::write(path, content)?;
+    Ok(())
+}
+
+fn load_pending_network_commands(state_dir: &Path) -> Result<Vec<PendingNetworkCommand>> {
+    let path = pending_network_commands_path(state_dir);
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let content = fs::read_to_string(path)?;
+    Ok(content
+        .lines()
+        .filter_map(|line| serde_json::from_str::<PendingNetworkCommand>(line.trim()).ok())
+        .collect())
+}
+
+fn upsert_peer_relationship_action_command(
+    state_dir: &Path,
+    mut command: PendingNetworkCommand,
+) -> Result<()> {
+    let PendingNetworkCommand::PeerRelationship {
+        remote_node_id,
+        action,
+        agent_envelope,
+        ..
+    } = &command
+    else {
+        bail!("peer relationship command upsert received non-relationship command");
+    };
+    let mut commands = load_pending_network_commands(state_dir)?;
+    if let Some(existing) = commands.iter_mut().find(|existing| {
+        peer_relationship_command_matches(existing, remote_node_id, *action, agent_envelope)
+    }) {
+        if let PendingNetworkCommand::PeerRelationship {
+            attempts,
+            next_retry_at,
+            last_error,
+            ..
+        } = &mut command
+        {
+            if let PendingNetworkCommand::PeerRelationship {
+                attempts: existing_attempts,
+                next_retry_at: existing_next_retry_at,
+                last_error: existing_last_error,
+                ..
+            } = &*existing
+            {
+                *attempts = *existing_attempts;
+                *next_retry_at = *existing_next_retry_at;
+                *last_error = existing_last_error.clone();
+            }
+        }
+        *existing = command;
+    } else {
+        commands.push(command);
+    }
+    write_pending_network_commands(state_dir, &commands)
+}
+
+pub(super) fn remove_peer_relationship_action_command(
+    state_dir: &Path,
+    remote_node_id: &str,
+    action: crate::control::PeerRelationshipAction,
+    agent_envelope: &RawAgentEnvelope,
+) -> Result<()> {
+    let mut commands = load_pending_network_commands(state_dir)?;
+    commands.retain(|command| {
+        !peer_relationship_command_matches(command, remote_node_id, action, agent_envelope)
+    });
+    write_pending_network_commands(state_dir, &commands)
+}
+
+pub(super) fn record_peer_relationship_action_command_failure(
+    state_dir: &Path,
+    remote_node_id: &str,
+    action: crate::control::PeerRelationshipAction,
+    agent_envelope: RawAgentEnvelope,
+    error: &str,
+) -> Result<()> {
+    let now_ms = observed_at_ms() as i64;
+    let mut commands = load_pending_network_commands(state_dir)?;
+    if let Some(command) = commands.iter_mut().find(|command| {
+        peer_relationship_command_matches(command, remote_node_id, action, &agent_envelope)
+    }) {
+        command.record_failure(error, now_ms);
+    } else {
+        let mut command = PendingNetworkCommand::PeerRelationship {
+            remote_node_id: remote_node_id.trim().to_owned(),
+            action,
+            agent_envelope,
+            attempts: 0,
+            next_retry_at: None,
+            last_error: None,
+        };
+        command.record_failure(error, now_ms);
+        commands.push(command);
+    }
+    write_pending_network_commands(state_dir, &commands)
+}
+
 pub fn enqueue_peer_relationship_action_command(
     state_dir: &Path,
     remote_node_id: &str,
     action: crate::control::PeerRelationshipAction,
     agent_envelope: RawAgentEnvelope,
 ) -> Result<()> {
-    enqueue_pending_network_command(
+    upsert_peer_relationship_action_command(
         state_dir,
-        &PendingNetworkCommand::PeerRelationship {
+        PendingNetworkCommand::PeerRelationship {
             remote_node_id: remote_node_id.trim().to_owned(),
             action,
             agent_envelope,
@@ -1032,15 +1232,50 @@ pub(super) fn process_pending_network_commands(
             retry.push(line.to_owned());
             continue;
         }
-        let result = match command.clone() {
+        let result: Result<()> = match command.clone() {
             PendingNetworkCommand::PeerRelationship {
                 remote_node_id,
                 action,
                 agent_envelope,
                 ..
-            } => service
-                .send_peer_relationship_action(&remote_node_id, action, Some(agent_envelope))
-                .map(|_| ()),
+            } => {
+                if command.should_abandon() {
+                    eprintln!(
+                        "network_bridge: abandoning queued peer relationship command after {} attempts for {}",
+                        command.attempts(),
+                        command.remote_node_id()
+                    );
+                    continue;
+                }
+                if service.release_stale_peer_relationship_action(
+                    &remote_node_id,
+                    action,
+                    &agent_envelope,
+                    now_ms,
+                ) {
+                    let error = "peer relationship request timed out without runtime result";
+                    command.record_in_flight_timeout(error, now_ms);
+                    retry.push(serde_json::to_string(&command)?);
+                    continue;
+                }
+                if service.has_pending_peer_relationship_action(
+                    &remote_node_id,
+                    action,
+                    &agent_envelope,
+                ) {
+                    command.defer_in_flight(now_ms);
+                    retry.push(serde_json::to_string(&command)?);
+                    continue;
+                }
+                service.send_peer_relationship_action(
+                    &remote_node_id,
+                    action,
+                    Some(agent_envelope),
+                )?;
+                command.record_dispatch_attempt(now_ms);
+                retry.push(serde_json::to_string(&command)?);
+                Ok(())
+            }
             PendingNetworkCommand::AgentPayment {
                 remote_node_id,
                 message_kind,
@@ -1463,5 +1698,128 @@ mod tests {
         assert!(!command.is_due(1_001));
         assert!(command.is_due(1_000 + PENDING_NETWORK_COMMAND_INITIAL_RETRY_MS));
         assert!(!command.should_abandon());
+    }
+
+    #[test]
+    fn peer_relationship_command_upserts_duplicate_request() {
+        let state_dir = std::env::temp_dir().join(format!(
+            "wattswarm-peer-command-upsert-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&state_dir).expect("create temp state dir");
+        let envelope = default_agent_envelope(
+            "local-node",
+            "remote-node",
+            "social.friend.request",
+            json!({
+                "action": "request",
+                "correlation_id": "correlation-1",
+                "request_id": "request-1"
+            }),
+        );
+
+        enqueue_peer_relationship_action_command(
+            &state_dir,
+            "remote-node",
+            crate::control::PeerRelationshipAction::Request,
+            envelope.clone(),
+        )
+        .expect("enqueue first command");
+        enqueue_peer_relationship_action_command(
+            &state_dir,
+            "remote-node",
+            crate::control::PeerRelationshipAction::Request,
+            envelope,
+        )
+        .expect("upsert duplicate command");
+
+        let commands = load_pending_network_commands(&state_dir).expect("load commands");
+        assert_eq!(commands.len(), 1);
+        let _ = std::fs::remove_dir_all(state_dir);
+    }
+
+    #[test]
+    fn peer_relationship_command_failure_updates_existing_retry() {
+        let state_dir = std::env::temp_dir().join(format!(
+            "wattswarm-peer-command-failure-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&state_dir).expect("create temp state dir");
+        let envelope = default_agent_envelope(
+            "local-node",
+            "remote-node",
+            "social.friend.request",
+            json!({
+                "action": "request",
+                "correlation_id": "correlation-1",
+                "request_id": "request-1"
+            }),
+        );
+        enqueue_peer_relationship_action_command(
+            &state_dir,
+            "remote-node",
+            crate::control::PeerRelationshipAction::Request,
+            envelope.clone(),
+        )
+        .expect("enqueue command");
+
+        record_peer_relationship_action_command_failure(
+            &state_dir,
+            "remote-node",
+            crate::control::PeerRelationshipAction::Request,
+            envelope,
+            "control stream timed out",
+        )
+        .expect("record failure");
+
+        let commands = load_pending_network_commands(&state_dir).expect("load commands");
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0].attempts(), 1);
+        assert!(commands[0].next_retry_at().is_some());
+        match &commands[0] {
+            PendingNetworkCommand::PeerRelationship { last_error, .. } => {
+                assert_eq!(last_error.as_deref(), Some("control stream timed out"));
+            }
+            PendingNetworkCommand::AgentPayment { .. } => panic!("expected peer relationship"),
+        }
+        let _ = std::fs::remove_dir_all(state_dir);
+    }
+
+    #[test]
+    fn peer_relationship_command_removed_after_matching_ack() {
+        let state_dir = std::env::temp_dir().join(format!(
+            "wattswarm-peer-command-remove-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&state_dir).expect("create temp state dir");
+        let envelope = default_agent_envelope(
+            "local-node",
+            "remote-node",
+            "social.friend.request",
+            json!({
+                "action": "request",
+                "correlation_id": "correlation-1",
+                "request_id": "request-1"
+            }),
+        );
+        enqueue_peer_relationship_action_command(
+            &state_dir,
+            "remote-node",
+            crate::control::PeerRelationshipAction::Request,
+            envelope.clone(),
+        )
+        .expect("enqueue command");
+
+        remove_peer_relationship_action_command(
+            &state_dir,
+            "remote-node",
+            crate::control::PeerRelationshipAction::Request,
+            &envelope,
+        )
+        .expect("remove command");
+
+        let commands = load_pending_network_commands(&state_dir).expect("load commands");
+        assert!(commands.is_empty());
+        let _ = std::fs::remove_dir_all(state_dir);
     }
 }
