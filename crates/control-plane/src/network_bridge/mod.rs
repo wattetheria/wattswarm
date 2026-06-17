@@ -76,6 +76,56 @@ pub use summary::{
     build_reputation_summary_for_runtime,
 };
 
+#[derive(Debug, Clone, Copy)]
+pub struct PrivateDmCryptoDiagnostic<'a> {
+    pub phase: &'static str,
+    pub message: &'static str,
+    pub event_id: Option<&'a str>,
+    pub local_node_id: &'a str,
+    pub remote_node_id: &'a str,
+    pub thread_id: &'a str,
+    pub message_id: &'a str,
+    pub scope_hint: Option<&'a str>,
+    pub scheme: &'a str,
+    pub key_agreement: &'a str,
+    pub cipher: &'a str,
+    pub sender_public_key_len: usize,
+    pub recipient_public_key_len: usize,
+}
+
+pub fn record_private_dm_crypto_diagnostic(
+    state_dir: &Path,
+    diagnostic: PrivateDmCryptoDiagnostic<'_>,
+) {
+    diagnostics::record_diagnostic(
+        Some(state_dir),
+        diagnostics::DiagnosticEvent::new(
+            "info",
+            "transport",
+            diagnostic.phase,
+            "ok",
+            diagnostic.message,
+        )
+        .event_id(diagnostic.event_id.unwrap_or(diagnostic.message_id))
+        .object("peer_dm_message", Some(diagnostic.message_id.to_owned()))
+        .source_node_id(Some(diagnostic.remote_node_id.to_owned()))
+        .details(json!({
+            "local_node_id": diagnostic.local_node_id,
+            "remote_node_id": diagnostic.remote_node_id,
+            "thread_id": diagnostic.thread_id,
+            "message_id": diagnostic.message_id,
+            "scope_hint": diagnostic.scope_hint,
+            "encrypted_payload_present": true,
+            "scheme": diagnostic.scheme,
+            "key_agreement": diagnostic.key_agreement,
+            "cipher": diagnostic.cipher,
+            "sender_public_key_len": diagnostic.sender_public_key_len,
+            "recipient_public_key_len": diagnostic.recipient_public_key_len,
+            "redacted_fields": ["sender_public_key_b64", "recipient_public_key_b64", "nonce_b64", "ciphertext_b64"],
+        })),
+    );
+}
+
 #[cfg(test)]
 use agent_delivery::{build_agent_event, topic_message_requires_reply};
 use agent_delivery::{

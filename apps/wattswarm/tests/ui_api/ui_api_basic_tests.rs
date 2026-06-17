@@ -481,6 +481,7 @@ fn peer_dm_send_uses_private_group_topic_messages() {
     let db_path = state_dir.join("ui.state");
     open_node(&state_dir, &db_path).expect("initialize local node");
     let remote_keypair = wattswarm::crypto::generate_private_message_keypair();
+    let remote_public_key_b64 = remote_keypair.public_key_b64.clone();
     wattswarm::control::save_peer_metadata_record_state(
         &state_dir,
         &wattswarm::control::PeerMetadataRecord {
@@ -502,7 +503,7 @@ fn peer_dm_send_uses_private_group_topic_messages() {
                         "scheme": "wattswarm.private.dm.v1",
                         "key_agreement": "x25519",
                         "cipher": "chacha20poly1305",
-                        "public_key_b64": remote_keypair.public_key_b64,
+                        "public_key_b64": remote_public_key_b64,
                     }
                 }
             })),
@@ -603,12 +604,44 @@ fn peer_dm_send_uses_private_group_topic_messages() {
                 .as_object()
                 .is_some()
         );
+        let ciphertext_b64 = topic_json["messages"][0]["content"]["encrypted"]["ciphertext_b64"]
+            .as_str()
+            .expect("encrypted topic payload has ciphertext")
+            .to_owned();
         assert!(topic_json["messages"][0]["content"]["content"].is_null());
         assert!(
             !serde_json::to_string(&topic_json["messages"][0]["content"])
                 .unwrap()
                 .contains("hello private group")
         );
+        let diagnostics = wattswarm::network_bridge::list_network_diagnostics(
+            &state_dir,
+            &wattswarm::network_bridge::DiagnosticFilter {
+                phase: Some("private_dm.encrypt".to_owned()),
+                ..Default::default()
+            },
+        )
+        .expect("list private dm encryption diagnostics");
+        let encrypt_diagnostic = diagnostics
+            .iter()
+            .find(|entry| {
+                entry.object_kind.as_deref() == Some("peer_dm_message")
+                    && entry.object_id.as_deref() == send_json["message_id"].as_str()
+            })
+            .expect("private dm encryption diagnostic recorded");
+        assert_eq!(
+            encrypt_diagnostic.details["encrypted_payload_present"].as_bool(),
+            Some(true)
+        );
+        assert_eq!(
+            encrypt_diagnostic.details["cipher"].as_str(),
+            Some("chacha20poly1305")
+        );
+        let encrypt_raw =
+            std::fs::read_to_string(state_dir.join("diagnostics/wattswarm_node.jsonl"))
+                .expect("read diagnostics log");
+        assert!(!encrypt_raw.contains(&remote_keypair.public_key_b64));
+        assert!(!encrypt_raw.contains(&ciphertext_b64));
 
         let other_network_topic_res = app
             .clone()

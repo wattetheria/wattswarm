@@ -8,8 +8,9 @@ use crate::control::{
 use crate::http::helpers::resolve_network_id;
 use crate::http::{ApiError, UiServerState, run_blocking};
 use crate::network_bridge::{
-    default_agent_envelope, enqueue_agent_payment_command,
+    PrivateDmCryptoDiagnostic, default_agent_envelope, enqueue_agent_payment_command,
     enqueue_peer_relationship_action_command, network_service_started,
+    record_private_dm_crypto_diagnostic,
 };
 use crate::network_p2p::RawAgentEnvelope;
 use anyhow::{Result, anyhow, bail};
@@ -209,6 +210,11 @@ pub(crate) async fn peer_dm_messages_send(
                 &message_id,
             ),
         )?;
+        let encrypted_scheme = encrypted.scheme.clone();
+        let encrypted_key_agreement = encrypted.key_agreement.clone();
+        let encrypted_cipher = encrypted.cipher.clone();
+        let encrypted_sender_public_key_len = encrypted.sender_public_key_b64.len();
+        let encrypted_recipient_public_key_len = encrypted.recipient_public_key_b64.len();
         let participants = {
             let mut members = vec![local_node_id.clone(), remote_node_id.clone()];
             members.sort();
@@ -249,6 +255,24 @@ pub(crate) async fn peer_dm_messages_send(
             None,
             now.saturating_add(1),
         )?;
+        record_private_dm_crypto_diagnostic(
+            &state_clone.state_dir,
+            PrivateDmCryptoDiagnostic {
+                phase: "private_dm.encrypt",
+                message: "private DM message encrypted for network transport",
+                event_id: Some(&event.event_id),
+                local_node_id: &local_node_id,
+                remote_node_id: &remote_node_id,
+                thread_id: &thread_id,
+                message_id: &message_id,
+                scope_hint: Some(&scope_hint),
+                scheme: &encrypted_scheme,
+                key_agreement: &encrypted_key_agreement,
+                cipher: &encrypted_cipher,
+                sender_public_key_len: encrypted_sender_public_key_len,
+                recipient_public_key_len: encrypted_recipient_public_key_len,
+            },
+        );
         crate::control::save_peer_dm_thread_record_state(
             &state_clone.state_dir,
             &crate::control::PeerDmThreadRecord {

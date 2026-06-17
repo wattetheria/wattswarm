@@ -867,6 +867,24 @@ pub(super) fn save_inbound_private_dm_topic_message(
         )?;
         let private_payload: Value =
             serde_json::from_slice(&plaintext).context("decode private dm plaintext")?;
+        record_private_dm_crypto_diagnostic(
+            state_dir,
+            PrivateDmCryptoDiagnostic {
+                phase: "private_dm.decrypt",
+                message: "private DM message decrypted from network transport",
+                event_id: Some(event_id),
+                local_node_id,
+                remote_node_id,
+                thread_id: &thread_id,
+                message_id,
+                scope_hint: None,
+                scheme: &encrypted.scheme,
+                key_agreement: &encrypted.key_agreement,
+                cipher: &encrypted.cipher,
+                sender_public_key_len: encrypted.sender_public_key_b64.len(),
+                recipient_public_key_len: encrypted.recipient_public_key_b64.len(),
+            },
+        );
         let message_content = private_payload
             .get("content")
             .cloned()

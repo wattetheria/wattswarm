@@ -1740,6 +1740,7 @@ fn inbound_private_dm_topic_message_decrypts_before_projection() {
         ),
     )
     .expect("encrypt inbound dm");
+    let encrypted_ciphertext_b64 = encrypted.ciphertext_b64.clone();
 
     let projection = save_inbound_private_dm_topic_message(
         &state_dir,
@@ -1777,6 +1778,35 @@ fn inbound_private_dm_topic_message_decrypts_before_projection() {
             .map(|envelope| envelope.capability.as_deref()),
         Some(Some("social.dm.send"))
     );
+    let diagnostics = list_network_diagnostics(
+        &state_dir,
+        &DiagnosticFilter {
+            phase: Some("private_dm.decrypt".to_owned()),
+            ..Default::default()
+        },
+    )
+    .expect("list private dm decryption diagnostics");
+    let decrypt_diagnostic = diagnostics
+        .iter()
+        .find(|entry| entry.object_id.as_deref() == Some(message_id))
+        .expect("private dm decryption diagnostic recorded");
+    assert_eq!(
+        decrypt_diagnostic.details["encrypted_payload_present"].as_bool(),
+        Some(true)
+    );
+    assert_eq!(
+        decrypt_diagnostic.details["scheme"].as_str(),
+        Some("wattswarm.private.dm.v1")
+    );
+    assert_eq!(
+        decrypt_diagnostic.details["cipher"].as_str(),
+        Some("chacha20poly1305")
+    );
+    let diagnostics_raw = fs::read_to_string(state_dir.join("diagnostics/wattswarm_node.jsonl"))
+        .expect("read diagnostics log");
+    assert!(!diagnostics_raw.contains(&local_keypair.public_key_b64));
+    assert!(!diagnostics_raw.contains(&remote_keypair.public_key_b64));
+    assert!(!diagnostics_raw.contains(&encrypted_ciphertext_b64));
 }
 
 #[test]
