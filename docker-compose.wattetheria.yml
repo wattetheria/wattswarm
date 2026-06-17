@@ -14,6 +14,8 @@ services:
       WATTSWARM_WATTETHERIA_SYNC_GRPC_LISTEN: "0.0.0.0:7791"
     ports:
       - "${WATTSWARM_SYNC_GRPC_PORT:-7791}:7791"
+    volumes:
+      - wattetheria_state:/var/lib/wattetheria:ro
     networks:
       - default
       - watt-net

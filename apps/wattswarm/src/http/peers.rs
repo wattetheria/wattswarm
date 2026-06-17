@@ -40,6 +40,15 @@ pub(crate) struct PeerDirectMessageSendRequest {
 }
 
 #[derive(Debug, Deserialize)]
+pub(crate) struct PrivateHiveKeyShareRequest {
+    remote_node_id: String,
+    feed_key: String,
+    scope_hint: String,
+    #[serde(default)]
+    agent_envelope: Option<RawAgentEnvelope>,
+}
+
+#[derive(Debug, Deserialize)]
 pub(crate) struct AgentPaymentSendRequest {
     remote_node_id: String,
     message_kind: String,
@@ -171,151 +180,227 @@ pub(crate) async fn peer_dm_messages_send(
 ) -> Result<Json<Value>, ApiError> {
     let state_clone = state.clone();
     let payload = run_blocking(move || {
-        let remote_node_id = req.remote_node_id.trim().to_owned();
-        if remote_node_id.is_empty() {
-            bail!("remote_node_id is required");
-        }
         let agent_envelope = req.agent_envelope.ok_or_else(|| {
             anyhow!("agent_envelope is required for private group direct messages")
         })?;
-        agent_envelope.validate()?;
-        let content = req.content;
-        let mut node = open_node(&state_clone.state_dir, &state_clone.db_path)?;
-        let local_node_id = node.node_id();
-        let network_id = resolve_network_id(&node);
-        let scope_hint = private_dm_scope_hint(&local_node_id, &remote_node_id);
-        let thread_id = private_dm_thread_id(&local_node_id, &remote_node_id);
-        let message_id = format!("dm-msg-{}", Uuid::new_v4());
-        let now = chrono::Utc::now().timestamp_millis().max(0) as u64;
-        let control_envelope = raw_agent_envelope_to_interaction(&agent_envelope);
-        let private_message_keypair =
-            crate::control::load_or_create_private_message_keypair_state(&state_clone.state_dir)?;
-        let recipient_public_key_b64 = load_peer_metadata_records_state(&state_clone.state_dir)?
-            .into_iter()
-            .find(|record| record.node_id == remote_node_id)
-            .and_then(|record| record.private_message_public_key_b64())
-            .ok_or_else(|| anyhow!("missing peer private message encryption key"))?;
-        let private_plaintext = serde_json::to_vec(&json!({
-            "content": content.clone(),
-            "agent_envelope": control_envelope.clone(),
-        }))?;
-        let encrypted = crate::crypto::encrypt_private_message(
-            &private_message_keypair.secret_key_b64,
-            &recipient_public_key_b64,
-            &private_plaintext,
-            &crate::control::private_dm_encryption_aad(
-                &local_node_id,
-                &remote_node_id,
-                &thread_id,
-                &message_id,
-            ),
-        )?;
-        let encrypted_scheme = encrypted.scheme.clone();
-        let encrypted_key_agreement = encrypted.key_agreement.clone();
-        let encrypted_cipher = encrypted.cipher.clone();
-        let encrypted_sender_public_key_len = encrypted.sender_public_key_b64.len();
-        let encrypted_recipient_public_key_len = encrypted.recipient_public_key_b64.len();
-        let participants = {
-            let mut members = vec![local_node_id.clone(), remote_node_id.clone()];
-            members.sort();
-            members
-        };
-        node.emit_at(
-            1,
-            crate::types::EventPayload::FeedSubscriptionUpdated(
-                crate::types::FeedSubscriptionUpdatedPayload {
-                    network_id: network_id.clone(),
-                    subscriber_node_id: local_node_id.clone(),
-                    feed_key: PRIVATE_DM_FEED_KEY.to_owned(),
-                    scope_hint: scope_hint.clone(),
-                    gossip_kinds: vec!["messages".to_owned()],
-                    provider_capabilities: Some(
-                        crate::types::TopicProviderCapabilities::local_history_provider(),
-                    ),
-                    agent_envelope: None,
-                    active: true,
-                },
-            ),
-            now,
-        )?;
-        let event = crate::control::emit_topic_message_with_content(
-            &mut node,
+        send_private_dm_content(
             &state_clone.state_dir,
-            &network_id,
-            PRIVATE_DM_FEED_KEY,
-            &scope_hint,
-            json!({
-                "kind": "direct_message",
-                "thread_id": thread_id,
-                "message_id": message_id,
-                "participants": participants,
-                "remote_node_id": remote_node_id,
-                "encrypted": encrypted,
-            }),
+            &state_clone.db_path,
+            req.remote_node_id,
+            req.content,
             None,
-            now.saturating_add(1),
-        )?;
-        record_private_dm_crypto_diagnostic(
+            agent_envelope,
+        )
+    })
+    .await?;
+    Ok(Json(payload))
+}
+
+pub(crate) async fn private_hive_key_share_send(
+    State(state): State<UiServerState>,
+    Json(req): Json<PrivateHiveKeyShareRequest>,
+) -> Result<Json<Value>, ApiError> {
+    let state_clone = state.clone();
+    let payload = run_blocking(move || {
+        let feed_key = req.feed_key.trim().to_owned();
+        let scope_hint = req.scope_hint.trim().to_owned();
+        if !crate::control::is_private_hive_route(&feed_key, &scope_hint) {
+            bail!("private hive key shares require a private hive route");
+        }
+        let record = crate::control::find_private_hive_key_record_state(
             &state_clone.state_dir,
-            PrivateDmCryptoDiagnostic {
-                phase: "private_dm.encrypt",
-                message: "private DM message encrypted for network transport",
-                event_id: Some(&event.event_id),
-                local_node_id: &local_node_id,
-                remote_node_id: &remote_node_id,
-                thread_id: &thread_id,
-                message_id: &message_id,
-                scope_hint: Some(&scope_hint),
-                scheme: &encrypted_scheme,
-                key_agreement: &encrypted_key_agreement,
-                cipher: &encrypted_cipher,
-                sender_public_key_len: encrypted_sender_public_key_len,
-                recipient_public_key_len: encrypted_recipient_public_key_len,
-            },
-        );
-        crate::control::save_peer_dm_thread_record_state(
+            &feed_key,
+            &scope_hint,
+        )?
+        .ok_or_else(|| anyhow!("private hive shared key missing"))?;
+        let content = json!({
+            "kind": "private_hive_key_share",
+            "feed_key": record.feed_key,
+            "scope_hint": record.scope_hint,
+            "group_id": record.group_id,
+            "epoch": record.epoch,
+            "shared_secret_b64": record.shared_secret_b64,
+        });
+        let local_record_content = json!({
+            "kind": "private_hive_key_share",
+            "feed_key": feed_key,
+            "scope_hint": scope_hint,
+            "group_id": content["group_id"],
+            "epoch": content["epoch"],
+            "shared_secret_b64_redacted": true,
+        });
+        let agent_envelope = req
+            .agent_envelope
+            .ok_or_else(|| anyhow!("agent_envelope is required for private hive key shares"))?;
+        let response = send_private_dm_content(
             &state_clone.state_dir,
-            &crate::control::PeerDmThreadRecord {
-                remote_node_id: remote_node_id.clone(),
-                thread_id: thread_id.clone(),
-                thread_kind: crate::control::PeerDmThreadKind::Direct,
-                session_state: crate::control::PeerDmSessionState::Ready,
-                relationship_established_at: None,
-                created_at: now,
-                updated_at: now.saturating_add(1),
-                last_message_at: Some(now.saturating_add(1)),
-            },
-        )?;
-        crate::control::save_peer_dm_message_record_state(
-            &state_clone.state_dir,
-            &crate::control::PeerDmMessageRecord {
-                thread_id: thread_id.clone(),
-                message_id: message_id.clone(),
-                remote_node_id: remote_node_id.clone(),
-                message_kind: crate::control::PeerDmMessageKind::Message,
-                direction: crate::control::PeerDmDirection::Outbound,
-                delivery_state: crate::control::PeerDmDeliveryState::Delivered,
-                a2a_protocol: agent_envelope.protocol.clone(),
-                agent_envelope: Some(control_envelope),
-                content,
-                created_at: now.saturating_add(1),
-                acknowledged_at: None,
-            },
+            &state_clone.db_path,
+            req.remote_node_id,
+            content,
+            Some(local_record_content),
+            agent_envelope,
         )?;
         Ok::<Value, anyhow::Error>(json!({
             "ok": true,
-            "queued": false,
-            "remote_node_id": remote_node_id,
-            "thread_id": thread_id,
-            "message_id": message_id,
-            "event_id": event.event_id,
-            "feed_key": PRIVATE_DM_FEED_KEY,
+            "remote_node_id": response["remote_node_id"],
+            "thread_id": response["thread_id"],
+            "message_id": response["message_id"],
+            "event_id": response["event_id"],
+            "feed_key": feed_key,
             "scope_hint": scope_hint,
-            "gossip_kinds": ["messages"],
+            "shared_secret_b64_redacted": true,
         }))
     })
     .await?;
     Ok(Json(payload))
+}
+
+fn send_private_dm_content(
+    state_dir: &std::path::Path,
+    db_path: &std::path::Path,
+    remote_node_id: String,
+    content: Value,
+    local_record_content: Option<Value>,
+    agent_envelope: RawAgentEnvelope,
+) -> Result<Value> {
+    let remote_node_id = remote_node_id.trim().to_owned();
+    if remote_node_id.is_empty() {
+        bail!("remote_node_id is required");
+    }
+    agent_envelope.validate()?;
+    let mut node = open_node(state_dir, db_path)?;
+    let local_node_id = node.node_id();
+    let network_id = resolve_network_id(&node);
+    let scope_hint = private_dm_scope_hint(&local_node_id, &remote_node_id);
+    let thread_id = private_dm_thread_id(&local_node_id, &remote_node_id);
+    let message_id = format!("dm-msg-{}", Uuid::new_v4());
+    let now = chrono::Utc::now().timestamp_millis().max(0) as u64;
+    let control_envelope = raw_agent_envelope_to_interaction(&agent_envelope);
+    let private_message_keypair =
+        crate::control::load_or_create_private_message_keypair_state(state_dir)?;
+    let recipient_public_key_b64 = load_peer_metadata_records_state(state_dir)?
+        .into_iter()
+        .find(|record| record.node_id == remote_node_id)
+        .and_then(|record| record.private_message_public_key_b64())
+        .ok_or_else(|| anyhow!("missing peer private message encryption key"))?;
+    let private_plaintext = serde_json::to_vec(&json!({
+        "content": content.clone(),
+        "agent_envelope": control_envelope.clone(),
+    }))?;
+    let encrypted = crate::crypto::encrypt_private_message(
+        &private_message_keypair.secret_key_b64,
+        &recipient_public_key_b64,
+        &private_plaintext,
+        &crate::control::private_dm_encryption_aad(
+            &local_node_id,
+            &remote_node_id,
+            &thread_id,
+            &message_id,
+        ),
+    )?;
+    let encrypted_scheme = encrypted.scheme.clone();
+    let encrypted_key_agreement = encrypted.key_agreement.clone();
+    let encrypted_cipher = encrypted.cipher.clone();
+    let encrypted_sender_public_key_len = encrypted.sender_public_key_b64.len();
+    let encrypted_recipient_public_key_len = encrypted.recipient_public_key_b64.len();
+    let participants = {
+        let mut members = vec![local_node_id.clone(), remote_node_id.clone()];
+        members.sort();
+        members
+    };
+    node.emit_at(
+        1,
+        crate::types::EventPayload::FeedSubscriptionUpdated(
+            crate::types::FeedSubscriptionUpdatedPayload {
+                network_id: network_id.clone(),
+                subscriber_node_id: local_node_id.clone(),
+                feed_key: PRIVATE_DM_FEED_KEY.to_owned(),
+                scope_hint: scope_hint.clone(),
+                gossip_kinds: vec!["messages".to_owned()],
+                provider_capabilities: Some(
+                    crate::types::TopicProviderCapabilities::local_history_provider(),
+                ),
+                agent_envelope: None,
+                active: true,
+            },
+        ),
+        now,
+    )?;
+    let event = crate::control::emit_topic_message_with_content(
+        &mut node,
+        state_dir,
+        &network_id,
+        PRIVATE_DM_FEED_KEY,
+        &scope_hint,
+        json!({
+            "kind": "direct_message",
+            "thread_id": thread_id,
+            "message_id": message_id,
+            "participants": participants,
+            "remote_node_id": remote_node_id,
+            "encrypted": encrypted,
+        }),
+        None,
+        now.saturating_add(1),
+    )?;
+    record_private_dm_crypto_diagnostic(
+        state_dir,
+        PrivateDmCryptoDiagnostic {
+            phase: "private_dm.encrypt",
+            message: "private DM message encrypted for network transport",
+            event_id: Some(&event.event_id),
+            local_node_id: &local_node_id,
+            remote_node_id: &remote_node_id,
+            thread_id: &thread_id,
+            message_id: &message_id,
+            scope_hint: Some(&scope_hint),
+            scheme: &encrypted_scheme,
+            key_agreement: &encrypted_key_agreement,
+            cipher: &encrypted_cipher,
+            sender_public_key_len: encrypted_sender_public_key_len,
+            recipient_public_key_len: encrypted_recipient_public_key_len,
+        },
+    );
+    crate::control::save_peer_dm_thread_record_state(
+        state_dir,
+        &crate::control::PeerDmThreadRecord {
+            remote_node_id: remote_node_id.clone(),
+            thread_id: thread_id.clone(),
+            thread_kind: crate::control::PeerDmThreadKind::Direct,
+            session_state: crate::control::PeerDmSessionState::Ready,
+            relationship_established_at: None,
+            created_at: now,
+            updated_at: now.saturating_add(1),
+            last_message_at: Some(now.saturating_add(1)),
+        },
+    )?;
+    crate::control::save_peer_dm_message_record_state(
+        state_dir,
+        &crate::control::PeerDmMessageRecord {
+            thread_id: thread_id.clone(),
+            message_id: message_id.clone(),
+            remote_node_id: remote_node_id.clone(),
+            message_kind: crate::control::PeerDmMessageKind::Message,
+            direction: crate::control::PeerDmDirection::Outbound,
+            delivery_state: crate::control::PeerDmDeliveryState::Delivered,
+            a2a_protocol: agent_envelope.protocol.clone(),
+            agent_envelope: Some(control_envelope),
+            content: local_record_content.unwrap_or(content),
+            created_at: now.saturating_add(1),
+            acknowledged_at: None,
+        },
+    )?;
+    Ok(json!({
+        "ok": true,
+        "queued": false,
+        "remote_node_id": remote_node_id,
+        "thread_id": thread_id,
+        "message_id": message_id,
+        "event_id": event.event_id,
+        "feed_key": PRIVATE_DM_FEED_KEY,
+        "scope_hint": scope_hint,
+        "gossip_kinds": ["messages"],
+    }))
 }
 
 pub(crate) async fn agent_payment_send(

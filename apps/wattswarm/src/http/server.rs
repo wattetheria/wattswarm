@@ -192,6 +192,10 @@ pub fn build_app(state: UiServerState) -> Router {
         .route("/api/peers/dm/threads", get(peers::peer_dm_threads_list))
         .route("/api/peers/dm/messages", get(peers::peer_dm_messages_list))
         .route("/api/peers/dm/messages", post(peers::peer_dm_messages_send))
+        .route(
+            "/api/peers/dm/private-hive-key-shares",
+            post(peers::private_hive_key_share_send),
+        )
         .route("/api/payments/messages", post(peers::agent_payment_send))
         .route("/api/log/head", get(diagnostics::log_head))
         .route("/api/log/replay", post(diagnostics::log_replay))

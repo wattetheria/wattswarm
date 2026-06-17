@@ -685,6 +685,187 @@ fn peer_dm_send_uses_private_group_topic_messages() {
 }
 
 #[test]
+fn private_hive_key_share_send_uses_encrypted_dm_and_redacts_local_record() {
+    let _guard = env_lock();
+    let _db_lock = DbTestLock::acquire();
+    let schema = reset_test_schema("test");
+    let _schema_guard = EnvVarGuard::set("WATTSWARM_PG_SCHEMA", &schema);
+    let _mode_guard = EnvVarGuard::set("WATTSWARM_NODE_MODE", "local");
+    let dir = tempdir().unwrap();
+    let state_dir = dir.path().join("state");
+    std::fs::create_dir_all(&state_dir).unwrap();
+    let db_path = state_dir.join("ui.state");
+    open_node(&state_dir, &db_path).expect("initialize local node");
+    let remote_keypair = wattswarm::crypto::generate_private_message_keypair();
+    let remote_public_key_b64 = remote_keypair.public_key_b64.clone();
+    let shared_secret_b64 = wattswarm::crypto::generate_private_group_secret_b64();
+    wattswarm::control::upsert_private_hive_key_record_state(
+        &state_dir,
+        wattswarm::control::PrivateHiveKeyRecord {
+            feed_key: "private.hive".to_owned(),
+            scope_hint: "group:dm-key-share".to_owned(),
+            group_id: "private.hive:dm-key-share".to_owned(),
+            epoch: 1,
+            shared_secret_b64: shared_secret_b64.clone(),
+            updated_at: 1,
+        },
+    )
+    .expect("save private hive key");
+    wattswarm::control::save_peer_metadata_record_state(
+        &state_dir,
+        &wattswarm::control::PeerMetadataRecord {
+            node_id: "node-beta".to_owned(),
+            network_id: None,
+            params_version: None,
+            params_hash: None,
+            agent_version_raw: None,
+            agent_version_prefix: None,
+            protocol_version: None,
+            observed_addr: None,
+            listen_addrs: Vec::new(),
+            protocols: Vec::new(),
+            handshake_status: "identified".to_owned(),
+            last_error: None,
+            contact_material: Some(json!({
+                "encryption": {
+                    "private_message": {
+                        "scheme": "wattswarm.private.dm.v1",
+                        "key_agreement": "x25519",
+                        "cipher": "chacha20poly1305",
+                        "public_key_b64": remote_public_key_b64,
+                    }
+                }
+            })),
+            contact_material_signature: None,
+            contact_material_updated_at: Some(1),
+            first_identified_at: 1,
+            last_identified_at: 1,
+        },
+    )
+    .expect("save peer encryption metadata");
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let app = build_app(UiServerState::new(state_dir.clone(), db_path.clone()));
+        let up_res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/node/up")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(up_res.status(), StatusCode::OK);
+
+        let send_res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/peers/dm/private-hive-key-shares")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({
+                            "remote_node_id": "node-beta",
+                            "feed_key": "private.hive",
+                            "scope_hint": "group:dm-key-share",
+                            "agent_envelope": {
+                                "protocol": "google_a2a",
+                                "source_agent_id": "agent-alpha",
+                                "target_agent_id": "agent-beta",
+                                "capability": "hive.private_key_share",
+                                "message_json": "{}"
+                            }
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let send_status = send_res.status();
+        let send_json = json_from(send_res).await;
+        assert_eq!(send_status, StatusCode::OK, "send response: {send_json}");
+        assert_eq!(send_json["ok"].as_bool(), Some(true));
+        assert_eq!(
+            send_json["shared_secret_b64_redacted"].as_bool(),
+            Some(true)
+        );
+        assert!(
+            !serde_json::to_string(&send_json)
+                .unwrap()
+                .contains(&shared_secret_b64)
+        );
+
+        let thread_id = send_json["thread_id"].as_str().expect("thread id");
+        let dm_res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(format!("/api/peers/dm/messages?thread_id={thread_id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(dm_res.status(), StatusCode::OK);
+        let dm_json = json_from(dm_res).await;
+        let local_messages = dm_json["messages"].as_array().expect("dm messages");
+        assert_eq!(local_messages.len(), 1);
+        assert_eq!(
+            local_messages[0]["content"]["shared_secret_b64_redacted"].as_bool(),
+            Some(true)
+        );
+        assert!(
+            !serde_json::to_string(&local_messages[0])
+                .unwrap()
+                .contains(&shared_secret_b64)
+        );
+
+        let topic_res = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(format!(
+                        "/api/topic/messages?feed_key=wattswarm.dm&scope_hint={}&limit=5",
+                        send_json["scope_hint"].as_str().expect("scope hint")
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(topic_res.status(), StatusCode::OK);
+        let topic_json = json_from(topic_res).await;
+        assert!(
+            !serde_json::to_string(&topic_json)
+                .unwrap()
+                .contains(&shared_secret_b64)
+        );
+        let diagnostics = wattswarm::network_bridge::list_network_diagnostics(
+            &state_dir,
+            &wattswarm::network_bridge::DiagnosticFilter {
+                phase: Some("private_dm.encrypt".to_owned()),
+                ..Default::default()
+            },
+        )
+        .expect("list private dm encryption diagnostics");
+        let message_id = send_json["message_id"].as_str().expect("message id");
+        assert!(diagnostics.iter().any(|entry| {
+            entry.object_kind.as_deref() == Some("peer_dm_message")
+                && entry.object_id.as_deref() == Some(message_id)
+                && entry.details["encrypted_payload_present"].as_bool() == Some(true)
+        }));
+    });
+}
+
+#[test]
 fn ui_root_page_serves_startup_view_and_diagnostics_route_redirects_legacy_console() {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
