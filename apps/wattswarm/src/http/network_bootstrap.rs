@@ -1,10 +1,11 @@
 use crate::control::{local_peer_id, open_configured_node};
 use crate::http::{ApiError, UiServerState, run_blocking};
-use anyhow::Result;
+use anyhow::{Result, bail};
 use axum::Json;
 use axum::extract::State;
 use serde_json::{Value, json};
 use std::path::Path;
+use wattswarm_network_p2p::NetworkNodeId;
 
 const ENV_PUBLIC_BOOTSTRAP_URLS: &str = "WATTSWARM_PUBLIC_BOOTSTRAP_URLS";
 const ENV_PUBLIC_BOOTSTRAP_CONTACTS: &str = "WATTSWARM_PUBLIC_BOOTSTRAP_CONTACTS";
@@ -56,7 +57,8 @@ pub(crate) async fn network_join_manifest(
         let node = open_configured_node(&state_clone.state_dir, &state_clone.db_path)?;
         let bundle = node.store.load_network_bootstrap_bundle()?;
         let relay_urls = split_public_manifest_values(ENV_IROH_RELAY_URLS);
-        let mut bootstrap_contacts = split_public_manifest_contacts(ENV_PUBLIC_BOOTSTRAP_CONTACTS);
+        let mut bootstrap_contacts =
+            public_manifest_bootstrap_contacts(ENV_PUBLIC_BOOTSTRAP_CONTACTS, &relay_urls)?;
         if bootstrap_contacts.is_empty() {
             if public_iroh_direct_addrs_disabled() && !relay_urls.is_empty() {
                 bootstrap_contacts.push(relay_only_bootstrap_contact_json(
@@ -97,27 +99,37 @@ fn split_public_manifest_values(key: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
-fn split_public_manifest_contacts(key: &str) -> Vec<String> {
-    std::env::var(key)
-        .ok()
-        .map(|raw| {
-            raw.lines()
-                .flat_map(|line| {
-                    let value = line.trim();
-                    if value.starts_with('{') {
-                        vec![value.to_owned()]
-                    } else {
-                        value
-                            .split(',')
-                            .map(str::trim)
-                            .filter(|value| !value.is_empty())
-                            .map(str::to_owned)
-                            .collect::<Vec<_>>()
-                    }
-                })
-                .collect()
+fn public_manifest_bootstrap_contacts(key: &str, relay_urls: &[String]) -> Result<Vec<String>> {
+    let Some(raw) = std::env::var(key).ok() else {
+        return Ok(Vec::new());
+    };
+    raw.lines()
+        .flat_map(|line| {
+            let value = line.trim();
+            if value.starts_with('{') {
+                vec![value.to_owned()]
+            } else {
+                value
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>()
+            }
         })
-        .unwrap_or_default()
+        .map(|value| public_manifest_bootstrap_contact(value, relay_urls))
+        .collect()
+}
+
+fn public_manifest_bootstrap_contact(value: String, relay_urls: &[String]) -> Result<String> {
+    if value.starts_with('{') || value.contains('@') {
+        return Ok(value);
+    }
+    if relay_urls.is_empty() {
+        bail!("bare bootstrap node id requires WATTSWARM_IROH_RELAY_URLS");
+    }
+    let peer_id = NetworkNodeId::new(value)?.to_string();
+    relay_only_bootstrap_contact_json_for_peer_id(peer_id, relay_urls)
 }
 
 fn public_iroh_direct_addrs_disabled() -> bool {
@@ -134,6 +146,13 @@ fn public_iroh_direct_addrs_disabled() -> bool {
 
 fn relay_only_bootstrap_contact_json(state_dir: &Path, relay_urls: &[String]) -> Result<String> {
     let peer_id = local_peer_id(state_dir)?;
+    relay_only_bootstrap_contact_json_for_peer_id(peer_id, relay_urls)
+}
+
+fn relay_only_bootstrap_contact_json_for_peer_id(
+    peer_id: String,
+    relay_urls: &[String],
+) -> Result<String> {
     let generated_at = chrono::Utc::now().timestamp_millis().max(0) as u64;
     Ok(json!({
         "node_id": peer_id.clone(),
