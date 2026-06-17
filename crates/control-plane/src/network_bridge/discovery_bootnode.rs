@@ -192,7 +192,6 @@ pub(super) fn query_discovery_bootnodes_for_candidate_records(
         .context("build discovery bootnode query HTTP client")?;
     let mut records = Vec::new();
     let mut seen = HashSet::new();
-    let mut seen_history_providers = HashSet::new();
     for discovery_url in &discovery_urls {
         let endpoint = match discovery_bootnode_query_endpoint(&discovery_url, network_id, settings)
         {
@@ -208,7 +207,6 @@ pub(super) fn query_discovery_bootnodes_for_candidate_records(
             network_id,
             now_ms,
             &mut seen,
-            &mut seen_history_providers,
             &mut records,
         );
     }
@@ -242,7 +240,6 @@ pub(super) fn query_discovery_bootnodes_for_candidate_records(
                 network_id,
                 now_ms,
                 &mut seen,
-                &mut seen_history_providers,
                 &mut records,
             );
         }
@@ -256,7 +253,6 @@ fn fetch_discovery_bootnode_records(
     network_id: &str,
     now_ms: u64,
     seen: &mut HashSet<String>,
-    seen_history_providers: &mut HashSet<String>,
     records: &mut Vec<SignedDiscoveryNodeRecord>,
 ) {
     match client.get(endpoint.clone()).send() {
@@ -268,15 +264,9 @@ fn fetch_discovery_bootnode_records(
                         let record = item.into_record();
                         if record.verify_fresh_at(now_ms).is_ok()
                             && record.body.network_id == network_id
+                            && seen.insert(record.body.node_id.clone())
                         {
-                            let has_history_provider =
-                                discovery_record_has_history_provider(&record);
-                            let is_new_node = seen.insert(record.body.node_id.clone());
-                            let is_new_history_provider = has_history_provider
-                                && seen_history_providers.insert(record.body.node_id.clone());
-                            if is_new_node || is_new_history_provider {
-                                records.push(record);
-                            }
+                            records.push(record);
                         }
                     }
                 }
@@ -404,9 +394,6 @@ pub(super) fn apply_discovery_bootnode_record(
     let registered = service
         .runtime
         .upsert_remote_contact_material(remote_network_peer_id.clone(), contact)?;
-    if discovery_record_has_history_provider(&record) {
-        service.remember_global_backfill_provider(NetworkNodeId::new(remote_network_peer_id)?);
-    }
     if !registered {
         return Ok(false);
     }
@@ -435,14 +422,6 @@ pub(super) fn apply_discovery_bootnode_record(
         })),
     );
     Ok(registered)
-}
-
-fn discovery_record_has_history_provider(record: &SignedDiscoveryNodeRecord) -> bool {
-    record
-        .body
-        .topic_providers
-        .iter()
-        .any(|provider| provider.capabilities.history_backfill && provider.capabilities.local_store)
 }
 
 fn discovery_record_distance_km(

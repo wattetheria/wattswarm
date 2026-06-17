@@ -79,7 +79,7 @@ fn discovery_bootnode_record_registers_iroh_contact_inside_radius_without_markin
 }
 
 #[test]
-fn discovery_topic_provider_record_marks_global_backfill_provider() {
+fn discovery_topic_provider_record_does_not_mark_global_backfill_provider() {
     let local_dir = temp_startup_dir("discovery-v1-topic-provider-local");
     let remote_dir = temp_startup_dir("discovery-v1-topic-provider-remote");
     let local_seed = [123u8; 32];
@@ -106,8 +106,8 @@ fn discovery_topic_provider_record_marks_global_backfill_provider() {
         1.0,
     );
     record.body.topic_providers.push(DiscoveryTopicProvider {
-        feed_key: "global-history".to_owned(),
-        scope_hint: "global".to_owned(),
+        feed_key: "sydney-weather".to_owned(),
+        scope_hint: "group:sydney-weather".to_owned(),
         capabilities: DiscoveryTopicProviderCapabilities::local_history_provider(),
         updated_at_ms: observed_at_ms(),
     });
@@ -144,7 +144,7 @@ fn discovery_topic_provider_record_marks_global_backfill_provider() {
 
     assert!(registered);
     assert!(node.peers().contains(&remote_node_id));
-    assert!(service.is_global_backfill_provider(&remote_peer));
+    assert!(!service.is_global_backfill_provider(&remote_peer));
 
     wattswarm_network_transport_iroh::shutdown_local_iroh_data_plane(&local_dir);
     wattswarm_network_transport_iroh::shutdown_local_iroh_data_plane(&remote_dir);
@@ -481,7 +481,7 @@ fn discovery_bootnode_query_without_local_geo_uses_capability_records() {
 }
 
 #[test]
-fn discovery_bootnode_query_fetches_topic_provider_records_for_local_subscriptions() {
+fn discovery_bootnode_query_dedups_topic_provider_records_for_known_nodes() {
     let local_dir = temp_startup_dir("discovery-v1-query-topic-provider-local");
     let remote_dir = temp_startup_dir("discovery-v1-query-topic-provider-remote");
     let local_identity = NodeIdentity::from_seed([116u8; 32]);
@@ -518,22 +518,6 @@ fn discovery_bootnode_query_fetches_topic_provider_records_for_local_subscriptio
             },
         )
         .expect("upsert subscription");
-    node.store
-        .upsert_feed_subscription_with_provider_capabilities(
-            crate::storage::FeedSubscriptionUpsert {
-                network_id: DEFAULT_NETWORK_CONTEXT_ID,
-                subscriber_node_id: &node.node_id(),
-                feed_key: "melbourne-power",
-                scope_hint: "group:melbourne-power",
-                gossip_kinds: &["events".to_owned()],
-                provider_capabilities: Some(
-                    &crate::types::TopicProviderCapabilities::local_history_provider(),
-                ),
-                active: true,
-                updated_at: observed_at_ms(),
-            },
-        )
-        .expect("upsert second subscription");
     let plain_record = signed_discovery_record_for_test(
         &remote_dir,
         remote_seed,
@@ -564,7 +548,7 @@ fn discovery_bootnode_query_fetches_topic_provider_records_for_local_subscriptio
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind discovery listener");
     let addr = listener.local_addr().expect("discovery listener addr");
     let handle = thread::spawn(move || {
-        for _ in 0..3 {
+        for _ in 0..2 {
             let (mut stream, _) = listener.accept().expect("accept discovery query");
             let request = read_http_request(&mut stream);
             let body = if request.starts_with("GET /api/network/discovery/capability?") {
@@ -574,14 +558,8 @@ fn discovery_bootnode_query_fetches_topic_provider_records_for_local_subscriptio
             } else {
                 assert!(request.starts_with("GET /api/network/discovery/topic-providers?"));
                 assert!(request.contains("network_id=default"));
-                assert!(
-                    request.contains("feed_key=sydney-weather")
-                        || request.contains("feed_key=melbourne-power")
-                );
-                assert!(
-                    request.contains("scope_hint=group%3Asydney-weather")
-                        || request.contains("scope_hint=group%3Amelbourne-power")
-                );
+                assert!(request.contains("feed_key=sydney-weather"));
+                assert!(request.contains("scope_hint=group%3Asydney-weather"));
                 &topic_response_body
             };
             let response = format!(
@@ -610,13 +588,9 @@ fn discovery_bootnode_query_fetches_topic_provider_records_for_local_subscriptio
     )
     .expect("query discovery bootnode");
 
-    assert_eq!(records.len(), 2);
-    assert_eq!(
-        records[1].body.topic_providers[0].feed_key,
-        "sydney-weather"
-    );
+    assert_eq!(records.len(), 1);
+    assert!(records[0].body.topic_providers.is_empty());
     records[0].verify().expect("plain record verifies");
-    records[1].verify().expect("topic provider record verifies");
     handle.join().expect("join discovery listener");
     wattswarm_network_transport_iroh::shutdown_local_iroh_data_plane(&remote_dir);
     fs::remove_dir_all(local_dir).expect("cleanup local");
