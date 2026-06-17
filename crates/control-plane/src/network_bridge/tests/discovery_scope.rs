@@ -69,6 +69,82 @@ fn discovery_bootnode_record_registers_iroh_contact_inside_radius_without_markin
         crate::control::load_peer_metadata_records_state(&local_dir).expect("peer metadata");
     assert_eq!(metadata[0].node_id, remote_node_id);
     assert_eq!(metadata[0].handshake_status, "discovery_v1");
+    let remote_peer = NetworkNodeId::new(remote_node_id.clone()).expect("remote peer id");
+    assert!(!service.is_global_backfill_provider(&remote_peer));
+
+    wattswarm_network_transport_iroh::shutdown_local_iroh_data_plane(&local_dir);
+    wattswarm_network_transport_iroh::shutdown_local_iroh_data_plane(&remote_dir);
+    fs::remove_dir_all(local_dir).expect("cleanup local");
+    fs::remove_dir_all(remote_dir).expect("cleanup remote");
+}
+
+#[test]
+fn discovery_topic_provider_record_marks_global_backfill_provider() {
+    let local_dir = temp_startup_dir("discovery-v1-topic-provider-local");
+    let remote_dir = temp_startup_dir("discovery-v1-topic-provider-remote");
+    let local_seed = [123u8; 32];
+    let remote_seed = [124u8; 32];
+    fs::write(local_dir.join("node_seed.hex"), hex::encode(local_seed)).expect("write local seed");
+    fs::write(remote_dir.join("node_seed.hex"), hex::encode(remote_seed))
+        .expect("write remote seed");
+    fs::write(
+        local_dir.join("startup_config.json"),
+        serde_json::to_vec(&json!({
+            "network_mode": "wan",
+            "relay_urls": ["https://relay.example.invalid/"]
+        }))
+        .expect("startup config json"),
+    )
+    .expect("write startup config");
+    let settings = discovery_bootnode_settings_from_state_dir(&local_dir).expect("settings");
+    let mut record = signed_discovery_record_for_test(
+        &remote_dir,
+        remote_seed,
+        DEFAULT_NETWORK_CONTEXT_ID,
+        70.0,
+        70.0,
+        1.0,
+    );
+    record.body.topic_providers.push(DiscoveryTopicProvider {
+        feed_key: "global-history".to_owned(),
+        scope_hint: "global".to_owned(),
+        capabilities: DiscoveryTopicProviderCapabilities::local_history_provider(),
+        updated_at_ms: observed_at_ms(),
+    });
+    record = SignedDiscoveryNodeRecord::sign(record.body, &NodeIdentity::from_seed(remote_seed))
+        .expect("resign topic provider record");
+    let remote_node_id = record.body.node_id.clone();
+    let remote_peer = NetworkNodeId::new(remote_node_id.clone()).expect("remote peer id");
+    let mut node = Node::open_in_memory_with_roles(&[Role::Proposer]).expect("node");
+    let mut service = NetworkBridgeService::new(
+        NetworkP2pNode::from_iroh_state_dir(
+            NetworkP2pConfig::default(),
+            local_dir.clone(),
+            local_seed,
+        )
+        .expect("iroh node"),
+        &[SwarmScope::Global],
+        &NetworkProtocolParams::default(),
+    )
+    .expect("service");
+    service.set_state_dir(local_dir.clone(), local_dir.join("ui.state"));
+
+    let local_peer_id = service.local_peer_id().to_string();
+    let registered = apply_discovery_bootnode_record(
+        &mut service,
+        &mut node,
+        &local_dir,
+        &local_peer_id,
+        DEFAULT_NETWORK_CONTEXT_ID,
+        &settings,
+        record,
+        observed_at_ms(),
+    )
+    .expect("apply discovery provider record");
+
+    assert!(registered);
+    assert!(node.peers().contains(&remote_node_id));
+    assert!(service.is_global_backfill_provider(&remote_peer));
 
     wattswarm_network_transport_iroh::shutdown_local_iroh_data_plane(&local_dir);
     wattswarm_network_transport_iroh::shutdown_local_iroh_data_plane(&remote_dir);
@@ -442,7 +518,23 @@ fn discovery_bootnode_query_fetches_topic_provider_records_for_local_subscriptio
             },
         )
         .expect("upsert subscription");
-    let mut record = signed_discovery_record_for_test(
+    node.store
+        .upsert_feed_subscription_with_provider_capabilities(
+            crate::storage::FeedSubscriptionUpsert {
+                network_id: DEFAULT_NETWORK_CONTEXT_ID,
+                subscriber_node_id: &node.node_id(),
+                feed_key: "melbourne-power",
+                scope_hint: "group:melbourne-power",
+                gossip_kinds: &["events".to_owned()],
+                provider_capabilities: Some(
+                    &crate::types::TopicProviderCapabilities::local_history_provider(),
+                ),
+                active: true,
+                updated_at: observed_at_ms(),
+            },
+        )
+        .expect("upsert second subscription");
+    let plain_record = signed_discovery_record_for_test(
         &remote_dir,
         remote_seed,
         DEFAULT_NETWORK_CONTEXT_ID,
@@ -450,6 +542,7 @@ fn discovery_bootnode_query_fetches_topic_provider_records_for_local_subscriptio
         70.0,
         1.0,
     );
+    let mut record = plain_record.clone();
     record.body.topic_providers.push(DiscoveryTopicProvider {
         feed_key: "sydney-weather".to_owned(),
         scope_hint: "group:sydney-weather".to_owned(),
@@ -458,9 +551,9 @@ fn discovery_bootnode_query_fetches_topic_provider_records_for_local_subscriptio
     });
     record = SignedDiscoveryNodeRecord::sign(record.body, &NodeIdentity::from_seed(remote_seed))
         .expect("resign topic provider record");
-    let empty_response_body = json!({
+    let capability_response_body = json!({
         "ok": true,
-        "records": [],
+        "records": [plain_record],
     })
     .to_string();
     let topic_response_body = json!({
@@ -471,18 +564,24 @@ fn discovery_bootnode_query_fetches_topic_provider_records_for_local_subscriptio
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind discovery listener");
     let addr = listener.local_addr().expect("discovery listener addr");
     let handle = thread::spawn(move || {
-        for _ in 0..2 {
+        for _ in 0..3 {
             let (mut stream, _) = listener.accept().expect("accept discovery query");
             let request = read_http_request(&mut stream);
             let body = if request.starts_with("GET /api/network/discovery/capability?") {
                 assert!(request.contains("network_id=default"));
                 assert!(request.contains("capability=wattswarm.node"));
-                &empty_response_body
+                &capability_response_body
             } else {
                 assert!(request.starts_with("GET /api/network/discovery/topic-providers?"));
                 assert!(request.contains("network_id=default"));
-                assert!(request.contains("feed_key=sydney-weather"));
-                assert!(request.contains("scope_hint=group%3Asydney-weather"));
+                assert!(
+                    request.contains("feed_key=sydney-weather")
+                        || request.contains("feed_key=melbourne-power")
+                );
+                assert!(
+                    request.contains("scope_hint=group%3Asydney-weather")
+                        || request.contains("scope_hint=group%3Amelbourne-power")
+                );
                 &topic_response_body
             };
             let response = format!(
@@ -511,12 +610,13 @@ fn discovery_bootnode_query_fetches_topic_provider_records_for_local_subscriptio
     )
     .expect("query discovery bootnode");
 
-    assert_eq!(records.len(), 1);
+    assert_eq!(records.len(), 2);
     assert_eq!(
-        records[0].body.topic_providers[0].feed_key,
+        records[1].body.topic_providers[0].feed_key,
         "sydney-weather"
     );
-    records[0].verify().expect("record verifies");
+    records[0].verify().expect("plain record verifies");
+    records[1].verify().expect("topic provider record verifies");
     handle.join().expect("join discovery listener");
     wattswarm_network_transport_iroh::shutdown_local_iroh_data_plane(&remote_dir);
     fs::remove_dir_all(local_dir).expect("cleanup local");
@@ -550,7 +650,7 @@ fn discovery_bootnode_query_failure_logging_suppresses_repeated_endpoint_failure
 }
 
 #[test]
-fn scopes_to_request_for_peer_limits_unknown_peers_to_public_control_scope() {
+fn scopes_to_request_for_peer_skips_global_for_unknown_non_provider_peer() {
     let local_dir = temp_startup_dir("scope-request-unknown");
     let local_seed = [121u8; 32];
     fs::write(local_dir.join("node_seed.hex"), hex::encode(local_seed)).expect("write local seed");
@@ -562,7 +662,7 @@ fn scopes_to_request_for_peer_limits_unknown_peers_to_public_control_scope() {
     .expect("write startup config");
     let peer = random_network_node_id();
     let target_scope = SwarmScope::Region("sol-1".to_owned());
-    let service = NetworkBridgeService::new(
+    let mut service = NetworkBridgeService::new(
         NetworkP2pNode::from_iroh_state_dir(
             NetworkP2pConfig::default(),
             local_dir.clone(),
@@ -576,6 +676,12 @@ fn scopes_to_request_for_peer_limits_unknown_peers_to_public_control_scope() {
 
     assert_eq!(
         service.scopes_to_request_for_peer(&peer),
+        Vec::<SwarmScope>::new()
+    );
+
+    service.remember_global_backfill_provider(peer.clone());
+    assert_eq!(
+        service.scopes_to_request_for_peer(&peer),
         vec![SwarmScope::Global]
     );
     wattswarm_network_transport_iroh::shutdown_local_iroh_data_plane(&local_dir);
@@ -583,7 +689,7 @@ fn scopes_to_request_for_peer_limits_unknown_peers_to_public_control_scope() {
 }
 
 #[test]
-fn scopes_to_request_for_peer_only_requests_known_scopes_plus_public_control() {
+fn scopes_to_request_for_peer_requests_known_scopes_and_provider_global() {
     let local_dir = temp_startup_dir("scope-request-known");
     let local_seed = [122u8; 32];
     fs::write(local_dir.join("node_seed.hex"), hex::encode(local_seed)).expect("write local seed");
@@ -615,6 +721,12 @@ fn scopes_to_request_for_peer_only_requests_known_scopes_plus_public_control() {
     state.known_scopes.insert(target_scope.clone());
     service.peer_sync_state.insert(peer.clone(), state);
 
+    assert_eq!(
+        service.scopes_to_request_for_peer(&peer),
+        vec![target_scope.clone()]
+    );
+
+    service.remember_global_backfill_provider(peer.clone());
     assert_eq!(
         service.scopes_to_request_for_peer(&peer),
         vec![target_scope, SwarmScope::Global]

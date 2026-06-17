@@ -231,6 +231,11 @@ impl NetworkBridgeService {
             }
             state.inflight_backfills()
         };
+        let scopes = scopes
+            .iter()
+            .filter(|scope| **scope != SwarmScope::Global || self.is_global_backfill_provider(peer))
+            .cloned()
+            .collect::<Vec<_>>();
         if scopes.is_empty() {
             return Ok(false);
         }
@@ -383,7 +388,7 @@ impl NetworkBridgeService {
         let scopes = self.backfill_scopes();
         let global_scope = scopes
             .iter()
-            .any(|scope| *scope == SwarmScope::Global)
+            .any(|scope| *scope == SwarmScope::Global && self.is_global_backfill_provider(peer))
             .then_some(SwarmScope::Global);
         let Some(state) = self.peer_sync_state.get(peer) else {
             return global_scope.into_iter().collect();
@@ -410,9 +415,14 @@ impl NetworkBridgeService {
     ) -> Option<NetworkNodeId> {
         let peers = self.connected_peers.iter().cloned().collect::<Vec<_>>();
         if *scope == SwarmScope::Global {
-            return self
-                .best_peer_for_scope(peers.iter().cloned(), scope, now, true)
-                .or_else(|| self.best_peer_for_scope(peers.into_iter(), scope, now, false));
+            return self.best_peer_for_scope(
+                peers
+                    .into_iter()
+                    .filter(|peer| self.is_global_backfill_provider(peer)),
+                scope,
+                now,
+                false,
+            );
         }
         self.best_peer_for_scope(peers.into_iter(), scope, now, true)
     }
@@ -541,6 +551,14 @@ impl NetworkBridgeService {
         state.record_seen_at(now);
         state.known_scopes.insert(scope.clone());
         self.persist_peer_sync_state();
+    }
+
+    pub(crate) fn remember_global_backfill_provider(&mut self, peer: NetworkNodeId) {
+        self.global_backfill_providers.insert(peer);
+    }
+
+    pub(crate) fn is_global_backfill_provider(&self, peer: &NetworkNodeId) -> bool {
+        self.global_backfill_providers.contains(peer)
     }
 
     pub(crate) fn peer_has_scope_activity(&self, peer: &NetworkNodeId, scope: &SwarmScope) -> bool {

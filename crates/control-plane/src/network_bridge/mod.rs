@@ -1155,6 +1155,7 @@ pub struct NetworkBridgeService {
     pinned_scopes: Vec<SwarmScope>,
     peer_sync_state: HashMap<NetworkNodeId, PeerSyncState>,
     connected_peers: HashSet<NetworkNodeId>,
+    global_backfill_providers: HashSet<NetworkNodeId>,
     known_peer_addrs: HashMap<NetworkNodeId, NetworkAddress>,
     peer_reconnect_state: HashMap<NetworkNodeId, PeerReconnectState>,
     abandoned_reconnect_peers: HashSet<NetworkNodeId>,
@@ -1179,6 +1180,12 @@ impl NetworkBridgeService {
         scopes: &[SwarmScope],
         protocol_params: &NetworkProtocolParams,
     ) -> Result<Self> {
+        let global_backfill_providers = node
+            .config()
+            .parse_bootstrap_peers()?
+            .into_iter()
+            .map(|(peer, _)| peer)
+            .collect::<HashSet<_>>();
         let mut runtime = NetworkRuntime::new(node)?;
         let mut subscribed_scopes = Vec::new();
         let mut subscribed_scope_kinds = HashMap::new();
@@ -1204,6 +1211,7 @@ impl NetworkBridgeService {
             subscribed_scope_kinds,
             peer_sync_state: HashMap::new(),
             connected_peers: HashSet::new(),
+            global_backfill_providers,
             known_peer_addrs: HashMap::new(),
             peer_reconnect_state: HashMap::new(),
             abandoned_reconnect_peers: HashSet::new(),

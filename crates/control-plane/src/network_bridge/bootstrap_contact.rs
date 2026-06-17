@@ -266,6 +266,7 @@ impl NetworkBridgeService {
                             )
                         })?;
                     if let Ok(peer) = NetworkNodeId::new(remote_network_peer_id) {
+                        self.remember_global_backfill_provider(peer.clone());
                         self.schedule_peer_reconnect(peer);
                     }
                 }

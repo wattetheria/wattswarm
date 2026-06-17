@@ -270,7 +270,12 @@ pub fn two_nodes_backfill_missing_events_over_request_response() {
     let mut node_a = make_node(identity_a, membership.clone());
     let mut node_b = make_node(identity_b, membership);
     let mut service_a = make_service();
-    let mut service_b = make_service();
+    let bootstrap_peer = bootstrap_peer_addr(&mut service_a, &mut node_a);
+    let mut service_b = make_bootstrap_service_with_params(
+        &[SwarmScope::Global],
+        &NetworkProtocolParams::default(),
+        &[bootstrap_peer],
+    );
 
     let event = node_a
         .emit_at(
