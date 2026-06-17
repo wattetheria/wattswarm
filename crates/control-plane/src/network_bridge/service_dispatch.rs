@@ -58,17 +58,42 @@ impl NetworkBridgeService {
             )?;
         }
         let contact_material = build_contact_material(&state_dir, &local_node_id)?;
+        let contact_material_private_message_key_len =
+            raw_contact_material_private_message_key_len(Some(&contact_material));
         let pending_agent_envelope = envelope.clone();
+        let request_action = wire_peer_relationship_action(action);
         let request_id = self.runtime.send_peer_relationship_request(
             &peer,
             PeerRelationshipRequest {
-                source_node_id: local_node_id,
+                source_node_id: local_node_id.clone(),
                 target_node_id: remote_node_id.clone(),
-                action: wire_peer_relationship_action(action),
+                action: request_action.clone(),
                 agent_envelope: Some(envelope),
                 contact_material: Some(contact_material),
             },
         )?;
+        diagnostics::record_diagnostic(
+            Some(&state_dir),
+            diagnostics::DiagnosticEvent::new(
+                "info",
+                "transport",
+                "peer_relationship.request",
+                "sent",
+                "peer relationship request sent",
+            )
+            .object("peer_relationship", Some(format!("{request_id:?}")))
+            .source_node_id(Some(local_node_id.clone()))
+            .details(json!({
+                "request_id": format!("{request_id:?}"),
+                "source_node_id": &local_node_id,
+                "target_node_id": &remote_node_id,
+                "action": request_action,
+                "has_contact_material": true,
+                "contact_material_has_private_message_key": contact_material_private_message_key_len.is_some(),
+                "contact_material_private_message_key_len": contact_material_private_message_key_len.unwrap_or_default(),
+                "agent_envelope": &pending_agent_envelope,
+            })),
+        );
         self.pending_relationship_requests.insert(
             request_id,
             PendingPeerRelationshipRequest {

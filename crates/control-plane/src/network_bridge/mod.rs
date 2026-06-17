@@ -89,7 +89,7 @@ use backfill::{
 };
 use bootstrap_contact::{
     build_contact_material, candidate_peer_addrs, iroh_contact_network_peer_id,
-    upsert_contact_material_for_peer,
+    raw_contact_material_private_message_key_len, upsert_contact_material_for_peer,
 };
 pub use bootstrap_contact::{
     export_local_bootstrap_contact, export_local_bootstrap_contact_json, validate_bootstrap_contact,

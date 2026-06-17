@@ -1110,6 +1110,8 @@ impl NetworkBridgeService {
                 let action = control_peer_relationship_action(request.action);
                 let local_node_id = self.local_peer_id().to_string();
                 let now = observed_at_ms();
+                let request_private_message_key_len =
+                    raw_contact_material_private_message_key_len(request.contact_material.as_ref());
                 diagnostics::record_diagnostic(
                     self.state_dir.as_deref(),
                     diagnostics::DiagnosticEvent::new(
@@ -1126,6 +1128,9 @@ impl NetworkBridgeService {
                         "source_node_id": &request.source_node_id,
                         "target_node_id": &request.target_node_id,
                         "action": request.action,
+                        "has_contact_material": request.contact_material.is_some(),
+                        "contact_material_has_private_message_key": request_private_message_key_len.is_some(),
+                        "contact_material_private_message_key_len": request_private_message_key_len.unwrap_or_default(),
                         "agent_envelope": &request.agent_envelope,
                     })),
                 );
@@ -1417,6 +1422,9 @@ impl NetworkBridgeService {
                 let action = pending.action;
                 let expected_action = wire_peer_relationship_action(action);
                 let local_node_id = self.local_peer_id().to_string();
+                let response_private_message_key_len = raw_contact_material_private_message_key_len(
+                    response.contact_material.as_ref(),
+                );
                 diagnostics::record_diagnostic(
                     self.state_dir.as_deref(),
                     diagnostics::DiagnosticEvent::new(
@@ -1436,6 +1444,9 @@ impl NetworkBridgeService {
                         "applied": response.applied,
                         "relationship_state": &response.relationship_state,
                         "detail": &response.detail,
+                        "has_contact_material": response.contact_material.is_some(),
+                        "contact_material_has_private_message_key": response_private_message_key_len.is_some(),
+                        "contact_material_private_message_key_len": response_private_message_key_len.unwrap_or_default(),
                         "agent_envelope": &response.agent_envelope,
                     })),
                 );

@@ -299,6 +299,73 @@ fn peer_relationship_action_allows_recently_seen_peer_without_live_connection() 
 }
 
 #[test]
+fn peer_relationship_action_records_outbound_contact_material_diagnostic() {
+    let local_dir = temp_startup_dir("relationship-action-diagnostic-local");
+    let remote_dir = temp_startup_dir("relationship-action-diagnostic-remote");
+    let local_seed = [117u8; 32];
+    let remote_seed = [118u8; 32];
+    std::fs::write(local_dir.join("node_seed.hex"), hex::encode(local_seed))
+        .expect("write local seed");
+    std::fs::write(remote_dir.join("node_seed.hex"), hex::encode(remote_seed))
+        .expect("write remote seed");
+    ensure_test_relay_urls(&local_dir);
+    ensure_test_relay_urls(&remote_dir);
+
+    let remote_endpoint =
+        wattswarm_network_transport_iroh::local_endpoint_id_from_state_dir(&remote_dir)
+            .expect("remote endpoint")
+            .to_string();
+    let peer = NetworkNodeId::new(remote_endpoint.clone()).expect("remote peer id");
+    let remote_contact = export_local_contact_material_for_network_peer_id(
+        &remote_dir,
+        &remote_endpoint,
+        observed_at_ms(),
+    )
+    .expect("remote contact");
+
+    let mut service = NetworkBridgeService::new(
+        NetworkP2pNode::from_iroh_state_dir(
+            NetworkP2pConfig::default(),
+            local_dir.clone(),
+            local_seed,
+        )
+        .expect("local node"),
+        &[SwarmScope::Global],
+        &NetworkProtocolParams::default(),
+    )
+    .expect("service");
+    service.set_state_dir(local_dir.clone(), local_dir.join("ui.state"));
+    service
+        .runtime
+        .upsert_remote_contact_material(peer.to_string(), remote_contact)
+        .expect("upsert contact");
+    service.record_peer_liveness(peer);
+
+    service
+        .send_peer_relationship_action(
+            &remote_endpoint,
+            crate::control::PeerRelationshipAction::Request,
+            None,
+        )
+        .expect("send relationship request");
+
+    let raw = std::fs::read_to_string(local_dir.join("diagnostics/wattswarm_node.jsonl"))
+        .expect("diagnostics");
+    assert!(raw.contains("\"phase\":\"peer_relationship.request\""));
+    assert!(raw.contains("\"status\":\"sent\""));
+    assert!(raw.contains("\"has_contact_material\":true"));
+    assert!(raw.contains("\"contact_material_has_private_message_key\":true"));
+    assert!(raw.contains("\"contact_material_private_message_key_len\":44"));
+    assert!(!raw.contains("\"contact_material\":"));
+    assert!(!raw.contains("\"public_key_b64\""));
+
+    wattswarm_network_transport_iroh::shutdown_local_iroh_data_plane(&local_dir);
+    wattswarm_network_transport_iroh::shutdown_local_iroh_data_plane(&remote_dir);
+    let _ = std::fs::remove_dir_all(local_dir);
+    let _ = std::fs::remove_dir_all(remote_dir);
+}
+
+#[test]
 fn queued_peer_relationship_command_remains_pending_until_runtime_ack() {
     let local_dir = temp_startup_dir("relationship-command-pending-local");
     let remote_dir = temp_startup_dir("relationship-command-pending-remote");
@@ -1526,6 +1593,74 @@ fn peer_relationship_response_persists_private_message_contact_material() {
     assert!(peer_metadata.private_message_public_key_b64().is_some());
 
     wattswarm_network_transport_iroh::shutdown_local_iroh_data_plane(&local_dir);
+    wattswarm_network_transport_iroh::shutdown_local_iroh_data_plane(&remote_dir);
+    std::fs::remove_dir_all(local_dir).expect("cleanup local");
+    std::fs::remove_dir_all(remote_dir).expect("cleanup remote");
+}
+
+#[test]
+fn discovery_contact_material_preserves_private_message_key() {
+    let local_dir = temp_startup_dir("relationship-contact-preserve-local");
+    let remote_dir = temp_startup_dir("relationship-contact-preserve-remote");
+    std::fs::write(local_dir.join("node_seed.hex"), hex::encode([113u8; 32]))
+        .expect("write local seed");
+    std::fs::write(remote_dir.join("node_seed.hex"), hex::encode([114u8; 32]))
+        .expect("write remote seed");
+    ensure_test_relay_urls(&local_dir);
+    ensure_test_relay_urls(&remote_dir);
+    let remote_endpoint =
+        wattswarm_network_transport_iroh::local_endpoint_id_from_state_dir(&remote_dir)
+            .expect("remote endpoint")
+            .to_string();
+    let relationship_contact =
+        build_contact_material(&remote_dir, &remote_endpoint).expect("relationship contact");
+
+    upsert_contact_material_for_peer(&local_dir, &remote_endpoint, &relationship_contact)
+        .expect("save relationship contact");
+    let original_key = crate::control::load_peer_metadata_records_state(&local_dir)
+        .expect("load peer metadata")
+        .into_iter()
+        .find(|record| record.node_id == remote_endpoint)
+        .and_then(|record| record.private_message_public_key_b64())
+        .expect("relationship contact key");
+
+    let discovery_contact = RawContactMaterial {
+        material_json: serde_json::to_string(&json!({
+            "node_id": remote_endpoint,
+            "peer_id": remote_endpoint,
+            "listen_addrs": [],
+            "generated_at": observed_at_ms(),
+            "transports": [],
+            "recommended_routes": {
+                "direct_message": "iroh_direct"
+            },
+            "discovery_protocol": "wattswarm-discovery/1"
+        }))
+        .expect("discovery contact json"),
+        signature: Some("discovery-signature".to_owned()),
+        generated_at: observed_at_ms(),
+    };
+    upsert_contact_material_for_peer(&local_dir, &remote_endpoint, &discovery_contact)
+        .expect("save discovery contact");
+
+    let peer_metadata = crate::control::load_peer_metadata_records_state(&local_dir)
+        .expect("reload peer metadata")
+        .into_iter()
+        .find(|record| record.node_id == remote_endpoint)
+        .expect("remote metadata");
+    assert_eq!(
+        peer_metadata.private_message_public_key_b64().as_deref(),
+        Some(original_key.as_str())
+    );
+    assert_eq!(
+        peer_metadata
+            .contact_material
+            .as_ref()
+            .and_then(|material| material.get("discovery_protocol"))
+            .and_then(Value::as_str),
+        Some("wattswarm-discovery/1")
+    );
+
     wattswarm_network_transport_iroh::shutdown_local_iroh_data_plane(&remote_dir);
     std::fs::remove_dir_all(local_dir).expect("cleanup local");
     std::fs::remove_dir_all(remote_dir).expect("cleanup remote");

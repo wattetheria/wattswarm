@@ -65,6 +65,54 @@ pub fn validate_bootstrap_contact(raw_contact: &str) -> Result<()> {
     parse_startup_bootstrap_contact(raw_contact).map(|_| ())
 }
 
+fn contact_material_private_message_key_b64(material: &Value) -> Option<&str> {
+    material
+        .get("encryption")
+        .and_then(|encryption| encryption.get("private_message"))
+        .and_then(|private_message| private_message.get("public_key_b64"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+pub(super) fn raw_contact_material_private_message_key_len(
+    contact_material: Option<&RawContactMaterial>,
+) -> Option<usize> {
+    contact_material
+        .and_then(|material| serde_json::from_str::<Value>(&material.material_json).ok())
+        .and_then(|material| contact_material_private_message_key_b64(&material).map(str::len))
+}
+
+fn preserve_existing_private_message_material(
+    mut incoming: Value,
+    existing: Option<&crate::control::PeerMetadataRecord>,
+) -> Value {
+    if contact_material_private_message_key_b64(&incoming).is_some() {
+        return incoming;
+    }
+    let Some(existing_private_message) = existing
+        .and_then(|record| record.contact_material.as_ref())
+        .and_then(|material| material.get("encryption"))
+        .and_then(|encryption| encryption.get("private_message"))
+        .cloned()
+    else {
+        return incoming;
+    };
+    let Some(incoming_object) = incoming.as_object_mut() else {
+        return incoming;
+    };
+    let encryption = incoming_object
+        .entry("encryption")
+        .or_insert_with(|| json!({}));
+    if !encryption.is_object() {
+        *encryption = json!({});
+    }
+    if let Some(encryption_object) = encryption.as_object_mut() {
+        encryption_object.insert("private_message".to_owned(), existing_private_message);
+    }
+    incoming
+}
+
 pub(super) fn upsert_contact_material_for_peer(
     state_dir: &Path,
     remote_node_id: &str,
@@ -74,6 +122,9 @@ pub(super) fn upsert_contact_material_for_peer(
     let existing = crate::control::load_peer_metadata_records_state(state_dir)?
         .into_iter()
         .find(|record| record.node_id == remote_node_id);
+    let parsed_contact_material = serde_json::from_str(&contact_material.material_json)
+        .ok()
+        .map(|material| preserve_existing_private_message_material(material, existing.as_ref()));
     let record = crate::control::PeerMetadataRecord {
         node_id: remote_node_id.to_owned(),
         network_id: existing.as_ref().and_then(|entry| entry.network_id.clone()),
@@ -104,7 +155,7 @@ pub(super) fn upsert_contact_material_for_peer(
             |entry| entry.handshake_status.clone(),
         ),
         last_error: None,
-        contact_material: serde_json::from_str(&contact_material.material_json).ok(),
+        contact_material: parsed_contact_material,
         contact_material_signature: contact_material.signature.clone(),
         contact_material_updated_at: Some(contact_material.generated_at),
         first_identified_at: existing

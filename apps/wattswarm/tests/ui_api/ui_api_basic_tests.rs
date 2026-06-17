@@ -698,6 +698,9 @@ fn ui_root_page_serves_startup_view_and_diagnostics_route_redirects_legacy_conso
                 r#"<link rel="icon" type="image/png" sizes="64x64" href="/favicon.png">"#
             )
         );
+        assert!(diagnostics_html.contains("function formatRawJson(row)"));
+        assert!(diagnostics_html.contains("normalized.endsWith(\"_at\")"));
+        assert!(diagnostics_html.contains("escapeHtml(formatRawJson(row))"));
 
         let legacy_res = app
             .oneshot(

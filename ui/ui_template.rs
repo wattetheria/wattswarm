@@ -698,6 +698,52 @@ pub const INDEX_HTML: &str = r#"<!DOCTYPE html>
       return Number.isNaN(parsed) ? String(value) : new Date(parsed).toLocaleString();
     }
 
+    const RAW_JSON_TIME_FIELDS = new Set([
+      "acknowledged_at",
+      "created_at",
+      "generated_at",
+      "queued_at",
+      "received_at",
+      "sent_at",
+      "timestamp",
+      "timestamp_ms",
+      "updated_at",
+    ]);
+
+    function isRawJsonTimeField(key) {
+      const normalized = String(key || "").toLowerCase();
+      return RAW_JSON_TIME_FIELDS.has(normalized)
+        || normalized.endsWith("_at")
+        || normalized.endsWith("_at_ms");
+    }
+
+    function formatRawJsonValue(key, value) {
+      if (Array.isArray(value)) {
+        return value.map((item) => formatRawJsonValue("", item));
+      }
+      if (value && typeof value === "object") {
+        return Object.fromEntries(
+          Object.entries(value).map(([childKey, childValue]) => [
+            childKey,
+            formatRawJsonValue(childKey, childValue),
+          ]),
+        );
+      }
+      if (!isRawJsonTimeField(key)) return value;
+      if (typeof value === "number") return formatTime(value);
+      if (typeof value === "string" && /^\d{10,13}$/.test(value.trim())) {
+        return formatTime(Number(value));
+      }
+      if (typeof value === "string" && !Number.isNaN(Date.parse(value))) {
+        return formatTime(value);
+      }
+      return value;
+    }
+
+    function formatRawJson(row) {
+      return JSON.stringify(formatRawJsonValue("", row), null, 2);
+    }
+
     const TITLE_MAX = 160;
     function conciseTitle(row) {
       const raw = String(row.message || row.phase || "diagnostic");
@@ -832,7 +878,7 @@ pub const INDEX_HTML: &str = r#"<!DOCTYPE html>
             <div class="meta"><span>${escapeHtml(formatTime(row.timestamp_ms || row.timestamp))}</span>${meta.map((item) => `<span>${escapeHtml(item)}</span>`).join("")}</div>
             <details>
               <summary>Raw JSON</summary>
-              <pre>${escapeHtml(JSON.stringify(row, null, 2))}</pre>
+              <pre>${escapeHtml(formatRawJson(row))}</pre>
             </details>
           </article>
         `;
