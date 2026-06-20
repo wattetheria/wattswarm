@@ -44,6 +44,9 @@ pub(crate) struct PrivateHiveKeyShareRequest {
     remote_node_id: String,
     feed_key: String,
     scope_hint: String,
+    display_name: String,
+    hive_name: String,
+    invite_text: String,
     #[serde(default)]
     agent_envelope: Option<RawAgentEnvelope>,
 }
@@ -215,6 +218,9 @@ pub(crate) async fn private_hive_key_share_send(
         .ok_or_else(|| anyhow!("private hive shared key missing"))?;
         let content = json!({
             "kind": "private_hive_key_share",
+            "text": req.invite_text,
+            "display_name": req.display_name,
+            "hive_name": req.hive_name,
             "feed_key": record.feed_key,
             "scope_hint": record.scope_hint,
             "group_id": record.group_id,
@@ -223,6 +229,9 @@ pub(crate) async fn private_hive_key_share_send(
         });
         let local_record_content = json!({
             "kind": "private_hive_key_share",
+            "text": content["text"],
+            "display_name": content["display_name"],
+            "hive_name": content["hive_name"],
             "feed_key": feed_key,
             "scope_hint": scope_hint,
             "group_id": content["group_id"],

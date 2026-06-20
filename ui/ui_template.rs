@@ -709,12 +709,33 @@ pub const INDEX_HTML: &str = r#"<!DOCTYPE html>
       "timestamp_ms",
       "updated_at",
     ]);
+    const RAW_JSON_STRING_PARSE_LIMIT = 200000;
+    const rawJsonRows = new Map();
 
     function isRawJsonTimeField(key) {
       const normalized = String(key || "").toLowerCase();
       return RAW_JSON_TIME_FIELDS.has(normalized)
         || normalized.endsWith("_at")
-        || normalized.endsWith("_at_ms");
+        || normalized.endsWith("_at_ms")
+        || normalized.startsWith("timestamp_")
+        || normalized.endsWith("_timestamp");
+    }
+
+    function rawJsonStringLooksStructured(value) {
+      const trimmed = String(value || "").trim();
+      return (trimmed.startsWith("{") && trimmed.endsWith("}"))
+        || (trimmed.startsWith("[") && trimmed.endsWith("]"));
+    }
+
+    function parseRawJsonString(value) {
+      if (typeof value !== "string") return null;
+      if (value.length > RAW_JSON_STRING_PARSE_LIMIT) return null;
+      if (!rawJsonStringLooksStructured(value)) return null;
+      try {
+        return JSON.parse(value);
+      } catch (_error) {
+        return null;
+      }
     }
 
     function formatRawJsonValue(key, value) {
@@ -729,19 +750,36 @@ pub const INDEX_HTML: &str = r#"<!DOCTYPE html>
           ]),
         );
       }
+      if (typeof value === "string") {
+        if (isRawJsonTimeField(key) && /^\d{10,13}$/.test(value.trim())) {
+          return formatTime(Number(value));
+        }
+        if (isRawJsonTimeField(key) && !Number.isNaN(Date.parse(value))) {
+          return formatTime(value);
+        }
+        const parsed = parseRawJsonString(value);
+        if (parsed !== null) return formatRawJsonValue(key, parsed);
+        return value;
+      }
       if (!isRawJsonTimeField(key)) return value;
       if (typeof value === "number") return formatTime(value);
-      if (typeof value === "string" && /^\d{10,13}$/.test(value.trim())) {
-        return formatTime(Number(value));
-      }
-      if (typeof value === "string" && !Number.isNaN(Date.parse(value))) {
-        return formatTime(value);
-      }
       return value;
     }
 
     function formatRawJson(row) {
       return JSON.stringify(formatRawJsonValue("", row), null, 2);
+    }
+
+    function renderRawJsonDetails(details) {
+      if (!details || !details.open || details.dataset.rendered === "true") return;
+      const pre = details.querySelector("pre");
+      const row = rawJsonRows.get(details.dataset.rawJsonKey);
+      if (!pre || !row) return;
+      pre.textContent = "Loading...";
+      requestAnimationFrame(() => {
+        pre.textContent = formatRawJson(row);
+        details.dataset.rendered = "true";
+      });
     }
 
     const TITLE_MAX = 160;
@@ -848,7 +886,10 @@ pub const INDEX_HTML: &str = r#"<!DOCTYPE html>
         list.innerHTML = `<div class="empty">No network diagnostics recorded for the current filters.</div>`;
         return;
       }
-      list.innerHTML = visible.map((row) => {
+      rawJsonRows.clear();
+      list.innerHTML = visible.map((row, index) => {
+        const rawJsonKey = String(index);
+        rawJsonRows.set(rawJsonKey, row);
         const details = row.details && typeof row.details === "object" ? row.details : {};
         const targetScope = details.target_scope_hint || details.target_scope || "";
         const feedKey = details.feed_key || "";
@@ -876,9 +917,9 @@ pub const INDEX_HTML: &str = r#"<!DOCTYPE html>
               </div>
             </div>
             <div class="meta"><span>${escapeHtml(formatTime(row.timestamp_ms || row.timestamp))}</span>${meta.map((item) => `<span>${escapeHtml(item)}</span>`).join("")}</div>
-            <details>
+            <details data-raw-json-key="${escapeHtml(rawJsonKey)}" ontoggle="renderRawJsonDetails(this)">
               <summary>Raw JSON</summary>
-              <pre>${escapeHtml(formatRawJson(row))}</pre>
+              <pre>Open to render formatted JSON.</pre>
             </details>
           </article>
         `;

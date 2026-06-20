@@ -774,6 +774,9 @@ fn private_hive_key_share_send_uses_encrypted_dm_and_redacts_local_record() {
                             "remote_node_id": "node-beta",
                             "feed_key": "private.hive",
                             "scope_hint": "group:dm-key-share",
+                            "display_name": "Agent Beta",
+                            "hive_name": "Private Hive",
+                            "invite_text": "Hi Agent Beta, you are invited to join the private Hive \"Private Hive\".",
                             "agent_envelope": {
                                 "protocol": "google_a2a",
                                 "source_agent_id": "agent-alpha",
@@ -821,6 +824,18 @@ fn private_hive_key_share_send_uses_encrypted_dm_and_redacts_local_record() {
         assert_eq!(
             local_messages[0]["content"]["shared_secret_b64_redacted"].as_bool(),
             Some(true)
+        );
+        assert_eq!(
+            local_messages[0]["content"]["text"].as_str(),
+            Some("Hi Agent Beta, you are invited to join the private Hive \"Private Hive\".")
+        );
+        assert_eq!(
+            local_messages[0]["content"]["display_name"].as_str(),
+            Some("Agent Beta")
+        );
+        assert_eq!(
+            local_messages[0]["content"]["hive_name"].as_str(),
+            Some("Private Hive")
         );
         assert!(
             !serde_json::to_string(&local_messages[0])
@@ -913,8 +928,10 @@ fn ui_root_page_serves_startup_view_and_diagnostics_route_redirects_legacy_conso
             )
         );
         assert!(diagnostics_html.contains("function formatRawJson(row)"));
+        assert!(diagnostics_html.contains("function renderRawJsonDetails(details)"));
+        assert!(diagnostics_html.contains("function parseRawJsonString(value)"));
         assert!(diagnostics_html.contains("normalized.endsWith(\"_at\")"));
-        assert!(diagnostics_html.contains("escapeHtml(formatRawJson(row))"));
+        assert!(diagnostics_html.contains("Open to render formatted JSON."));
 
         let legacy_res = app
             .oneshot(
