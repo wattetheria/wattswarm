@@ -9,7 +9,7 @@ use axum::extract::{Path, Query, State};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::fs;
-use std::path::{Path as FsPath, PathBuf};
+use std::path::Path as FsPath;
 use std::time::Duration;
 use wattswarm_crypto::NodeIdentity;
 use wattswarm_network_discovery::{
@@ -27,9 +27,10 @@ const DISCOVERY_RECORDS_ROUTE: &str = "/api/network/discovery/records";
 const DEFAULT_DISCOVERY_RECORD_RADIUS_KM: f64 = 1000.0;
 const DISCOVERY_ANNOUNCE_TIMEOUT: Duration = Duration::from_secs(3);
 const DISCOVERY_AGENT_CARD_ENABLED_ENV: &str = "WATTSWARM_DISCOVERY_AGENT_CARD_ENABLED";
-const DISCOVERY_AGENT_CARD_PATH_ENV: &str = "WATTSWARM_DISCOVERY_AGENT_CARD_PATH";
-const DEFAULT_DISCOVERY_AGENT_CARD_PATH: &str =
-    "/var/lib/wattetheria/.agent-participation/agent-card.json";
+const DISCOVERY_AGENT_CARD_URL_ENV: &str = "WATTSWARM_DISCOVERY_AGENT_CARD_URL";
+const DISCOVERY_AGENT_CARD_TOKEN_ENV: &str = "WATTSWARM_DISCOVERY_AGENT_CARD_TOKEN";
+const DISCOVERY_AGENT_CARD_ROUTE: &str = "/v1/wattetheria/source-agent-card";
+const DEFAULT_DISCOVERY_AGENT_CARD_TOKEN_PATH: &str = "/var/lib/wattetheria/control.token";
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct NearbyDiscoveryQuery {
@@ -353,14 +354,38 @@ fn discovery_agent_card_enabled() -> bool {
 }
 
 fn load_discovery_source_agent_card(local_node_id: &str) -> Result<Option<SourceAgentCard>> {
-    let path = discovery_agent_card_path();
-    if !path.exists() {
-        return Ok(None);
+    if let Some(endpoint) = discovery_agent_card_url() {
+        return fetch_discovery_source_agent_card(&endpoint, local_node_id).map(Some);
     }
-    let raw = fs::read(&path)
-        .with_context(|| format!("read discovery source agent card at {}", path.display()))?;
-    let card: SourceAgentCard = serde_json::from_slice(&raw)
-        .with_context(|| format!("parse discovery source agent card at {}", path.display()))?;
+    Ok(None)
+}
+
+fn fetch_discovery_source_agent_card(
+    endpoint: &str,
+    local_node_id: &str,
+) -> Result<SourceAgentCard> {
+    let token = discovery_agent_card_token()?
+        .with_context(|| format!("discovery source agent card token is required for {endpoint}"))?;
+    let card = reqwest::blocking::Client::builder()
+        .timeout(DISCOVERY_ANNOUNCE_TIMEOUT)
+        .build()
+        .context("build discovery source agent card HTTP client")?
+        .get(endpoint)
+        .bearer_auth(token)
+        .send()
+        .with_context(|| format!("fetch discovery source agent card from {endpoint}"))?
+        .error_for_status()
+        .with_context(|| format!("fetch discovery source agent card from {endpoint}"))?
+        .json::<SourceAgentCard>()
+        .with_context(|| format!("decode discovery source agent card from {endpoint}"))?;
+    validate_discovery_source_agent_card_node(&card, local_node_id)?;
+    Ok(card)
+}
+
+fn validate_discovery_source_agent_card_node(
+    card: &SourceAgentCard,
+    local_node_id: &str,
+) -> Result<()> {
     if let Some(card_node_id) = card.node_id.as_deref()
         && card_node_id != local_node_id
     {
@@ -370,16 +395,45 @@ fn load_discovery_source_agent_card(local_node_id: &str) -> Result<Option<Source
             local_node_id
         );
     }
-    Ok(Some(card))
+    Ok(())
 }
 
-fn discovery_agent_card_path() -> PathBuf {
-    std::env::var(DISCOVERY_AGENT_CARD_PATH_ENV)
+fn discovery_agent_card_url() -> Option<String> {
+    std::env::var(DISCOVERY_AGENT_CARD_URL_ENV)
+        .ok()
+        .map(|value| value.trim().trim_end_matches('/').to_owned())
+        .filter(|value| !value.is_empty())
+        .map(|value| {
+            if value.ends_with(DISCOVERY_AGENT_CARD_ROUTE) {
+                value
+            } else {
+                format!("{value}{DISCOVERY_AGENT_CARD_ROUTE}")
+            }
+        })
+}
+
+fn discovery_agent_card_token() -> Result<Option<String>> {
+    if let Some(token) = std::env::var(DISCOVERY_AGENT_CARD_TOKEN_ENV)
         .ok()
         .map(|value| value.trim().to_owned())
         .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(DEFAULT_DISCOVERY_AGENT_CARD_PATH))
+    {
+        return Ok(Some(token));
+    }
+    let path = std::path::Path::new(DEFAULT_DISCOVERY_AGENT_CARD_TOKEN_PATH);
+    if !path.exists() {
+        return Ok(None);
+    }
+    let token = fs::read_to_string(path)
+        .with_context(|| {
+            format!(
+                "read discovery source agent card token at {}",
+                path.display()
+            )
+        })?
+        .trim()
+        .to_owned();
+    Ok((!token.is_empty()).then_some(token))
 }
 
 fn local_topic_provider_records(

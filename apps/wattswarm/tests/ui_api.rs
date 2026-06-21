@@ -131,6 +131,13 @@ struct DiscoveryRecordStubServer {
     handle: Option<std::thread::JoinHandle<()>>,
 }
 
+struct SourceAgentCardStubServer {
+    addr: SocketAddr,
+    requests: Arc<Mutex<Vec<String>>>,
+    stop: Arc<AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
 impl UiStubRuntimeServer {
     fn start(cfg: UiStubRuntimeConfig) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind stub listener");
@@ -217,6 +224,57 @@ impl DiscoveryRecordStubServer {
 }
 
 impl Drop for DiscoveryRecordStubServer {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        let _ = TcpStream::connect(self.addr);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+impl SourceAgentCardStubServer {
+    fn start(card: SourceAgentCard, expected_token: &'static str) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind source card stub listener");
+        listener
+            .set_nonblocking(true)
+            .expect("set source card stub nonblocking");
+        let addr = listener.local_addr().expect("source card listener addr");
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let request_log = Arc::clone(&requests);
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_flag = Arc::clone(&stop);
+        let body = serde_json::to_string(&card).expect("encode source card response");
+        let handle = std::thread::spawn(move || {
+            while !stop_flag.load(Ordering::Relaxed) {
+                match listener.accept() {
+                    Ok((stream, _)) => handle_source_agent_card_stub_conn(
+                        stream,
+                        &request_log,
+                        expected_token,
+                        &body,
+                    ),
+                    Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        Self {
+            addr,
+            requests,
+            stop,
+            handle: Some(handle),
+        }
+    }
+
+    fn base_url(&self) -> String {
+        format!("http://{}", self.addr)
+    }
+}
+
+impl Drop for SourceAgentCardStubServer {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
         let _ = TcpStream::connect(self.addr);
@@ -431,6 +489,35 @@ fn handle_discovery_stub_conn(
     write_stub_response(stream, 404, "{}")
 }
 
+fn handle_source_agent_card_stub_conn(
+    mut stream: TcpStream,
+    requests: &Arc<Mutex<Vec<String>>>,
+    expected_token: &str,
+    body: &str,
+) {
+    let Ok(req_bytes) = read_stub_request(&mut stream) else {
+        return;
+    };
+    if req_bytes.is_empty() {
+        return;
+    }
+    let req = String::from_utf8_lossy(&req_bytes);
+    if let Ok(mut requests) = requests.lock() {
+        requests.push(req.to_string());
+    }
+    let line = req.lines().next().unwrap_or_default();
+    let expected_auth = format!(
+        "authorization: bearer {}",
+        expected_token.to_ascii_lowercase()
+    );
+    if line.starts_with("GET /v1/wattetheria/source-agent-card ")
+        && req.to_ascii_lowercase().contains(&expected_auth)
+    {
+        return write_stub_response(stream, 200, body);
+    }
+    write_stub_response(stream, 401, "{}")
+}
+
 impl DbTestLock {
     fn acquire() -> Self {
         let conn = Connection::open("ui-db-lock").expect("open db lock connection");
@@ -516,15 +603,8 @@ fn network_discovery_auto_announces_local_record_to_bootnode() {
     let dir = tempdir().expect("tempdir");
     let state_dir = dir.path().join("state");
     fs::create_dir_all(&state_dir).expect("create state dir");
-    let source_agent_card_path = dir.path().join("agent-card.json");
     let _agent_card_enabled_guard =
         EnvVarGuard::set("WATTSWARM_DISCOVERY_AGENT_CARD_ENABLED", "true");
-    let _agent_card_path_guard = EnvVarGuard::set(
-        "WATTSWARM_DISCOVERY_AGENT_CARD_PATH",
-        source_agent_card_path
-            .to_str()
-            .expect("source agent card path"),
-    );
     wattswarm::startup_config::save_startup_config(
         &wattswarm::startup_config::startup_config_path(&state_dir),
         &wattswarm::startup_config::StartupConfig {
@@ -555,19 +635,23 @@ fn network_discovery_auto_announces_local_record_to_bootnode() {
                 .as_bytes()
         )
     );
-    fs::write(
-        &source_agent_card_path,
-        serde_json::to_vec(&SourceAgentCard {
+    let source_agent_card_server = SourceAgentCardStubServer::start(
+        SourceAgentCard {
             agent_id: "did:key:zLocalDiscoveryAgent".to_owned(),
             node_id: Some(local_node_id),
             card_hash: source_agent_card_hash,
             issued_at: 1_700_000_000_000,
             card: source_agent_card,
             signature: Some("agent-card-signature".to_owned()),
-        })
-        .expect("encode source agent card"),
-    )
-    .expect("write source agent card");
+        },
+        "source-card-token",
+    );
+    let _agent_card_url_guard = EnvVarGuard::set(
+        "WATTSWARM_DISCOVERY_AGENT_CARD_URL",
+        &source_agent_card_server.base_url(),
+    );
+    let _agent_card_token_guard =
+        EnvVarGuard::set("WATTSWARM_DISCOVERY_AGENT_CARD_TOKEN", "source-card-token");
     let stub = DiscoveryRecordStubServer::start();
     wattswarm::control::save_discovery_bootnode_urls_state(&state_dir, &[stub.base_url()])
         .expect("save discovery bootnode urls");
@@ -609,6 +693,16 @@ fn network_discovery_auto_announces_local_record_to_bootnode() {
     assert_eq!(
         source_agent_card.agent_id.as_str(),
         "did:key:zLocalDiscoveryAgent"
+    );
+    let source_card_requests = source_agent_card_server
+        .requests
+        .lock()
+        .expect("source card requests");
+    assert_eq!(source_card_requests.len(), 1);
+    assert!(
+        source_card_requests[0]
+            .to_ascii_lowercase()
+            .contains("authorization: bearer source-card-token")
     );
     let contact = record
         .body
