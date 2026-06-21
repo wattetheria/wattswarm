@@ -128,12 +128,43 @@ impl NetworkBridgeService {
         ) else {
             return;
         };
-        let Ok(content) = serde_json::from_slice::<Value>(&plaintext) else {
+        let Ok(private_plaintext) = serde_json::from_slice::<Value>(&plaintext) else {
             return;
         };
-        let _ =
-            node.store
-                .update_topic_message_content(&event.event_id, &content, event.created_at);
+        let Ok((content, agent_envelope)) =
+            crate::control::decode_private_hive_plaintext_payload(private_plaintext)
+        else {
+            return;
+        };
+        if node
+            .store
+            .update_topic_message_content_and_agent_envelope(
+                &event.event_id,
+                &content,
+                agent_envelope.as_ref(),
+                event.created_at,
+            )
+            .is_err()
+        {
+            return;
+        }
+        record_private_hive_crypto_diagnostic(
+            state_dir,
+            PrivateHiveCryptoDiagnostic {
+                phase: "private_hive.decrypt",
+                message: "private hive message decrypted from network transport",
+                event_id: Some(&event.event_id),
+                source_node_id: &event.author_node_id,
+                local_node_id: &node.node_id(),
+                feed_key: &payload.feed_key,
+                scope_hint: &payload.scope_hint,
+                message_id,
+                group_id: &encrypted.group_id,
+                epoch: encrypted.epoch,
+                scheme: &encrypted.scheme,
+                cipher: &encrypted.cipher,
+            },
+        );
     }
 
     fn deliver_task_lifecycle_agent_event(&self, node: &Node, event: &crate::types::Event) {

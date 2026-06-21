@@ -438,9 +438,13 @@ fn embedded_topic_agent_envelope(
 fn topic_message_agent_envelope(
     payload: &crate::types::TopicMessagePostedPayload,
     content: &Value,
+    stored_agent_envelope: Option<&wattswarm_protocol::types::AgentEnvelope>,
 ) -> Result<Option<wattswarm_protocol::types::AgentEnvelope>> {
     if payload.agent_envelope.is_some() {
         return Ok(payload.agent_envelope.clone());
+    }
+    if stored_agent_envelope.is_some() {
+        return Ok(stored_agent_envelope.cloned());
     }
     embedded_topic_agent_envelope(content)
 }
@@ -851,7 +855,11 @@ pub(super) fn topic_message_agent_event(
     if !topic_message_requires_reply(&topic_message.content) {
         return Ok(None);
     }
-    let agent_envelope = topic_message_agent_envelope(payload, &topic_message.content)?;
+    let agent_envelope = topic_message_agent_envelope(
+        payload,
+        &topic_message.content,
+        topic_message.agent_envelope.as_ref(),
+    )?;
     Ok(Some(build_agent_event_with_agent_envelope(
         wattswarm_protocol::types::AgentEventType::TopicMessageRequiresReply,
         wattswarm_protocol::types::AgentEventSourceKind::TopicMessage,

@@ -4,7 +4,7 @@ use crate::runtime::{HttpRuntimeClient, RuntimeCapabilities, RuntimeClient};
 use crate::storage::{PgStore, local_control_scope_id, local_control_store};
 use crate::task_template::sample_contract;
 use crate::types::{
-    Candidate, ClaimRole, EventPayload, ExecutionIntentDeclaredPayload,
+    AgentEnvelope, Candidate, ClaimRole, EventPayload, ExecutionIntentDeclaredPayload,
     ExecutionSetConfirmedPayload, ExecutionSetMember, FinalityProof, Membership,
     NetworkBootstrapBundle, NetworkJoinManifest, Role, TaskContract, VerificationStatus,
     VerifierResult, VoteChoice, VoteCommitPayload, VoteRevealPayload,
@@ -118,6 +118,37 @@ pub fn private_hive_encryption_aad(feed_key: &str, scope_hint: &str, message_id:
         message_id.trim()
     )
     .into_bytes()
+}
+
+pub fn private_hive_plaintext_payload(
+    content: Value,
+    agent_envelope: Option<AgentEnvelope>,
+) -> Value {
+    json!({
+        "kind": "private_hive_plaintext_v1",
+        "content": content,
+        "agent_envelope": agent_envelope,
+    })
+}
+
+pub fn decode_private_hive_plaintext_payload(
+    value: Value,
+) -> Result<(Value, Option<AgentEnvelope>)> {
+    let Some(kind) = value.get("kind").and_then(Value::as_str) else {
+        return Ok((value, None));
+    };
+    if kind != "private_hive_plaintext_v1" {
+        return Ok((value, None));
+    }
+    let content = value.get("content").cloned().unwrap_or(Value::Null);
+    let agent_envelope = value
+        .get("agent_envelope")
+        .filter(|value| !value.is_null())
+        .cloned()
+        .map(serde_json::from_value)
+        .transpose()
+        .context("decode private hive plaintext agent envelope")?;
+    Ok((content, agent_envelope))
 }
 
 pub fn executor_registry_path(state_dir: &Path) -> PathBuf {

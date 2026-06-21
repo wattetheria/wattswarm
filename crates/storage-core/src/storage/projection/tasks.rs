@@ -750,6 +750,40 @@ impl PgStore {
         Ok(())
     }
 
+    pub fn update_topic_message_content_and_agent_envelope(
+        &self,
+        message_id: &str,
+        content: &serde_json::Value,
+        agent_envelope: Option<&AgentEnvelope>,
+        resolved_at: u64,
+    ) -> Result<()> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
+        let updated = conn.execute(
+            "UPDATE topic_messages
+             SET content_json = $3,
+                 agent_envelope_json = $4,
+                 content_resolved_at = TIMESTAMPTZ 'epoch' + ($5::bigint * INTERVAL '1 millisecond')
+             WHERE org_id = $1 AND message_id = $2",
+            params![
+                self.org_id(),
+                message_id,
+                serde_json::to_string(content)?,
+                agent_envelope.map(serde_json::to_string).transpose()?,
+                resolved_at as i64
+            ],
+        )?;
+        if updated == 0 {
+            return Err(SwarmError::Storage(format!(
+                "topic message {message_id} not found for content update"
+            ))
+            .into());
+        }
+        Ok(())
+    }
+
     pub fn upsert_topic_cursor(
         &self,
         network_id: &str,

@@ -126,6 +126,54 @@ pub fn record_private_dm_crypto_diagnostic(
     );
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct PrivateHiveCryptoDiagnostic<'a> {
+    pub phase: &'static str,
+    pub message: &'static str,
+    pub event_id: Option<&'a str>,
+    pub source_node_id: &'a str,
+    pub local_node_id: &'a str,
+    pub feed_key: &'a str,
+    pub scope_hint: &'a str,
+    pub message_id: &'a str,
+    pub group_id: &'a str,
+    pub epoch: u64,
+    pub scheme: &'a str,
+    pub cipher: &'a str,
+}
+
+pub fn record_private_hive_crypto_diagnostic(
+    state_dir: &Path,
+    diagnostic: PrivateHiveCryptoDiagnostic<'_>,
+) {
+    diagnostics::record_diagnostic(
+        Some(state_dir),
+        diagnostics::DiagnosticEvent::new(
+            "info",
+            "transport",
+            diagnostic.phase,
+            "ok",
+            diagnostic.message,
+        )
+        .event_id(diagnostic.event_id.unwrap_or(diagnostic.message_id))
+        .object("topic_message", Some(diagnostic.message_id.to_owned()))
+        .source_node_id(Some(diagnostic.source_node_id.to_owned()))
+        .details(json!({
+            "local_node_id": diagnostic.local_node_id,
+            "source_node_id": diagnostic.source_node_id,
+            "feed_key": diagnostic.feed_key,
+            "scope_hint": diagnostic.scope_hint,
+            "message_id": diagnostic.message_id,
+            "group_id": diagnostic.group_id,
+            "epoch": diagnostic.epoch,
+            "encrypted_payload_present": true,
+            "scheme": diagnostic.scheme,
+            "cipher": diagnostic.cipher,
+            "redacted_fields": ["shared_secret_b64", "nonce_b64", "ciphertext_b64"],
+        })),
+    );
+}
+
 #[cfg(test)]
 use agent_delivery::{build_agent_event, topic_message_requires_reply};
 use agent_delivery::{

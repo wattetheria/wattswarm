@@ -755,6 +755,163 @@ fn backfill_encrypted_private_hive_topic_skips_local_agent_event() {
 }
 
 #[test]
+fn backfill_encrypted_private_hive_topic_records_decrypt_diagnostic() {
+    let state_dir = temp_startup_dir("backfill-encrypted-private-hive-topic-decrypt-diagnostic");
+    let local = NodeIdentity::random();
+    let remote = NodeIdentity::random();
+    let local_node_id = local.node_id();
+    let remote_node_id = remote.node_id();
+    let membership = membership_with_roles(&[local_node_id.clone(), remote_node_id.clone()]);
+    let mut node =
+        Node::new(local, PgStore::open_in_memory().expect("store"), membership).expect("node");
+    let scope = SwarmScope::Group("dm-private-hive-8".to_owned());
+    let feed_key = "private.hive.crew";
+    let scope_hint = scope_hint_label(&scope);
+    let message_id = "private-hive-message-2";
+    let group_id = "private.hive:dm-private-hive-8";
+    let shared_secret_b64 = crate::crypto::generate_private_group_secret_b64();
+    crate::control::upsert_private_hive_key_record_state(
+        &state_dir,
+        crate::control::PrivateHiveKeyRecord {
+            feed_key: feed_key.to_owned(),
+            scope_hint: scope_hint.clone(),
+            group_id: group_id.to_owned(),
+            epoch: 1,
+            shared_secret_b64: shared_secret_b64.clone(),
+            updated_at: 1,
+        },
+    )
+    .expect("save private hive key");
+    node.store
+        .upsert_feed_subscription(
+            "default",
+            &local_node_id,
+            feed_key,
+            &scope_hint,
+            &["messages".to_owned()],
+            true,
+            1,
+        )
+        .expect("local private hive subscription");
+    let private_plaintext = crate::control::private_hive_plaintext_payload(
+        json!({"text": "encrypted private hive hello"}),
+        Some(wattswarm_protocol::types::AgentEnvelope {
+            protocol: "google_a2a".to_owned(),
+            source_agent_id: Some("agent-remote".to_owned()),
+            target_agent_id: Some("agent-local".to_owned()),
+            source_node_id: Some(remote_node_id.clone()),
+            target_node_id: Some(local_node_id.clone()),
+            capability: Some("hive.message.post".to_owned()),
+            message_json: json!({"content":{"text":"encrypted private hive hello"}}).to_string(),
+            signature: Some("sig".to_owned()),
+            transport_profile: None,
+            source_agent_card: None,
+            extensions_json: None,
+        }),
+    );
+    let encrypted = crate::crypto::encrypt_private_group_content(
+        &shared_secret_b64,
+        group_id,
+        1,
+        &serde_json::to_vec(&private_plaintext).expect("encode private hive plaintext"),
+        &crate::control::private_hive_encryption_aad(feed_key, &scope_hint, message_id),
+    )
+    .expect("encrypt private hive message");
+    let remote_event = build_event_for_external(
+        &remote,
+        1,
+        10,
+        crate::types::EventPayload::TopicMessagePosted(crate::types::TopicMessagePostedPayload {
+            network_id: "default".to_owned(),
+            feed_key: feed_key.to_owned(),
+            scope_hint: scope_hint.clone(),
+            content_ref: sample_topic_content_ref("sha256:private-hive-message", &remote_node_id),
+            local_content_cache: Some(json!({
+                "kind": "private_encrypted",
+                "private_kind": "hive_message",
+                "message_id": message_id,
+                "encrypted": encrypted
+            })),
+            reply_to_message_id: None,
+            agent_envelope: None,
+        }),
+    )
+    .expect("private hive topic event");
+    let mut service = test_event_routing_service(
+        &state_dir,
+        [147u8; 32],
+        &[SwarmScope::Global, scope.clone()],
+    );
+    let request_id = BackfillRequestId::new(48);
+
+    service
+        .process_runtime_event(
+            &mut node,
+            NetworkRuntimeEvent::BackfillResponse {
+                peer: random_network_node_id(),
+                request_id,
+                response: crate::network_p2p::BackfillResponse {
+                    scope: scope.clone(),
+                    next_from_event_seq: 1,
+                    feed_key: Some(feed_key.to_owned()),
+                    head_event_ids: vec![remote_event.event_id.clone()],
+                    events: vec![EventEnvelope {
+                        scope,
+                        event: remote_event.clone(),
+                        content_source_node_id: None,
+                    }],
+                },
+            },
+        )
+        .expect("process private hive backfill response");
+
+    let stored_message = node
+        .store
+        .get_topic_message(&remote_event.event_id)
+        .expect("load private hive topic message")
+        .expect("private hive topic message stored");
+    assert_eq!(
+        stored_message.content["text"].as_str(),
+        Some("encrypted private hive hello")
+    );
+    assert_eq!(
+        stored_message
+            .agent_envelope
+            .as_ref()
+            .and_then(|envelope| envelope.capability.as_deref()),
+        Some("hive.message.post")
+    );
+    let diagnostics = list_network_diagnostics(
+        &state_dir,
+        &DiagnosticFilter {
+            phase: Some("private_hive.decrypt".to_owned()),
+            ..Default::default()
+        },
+    )
+    .expect("list private hive decryption diagnostics");
+    let decrypt_diagnostic = diagnostics
+        .iter()
+        .find(|entry| entry.event_id == Some(remote_event.event_id.clone()))
+        .expect("private hive decryption diagnostic recorded");
+    assert_eq!(
+        decrypt_diagnostic.details["encrypted_payload_present"].as_bool(),
+        Some(true)
+    );
+    assert_eq!(
+        decrypt_diagnostic.details["scheme"].as_str(),
+        Some("wattswarm.private.group.gss.v1")
+    );
+    assert_eq!(
+        decrypt_diagnostic.details["cipher"].as_str(),
+        Some("chacha20poly1305")
+    );
+    let diagnostics_raw = fs::read_to_string(state_dir.join("diagnostics/wattswarm_node.jsonl"))
+        .expect("read diagnostics log");
+    assert!(!diagnostics_raw.contains("encrypted private hive hello"));
+    assert!(!diagnostics_raw.contains(&shared_secret_b64));
+}
+
+#[test]
 fn deliver_agent_event_writes_local_diagnostics() {
     let state_dir = temp_startup_dir("agent-event-diagnostics");
     let event = build_agent_event(
@@ -1245,6 +1402,96 @@ fn private_dm_topic_agent_event_exposes_direct_message_content() {
             .expect("agent envelope message json parses")["content"]
             .as_str(),
         Some("hello private dm")
+    );
+}
+
+#[test]
+fn private_hive_topic_agent_event_uses_decrypted_stored_agent_envelope() {
+    let local = NodeIdentity::random();
+    let remote = NodeIdentity::random();
+    let local_node_id = local.node_id();
+    let remote_node_id = remote.node_id();
+    let membership = membership_with_roles(&[local_node_id.clone(), remote_node_id.clone()]);
+    let node =
+        Node::new(local, PgStore::open_in_memory().expect("store"), membership).expect("node");
+    let feed_key = "private.hive";
+    let scope_hint = "group:dm-private";
+    let agent_envelope = wattswarm_protocol::types::AgentEnvelope {
+        protocol: "google_a2a".to_owned(),
+        source_agent_id: Some("agent-remote".to_owned()),
+        target_agent_id: Some("agent-local".to_owned()),
+        source_node_id: Some(remote_node_id.clone()),
+        target_node_id: Some(local_node_id.clone()),
+        capability: Some("hive.message.post".to_owned()),
+        message_json: json!({"content":{"text":"private hive hello"}}).to_string(),
+        signature: Some("sig".to_owned()),
+        transport_profile: None,
+        source_agent_card: None,
+        extensions_json: None,
+    };
+    let remote_event = build_event_for_external(
+        &remote,
+        1,
+        10,
+        crate::types::EventPayload::TopicMessagePosted(crate::types::TopicMessagePostedPayload {
+            network_id: "default".to_owned(),
+            feed_key: feed_key.to_owned(),
+            scope_hint: scope_hint.to_owned(),
+            content_ref: sample_topic_content_ref("sha256:private-hive-message", &remote_node_id),
+            local_content_cache: Some(json!({
+                "kind": "private_encrypted",
+                "private_kind": "hive_message",
+                "message_id": "private-hive-message-1",
+                "encrypted": {
+                    "scheme": "wattswarm.private.group.v1",
+                    "cipher": "chacha20poly1305",
+                    "group_id": "private.hive:dm-private",
+                    "epoch": 1,
+                    "nonce_b64": "AA==",
+                    "ciphertext_b64": "AA=="
+                }
+            })),
+            reply_to_message_id: None,
+            agent_envelope: None,
+        }),
+    )
+    .expect("private hive topic event");
+    let crate::types::EventPayload::TopicMessagePosted(payload) = &remote_event.payload else {
+        panic!("expected topic message");
+    };
+    node.store
+        .put_topic_message(
+            &remote_event.event_id,
+            &payload.network_id,
+            &payload.feed_key,
+            &payload.scope_hint,
+            &remote_node_id,
+            Some(&agent_envelope),
+            &payload.content_ref,
+            Some(&json!({"text": "private hive hello"})),
+            payload.reply_to_message_id.as_deref(),
+            remote_event.created_at,
+        )
+        .expect("store decrypted private hive message");
+
+    let agent_event = topic_message_agent_event(&node, &remote_event, payload)
+        .expect("agent event result")
+        .expect("agent event");
+
+    assert_eq!(
+        agent_event.payload["content"]["text"].as_str(),
+        Some("private hive hello")
+    );
+    let promoted = agent_event
+        .agent_envelope
+        .as_ref()
+        .expect("stored private hive envelope promoted to agent event");
+    assert_eq!(promoted.capability.as_deref(), Some("hive.message.post"));
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&promoted.message_json)
+            .expect("message json parses")["content"]["text"]
+            .as_str(),
+        Some("private hive hello")
     );
 }
 
