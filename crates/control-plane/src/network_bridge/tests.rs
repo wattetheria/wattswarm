@@ -22,6 +22,7 @@ use wattswarm_network_discovery::{
     DEFAULT_RECORD_TTL_MS, DiscoveryNodeRecordBody, DiscoveryTopicProvider,
     DiscoveryTopicProviderCapabilities,
 };
+use wattswarm_protocol::types::SourceAgentCard;
 
 mod discovery_scope;
 mod event_routing;

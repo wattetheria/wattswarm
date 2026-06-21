@@ -5161,6 +5161,7 @@ dependencies = [
  "protoc-bin-vendored",
  "reqwest",
  "serde",
+ "serde_jcs",
  "serde_json",
  "tempfile",
  "tokio",
@@ -5251,8 +5252,10 @@ dependencies = [
  "hex",
  "serde",
  "serde_jcs",
+ "serde_json",
  "wattswarm-crypto",
  "wattswarm-network-transport-core",
+ "wattswarm-protocol",
 ]
 
 [[package]]

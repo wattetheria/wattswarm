@@ -30,10 +30,12 @@ use wattswarm::ui::{UiServerState, build_app};
 use wattswarm::wattetheria_sync;
 use wattswarm::wattetheria_sync::proto::wattetheria_sync_service_client::WattetheriaSyncServiceClient;
 use wattswarm::wattetheria_sync::proto::{ProjectionStreamRequest, UpdateStartupGeoRequest};
+use wattswarm_crypto::sha256_hex;
 use wattswarm_network_discovery::{
     DEFAULT_RECORD_TTL_MS, DiscoveryGeo, DiscoveryNodeRecordBody, DiscoveryRecordCapabilities,
     DiscoveryTopicProvider, DiscoveryTopicProviderCapabilities, SignedDiscoveryNodeRecord,
 };
+use wattswarm_protocol::types::SourceAgentCard;
 use wattswarm_storage_core::storage::pg::Connection;
 use wattswarm_storage_core::types::ArtifactRef;
 
@@ -514,6 +516,15 @@ fn network_discovery_auto_announces_local_record_to_bootnode() {
     let dir = tempdir().expect("tempdir");
     let state_dir = dir.path().join("state");
     fs::create_dir_all(&state_dir).expect("create state dir");
+    let source_agent_card_path = dir.path().join("agent-card.json");
+    let _agent_card_enabled_guard =
+        EnvVarGuard::set("WATTSWARM_DISCOVERY_AGENT_CARD_ENABLED", "true");
+    let _agent_card_path_guard = EnvVarGuard::set(
+        "WATTSWARM_DISCOVERY_AGENT_CARD_PATH",
+        source_agent_card_path
+            .to_str()
+            .expect("source agent card path"),
+    );
     wattswarm::startup_config::save_startup_config(
         &wattswarm::startup_config::startup_config_path(&state_dir),
         &wattswarm::startup_config::StartupConfig {
@@ -524,6 +535,39 @@ fn network_discovery_auto_announces_local_record_to_bootnode() {
         },
     )
     .expect("save startup config");
+    let local_node_id = wattswarm::control::local_node_id(&state_dir).expect("local node id");
+    let source_agent_card = json!({
+        "name": "Local Discovery Agent",
+        "description": "Public discovery profile",
+        "metadata": {
+            "agent_id": "did:key:zLocalDiscoveryAgent",
+            "node_id": local_node_id,
+        },
+        "skills": [
+            {"id": "nearby", "name": "Nearby"}
+        ]
+    });
+    let source_agent_card_hash = format!(
+        "sha256:{}",
+        sha256_hex(
+            serde_jcs::to_string(&source_agent_card)
+                .expect("canonical source agent card")
+                .as_bytes()
+        )
+    );
+    fs::write(
+        &source_agent_card_path,
+        serde_json::to_vec(&SourceAgentCard {
+            agent_id: "did:key:zLocalDiscoveryAgent".to_owned(),
+            node_id: Some(local_node_id),
+            card_hash: source_agent_card_hash,
+            issued_at: 1_700_000_000_000,
+            card: source_agent_card,
+            signature: Some("agent-card-signature".to_owned()),
+        })
+        .expect("encode source agent card"),
+    )
+    .expect("write source agent card");
     let stub = DiscoveryRecordStubServer::start();
     wattswarm::control::save_discovery_bootnode_urls_state(&state_dir, &[stub.base_url()])
         .expect("save discovery bootnode urls");
@@ -553,6 +597,19 @@ fn network_discovery_auto_announces_local_record_to_bootnode() {
     );
     assert_eq!(record.body.ttl_ms, DEFAULT_RECORD_TTL_MS);
     assert!(record.body.capabilities.contains("wattswarm.node"));
+    let source_agent_card = record
+        .body
+        .source_agent_card
+        .as_ref()
+        .expect("source agent card");
+    assert_eq!(
+        source_agent_card.card["name"].as_str(),
+        Some("Local Discovery Agent")
+    );
+    assert_eq!(
+        source_agent_card.agent_id.as_str(),
+        "did:key:zLocalDiscoveryAgent"
+    );
     let contact = record
         .body
         .transport_contact

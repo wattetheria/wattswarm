@@ -23,7 +23,7 @@ fn discovery_bootnode_record_registers_iroh_contact_inside_radius_without_markin
     )
     .expect("write startup config");
     let settings = discovery_bootnode_settings_from_state_dir(&local_dir).expect("settings");
-    let record = signed_discovery_record_for_test(
+    let mut record = signed_discovery_record_for_test(
         &remote_dir,
         remote_seed,
         DEFAULT_NETWORK_CONTEXT_ID,
@@ -32,6 +32,28 @@ fn discovery_bootnode_record_registers_iroh_contact_inside_radius_without_markin
         20.0,
     );
     let remote_node_id = record.body.node_id.clone();
+    let agent_card = json!({
+        "name": "Remote Discovery Agent",
+        "description": "Public discovery agent card",
+        "metadata": {
+            "agent_id": "did:key:zRemoteDiscoveryAgent",
+            "node_id": remote_node_id,
+        },
+    });
+    let card_hash = format!(
+        "sha256:{}",
+        sha256_hex(serde_jcs::to_string(&agent_card).unwrap().as_bytes())
+    );
+    record.body.source_agent_card = Some(SourceAgentCard {
+        agent_id: "did:key:zRemoteDiscoveryAgent".to_owned(),
+        node_id: Some(remote_node_id.clone()),
+        card_hash,
+        issued_at: observed_at_ms(),
+        card: agent_card,
+        signature: Some("agent-card-signature".to_owned()),
+    });
+    record = SignedDiscoveryNodeRecord::sign(record.body, &NodeIdentity::from_seed(remote_seed))
+        .expect("resign discovery record with source agent card");
     let mut node = Node::open_in_memory_with_roles(&[Role::Proposer]).expect("node");
     let mut service = NetworkBridgeService::new(
         NetworkP2pNode::from_iroh_state_dir(
@@ -69,6 +91,22 @@ fn discovery_bootnode_record_registers_iroh_contact_inside_radius_without_markin
         crate::control::load_peer_metadata_records_state(&local_dir).expect("peer metadata");
     assert_eq!(metadata[0].node_id, remote_node_id);
     assert_eq!(metadata[0].handshake_status, "discovery_v1");
+    assert_eq!(
+        metadata[0]
+            .contact_material
+            .as_ref()
+            .and_then(|material| material.pointer("/source_agent_card/card/name"))
+            .and_then(Value::as_str),
+        Some("Remote Discovery Agent")
+    );
+    assert_eq!(
+        metadata[0]
+            .contact_material
+            .as_ref()
+            .and_then(|material| material.pointer("/source_agent_card/agent_id"))
+            .and_then(Value::as_str),
+        Some("did:key:zRemoteDiscoveryAgent")
+    );
     let remote_peer = NetworkNodeId::new(remote_node_id.clone()).expect("remote peer id");
     assert!(!service.is_global_backfill_provider(&remote_peer));
 

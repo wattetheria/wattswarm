@@ -1,11 +1,13 @@
 use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
-use wattswarm_crypto::{NodeIdentity, verify_signature};
+use wattswarm_crypto::{NodeIdentity, sha256_hex, verify_signature};
 use wattswarm_network_transport_core::TransportContactMaterial;
+use wattswarm_protocol::types::SourceAgentCard;
 
 pub const DISCOVERY_PROTOCOL_VERSION: &str = "wattswarm-discovery/1";
 pub const DEFAULT_RECORD_TTL_MS: u64 = 5 * 60 * 1000;
+const MAX_DISCOVERY_SOURCE_AGENT_CARD_BYTES: usize = 64 * 1024;
 const EARTH_RADIUS_KM: f64 = 6_371.0;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -39,7 +41,7 @@ impl DiscoveryGeo {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DiscoveryRecordCapabilities {
     #[serde(default)]
     pub services: BTreeSet<String>,
@@ -64,14 +66,6 @@ impl DiscoveryRecordCapabilities {
     }
 }
 
-impl Default for DiscoveryRecordCapabilities {
-    fn default() -> Self {
-        Self {
-            services: BTreeSet::new(),
-        }
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DiscoveryNodeRecordBody {
     pub protocol_version: String,
@@ -89,6 +83,8 @@ pub struct DiscoveryNodeRecordBody {
     pub topic_providers: Vec<DiscoveryTopicProvider>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transport_contact: Option<TransportContactMaterial>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_agent_card: Option<SourceAgentCard>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -154,6 +150,7 @@ impl DiscoveryNodeRecordBody {
             capabilities: DiscoveryRecordCapabilities::default(),
             topic_providers: Vec::new(),
             transport_contact: None,
+            source_agent_card: None,
         }
     }
 
@@ -179,10 +176,13 @@ impl DiscoveryNodeRecordBody {
         for provider in &self.topic_providers {
             provider.validate()?;
         }
-        if let Some(contact) = &self.transport_contact {
-            if contact.peer_id != self.node_id {
-                bail!("transport contact peer_id must match node_id");
-            }
+        if let Some(contact) = &self.transport_contact
+            && contact.peer_id != self.node_id
+        {
+            bail!("transport contact peer_id must match node_id");
+        }
+        if let Some(card) = &self.source_agent_card {
+            validate_source_agent_card(card, &self.node_id)?;
         }
         Ok(())
     }
@@ -489,6 +489,29 @@ fn validate_hex_public_key(value: &str) -> Result<()> {
     Ok(())
 }
 
+fn validate_source_agent_card(card: &SourceAgentCard, node_id: &str) -> Result<()> {
+    validate_segment("source_agent_card.agent_id", &card.agent_id)?;
+    if let Some(card_node_id) = card.node_id.as_deref() {
+        validate_segment("source_agent_card.node_id", card_node_id)?;
+        if card_node_id != node_id {
+            bail!("source_agent_card node_id must match discovery node_id");
+        }
+    }
+    if card.card_hash.trim().is_empty() {
+        bail!("source_agent_card.card_hash cannot be empty");
+    }
+    let canonical_card =
+        serde_jcs::to_string(&card.card).context("canonicalize source_agent_card card")?;
+    if canonical_card.len() > MAX_DISCOVERY_SOURCE_AGENT_CARD_BYTES {
+        bail!("source_agent_card card exceeds maximum discovery size");
+    }
+    let expected_hash = format!("sha256:{}", sha256_hex(canonical_card.as_bytes()));
+    if card.card_hash != expected_hash {
+        bail!("source_agent_card card_hash does not match card");
+    }
+    Ok(())
+}
+
 fn normalize_capability(raw: &str) -> Result<String> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
@@ -515,7 +538,9 @@ fn haversine_km(lat_a: f64, lon_a: f64, lat_b: f64, lon_b: f64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
+    #[allow(clippy::too_many_arguments)]
     fn record(
         identity: &NodeIdentity,
         network_id: &str,
@@ -554,6 +579,44 @@ mod tests {
         signed.verify_fresh_at(1_500).unwrap();
 
         signed.body.network_id = "other-network".to_owned();
+        assert!(signed.verify().is_err());
+    }
+
+    #[test]
+    fn signed_record_accepts_source_agent_card_and_rejects_card_tampering() {
+        let identity = NodeIdentity::from_seed([21; 32]);
+        let node_id = identity.node_id();
+        let card = json!({
+            "name": "Discovery Agent",
+            "description": "Public discovery profile",
+            "metadata": {
+                "agent_id": "did:key:zDiscoveryAgent",
+                "node_id": node_id,
+            },
+        });
+        let card_hash = format!(
+            "sha256:{}",
+            sha256_hex(serde_jcs::to_string(&card).unwrap().as_bytes())
+        );
+        let mut body = DiscoveryNodeRecordBody::new(
+            "mainnet:wattetheria",
+            node_id.clone(),
+            node_id.clone(),
+            1,
+            1_000,
+        );
+        body.source_agent_card = Some(SourceAgentCard {
+            agent_id: "did:key:zDiscoveryAgent".to_owned(),
+            node_id: Some(node_id),
+            card_hash,
+            issued_at: 1_000,
+            card,
+            signature: Some("signature".to_owned()),
+        });
+        let mut signed = SignedDiscoveryNodeRecord::sign(body, &identity).unwrap();
+
+        signed.verify_fresh_at(1_500).unwrap();
+        signed.body.source_agent_card.as_mut().unwrap().card["name"] = json!("Tampered Agent");
         assert!(signed.verify().is_err());
     }
 

@@ -9,7 +9,7 @@ use axum::extract::{Path, Query, State};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::fs;
-use std::path::Path as FsPath;
+use std::path::{Path as FsPath, PathBuf};
 use std::time::Duration;
 use wattswarm_crypto::NodeIdentity;
 use wattswarm_network_discovery::{
@@ -18,6 +18,7 @@ use wattswarm_network_discovery::{
     DiscoveryTopicProviderCapabilities, SignedDiscoveryNodeRecord,
 };
 use wattswarm_network_transport_iroh::export_local_contact_material_for_network_peer_id;
+use wattswarm_protocol::types::SourceAgentCard;
 
 const DISCOVERY_RECORDS_FILE: &str = "discovery_records_v1.json";
 const DEFAULT_DISCOVERY_QUERY_LIMIT: usize = 50;
@@ -25,6 +26,10 @@ const MAX_DISCOVERY_QUERY_LIMIT: usize = 200;
 const DISCOVERY_RECORDS_ROUTE: &str = "/api/network/discovery/records";
 const DEFAULT_DISCOVERY_RECORD_RADIUS_KM: f64 = 1000.0;
 const DISCOVERY_ANNOUNCE_TIMEOUT: Duration = Duration::from_secs(3);
+const DISCOVERY_AGENT_CARD_ENABLED_ENV: &str = "WATTSWARM_DISCOVERY_AGENT_CARD_ENABLED";
+const DISCOVERY_AGENT_CARD_PATH_ENV: &str = "WATTSWARM_DISCOVERY_AGENT_CARD_PATH";
+const DEFAULT_DISCOVERY_AGENT_CARD_PATH: &str =
+    "/var/lib/wattetheria/.agent-participation/agent-card.json";
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct NearbyDiscoveryQuery {
@@ -304,7 +309,77 @@ fn build_local_discovery_record(
     {
         body.transport_contact = Some(contact);
     }
-    SignedDiscoveryNodeRecord::sign(body, &identity)
+    if discovery_agent_card_enabled() {
+        match load_discovery_source_agent_card(&body.node_id) {
+            Ok(Some(card)) => {
+                body.source_agent_card = Some(card);
+            }
+            Ok(None) => {}
+            Err(error) => {
+                eprintln!("wattswarm discovery source agent card export skipped: {error:#}");
+            }
+        }
+    }
+    sign_discovery_record_with_agent_card_fallback(body, &identity)
+}
+
+fn sign_discovery_record_with_agent_card_fallback(
+    mut body: DiscoveryNodeRecordBody,
+    identity: &NodeIdentity,
+) -> Result<SignedDiscoveryNodeRecord> {
+    match SignedDiscoveryNodeRecord::sign(body.clone(), identity) {
+        Ok(record) => Ok(record),
+        Err(error) if body.source_agent_card.is_some() => {
+            eprintln!(
+                "wattswarm discovery source agent card invalid; signing without card: {error:#}"
+            );
+            body.source_agent_card = None;
+            SignedDiscoveryNodeRecord::sign(body, identity)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn discovery_agent_card_enabled() -> bool {
+    std::env::var(DISCOVERY_AGENT_CARD_ENABLED_ENV)
+        .ok()
+        .map(|value| {
+            !matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "0" | "false" | "no" | "off"
+            )
+        })
+        .unwrap_or(true)
+}
+
+fn load_discovery_source_agent_card(local_node_id: &str) -> Result<Option<SourceAgentCard>> {
+    let path = discovery_agent_card_path();
+    if !path.exists() {
+        return Ok(None);
+    }
+    let raw = fs::read(&path)
+        .with_context(|| format!("read discovery source agent card at {}", path.display()))?;
+    let card: SourceAgentCard = serde_json::from_slice(&raw)
+        .with_context(|| format!("parse discovery source agent card at {}", path.display()))?;
+    if let Some(card_node_id) = card.node_id.as_deref()
+        && card_node_id != local_node_id
+    {
+        anyhow::bail!(
+            "source_agent_card node_id {} does not match local node_id {}",
+            card_node_id,
+            local_node_id
+        );
+    }
+    Ok(Some(card))
+}
+
+fn discovery_agent_card_path() -> PathBuf {
+    std::env::var(DISCOVERY_AGENT_CARD_PATH_ENV)
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_DISCOVERY_AGENT_CARD_PATH))
 }
 
 fn local_topic_provider_records(

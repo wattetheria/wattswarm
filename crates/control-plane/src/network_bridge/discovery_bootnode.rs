@@ -453,7 +453,7 @@ fn raw_contact_material_from_discovery_record(
         crate::control::recommended_data_routes(Some(&contact.metadata.capabilities));
     let node_id = record.body.node_id.clone();
     let protocol_version = record.body.protocol_version.clone();
-    let material = json!({
+    let mut material = json!({
         "node_id": node_id,
         "peer_id": contact.peer_id,
         "listen_addrs": contact.metadata.listen_addrs.clone(),
@@ -462,6 +462,9 @@ fn raw_contact_material_from_discovery_record(
         "recommended_routes": recommended_routes,
         "discovery_protocol": protocol_version,
     });
+    if let Some(source_agent_card) = &record.body.source_agent_card {
+        material["source_agent_card"] = serde_json::to_value(source_agent_card)?;
+    }
     Ok(RawContactMaterial {
         material_json: serde_json::to_string(&material)?,
         signature: Some(record.signature_hex.clone()),
