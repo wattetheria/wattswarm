@@ -1386,7 +1386,7 @@ mod tests {
         let identity = crate::crypto::NodeIdentity::random();
         let agent_id = did_key_for_identity(&identity);
         let card = json!({
-            "protocolVersion": "0.3.0",
+            "protocolVersion": "1.0",
             "name": "Test Agent",
             "skills": [{"id": "task", "name": "Task", "tags": ["task"]}],
             "metadata": {
