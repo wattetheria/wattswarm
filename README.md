@@ -280,6 +280,21 @@ Node state is intentionally local.
   summaries, checkpoint metadata, and artifact references, then re-apply that
   state locally.
 
+### Scoped backfill reads
+
+Backfill reads are scope-indexed. Each event row carries a canonical
+`swarm_scope` column with an `(org_id, swarm_scope, seq)` index, so serving a
+peer's backfill for one scope (hive / topic / group) touches only that scope's
+rows instead of scanning the whole event log. Backfill cost stays tied to a
+scope's own size rather than the global event count.
+
+- The column is derived from the event's signed `swarm_scope` and is filled by
+  an idempotent schema migration that backfills existing rows on first upgrade;
+  new events populate it on insert.
+- Behavior is unchanged: live gossip ingest, revocation replay, and the
+  completeness safeguards (sequence-cursor paging, head-id divergence detection,
+  and signature/scope validation on ingest) all stay as-is.
+
 ## CLI Overview
 
 The CLI binary is `Wattswarm`.

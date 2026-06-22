@@ -569,3 +569,125 @@ fn topic_backfill_response_advances_local_cursor() {
     assert_eq!(cursor.last_event_seq, 2);
     assert_eq!(cursor.scope_hint, "group:crew-7");
 }
+
+fn emit_topic(node: &mut Node, scope_hint: &str, feed_key: &str, created_at: u64) -> String {
+    node.emit_at(
+        1,
+        crate::types::EventPayload::TopicMessagePosted(crate::types::TopicMessagePostedPayload {
+            network_id: "default".to_owned(),
+            feed_key: feed_key.to_owned(),
+            scope_hint: scope_hint.to_owned(),
+            content_ref: sample_topic_content_ref("sha256:msg", "node-local"),
+            local_content_cache: Some(json!({"text":"hi"})),
+            reply_to_message_id: None,
+            agent_envelope: None,
+        }),
+        created_at,
+    )
+    .expect("emit topic")
+    .event_id
+}
+
+#[test]
+fn recent_backfill_lane_event_ids_scope_indexed_matches_expected() {
+    let mut node = Node::open_in_memory_with_roles(&[Role::Proposer]).expect("node");
+    let alpha1 = emit_topic(&mut node, "group:alpha", "crew.chat", 10);
+    let _beta1 = emit_topic(&mut node, "group:beta", "crew.chat", 11);
+    let alpha2 = emit_topic(&mut node, "group:alpha", "crew.chat", 12);
+    let alpha3 = emit_topic(&mut node, "group:alpha", "crew.chat", 13);
+    let alpha = SwarmScope::Group("alpha".to_owned());
+
+    // Newest-first, isolated to the requested scope.
+    let ids = recent_backfill_lane_event_ids(&node, &alpha, None, 10).expect("lane ids");
+    assert_eq!(ids, vec![alpha3.clone(), alpha2.clone(), alpha1.clone()]);
+
+    // Limit is applied after filtering.
+    let ids = recent_backfill_lane_event_ids(&node, &alpha, None, 2).expect("lane ids");
+    assert_eq!(ids, vec![alpha3.clone(), alpha2.clone()]);
+
+    // feed_key narrows within the scope.
+    let ids =
+        recent_backfill_lane_event_ids(&node, &alpha, Some("crew.chat"), 10).expect("lane ids");
+    assert_eq!(ids, vec![alpha3, alpha2, alpha1]);
+    let none =
+        recent_backfill_lane_event_ids(&node, &alpha, Some("other.chat"), 10).expect("lane ids");
+    assert!(none.is_empty());
+}
+
+#[test]
+fn backfill_response_scope_indexed_isolates_and_advances_cursor() {
+    let mut node = Node::open_in_memory_with_roles(&[Role::Proposer]).expect("node");
+    let a1 = emit_topic(&mut node, "group:alpha", "crew.chat", 10);
+    let _b1 = emit_topic(&mut node, "group:beta", "crew.chat", 11);
+    let a2 = emit_topic(&mut node, "group:alpha", "crew.chat", 12);
+    let _b2 = emit_topic(&mut node, "group:beta", "crew.chat", 13);
+    let a3 = emit_topic(&mut node, "group:alpha", "crew.chat", 14);
+    let alpha = SwarmScope::Group("alpha".to_owned());
+
+    // First page: only alpha events, in order, cursor advanced past them.
+    let first = backfill_response_for_request(
+        &node,
+        "peer",
+        &BackfillRequest {
+            scope: alpha.clone(),
+            from_event_seq: 0,
+            limit: 2,
+            feed_key: None,
+            known_event_ids: Vec::new(),
+        },
+        32,
+        64,
+    )
+    .expect("first");
+    let first_ids: Vec<String> = first
+        .events
+        .iter()
+        .map(|e| e.event.event_id.clone())
+        .collect();
+    assert_eq!(first_ids, vec![a1.clone(), a2.clone()]);
+    assert!(first.events.iter().all(|e| e.scope == alpha));
+
+    // Resume from the returned cursor: remaining alpha event, no beta leakage.
+    let second = backfill_response_for_request(
+        &node,
+        "peer",
+        &BackfillRequest {
+            scope: alpha.clone(),
+            from_event_seq: first.next_from_event_seq,
+            limit: 2,
+            feed_key: None,
+            known_event_ids: Vec::new(),
+        },
+        32,
+        64,
+    )
+    .expect("second");
+    let second_ids: Vec<String> = second
+        .events
+        .iter()
+        .map(|e| e.event.event_id.clone())
+        .collect();
+    assert_eq!(second_ids, vec![a3.clone()]);
+
+    // known_event_ids dedup excludes events the requester already holds.
+    let deduped = backfill_response_for_request(
+        &node,
+        "peer",
+        &BackfillRequest {
+            scope: alpha,
+            from_event_seq: 0,
+            limit: 8,
+            feed_key: None,
+            known_event_ids: vec![a1, a2],
+        },
+        32,
+        64,
+    )
+    .expect("deduped");
+    let deduped_ids: Vec<String> = deduped
+        .events
+        .iter()
+        .map(|e| e.event.event_id.clone())
+        .collect();
+    assert_eq!(deduped_ids, vec![a3]);
+}

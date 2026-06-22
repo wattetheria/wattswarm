@@ -3,14 +3,15 @@ use super::*;
 impl PgStore {
     pub fn append_event(&self, event: &Event) -> Result<u64> {
         let event_json = serde_json::to_string(event)?;
+        let swarm_scope = canonical_swarm_scope(&event.swarm_scope);
         let conn = self
             .conn
             .lock()
             .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
         let seq: i64 = conn
             .query_row(
-                "INSERT INTO events(org_id, event_id, protocol_version, task_id, epoch, event_kind, author_node_id, created_at, event_json)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, TIMESTAMPTZ 'epoch' + ($8::bigint * INTERVAL '1 millisecond'), $9)
+                "INSERT INTO events(org_id, event_id, protocol_version, task_id, epoch, event_kind, author_node_id, created_at, event_json, swarm_scope)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, TIMESTAMPTZ 'epoch' + ($8::bigint * INTERVAL '1 millisecond'), $9, $10)
                  RETURNING seq",
                 params![
                     self.org_id(),
@@ -22,6 +23,7 @@ impl PgStore {
                     event.author_node_id,
                     event.created_at as i64,
                     event_json,
+                    swarm_scope,
                 ],
                 |r| r.get(0),
             )
@@ -116,6 +118,90 @@ impl PgStore {
 
     pub fn load_all_events(&self) -> Result<Vec<(u64, Event)>> {
         self.load_events_from(0)
+    }
+
+    /// Load events for a single swarm scope, newest first, older than
+    /// `before_exclusive` (unbounded when `None`).
+    ///
+    /// Scope-indexed counterpart to scanning the whole event log newest-first:
+    /// only rows whose `swarm_scope` column equals `scope_canonical` are read.
+    /// Callers paginate backward via the returned seqs and apply the remaining
+    /// backfill-lane filters (revocation/ban/network and feed_key) in Rust.
+    pub fn load_scope_events_before(
+        &self,
+        scope_canonical: &str,
+        before_exclusive: Option<u64>,
+        limit: usize,
+    ) -> Result<Vec<(u64, Event)>> {
+        let before = before_exclusive.map_or(i64::MAX, |seq| seq as i64);
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
+        let mut stmt = conn.prepare(
+            "SELECT seq, event_json FROM events
+             WHERE org_id = $1
+               AND swarm_scope = $2
+               AND seq < $3
+             ORDER BY seq DESC
+             LIMIT $4",
+        )?;
+        let rows = stmt.query_map(
+            params![self.org_id(), scope_canonical, before, limit as i64],
+            |row| {
+                let seq: i64 = row.get(0)?;
+                let json: String = row.get(1)?;
+                let event: Event = serde_json::from_str(&json).map_err(|e| {
+                    pg::Error::FromSqlConversionFailure(1, pg::types::Type::Text, Box::new(e))
+                })?;
+                Ok((seq as u64, event))
+            },
+        )?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
+    /// Load a page of events for a single swarm scope, oldest first, after `from_exclusive`.
+    ///
+    /// Scope-indexed counterpart to `load_events_page`; only rows whose
+    /// `swarm_scope` column equals `scope_canonical` are read, so a sparse
+    /// scope in a busy global log no longer scans unrelated rows.
+    pub fn load_scope_events_page(
+        &self,
+        scope_canonical: &str,
+        from_exclusive: u64,
+        limit: usize,
+    ) -> Result<Vec<(u64, Event)>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
+        let mut stmt = conn.prepare(
+            "SELECT seq, event_json FROM events
+             WHERE org_id = $1
+               AND swarm_scope = $2
+               AND seq > $3
+             ORDER BY seq ASC
+             LIMIT $4",
+        )?;
+        let rows = stmt.query_map(
+            params![
+                self.org_id(),
+                scope_canonical,
+                from_exclusive as i64,
+                limit as i64
+            ],
+            |row| {
+                let seq: i64 = row.get(0)?;
+                let json: String = row.get(1)?;
+                let event: Event = serde_json::from_str(&json).map_err(|e| {
+                    pg::Error::FromSqlConversionFailure(1, pg::types::Type::Text, Box::new(e))
+                })?;
+                Ok((seq as u64, event))
+            },
+        )?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
     }
 
     pub fn task_created_by_node_id(&self, task_id: &str) -> Result<Option<String>> {

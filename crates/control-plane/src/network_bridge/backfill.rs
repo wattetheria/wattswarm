@@ -4,6 +4,11 @@ use crate::network_p2p::BackfillResponse;
 const BACKFILL_HEAD_EVENT_IDS_LIMIT: usize = 8;
 pub(super) const BACKFILL_KNOWN_EVENT_IDS_LIMIT: usize = 64;
 
+/// Backward-scan page size for `recent_backfill_lane_event_ids`. Bounds memory
+/// while paginating a scope's events newest-first to absorb events filtered out
+/// by `should_sync_event` (revoked/banned) before reaching the requested limit.
+const SCOPE_LANE_SCAN_BATCH: usize = 256;
+
 fn event_matches_backfill_lane(
     node: &Node,
     event: &crate::types::Event,
@@ -39,16 +44,28 @@ pub(super) fn recent_backfill_lane_event_ids(
     if limit == 0 {
         return Ok(Vec::new());
     }
+    let scope_label = scope_hint_label(scope);
     let mut event_ids = Vec::new();
-    for (_, event) in node.store.load_all_events()?.into_iter().rev() {
-        if !should_sync_event(node, &event)? {
-            continue;
+    let mut before: Option<u64> = None;
+    loop {
+        let batch =
+            node.store
+                .load_scope_events_before(&scope_label, before, SCOPE_LANE_SCAN_BATCH)?;
+        let batch_len = batch.len();
+        for (seq, event) in batch {
+            before = Some(seq);
+            if !should_sync_event(node, &event)? {
+                continue;
+            }
+            if !event_matches_backfill_lane(node, &event, scope, feed_key)? {
+                continue;
+            }
+            event_ids.push(event.event_id);
+            if event_ids.len() >= limit {
+                return Ok(event_ids);
+            }
         }
-        if !event_matches_backfill_lane(node, &event, scope, feed_key)? {
-            continue;
-        }
-        event_ids.push(event.event_id);
-        if event_ids.len() >= limit {
+        if batch_len < SCOPE_LANE_SCAN_BATCH {
             break;
         }
     }
@@ -63,6 +80,7 @@ pub fn backfill_response_for_request(
     hard_limit: usize,
 ) -> Result<BackfillResponse> {
     request.validate(max_limit, hard_limit)?;
+    let scope_label = scope_hint_label(&request.scope);
     let mut next_from_event_seq = request.from_event_seq;
     let mut from_event_seq = request.from_event_seq;
     let mut envelopes = Vec::new();
@@ -79,7 +97,8 @@ pub fn backfill_response_for_request(
     )?;
 
     while envelopes.len() < request.limit {
-        let rows = node.store.load_events_page(
+        let rows = node.store.load_scope_events_page(
+            &scope_label,
             from_event_seq,
             request.limit.saturating_sub(envelopes.len()).max(32),
         )?;

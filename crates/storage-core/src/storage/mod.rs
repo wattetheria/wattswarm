@@ -429,6 +429,18 @@ pub struct ExecutionSetMemberRow {
 
 pub type ProjectionScope = wattswarm_protocol::types::ScopeHint;
 
+/// Canonical scope label for the `events.swarm_scope` index column.
+///
+/// Derived from an event's signed `swarm_scope` string with the same
+/// `parse_with_prefix_fallback` semantics the backfill lane filter uses
+/// (`signed_event_scope`), so an indexed lookup by this column accepts exactly
+/// the events `event_matches_backfill_lane` accepts. Unparseable scopes yield
+/// `None` (stored as NULL) and are excluded from scope lookups, matching the
+/// filter's rejection of events whose `signed_event_scope` is `None`.
+pub(crate) fn canonical_swarm_scope(raw: &str) -> Option<String> {
+    ProjectionScope::parse_with_prefix_fallback(raw).map(|scope| scope.canonical())
+}
+
 impl FeedSubscriptionRow {
     pub fn scope(&self) -> Option<ProjectionScope> {
         ProjectionScope::parse(&self.scope_hint)

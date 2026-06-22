@@ -304,6 +304,60 @@ fn migrate_feed_subscription_network_id_schema(conn: &Connection) -> Result<()> 
     Ok(())
 }
 
+/// Add the `events.swarm_scope` index column used by scope-filtered backfill
+/// reads, plus its `(org_id, swarm_scope, seq)` index. Existing rows are
+/// backfilled once when the column is first added; new rows are populated by
+/// `append_event`. The stored value is `canonical_swarm_scope(event.swarm_scope)`
+/// so an indexed lookup accepts exactly the events the backfill-lane filter
+/// accepts.
+fn migrate_events_swarm_scope_schema(conn: &Connection) -> Result<()> {
+    let freshly_added = !column_exists(conn, "events", "swarm_scope");
+    if freshly_added {
+        conn.execute_batch("ALTER TABLE events ADD COLUMN swarm_scope TEXT")?;
+        backfill_events_swarm_scope(conn)?;
+    }
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_events_scope ON events(org_id, swarm_scope, seq)",
+    )?;
+    Ok(())
+}
+
+/// One-time backfill of `events.swarm_scope` for rows written before the column
+/// existed. Reuses [`canonical_swarm_scope`] so the stored value matches the
+/// backfill-lane filter exactly. Unparseable scopes stay NULL and are excluded
+/// from scope lookups, matching the filter's rejection of `signed_event_scope ==
+/// None`.
+fn backfill_events_swarm_scope(conn: &Connection) -> Result<()> {
+    let pending: Vec<(i64, String)> = {
+        let mut stmt = conn.prepare(
+            "SELECT seq, event_json FROM events
+             WHERE swarm_scope IS NULL
+             ORDER BY seq ASC",
+        )?;
+        let rows = stmt.query_map(params![], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()?
+    };
+    for (seq, event_json) in pending {
+        let canonical = serde_json::from_str::<serde_json::Value>(&event_json)
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("swarm_scope")
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(canonical_swarm_scope)
+            });
+        if let Some(canonical) = canonical {
+            conn.execute(
+                "UPDATE events SET swarm_scope = $1 WHERE seq = $2",
+                params![canonical, seq],
+            )?;
+        }
+    }
+    Ok(())
+}
+
 fn migrate_topic_cursor_network_id_schema(conn: &Connection) -> Result<()> {
     if !column_exists(conn, "topic_cursors", "network_id") {
         conn.execute_batch(
@@ -2018,6 +2072,7 @@ impl PgStore {
             migrate_agent_event_bus_local_agent_envelope_schema(&conn)?;
             migrate_network_peer_sync_state_identity_schema(&conn)?;
             migrate_feed_subscription_network_id_schema(&conn)?;
+            migrate_events_swarm_scope_schema(&conn)?;
             migrate_topic_cursor_network_id_schema(&conn)?;
             migrate_peer_relationships_local_trim_signature_column(&conn)?;
             migrate_peer_dm_messages_local_trim_product_columns(&conn)?;
@@ -2045,5 +2100,67 @@ impl PgStore {
             conn: Arc::new(Mutex::new(conn)),
             org_id: Arc::new(UNSET_ORG_ID.to_owned()),
         })
+    }
+}
+
+#[cfg(test)]
+mod swarm_scope_migration_tests {
+    use super::*;
+
+    #[test]
+    fn backfill_events_swarm_scope_populates_existing_null_rows() {
+        let conn = Connection::open_in_memory().expect("conn");
+        conn.execute_batch(
+            "CREATE TABLE events (
+                 seq BIGSERIAL PRIMARY KEY,
+                 org_id TEXT NOT NULL DEFAULT '__unset_org__',
+                 event_id TEXT NOT NULL UNIQUE,
+                 event_json TEXT NOT NULL,
+                 swarm_scope TEXT
+             );",
+        )
+        .expect("create events");
+        for (event_id, scope) in [
+            ("e1", "group:alpha"),
+            ("e2", "group:beta/thread"),
+            ("e3", "garbage"),
+        ] {
+            conn.execute(
+                "INSERT INTO events(org_id, event_id, event_json) VALUES ($1, $2, $3)",
+                params!["org", event_id, format!("{{\"swarm_scope\":\"{scope}\"}}")],
+            )
+            .expect("insert");
+        }
+
+        backfill_events_swarm_scope(&conn).expect("backfill");
+
+        let count = |sql: &str, id: &str| -> i64 {
+            conn.query_row(sql, params![id], |r| r.get::<_, i64>(0))
+                .expect("count")
+        };
+        // Canonical scope is stored verbatim.
+        assert_eq!(
+            count(
+                "SELECT count(*) FROM events WHERE event_id = $1 AND swarm_scope = 'group:alpha'",
+                "e1"
+            ),
+            1
+        );
+        // Prefix-fallback canonicalization: group:beta/thread -> group:beta.
+        assert_eq!(
+            count(
+                "SELECT count(*) FROM events WHERE event_id = $1 AND swarm_scope = 'group:beta'",
+                "e2"
+            ),
+            1
+        );
+        // Unparseable scope stays NULL.
+        assert_eq!(
+            count(
+                "SELECT count(*) FROM events WHERE event_id = $1 AND swarm_scope IS NULL",
+                "e3"
+            ),
+            1
+        );
     }
 }
