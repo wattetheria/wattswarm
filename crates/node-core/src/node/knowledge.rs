@@ -482,22 +482,32 @@ impl Node {
         role: ClaimRole,
         author_node_id: &str,
         execution_id: &str,
-        now: u64,
+        _now: u64,
     ) -> Result<()> {
-        let role_str = claim_role_str(role);
-        let lease = self
-            .store
-            .get_lease(task_id, role_str)?
-            .ok_or_else(|| SwarmError::NotFound("lease missing".into()))?;
-
-        if lease.claimer_node_id != author_node_id {
-            return Err(SwarmError::InvalidEvent("lease claimer mismatch".into()).into());
+        let mut active_claim = false;
+        for (_, event) in self.store.load_all_events()? {
+            match event.payload {
+                EventPayload::TaskClaimed(claim)
+                    if claim.task_id == task_id
+                        && claim.role == role
+                        && claim.claimer_node_id == author_node_id
+                        && claim.execution_id == execution_id =>
+                {
+                    active_claim = true;
+                }
+                EventPayload::TaskClaimReleased(claim)
+                    if claim.task_id == task_id
+                        && claim.role == role
+                        && claim.claimer_node_id == author_node_id
+                        && claim.execution_id == execution_id =>
+                {
+                    active_claim = false;
+                }
+                _ => {}
+            }
         }
-        if lease.execution_id != execution_id {
-            return Err(SwarmError::InvalidEvent("lease execution_id mismatch".into()).into());
-        }
-        if is_deadline_expired(lease.lease_until, now) {
-            return Err(SwarmError::InvalidEvent("lease expired".into()).into());
+        if !active_claim {
+            return Err(SwarmError::NotFound("claim missing".into()).into());
         }
         Ok(())
     }

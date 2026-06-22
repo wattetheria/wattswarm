@@ -902,39 +902,13 @@ impl Node {
         Ok(())
     }
 
-    pub(crate) fn validate_claimed(&self, event: &Event, claim: &ClaimPayload) -> Result<()> {
+    pub(crate) fn validate_claimed(&self, _event: &Event, claim: &ClaimPayload) -> Result<()> {
         let task = self.require_task(&claim.task_id)?;
         if task.terminal_state != TaskTerminalState::Open {
             return Err(SwarmError::InvalidEvent("claim on closed task".into()).into());
         }
         if claim.execution_id.trim().is_empty() {
             return Err(SwarmError::InvalidEvent("execution_id required".into()).into());
-        }
-
-        let role_str = claim_role_str(claim.role);
-        if let Some(current) = self.store.get_lease(&claim.task_id, role_str)?
-            && !is_deadline_expired(current.lease_until, event.created_at)
-        {
-            let winner = std::cmp::min(current.execution_id.clone(), claim.execution_id.clone());
-            if winner != claim.execution_id {
-                return Err(SwarmError::Conflict("lease conflict (tie-break loser)".into()).into());
-            }
-        }
-
-        if claim.lease_until <= event.created_at {
-            return Err(
-                SwarmError::InvalidEvent("lease_until must be in the future".into()).into(),
-            );
-        }
-        let max_lease_until = event
-            .created_at
-            .saturating_add(task.contract.assignment.claim.lease_ms)
-            .saturating_add(CLOCK_SKEW_TOLERANCE_MS);
-        if claim.lease_until > max_lease_until {
-            return Err(SwarmError::InvalidEvent(
-                "lease_until exceeds contract lease window".into(),
-            )
-            .into());
         }
         Ok(())
     }
@@ -944,52 +918,25 @@ impl Node {
         event: &Event,
         claim: &ClaimRenewPayload,
     ) -> Result<()> {
-        let task = self.require_task(&claim.task_id)?;
-        let role_str = claim_role_str(claim.role);
-        let current = self
-            .store
-            .get_lease(&claim.task_id, role_str)?
-            .ok_or_else(|| SwarmError::NotFound("lease missing".into()))?;
-        if current.claimer_node_id != claim.claimer_node_id
-            || current.execution_id != claim.execution_id
-        {
-            return Err(SwarmError::InvalidEvent("renew must match active lease".into()).into());
-        }
-        if is_deadline_expired(current.lease_until, event.created_at) {
-            return Err(SwarmError::InvalidEvent("cannot renew expired lease".into()).into());
-        }
-        if claim.lease_until <= current.lease_until {
-            return Err(SwarmError::InvalidEvent("renew lease_until must extend".into()).into());
-        }
-        if claim.lease_until <= event.created_at {
-            return Err(
-                SwarmError::InvalidEvent("renew lease_until must be in the future".into()).into(),
-            );
-        }
-        let max_lease_until = event
-            .created_at
-            .saturating_add(task.contract.assignment.claim.lease_ms)
-            .saturating_add(CLOCK_SKEW_TOLERANCE_MS);
-        if claim.lease_until > max_lease_until {
-            return Err(SwarmError::InvalidEvent(
-                "renew lease_until exceeds contract lease window".into(),
-            )
-            .into());
-        }
+        self.require_task(&claim.task_id)?;
+        self.assert_valid_lease(
+            &claim.task_id,
+            claim.role,
+            &claim.claimer_node_id,
+            &claim.execution_id,
+            event.created_at,
+        )?;
         Ok(())
     }
 
     pub(crate) fn validate_claim_released(&self, claim: &ClaimReleasePayload) -> Result<()> {
-        let role_str = claim_role_str(claim.role);
-        let current = self
-            .store
-            .get_lease(&claim.task_id, role_str)?
-            .ok_or_else(|| SwarmError::NotFound("lease missing".into()))?;
-        if current.claimer_node_id != claim.claimer_node_id
-            || current.execution_id != claim.execution_id
-        {
-            return Err(SwarmError::InvalidEvent("release must match active lease".into()).into());
-        }
+        self.assert_valid_lease(
+            &claim.task_id,
+            claim.role,
+            &claim.claimer_node_id,
+            &claim.execution_id,
+            0,
+        )?;
         Ok(())
     }
 

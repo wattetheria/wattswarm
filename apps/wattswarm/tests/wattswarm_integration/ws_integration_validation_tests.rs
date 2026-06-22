@@ -72,7 +72,7 @@ fn batched_backfill_allows_interleaving_local_lease_renew() {
 }
 
 #[test]
-fn lease_conflict_tiebreak_and_renew_behavior() {
+fn multiple_claim_requests_for_same_role_do_not_conflict() {
     let id = identity(4);
     let membership = membership_all(&[id.node_id()]);
     let mut node = mk_node(id, membership);
@@ -89,22 +89,14 @@ fn lease_conflict_tiebreak_and_renew_behavior() {
 
     node.claim_task("task-lease", ClaimRole::Propose, "a-exec", 1_100, 1, 120)
         .unwrap();
-
-    let lease = node
-        .store
-        .get_lease("task-lease", "propose")
-        .unwrap()
+    node.claim_task("task-lease", ClaimRole::Propose, "m-exec", 1_200, 1, 130)
         .unwrap();
-    assert_eq!(lease.execution_id, "a-exec");
-
-    let loser = node.claim_task("task-lease", ClaimRole::Propose, "m-exec", 1_200, 1, 130);
-    assert!(loser.is_err());
 
     node.renew_claim("task-lease", ClaimRole::Propose, "a-exec", 2_000, 1, 200)
         .unwrap();
 
-    let candidate = make_candidate(
-        "c-lease",
+    let first_candidate = make_candidate(
+        "c-lease-a",
         "a-exec",
         serde_json::json!({"answer":"x"}),
         vec![],
@@ -117,12 +109,29 @@ fn lease_conflict_tiebreak_and_renew_behavior() {
             producer: "r/p".to_owned(),
         }],
     );
-    node.propose_candidate("task-lease", candidate, 1, 1500)
+    node.propose_candidate("task-lease", first_candidate, 1, 1500)
+        .unwrap();
+
+    let later_candidate = make_candidate(
+        "c-lease-z",
+        "z-exec",
+        serde_json::json!({"answer":"y"}),
+        vec![],
+        vec![wattswarm::types::ArtifactRef {
+            uri: "https://e2".to_owned(),
+            digest: "sha256:2".to_owned(),
+            size_bytes: 1,
+            mime: "text/plain".to_owned(),
+            created_at: 1,
+            producer: "r/p".to_owned(),
+        }],
+    );
+    node.propose_candidate("task-lease", later_candidate, 1, 1600)
         .unwrap();
 }
 
 #[test]
-fn lease_tolerance_accepts_small_clock_skew() {
+fn claim_request_allows_candidate_after_original_lease_time() {
     let id = identity(23);
     let membership = membership_all(&[id.node_id()]);
     let mut node = mk_node(id, membership);
@@ -163,13 +172,13 @@ fn lease_tolerance_accepts_small_clock_skew() {
         }],
     );
 
-    let slightly_after_expiry = 1_000 + CLOCK_SKEW_TOLERANCE_MS - 1;
-    node.propose_candidate("task-skew-ok", candidate, 1, slightly_after_expiry)
+    let after_original_lease = 1_000 + CLOCK_SKEW_TOLERANCE_MS + 1;
+    node.propose_candidate("task-skew-ok", candidate, 1, after_original_lease)
         .unwrap();
 }
 
 #[test]
-fn lease_tolerance_rejects_beyond_clock_window() {
+fn released_claim_request_rejects_later_candidate() {
     let id = identity(24);
     let membership = membership_all(&[id.node_id()]);
     let mut node = mk_node(id, membership);
@@ -194,6 +203,8 @@ fn lease_tolerance_rejects_beyond_clock_window() {
         200,
     )
     .unwrap();
+    node.release_claim("task-skew-bad", ClaimRole::Propose, "exec-skew", 1, 250)
+        .unwrap();
 
     let candidate = make_candidate(
         "c-skew-bad",
@@ -210,9 +221,8 @@ fn lease_tolerance_rejects_beyond_clock_window() {
         }],
     );
 
-    let far_after_expiry = 1_000 + CLOCK_SKEW_TOLERANCE_MS + 1;
     assert!(
-        node.propose_candidate("task-skew-bad", candidate, 1, far_after_expiry)
+        node.propose_candidate("task-skew-bad", candidate, 1, 260)
             .is_err()
     );
 }

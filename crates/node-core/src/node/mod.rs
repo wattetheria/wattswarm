@@ -1,6 +1,6 @@
 use crate::constants::{
-    BACKFILL_BATCH_EVENTS, CLOCK_SKEW_TOLERANCE_MS, INLINE_MIME_ALLOWLIST, LOCAL_PROTOCOL_VERSION,
-    MAX_EVENT_BYTES, MAX_EVENT_PAYLOAD_BYTES, MAX_INLINE_EVIDENCE_BYTES, MAX_INLINE_MEDIA_BYTES,
+    BACKFILL_BATCH_EVENTS, INLINE_MIME_ALLOWLIST, LOCAL_PROTOCOL_VERSION, MAX_EVENT_BYTES,
+    MAX_EVENT_PAYLOAD_BYTES, MAX_INLINE_EVIDENCE_BYTES, MAX_INLINE_MEDIA_BYTES,
     MAX_STRUCTURED_SUMMARY_BYTES, REPUTATION_SCALE,
 };
 use crate::crypto::{
@@ -250,10 +250,6 @@ fn decoded_looks_like_media(bytes: &[u8]) -> bool {
         return true;
     }
     false
-}
-
-fn is_deadline_expired(deadline: u64, now: u64) -> bool {
-    deadline.saturating_add(CLOCK_SKEW_TOLERANCE_MS) < now
 }
 
 fn stage_cost_for_payload(payload: &EventPayload) -> Option<(&'static str, u64)> {
