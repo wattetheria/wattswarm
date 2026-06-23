@@ -8,6 +8,7 @@ use super::status::{
 };
 
 pub(crate) const STEP_STATUS_REMOTE_DISPATCHED: &str = "REMOTE_DISPATCHED";
+pub(crate) const RUN_QUEUE_TASK_FEED_KEY: &str = "venue.run_queue.task";
 const RUN_QUEUE_COORDINATION_KEY: &str = "_run_queue_coordination";
 use super::types::RunStepCounts;
 
@@ -95,6 +96,42 @@ pub(crate) fn build_step_inputs(shared_inputs: &Value, prompt: &str, agent_id: &
     Value::Object(merged)
 }
 
+pub(crate) fn build_task_scoped_step_inputs(
+    shared_inputs: &Value,
+    prompt: &str,
+    agent_id: &str,
+    task_id: &str,
+    target_node_id: Option<&str>,
+) -> Value {
+    let mut merged = match build_step_inputs(shared_inputs, prompt, agent_id) {
+        Value::Object(object) => object,
+        _ => Map::new(),
+    };
+    merged.insert(
+        "swarm_scope".to_owned(),
+        Value::String(run_queue_task_scope_hint(task_id)),
+    );
+    if let Some(target_node_id) = target_node_id
+        .map(str::trim)
+        .filter(|target_node_id| !target_node_id.is_empty())
+    {
+        merged.insert(
+            "swarm_route".to_owned(),
+            serde_json::json!({
+                "group_id": task_id,
+                "target_node_ids": [target_node_id],
+                "relation_tags": ["run_queue"],
+                "forward_budget": 1
+            }),
+        );
+    }
+    Value::Object(merged)
+}
+
+pub(crate) fn run_queue_task_scope_hint(task_id: &str) -> String {
+    format!("group:{task_id}")
+}
+
 pub(crate) fn coordinator_must_not_execute_locally(
     shared_inputs: &Value,
     local_node_id: &str,
@@ -170,5 +207,25 @@ mod tests {
             }),
             "node-a"
         ));
+    }
+
+    #[test]
+    fn task_scoped_step_inputs_bind_child_scope_to_task_id() {
+        let merged = build_task_scoped_step_inputs(
+            &json!({"x": 1}),
+            "prompt-a",
+            "agent-a",
+            "run-parent-agent-a-1",
+            Some("node-agent-a"),
+        );
+        assert_eq!(merged["x"], 1);
+        assert_eq!(merged["prompt"], "prompt-a");
+        assert_eq!(merged["agent_id"], "agent-a");
+        assert_eq!(merged["swarm_scope"], "group:run-parent-agent-a-1");
+        assert_eq!(merged["swarm_route"]["group_id"], "run-parent-agent-a-1");
+        assert_eq!(
+            merged["swarm_route"]["target_node_ids"],
+            json!(["node-agent-a"])
+        );
     }
 }

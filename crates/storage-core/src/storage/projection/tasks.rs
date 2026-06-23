@@ -380,6 +380,40 @@ impl PgStore {
         Ok(out)
     }
 
+    pub fn list_feed_subscriptions_for_network(
+        &self,
+        network_id: &str,
+    ) -> Result<Vec<FeedSubscriptionRow>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
+        let mut stmt = conn.prepare(
+            "SELECT subscriber_node_id, feed_key, scope_hint, gossip_kinds_json, provider_capabilities_json, active, CAST(EXTRACT(EPOCH FROM updated_at) * 1000 AS BIGINT)
+             FROM feed_subscriptions
+             WHERE org_id = $1 AND network_id = $2
+             ORDER BY updated_at DESC, subscriber_node_id ASC, feed_key ASC",
+        )?;
+        let rows = stmt.query_map(params![self.org_id(), network_id], |r| {
+            let updated_at_ms: i64 = r.get(6)?;
+            Ok(FeedSubscriptionRow {
+                network_id: network_id.to_owned(),
+                subscriber_node_id: r.get(0)?,
+                feed_key: r.get(1)?,
+                scope_hint: Self::canonical_scope_hint_or_original(r.get(2)?),
+                gossip_kinds: Self::decode_gossip_kinds_json(r.get(3)?),
+                provider_capabilities: Self::decode_topic_provider_capabilities_json(r.get(4)?),
+                active: r.get(5)?,
+                updated_at: updated_at_ms as u64,
+            })
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
     pub fn put_task_announcement(
         &self,
         task_id: &str,

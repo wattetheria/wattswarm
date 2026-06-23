@@ -1,5 +1,8 @@
 use super::*;
 
+const RUN_QUEUE_ANNOUNCEMENT_FEED_KEY: &str = "venue.run_queue";
+const RUN_QUEUE_TASK_FEED_KEY: &str = "venue.run_queue.task";
+
 fn load_remote_task_bridge_registry_file(path: &Path) -> Result<RemoteTaskBridgeRegistry> {
     if !path.exists() {
         return Ok(RemoteTaskBridgeRegistry::default());
@@ -420,6 +423,11 @@ fn bridged_task_contract(node: &Node, state_dir: &Path, task_id: &str) -> Result
     if let Some(contract) = detail.contract {
         return Ok(contract);
     }
+    if let Some(contract) =
+        task_contract_from_announcement_summary(task_id, &detail.announcement.summary)?
+    {
+        return Ok(contract);
+    }
     let bytes = fetch_task_detail_artifact(state_dir, node, task_id, observed_at_ms())?;
     let contract = serde_json::from_slice::<TaskContract>(&bytes)
         .with_context(|| format!("parse bridged task detail for {task_id}"))?;
@@ -431,6 +439,64 @@ fn bridged_task_contract(node: &Node, state_dir: &Path, task_id: &str) -> Result
         ));
     }
     Ok(contract)
+}
+
+fn task_contract_from_announcement_summary(
+    task_id: &str,
+    summary: &Value,
+) -> Result<Option<TaskContract>> {
+    let Some(raw_contract) = summary.get("task_contract") else {
+        return Ok(None);
+    };
+    let contract: TaskContract = serde_json::from_value(raw_contract.clone())
+        .with_context(|| format!("parse task_contract from announcement summary for {task_id}"))?;
+    if contract.task_id != task_id {
+        return Err(anyhow!(
+            "announcement summary task_contract task_id mismatch: expected {}, got {}",
+            task_id,
+            contract.task_id
+        ));
+    }
+    Ok(Some(contract))
+}
+
+fn run_queue_task_scope_hint(task_id: &str) -> String {
+    format!("group:{task_id}")
+}
+
+fn ensure_run_queue_task_scope(
+    node: &Node,
+    task_id: &str,
+    contract: &TaskContract,
+    updated_at: u64,
+) -> Result<()> {
+    let expected_scope = run_queue_task_scope_hint(task_id);
+    let actual_scope = contract
+        .inputs
+        .get("swarm_scope")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or_default();
+    if actual_scope != expected_scope {
+        return Err(anyhow!(
+            "run-queue task {} must use task-id scope {}; got {}",
+            task_id,
+            expected_scope,
+            actual_scope
+        ));
+    }
+    let network_id = current_network_context_id(node);
+    let node_id = node.node_id();
+    node.store.upsert_feed_subscription(
+        &network_id,
+        &node_id,
+        RUN_QUEUE_TASK_FEED_KEY,
+        &expected_scope,
+        &["events".to_owned()],
+        true,
+        updated_at,
+    )?;
+    Ok(())
 }
 
 fn bridge_origin_payload(
@@ -494,6 +560,9 @@ pub fn bridge_remote_task_into_local_execution(
             node.node_id(),
             scope_hint
         ));
+    }
+    if announcement.feed_key == RUN_QUEUE_ANNOUNCEMENT_FEED_KEY {
+        ensure_run_queue_task_scope(node, &task_id, &contract, observed_at_ms())?;
     }
     let mut registry = load_remote_task_bridge_registry(state_dir)?;
 

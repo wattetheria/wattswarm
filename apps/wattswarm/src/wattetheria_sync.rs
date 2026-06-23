@@ -184,6 +184,13 @@ pub struct TopicActivitySnapshot {
     pub cursor: Option<TopicCursorRow>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct TopicSubscriptionSnapshot {
+    pub generated_at: u64,
+    pub network_id: String,
+    pub subscriptions: Vec<wattswarm_storage_core::storage::FeedSubscriptionRow>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SocialProjectionSnapshot {
     pub generated_at: u64,
@@ -205,6 +212,11 @@ pub struct TopicActivityQuery {
     pub scope_hint: String,
     pub limit: Option<usize>,
     pub subscriber_node_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct TopicSubscriptionQuery {
+    pub network_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -672,6 +684,28 @@ pub fn build_topic_activity_snapshot(
     })
 }
 
+pub fn build_topic_subscription_snapshot(
+    state_dir: &Path,
+    db_path: &Path,
+    network_id: Option<&str>,
+) -> Result<TopicSubscriptionSnapshot> {
+    ensure_sync_node_mode_configured(state_dir)?;
+    let node = open_configured_node(state_dir, db_path)?;
+    let network_id = network_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| resolve_network_id(&node));
+    let subscriptions = node
+        .store
+        .list_feed_subscriptions_for_network(&network_id)?;
+    Ok(TopicSubscriptionSnapshot {
+        generated_at: now_ms(),
+        network_id,
+        subscriptions,
+    })
+}
+
 pub fn build_social_projection_snapshot(
     state_dir: &Path,
     limit: usize,
@@ -909,6 +943,22 @@ pub(crate) async fn topic_activity_http(
             &query.scope_hint,
             query.limit.unwrap_or(50),
             query.subscriber_node_id.as_deref(),
+        )
+    })
+    .await?;
+    Ok(Json(snapshot))
+}
+
+pub(crate) async fn topic_subscriptions_http(
+    State(state): State<UiServerState>,
+    Query(query): Query<TopicSubscriptionQuery>,
+) -> Result<Json<TopicSubscriptionSnapshot>, ApiError> {
+    let state_clone = state.clone();
+    let snapshot = run_blocking(move || {
+        build_topic_subscription_snapshot(
+            &state_clone.state_dir,
+            &state_clone.db_path,
+            query.network_id.as_deref(),
         )
     })
     .await?;

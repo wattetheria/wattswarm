@@ -170,6 +170,128 @@ fn remote_task_bridge_materializes_executes_and_dedupes() {
 }
 
 #[test]
+fn run_queue_remote_bridge_uses_task_id_scope_for_candidate_results() {
+    let _guard = env_lock();
+    let _db_lock = DbTestLock::acquire();
+    reset_test_schema("test");
+    let _schema_guard = EnvVarGuard::set("WATTSWARM_PG_SCHEMA", "test");
+    let dir = temp_test_dir("run-queue-remote-task-scope");
+    let state_dir = dir.join("state");
+    fs::create_dir_all(&state_dir).expect("create state dir");
+    let db_path = state_dir.join("test.state");
+    let stub = RuntimeStub::start(&["default"]);
+    wait_for_stub_listener(&stub);
+
+    save_executor_registry_state(
+        &state_dir,
+        &ExecutorRegistry {
+            entries: vec![ExecutorRegistryEntry {
+                name: "core-agent".to_owned(),
+                base_url: stub.base_url(),
+                agent_event_callback_base_url: None,
+                kind: Default::default(),
+                target_node_id: None,
+                scope_hint: None,
+                commit_plane_endpoint: None,
+                commit_plane_token_file: None,
+            }],
+        },
+    )
+    .expect("save executor registry");
+
+    let mut node = open_node(&state_dir, &db_path).expect("open node");
+    let coordinator = NodeIdentity::random();
+    let mut membership = Membership::new();
+    for role in [
+        Role::Proposer,
+        Role::Verifier,
+        Role::Committer,
+        Role::Finalizer,
+    ] {
+        membership.grant(&node.node_id(), role);
+    }
+    membership.grant(&coordinator.node_id(), Role::Proposer);
+    node.store
+        .put_membership(&serde_json::to_string(&membership).expect("membership json"))
+        .expect("put membership");
+
+    let policy_hash = node
+        .policy_registry()
+        .binding_for("vp.schema_only.v1", serde_json::json!({}))
+        .expect("policy binding")
+        .policy_hash;
+    let task_id = format!("run-parent-agent-a-{}", Uuid::new_v4().simple());
+    let mut contract = sample_contract(&task_id, policy_hash);
+    contract.inputs = json!({
+        "prompt": "run queue scoped child task",
+        "swarm_scope": format!("group:{task_id}"),
+        "swarm_route": {
+            "group_id": task_id,
+            "target_node_ids": [node.node_id()],
+            "relation_tags": ["run_queue"],
+            "forward_budget": 1
+        }
+    });
+    let topology = node
+        .store
+        .load_network_topology_for_org(node.store.org_id())
+        .expect("load topology");
+    let announcement_unsigned = UnsignedEvent::from_payload(
+        "0.1.0".to_owned(),
+        coordinator.node_id(),
+        1,
+        100,
+        wattswarm_control_plane::types::EventPayload::TaskAnnounced(TaskAnnouncedPayload {
+            network_id: topology.network.network_id.clone(),
+            task_id: task_id.clone(),
+            announcement_id: format!("ann-{}", Uuid::new_v4().simple()),
+            feed_key: "venue.run_queue".to_owned(),
+            scope_hint: format!("node:{}", node.node_id()),
+            summary: json!({
+                "title": "run queue scoped bridge task",
+                "task_contract": contract,
+            }),
+            detail_ref: None,
+            agent_envelope: None,
+        }),
+    );
+    let announcement = coordinator
+        .sign_unsigned_event(&announcement_unsigned)
+        .expect("sign remote announcement");
+    node.ingest_remote(announcement)
+        .expect("ingest remote announcement");
+
+    let out = bridge_remote_task_into_local_execution(
+        &mut node,
+        &state_dir,
+        RemoteTaskBridgeRequest {
+            executor: "core-agent".to_owned(),
+            profile: "default".to_owned(),
+            task_id: task_id.clone(),
+        },
+    )
+    .expect("bridge remote task");
+    assert_eq!(out["task_id"], json!(task_id.clone()));
+    assert_eq!(out["terminal_state"], json!("Finalized"));
+
+    let events = node.store.load_events_page(0, 200).expect("load events");
+    let candidate_event = events
+        .into_iter()
+        .map(|(_, event)| event)
+        .find(|event| {
+            matches!(
+                &event.payload,
+                wattswarm_control_plane::types::EventPayload::CandidateProposed(payload)
+                    if payload.task_id == task_id
+            )
+        })
+        .expect("candidate proposed event");
+    assert_eq!(candidate_event.swarm_scope, format!("group:{task_id}"));
+
+    cleanup_dir(&dir);
+}
+
+#[test]
 fn remote_task_bridge_rejects_node_scoped_tasks_for_other_nodes() {
     let _guard = env_lock();
     let _db_lock = DbTestLock::acquire();

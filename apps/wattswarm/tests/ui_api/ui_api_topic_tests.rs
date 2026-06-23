@@ -173,6 +173,77 @@ fn ui_exposes_topic_message_history_and_cursor_queries() {
 }
 
 #[test]
+fn wattetheria_topic_subscriptions_include_latest_active_and_inactive_rows() {
+    let _guard = env_lock();
+    let _db_lock = DbTestLock::acquire();
+    let schema = reset_test_schema("test");
+    let _schema_guard = EnvVarGuard::set("WATTSWARM_PG_SCHEMA", &schema);
+    let _mode_guard = EnvVarGuard::set("WATTSWARM_NODE_MODE", "local");
+    let dir = tempdir().unwrap();
+    let state_dir = dir.path().join("state");
+    std::fs::create_dir_all(&state_dir).unwrap();
+    let db_path = state_dir.join("ui.state");
+    let app = build_app(UiServerState::new(state_dir.clone(), db_path.clone()));
+    let network_id = {
+        let node = open_node(&state_dir, &db_path).expect("open node");
+        let network_id = format!("local:{}", node.node_id());
+        for (subscriber_node_id, active, updated_at) in [
+            ("node-active", true, 100),
+            ("node-left", true, 110),
+            ("node-left", false, 120),
+        ] {
+            node.store
+                .upsert_feed_subscription(
+                    &network_id,
+                    subscriber_node_id,
+                    "crew.chat",
+                    "group:crew-7",
+                    &["messages".to_owned()],
+                    active,
+                    updated_at,
+                )
+                .expect("upsert topic subscription");
+        }
+        network_id
+    };
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(format!(
+                        "/api/wattetheria/topic/subscriptions?network_id={network_id}"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = json_from(res).await;
+        assert_eq!(body["network_id"].as_str(), Some(network_id.as_str()));
+        let subscriptions = body["subscriptions"].as_array().unwrap();
+        assert_eq!(subscriptions.len(), 2);
+        let active = subscriptions
+            .iter()
+            .find(|row| row["subscriber_node_id"].as_str() == Some("node-active"))
+            .expect("active subscription row");
+        assert_eq!(active["active"].as_bool(), Some(true));
+        let left = subscriptions
+            .iter()
+            .find(|row| row["subscriber_node_id"].as_str() == Some("node-left"))
+            .expect("inactive subscription row");
+        assert_eq!(left["active"].as_bool(), Some(false));
+        assert_eq!(left["updated_at"].as_u64(), Some(120));
+    });
+}
+
+#[test]
 fn ui_topic_message_post_preserves_agent_envelope() {
     let _guard = env_lock();
     let _db_lock = DbTestLock::acquire();

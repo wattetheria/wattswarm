@@ -175,7 +175,7 @@ pub struct TaskStageUsageRow {
     pub finalize_used: u64,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct FeedSubscriptionRow {
     pub network_id: String,
     pub subscriber_node_id: String,

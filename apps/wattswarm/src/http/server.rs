@@ -289,6 +289,10 @@ pub fn build_app(state: UiServerState) -> Router {
             get(wattetheria_sync::topic_activity_http),
         )
         .route(
+            "/api/wattetheria/topic/subscriptions",
+            get(wattetheria_sync::topic_subscriptions_http),
+        )
+        .route(
             "/api/wattetheria/knowledge/export",
             post(wattetheria_sync::knowledge_export_snapshot_http),
         )

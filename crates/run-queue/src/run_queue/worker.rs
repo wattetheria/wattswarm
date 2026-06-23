@@ -21,8 +21,9 @@ use super::status::{
 };
 use super::types::{ClaimedStep, WorkerOptions};
 use super::utils::{
-    STEP_STATUS_REMOTE_DISPATCHED, build_step_inputs, coordinator_must_not_execute_locally, now_ms,
-    retry_delay_ms,
+    RUN_QUEUE_TASK_FEED_KEY, STEP_STATUS_REMOTE_DISPATCHED, build_step_inputs,
+    build_task_scoped_step_inputs, coordinator_must_not_execute_locally, now_ms, retry_delay_ms,
+    run_queue_task_scope_hint,
 };
 
 impl PgRunQueue {
@@ -164,23 +165,30 @@ impl PgRunQueue {
         let executor = normalize_executor_name(&step.executor).to_owned();
         let dispatch_result = (|| -> Result<Value> {
             let mut node = open_node(state_dir, db_path)?;
+            // Resolve scope and target from executor registry.
+            let reg = load_executor_registry_state(state_dir)?;
+            let executor_entry = reg.entries.iter().find(|e| e.name == executor);
+            let target_node_id = executor_entry.and_then(|e| e.target_node_id.clone());
             let policy_hash = node
                 .policy_registry()
                 .binding_for("vp.schema_only.v1", json!({}))?
                 .policy_hash;
             let mut contract: TaskContract = sample_contract(&task_id, policy_hash);
             contract.task_type = step.task_type.clone();
-            contract.inputs = build_step_inputs(&step.shared_inputs, &step.prompt, &step.agent_id);
+            contract.inputs = build_task_scoped_step_inputs(
+                &step.shared_inputs,
+                &step.prompt,
+                &step.agent_id,
+                &task_id,
+                target_node_id.as_deref(),
+            );
+            subscribe_run_queue_task_scope(&node, &task_id, now_ms() as u64)?;
 
             // Submit the task locally (creates TaskCreated event).
             if node.task_view(&task_id)?.is_none() {
-                node.submit_task(contract, 1, now_ms() as u64)?;
+                node.submit_task(contract.clone(), 1, now_ms() as u64)?;
             }
 
-            // Resolve scope and target from executor registry.
-            let reg = load_executor_registry_state(state_dir)?;
-            let executor_entry = reg.entries.iter().find(|e| e.name == executor);
-            let target_node_id = executor_entry.and_then(|e| e.target_node_id.clone());
             // If a target_node_id is set, use node-scoped routing so the
             // announcement reaches only the intended executor node.
             let scope_hint = match &target_node_id {
@@ -198,6 +206,7 @@ impl PgRunQueue {
                 "agent_id": step.agent_id,
                 "executor": executor,
                 "profile": step.profile,
+                "task_contract": contract,
             });
 
             // Announce to the network — gossip will carry this to remote nodes.
@@ -225,7 +234,7 @@ impl PgRunQueue {
                 // Mark step as remote-dispatched. Keep the lease alive so
                 // the lease-expiry recovery can handle timeout if the remote
                 // node never responds.
-                self.mark_step_remote_dispatched(step)
+                self.mark_step_remote_dispatched(step, &task_id)
             }
             Err(err) => {
                 let err_text = format!("{err:#}");
@@ -257,18 +266,21 @@ impl PgRunQueue {
             .is_some_and(|entry| entry.kind == ExecutorKind::Remote)
     }
 
-    fn mark_step_remote_dispatched(&self, step: &ClaimedStep) -> Result<()> {
+    fn mark_step_remote_dispatched(&self, step: &ClaimedStep, task_id: &str) -> Result<()> {
         let now = now_ms();
         let mut client = self.connect()?;
         let mut tx = client.transaction()?;
         tx.execute(
             "UPDATE run_steps
-             SET status = $3, updated_at = TIMESTAMPTZ 'epoch' + ($4::bigint * INTERVAL '1 millisecond')
-             WHERE org_id = $1 AND step_id = $2 AND lease_id = $5 AND status = $6",
+             SET status = $3,
+                 task_id = $4,
+                 updated_at = TIMESTAMPTZ 'epoch' + ($5::bigint * INTERVAL '1 millisecond')
+             WHERE org_id = $1 AND step_id = $2 AND lease_id = $6 AND status = $7",
             &[
                 &self.org_id(),
                 &step.step_id,
                 &STEP_STATUS_REMOTE_DISPATCHED,
+                &task_id,
                 &now,
                 &step.lease_id,
                 &STEP_STATUS_LEASED,
@@ -282,7 +294,8 @@ impl PgRunQueue {
                 "step_id": step.step_id,
                 "executor": step.executor,
                 "agent_id": step.agent_id,
-                "attempt": step.attempt
+                "attempt": step.attempt,
+                "task_id": task_id
             }),
             now,
         )?;
@@ -535,6 +548,28 @@ impl PgRunQueue {
         self.finalize_run_if_terminal(&step.run_id, now)?;
         Ok(())
     }
+}
+
+fn subscribe_run_queue_task_scope(
+    node: &crate::control::node::Node,
+    task_id: &str,
+    updated_at: u64,
+) -> Result<()> {
+    let network_id = node
+        .store
+        .load_verified_network_protocol_params()
+        .map(|verified| verified.network_id)
+        .unwrap_or_else(|_| "default".to_owned());
+    let node_id = node.node_id();
+    node.store.upsert_feed_subscription(
+        &network_id,
+        &node_id,
+        RUN_QUEUE_TASK_FEED_KEY,
+        &run_queue_task_scope_hint(task_id),
+        &["events".to_owned()],
+        true,
+        updated_at,
+    )
 }
 
 fn extract_status_code(err_text: &str, marker: &str) -> Option<u16> {
@@ -892,6 +927,62 @@ mod tests {
             .expect("run row");
         let run_status: String = run_row.get(0);
         assert_eq!(run_status, RUN_STATUS_RUNNING);
+
+        cleanup_run(&queue, &run_id);
+    }
+
+    #[test]
+    fn mark_remote_dispatched_persists_task_id_for_result_bridge() {
+        let _guard = test_guard();
+        let Some(queue) = queue_or_skip() else {
+            return;
+        };
+        let Some(_db_lock) = DbTestLock::acquire(&queue) else {
+            return;
+        };
+        queue.init_schema().expect("init schema");
+        if shared_db_is_busy(&queue) {
+            eprintln!("skip remote dispatch test: shared database has active external runs");
+            return;
+        }
+        purge_worker_runs(&queue);
+        let run_id = format!("worker-remote-dispatch-{}", Uuid::new_v4().simple());
+        cleanup_run(&queue, &run_id);
+        let Some(claimed) = prepare_claimed_step(&queue, &run_id) else {
+            eprintln!("skip remote dispatch test: target run was not claimable in shared env");
+            cleanup_run(&queue, &run_id);
+            return;
+        };
+        let task_id = format!(
+            "run-{}-{}-{}",
+            claimed.run_id, claimed.agent_id, claimed.attempt
+        );
+
+        queue
+            .mark_step_remote_dispatched(&claimed, &task_id)
+            .expect("mark remote dispatched");
+
+        let mut client = queue.connect().expect("connect");
+        let step_row = client
+            .query_one(
+                "SELECT status, task_id FROM run_steps WHERE org_id = $1 AND step_id = $2",
+                &[&queue.org_id(), &claimed.step_id],
+            )
+            .expect("step row");
+        let status: String = step_row.get(0);
+        let persisted_task_id: Option<String> = step_row.get(1);
+        assert_eq!(status, STEP_STATUS_REMOTE_DISPATCHED);
+        assert_eq!(persisted_task_id.as_deref(), Some(task_id.as_str()));
+
+        let events = queue.run_events(&run_id, 20).expect("events");
+        let event = events
+            .iter()
+            .find(|event| event.event_type == "STEP_REMOTE_DISPATCHED")
+            .expect("remote dispatched event");
+        assert_eq!(
+            event.payload.get("task_id").and_then(Value::as_str),
+            Some(task_id.as_str())
+        );
 
         cleanup_run(&queue, &run_id);
     }

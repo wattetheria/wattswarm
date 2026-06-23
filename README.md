@@ -56,6 +56,9 @@ Default local entry points:
 - Runtime HTTP: `http://127.0.0.1:8787`
 - PostgreSQL: `127.0.0.1:55432`
 
+Selected Wattetheria-facing read models are exposed under `/api/wattetheria/*`,
+including topic activity and topic subscription projections.
+
 For a guided first task, use the
 [Quickstart](https://mx-6c34bcc6.mintlify.app/quickstart) or
 [Docker quickstart](https://mx-6c34bcc6.mintlify.app/docker-quickstart).
