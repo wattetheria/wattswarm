@@ -1209,6 +1209,26 @@ fn network_discovery_bootnode_accepts_signed_records_and_filters_queries() {
             capabilities: DiscoveryTopicProviderCapabilities::local_history_provider(),
             updated_at_ms: now_ms,
         });
+        let agent_card = json!({
+            "name": "Agent Alpha",
+            "metadata": {
+                "agent_id": "did:key:zAgentAlpha",
+                "node_id": node_id.clone(),
+                "public_id": "@agent-alpha",
+                "display_name": "Agent Alpha",
+            },
+        });
+        body.source_agent_card = Some(SourceAgentCard {
+            agent_id: "did:key:zAgentAlpha".to_owned(),
+            node_id: Some(node_id.clone()),
+            card_hash: format!(
+                "sha256:{}",
+                sha256_hex(serde_jcs::to_string(&agent_card).unwrap().as_bytes())
+            ),
+            issued_at: now_ms,
+            card: agent_card,
+            signature: Some("agent-card-signature".to_owned()),
+        });
         let record = SignedDiscoveryNodeRecord::sign(body, &identity).unwrap();
 
         let announce_res = app
@@ -1281,6 +1301,54 @@ fn network_discovery_bootnode_accepts_signed_records_and_filters_queries() {
         assert_eq!(
             topic_provider_json["records"][0]["body"]["node_id"].as_str(),
             Some(node_id.as_str())
+        );
+
+        let agent_res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/network/discovery/agent?network_id=mainnet:test&public_id=%40agent-alpha")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(agent_res.status(), StatusCode::OK);
+        let agent_json = json_from(agent_res).await;
+        assert_eq!(
+            agent_json["records"][0]["body"]["node_id"].as_str(),
+            Some(node_id.as_str())
+        );
+        assert_eq!(
+            agent_json["records"][0]["body"]["source_agent_card"]["card"]["metadata"]
+                ["public_id"]
+                .as_str(),
+            Some("@agent-alpha")
+        );
+
+        let display_name_res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/network/discovery/agent?network_id=mainnet:test&display_name=%40Agent%20Alpha")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(display_name_res.status(), StatusCode::OK);
+        let display_name_json = json_from(display_name_res).await;
+        assert_eq!(
+            display_name_json["records"][0]["body"]["node_id"].as_str(),
+            Some(node_id.as_str())
+        );
+        assert_eq!(
+            display_name_json["records"][0]["body"]["source_agent_card"]["card"]["metadata"]
+                ["display_name"]
+                .as_str(),
+            Some("Agent Alpha")
         );
 
         let mut tampered = record.clone();

@@ -60,6 +60,17 @@ pub(crate) struct TopicProviderDiscoveryQuery {
     limit: Option<usize>,
 }
 
+#[derive(Debug, Deserialize)]
+pub(crate) struct AgentDiscoveryQuery {
+    network_id: String,
+    #[serde(default)]
+    public_id: Option<String>,
+    #[serde(default)]
+    display_name: Option<String>,
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct DiscoveryAnnounceReport {
     pub attempted: usize,
@@ -217,6 +228,42 @@ pub(crate) async fn discovery_find_topic_providers(
     Ok(Json(response))
 }
 
+pub(crate) async fn discovery_find_agent(
+    State(state): State<UiServerState>,
+    Query(query): Query<AgentDiscoveryQuery>,
+) -> Result<Json<Value>, ApiError> {
+    let state_clone = state.clone();
+    let response = run_blocking(move || -> Result<Value> {
+        let public_id = query
+            .public_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let display_name = query
+            .display_name
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        if public_id.is_none() && display_name.is_none() {
+            anyhow::bail!("public_id or display_name is required");
+        }
+        let now_ms = now_ms();
+        let table = load_discovery_records(&state_clone.state_dir, now_ms)?;
+        let records = table
+            .active_records(now_ms, normalize_limit(query.limit))
+            .into_iter()
+            .filter(|record| record.body.network_id == query.network_id)
+            .filter(|record| discovery_record_matches_agent_query(record, public_id, display_name))
+            .collect::<Vec<_>>();
+        Ok(json!({
+            "ok": true,
+            "records": records,
+        }))
+    })
+    .await?;
+    Ok(Json(response))
+}
+
 fn load_discovery_records(state_dir: &FsPath, now_ms: u64) -> Result<DiscoveryRoutingTable> {
     let path = discovery_records_path(state_dir);
     let mut table = DiscoveryRoutingTable::new();
@@ -236,6 +283,76 @@ fn load_discovery_records(state_dir: &FsPath, now_ms: u64) -> Result<DiscoveryRo
         }
     }
     Ok(table)
+}
+
+fn discovery_record_matches_agent_query(
+    record: &SignedDiscoveryNodeRecord,
+    public_id: Option<&str>,
+    display_name: Option<&str>,
+) -> bool {
+    if let Some(public_id) = public_id {
+        return discovery_record_public_id(record).as_deref() == Some(public_id);
+    }
+    let Some(display_name) = display_name else {
+        return false;
+    };
+    let display_key = display_name_lookup_key(display_name);
+    !display_key.is_empty()
+        && discovery_record_display_names(record)
+            .into_iter()
+            .any(|name| display_name_lookup_key(&name) == display_key)
+}
+
+fn discovery_record_public_id(record: &SignedDiscoveryNodeRecord) -> Option<String> {
+    record
+        .body
+        .source_agent_card
+        .as_ref()
+        .and_then(|card| card.card.pointer("/metadata/public_id"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn discovery_record_display_names(record: &SignedDiscoveryNodeRecord) -> Vec<String> {
+    let Some(card) = record
+        .body
+        .source_agent_card
+        .as_ref()
+        .map(|source_card| &source_card.card)
+    else {
+        return Vec::new();
+    };
+    let mut names = Vec::new();
+    if let Some(name) = card
+        .get("name")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        names.push(name.to_owned());
+    }
+    if let Some(name) = card
+        .pointer("/metadata/display_name")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        names.push(name.to_owned());
+    }
+    names.sort();
+    names.dedup();
+    names
+}
+
+fn display_name_lookup_key(value: &str) -> String {
+    value
+        .trim()
+        .strip_prefix('@')
+        .unwrap_or_else(|| value.trim())
+        .trim()
+        .to_string()
 }
 
 fn quarantine_corrupt_discovery_records(path: &FsPath, error: &serde_json::Error) {
