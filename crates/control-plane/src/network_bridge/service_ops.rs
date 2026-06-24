@@ -175,6 +175,7 @@ impl NetworkBridgeService {
                 feed_key: None,
                 known_event_ids: Vec::new(),
             },
+            BACKFILL_TIMEOUT_FALLBACK,
         )
     }
 
@@ -289,6 +290,10 @@ impl NetworkBridgeService {
                     None,
                     BACKFILL_KNOWN_EVENT_IDS_LIMIT,
                 )?;
+                let timeout = self.peer_sync_state.get(peer).map_or(
+                    BACKFILL_TIMEOUT_FALLBACK,
+                    PeerSyncState::backfill_request_timeout,
+                );
                 let request_id = self.runtime.send_backfill_request(
                     peer,
                     BackfillRequest {
@@ -298,11 +303,18 @@ impl NetworkBridgeService {
                         feed_key: None,
                         known_event_ids,
                     },
+                    timeout,
                 )?;
                 self.peer_sync_state
                     .entry(peer.clone())
                     .or_insert_with(|| PeerSyncState::new(now))
-                    .record_pending_backfill(request_id, scope.clone(), None, now);
+                    .record_pending_backfill_with_timeout(
+                        request_id,
+                        scope.clone(),
+                        None,
+                        now,
+                        timeout,
+                    );
                 requests_sent += 1;
             }
             for subscription in active_subscriptions
@@ -332,6 +344,10 @@ impl NetworkBridgeService {
                     Some(&subscription.feed_key),
                     BACKFILL_KNOWN_EVENT_IDS_LIMIT,
                 )?;
+                let timeout = self.peer_sync_state.get(peer).map_or(
+                    BACKFILL_TIMEOUT_FALLBACK,
+                    PeerSyncState::backfill_request_timeout,
+                );
                 let request_id = self.runtime.send_backfill_request(
                     peer,
                     BackfillRequest {
@@ -341,15 +357,17 @@ impl NetworkBridgeService {
                         feed_key: Some(subscription.feed_key.clone()),
                         known_event_ids,
                     },
+                    timeout,
                 )?;
                 self.peer_sync_state
                     .entry(peer.clone())
                     .or_insert_with(|| PeerSyncState::new(now))
-                    .record_pending_backfill(
+                    .record_pending_backfill_with_timeout(
                         request_id,
                         scope.clone(),
                         Some(subscription.feed_key.clone()),
                         now,
+                        timeout,
                     );
                 requests_sent += 1;
             }
@@ -851,8 +869,9 @@ impl NetworkBridgeService {
         request_id: BackfillRequestId,
     ) {
         if let Some(state) = self.peer_sync_state.get_mut(&peer) {
-            let was_pending = state.record_backfill_request_completed(request_id);
-            state.next_retry_at = Instant::now() + self.anti_entropy_interval;
+            let now = Instant::now();
+            let was_pending = state.record_backfill_request_completed(request_id, now);
+            state.next_retry_at = now + self.anti_entropy_interval;
             if was_pending {
                 state.backfill_successes = state.backfill_successes.saturating_add(1);
                 state.backfill_failures = 0;
@@ -921,20 +940,17 @@ impl NetworkBridgeService {
         self.persist_peer_sync_state();
     }
 
-    pub(crate) fn expire_stale_backfill_requests(
-        &mut self,
-        now: Instant,
-        timeout: Duration,
-    ) -> usize {
+    pub(crate) fn expire_stale_backfill_requests(&mut self, now: Instant) -> usize {
         let mut expired = Vec::new();
         for (peer, state) in &self.peer_sync_state {
             for (request_id, pending) in &state.inflight_backfill_requests {
-                if now.duration_since(pending.sent_at) >= timeout {
+                if now.duration_since(pending.sent_at) >= pending.timeout {
                     expired.push((
                         peer.clone(),
                         *request_id,
                         pending.scope.clone(),
                         pending.feed_key.clone(),
+                        pending.timeout,
                     ));
                 }
             }
@@ -943,7 +959,7 @@ impl NetworkBridgeService {
             return 0;
         }
         let mut peer_cooldowns = HashMap::new();
-        for (peer, request_id, scope, feed_key) in &expired {
+        for (peer, request_id, scope, feed_key, timeout) in &expired {
             let mut cooldown_event = None;
             if let Some(state) = self.peer_sync_state.get_mut(peer)
                 && let Some(event) = state.record_backfill_request_failed_at(*request_id, now)

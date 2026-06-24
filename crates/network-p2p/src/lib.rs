@@ -2,7 +2,7 @@ use anyhow::{Result, anyhow};
 use iroh::EndpointId;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::{collections::HashMap, path::PathBuf};
+use std::{collections::HashMap, path::PathBuf, time::Duration};
 use wattswarm_network_substrate::{
     self as substrate, RawBackfillResponse, RawGossipMessage, SubstrateConfig, SubstrateNode,
     SubstrateRuntime, SubstrateRuntimeEvent,
@@ -545,8 +545,9 @@ impl NetworkRuntime {
         &mut self,
         peer: &NetworkNodeId,
         request: BackfillRequest,
+        timeout: Duration,
     ) -> Result<BackfillRequestId> {
-        self.inner.send_backfill_request(peer, request)
+        self.inner.send_backfill_request(peer, request, timeout)
     }
 
     pub fn send_backfill_response(

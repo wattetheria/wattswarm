@@ -842,7 +842,6 @@ impl NetworkBridgeService {
                 response,
             } => {
                 self.record_peer_scope_activity(peer.clone(), &response.scope);
-                self.mark_backfill_completed(peer.clone(), request_id);
                 self.record_peer_remote_head_event_ids(
                     peer.clone(),
                     &response.scope,
@@ -851,6 +850,7 @@ impl NetworkBridgeService {
                 );
                 let applied_envelopes = ingest_backfill_response_events(node, &response)?;
                 let events = applied_envelopes.len();
+                self.mark_backfill_completed(peer.clone(), request_id);
                 let mut unknown_empty_head = false;
                 if response.events.is_empty() {
                     for event_id in &response.head_event_ids {

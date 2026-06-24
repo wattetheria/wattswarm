@@ -237,10 +237,19 @@ const TASK_OUTCOME_SUMMARY_KIND: &str = "task_outcome_v1";
 const AGENT_PAYMENT_SUMMARY_KIND: &str = "agent_payment_session_v1";
 const CORE_AGENT_EXECUTOR_NAME: &str = "core-agent";
 const MAX_INFLIGHT_BACKFILLS_PER_PEER: usize = 8;
-const BACKFILL_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
-const BACKFILL_LANE_COOLDOWN_INITIAL: Duration = BACKFILL_REQUEST_TIMEOUT;
+// Adaptive per-peer backfill request timeout, using the same broad shape as
+// DM attempt timeout but with batch-backfill-specific bounds. The timeout
+// is computed once per request and passed to the underlying control request so
+// the bridge cleanup deadline and network deadline stay aligned.
+const BACKFILL_TIMEOUT_LATENCY_MULTIPLIER: u64 = 4;
+const BACKFILL_TIMEOUT_MIN: Duration = Duration::from_secs(5);
+const BACKFILL_TIMEOUT_MAX: Duration = Duration::from_secs(90);
+const BACKFILL_TIMEOUT_FALLBACK: Duration = Duration::from_secs(30);
+// EWMA divisor for backfill round-trip samples: smoothed = (smoothed*(N-1) + sample)/N.
+const BACKFILL_LATENCY_EWMA_DIVISOR: u64 = 4;
+const BACKFILL_LANE_COOLDOWN_INITIAL: Duration = BACKFILL_TIMEOUT_FALLBACK;
 const BACKFILL_LANE_COOLDOWN_MAX: Duration = Duration::from_secs(300);
-const BACKFILL_PEER_COOLDOWN_INITIAL: Duration = BACKFILL_REQUEST_TIMEOUT;
+const BACKFILL_PEER_COOLDOWN_INITIAL: Duration = BACKFILL_TIMEOUT_FALLBACK;
 const BACKFILL_PEER_COOLDOWN_MAX: Duration = Duration::from_secs(300);
 const PEER_LAST_SEEN_TTL: Duration = Duration::from_secs(180);
 const SUMMARY_BACKPRESSURE_HIGH_WATERMARK: u64 = 256;
@@ -574,6 +583,9 @@ struct PeerSyncState {
     inflight_backfill_requests: HashMap<BackfillRequestId, PendingBackfillRequest>,
     backfill_successes: u64,
     backfill_failures: u64,
+    // EWMA of observed successful backfill round-trip latency (ms). Runtime-only;
+    // `None` until the first sample, which falls back to the conservative timeout.
+    smoothed_backfill_latency_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -649,11 +661,27 @@ struct PendingBackfillRequest {
     scope: SwarmScope,
     feed_key: Option<String>,
     sent_at: Instant,
+    timeout: Duration,
 }
 
 impl PendingBackfillRequest {
     fn lane_key(&self) -> BackfillLaneKey {
         BackfillLaneKey::new(&self.scope, self.feed_key.as_deref())
+    }
+}
+
+/// Adaptive backfill request timeout derived from a peer's smoothed round-trip latency.
+///
+/// Scales observed backfill latency and clamps it so fast peers time out quickly
+/// while slow relay peers get a wider window than the prior fixed timeout. Peers
+/// without a latency sample yet use the conservative fallback.
+fn backfill_attempt_timeout(smoothed_latency_ms: Option<u64>) -> Duration {
+    match smoothed_latency_ms {
+        Some(latency_ms) if latency_ms > 0 => {
+            Duration::from_millis(latency_ms.saturating_mul(BACKFILL_TIMEOUT_LATENCY_MULTIPLIER))
+                .clamp(BACKFILL_TIMEOUT_MIN, BACKFILL_TIMEOUT_MAX)
+        }
+        _ => BACKFILL_TIMEOUT_FALLBACK,
     }
 }
 
@@ -699,6 +727,7 @@ impl PeerSyncState {
             inflight_backfill_requests: HashMap::new(),
             backfill_successes: 0,
             backfill_failures: 0,
+            smoothed_backfill_latency_ms: None,
         }
     }
 
@@ -714,12 +743,30 @@ impl PeerSyncState {
         self.inflight_backfill_requests.len()
     }
 
+    #[cfg(test)]
     fn record_pending_backfill(
         &mut self,
         request_id: BackfillRequestId,
         scope: SwarmScope,
         feed_key: Option<String>,
         sent_at: Instant,
+    ) {
+        self.record_pending_backfill_with_timeout(
+            request_id,
+            scope,
+            feed_key,
+            sent_at,
+            self.backfill_request_timeout(),
+        );
+    }
+
+    fn record_pending_backfill_with_timeout(
+        &mut self,
+        request_id: BackfillRequestId,
+        scope: SwarmScope,
+        feed_key: Option<String>,
+        sent_at: Instant,
+        timeout: Duration,
     ) {
         self.backfill_peer_health.claim_request_at(sent_at);
         let lane = BackfillLaneKey::new(&scope, feed_key.as_deref());
@@ -732,6 +779,7 @@ impl PeerSyncState {
                 scope,
                 feed_key,
                 sent_at,
+                timeout,
             },
         );
     }
@@ -751,13 +799,37 @@ impl PeerSyncState {
             .is_none_or(|health| health.can_request_at(now))
     }
 
-    fn record_backfill_request_completed(&mut self, request_id: BackfillRequestId) -> bool {
+    fn record_backfill_request_completed(
+        &mut self,
+        request_id: BackfillRequestId,
+        now: Instant,
+    ) -> bool {
         let Some(pending) = self.inflight_backfill_requests.remove(&request_id) else {
             return false;
         };
+        self.record_backfill_latency(now.saturating_duration_since(pending.sent_at));
         self.backfill_lane_health.remove(&pending.lane_key());
         self.backfill_peer_health.clear();
         true
+    }
+
+    /// Blend a successful backfill round-trip sample into the peer's smoothed latency.
+    fn record_backfill_latency(&mut self, sample: Duration) {
+        let sample_ms = u64::try_from(sample.as_millis()).unwrap_or(u64::MAX);
+        self.smoothed_backfill_latency_ms = Some(match self.smoothed_backfill_latency_ms {
+            Some(previous) => {
+                previous
+                    .saturating_mul(BACKFILL_LATENCY_EWMA_DIVISOR - 1)
+                    .saturating_add(sample_ms)
+                    / BACKFILL_LATENCY_EWMA_DIVISOR
+            }
+            None => sample_ms,
+        });
+    }
+
+    /// Adaptive timeout for this peer based on its smoothed backfill latency.
+    fn backfill_request_timeout(&self) -> Duration {
+        backfill_attempt_timeout(self.smoothed_backfill_latency_ms)
     }
 
     fn record_backfill_request_failed_at(

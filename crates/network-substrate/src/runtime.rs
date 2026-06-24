@@ -479,6 +479,7 @@ impl SubstrateRuntime {
         &mut self,
         peer: &NetworkNodeId,
         request: RawBackfillRequest,
+        timeout: Duration,
     ) -> Result<BackfillRequestId> {
         let request_id = BackfillRequestId::new(self.reserve_request_number());
         let (kind, payload) = match encode_raw_control_request(RawControlRequest::Backfill(request))
@@ -516,6 +517,7 @@ impl SubstrateRuntime {
             kind,
             payload,
             remote_contact,
+            timeout,
             move |peer, response| match response {
                 Ok(RawControlResponse::Backfill(response)) => {
                     SubstrateRuntimeEvent::BackfillResponse {
@@ -585,6 +587,7 @@ impl SubstrateRuntime {
             kind,
             payload,
             remote_contact,
+            Duration::from_millis(self.config.control_request_timeout_ms),
             move |peer, response| match response {
                 Ok(RawControlResponse::ContactMaterial(response)) => {
                     SubstrateRuntimeEvent::ContactMaterialResponse {
@@ -654,6 +657,7 @@ impl SubstrateRuntime {
             kind,
             payload,
             remote_contact,
+            Duration::from_millis(self.config.control_request_timeout_ms),
             move |peer, response| match response {
                 Ok(RawControlResponse::PeerRelationship(response)) => {
                     SubstrateRuntimeEvent::PeerRelationshipResponse {
@@ -693,6 +697,7 @@ impl SubstrateRuntime {
         kind: String,
         payload: Vec<u8>,
         remote_contact: TransportContactMaterial,
+        timeout: Duration,
         build_event: impl FnOnce(
             NetworkNodeId,
             std::result::Result<RawControlResponse, anyhow::Error>,
@@ -704,7 +709,6 @@ impl SubstrateRuntime {
         let local_peer_id = self.local_peer_id.clone();
         let peer = peer.clone();
         let control_tx = self.control_tx.clone();
-        let timeout = Duration::from_millis(self.config.control_request_timeout_ms);
         std::thread::spawn(move || {
             let response = send_control_stream_request_for_network_peer_id_with_timeout(
                 &state_dir,

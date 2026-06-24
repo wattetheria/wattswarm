@@ -1174,6 +1174,51 @@ fn ui_exposes_network_bootstrap_bundle() {
 }
 
 #[test]
+fn network_discovery_bootnodes_returns_persisted_urls() {
+    let dir = tempdir().unwrap();
+    let state_dir = dir.path().join("state");
+    std::fs::create_dir_all(&state_dir).unwrap();
+    let db_path = state_dir.join("ui.state");
+    wattswarm::control::save_discovery_bootnode_urls_state(
+        &state_dir,
+        &[
+            " https://bootstrap-a.example.com/ ".to_owned(),
+            "https://bootstrap-b.example.com/api/network/discovery".to_owned(),
+        ],
+    )
+    .expect("save discovery bootnode urls");
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let app = build_app(UiServerState::new(state_dir, db_path));
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/network/discovery/bootnodes")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(res.status(), StatusCode::OK);
+        let json = json_from(res).await;
+        assert_eq!(json["ok"].as_bool(), Some(true));
+        assert_eq!(
+            json["urls"].as_array().cloned().unwrap_or_default(),
+            vec![
+                json!("https://bootstrap-a.example.com"),
+                json!("https://bootstrap-b.example.com/api/network/discovery")
+            ]
+        );
+    });
+}
+
+#[test]
 fn network_discovery_bootnode_accepts_signed_records_and_filters_queries() {
     let _guard = env_lock();
     let runtime = tokio::runtime::Builder::new_current_thread()

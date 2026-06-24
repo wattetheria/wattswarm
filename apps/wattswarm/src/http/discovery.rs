@@ -135,6 +135,21 @@ pub(crate) async fn discovery_announce_record(
     Ok(Json(response))
 }
 
+pub(crate) async fn discovery_bootnodes(
+    State(state): State<UiServerState>,
+) -> Result<Json<Value>, ApiError> {
+    let state_clone = state.clone();
+    let response = run_blocking(move || -> Result<Value> {
+        let urls = load_discovery_bootnode_urls_state(&state_clone.state_dir)?;
+        Ok(json!({
+            "ok": true,
+            "urls": urls,
+        }))
+    })
+    .await?;
+    Ok(Json(response))
+}
+
 pub(crate) async fn discovery_find_node(
     State(state): State<UiServerState>,
     Path(node_id): Path<String>,

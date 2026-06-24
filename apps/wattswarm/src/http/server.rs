@@ -179,6 +179,10 @@ pub fn build_app(state: UiServerState) -> Router {
             get(discovery::discovery_find_agent),
         )
         .route(
+            "/api/network/discovery/bootnodes",
+            get(discovery::discovery_bootnodes),
+        )
+        .route(
             "/api/network/discovery/node/:node_id",
             get(discovery::discovery_find_node),
         )

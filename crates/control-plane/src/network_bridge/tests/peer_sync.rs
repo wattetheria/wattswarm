@@ -790,7 +790,7 @@ fn stale_backfill_requests_expire_and_release_peer_slot() {
     );
     service.peer_sync_state.insert(peer.clone(), state);
 
-    let expired = service.expire_stale_backfill_requests(Instant::now(), Duration::from_millis(1));
+    let expired = service.expire_stale_backfill_requests(Instant::now());
 
     assert_eq!(expired, 1);
     let state = service.peer_sync_state.get(&peer).expect("peer state");
@@ -826,7 +826,7 @@ fn backfill_timeout_cools_lane_and_removes_peer_from_selection_until_probe_windo
         BackfillRequestId::new(100),
         SwarmScope::Global,
         None,
-        now - BACKFILL_REQUEST_TIMEOUT,
+        now - BACKFILL_TIMEOUT_FALLBACK,
     );
     service.peer_sync_state.insert(peer.clone(), state);
 
@@ -834,10 +834,7 @@ fn backfill_timeout_cools_lane_and_removes_peer_from_selection_until_probe_windo
         service.preferred_backfill_peer_for_scope(&SwarmScope::Global, now),
         Some(peer.clone())
     );
-    assert_eq!(
-        service.expire_stale_backfill_requests(now, Duration::from_millis(1)),
-        1
-    );
+    assert_eq!(service.expire_stale_backfill_requests(now), 1);
     assert_eq!(
         service.preferred_backfill_peer_for_scope(&SwarmScope::Global, now),
         None
@@ -895,15 +892,12 @@ fn multi_lane_backfill_timeouts_cool_peer_once_and_allow_single_probe() {
             BackfillRequestId::new(400 + offset as u64),
             scope,
             None,
-            now - BACKFILL_REQUEST_TIMEOUT,
+            now - BACKFILL_TIMEOUT_FALLBACK,
         );
     }
     service.peer_sync_state.insert(peer.clone(), state);
 
-    assert_eq!(
-        service.expire_stale_backfill_requests(now, Duration::from_millis(1)),
-        3
-    );
+    assert_eq!(service.expire_stale_backfill_requests(now), 3);
     let state = service.peer_sync_state.get(&peer).expect("peer state");
     assert_eq!(
         state.backfill_peer_health.cooldown,
@@ -945,7 +939,7 @@ fn failed_recovery_probe_extends_backfill_lane_cooldown() {
         BackfillRequestId::new(200),
         SwarmScope::Global,
         None,
-        now - BACKFILL_REQUEST_TIMEOUT,
+        now - BACKFILL_TIMEOUT_FALLBACK,
     );
     let first = state
         .record_backfill_request_failed_at(BackfillRequestId::new(200), now)
@@ -975,7 +969,7 @@ fn successful_recovery_probe_clears_backfill_lane_cooldown() {
         BackfillRequestId::new(300),
         SwarmScope::Global,
         None,
-        now - BACKFILL_REQUEST_TIMEOUT,
+        now - BACKFILL_TIMEOUT_FALLBACK,
     );
     state
         .record_backfill_request_failed_at(BackfillRequestId::new(300), now)
@@ -994,7 +988,7 @@ fn successful_recovery_probe_clears_backfill_lane_cooldown() {
             .backfill_lane_health
             .contains_key(&BackfillLaneKey::new(&SwarmScope::Global, None))
     );
-    assert!(state.record_backfill_request_completed(BackfillRequestId::new(301)));
+    assert!(state.record_backfill_request_completed(BackfillRequestId::new(301), probe_at));
     assert!(state.backfill_peer_available_at(probe_at));
     assert_eq!(state.backfill_peer_health.cooldown, Duration::ZERO);
     assert!(
@@ -1002,6 +996,119 @@ fn successful_recovery_probe_clears_backfill_lane_cooldown() {
             .backfill_lane_health
             .contains_key(&BackfillLaneKey::new(&SwarmScope::Global, None))
     );
+}
+
+#[test]
+fn backfill_attempt_timeout_scales_and_clamps_for_batch_requests() {
+    // No sample yet → conservative fallback (matches the prior fixed window).
+    assert_eq!(backfill_attempt_timeout(None), BACKFILL_TIMEOUT_FALLBACK);
+    assert_eq!(backfill_attempt_timeout(Some(0)), BACKFILL_TIMEOUT_FALLBACK);
+    // Fast peer: 500ms * 4 = 2s, floored to the minimum.
+    assert_eq!(backfill_attempt_timeout(Some(500)), BACKFILL_TIMEOUT_MIN);
+    // Mid-range scales linearly: 3s * 4 = 12s.
+    assert_eq!(
+        backfill_attempt_timeout(Some(3_000)),
+        Duration::from_secs(12)
+    );
+    // Slow relay peer clamped to the ceiling: 100s * 4 → 90s.
+    assert_eq!(
+        backfill_attempt_timeout(Some(100_000)),
+        BACKFILL_TIMEOUT_MAX
+    );
+}
+
+#[test]
+fn backfill_latency_ewma_smooths_round_trip_samples() {
+    let mut state = PeerSyncState::new(Instant::now());
+    assert_eq!(state.smoothed_backfill_latency_ms, None);
+    assert_eq!(state.backfill_request_timeout(), BACKFILL_TIMEOUT_FALLBACK);
+
+    // First sample seeds the EWMA directly.
+    state.record_backfill_latency(Duration::from_millis(4_000));
+    assert_eq!(state.smoothed_backfill_latency_ms, Some(4_000));
+
+    // Subsequent samples blend: (4000*3 + 8000)/4 = 5000.
+    state.record_backfill_latency(Duration::from_millis(8_000));
+    assert_eq!(state.smoothed_backfill_latency_ms, Some(5_000));
+
+    // Adaptive timeout follows the smoothed latency: 5s * 4 = 20s.
+    assert_eq!(state.backfill_request_timeout(), Duration::from_secs(20));
+
+    // A pathologically large sample saturates without overflow and clamps to the ceiling.
+    state.record_backfill_latency(Duration::from_secs(u64::MAX / 1000));
+    assert_eq!(state.backfill_request_timeout(), BACKFILL_TIMEOUT_MAX);
+}
+
+#[test]
+fn expire_stale_backfill_requests_uses_per_peer_adaptive_timeout() {
+    let now = Instant::now();
+    let mut service = NetworkBridgeService::new(
+        test_network_node(NetworkP2pConfig::default()).expect("node"),
+        &[SwarmScope::Global],
+        &NetworkProtocolParams::default(),
+    )
+    .expect("service");
+
+    // Fast peer: 1s smoothed latency → adaptive timeout floored to MIN (5s).
+    let fast_peer = random_network_node_id();
+    let mut fast_state = PeerSyncState::new(now);
+    fast_state.record_backfill_latency(Duration::from_secs(1));
+    fast_state.record_pending_backfill(
+        BackfillRequestId::new(700),
+        SwarmScope::Global,
+        None,
+        now - Duration::from_secs(6),
+    );
+    service
+        .peer_sync_state
+        .insert(fast_peer.clone(), fast_state);
+
+    // Cold peer: no sample → 30s fallback; the same 6s-old request must survive.
+    let cold_peer = random_network_node_id();
+    let mut cold_state = PeerSyncState::new(now);
+    cold_state.record_pending_backfill(
+        BackfillRequestId::new(701),
+        SwarmScope::Global,
+        None,
+        now - Duration::from_secs(6),
+    );
+    service
+        .peer_sync_state
+        .insert(cold_peer.clone(), cold_state);
+
+    // Only the fast peer's request exceeds its (5s) adaptive timeout.
+    assert_eq!(service.expire_stale_backfill_requests(now), 1);
+    assert_eq!(service.peer_sync_state[&fast_peer].inflight_backfills(), 0);
+    assert_eq!(service.peer_sync_state[&cold_peer].inflight_backfills(), 1);
+}
+
+#[test]
+fn pending_backfill_request_keeps_timeout_chosen_at_send_time() {
+    let now = Instant::now();
+    let peer = random_network_node_id();
+    let mut service = NetworkBridgeService::new(
+        test_network_node(NetworkP2pConfig::default()).expect("node"),
+        &[SwarmScope::Global],
+        &NetworkProtocolParams::default(),
+    )
+    .expect("service");
+    let mut state = PeerSyncState::new(now);
+
+    state.record_backfill_latency(Duration::from_secs(1));
+    assert_eq!(state.backfill_request_timeout(), BACKFILL_TIMEOUT_MIN);
+    state.record_pending_backfill(
+        BackfillRequestId::new(702),
+        SwarmScope::Global,
+        None,
+        now - BACKFILL_TIMEOUT_MIN - Duration::from_millis(1),
+    );
+
+    state.record_backfill_latency(Duration::from_secs(100));
+    assert!(state.backfill_request_timeout() > BACKFILL_TIMEOUT_MIN);
+    service.peer_sync_state.insert(peer.clone(), state);
+
+    assert_eq!(service.expire_stale_backfill_requests(now), 1);
+    assert_eq!(service.peer_sync_state[&peer].inflight_backfills(), 0);
 }
 
 #[test]
