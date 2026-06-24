@@ -219,6 +219,61 @@ pub const STARTUP_HTML: &str = r#"<!DOCTYPE html>
       color: var(--accent-contrast);
       border-color: var(--accent);
     }
+    .confirm-dialog {
+      width: min(26rem, calc(100vw - 2rem));
+      padding: 0;
+      border: 1px solid var(--line-strong);
+      border-radius: var(--radius-lg);
+      background: var(--surface);
+      color: var(--ink);
+      box-shadow: var(--shadow-md);
+    }
+    .confirm-dialog::backdrop {
+      background: rgba(16, 24, 40, 0.45);
+      backdrop-filter: blur(2px);
+    }
+    .confirm-dialog[open] {
+      animation: confirm-pop 0.14s ease;
+    }
+    @keyframes confirm-pop {
+      from { opacity: 0; transform: translateY(6px) scale(0.98); }
+      to { opacity: 1; transform: none; }
+    }
+    .confirm-dialog-body {
+      padding: 1.25rem 1.25rem 0.4rem;
+    }
+    .confirm-dialog-title {
+      margin: 0 0 0.5rem;
+      font-size: 1rem;
+      font-weight: 700;
+      color: var(--ink);
+      letter-spacing: 0;
+      text-transform: none;
+    }
+    .confirm-dialog-message {
+      margin: 0;
+      font-size: 0.85rem;
+      line-height: 1.5;
+      color: var(--muted);
+    }
+    .confirm-dialog-actions {
+      display: flex;
+      justify-content: flex-end;
+      gap: 0.6rem;
+      padding: 1rem 1.25rem 1.25rem;
+    }
+    button.danger-solid {
+      background: var(--red);
+      border-color: var(--red);
+      color: #fff;
+    }
+    button.danger-solid:hover {
+      filter: brightness(0.95);
+    }
+    button.danger-solid:focus-visible {
+      outline: none;
+      box-shadow: 0 0 0 3px rgba(220, 38, 38, 0.22);
+    }
     .meta {
       display: grid;
       gap: 8px;
@@ -446,9 +501,9 @@ pub const STARTUP_HTML: &str = r#"<!DOCTYPE html>
           <h2>Network Mode</h2>
           <div class="hint">Choose where this node should live. WAN discovers Wattetheria bootstrap and gateway endpoints automatically.</div>
           <div class="mode-buttons">
-            <button id="networkLocal" class="mode" type="button" onclick="setNetworkMode('local')">Local</button>
-            <button id="networkLan" class="mode" type="button" onclick="setNetworkMode('lan')">LAN</button>
-            <button id="networkWan" class="mode" type="button" onclick="setNetworkMode('wan')">WAN</button>
+            <button id="networkLocal" class="mode" type="button" onclick="requestNetworkModeChange('local')">Local</button>
+            <button id="networkLan" class="mode" type="button" onclick="requestNetworkModeChange('lan')">LAN</button>
+            <button id="networkWan" class="mode" type="button" onclick="requestNetworkModeChange('wan')">WAN</button>
           </div>
           <div class="meta">
             <div class="meta-line"><span>Selected</span><code id="networkModeLabel">local</code></div>
@@ -563,6 +618,84 @@ Those stay in CLI, compose, or config files for advanced operators.</pre>
       const manualJoin = mode === 'lan';
       document.getElementById('bootstrapContactsField').classList.toggle('hidden', !manualJoin);
       document.getElementById('gatewayUrlsField').classList.toggle('hidden', !manualJoin);
+    }
+
+    function confirmDialog(options) {
+      const opts = options || {};
+      const title = opts.title || 'Confirm';
+      const message = opts.message || '';
+      const confirmText = opts.confirmText || 'Confirm';
+      const cancelText = opts.cancelText || 'Cancel';
+      const danger = Boolean(opts.danger);
+
+      let dialog = document.getElementById('appConfirmDialog');
+      if (!dialog) {
+        dialog = document.createElement('dialog');
+        dialog.id = 'appConfirmDialog';
+        dialog.className = 'confirm-dialog';
+        dialog.innerHTML =
+          '<div class="confirm-dialog-body">' +
+            '<h3 class="confirm-dialog-title"></h3>' +
+            '<p class="confirm-dialog-message"></p>' +
+          '</div>' +
+          '<div class="confirm-dialog-actions">' +
+            '<button type="button" class="alt" data-confirm-cancel></button>' +
+            '<button type="button" data-confirm-ok></button>' +
+          '</div>';
+        document.body.appendChild(dialog);
+      }
+
+      const okBtn = dialog.querySelector('[data-confirm-ok]');
+      const cancelBtn = dialog.querySelector('[data-confirm-cancel]');
+      dialog.querySelector('.confirm-dialog-title').textContent = title;
+      dialog.querySelector('.confirm-dialog-message').textContent = message;
+      okBtn.textContent = confirmText;
+      cancelBtn.textContent = cancelText;
+      okBtn.className = danger ? 'danger-solid' : '';
+
+      return new Promise((resolve) => {
+        let settled = false;
+        const close = (result) => {
+          if (settled) return;
+          settled = true;
+          okBtn.removeEventListener('click', onOk);
+          cancelBtn.removeEventListener('click', onCancel);
+          dialog.removeEventListener('cancel', onCancel);
+          dialog.removeEventListener('click', onBackdrop);
+          if (dialog.open) dialog.close();
+          resolve(result);
+        };
+        const onOk = () => close(true);
+        const onCancel = (event) => {
+          if (event && event.preventDefault) event.preventDefault();
+          close(false);
+        };
+        const onBackdrop = (event) => {
+          if (event.target === dialog) close(false);
+        };
+        okBtn.addEventListener('click', onOk);
+        cancelBtn.addEventListener('click', onCancel);
+        dialog.addEventListener('cancel', onCancel);
+        dialog.addEventListener('click', onBackdrop);
+        dialog.showModal();
+        okBtn.focus();
+      });
+    }
+
+    async function requestNetworkModeChange(mode) {
+      const currentMode = startupConfig && startupConfig.network_mode;
+      const downgradingFromWan = currentMode === 'wan' && (mode === 'lan' || mode === 'local');
+      const confirmed = !downgradingFromWan || await confirmDialog({
+        title: 'Switch network mode',
+        message: 'Switching from WAN to LAN or Local can clear WAN startup bootstrap/gateway settings.',
+        confirmText: 'Switch',
+        cancelText: 'Cancel',
+        danger: true
+      });
+      if (!confirmed) {
+        return;
+      }
+      setNetworkMode(mode);
     }
 
     function syncFormFromConfig(cfg) {
