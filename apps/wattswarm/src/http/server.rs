@@ -151,6 +151,10 @@ pub fn build_app(state: UiServerState) -> Router {
             get(crate::http::network_bootstrap::network_local),
         )
         .route(
+            "/api/network/contact-material/local",
+            get(crate::http::network_bootstrap::network_local_contact_material),
+        )
+        .route(
             "/api/network/bootstrap",
             get(crate::http::network_bootstrap::network_bootstrap),
         )
@@ -200,6 +204,10 @@ pub fn build_app(state: UiServerState) -> Router {
         .route("/api/peers/dm/threads", get(peers::peer_dm_threads_list))
         .route("/api/peers/dm/messages", get(peers::peer_dm_messages_list))
         .route("/api/peers/dm/messages", post(peers::peer_dm_messages_send))
+        .route(
+            "/api/peers/contact-material",
+            post(peers::peer_contact_material_upsert),
+        )
         .route(
             "/api/peers/dm/private-hive-key-shares",
             post(peers::private_hive_key_share_send),

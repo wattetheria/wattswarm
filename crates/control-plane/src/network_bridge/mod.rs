@@ -187,10 +187,11 @@ use backfill::{
 };
 use bootstrap_contact::{
     build_contact_material, candidate_peer_addrs, iroh_contact_network_peer_id,
-    raw_contact_material_private_message_key_len, upsert_contact_material_for_peer,
+    raw_contact_material_private_message_key_len,
 };
 pub use bootstrap_contact::{
-    export_local_bootstrap_contact, export_local_bootstrap_contact_json, validate_bootstrap_contact,
+    export_local_bootstrap_contact, export_local_bootstrap_contact_json,
+    export_local_contact_material, upsert_contact_material_for_peer, validate_bootstrap_contact,
 };
 use discovery_bootnode::{
     apply_discovery_bootnode_record, discovery_bootnode_settings_from_state_dir,

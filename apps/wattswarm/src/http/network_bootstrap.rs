@@ -34,6 +34,20 @@ pub(crate) async fn network_local(
     })))
 }
 
+pub(crate) async fn network_local_contact_material(
+    State(state): State<UiServerState>,
+) -> Result<Json<Value>, ApiError> {
+    let state_clone = state.clone();
+    let contact_material = run_blocking(move || {
+        crate::network_bridge::export_local_contact_material(&state_clone.state_dir)
+    })
+    .await?;
+    Ok(Json(json!({
+        "ok": true,
+        "contact_material": contact_material,
+    })))
+}
+
 pub(crate) async fn network_bootstrap(
     State(state): State<UiServerState>,
 ) -> Result<Json<Value>, ApiError> {

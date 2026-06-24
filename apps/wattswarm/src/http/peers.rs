@@ -12,7 +12,7 @@ use crate::network_bridge::{
     enqueue_peer_relationship_action_command, network_service_started,
     record_private_dm_crypto_diagnostic,
 };
-use crate::network_p2p::RawAgentEnvelope;
+use crate::network_p2p::{RawAgentEnvelope, RawContactMaterial};
 use anyhow::{Result, anyhow, bail};
 use axum::Json;
 use axum::extract::{Query, State};
@@ -37,6 +37,12 @@ pub(crate) struct PeerDirectMessageSendRequest {
     content: Value,
     #[serde(default)]
     agent_envelope: Option<RawAgentEnvelope>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct PeerContactMaterialUpsertRequest {
+    remote_node_id: String,
+    contact_material: RawContactMaterial,
 }
 
 #[derive(Debug, Deserialize)]
@@ -194,6 +200,32 @@ pub(crate) async fn peer_dm_messages_send(
             None,
             agent_envelope,
         )
+    })
+    .await?;
+    Ok(Json(payload))
+}
+
+pub(crate) async fn peer_contact_material_upsert(
+    State(state): State<UiServerState>,
+    Json(req): Json<PeerContactMaterialUpsertRequest>,
+) -> Result<Json<Value>, ApiError> {
+    let state_clone = state.clone();
+    let payload = run_blocking(move || {
+        let remote_node_id = req.remote_node_id.trim().to_owned();
+        if remote_node_id.is_empty() {
+            bail!("remote_node_id is required");
+        }
+        req.contact_material.validate()?;
+        crate::network_bridge::upsert_contact_material_for_peer(
+            &state_clone.state_dir,
+            &remote_node_id,
+            &req.contact_material,
+        )?;
+        Ok::<Value, anyhow::Error>(json!({
+            "ok": true,
+            "remote_node_id": remote_node_id,
+            "contact_material_saved": true,
+        }))
     })
     .await?;
     Ok(Json(payload))

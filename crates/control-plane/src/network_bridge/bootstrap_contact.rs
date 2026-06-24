@@ -55,6 +55,12 @@ pub fn export_local_bootstrap_contact_json(state_dir: &Path) -> Result<String> {
     Ok(build_contact_material(state_dir, &endpoint_id)?.material_json)
 }
 
+pub fn export_local_contact_material(state_dir: &Path) -> Result<RawContactMaterial> {
+    let _ = crate::control::local_node_id(state_dir)?;
+    let endpoint_id = local_endpoint_id_from_state_dir(state_dir)?.to_string();
+    build_contact_material(state_dir, &endpoint_id)
+}
+
 fn export_local_bootstrap_contact_material(state_dir: &Path) -> Result<TransportContactMaterial> {
     let _ = crate::control::local_node_id(state_dir)?;
     let endpoint_id = local_endpoint_id_from_state_dir(state_dir)?.to_string();
@@ -113,7 +119,7 @@ fn preserve_existing_private_message_material(
     incoming
 }
 
-pub(super) fn upsert_contact_material_for_peer(
+pub fn upsert_contact_material_for_peer(
     state_dir: &Path,
     remote_node_id: &str,
     contact_material: &RawContactMaterial,
