@@ -26,6 +26,19 @@ struct DiscoveryBootnodeNearbyResponse {
     records: Vec<DiscoveryBootnodeRecordItem>,
 }
 
+#[derive(Debug, Serialize)]
+struct DiscoveryBootnodeTopicProviderBatchRequest<'a> {
+    network_id: &'a str,
+    queries: Vec<DiscoveryBootnodeTopicProviderBatchQuery<'a>>,
+    limit: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct DiscoveryBootnodeTopicProviderBatchQuery<'a> {
+    feed_key: &'a str,
+    scope_hint: &'a str,
+}
+
 #[derive(Debug, Default)]
 struct DiscoveryBootnodeFailureLogState {
     consecutive_failures: u64,
@@ -220,8 +233,34 @@ pub(super) fn query_discovery_bootnodes_for_candidate_records(
             return Ok(records);
         }
     };
-    for subscription in subscriptions {
-        for discovery_url in &discovery_urls {
+    let subscriptions = subscriptions
+        .into_iter()
+        .filter(|subscription| subscription.feed_key.trim() != crate::control::PRIVATE_DM_FEED_KEY)
+        .collect::<Vec<_>>();
+    if subscriptions.is_empty() {
+        return Ok(records);
+    }
+    for discovery_url in &discovery_urls {
+        let batch_endpoint =
+            match discovery_bootnode_topic_provider_batch_endpoint(discovery_url, network_id) {
+                Ok(endpoint) => endpoint,
+                Err(error) => {
+                    eprintln!("discovery bootnode URL skipped {discovery_url}: {error}");
+                    continue;
+                }
+            };
+        if fetch_discovery_bootnode_topic_provider_batch_records(
+            &client,
+            batch_endpoint,
+            network_id,
+            &subscriptions,
+            now_ms,
+            &mut seen,
+            &mut records,
+        ) {
+            continue;
+        }
+        for subscription in &subscriptions {
             let endpoint = match discovery_bootnode_topic_provider_endpoint(
                 discovery_url,
                 network_id,
@@ -280,6 +319,62 @@ fn fetch_discovery_bootnode_records(
     }
 }
 
+fn fetch_discovery_bootnode_topic_provider_batch_records(
+    client: &reqwest::blocking::Client,
+    endpoint: String,
+    network_id: &str,
+    subscriptions: &[crate::storage::FeedSubscriptionRow],
+    now_ms: u64,
+    seen: &mut HashSet<String>,
+    records: &mut Vec<SignedDiscoveryNodeRecord>,
+) -> bool {
+    let request = DiscoveryBootnodeTopicProviderBatchRequest {
+        network_id,
+        queries: subscriptions
+            .iter()
+            .map(|subscription| DiscoveryBootnodeTopicProviderBatchQuery {
+                feed_key: &subscription.feed_key,
+                scope_hint: &subscription.scope_hint,
+            })
+            .collect(),
+        limit: DISCOVERY_BOOTNODE_QUERY_LIMIT,
+    };
+    match client.post(endpoint.clone()).json(&request).send() {
+        Ok(response) => {
+            let status = response.status();
+            if status == reqwest::StatusCode::NOT_FOUND
+                || status == reqwest::StatusCode::METHOD_NOT_ALLOWED
+            {
+                return false;
+            }
+            match response.error_for_status() {
+                Ok(response) => match response.json::<DiscoveryBootnodeNearbyResponse>() {
+                    Ok(payload) => {
+                        reset_discovery_bootnode_failure_log_state(&endpoint);
+                        for item in payload.records {
+                            let record = item.into_record();
+                            if record.verify_fresh_at(now_ms).is_ok()
+                                && record.body.network_id == network_id
+                                && seen.insert(record.body.node_id.clone())
+                            {
+                                records.push(record);
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        eprintln!(
+                            "discovery bootnode response decode failed {endpoint}: {error:#}"
+                        );
+                    }
+                },
+                Err(error) => log_discovery_bootnode_query_failure(&endpoint, &error),
+            }
+        }
+        Err(error) => log_discovery_bootnode_query_failure(&endpoint, &error),
+    }
+    true
+}
+
 fn discovery_bootnode_query_endpoint(
     base_url: &str,
     network_id: &str,
@@ -315,6 +410,29 @@ fn discovery_bootnode_query_endpoint(
             pairs.append_pair("capability", DISCOVERY_NODE_CAPABILITY);
         }
         pairs.append_pair("limit", &DISCOVERY_BOOTNODE_QUERY_LIMIT.to_string());
+    }
+    Ok(url.to_string())
+}
+
+fn discovery_bootnode_topic_provider_batch_endpoint(
+    base_url: &str,
+    network_id: &str,
+) -> Result<String> {
+    let base_url = base_url.trim().trim_end_matches('/');
+    let endpoint = if base_url.ends_with("/api/network/discovery/topic-providers/batch") {
+        base_url.to_owned()
+    } else if base_url.ends_with("/api/network/discovery/topic-providers") {
+        format!("{base_url}/batch")
+    } else if base_url.ends_with("/api/network/discovery") {
+        format!("{base_url}/topic-providers/batch")
+    } else {
+        format!("{base_url}/api/network/discovery/topic-providers/batch")
+    };
+    let mut url = reqwest::Url::parse(&endpoint)
+        .with_context(|| format!("parse discovery bootnode URL {endpoint}"))?;
+    {
+        let mut pairs = url.query_pairs_mut();
+        pairs.append_pair("network_id", network_id);
     }
     Ok(url.to_string())
 }

@@ -241,9 +241,17 @@ pub struct DiscoveryCandidate {
     pub distance_km: Option<f64>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct TopicProviderIndexKey {
+    network_id: String,
+    feed_key: String,
+    scope_hint: String,
+}
+
 #[derive(Debug, Default)]
 pub struct DiscoveryRoutingTable {
     records: BTreeMap<String, SignedDiscoveryNodeRecord>,
+    topic_provider_index: BTreeMap<TopicProviderIndexKey, BTreeSet<String>>,
 }
 
 impl DiscoveryRoutingTable {
@@ -268,14 +276,17 @@ impl DiscoveryRoutingTable {
         let node_id = record.body.node_id.clone();
         let incoming_seq = record.body.seq;
         let incoming_updated_at_ms = record.body.updated_at_ms;
-        match self.records.get(&node_id) {
+        match self.records.get(&node_id).cloned() {
             None => {
+                self.index_topic_providers_for_record(&record);
                 self.records.insert(node_id, record);
                 Ok(DiscoveryRecordUpsert::Inserted)
             }
             Some(existing)
-                if should_replace_record(existing, incoming_seq, incoming_updated_at_ms) =>
+                if should_replace_record(&existing, incoming_seq, incoming_updated_at_ms) =>
             {
+                self.remove_topic_provider_index_for_record(&existing);
+                self.index_topic_providers_for_record(&record);
                 self.records.insert(node_id, record);
                 Ok(DiscoveryRecordUpsert::Updated)
             }
@@ -326,14 +337,18 @@ impl DiscoveryRoutingTable {
         now_ms: u64,
         limit: usize,
     ) -> Vec<SignedDiscoveryNodeRecord> {
-        self.records
-            .values()
+        let key = TopicProviderIndexKey {
+            network_id: network_id.to_owned(),
+            feed_key: feed_key.to_owned(),
+            scope_hint: scope_hint.to_owned(),
+        };
+        self.topic_provider_index
+            .get(&key)
+            .into_iter()
+            .flat_map(|node_ids| node_ids.iter())
+            .filter_map(|node_id| self.records.get(node_id))
             .filter(|record| {
-                record.body.network_id == network_id
-                    && !record.body.is_expired_at(now_ms)
-                    && record.body.topic_providers.iter().any(|provider| {
-                        provider.feed_key == feed_key && provider.scope_hint == scope_hint
-                    })
+                record.body.network_id == network_id && !record.body.is_expired_at(now_ms)
             })
             .take(limit)
             .cloned()
@@ -380,7 +395,48 @@ impl DiscoveryRoutingTable {
         let before = self.records.len();
         self.records
             .retain(|_, record| !record.body.is_expired_at(now_ms));
-        before - self.records.len()
+        let pruned = before - self.records.len();
+        if pruned > 0 {
+            self.rebuild_topic_provider_index();
+        }
+        pruned
+    }
+
+    fn index_topic_providers_for_record(&mut self, record: &SignedDiscoveryNodeRecord) {
+        for provider in &record.body.topic_providers {
+            let key = TopicProviderIndexKey {
+                network_id: record.body.network_id.clone(),
+                feed_key: provider.feed_key.clone(),
+                scope_hint: provider.scope_hint.clone(),
+            };
+            self.topic_provider_index
+                .entry(key)
+                .or_default()
+                .insert(record.body.node_id.clone());
+        }
+    }
+
+    fn remove_topic_provider_index_for_record(&mut self, record: &SignedDiscoveryNodeRecord) {
+        for provider in &record.body.topic_providers {
+            let key = TopicProviderIndexKey {
+                network_id: record.body.network_id.clone(),
+                feed_key: provider.feed_key.clone(),
+                scope_hint: provider.scope_hint.clone(),
+            };
+            if let Some(node_ids) = self.topic_provider_index.get_mut(&key) {
+                node_ids.remove(&record.body.node_id);
+                if node_ids.is_empty() {
+                    self.topic_provider_index.remove(&key);
+                }
+            }
+        }
+    }
+
+    fn rebuild_topic_provider_index(&mut self) {
+        self.topic_provider_index.clear();
+        for record in self.records.values().cloned().collect::<Vec<_>>() {
+            self.index_topic_providers_for_record(&record);
+        }
     }
 }
 
@@ -849,6 +905,128 @@ mod tests {
         );
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].body.node_id, provider_identity.node_id());
+    }
+
+    #[test]
+    fn topic_provider_index_tracks_record_replacement() {
+        let identity = NodeIdentity::from_seed([14; 32]);
+        let mut table = DiscoveryRoutingTable::new();
+        let mut first_body = record(
+            &identity,
+            "mainnet:wattetheria",
+            1,
+            10_000,
+            0.0,
+            0.0,
+            1_000.0,
+            &["wattswarm.node"],
+        )
+        .body;
+        first_body.topic_providers.push(DiscoveryTopicProvider {
+            feed_key: "sydney-weather".to_owned(),
+            scope_hint: "group:sydney-weather".to_owned(),
+            capabilities: DiscoveryTopicProviderCapabilities::local_history_provider(),
+            updated_at_ms: 10_000,
+        });
+        table
+            .announce_record(
+                SignedDiscoveryNodeRecord::sign(first_body, &identity).unwrap(),
+                10_001,
+            )
+            .unwrap();
+
+        let mut replacement_body = record(
+            &identity,
+            "mainnet:wattetheria",
+            2,
+            10_100,
+            0.0,
+            0.0,
+            1_000.0,
+            &["wattswarm.node"],
+        )
+        .body;
+        replacement_body
+            .topic_providers
+            .push(DiscoveryTopicProvider {
+                feed_key: "london-economy".to_owned(),
+                scope_hint: "group:london-economy".to_owned(),
+                capabilities: DiscoveryTopicProviderCapabilities::local_history_provider(),
+                updated_at_ms: 10_100,
+            });
+        table
+            .announce_record(
+                SignedDiscoveryNodeRecord::sign(replacement_body, &identity).unwrap(),
+                10_101,
+            )
+            .unwrap();
+
+        assert!(
+            table
+                .find_topic_providers(
+                    "mainnet:wattetheria",
+                    "sydney-weather",
+                    "group:sydney-weather",
+                    10_200,
+                    10,
+                )
+                .is_empty()
+        );
+        assert_eq!(
+            table
+                .find_topic_providers(
+                    "mainnet:wattetheria",
+                    "london-economy",
+                    "group:london-economy",
+                    10_200,
+                    10,
+                )
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn topic_provider_index_prunes_expired_records() {
+        let identity = NodeIdentity::from_seed([15; 32]);
+        let mut table = DiscoveryRoutingTable::new();
+        let mut body = record(
+            &identity,
+            "mainnet:wattetheria",
+            1,
+            10_000,
+            0.0,
+            0.0,
+            1_000.0,
+            &["wattswarm.node"],
+        )
+        .body;
+        body.ttl_ms = 1_000;
+        body.topic_providers.push(DiscoveryTopicProvider {
+            feed_key: "sydney-weather".to_owned(),
+            scope_hint: "group:sydney-weather".to_owned(),
+            capabilities: DiscoveryTopicProviderCapabilities::local_history_provider(),
+            updated_at_ms: 10_000,
+        });
+        table
+            .announce_record(
+                SignedDiscoveryNodeRecord::sign(body, &identity).unwrap(),
+                10_001,
+            )
+            .unwrap();
+
+        assert_eq!(table.prune_expired(11_001), 1);
+        assert!(
+            table
+                .find_topic_providers(
+                    "mainnet:wattetheria",
+                    "sydney-weather",
+                    "group:sydney-weather",
+                    11_001,
+                    10,
+                )
+                .is_empty()
+        );
     }
 
     #[test]

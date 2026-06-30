@@ -655,12 +655,52 @@ fn network_discovery_auto_announces_local_record_to_bootnode() {
     let stub = DiscoveryRecordStubServer::start();
     wattswarm::control::save_discovery_bootnode_urls_state(&state_dir, &[stub.base_url()])
         .expect("save discovery bootnode urls");
+    let db_path = state_dir.join("local.state");
+    let node = open_node(&state_dir, &db_path).expect("open node");
+    let subscriber_node_id = node.node_id();
+    let network_id = node
+        .store
+        .load_verified_network_protocol_params()
+        .expect("verified network params")
+        .network_id;
+    let subscription_kinds = vec!["events".to_owned()];
+    node.store
+        .upsert_feed_subscription_with_provider_capabilities(
+            wattswarm::storage::FeedSubscriptionUpsert {
+                network_id: &network_id,
+                subscriber_node_id: &subscriber_node_id,
+                feed_key: "public.hive",
+                scope_hint: "group:public-hive",
+                gossip_kinds: &subscription_kinds,
+                provider_capabilities: Some(
+                    &wattswarm::types::TopicProviderCapabilities::local_history_provider(),
+                ),
+                active: true,
+                updated_at: 1_700_000_000_000,
+            },
+        )
+        .expect("upsert public subscription");
+    node.store
+        .upsert_feed_subscription_with_provider_capabilities(
+            wattswarm::storage::FeedSubscriptionUpsert {
+                network_id: &network_id,
+                subscriber_node_id: &subscriber_node_id,
+                feed_key: wattswarm::control::PRIVATE_DM_FEED_KEY,
+                scope_hint: "group:dm-private",
+                gossip_kinds: &subscription_kinds,
+                provider_capabilities: Some(
+                    &wattswarm::types::TopicProviderCapabilities::local_history_provider(),
+                ),
+                active: true,
+                updated_at: 1_700_000_000_000,
+            },
+        )
+        .expect("upsert private dm subscription");
+    drop(node);
 
-    let report = wattswarm::ui::maybe_announce_local_record_to_discovery_bootnodes(
-        &state_dir,
-        &state_dir.join("local.state"),
-    )
-    .expect("announce local discovery record");
+    let report =
+        wattswarm::ui::maybe_announce_local_record_to_discovery_bootnodes(&state_dir, &db_path)
+            .expect("announce local discovery record");
 
     assert_eq!(report.attempted, 1);
     assert_eq!(report.succeeded, 1);
@@ -681,6 +721,21 @@ fn network_discovery_auto_announces_local_record_to_bootnode() {
     );
     assert_eq!(record.body.ttl_ms, DEFAULT_RECORD_TTL_MS);
     assert!(record.body.capabilities.contains("wattswarm.node"));
+    assert!(
+        record
+            .body
+            .topic_providers
+            .iter()
+            .any(|provider| provider.feed_key == "public.hive"
+                && provider.scope_hint == "group:public-hive")
+    );
+    assert!(
+        record
+            .body
+            .topic_providers
+            .iter()
+            .all(|provider| provider.feed_key != wattswarm::control::PRIVATE_DM_FEED_KEY)
+    );
     let source_agent_card = record
         .body
         .source_agent_card

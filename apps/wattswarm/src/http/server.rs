@@ -179,6 +179,10 @@ pub fn build_app(state: UiServerState) -> Router {
             get(discovery::discovery_find_topic_providers),
         )
         .route(
+            "/api/network/discovery/topic-providers/batch",
+            post(discovery::discovery_find_topic_providers_batch),
+        )
+        .route(
             "/api/network/discovery/agent",
             get(discovery::discovery_find_agent),
         )

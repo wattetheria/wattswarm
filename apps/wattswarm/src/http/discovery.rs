@@ -1,4 +1,6 @@
-use crate::control::{load_discovery_bootnode_urls_state, local_peer_id, open_configured_node};
+use crate::control::{
+    PRIVATE_DM_FEED_KEY, load_discovery_bootnode_urls_state, local_peer_id, open_configured_node,
+};
 use crate::http::{ApiError, UiServerState, run_blocking};
 use crate::startup_config::{load_startup_config, startup_config_path};
 use crate::storage::PgStore;
@@ -58,6 +60,20 @@ pub(crate) struct TopicProviderDiscoveryQuery {
     scope_hint: String,
     #[serde(default)]
     limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct TopicProviderBatchDiscoveryRequest {
+    network_id: String,
+    queries: Vec<TopicProviderBatchQuery>,
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct TopicProviderBatchQuery {
+    feed_key: String,
+    scope_hint: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -234,6 +250,45 @@ pub(crate) async fn discovery_find_topic_providers(
             now_ms,
             normalize_limit(query.limit),
         );
+        Ok(json!({
+            "ok": true,
+            "records": records,
+        }))
+    })
+    .await?;
+    Ok(Json(response))
+}
+
+pub(crate) async fn discovery_find_topic_providers_batch(
+    State(state): State<UiServerState>,
+    Json(request): Json<TopicProviderBatchDiscoveryRequest>,
+) -> Result<Json<Value>, ApiError> {
+    let state_clone = state.clone();
+    let response = run_blocking(move || -> Result<Value> {
+        let now_ms = now_ms();
+        let table = load_discovery_records(&state_clone.state_dir, now_ms)?;
+        let limit = normalize_limit(request.limit);
+        let mut records = Vec::new();
+        let mut seen = std::collections::BTreeSet::new();
+        for query in request.queries {
+            for record in table.find_topic_providers(
+                &request.network_id,
+                &query.feed_key,
+                &query.scope_hint,
+                now_ms,
+                limit,
+            ) {
+                if seen.insert(record.body.node_id.clone()) {
+                    records.push(record);
+                    if records.len() >= limit {
+                        break;
+                    }
+                }
+            }
+            if records.len() >= limit {
+                break;
+            }
+        }
         Ok(json!({
             "ok": true,
             "records": records,
@@ -580,6 +635,7 @@ fn local_topic_provider_records(
         .list_active_feed_subscriptions(network_id, &identity.node_id())?;
     subscriptions
         .into_iter()
+        .filter(|subscription| should_export_topic_provider(&subscription.feed_key))
         .map(|subscription| {
             Ok(DiscoveryTopicProvider {
                 feed_key: subscription.feed_key,
@@ -591,6 +647,10 @@ fn local_topic_provider_records(
             })
         })
         .collect()
+}
+
+fn should_export_topic_provider(feed_key: &str) -> bool {
+    feed_key.trim() != PRIVATE_DM_FEED_KEY
 }
 
 fn discovery_provider_capabilities(

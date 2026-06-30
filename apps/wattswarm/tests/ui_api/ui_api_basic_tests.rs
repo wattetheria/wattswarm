@@ -1348,6 +1348,35 @@ fn network_discovery_bootnode_accepts_signed_records_and_filters_queries() {
             Some(node_id.as_str())
         );
 
+        let topic_provider_batch_res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/network/discovery/topic-providers/batch")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({
+                            "network_id": "mainnet:test",
+                            "queries": [{
+                                "feed_key": "sydney-weather",
+                                "scope_hint": "group:sydney-weather",
+                            }],
+                            "limit": 10,
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(topic_provider_batch_res.status(), StatusCode::OK);
+        let topic_provider_batch_json = json_from(topic_provider_batch_res).await;
+        assert_eq!(
+            topic_provider_batch_json["records"][0]["body"]["node_id"].as_str(),
+            Some(node_id.as_str())
+        );
+
         let agent_res = app
             .clone()
             .oneshot(
