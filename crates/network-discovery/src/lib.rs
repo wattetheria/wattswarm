@@ -7,6 +7,8 @@ use wattswarm_protocol::types::SourceAgentCard;
 
 pub const DISCOVERY_PROTOCOL_VERSION: &str = "wattswarm-discovery/1";
 pub const DEFAULT_RECORD_TTL_MS: u64 = 5 * 60 * 1000;
+pub const MAX_DISCOVERY_RECORD_BYTES: usize = 256 * 1024;
+pub const MAX_TOPIC_PROVIDERS_PER_RECORD: usize = 512;
 const MAX_DISCOVERY_SOURCE_AGENT_CARD_BYTES: usize = 64 * 1024;
 const EARTH_RADIUS_KM: f64 = 6_371.0;
 
@@ -173,6 +175,12 @@ impl DiscoveryNodeRecordBody {
         if let Some(geo) = &self.geo {
             geo.validate()?;
         }
+        if self.topic_providers.len() > MAX_TOPIC_PROVIDERS_PER_RECORD {
+            bail!(
+                "topic_providers exceeds maximum discovery record count of {}",
+                MAX_TOPIC_PROVIDERS_PER_RECORD
+            );
+        }
         for provider in &self.topic_providers {
             provider.validate()?;
         }
@@ -209,14 +217,17 @@ impl SignedDiscoveryNodeRecord {
             bail!("discovery record signer does not match body public key");
         }
         let signing_bytes = canonical_body_bytes(&body)?;
-        Ok(Self {
+        let record = Self {
             body,
             signature_hex: identity.sign_bytes(&signing_bytes),
-        })
+        };
+        validate_signed_record_size(&record)?;
+        Ok(record)
     }
 
     pub fn verify(&self) -> Result<()> {
         self.body.validate()?;
+        validate_signed_record_size(self)?;
         let signing_bytes = canonical_body_bytes(&self.body)?;
         verify_signature(
             &self.body.signing_public_key_hex,
@@ -233,6 +244,17 @@ impl SignedDiscoveryNodeRecord {
         }
         Ok(())
     }
+}
+
+fn validate_signed_record_size(record: &SignedDiscoveryNodeRecord) -> Result<()> {
+    let record_bytes = serde_json::to_vec(record).context("serialize discovery record")?;
+    if record_bytes.len() > MAX_DISCOVERY_RECORD_BYTES {
+        bail!(
+            "discovery record exceeds maximum size of {} bytes",
+            MAX_DISCOVERY_RECORD_BYTES
+        );
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -905,6 +927,50 @@ mod tests {
         );
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].body.node_id, provider_identity.node_id());
+    }
+
+    #[test]
+    fn signed_record_rejects_too_many_topic_providers() {
+        let identity = NodeIdentity::from_seed([22; 32]);
+        let node_id = identity.node_id();
+        let mut body = DiscoveryNodeRecordBody::new("net", node_id.clone(), node_id, 1, 1_000);
+        for index in 0..=MAX_TOPIC_PROVIDERS_PER_RECORD {
+            body.topic_providers.push(DiscoveryTopicProvider {
+                feed_key: format!("feed-{index}"),
+                scope_hint: format!("group:scope-{index}"),
+                capabilities: DiscoveryTopicProviderCapabilities::local_history_provider(),
+                updated_at_ms: 1_000,
+            });
+        }
+
+        let error = SignedDiscoveryNodeRecord::sign(body, &identity)
+            .expect_err("too many topic providers must be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("topic_providers exceeds maximum discovery record count")
+        );
+    }
+
+    #[test]
+    fn signed_record_rejects_oversized_record_bytes() {
+        let identity = NodeIdentity::from_seed([23; 32]);
+        let node_id = identity.node_id();
+        let mut body = DiscoveryNodeRecordBody::new("net", node_id.clone(), node_id, 1, 1_000);
+        body.topic_providers.push(DiscoveryTopicProvider {
+            feed_key: "feed".to_owned(),
+            scope_hint: format!("group:{}", "a".repeat(MAX_DISCOVERY_RECORD_BYTES)),
+            capabilities: DiscoveryTopicProviderCapabilities::local_history_provider(),
+            updated_at_ms: 1_000,
+        });
+
+        let error = SignedDiscoveryNodeRecord::sign(body, &identity)
+            .expect_err("oversized discovery records must be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("discovery record exceeds maximum size")
+        );
     }
 
     #[test]
