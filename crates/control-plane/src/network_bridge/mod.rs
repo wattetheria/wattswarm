@@ -1485,6 +1485,27 @@ impl NetworkBridgeService {
         }
     }
 
+    fn persist_peer_sync_state_for_peer(&self, peer: &NetworkNodeId) {
+        let Some(state_dir) = &self.state_dir else {
+            return;
+        };
+        let Some(state) = self.peer_sync_state.get(peer) else {
+            return;
+        };
+        let updated_at = chrono::Utc::now().timestamp_millis().max(0) as u64;
+        let Some(record) = peer_sync_state_record(peer, state, updated_at) else {
+            return;
+        };
+        if let Err(err) =
+            crate::control::save_network_peer_sync_state_record_state(state_dir, &record)
+        {
+            eprintln!(
+                "peer sync state DB write failed for {}: {err}",
+                record.network_peer_id
+            );
+        }
+    }
+
     pub fn local_peer_id(&self) -> NetworkNodeId {
         self.runtime.local_peer_id()
     }

@@ -1,5 +1,6 @@
 use super::*;
 use crate::network_p2p::BackfillResponse;
+use std::time::{Duration, Instant};
 
 const BACKFILL_HEAD_EVENT_IDS_LIMIT: usize = 8;
 pub(super) const BACKFILL_KNOWN_EVENT_IDS_LIMIT: usize = 64;
@@ -8,6 +9,24 @@ pub(super) const BACKFILL_KNOWN_EVENT_IDS_LIMIT: usize = 64;
 /// while paginating a scope's events newest-first to absorb events filtered out
 /// by `should_sync_event` (revoked/banned) before reaching the requested limit.
 const SCOPE_LANE_SCAN_BATCH: usize = 256;
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(super) struct BackfillServeMetrics {
+    pub head_scan_ms: u64,
+    pub page_read_ms: u64,
+    pub sync_filter_ms: u64,
+    pub lane_filter_ms: u64,
+    pub pages_read: u64,
+    pub rows_read: u64,
+    pub events_returned: u64,
+    pub known_event_skips: u64,
+    pub sync_filter_skips: u64,
+    pub lane_filter_skips: u64,
+}
+
+fn duration_millis(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
 
 fn event_matches_backfill_lane(
     node: &Node,
@@ -79,6 +98,43 @@ pub fn backfill_response_for_request(
     max_limit: usize,
     hard_limit: usize,
 ) -> Result<BackfillResponse> {
+    backfill_response_for_request_inner(
+        node,
+        local_transport_node_id,
+        request,
+        max_limit,
+        hard_limit,
+        None,
+    )
+}
+
+pub(super) fn backfill_response_for_request_with_metrics(
+    node: &Node,
+    local_transport_node_id: &str,
+    request: &BackfillRequest,
+    max_limit: usize,
+    hard_limit: usize,
+) -> Result<(BackfillResponse, BackfillServeMetrics)> {
+    let mut metrics = BackfillServeMetrics::default();
+    let response = backfill_response_for_request_inner(
+        node,
+        local_transport_node_id,
+        request,
+        max_limit,
+        hard_limit,
+        Some(&mut metrics),
+    )?;
+    Ok((response, metrics))
+}
+
+fn backfill_response_for_request_inner(
+    node: &Node,
+    local_transport_node_id: &str,
+    request: &BackfillRequest,
+    max_limit: usize,
+    hard_limit: usize,
+    mut metrics: Option<&mut BackfillServeMetrics>,
+) -> Result<BackfillResponse> {
     request.validate(max_limit, hard_limit)?;
     let scope_label = scope_hint_label(&request.scope);
     let mut next_from_event_seq = request.from_event_seq;
@@ -89,37 +145,74 @@ pub fn backfill_response_for_request(
         .iter()
         .map(String::as_str)
         .collect::<HashSet<_>>();
+    let head_started_at = metrics.is_some().then(Instant::now);
     let head_event_ids = recent_backfill_lane_event_ids(
         node,
         &request.scope,
         request.feed_key.as_deref(),
         BACKFILL_HEAD_EVENT_IDS_LIMIT,
     )?;
+    if let (Some(metrics), Some(started_at)) = (metrics.as_deref_mut(), head_started_at) {
+        metrics.head_scan_ms = duration_millis(started_at.elapsed());
+    }
 
     while envelopes.len() < request.limit {
+        let page_started_at = metrics.is_some().then(Instant::now);
         let rows = node.store.load_scope_events_page(
             &scope_label,
             from_event_seq,
             request.limit.saturating_sub(envelopes.len()).max(32),
         )?;
+        if let (Some(metrics), Some(started_at)) = (metrics.as_deref_mut(), page_started_at) {
+            metrics.page_read_ms = metrics
+                .page_read_ms
+                .saturating_add(duration_millis(started_at.elapsed()));
+        }
         if rows.is_empty() {
             break;
+        }
+        if let Some(metrics) = metrics.as_deref_mut() {
+            metrics.pages_read = metrics.pages_read.saturating_add(1);
+            metrics.rows_read = metrics.rows_read.saturating_add(rows.len() as u64);
         }
         for (seq, event) in rows {
             from_event_seq = seq;
             next_from_event_seq = seq;
-            if !should_sync_event(node, &event)? {
+            let sync_started_at = metrics.is_some().then(Instant::now);
+            let should_sync = should_sync_event(node, &event)?;
+            if let (Some(metrics), Some(started_at)) = (metrics.as_deref_mut(), sync_started_at) {
+                metrics.sync_filter_ms = metrics
+                    .sync_filter_ms
+                    .saturating_add(duration_millis(started_at.elapsed()));
+            }
+            if !should_sync {
+                if let Some(metrics) = metrics.as_deref_mut() {
+                    metrics.sync_filter_skips = metrics.sync_filter_skips.saturating_add(1);
+                }
                 continue;
             }
             if known_event_ids.contains(event.event_id.as_str()) {
+                if let Some(metrics) = metrics.as_deref_mut() {
+                    metrics.known_event_skips = metrics.known_event_skips.saturating_add(1);
+                }
                 continue;
             }
-            if !event_matches_backfill_lane(
+            let lane_started_at = metrics.is_some().then(Instant::now);
+            let matches_lane = event_matches_backfill_lane(
                 node,
                 &event,
                 &request.scope,
                 request.feed_key.as_deref(),
-            )? {
+            )?;
+            if let (Some(metrics), Some(started_at)) = (metrics.as_deref_mut(), lane_started_at) {
+                metrics.lane_filter_ms = metrics
+                    .lane_filter_ms
+                    .saturating_add(duration_millis(started_at.elapsed()));
+            }
+            if !matches_lane {
+                if let Some(metrics) = metrics.as_deref_mut() {
+                    metrics.lane_filter_skips = metrics.lane_filter_skips.saturating_add(1);
+                }
                 continue;
             }
             envelopes.push(EventEnvelope {
@@ -133,6 +226,9 @@ pub fn backfill_response_for_request(
         }
     }
 
+    if let Some(metrics) = metrics.as_deref_mut() {
+        metrics.events_returned = envelopes.len() as u64;
+    }
     Ok(BackfillResponse {
         scope: request.scope.clone(),
         next_from_event_seq,

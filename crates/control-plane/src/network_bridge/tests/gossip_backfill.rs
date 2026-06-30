@@ -1,3 +1,4 @@
+use super::super::backfill::backfill_response_for_request_with_metrics;
 use super::*;
 
 #[test]
@@ -174,6 +175,47 @@ fn backfill_response_for_request_wraps_public_control_events() {
         response.events[0].event.payload,
         crate::types::EventPayload::CheckpointCreated(_)
     ));
+}
+
+#[test]
+fn backfill_response_metrics_record_page_and_filter_work() {
+    let local = NodeIdentity::random();
+    let remote = NodeIdentity::random();
+    let membership = membership_with_roles(&[local.node_id(), remote.node_id()]);
+    let mut node =
+        Node::new(local, PgStore::open_in_memory().expect("store"), membership).expect("node");
+    node.emit_at(
+        1,
+        crate::types::EventPayload::CheckpointCreated(crate::types::CheckpointCreatedPayload {
+            checkpoint_id: "cp-backfill-metrics".to_owned(),
+            up_to_seq: 0,
+        }),
+        100,
+    )
+    .expect("emit checkpoint");
+
+    let (response, metrics) = backfill_response_for_request_with_metrics(
+        &node,
+        "peer-local",
+        &BackfillRequest {
+            scope: SwarmScope::Global,
+            from_event_seq: 0,
+            limit: 8,
+            feed_key: None,
+            known_event_ids: Vec::new(),
+        },
+        32,
+        64,
+    )
+    .expect("backfill response");
+
+    assert_eq!(response.events.len(), 1);
+    assert_eq!(metrics.events_returned, 1);
+    assert_eq!(metrics.pages_read, 1);
+    assert_eq!(metrics.rows_read, 1);
+    assert_eq!(metrics.known_event_skips, 0);
+    assert_eq!(metrics.sync_filter_skips, 0);
+    assert_eq!(metrics.lane_filter_skips, 0);
 }
 
 #[test]

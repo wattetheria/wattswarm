@@ -209,13 +209,37 @@ fn stale_connected_peer_is_not_backfill_eligible_until_liveness_refresh() {
 }
 
 #[test]
-fn stale_connected_peer_expires_and_becomes_reconnect_candidate() {
+fn peer_liveness_refresh_does_not_persist_peer_sync_state() {
+    let dir = temp_startup_dir("peer-liveness-memory-only");
     let mut service = NetworkBridgeService::new(
         test_network_node(NetworkP2pConfig::default()).expect("node"),
         &[SwarmScope::Global],
         &NetworkProtocolParams::default(),
     )
     .expect("service");
+    service.set_state_dir(dir.clone(), dir.join("ui.state"));
+    let peer = random_network_node_id();
+
+    service.record_peer_liveness(peer.clone());
+
+    assert!(service.peer_recently_seen_at(&peer, Instant::now()));
+    let persisted = crate::control::load_network_peer_sync_state_records_state(&dir)
+        .expect("load peer sync rows");
+    assert!(persisted.is_empty());
+
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn stale_connected_peer_expires_and_becomes_reconnect_candidate() {
+    let service_dir = temp_startup_dir("stale-connected-peer-diagnostic");
+    let mut service = NetworkBridgeService::new(
+        test_network_node(NetworkP2pConfig::default()).expect("node"),
+        &[SwarmScope::Global],
+        &NetworkProtocolParams::default(),
+    )
+    .expect("service");
+    service.set_state_dir(service_dir.clone(), service_dir.join("ui.state"));
     let (dir, peer) =
         register_contacted_peer(&mut service, "stale-connected-peer-expire", [48_u8; 32]);
     let now = Instant::now();
@@ -228,9 +252,28 @@ fn stale_connected_peer_expires_and_becomes_reconnect_candidate() {
     assert_eq!(service.expire_stale_connected_peers(now), 1);
     assert!(!service.connected_peers.contains(&peer));
     assert_eq!(service.reconnect_attempts_for_peer(&peer), Some(0));
+    let raw = fs::read_to_string(service_dir.join("diagnostics/wattswarm_node.jsonl"))
+        .expect("diagnostic log");
+    let diagnostic = raw
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("diagnostic json"))
+        .find(|entry| entry["phase"] == "connection.expired_stale")
+        .expect("stale connection diagnostic");
+    assert_eq!(diagnostic["status"], "disconnected");
+    assert_eq!(diagnostic["object_kind"], "peer");
+    assert_eq!(diagnostic["object_id"], peer.to_string());
+    assert_eq!(diagnostic["source_node_id"], peer.to_string());
+    assert_eq!(
+        diagnostic["details"]["reason"],
+        "peer_last_seen_ttl_expired"
+    );
+    assert_eq!(diagnostic["details"]["peer_id"], peer.to_string());
+    assert_eq!(diagnostic["details"]["inflight_backfills"], 0);
+    assert_eq!(diagnostic["details"]["known_scope_count"], 0);
 
     wattswarm_network_transport_iroh::shutdown_local_iroh_data_plane(&dir);
     let _ = std::fs::remove_dir_all(dir);
+    let _ = std::fs::remove_dir_all(service_dir);
 }
 
 #[test]
@@ -363,6 +406,130 @@ fn peer_relationship_action_records_outbound_contact_material_diagnostic() {
     wattswarm_network_transport_iroh::shutdown_local_iroh_data_plane(&remote_dir);
     let _ = std::fs::remove_dir_all(local_dir);
     let _ = std::fs::remove_dir_all(remote_dir);
+}
+
+#[test]
+fn contact_material_failures_record_peer_diagnostics() {
+    let dir = temp_startup_dir("contact-material-failure-diagnostic");
+    let peer = random_network_node_id();
+    let mut node = Node::open_in_memory_with_roles(&[Role::Proposer]).expect("node");
+    let mut service = NetworkBridgeService::new(
+        test_network_node(NetworkP2pConfig::default()).expect("node"),
+        &[SwarmScope::Global],
+        &NetworkProtocolParams::default(),
+    )
+    .expect("service");
+    service.set_state_dir(dir.clone(), dir.join("ui.state"));
+
+    service
+        .handle_runtime_event(
+            &mut node,
+            Ok(NetworkRuntimeEvent::ContactMaterialOutboundFailure {
+                peer: peer.clone(),
+                request_id: crate::network_p2p::ContactMaterialRequestId::new(42),
+                error: "relay stream closed".to_owned(),
+            }),
+        )
+        .expect("outbound failure");
+    service
+        .handle_runtime_event(
+            &mut node,
+            Ok(NetworkRuntimeEvent::ContactMaterialInboundFailure {
+                peer: peer.clone(),
+                error: "malformed contact material".to_owned(),
+            }),
+        )
+        .expect("inbound failure");
+
+    let raw =
+        fs::read_to_string(dir.join("diagnostics/wattswarm_node.jsonl")).expect("diagnostic log");
+    assert!(raw.contains("\"phase\":\"contact_material.outbound\""));
+    assert!(raw.contains("\"phase\":\"contact_material.inbound\""));
+    assert!(raw.contains("\"status\":\"failed\""));
+    assert!(raw.contains(&format!("\"object_id\":\"{}\"", peer)));
+    assert!(raw.contains(&format!("\"source_node_id\":\"{}\"", peer)));
+    assert!(raw.contains("\"request_id\":\"ContactMaterialRequestId(42)\""));
+    assert!(raw.contains("\"error\":\"relay stream closed\""));
+    assert!(raw.contains("\"error\":\"malformed contact material\""));
+
+    let rows = diagnostics::list_diagnostics(
+        &dir,
+        &diagnostics::DiagnosticFilter {
+            source_node_id: Some(peer.to_string()),
+            limit: Some(10),
+            ..diagnostics::DiagnosticFilter::default()
+        },
+    )
+    .expect("list diagnostics");
+    assert_eq!(rows.len(), 2);
+
+    std::fs::remove_dir_all(dir).expect("cleanup");
+}
+
+#[test]
+fn contact_material_inbound_request_records_handler_diagnostics() {
+    let dir = temp_startup_dir("contact-material-inbound-diagnostic");
+    let local_seed = [119u8; 32];
+    std::fs::write(dir.join("node_seed.hex"), hex::encode(local_seed)).expect("write local seed");
+    ensure_test_relay_urls(&dir);
+    let peer = random_network_node_id();
+    let request_id: crate::network_p2p::InboundRequestId =
+        serde_json::from_value(json!(7)).expect("request id");
+    let mut node = Node::open_in_memory_with_roles(&[Role::Proposer]).expect("node");
+    let mut service = NetworkBridgeService::new(
+        NetworkP2pNode::from_iroh_state_dir(NetworkP2pConfig::default(), dir.clone(), local_seed)
+            .expect("node"),
+        &[SwarmScope::Global],
+        &NetworkProtocolParams::default(),
+    )
+    .expect("service");
+    service.set_state_dir(dir.clone(), dir.join("ui.state"));
+
+    let err = service
+        .handle_runtime_event(
+            &mut node,
+            Ok(NetworkRuntimeEvent::ContactMaterialRequest {
+                peer: peer.clone(),
+                request: crate::network_p2p::ContactMaterialRequest {
+                    source_node_id: peer.to_string(),
+                    target_node_id: service.local_peer_id().to_string(),
+                },
+                request_id,
+            }),
+        )
+        .expect_err("missing response channel");
+    assert!(
+        err.to_string()
+            .contains("unknown contact material response request id 7")
+    );
+
+    let raw =
+        fs::read_to_string(dir.join("diagnostics/wattswarm_node.jsonl")).expect("diagnostic log");
+    assert!(raw.contains("\"phase\":\"contact_material.inbound.request\""));
+    assert!(raw.contains("\"status\":\"received\""));
+    assert!(raw.contains("\"phase\":\"contact_material.inbound.response\""));
+    assert!(raw.contains("\"status\":\"failed\""));
+    assert!(raw.contains(&format!("\"object_id\":\"{}\"", peer)));
+    assert!(raw.contains(&format!("\"source_node_id\":\"{}\"", peer)));
+    assert!(raw.contains("\"request_id\":\"7\""));
+    assert!(raw.contains("\"error\":\"unknown contact material response request id 7\""));
+    assert!(raw.contains("\"duration_ms\""));
+    assert!(!raw.contains("\"contact_material\":"));
+    assert!(!raw.contains("\"public_key_b64\""));
+
+    let rows = diagnostics::list_diagnostics(
+        &dir,
+        &diagnostics::DiagnosticFilter {
+            source_node_id: Some(peer.to_string()),
+            limit: Some(10),
+            ..diagnostics::DiagnosticFilter::default()
+        },
+    )
+    .expect("list diagnostics");
+    assert_eq!(rows.len(), 2);
+
+    wattswarm_network_transport_iroh::shutdown_local_iroh_data_plane(&dir);
+    std::fs::remove_dir_all(dir).expect("cleanup");
 }
 
 #[test]
@@ -657,6 +824,138 @@ fn peer_sync_state_persists_scope_cursor_and_remote_heads() {
             .expect("known scopes JSON"),
         vec![scope]
     );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn peer_scope_activity_persists_only_changed_peer() {
+    let dir = temp_startup_dir("peer-sync-state-single-peer-persist");
+    let changed_peer = random_network_node_id();
+    let unchanged_peer = random_network_node_id();
+    let scope = SwarmScope::Group("crew-7".to_owned());
+    for (peer, updated_at) in [(&changed_peer, 10), (&unchanged_peer, 20)] {
+        crate::control::save_network_peer_sync_state_record_state(
+            &dir,
+            &crate::control::NetworkPeerSyncStateRecord {
+                network_peer_id: peer.to_string(),
+                known_scopes_json: "[]".to_owned(),
+                backfill_cursors_json: "[]".to_owned(),
+                remote_heads_json: "[]".to_owned(),
+                backfill_successes: 0,
+                backfill_failures: 0,
+                updated_at,
+            },
+        )
+        .expect("save peer sync row");
+    }
+    let mut service = NetworkBridgeService::new(
+        test_network_node(NetworkP2pConfig::default()).expect("node"),
+        &[SwarmScope::Global],
+        &NetworkProtocolParams::default(),
+    )
+    .expect("service");
+    service.set_state_dir(dir.clone(), dir.join("store.state"));
+
+    service.record_peer_scope_activity(changed_peer.clone(), &scope);
+
+    let records =
+        crate::control::load_network_peer_sync_state_records_state(&dir).expect("load rows");
+    let changed = records
+        .iter()
+        .find(|record| record.network_peer_id == changed_peer.to_string())
+        .expect("changed peer row");
+    let unchanged = records
+        .iter()
+        .find(|record| record.network_peer_id == unchanged_peer.to_string())
+        .expect("unchanged peer row");
+    assert!(changed.updated_at > 10);
+    assert_eq!(unchanged.updated_at, 20);
+    assert_eq!(
+        serde_json::from_str::<Vec<SwarmScope>>(&changed.known_scopes_json)
+            .expect("known scopes JSON"),
+        vec![scope]
+    );
+    assert_eq!(unchanged.known_scopes_json, "[]");
+
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn backfill_response_progress_persists_peer_sync_state_once() {
+    let dir = temp_startup_dir("peer-sync-backfill-response-progress");
+    let peer = random_network_node_id();
+    let scope = SwarmScope::Group("crew-7".to_owned());
+    let feed_key = "crew.chat";
+    let request_id = BackfillRequestId::new(77);
+    let mut node = Node::open_in_memory_with_roles(&[Role::Proposer]).expect("node");
+    let mut service = NetworkBridgeService::new(
+        test_network_node(NetworkP2pConfig::default()).expect("node"),
+        &[SwarmScope::Global, scope.clone()],
+        &NetworkProtocolParams::default(),
+    )
+    .expect("service");
+    service.set_state_dir(dir.clone(), dir.join("store.state"));
+    let mut state = PeerSyncState::new(Instant::now());
+    state.record_pending_backfill(
+        request_id,
+        scope.clone(),
+        Some(feed_key.to_owned()),
+        Instant::now(),
+    );
+    service.peer_sync_state.insert(peer.clone(), state);
+
+    let tick = service
+        .process_runtime_event(
+            &mut node,
+            NetworkRuntimeEvent::BackfillResponse {
+                peer: peer.clone(),
+                request_id,
+                response: BackfillResponse {
+                    scope: scope.clone(),
+                    next_from_event_seq: 42,
+                    feed_key: Some(feed_key.to_owned()),
+                    head_event_ids: Vec::new(),
+                    events: Vec::new(),
+                },
+            },
+        )
+        .expect("backfill response");
+
+    assert!(matches!(
+        tick,
+        NetworkBridgeTick::BackfillApplied {
+            peer: seen,
+            request_id: seen_request_id,
+            events: 0,
+        } if seen == peer && seen_request_id == request_id
+    ));
+    let state = service
+        .peer_sync_state
+        .get(&peer)
+        .expect("updated peer state");
+    assert!(state.known_scopes.contains(&scope));
+    assert_eq!(state.inflight_backfills(), 0);
+    assert_eq!(state.backfill_successes, 1);
+    assert_eq!(state.backfill_failures, 0);
+    assert_eq!(state.backfill_cursor(&scope, Some(feed_key)), 42);
+
+    let mut reloaded = NetworkBridgeService::new(
+        test_network_node(NetworkP2pConfig::default()).expect("node"),
+        &[SwarmScope::Global],
+        &NetworkProtocolParams::default(),
+    )
+    .expect("service");
+    reloaded.set_state_dir(dir.clone(), dir.join("store.state"));
+    let reloaded_state = reloaded
+        .peer_sync_state
+        .get(&peer)
+        .expect("reloaded peer sync state");
+    assert!(reloaded_state.known_scopes.contains(&scope));
+    assert_eq!(reloaded_state.inflight_backfills(), 0);
+    assert_eq!(reloaded_state.backfill_successes, 1);
+    assert_eq!(reloaded_state.backfill_failures, 0);
+    assert_eq!(reloaded_state.backfill_cursor(&scope, Some(feed_key)), 42);
+
     let _ = std::fs::remove_dir_all(dir);
 }
 

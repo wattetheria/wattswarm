@@ -377,7 +377,7 @@ impl NetworkBridgeService {
                 state.last_backfill_request_at = Some(now);
                 state.next_retry_at = now + self.backfill_retry_after;
             }
-            self.persist_peer_sync_state();
+            self.persist_peer_sync_state_for_peer(peer);
         }
         Ok(requests_sent > 0)
     }
@@ -554,21 +554,20 @@ impl NetworkBridgeService {
     pub(crate) fn record_peer_liveness(&mut self, peer: NetworkNodeId) {
         let now = Instant::now();
         self.peer_sync_state
-            .entry(peer)
+            .entry(peer.clone())
             .or_insert_with(|| PeerSyncState::new(now))
             .record_seen_at(now);
-        self.persist_peer_sync_state();
     }
 
     pub(crate) fn record_peer_scope_activity(&mut self, peer: NetworkNodeId, scope: &SwarmScope) {
         let now = Instant::now();
         let state = self
             .peer_sync_state
-            .entry(peer)
+            .entry(peer.clone())
             .or_insert_with(|| PeerSyncState::new(now));
         state.record_seen_at(now);
         state.known_scopes.insert(scope.clone());
-        self.persist_peer_sync_state();
+        self.persist_peer_sync_state_for_peer(&peer);
     }
 
     pub(crate) fn remember_global_backfill_provider(&mut self, peer: NetworkNodeId) {
@@ -645,7 +644,7 @@ impl NetworkBridgeService {
             .record_seen_at(now);
         self.peer_reconnect_state.remove(&peer);
         self.abandoned_reconnect_peers.remove(&peer);
-        self.persist_peer_sync_state();
+        self.persist_peer_sync_state_for_peer(&peer);
         inserted
     }
 
@@ -658,7 +657,48 @@ impl NetworkBridgeService {
             .collect::<Vec<_>>();
         let mut expired = 0usize;
         for peer in stale_peers {
+            let (last_seen_age_ms, inflight_backfills, known_scope_count, next_retry_in_ms) = self
+                .peer_sync_state
+                .get(&peer)
+                .map(|state| {
+                    (
+                        now.saturating_duration_since(state.last_seen_at)
+                            .as_millis(),
+                        state.inflight_backfills(),
+                        state.known_scopes.len(),
+                        state
+                            .next_retry_at
+                            .saturating_duration_since(now)
+                            .as_millis(),
+                    )
+                })
+                .unwrap_or((0, 0, 0, 0));
             if self.mark_peer_disconnected(peer.clone()) {
+                diagnostics::record_diagnostic(
+                    self.state_dir.as_deref(),
+                    diagnostics::DiagnosticEvent::new(
+                        "warn",
+                        "transport",
+                        "connection.expired_stale",
+                        "disconnected",
+                        format!("stale connected peer expired: {peer}"),
+                    )
+                    .event_id(format!(
+                        "stale-connected-peer-expired:{peer}:{}",
+                        observed_at_ms()
+                    ))
+                    .object("peer", Some(peer.to_string()))
+                    .source_node_id(Some(peer.to_string()))
+                    .details(json!({
+                        "peer_id": peer.to_string(),
+                        "reason": "peer_last_seen_ttl_expired",
+                        "last_seen_age_ms": last_seen_age_ms,
+                        "stale_after_ms": PEER_LAST_SEEN_TTL.as_millis(),
+                        "inflight_backfills": inflight_backfills,
+                        "known_scope_count": known_scope_count,
+                        "next_retry_in_ms": next_retry_in_ms,
+                    })),
+                );
                 self.schedule_peer_reconnect(peer);
                 expired += 1;
             }
@@ -674,7 +714,7 @@ impl NetworkBridgeService {
         }
         self.pending_relationship_requests
             .retain(|_, pending| pending.peer != peer);
-        self.persist_peer_sync_state();
+        self.persist_peer_sync_state_for_peer(&peer);
         removed
     }
 
@@ -863,23 +903,40 @@ impl NetworkBridgeService {
         );
     }
 
-    pub(crate) fn mark_backfill_completed(
+    pub(crate) fn record_peer_backfill_response_progress(
         &mut self,
         peer: NetworkNodeId,
+        scope: &SwarmScope,
+        feed_key: Option<&str>,
+        head_event_ids: &[String],
         request_id: BackfillRequestId,
+        next_from_event_seq: u64,
+        reset_cursor: bool,
     ) {
-        if let Some(state) = self.peer_sync_state.get_mut(&peer) {
-            let now = Instant::now();
-            let was_pending = state.record_backfill_request_completed(request_id, now);
-            state.next_retry_at = now + self.anti_entropy_interval;
-            if was_pending {
-                state.backfill_successes = state.backfill_successes.saturating_add(1);
-                state.backfill_failures = 0;
-            }
+        let now = Instant::now();
+        let next_retry_at = now + self.anti_entropy_interval;
+        let state = self
+            .peer_sync_state
+            .entry(peer.clone())
+            .or_insert_with(|| PeerSyncState::new(now));
+        state.record_seen_at(now);
+        state.known_scopes.insert(scope.clone());
+        state.record_remote_head_event_ids(scope, feed_key, head_event_ids);
+        let was_pending = state.record_backfill_request_completed(request_id, now);
+        state.next_retry_at = next_retry_at;
+        if was_pending {
+            state.backfill_successes = state.backfill_successes.saturating_add(1);
+            state.backfill_failures = 0;
         }
-        self.persist_peer_sync_state();
+        if reset_cursor {
+            state.reset_backfill_cursor(scope, feed_key);
+        } else {
+            state.record_backfill_cursor(scope, feed_key, next_from_event_seq);
+        }
+        self.persist_peer_sync_state_for_peer(&peer);
     }
 
+    #[cfg(test)]
     pub(crate) fn record_peer_remote_head_event_ids(
         &mut self,
         peer: NetworkNodeId,
@@ -888,12 +945,13 @@ impl NetworkBridgeService {
         head_event_ids: &[String],
     ) {
         self.peer_sync_state
-            .entry(peer)
+            .entry(peer.clone())
             .or_insert_with(|| PeerSyncState::new(Instant::now()))
             .record_remote_head_event_ids(scope, feed_key, head_event_ids);
-        self.persist_peer_sync_state();
+        self.persist_peer_sync_state_for_peer(&peer);
     }
 
+    #[cfg(test)]
     pub(crate) fn record_peer_backfill_cursor(
         &mut self,
         peer: NetworkNodeId,
@@ -902,23 +960,10 @@ impl NetworkBridgeService {
         next_from_event_seq: u64,
     ) {
         self.peer_sync_state
-            .entry(peer)
+            .entry(peer.clone())
             .or_insert_with(|| PeerSyncState::new(Instant::now()))
             .record_backfill_cursor(scope, feed_key, next_from_event_seq);
-        self.persist_peer_sync_state();
-    }
-
-    pub(crate) fn reset_peer_backfill_cursor(
-        &mut self,
-        peer: NetworkNodeId,
-        scope: &SwarmScope,
-        feed_key: Option<&str>,
-    ) {
-        self.peer_sync_state
-            .entry(peer)
-            .or_insert_with(|| PeerSyncState::new(Instant::now()))
-            .reset_backfill_cursor(scope, feed_key);
-        self.persist_peer_sync_state();
+        self.persist_peer_sync_state_for_peer(&peer);
     }
 
     pub(crate) fn mark_backfill_failed(
@@ -937,7 +982,7 @@ impl NetworkBridgeService {
                 state.backfill_failures = state.backfill_failures.saturating_add(1);
             }
         }
-        self.persist_peer_sync_state();
+        self.persist_peer_sync_state_for_peer(&peer);
     }
 
     pub(crate) fn expire_stale_backfill_requests(&mut self, now: Instant) -> usize {

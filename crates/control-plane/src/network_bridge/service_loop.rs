@@ -7,11 +7,301 @@ static LATEST_NETWORK_OBSERVABILITY_SNAPSHOTS: OnceLock<
 > = OnceLock::new();
 
 const NETWORK_SERVICE_START_RETRY_DELAY: Duration = Duration::from_secs(5);
+const NETWORK_LOOP_DIAGNOSTIC_INTERVAL: Duration = Duration::from_secs(1);
 /// Cap retry attempts so a stuck dependency (e.g. an unreachable relay) doesn't
 /// keep the network bridge in `retrying` forever. After this many consecutive
 /// retryable failures the bridge thread exits with status=Failed; operators
 /// see a clear terminal state and the container can be restarted by docker.
 const MAX_NETWORK_SERVICE_START_RETRIES: u32 = 5;
+
+#[derive(Debug, Default)]
+struct DurationStats {
+    count: u64,
+    total_ms: u128,
+    max_ms: u128,
+}
+
+impl DurationStats {
+    fn record(&mut self, elapsed: Duration) {
+        let elapsed_ms = elapsed.as_millis();
+        self.count = self.count.saturating_add(1);
+        self.total_ms = self.total_ms.saturating_add(elapsed_ms);
+        self.max_ms = self.max_ms.max(elapsed_ms);
+    }
+}
+
+#[derive(Debug)]
+struct NetworkLoopDiagnostics {
+    window_started_at: Instant,
+    iterations: u64,
+    busy_iterations: u64,
+    idle_sleeps: u64,
+    ticks_total: u64,
+    listening_ticks: u64,
+    transport_notice_ticks: u64,
+    connected_ticks: u64,
+    disconnected_ticks: u64,
+    event_ingested_ticks: u64,
+    summary_applied_ticks: u64,
+    rule_applied_ticks: u64,
+    checkpoint_applied_ticks: u64,
+    gossip_ignored_ticks: u64,
+    backfill_served_ticks: u64,
+    backfill_applied_ticks: u64,
+    backfill_failed_ticks: u64,
+    peer_relationship_updated_ticks: u64,
+    peer_relationship_failed_ticks: u64,
+    transport_notice_prefix_counts: HashMap<String, u64>,
+    connected_peer_counts: HashMap<String, u64>,
+    disconnected_peer_counts: HashMap<String, u64>,
+    tick_duration_stats: HashMap<String, DurationStats>,
+    phase_duration_stats: HashMap<String, DurationStats>,
+    snapshot_count: u64,
+    snapshot_total_ms: u128,
+    snapshot_max_ms: u128,
+}
+
+impl NetworkLoopDiagnostics {
+    fn new() -> Self {
+        Self::new_at(Instant::now())
+    }
+
+    fn new_at(window_started_at: Instant) -> Self {
+        Self {
+            window_started_at,
+            iterations: 0,
+            busy_iterations: 0,
+            idle_sleeps: 0,
+            ticks_total: 0,
+            listening_ticks: 0,
+            transport_notice_ticks: 0,
+            connected_ticks: 0,
+            disconnected_ticks: 0,
+            event_ingested_ticks: 0,
+            summary_applied_ticks: 0,
+            rule_applied_ticks: 0,
+            checkpoint_applied_ticks: 0,
+            gossip_ignored_ticks: 0,
+            backfill_served_ticks: 0,
+            backfill_applied_ticks: 0,
+            backfill_failed_ticks: 0,
+            peer_relationship_updated_ticks: 0,
+            peer_relationship_failed_ticks: 0,
+            transport_notice_prefix_counts: HashMap::new(),
+            connected_peer_counts: HashMap::new(),
+            disconnected_peer_counts: HashMap::new(),
+            tick_duration_stats: HashMap::new(),
+            phase_duration_stats: HashMap::new(),
+            snapshot_count: 0,
+            snapshot_total_ms: 0,
+            snapshot_max_ms: 0,
+        }
+    }
+
+    fn record_tick(&mut self, tick: &NetworkBridgeTick, elapsed: Duration) {
+        self.ticks_total = self.ticks_total.saturating_add(1);
+        self.record_duration("tick", tick_duration_label(tick), elapsed);
+        match tick {
+            NetworkBridgeTick::Listening { .. } => {
+                self.listening_ticks = self.listening_ticks.saturating_add(1);
+            }
+            NetworkBridgeTick::TransportNotice { detail } => {
+                self.transport_notice_ticks = self.transport_notice_ticks.saturating_add(1);
+                let prefix = transport_notice_prefix(detail).to_owned();
+                *self
+                    .transport_notice_prefix_counts
+                    .entry(prefix)
+                    .or_default() += 1;
+            }
+            NetworkBridgeTick::Connected { peer } => {
+                self.connected_ticks = self.connected_ticks.saturating_add(1);
+                *self
+                    .connected_peer_counts
+                    .entry(peer.to_string())
+                    .or_default() += 1;
+            }
+            NetworkBridgeTick::Disconnected { peer } => {
+                self.disconnected_ticks = self.disconnected_ticks.saturating_add(1);
+                *self
+                    .disconnected_peer_counts
+                    .entry(peer.to_string())
+                    .or_default() += 1;
+            }
+            NetworkBridgeTick::EventIngested { .. } => {
+                self.event_ingested_ticks = self.event_ingested_ticks.saturating_add(1);
+            }
+            NetworkBridgeTick::SummaryApplied { .. } => {
+                self.summary_applied_ticks = self.summary_applied_ticks.saturating_add(1);
+            }
+            NetworkBridgeTick::RuleApplied { .. } => {
+                self.rule_applied_ticks = self.rule_applied_ticks.saturating_add(1);
+            }
+            NetworkBridgeTick::CheckpointApplied { .. } => {
+                self.checkpoint_applied_ticks = self.checkpoint_applied_ticks.saturating_add(1);
+            }
+            NetworkBridgeTick::GossipIgnored { .. } => {
+                self.gossip_ignored_ticks = self.gossip_ignored_ticks.saturating_add(1);
+            }
+            NetworkBridgeTick::BackfillServed { .. } => {
+                self.backfill_served_ticks = self.backfill_served_ticks.saturating_add(1);
+            }
+            NetworkBridgeTick::BackfillApplied { .. } => {
+                self.backfill_applied_ticks = self.backfill_applied_ticks.saturating_add(1);
+            }
+            NetworkBridgeTick::BackfillFailed { .. } => {
+                self.backfill_failed_ticks = self.backfill_failed_ticks.saturating_add(1);
+            }
+            NetworkBridgeTick::PeerRelationshipUpdated { .. } => {
+                self.peer_relationship_updated_ticks =
+                    self.peer_relationship_updated_ticks.saturating_add(1);
+            }
+            NetworkBridgeTick::PeerRelationshipFailed { .. } => {
+                self.peer_relationship_failed_ticks =
+                    self.peer_relationship_failed_ticks.saturating_add(1);
+            }
+        }
+    }
+
+    fn record_iteration(&mut self, did_work: bool) {
+        self.iterations = self.iterations.saturating_add(1);
+        if did_work {
+            self.busy_iterations = self.busy_iterations.saturating_add(1);
+        }
+    }
+
+    fn record_idle_sleep(&mut self) {
+        self.idle_sleeps = self.idle_sleeps.saturating_add(1);
+    }
+
+    fn record_snapshot_duration(&mut self, elapsed: Duration) {
+        let elapsed_ms = elapsed.as_millis();
+        self.snapshot_count = self.snapshot_count.saturating_add(1);
+        self.snapshot_total_ms = self.snapshot_total_ms.saturating_add(elapsed_ms);
+        self.snapshot_max_ms = self.snapshot_max_ms.max(elapsed_ms);
+        self.record_phase_duration("observability_snapshot", elapsed);
+    }
+
+    fn record_phase_duration(&mut self, phase: &'static str, elapsed: Duration) {
+        self.record_duration("phase", phase.to_owned(), elapsed);
+    }
+
+    fn record_duration(&mut self, kind: &'static str, label: String, elapsed: Duration) {
+        let stats = match kind {
+            "tick" => &mut self.tick_duration_stats,
+            "phase" => &mut self.phase_duration_stats,
+            _ => return,
+        };
+        stats.entry(label).or_default().record(elapsed);
+    }
+
+    fn maybe_emit(&mut self, now: Instant) -> Option<String> {
+        let elapsed = now.saturating_duration_since(self.window_started_at);
+        if elapsed < NETWORK_LOOP_DIAGNOSTIC_INTERVAL {
+            return None;
+        }
+        let line = self.has_activity().then(|| self.render(elapsed));
+        *self = Self::new_at(now);
+        line
+    }
+
+    fn has_activity(&self) -> bool {
+        self.busy_iterations > 0 || self.ticks_total > 0
+    }
+
+    fn render(&self, elapsed: Duration) -> String {
+        format!(
+            "network bridge loop diagnostics: window_ms={} iterations={} busy_iterations={} idle_sleeps={} ticks_total={} listening={} transport_notice={} connected={} disconnected={} event_ingested={} summary_applied={} rule_applied={} checkpoint_applied={} gossip_ignored={} backfill_served={} backfill_applied={} backfill_failed={} peer_relationship_updated={} peer_relationship_failed={} transport_notice_prefixes={} connected_peers={} disconnected_peers={} tick_durations={} phase_durations={} snapshots={} snapshot_total_ms={} snapshot_max_ms={}",
+            elapsed.as_millis(),
+            self.iterations,
+            self.busy_iterations,
+            self.idle_sleeps,
+            self.ticks_total,
+            self.listening_ticks,
+            self.transport_notice_ticks,
+            self.connected_ticks,
+            self.disconnected_ticks,
+            self.event_ingested_ticks,
+            self.summary_applied_ticks,
+            self.rule_applied_ticks,
+            self.checkpoint_applied_ticks,
+            self.gossip_ignored_ticks,
+            self.backfill_served_ticks,
+            self.backfill_applied_ticks,
+            self.backfill_failed_ticks,
+            self.peer_relationship_updated_ticks,
+            self.peer_relationship_failed_ticks,
+            format_counts(&self.transport_notice_prefix_counts),
+            format_counts(&self.connected_peer_counts),
+            format_counts(&self.disconnected_peer_counts),
+            format_duration_stats(&self.tick_duration_stats),
+            format_duration_stats(&self.phase_duration_stats),
+            self.snapshot_count,
+            self.snapshot_total_ms,
+            self.snapshot_max_ms,
+        )
+    }
+}
+
+fn tick_duration_label(tick: &NetworkBridgeTick) -> String {
+    match tick {
+        NetworkBridgeTick::Listening { .. } => "listening".to_owned(),
+        NetworkBridgeTick::TransportNotice { detail } => {
+            format!("transport_notice:{}", transport_notice_prefix(detail))
+        }
+        NetworkBridgeTick::Connected { .. } => "connected".to_owned(),
+        NetworkBridgeTick::Disconnected { .. } => "disconnected".to_owned(),
+        NetworkBridgeTick::EventIngested { .. } => "event_ingested".to_owned(),
+        NetworkBridgeTick::SummaryApplied { .. } => "summary_applied".to_owned(),
+        NetworkBridgeTick::RuleApplied { .. } => "rule_applied".to_owned(),
+        NetworkBridgeTick::CheckpointApplied { .. } => "checkpoint_applied".to_owned(),
+        NetworkBridgeTick::GossipIgnored { .. } => "gossip_ignored".to_owned(),
+        NetworkBridgeTick::BackfillServed { .. } => "backfill_served".to_owned(),
+        NetworkBridgeTick::BackfillApplied { .. } => "backfill_applied".to_owned(),
+        NetworkBridgeTick::BackfillFailed { .. } => "backfill_failed".to_owned(),
+        NetworkBridgeTick::PeerRelationshipUpdated { .. } => "peer_relationship_updated".to_owned(),
+        NetworkBridgeTick::PeerRelationshipFailed { .. } => "peer_relationship_failed".to_owned(),
+    }
+}
+
+fn transport_notice_prefix(detail: &str) -> &str {
+    detail
+        .split_whitespace()
+        .next()
+        .unwrap_or("empty_transport_notice")
+}
+
+fn format_counts(counts: &HashMap<String, u64>) -> String {
+    if counts.is_empty() {
+        return "[]".to_owned();
+    }
+    let mut entries = counts.iter().collect::<Vec<_>>();
+    entries.sort_by_key(|(key, _)| *key);
+    let body = entries
+        .into_iter()
+        .map(|(key, count)| format!("{key}:{count}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("[{body}]")
+}
+
+fn format_duration_stats(stats: &HashMap<String, DurationStats>) -> String {
+    if stats.is_empty() {
+        return "[]".to_owned();
+    }
+    let mut entries = stats.iter().collect::<Vec<_>>();
+    entries.sort_by_key(|(key, _)| *key);
+    let body = entries
+        .into_iter()
+        .map(|(key, stats)| {
+            format!(
+                "{key}:count={},total_ms={},max_ms={}",
+                stats.count, stats.total_ms, stats.max_ms
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("[{body}]")
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum NetworkServiceStatus {
@@ -487,31 +777,41 @@ fn run_background_network_service_with_hook(
     let mut announced_peers: HashMap<String, Instant> = HashMap::new();
     let mut last_published_seq = node.head_seq()?;
     let mut next_discovery_bootnode_query_at = Instant::now();
+    let mut loop_diagnostics = NetworkLoopDiagnostics::new();
+    let debug_diagnostics = diagnostics::debug_diagnostics_enabled();
 
     loop {
         let mut did_work = false;
+        let try_tick_drain_started_at = Instant::now();
         loop {
+            let try_tick_started_at = Instant::now();
             match service.try_tick(&mut node) {
-                Ok(Some(NetworkBridgeTick::Listening { address })) => {
+                Ok(Some(tick)) => {
+                    loop_diagnostics.record_tick(&tick, try_tick_started_at.elapsed());
                     did_work = true;
-                    if !announced_listen {
-                        crate::udp_announce::announce_startup(
-                            "p2p-startup",
-                            Some(&address.to_string()),
-                            Some(&node_id),
-                        );
-                        announced_listen = true;
+                    match tick {
+                        NetworkBridgeTick::Listening { address } => {
+                            if !announced_listen {
+                                crate::udp_announce::announce_startup(
+                                    "p2p-startup",
+                                    Some(&address.to_string()),
+                                    Some(&node_id),
+                                );
+                                announced_listen = true;
+                            }
+                        }
+                        NetworkBridgeTick::Connected { peer } => {
+                            let peer_str = peer.to_string();
+                            if record_peer_announcement(
+                                &mut announced_peers,
+                                &peer_str,
+                                Instant::now(),
+                            ) {
+                                eprintln!("p2p peer connected: {peer}");
+                            }
+                        }
+                        _ => {}
                     }
-                }
-                Ok(Some(NetworkBridgeTick::Connected { peer })) => {
-                    did_work = true;
-                    let peer_str = peer.to_string();
-                    if record_peer_announcement(&mut announced_peers, &peer_str, Instant::now()) {
-                        eprintln!("p2p peer connected: {peer}");
-                    }
-                }
-                Ok(Some(_)) => {
-                    did_work = true;
                 }
                 Ok(None) => break,
                 Err(err) => {
@@ -521,6 +821,9 @@ fn run_background_network_service_with_hook(
                 }
             }
         }
+        loop_diagnostics
+            .record_phase_duration("try_tick_drain", try_tick_drain_started_at.elapsed());
+        let pending_commands_started_at = Instant::now();
         let processed_pending_commands =
             match process_pending_network_commands(&mut node, &mut service, state_dir) {
                 Ok(count) => count,
@@ -529,12 +832,21 @@ fn run_background_network_service_with_hook(
                     0
                 }
             };
+        loop_diagnostics
+            .record_phase_duration("pending_commands", pending_commands_started_at.elapsed());
         if processed_pending_commands > 0 {
             did_work = true;
         }
-        if service.expire_stale_connected_peers(Instant::now()) > 0 {
+        let expire_connected_started_at = Instant::now();
+        let expired_connected = service.expire_stale_connected_peers(Instant::now());
+        loop_diagnostics.record_phase_duration(
+            "expire_stale_connected_peers",
+            expire_connected_started_at.elapsed(),
+        );
+        if expired_connected > 0 {
             did_work = true;
         }
+        let reconnect_started_at = Instant::now();
         match service
             .run_reconnect_supervision()
             .context("network bridge run reconnect supervision")
@@ -552,6 +864,9 @@ fn run_background_network_service_with_hook(
                 );
             }
         }
+        loop_diagnostics
+            .record_phase_duration("reconnect_supervision", reconnect_started_at.elapsed());
+        let publish_started_at = Instant::now();
         match publish_pending_scoped_updates(&mut service, &node, &node_id, last_published_seq)
             .context("network bridge publish pending scoped updates")
         {
@@ -571,7 +886,12 @@ fn run_background_network_service_with_hook(
                 );
             }
         }
+        loop_diagnostics.record_phase_duration(
+            "publish_pending_scoped_updates",
+            publish_started_at.elapsed(),
+        );
         if Instant::now() >= next_discovery_bootnode_query_at {
+            let discovery_started_at = Instant::now();
             match discovery_bootnode_settings_from_state_dir(state_dir) {
                 Ok(settings) => {
                     next_discovery_bootnode_query_at = Instant::now() + settings.interval;
@@ -613,10 +933,19 @@ fn run_background_network_service_with_hook(
                     eprintln!("discovery bootnode query skipped: {err}");
                 }
             }
+            loop_diagnostics
+                .record_phase_duration("discovery_bootnode_query", discovery_started_at.elapsed());
         }
-        if service.expire_stale_backfill_requests(Instant::now()) > 0 {
+        let expire_backfill_started_at = Instant::now();
+        let expired_backfills = service.expire_stale_backfill_requests(Instant::now());
+        loop_diagnostics.record_phase_duration(
+            "expire_stale_backfill_requests",
+            expire_backfill_started_at.elapsed(),
+        );
+        if expired_backfills > 0 {
             did_work = true;
         }
+        let anti_entropy_started_at = Instant::now();
         match service
             .run_anti_entropy(&node)
             .context("network bridge run anti-entropy")
@@ -634,15 +963,28 @@ fn run_background_network_service_with_hook(
                 );
             }
         }
+        loop_diagnostics.record_phase_duration("anti_entropy", anti_entropy_started_at.elapsed());
+        let snapshot_started_at = Instant::now();
         match service.observability_snapshot(&node) {
             Ok(snapshot) => store_latest_network_observability_snapshot(state_dir, snapshot),
             Err(err) => eprintln!("network bridge observability snapshot failed: {err}"),
         }
+        loop_diagnostics.record_snapshot_duration(snapshot_started_at.elapsed());
         if let Some(hook) = post_tick_hook {
+            let post_tick_hook_started_at = Instant::now();
             hook(&mut node, state_dir);
+            loop_diagnostics
+                .record_phase_duration("post_tick_hook", post_tick_hook_started_at.elapsed());
         }
+        loop_diagnostics.record_iteration(did_work);
         if !did_work {
+            loop_diagnostics.record_idle_sleep();
             thread::sleep(IDLE_NETWORK_SLEEP);
+        }
+        if let Some(line) = loop_diagnostics.maybe_emit(Instant::now())
+            && debug_diagnostics
+        {
+            eprintln!("{line}");
         }
     }
 }
@@ -706,5 +1048,87 @@ mod tests {
         assert!(!is_retryable_network_service_startup_error(
             "network bridge startup validate p2p config: invalid listen address"
         ));
+    }
+
+    #[test]
+    fn loop_diagnostics_aggregates_tick_and_snapshot_counts() {
+        let started_at = Instant::now();
+        let mut diagnostics = NetworkLoopDiagnostics::new_at(started_at);
+
+        diagnostics.record_tick(
+            &NetworkBridgeTick::TransportNotice {
+                detail: "gossip_neighbor_up peer=peer-a scope=Global kind=Events".to_owned(),
+            },
+            Duration::from_millis(11),
+        );
+        diagnostics.record_tick(
+            &NetworkBridgeTick::TransportNotice {
+                detail: "peer_discovered peer=peer-b source=bootstrap address=peer-b".to_owned(),
+            },
+            Duration::from_millis(13),
+        );
+        diagnostics.record_iteration(true);
+        diagnostics.record_iteration(false);
+        diagnostics.record_idle_sleep();
+        diagnostics.record_phase_duration("try_tick_drain", Duration::from_millis(30));
+        diagnostics.record_phase_duration("anti_entropy", Duration::from_millis(2));
+        diagnostics.record_snapshot_duration(Duration::from_millis(3));
+        diagnostics.record_snapshot_duration(Duration::from_millis(7));
+
+        let line = diagnostics
+            .maybe_emit(started_at + NETWORK_LOOP_DIAGNOSTIC_INTERVAL)
+            .expect("diagnostic line emitted after interval");
+
+        assert!(line.contains("iterations=2"));
+        assert!(line.contains("busy_iterations=1"));
+        assert!(line.contains("idle_sleeps=1"));
+        assert!(line.contains("ticks_total=2"));
+        assert!(line.contains("transport_notice=2"));
+        assert!(
+            line.contains("transport_notice_prefixes=[gossip_neighbor_up:1,peer_discovered:1]")
+        );
+        assert!(line.contains("transport_notice:gossip_neighbor_up:count=1,total_ms=11,max_ms=11"));
+        assert!(line.contains("transport_notice:peer_discovered:count=1,total_ms=13,max_ms=13"));
+        assert!(line.contains("anti_entropy:count=1,total_ms=2,max_ms=2"));
+        assert!(line.contains("observability_snapshot:count=2,total_ms=10,max_ms=7"));
+        assert!(line.contains("try_tick_drain:count=1,total_ms=30,max_ms=30"));
+        assert!(line.contains("snapshots=2"));
+        assert!(line.contains("snapshot_total_ms=10"));
+        assert!(line.contains("snapshot_max_ms=7"));
+        assert_eq!(diagnostics.iterations, 0);
+        assert_eq!(diagnostics.ticks_total, 0);
+    }
+
+    #[test]
+    fn loop_diagnostics_waits_for_reporting_interval() {
+        let started_at = Instant::now();
+        let mut diagnostics = NetworkLoopDiagnostics::new_at(started_at);
+
+        diagnostics.record_iteration(true);
+
+        assert!(
+            diagnostics
+                .maybe_emit(started_at + Duration::from_millis(999))
+                .is_none()
+        );
+        assert_eq!(diagnostics.iterations, 1);
+    }
+
+    #[test]
+    fn loop_diagnostics_suppresses_idle_windows() {
+        let started_at = Instant::now();
+        let mut diagnostics = NetworkLoopDiagnostics::new_at(started_at);
+
+        diagnostics.record_iteration(false);
+        diagnostics.record_idle_sleep();
+        diagnostics.record_snapshot_duration(Duration::from_millis(5));
+
+        assert!(
+            diagnostics
+                .maybe_emit(started_at + NETWORK_LOOP_DIAGNOSTIC_INTERVAL)
+                .is_none()
+        );
+        assert_eq!(diagnostics.iterations, 0);
+        assert_eq!(diagnostics.snapshot_count, 0);
     }
 }

@@ -1,7 +1,78 @@
+use super::backfill::{
+    BackfillServeMetrics, backfill_response_for_request, backfill_response_for_request_with_metrics,
+};
 use super::*;
 
 fn should_record_backfill_response_diagnostic(events_applied: usize) -> bool {
     events_applied > 0
+}
+
+fn record_backfill_serve_diagnostic(
+    state_dir: Option<&Path>,
+    peer: &NetworkNodeId,
+    request: &BackfillRequest,
+    request_id: crate::network_p2p::InboundRequestId,
+    authorized: bool,
+    events: usize,
+    metrics: Option<&BackfillServeMetrics>,
+    send_ms: u64,
+    status: &'static str,
+    error: Option<&str>,
+) {
+    if !diagnostics::debug_diagnostics_enabled() {
+        return;
+    }
+    let mut details = json!({
+        "peer_id": peer.to_string(),
+        "request_id": request_id.to_string(),
+        "authorized": authorized,
+        "scope": scope_hint_label(&request.scope),
+        "feed_key": request.feed_key,
+        "from_event_seq": request.from_event_seq,
+        "requested_limit": request.limit,
+        "known_event_ids": request.known_event_ids.len(),
+        "events": events,
+        "send_ms": send_ms,
+    });
+    if let Some(metrics) = metrics
+        && let Some(object) = details.as_object_mut()
+    {
+        object.insert(
+            "metrics".to_owned(),
+            json!({
+                "head_scan_ms": metrics.head_scan_ms,
+                "page_read_ms": metrics.page_read_ms,
+                "sync_filter_ms": metrics.sync_filter_ms,
+                "lane_filter_ms": metrics.lane_filter_ms,
+                "pages_read": metrics.pages_read,
+                "rows_read": metrics.rows_read,
+                "events_returned": metrics.events_returned,
+                "known_event_skips": metrics.known_event_skips,
+                "sync_filter_skips": metrics.sync_filter_skips,
+                "lane_filter_skips": metrics.lane_filter_skips,
+            }),
+        );
+    }
+    if let Some(error) = error
+        && let Some(object) = details.as_object_mut()
+    {
+        object.insert("error".to_owned(), json!(error));
+    }
+
+    diagnostics::record_diagnostic(
+        state_dir,
+        diagnostics::DiagnosticEvent::new(
+            if error.is_some() { "warn" } else { "info" },
+            "transport",
+            "backfill.serve",
+            status,
+            format!("backfill serve {status} peer={peer} request_id={request_id}"),
+        )
+        .object("peer", Some(peer.to_string()))
+        .source_node_id(Some(peer.to_string()))
+        .scope(&request.scope)
+        .details(details),
+    );
 }
 
 fn is_missing_iroh_contact_material_error(error: &str) -> bool {
@@ -804,14 +875,29 @@ impl NetworkBridgeService {
                 request_id,
             } => {
                 self.record_peer_liveness(peer.clone());
-                let response = if self.inbound_backfill_authorized(&peer, &request) {
-                    backfill_response_for_request(
-                        node,
-                        &self.local_peer_id().to_string(),
-                        &request,
-                        self.runtime.config().max_backfill_events,
-                        self.runtime.config().max_backfill_events_hard_limit,
-                    )?
+                let authorized = self.inbound_backfill_authorized(&peer, &request);
+                let debug_diagnostics = diagnostics::debug_diagnostics_enabled();
+                let mut serve_metrics = None;
+                let response = if authorized {
+                    if debug_diagnostics {
+                        let (response, metrics) = backfill_response_for_request_with_metrics(
+                            node,
+                            &self.local_peer_id().to_string(),
+                            &request,
+                            self.runtime.config().max_backfill_events,
+                            self.runtime.config().max_backfill_events_hard_limit,
+                        )?;
+                        serve_metrics = Some(metrics);
+                        response
+                    } else {
+                        backfill_response_for_request(
+                            node,
+                            &self.local_peer_id().to_string(),
+                            &request,
+                            self.runtime.config().max_backfill_events,
+                            self.runtime.config().max_backfill_events_hard_limit,
+                        )?
+                    }
                 } else {
                     crate::network_p2p::BackfillResponse {
                         scope: request.scope.clone(),
@@ -822,18 +908,85 @@ impl NetworkBridgeService {
                     }
                 };
                 let events = response.events.len();
+                let send_started_at = debug_diagnostics.then(Instant::now);
                 match self.runtime.send_backfill_response(request_id, response) {
-                    Ok(()) => Ok(NetworkBridgeTick::BackfillServed { peer, events }),
+                    Ok(()) => {
+                        if debug_diagnostics {
+                            let send_ms = send_started_at
+                                .map(|started_at| {
+                                    u64::try_from(started_at.elapsed().as_millis())
+                                        .unwrap_or(u64::MAX)
+                                })
+                                .unwrap_or(0);
+                            record_backfill_serve_diagnostic(
+                                self.state_dir.as_deref(),
+                                &peer,
+                                &request,
+                                request_id,
+                                authorized,
+                                events,
+                                serve_metrics.as_ref(),
+                                send_ms,
+                                "ok",
+                                None,
+                            );
+                        }
+                        Ok(NetworkBridgeTick::BackfillServed { peer, events })
+                    }
                     Err(error)
                         if error
                             .to_string()
                             .contains("backfill response channel closed") =>
                     {
+                        let error_string = error.to_string();
+                        if debug_diagnostics {
+                            let send_ms = send_started_at
+                                .map(|started_at| {
+                                    u64::try_from(started_at.elapsed().as_millis())
+                                        .unwrap_or(u64::MAX)
+                                })
+                                .unwrap_or(0);
+                            record_backfill_serve_diagnostic(
+                                self.state_dir.as_deref(),
+                                &peer,
+                                &request,
+                                request_id,
+                                authorized,
+                                events,
+                                serve_metrics.as_ref(),
+                                send_ms,
+                                "dropped",
+                                Some(&error_string),
+                            );
+                        }
                         Ok(NetworkBridgeTick::TransportNotice {
                             detail: format!("backfill_response_dropped peer={peer} reason={error}"),
                         })
                     }
-                    Err(error) => Err(error),
+                    Err(error) => {
+                        let error_string = error.to_string();
+                        if debug_diagnostics {
+                            let send_ms = send_started_at
+                                .map(|started_at| {
+                                    u64::try_from(started_at.elapsed().as_millis())
+                                        .unwrap_or(u64::MAX)
+                                })
+                                .unwrap_or(0);
+                            record_backfill_serve_diagnostic(
+                                self.state_dir.as_deref(),
+                                &peer,
+                                &request,
+                                request_id,
+                                authorized,
+                                events,
+                                serve_metrics.as_ref(),
+                                send_ms,
+                                "failed",
+                                Some(&error_string),
+                            );
+                        }
+                        Err(error)
+                    }
                 }
             }
             NetworkRuntimeEvent::BackfillResponse {
@@ -841,16 +994,8 @@ impl NetworkBridgeService {
                 request_id,
                 response,
             } => {
-                self.record_peer_scope_activity(peer.clone(), &response.scope);
-                self.record_peer_remote_head_event_ids(
-                    peer.clone(),
-                    &response.scope,
-                    response.feed_key.as_deref(),
-                    &response.head_event_ids,
-                );
                 let applied_envelopes = ingest_backfill_response_events(node, &response)?;
                 let events = applied_envelopes.len();
-                self.mark_backfill_completed(peer.clone(), request_id);
                 let mut unknown_empty_head = false;
                 if response.events.is_empty() {
                     for event_id in &response.head_event_ids {
@@ -860,20 +1005,15 @@ impl NetworkBridgeService {
                         }
                     }
                 }
-                if unknown_empty_head {
-                    self.reset_peer_backfill_cursor(
-                        peer.clone(),
-                        &response.scope,
-                        response.feed_key.as_deref(),
-                    );
-                } else {
-                    self.record_peer_backfill_cursor(
-                        peer.clone(),
-                        &response.scope,
-                        response.feed_key.as_deref(),
-                        response.next_from_event_seq,
-                    );
-                }
+                self.record_peer_backfill_response_progress(
+                    peer.clone(),
+                    &response.scope,
+                    response.feed_key.as_deref(),
+                    &response.head_event_ids,
+                    request_id,
+                    response.next_from_event_seq,
+                    unknown_empty_head,
+                );
                 if should_record_backfill_response_diagnostic(events) {
                     diagnostics::record_diagnostic(
                         self.state_dir.as_deref(),
@@ -1003,41 +1143,117 @@ impl NetworkBridgeService {
                 request_id,
             } => {
                 self.record_peer_liveness(peer.clone());
+                let received_at_ms = observed_at_ms();
                 let local_node_id = self.local_peer_id().to_string();
-                let now = observed_at_ms();
-                let response = if request.source_node_id != peer.to_string() {
+                let request_source_node_id = request.source_node_id.clone();
+                let request_target_node_id = request.target_node_id.clone();
+                diagnostics::record_diagnostic(
+                    self.state_dir.as_deref(),
+                    diagnostics::DiagnosticEvent::new(
+                        "info",
+                        "transport",
+                        "contact_material.inbound.request",
+                        "received",
+                        format!(
+                            "contact_material_request_received peer={peer} request_id={request_id}"
+                        ),
+                    )
+                    .object("peer", Some(peer.to_string()))
+                    .source_node_id(Some(peer.to_string()))
+                    .details(json!({
+                        "peer_id": peer.to_string(),
+                        "request_id": request_id.to_string(),
+                        "source_node_id": &request_source_node_id,
+                        "target_node_id": &request_target_node_id,
+                    })),
+                );
+                let response = if request_source_node_id != peer.to_string() {
                     RawContactMaterialResponse {
-                        source_node_id: local_node_id,
-                        target_node_id: request.source_node_id,
+                        source_node_id: local_node_id.clone(),
+                        target_node_id: request_source_node_id.clone(),
                         applied: false,
                         contact_material: None,
                         detail: Some("contact material request source_node_id mismatch".to_owned()),
-                        updated_at: now,
+                        updated_at: received_at_ms,
                     }
                 } else if let Some(state_dir) = self.state_dir.as_ref() {
                     RawContactMaterialResponse {
                         source_node_id: self.local_peer_id().to_string(),
-                        target_node_id: request.source_node_id,
+                        target_node_id: request_source_node_id.clone(),
                         applied: true,
                         contact_material: Some(build_contact_material(
                             state_dir,
                             &self.local_peer_id().to_string(),
                         )?),
                         detail: None,
-                        updated_at: now,
+                        updated_at: received_at_ms,
                     }
                 } else {
                     RawContactMaterialResponse {
                         source_node_id: self.local_peer_id().to_string(),
-                        target_node_id: request.source_node_id,
+                        target_node_id: request_source_node_id.clone(),
                         applied: false,
                         contact_material: None,
                         detail: Some("state_dir is not configured".to_owned()),
-                        updated_at: now,
+                        updated_at: received_at_ms,
                     }
                 };
-                self.runtime
-                    .send_contact_material_response(request_id, response)?;
+                let response_applied = response.applied;
+                let response_detail = response.detail.clone();
+                if let Err(err) = self
+                    .runtime
+                    .send_contact_material_response(request_id, response)
+                {
+                    let completed_at_ms = observed_at_ms();
+                    diagnostics::record_diagnostic(
+                        self.state_dir.as_deref(),
+                        diagnostics::DiagnosticEvent::new(
+                            "warn",
+                            "transport",
+                            "contact_material.inbound.response",
+                            "failed",
+                            format!(
+                                "contact_material_response_failed peer={peer} request_id={request_id} error={err}"
+                            ),
+                        )
+                        .object("peer", Some(peer.to_string()))
+                        .source_node_id(Some(peer.to_string()))
+                        .details(json!({
+                            "peer_id": peer.to_string(),
+                            "request_id": request_id.to_string(),
+                            "source_node_id": &request_source_node_id,
+                            "target_node_id": &request_target_node_id,
+                            "duration_ms": completed_at_ms.saturating_sub(received_at_ms),
+                            "error": err.to_string(),
+                        })),
+                    );
+                    return Err(err);
+                }
+                let completed_at_ms = observed_at_ms();
+                let response_status = if response_applied { "ok" } else { "rejected" };
+                diagnostics::record_diagnostic(
+                    self.state_dir.as_deref(),
+                    diagnostics::DiagnosticEvent::new(
+                        "info",
+                        "transport",
+                        "contact_material.inbound.response",
+                        response_status,
+                        format!(
+                            "contact_material_response_sent peer={peer} request_id={request_id} status={response_status}"
+                        ),
+                    )
+                    .object("peer", Some(peer.to_string()))
+                    .source_node_id(Some(peer.to_string()))
+                    .details(json!({
+                        "peer_id": peer.to_string(),
+                        "request_id": request_id.to_string(),
+                        "source_node_id": &request_source_node_id,
+                        "target_node_id": &request_target_node_id,
+                        "duration_ms": completed_at_ms.saturating_sub(received_at_ms),
+                        "applied": response_applied,
+                        "detail": response_detail,
+                    })),
+                );
                 Ok(NetworkBridgeTick::TransportNotice {
                     detail: format!("contact_material_served peer={peer}"),
                 })
@@ -1121,6 +1337,25 @@ impl NetworkBridgeService {
             } => {
                 self.pending_contact_material_requests.remove(&request_id);
                 self.mark_peer_control_stream_failed(peer.clone());
+                diagnostics::record_diagnostic(
+                    self.state_dir.as_deref(),
+                    diagnostics::DiagnosticEvent::new(
+                        "warn",
+                        "transport",
+                        "contact_material.outbound",
+                        "failed",
+                        format!(
+                            "contact_material_outbound_failure peer={peer} request_id={request_id:?} error={error}"
+                        ),
+                    )
+                    .object("peer", Some(peer.to_string()))
+                    .source_node_id(Some(peer.to_string()))
+                    .details(json!({
+                        "peer_id": peer.to_string(),
+                        "request_id": format!("{request_id:?}"),
+                        "error": &error,
+                    })),
+                );
                 Ok(NetworkBridgeTick::TransportNotice {
                     detail: format!(
                         "contact_material_outbound_failure peer={peer} request_id={request_id:?} error={error}"
@@ -1128,6 +1363,22 @@ impl NetworkBridgeService {
                 })
             }
             NetworkRuntimeEvent::ContactMaterialInboundFailure { peer, error } => {
+                diagnostics::record_diagnostic(
+                    self.state_dir.as_deref(),
+                    diagnostics::DiagnosticEvent::new(
+                        "warn",
+                        "transport",
+                        "contact_material.inbound",
+                        "failed",
+                        format!("contact_material_inbound_failure peer={peer} error={error}"),
+                    )
+                    .object("peer", Some(peer.to_string()))
+                    .source_node_id(Some(peer.to_string()))
+                    .details(json!({
+                        "peer_id": peer.to_string(),
+                        "error": &error,
+                    })),
+                );
                 Ok(NetworkBridgeTick::TransportNotice {
                     detail: format!("contact_material_inbound_failure peer={peer} error={error}"),
                 })
@@ -1618,11 +1869,110 @@ impl NetworkBridgeService {
 
 #[cfg(test)]
 mod tests {
-    use super::should_record_backfill_response_diagnostic;
+    use super::*;
+    use std::env;
+    use std::fs;
+    use std::path::PathBuf;
+
+    struct EnvVarGuard {
+        key: &'static str,
+        prev: Option<String>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: Option<&str>) -> Self {
+            let prev = env::var(key).ok();
+            // SAFETY: this test restores the env var before returning.
+            unsafe {
+                if let Some(value) = value {
+                    env::set_var(key, value);
+                } else {
+                    env::remove_var(key);
+                }
+            }
+            Self { key, prev }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            // SAFETY: this guard restores the env var value captured at construction.
+            unsafe {
+                if let Some(prev) = &self.prev {
+                    env::set_var(self.key, prev);
+                } else {
+                    env::remove_var(self.key);
+                }
+            }
+        }
+    }
+
+    fn service_runtime_test_dir(label: &str) -> PathBuf {
+        let dir = env::temp_dir().join(format!(
+            "wattswarm-network-bridge-{label}-{}-{}",
+            std::process::id(),
+            observed_at_ms()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("create temp dir");
+        dir
+    }
 
     #[test]
     fn backfill_response_diagnostics_skip_empty_responses() {
         assert!(!should_record_backfill_response_diagnostic(0));
         assert!(should_record_backfill_response_diagnostic(1));
+    }
+
+    #[test]
+    fn backfill_serve_diagnostics_require_debug_env() {
+        let dir = service_runtime_test_dir("backfill-serve-debug-env");
+        let peer =
+            NetworkNodeId::new("9b196ed13c0ec849dd7b8bf5add0b07ad2c88c1bf5d79e8591f6681ab1803258")
+                .expect("peer id");
+        let request = BackfillRequest {
+            scope: SwarmScope::Global,
+            from_event_seq: 0,
+            limit: 8,
+            feed_key: None,
+            known_event_ids: Vec::new(),
+        };
+        let request_id: crate::network_p2p::InboundRequestId =
+            serde_json::from_value(json!(7)).expect("request id");
+
+        let disabled = EnvVarGuard::set(diagnostics::ENV_NETWORK_DEBUG_DIAGNOSTICS, None);
+        record_backfill_serve_diagnostic(
+            Some(&dir),
+            &peer,
+            &request,
+            request_id,
+            true,
+            0,
+            None,
+            0,
+            "ok",
+            None,
+        );
+        assert!(!dir.join("diagnostics/wattswarm_node.jsonl").exists());
+        drop(disabled);
+
+        let _enabled = EnvVarGuard::set(diagnostics::ENV_NETWORK_DEBUG_DIAGNOSTICS, Some("1"));
+        record_backfill_serve_diagnostic(
+            Some(&dir),
+            &peer,
+            &request,
+            request_id,
+            true,
+            0,
+            None,
+            0,
+            "ok",
+            None,
+        );
+        let raw = fs::read_to_string(dir.join("diagnostics/wattswarm_node.jsonl"))
+            .expect("diagnostic log");
+        assert!(raw.contains("\"phase\":\"backfill.serve\""));
+
+        let _ = fs::remove_dir_all(dir);
     }
 }

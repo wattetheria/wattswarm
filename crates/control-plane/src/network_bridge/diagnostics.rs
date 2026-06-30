@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::HashSet;
+use std::env;
 use std::fs::{self, OpenOptions};
 use std::io::Write as _;
 use std::path::Path;
@@ -10,6 +11,13 @@ use uuid::Uuid;
 use crate::network_p2p::SwarmScope;
 
 const DIAGNOSTIC_LOG_RELATIVE_PATH: &str = "diagnostics/wattswarm_node.jsonl";
+pub(super) const ENV_NETWORK_DEBUG_DIAGNOSTICS: &str = "WATTSWARM_NETWORK_DEBUG_DIAGNOSTICS";
+
+pub(super) fn debug_diagnostics_enabled() -> bool {
+    env::var(ENV_NETWORK_DEBUG_DIAGNOSTICS)
+        .ok()
+        .is_some_and(|value| matches!(value.trim(), "1" | "true" | "TRUE" | "yes" | "on" | "ON"))
+}
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct DiagnosticEntry {
