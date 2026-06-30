@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::fs;
 use std::path::Path as FsPath;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use wattswarm_crypto::NodeIdentity;
 use wattswarm_network_discovery::{
     DEFAULT_RECORD_TTL_MS, DiscoveryGeo, DiscoveryNodeRecordBody, DiscoveryRecordCapabilities,
@@ -28,6 +28,8 @@ const MAX_DISCOVERY_QUERY_LIMIT: usize = 200;
 const DISCOVERY_RECORDS_ROUTE: &str = "/api/network/discovery/records";
 const DEFAULT_DISCOVERY_RECORD_RADIUS_KM: f64 = 1000.0;
 const DISCOVERY_ANNOUNCE_TIMEOUT: Duration = Duration::from_secs(3);
+const DISCOVERY_RECORDS_PRUNE_INTERVAL: Duration = Duration::from_secs(30);
+const DISCOVERY_RECORDS_SNAPSHOT_INTERVAL: Duration = Duration::from_secs(30);
 const DISCOVERY_AGENT_CARD_ENABLED_ENV: &str = "WATTSWARM_DISCOVERY_AGENT_CARD_ENABLED";
 const DISCOVERY_AGENT_CARD_URL_ENV: &str = "WATTSWARM_DISCOVERY_AGENT_CARD_URL";
 const DISCOVERY_AGENT_CARD_TOKEN_ENV: &str = "WATTSWARM_DISCOVERY_AGENT_CARD_TOKEN";
@@ -137,9 +139,20 @@ pub(crate) async fn discovery_announce_record(
     let state_clone = state.clone();
     let response = run_blocking(move || -> Result<Value> {
         let now_ms = now_ms();
-        let mut table = load_discovery_records(&state_clone.state_dir, now_ms)?;
-        let status = table.announce_record(record.clone(), now_ms)?;
-        save_discovery_records(&state_clone.state_dir, &table, now_ms)?;
+        let status = {
+            let mut table = state_clone
+                .discovery_records
+                .write()
+                .map_err(|_| anyhow::anyhow!("discovery records lock poisoned"))?;
+            table.announce_record(record.clone(), now_ms)?
+        };
+        if matches!(
+            status,
+            DiscoveryRecordUpsert::Inserted | DiscoveryRecordUpsert::Updated
+        ) {
+            mark_discovery_records_dirty(&state_clone)?;
+        }
+        persist_discovery_records_if_due(&state_clone, now_ms)?;
         Ok(json!({
             "ok": true,
             "status": upsert_status(status),
@@ -173,11 +186,12 @@ pub(crate) async fn discovery_find_node(
     let state_clone = state.clone();
     let response = run_blocking(move || -> Result<Value> {
         let now_ms = now_ms();
-        let table = load_discovery_records(&state_clone.state_dir, now_ms)?;
-        Ok(json!({
-            "ok": true,
-            "record": table.find_node(&node_id, now_ms),
-        }))
+        read_discovery_records(&state_clone, now_ms, |table| {
+            Ok(json!({
+                "ok": true,
+                "record": table.find_node(&node_id, now_ms),
+            }))
+        })
     })
     .await?;
     Ok(Json(response))
@@ -196,17 +210,18 @@ pub(crate) async fn discovery_find_nearby(
         };
         origin.validate()?;
         let now_ms = now_ms();
-        let table = load_discovery_records(&state_clone.state_dir, now_ms)?;
-        let records = table.find_nearby(
-            &query.network_id,
-            &origin,
-            now_ms,
-            normalize_limit(query.limit),
-        );
-        Ok(json!({
-            "ok": true,
-            "records": records,
-        }))
+        read_discovery_records(&state_clone, now_ms, |table| {
+            let records = table.find_nearby(
+                &query.network_id,
+                &origin,
+                now_ms,
+                normalize_limit(query.limit),
+            );
+            Ok(json!({
+                "ok": true,
+                "records": records,
+            }))
+        })
     })
     .await?;
     Ok(Json(response))
@@ -219,17 +234,18 @@ pub(crate) async fn discovery_find_capability(
     let state_clone = state.clone();
     let response = run_blocking(move || -> Result<Value> {
         let now_ms = now_ms();
-        let table = load_discovery_records(&state_clone.state_dir, now_ms)?;
-        let records = table.find_capability(
-            &query.network_id,
-            &query.capability,
-            now_ms,
-            normalize_limit(query.limit),
-        );
-        Ok(json!({
-            "ok": true,
-            "records": records,
-        }))
+        read_discovery_records(&state_clone, now_ms, |table| {
+            let records = table.find_capability(
+                &query.network_id,
+                &query.capability,
+                now_ms,
+                normalize_limit(query.limit),
+            );
+            Ok(json!({
+                "ok": true,
+                "records": records,
+            }))
+        })
     })
     .await?;
     Ok(Json(response))
@@ -242,18 +258,19 @@ pub(crate) async fn discovery_find_topic_providers(
     let state_clone = state.clone();
     let response = run_blocking(move || -> Result<Value> {
         let now_ms = now_ms();
-        let table = load_discovery_records(&state_clone.state_dir, now_ms)?;
-        let records = table.find_topic_providers(
-            &query.network_id,
-            &query.feed_key,
-            &query.scope_hint,
-            now_ms,
-            normalize_limit(query.limit),
-        );
-        Ok(json!({
-            "ok": true,
-            "records": records,
-        }))
+        read_discovery_records(&state_clone, now_ms, |table| {
+            let records = table.find_topic_providers(
+                &query.network_id,
+                &query.feed_key,
+                &query.scope_hint,
+                now_ms,
+                normalize_limit(query.limit),
+            );
+            Ok(json!({
+                "ok": true,
+                "records": records,
+            }))
+        })
     })
     .await?;
     Ok(Json(response))
@@ -266,33 +283,34 @@ pub(crate) async fn discovery_find_topic_providers_batch(
     let state_clone = state.clone();
     let response = run_blocking(move || -> Result<Value> {
         let now_ms = now_ms();
-        let table = load_discovery_records(&state_clone.state_dir, now_ms)?;
-        let limit = normalize_limit(request.limit);
-        let mut records = Vec::new();
-        let mut seen = std::collections::BTreeSet::new();
-        for query in request.queries {
-            for record in table.find_topic_providers(
-                &request.network_id,
-                &query.feed_key,
-                &query.scope_hint,
-                now_ms,
-                limit,
-            ) {
-                if seen.insert(record.body.node_id.clone()) {
-                    records.push(record);
-                    if records.len() >= limit {
-                        break;
+        read_discovery_records(&state_clone, now_ms, |table| {
+            let limit = normalize_limit(request.limit);
+            let mut records = Vec::new();
+            let mut seen = std::collections::BTreeSet::new();
+            for query in request.queries {
+                for record in table.find_topic_providers(
+                    &request.network_id,
+                    &query.feed_key,
+                    &query.scope_hint,
+                    now_ms,
+                    limit,
+                ) {
+                    if seen.insert(record.body.node_id.clone()) {
+                        records.push(record);
+                        if records.len() >= limit {
+                            break;
+                        }
                     }
                 }
+                if records.len() >= limit {
+                    break;
+                }
             }
-            if records.len() >= limit {
-                break;
-            }
-        }
-        Ok(json!({
-            "ok": true,
-            "records": records,
-        }))
+            Ok(json!({
+                "ok": true,
+                "records": records,
+            }))
+        })
     })
     .await?;
     Ok(Json(response))
@@ -318,23 +336,128 @@ pub(crate) async fn discovery_find_agent(
             anyhow::bail!("public_id or display_name is required");
         }
         let now_ms = now_ms();
-        let table = load_discovery_records(&state_clone.state_dir, now_ms)?;
-        let records = table
-            .active_records(now_ms, normalize_limit(query.limit))
-            .into_iter()
-            .filter(|record| record.body.network_id == query.network_id)
-            .filter(|record| discovery_record_matches_agent_query(record, public_id, display_name))
-            .collect::<Vec<_>>();
-        Ok(json!({
-            "ok": true,
-            "records": records,
-        }))
+        read_discovery_records(&state_clone, now_ms, |table| {
+            let records = table
+                .active_records(now_ms, normalize_limit(query.limit))
+                .into_iter()
+                .filter(|record| record.body.network_id == query.network_id)
+                .filter(|record| {
+                    discovery_record_matches_agent_query(record, public_id, display_name)
+                })
+                .collect::<Vec<_>>();
+            Ok(json!({
+                "ok": true,
+                "records": records,
+            }))
+        })
     })
     .await?;
     Ok(Json(response))
 }
 
-fn load_discovery_records(state_dir: &FsPath, now_ms: u64) -> Result<DiscoveryRoutingTable> {
+fn read_discovery_records<T>(
+    state: &UiServerState,
+    now_ms: u64,
+    read: impl FnOnce(&DiscoveryRoutingTable) -> Result<T>,
+) -> Result<T> {
+    prune_discovery_records_if_due(state, now_ms)?;
+    let table = state
+        .discovery_records
+        .read()
+        .map_err(|_| anyhow::anyhow!("discovery records lock poisoned"))?;
+    read(&table)
+}
+
+fn prune_discovery_records_if_due(state: &UiServerState, now_ms: u64) -> Result<()> {
+    let should_prune = {
+        let maintenance = state
+            .discovery_records_maintenance
+            .lock()
+            .map_err(|_| anyhow::anyhow!("discovery records maintenance lock poisoned"))?;
+        maintenance
+            .last_prune_at
+            .map(|last_prune| last_prune.elapsed() >= DISCOVERY_RECORDS_PRUNE_INTERVAL)
+            .unwrap_or(true)
+    };
+    if !should_prune {
+        return Ok(());
+    }
+
+    let pruned = {
+        let mut table = state
+            .discovery_records
+            .write()
+            .map_err(|_| anyhow::anyhow!("discovery records lock poisoned"))?;
+        let pruned = table.prune_expired(now_ms);
+        pruned
+    };
+    let mut maintenance = state
+        .discovery_records_maintenance
+        .lock()
+        .map_err(|_| anyhow::anyhow!("discovery records maintenance lock poisoned"))?;
+    maintenance.last_prune_at = Some(Instant::now());
+    if pruned > 0 {
+        maintenance.snapshot_generation = maintenance.snapshot_generation.saturating_add(1);
+        eprintln!("wattswarm discovery pruned expired records: {pruned}");
+    }
+    drop(maintenance);
+    persist_discovery_records_if_due(state, now_ms)?;
+    Ok(())
+}
+
+fn mark_discovery_records_dirty(state: &UiServerState) -> Result<()> {
+    let mut maintenance = state
+        .discovery_records_maintenance
+        .lock()
+        .map_err(|_| anyhow::anyhow!("discovery records maintenance lock poisoned"))?;
+    maintenance.snapshot_generation = maintenance.snapshot_generation.saturating_add(1);
+    Ok(())
+}
+
+fn persist_discovery_records_if_due(state: &UiServerState, now_ms: u64) -> Result<()> {
+    let target_generation = {
+        let mut maintenance = state
+            .discovery_records_maintenance
+            .lock()
+            .map_err(|_| anyhow::anyhow!("discovery records maintenance lock poisoned"))?;
+        let has_unpersisted_changes =
+            maintenance.snapshot_generation > maintenance.persisted_generation;
+        let snapshot_due = maintenance
+            .last_snapshot_at
+            .map(|last_snapshot| last_snapshot.elapsed() >= DISCOVERY_RECORDS_SNAPSHOT_INTERVAL)
+            .unwrap_or(true);
+        if !has_unpersisted_changes || !snapshot_due || maintenance.snapshot_in_progress {
+            return Ok(());
+        }
+        maintenance.snapshot_in_progress = true;
+        maintenance.snapshot_generation
+    };
+
+    let records = {
+        let table = state
+            .discovery_records
+            .read()
+            .map_err(|_| anyhow::anyhow!("discovery records lock poisoned"))?;
+        table.active_records(now_ms, usize::MAX)
+    };
+    let save_result = save_discovery_records(&state.state_dir, &records);
+
+    let mut maintenance = state
+        .discovery_records_maintenance
+        .lock()
+        .map_err(|_| anyhow::anyhow!("discovery records maintenance lock poisoned"))?;
+    maintenance.snapshot_in_progress = false;
+    if save_result.is_ok() {
+        maintenance.persisted_generation = maintenance.persisted_generation.max(target_generation);
+        maintenance.last_snapshot_at = Some(Instant::now());
+    }
+    save_result
+}
+
+pub(crate) fn load_discovery_records(
+    state_dir: &FsPath,
+    now_ms: u64,
+) -> Result<DiscoveryRoutingTable> {
     let path = discovery_records_path(state_dir);
     let mut table = DiscoveryRoutingTable::new();
     let Ok(bytes) = fs::read(&path) else {
@@ -441,14 +564,9 @@ fn quarantine_corrupt_discovery_records(path: &FsPath, error: &serde_json::Error
     }
 }
 
-fn save_discovery_records(
-    state_dir: &FsPath,
-    table: &DiscoveryRoutingTable,
-    now_ms: u64,
-) -> Result<()> {
+fn save_discovery_records(state_dir: &FsPath, records: &[SignedDiscoveryNodeRecord]) -> Result<()> {
     fs::create_dir_all(state_dir)?;
     let path = discovery_records_path(state_dir);
-    let records = table.active_records(now_ms, usize::MAX);
     let nonce = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -457,7 +575,7 @@ fn save_discovery_records(
         ".{DISCOVERY_RECORDS_FILE}.{}.{nonce}.tmp",
         std::process::id()
     ));
-    fs::write(&tmp_path, serde_json::to_vec_pretty(&records)?)?;
+    fs::write(&tmp_path, serde_json::to_vec(records)?)?;
     fs::rename(&tmp_path, path)?;
     Ok(())
 }

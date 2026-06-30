@@ -1230,7 +1230,7 @@ fn network_discovery_bootnode_accepts_signed_records_and_filters_queries() {
         let state_dir = dir.path().join("state");
         std::fs::create_dir_all(&state_dir).unwrap();
         let db_path = state_dir.join("ui.state");
-        let app = build_app(UiServerState::new(state_dir, db_path));
+        let app = build_app(UiServerState::new(state_dir.clone(), db_path));
         let identity = NodeIdentity::from_seed([91; 32]);
         let now_ms = chrono::Utc::now().timestamp_millis().max(0) as u64;
         let node_id = identity.node_id();
@@ -1293,6 +1293,8 @@ fn network_discovery_bootnode_accepts_signed_records_and_filters_queries() {
         assert_eq!(announce_json["ok"].as_bool(), Some(true));
         assert_eq!(announce_json["status"].as_str(), Some("inserted"));
         assert_eq!(announce_json["node_id"].as_str(), Some(node_id.as_str()));
+        std::fs::write(state_dir.join("discovery_records_v1.json"), "{not-json")
+            .expect("corrupt persisted discovery records after announce");
 
         let nearby_res = app
             .clone()
@@ -1514,6 +1516,110 @@ fn network_discovery_bootnode_recovers_from_corrupt_records_file() {
             .filter_map(Result::ok)
             .any(|entry| entry.file_name().to_string_lossy().ends_with(".tmp"));
         assert!(!leftover_tmp, "atomic save must not leave temp files");
+    });
+}
+
+#[test]
+fn network_discovery_bootnode_throttles_snapshot_writes_after_initial_persist() {
+    let _guard = env_lock();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let dir = tempdir().unwrap();
+        let state_dir = dir.path().join("state");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        let records_path = state_dir.join("discovery_records_v1.json");
+        let db_path = state_dir.join("ui.state");
+        let app = build_app(UiServerState::new(state_dir, db_path));
+        let now_ms = chrono::Utc::now().timestamp_millis().max(0) as u64;
+
+        let identity_a = NodeIdentity::from_seed([93; 32]);
+        let node_id_a = identity_a.node_id();
+        let record_a = SignedDiscoveryNodeRecord::sign(
+            DiscoveryNodeRecordBody::new(
+                "mainnet:test",
+                node_id_a.clone(),
+                node_id_a.clone(),
+                1,
+                now_ms,
+            ),
+            &identity_a,
+        )
+        .unwrap();
+        let announce_a = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/network/discovery/records")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&record_a).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(announce_a.status(), StatusCode::OK);
+        let saved_after_first: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&records_path).unwrap()).unwrap();
+        assert_eq!(
+            saved_after_first[0]["body"]["node_id"].as_str(),
+            Some(node_id_a.as_str())
+        );
+
+        let identity_b = NodeIdentity::from_seed([94; 32]);
+        let node_id_b = identity_b.node_id();
+        let record_b = SignedDiscoveryNodeRecord::sign(
+            DiscoveryNodeRecordBody::new(
+                "mainnet:test",
+                node_id_b.clone(),
+                node_id_b.clone(),
+                1,
+                now_ms,
+            ),
+            &identity_b,
+        )
+        .unwrap();
+        let announce_b = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/network/discovery/records")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&record_b).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(announce_b.status(), StatusCode::OK);
+
+        let find_b = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(format!("/api/network/discovery/node/{node_id_b}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(find_b.status(), StatusCode::OK);
+        let find_b_json = json_from(find_b).await;
+        assert_eq!(
+            find_b_json["record"]["body"]["node_id"].as_str(),
+            Some(node_id_b.as_str())
+        );
+
+        let saved_after_second: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&records_path).unwrap()).unwrap();
+        assert_eq!(saved_after_second.as_array().map(Vec::len), Some(1));
+        assert_eq!(
+            saved_after_second[0]["body"]["node_id"].as_str(),
+            Some(node_id_a.as_str())
+        );
     });
 }
 

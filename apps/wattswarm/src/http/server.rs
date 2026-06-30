@@ -52,7 +52,7 @@ pub fn run(state_dir: PathBuf, db_path: PathBuf, listen: String) -> Result<()> {
     if network_enabled {
         crate::udp_announce::announce_startup("ui-startup", Some(&listen), node_id.as_deref());
     }
-    let state = UiServerState { state_dir, db_path };
+    let state = UiServerState::new(state_dir, db_path);
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
