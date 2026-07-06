@@ -1,0 +1,277 @@
+//! Shared theme stylesheet injected into every wattswarm page template.
+//!
+//! Pages embed the `SWARM_THEME_PLACEHOLDER` marker inside their `<style>`
+//! block; `http::pages` replaces it with `SWARM_THEME_CSS` when the page is
+//! first rendered. Theme palettes: default "forest" plus matcha / butter /
+//! chocolate, whose token values come from Meta's Astryx design system
+//! (https://github.com/facebook/astryx, MIT License,
+//! packages/themes/{matcha,butter,chocolate}/src). Fonts are self-hosted
+//! under /fonts (SIL OFL 1.1, see ui/public/fonts/OFL.txt).
+
+pub const SWARM_THEME_PLACEHOLDER: &str = "/*__SWARM_THEME_CSS__*/";
+
+pub const SWARM_THEME_CSS: &str = r#"
+    @font-face {
+      font-family: "DM Sans";
+      font-style: normal;
+      font-weight: 400;
+      font-display: swap;
+      src: url("/fonts/dm-sans-v17-latin-regular.woff2") format("woff2");
+    }
+    @font-face {
+      font-family: "DM Sans";
+      font-style: normal;
+      font-weight: 500;
+      font-display: swap;
+      src: url("/fonts/dm-sans-v17-latin-500.woff2") format("woff2");
+    }
+    @font-face {
+      font-family: "DM Sans";
+      font-style: normal;
+      font-weight: 600 700;
+      font-display: swap;
+      src: url("/fonts/dm-sans-v17-latin-600.woff2") format("woff2");
+    }
+    @font-face {
+      font-family: "Outfit";
+      font-style: normal;
+      font-weight: 400;
+      font-display: swap;
+      src: url("/fonts/outfit-v15-latin-regular.woff2") format("woff2");
+    }
+    @font-face {
+      font-family: "Outfit";
+      font-style: normal;
+      font-weight: 500;
+      font-display: swap;
+      src: url("/fonts/outfit-v15-latin-500.woff2") format("woff2");
+    }
+    @font-face {
+      font-family: "Outfit";
+      font-style: normal;
+      font-weight: 600 700;
+      font-display: swap;
+      src: url("/fonts/outfit-v15-latin-600.woff2") format("woff2");
+    }
+    @font-face {
+      font-family: "Albert Sans";
+      font-style: normal;
+      font-weight: 400;
+      font-display: swap;
+      src: url("/fonts/albert-sans-v4-latin-regular.woff2") format("woff2");
+    }
+    @font-face {
+      font-family: "Albert Sans";
+      font-style: normal;
+      font-weight: 500;
+      font-display: swap;
+      src: url("/fonts/albert-sans-v4-latin-500.woff2") format("woff2");
+    }
+    @font-face {
+      font-family: "Albert Sans";
+      font-style: normal;
+      font-weight: 600 700;
+      font-display: swap;
+      src: url("/fonts/albert-sans-v4-latin-600.woff2") format("woff2");
+    }
+    @font-face {
+      font-family: "Fraunces";
+      font-style: normal;
+      font-weight: 500 700;
+      font-display: swap;
+      src: url("/fonts/fraunces-v38-latin-600.woff2") format("woff2");
+    }
+    @font-face {
+      font-family: "Playwrite US Trad";
+      font-style: normal;
+      font-weight: 400 700;
+      font-display: swap;
+      src: url("/fonts/playwrite-us-trad-v11-latin-regular.woff2") format("woff2");
+    }
+
+    /* Base palette = matcha (the default theme); [data-theme] overrides it. */
+    :root {
+      --bg: #F0F0E0;
+      --surface: #ffffff;
+      --surface-alt: #f7f7ea;
+      --surface-inset: #fafaf0;
+      --ink: #3E481D;
+      --muted: #707E46;
+      --faint: #C0CBA9;
+      --line: #DCE3CE;
+      --line-soft: #e7ecda;
+      --line-strong: #B7C29E;
+      --green: #4D9900;
+      --green-soft: #4D990020;
+      --green-ink: #3d7a00;
+      --red: #FD0000;
+      --red-soft: #FD000020;
+      --red-ink: #cc0000;
+      --blue: #3a5e8c;
+      --blue-soft: #3a5e8c33;
+      --blue-ink: #2e4a6e;
+      --amber: #c47620;
+      --amber-soft: #c4762033;
+      --amber-ink: #a06018;
+      --radius-sm: 6px;
+      --radius: 12px;
+      --radius-lg: 18px;
+      --radius-btn: 999px;
+      --shadow-sm: 0 2px 4px #3E481D0D, 0 4px 8px #3E481D1A;
+      --shadow-md: 0 2px 4px #3E481D0D, 0 4px 12px #3E481D1A;
+      --font-body: "DM Sans", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+      --font-head: "Playwrite US Trad", Georgia, "Times New Roman", serif;
+      --accent: #3E481D;
+      --accent-strong: #2c3414;
+      --accent-soft: #3E481D14;
+      --accent-contrast: #ffffff;
+    }
+
+    :root[data-theme="forest"] {
+      --bg: #f4f6f8;
+      --surface: #ffffff;
+      --surface-alt: #f7f8fa;
+      --surface-inset: #fbfcfd;
+      --ink: #111827;
+      --muted: #6b7280;
+      --faint: #9aa1ac;
+      --line: #e9ebf0;
+      --line-soft: #eef0f4;
+      --line-strong: #d6dae1;
+      --green: #16a34a;
+      --green-soft: #e9f7ee;
+      --green-ink: #166534;
+      --red: #dc2626;
+      --red-soft: #fdecec;
+      --red-ink: #991b1b;
+      --blue: #2563eb;
+      --blue-soft: #eef4ff;
+      --blue-ink: #1e40af;
+      --amber: #b45309;
+      --amber-soft: #fef3e2;
+      --amber-ink: #92400e;
+      --radius-sm: 6px;
+      --radius: 8px;
+      --radius-lg: 12px;
+      --radius-btn: 8px;
+      --shadow-sm: 0 1px 2px rgba(16, 24, 40, 0.04), 0 1px 3px rgba(16, 24, 40, 0.06);
+      --shadow-md: 0 4px 12px rgba(16, 24, 40, 0.08);
+      --font-body: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Inter", "Helvetica Neue", Arial, sans-serif;
+      --font-head: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Inter", "Helvetica Neue", Arial, sans-serif;
+      --accent: #16a34a;
+      --accent-strong: #14532d;
+      --accent-soft: #e9f7ee;
+      --accent-contrast: #ffffff;
+    }
+
+    :root[data-theme="matcha"] {
+      --bg: #F0F0E0;
+      --surface: #ffffff;
+      --surface-alt: #f7f7ea;
+      --surface-inset: #fafaf0;
+      --ink: #3E481D;
+      --muted: #707E46;
+      --faint: #C0CBA9;
+      --line: #DCE3CE;
+      --line-soft: #e7ecda;
+      --line-strong: #B7C29E;
+      --green: #4D9900;
+      --green-soft: #4D990020;
+      --green-ink: #3d7a00;
+      --red: #FD0000;
+      --red-soft: #FD000020;
+      --red-ink: #cc0000;
+      --blue: #3a5e8c;
+      --blue-soft: #3a5e8c33;
+      --blue-ink: #2e4a6e;
+      --amber: #c47620;
+      --amber-soft: #c4762033;
+      --amber-ink: #a06018;
+      --radius-sm: 6px;
+      --radius: 12px;
+      --radius-lg: 18px;
+      --radius-btn: 999px;
+      --shadow-sm: 0 2px 4px #3E481D0D, 0 4px 8px #3E481D1A;
+      --shadow-md: 0 2px 4px #3E481D0D, 0 4px 12px #3E481D1A;
+      --font-body: "DM Sans", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+      --font-head: "Playwrite US Trad", Georgia, "Times New Roman", serif;
+      --accent: #3E481D;
+      --accent-strong: #2c3414;
+      --accent-soft: #3E481D14;
+      --accent-contrast: #ffffff;
+    }
+
+    :root[data-theme="butter"] {
+      --bg: #FDFBE4;
+      --surface: #ffffff;
+      --surface-alt: #fbf8de;
+      --surface-inset: #fdfcec;
+      --ink: #1d1c11;
+      --muted: #605f52;
+      --faint: #adac9e;
+      --line: #e5e3d4;
+      --line-soft: #edebde;
+      --line-strong: #cfcdba;
+      --green: #004700;
+      --green-soft: #00470033;
+      --green-ink: #004800;
+      --red: #771210;
+      --red-soft: #77121033;
+      --red-ink: #771210;
+      --blue: #225BFF;
+      --blue-soft: #225BFF33;
+      --blue-ink: #203a6c;
+      --amber: #543700;
+      --amber-soft: #54370033;
+      --amber-ink: #622e00;
+      --radius-sm: 6px;
+      --radius: 8px;
+      --radius-lg: 12px;
+      --radius-btn: 8px;
+      --shadow-sm: 0 2px 4px #1d1c110D, 0 4px 8px #1d1c111A;
+      --shadow-md: 0 2px 4px #1d1c110D, 0 4px 12px #1d1c111A;
+      --font-body: "Outfit", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+      --font-head: "Outfit", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+      --accent: #225BFF;
+      --accent-strong: #1a45c2;
+      --accent-soft: #225BFF1a;
+      --accent-contrast: #ffffff;
+    }
+
+    :root[data-theme="chocolate"] {
+      --bg: #FFFCF7;
+      --surface: #EDE4D4;
+      --surface-alt: #f5efe3;
+      --surface-inset: #faf6ed;
+      --ink: #4a3520;
+      --muted: #B88859;
+      --faint: #C4AC95;
+      --line: #C4AC95;
+      --line-soft: #d9ccb8;
+      --line-strong: #B88859;
+      --green: #709900;
+      --green-soft: #70990020;
+      --green-ink: #5a7a00;
+      --red: #FD0000;
+      --red-soft: #FD000020;
+      --red-ink: #cc0000;
+      --blue: #3a5e8c;
+      --blue-soft: #3a5e8c33;
+      --blue-ink: #2e4a6e;
+      --amber: #a06018;
+      --amber-soft: #FFB60020;
+      --amber-ink: #a06018;
+      --radius-sm: 6px;
+      --radius: 10px;
+      --radius-lg: 12px;
+      --radius-btn: 999px;
+      --shadow-sm: 0 2px 4px #4a35200D, 0 4px 8px #4a35201A;
+      --shadow-md: 0 2px 4px #4a35200D, 0 4px 12px #4a35201A;
+      --font-body: "Albert Sans", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+      --font-head: "Fraunces", Georgia, "Times New Roman", serif;
+      --accent: #8C5927;
+      --accent-strong: #6f4218;
+      --accent-soft: #8C592714;
+      --accent-contrast: #ffffff;
+    }
+"#;

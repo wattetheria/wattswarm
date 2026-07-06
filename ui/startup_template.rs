@@ -6,51 +6,19 @@ pub const STARTUP_HTML: &str = r#"<!DOCTYPE html>
   <title>Wattswarm Console</title>
   <link rel="icon" type="image/png" sizes="64x64" href="/favicon.png">
   <style>
-    :root {
-      --bg: #f4f6f8;
-      --surface: #ffffff;
-      --surface-alt: #f7f8fa;
-      --surface-inset: #fbfcfd;
-      --ink: #111827;
-      --muted: #6b7280;
-      --faint: #9aa1ac;
-      --line: #e9ebf0;
-      --line-soft: #eef0f4;
-      --line-strong: #d6dae1;
-      --green: #16a34a;
-      --green-soft: #e9f7ee;
-      --green-ink: #166534;
-      --red: #dc2626;
-      --red-soft: #fdecec;
-      --red-ink: #991b1b;
-      --amber: #b45309;
-      --amber-soft: #fef3e2;
-      --amber-ink: #92400e;
-      --radius-sm: 6px;
-      --radius: 8px;
-      --radius-lg: 12px;
-      --shadow-sm: 0 1px 2px rgba(16, 24, 40, 0.04), 0 1px 3px rgba(16, 24, 40, 0.06);
-      --shadow-md: 0 4px 12px rgba(16, 24, 40, 0.08);
-      --accent: #16a34a;
-      --accent-strong: #14532d;
-      --accent-soft: #e9f7ee;
-      --accent-contrast: #ffffff;
-    }
-    :root[data-theme="teal"] { --accent: #0d9488; --accent-strong: #115e59; --accent-soft: #e4f5f3; --accent-contrast: #ffffff; }
-    :root[data-theme="emerald"] { --accent: #10b981; --accent-strong: #065f46; --accent-soft: #e7f8f1; --accent-contrast: #ffffff; }
-    :root[data-theme="forest"] { --accent: #16a34a; --accent-strong: #14532d; --accent-soft: #e9f7ee; --accent-contrast: #ffffff; }
-    :root[data-theme="blue-royal"] { --accent: #2563eb; --accent-strong: #1e3a8a; --accent-soft: #eff4ff; --accent-contrast: #ffffff; }
-    :root[data-theme="blue-sky"] { --accent: #0284c7; --accent-strong: #075985; --accent-soft: #e8f7fe; --accent-contrast: #ffffff; }
-    :root[data-theme="indigo"] { --accent: #4f46e5; --accent-strong: #3730a3; --accent-soft: #eef0fe; --accent-contrast: #ffffff; }
+    /*__SWARM_THEME_CSS__*/
 
     * { box-sizing: border-box; }
     body {
       margin: 0;
-      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Inter", "Helvetica Neue", Arial, sans-serif;
+      font-family: var(--font-body);
       background: var(--bg);
       color: var(--ink);
       -webkit-font-smoothing: antialiased;
       text-rendering: optimizeLegibility;
+    }
+    h1 {
+      font-family: var(--font-head);
     }
     .wrap {
       max-width: 1360px;
@@ -191,7 +159,7 @@ pub const STARTUP_HTML: &str = r#"<!DOCTYPE html>
       font-size: 0.86rem;
       padding: 0.55rem 0.95rem;
       min-height: 2.4rem;
-      border-radius: var(--radius);
+      border-radius: var(--radius-btn);
       cursor: pointer;
       transition: filter 0.12s ease, background 0.12s ease;
     }
@@ -349,24 +317,6 @@ pub const STARTUP_HTML: &str = r#"<!DOCTYPE html>
       background: var(--surface);
       color: var(--ink);
     }
-    .pill {
-      position: fixed;
-      top: 14px;
-      right: 14px;
-      z-index: 9999;
-      border: 1px solid var(--line);
-      border-radius: 999px;
-      box-shadow: var(--shadow-md);
-      background: var(--surface);
-      color: var(--muted);
-      padding: 0.35rem 0.8rem;
-      font-size: 0.74rem;
-      font-weight: 600;
-      letter-spacing: 0.02em;
-    }
-    .pill.ok { background: var(--green-soft); color: var(--green-ink); border-color: transparent; }
-    .pill.warn { background: var(--amber-soft); color: var(--amber-ink); border-color: transparent; }
-    .pill.err { background: var(--red-soft); color: var(--red-ink); border-color: transparent; }
     .links {
       display: flex;
       gap: 10px;
@@ -449,7 +399,6 @@ pub const STARTUP_HTML: &str = r#"<!DOCTYPE html>
   </style>
 </head>
 <body>
-  <div id="statusPill" class="pill">idle</div>
   <div class="wrap">
     <div class="panel hero-panel">
       <div>
@@ -464,13 +413,11 @@ pub const STARTUP_HTML: &str = r#"<!DOCTYPE html>
       <div class="hero-actions">
         <div class="theme-picker" aria-label="Accent color theme">
           <span class="theme-picker-label">Theme</span>
-          <div class="theme-swatches" role="group" aria-label="Choose accent color">
-            <button class="theme-swatch" type="button" data-theme-swatch="teal" style="--sw:#0d9488" title="Teal" aria-label="Teal theme"></button>
-            <button class="theme-swatch" type="button" data-theme-swatch="emerald" style="--sw:#10b981" title="Emerald" aria-label="Emerald theme"></button>
+          <div class="theme-swatches" role="group" aria-label="Choose theme">
             <button class="theme-swatch" type="button" data-theme-swatch="forest" style="--sw:#16a34a" title="Forest" aria-label="Forest theme"></button>
-            <button class="theme-swatch" type="button" data-theme-swatch="blue-royal" style="--sw:#2563eb" title="Royal blue" aria-label="Royal blue theme"></button>
-            <button class="theme-swatch" type="button" data-theme-swatch="blue-sky" style="--sw:#0284c7" title="Sky blue" aria-label="Sky blue theme"></button>
-            <button class="theme-swatch" type="button" data-theme-swatch="indigo" style="--sw:#4f46e5" title="Indigo" aria-label="Indigo theme"></button>
+            <button class="theme-swatch" type="button" data-theme-swatch="matcha" style="--sw:#3E481D" title="Matcha" aria-label="Matcha theme"></button>
+            <button class="theme-swatch" type="button" data-theme-swatch="butter" style="--sw:#225BFF" title="Butter" aria-label="Butter theme"></button>
+            <button class="theme-swatch" type="button" data-theme-swatch="chocolate" style="--sw:#8C5927" title="Chocolate" aria-label="Chocolate theme"></button>
           </div>
         </div>
         <div class="action-row">
@@ -558,8 +505,8 @@ Those stay in CLI, compose, or config files for advanced operators.</pre>
     let startupConfig = null;
 
     const STORAGE_KEY = "wattswarm-console";
-    const themeOptions = ["teal", "emerald", "forest", "blue-royal", "blue-sky", "indigo"];
-    const defaultTheme = "forest";
+    const themeOptions = ["forest", "matcha", "butter", "chocolate"];
+    const defaultTheme = "matcha";
     function readStoredSettings() {
       try { return JSON.parse(localStorage.getItem(STORAGE_KEY) || "{}") || {}; }
       catch (_) { return {}; }
@@ -591,6 +538,7 @@ Those stay in CLI, compose, or config files for advanced operators.</pre>
     }
 
     function setStatus(kind, text) {
+      if (!statusPill) return;
       statusPill.className = `pill ${kind || ''}`.trim();
       statusPill.textContent = text;
     }

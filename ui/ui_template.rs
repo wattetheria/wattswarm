@@ -6,54 +6,19 @@ pub const INDEX_HTML: &str = r#"<!DOCTYPE html>
   <title>Wattswarm Network Diagnostics</title>
   <link rel="icon" type="image/png" sizes="64x64" href="/favicon.png">
   <style>
-    :root {
-      --bg: #f4f6f8;
-      --surface: #ffffff;
-      --surface-alt: #f7f8fa;
-      --surface-inset: #fbfcfd;
-      --ink: #111827;
-      --muted: #6b7280;
-      --faint: #9aa1ac;
-      --line: #e9ebf0;
-      --line-soft: #eef0f4;
-      --line-strong: #d6dae1;
-      --green: #16a34a;
-      --green-soft: #e9f7ee;
-      --green-ink: #166534;
-      --red: #dc2626;
-      --red-soft: #fdecec;
-      --red-ink: #991b1b;
-      --blue: #2563eb;
-      --blue-soft: #eef4ff;
-      --blue-ink: #1e40af;
-      --amber: #b45309;
-      --amber-soft: #fef3e2;
-      --amber-ink: #92400e;
-      --radius-sm: 6px;
-      --radius: 8px;
-      --radius-lg: 12px;
-      --shadow-sm: 0 1px 2px rgba(16, 24, 40, 0.04), 0 1px 3px rgba(16, 24, 40, 0.06);
-      --shadow-md: 0 4px 12px rgba(16, 24, 40, 0.08);
-      --accent: #16a34a;
-      --accent-strong: #14532d;
-      --accent-soft: #e9f7ee;
-      --accent-contrast: #ffffff;
-    }
-    :root[data-theme="teal"] { --accent: #0d9488; --accent-strong: #115e59; --accent-soft: #e4f5f3; --accent-contrast: #ffffff; }
-    :root[data-theme="emerald"] { --accent: #10b981; --accent-strong: #065f46; --accent-soft: #e7f8f1; --accent-contrast: #ffffff; }
-    :root[data-theme="forest"] { --accent: #16a34a; --accent-strong: #14532d; --accent-soft: #e9f7ee; --accent-contrast: #ffffff; }
-    :root[data-theme="blue-royal"] { --accent: #2563eb; --accent-strong: #1e3a8a; --accent-soft: #eff4ff; --accent-contrast: #ffffff; }
-    :root[data-theme="blue-sky"] { --accent: #0284c7; --accent-strong: #075985; --accent-soft: #e8f7fe; --accent-contrast: #ffffff; }
-    :root[data-theme="indigo"] { --accent: #4f46e5; --accent-strong: #3730a3; --accent-soft: #eef0fe; --accent-contrast: #ffffff; }
+    /*__SWARM_THEME_CSS__*/
 
     * { box-sizing: border-box; }
     body {
       margin: 0;
-      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Inter", "Helvetica Neue", Arial, sans-serif;
+      font-family: var(--font-body);
       background: var(--bg);
       color: var(--ink);
       -webkit-font-smoothing: antialiased;
       text-rendering: optimizeLegibility;
+    }
+    h1 {
+      font-family: var(--font-head);
     }
     .wrap {
       max-width: 1560px;
@@ -170,6 +135,41 @@ pub const INDEX_HTML: &str = r#"<!DOCTYPE html>
       box-shadow: var(--shadow-sm);
       padding: 20px;
     }
+    .connectivity-panel {
+      margin-bottom: 18px;
+    }
+    .connectivity-grid {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 10px;
+    }
+    .connectivity-item {
+      display: grid;
+      gap: 6px;
+      min-width: 0;
+      padding: 12px;
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: var(--surface-inset);
+    }
+    .connectivity-item code {
+      display: block;
+      min-width: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      font-family: ui-monospace, "SF Mono", "SFMono-Regular", Menlo, Consolas, monospace;
+      font-size: 0.92rem;
+      color: var(--ink);
+    }
+    .connectivity-item code.route-current {
+      font-weight: 800;
+      text-transform: uppercase;
+    }
+    .connectivity-item code.route-current.direct { color: var(--green-ink); }
+    .connectivity-item code.route-current.relay { color: var(--amber-ink); }
+    .connectivity-item code.route-current.custom { color: var(--blue-ink); }
+    .connectivity-item code.route-current.unknown { color: var(--muted); }
     .filters {
       display: grid;
       gap: 12px;
@@ -213,7 +213,7 @@ pub const INDEX_HTML: &str = r#"<!DOCTYPE html>
       min-height: 2.4rem;
       padding: 0.55rem 0.95rem;
       border: 1px solid transparent;
-      border-radius: var(--radius);
+      border-radius: var(--radius-btn);
       background: var(--accent);
       color: var(--accent-contrast);
       cursor: pointer;
@@ -411,7 +411,7 @@ pub const INDEX_HTML: &str = r#"<!DOCTYPE html>
     @media (max-width: 1100px) {
       .head { align-items: stretch; flex-direction: column; }
       .head-actions { justify-content: space-between; }
-      .grid, .filters { grid-template-columns: 1fr; }
+      .grid, .filters, .connectivity-grid { grid-template-columns: 1fr; }
       .row-head { flex-direction: column; }
       .pills { justify-content: start; }
     }
@@ -427,13 +427,11 @@ pub const INDEX_HTML: &str = r#"<!DOCTYPE html>
       <div class="head-actions">
         <div class="theme-picker" aria-label="Accent color theme">
           <span class="theme-picker-label">Theme</span>
-          <div class="theme-swatches" role="group" aria-label="Choose accent color">
-            <button class="theme-swatch" type="button" data-theme-swatch="teal" style="--sw:#0d9488" title="Teal" aria-label="Teal theme"></button>
-            <button class="theme-swatch" type="button" data-theme-swatch="emerald" style="--sw:#10b981" title="Emerald" aria-label="Emerald theme"></button>
+          <div class="theme-swatches" role="group" aria-label="Choose theme">
             <button class="theme-swatch" type="button" data-theme-swatch="forest" style="--sw:#16a34a" title="Forest" aria-label="Forest theme"></button>
-            <button class="theme-swatch" type="button" data-theme-swatch="blue-royal" style="--sw:#2563eb" title="Royal blue" aria-label="Royal blue theme"></button>
-            <button class="theme-swatch" type="button" data-theme-swatch="blue-sky" style="--sw:#0284c7" title="Sky blue" aria-label="Sky blue theme"></button>
-            <button class="theme-swatch" type="button" data-theme-swatch="indigo" style="--sw:#4f46e5" title="Indigo" aria-label="Indigo theme"></button>
+            <button class="theme-swatch" type="button" data-theme-swatch="matcha" style="--sw:#3E481D" title="Matcha" aria-label="Matcha theme"></button>
+            <button class="theme-swatch" type="button" data-theme-swatch="butter" style="--sw:#225BFF" title="Butter" aria-label="Butter theme"></button>
+            <button class="theme-swatch" type="button" data-theme-swatch="chocolate" style="--sw:#8C5927" title="Chocolate" aria-label="Chocolate theme"></button>
           </div>
         </div>
         <div id="generatedAt" class="timestamp">Not refreshed</div>
@@ -461,6 +459,41 @@ pub const INDEX_HTML: &str = r#"<!DOCTYPE html>
         <div class="label">Diagnostics</div>
         <div id="diagnosticCount" class="value">0</div>
       </div>
+    </section>
+
+    <section class="panel connectivity-panel" aria-label="Iroh connectivity">
+      <h2>Iroh Connectivity</h2>
+      <div class="connectivity-grid">
+        <div class="connectivity-item">
+          <div class="label">Endpoint ID</div>
+          <code id="irohEndpointId">-</code>
+        </div>
+        <div class="connectivity-item">
+          <div class="label">Current Path</div>
+          <code id="irohCurrentPath" class="route-current unknown">unknown</code>
+        </div>
+        <div class="connectivity-item">
+          <div class="label">Dial Target</div>
+          <code id="irohDialTarget">-</code>
+        </div>
+        <div class="connectivity-item">
+          <div class="label">Relay URLs</div>
+          <code id="irohRelayUrls">none</code>
+        </div>
+        <div class="connectivity-item">
+          <div class="label">Route Policy</div>
+          <code id="irohRoutePolicy">Iroh native direct-first</code>
+        </div>
+        <div class="connectivity-item">
+          <div class="label">Fallback</div>
+          <code id="irohFallback">relay fallback managed by Iroh</code>
+        </div>
+        <div class="connectivity-item">
+          <div class="label">Transport Detail</div>
+          <code id="irohTransportDetail">managed by Iroh</code>
+        </div>
+      </div>
+      <div class="hint">Wattswarm uses Endpoint ID as the identity and dial target. Iroh manages direct path selection and relay fallback.</div>
     </section>
 
     <section class="panel">
@@ -522,8 +555,8 @@ pub const INDEX_HTML: &str = r#"<!DOCTYPE html>
     let activeMode = "all";
 
     const STORAGE_KEY = "wattswarm-console";
-    const themeOptions = ["teal", "emerald", "forest", "blue-royal", "blue-sky", "indigo"];
-    const defaultTheme = "forest";
+    const themeOptions = ["forest", "matcha", "butter", "chocolate"];
+    const defaultTheme = "matcha";
 
     function readStoredSettings() {
       try { return JSON.parse(localStorage.getItem(STORAGE_KEY) || "{}") || {}; }
@@ -871,6 +904,48 @@ pub const INDEX_HTML: &str = r#"<!DOCTYPE html>
       return text.includes(activeMode);
     }
 
+    function setConnectivityText(id, value, size = 36) {
+      const el = qs(id);
+      const text = Array.isArray(value) ? value.filter(Boolean).join(", ") : String(value || "");
+      el.textContent = compact(text || "-", size);
+      el.title = text || "-";
+    }
+
+    function latestIrohRouteDiagnostic(rows) {
+      return safeArray(rows)
+        .filter((row) => row.phase === "iroh.route.selected")
+        .sort((a, b) => Number(b.timestamp_ms || b.timestamp || 0) - Number(a.timestamp_ms || a.timestamp || 0))[0] || null;
+    }
+
+    function setIrohCurrentPath(value) {
+      const route = String(value || "unknown").toLowerCase();
+      const normalized = ["direct", "relay", "custom"].includes(route) ? route : "unknown";
+      const el = qs("irohCurrentPath");
+      el.textContent = normalized;
+      el.className = `route-current ${normalized}`;
+      el.title = normalized === "unknown"
+        ? "No successful Iroh stream has recorded a selected path yet."
+        : `Latest Iroh selected path: ${normalized}`;
+    }
+
+    function renderIrohConnectivity(snapshot, rows) {
+      const endpointId = snapshot.local_iroh_endpoint_id || "-";
+      const relayUrls = safeArray(snapshot.relay_reservations);
+      const dialTarget = relayUrls.length
+        ? `EndpointAddr { id: ${compact(endpointId, 18)}, relay_urls: ${relayUrls.length} }`
+        : `EndpointId ${compact(endpointId, 28)}`;
+      const routeDiagnostic = latestIrohRouteDiagnostic(rows);
+      const routeDetails = routeDiagnostic ? diagnosticDetails(routeDiagnostic) : {};
+
+      setConnectivityText("irohEndpointId", endpointId, 42);
+      setIrohCurrentPath(routeDetails.selected_route);
+      setConnectivityText("irohDialTarget", dialTarget, 46);
+      setConnectivityText("irohRelayUrls", relayUrls.length ? relayUrls : "none", 46);
+      setConnectivityText("irohRoutePolicy", "Iroh native direct-first", 46);
+      setConnectivityText("irohFallback", "relay fallback managed by Iroh", 46);
+      setConnectivityText("irohTransportDetail", "managed by Iroh", 46);
+    }
+
     function render(payload, rows) {
       const snapshot = payload.snapshot || {};
       const visible = safeArray(rows).filter(modeMatches);
@@ -880,6 +955,7 @@ pub const INDEX_HTML: &str = r#"<!DOCTYPE html>
       qs("knownIrohContacts").textContent = String(snapshot.known_iroh_contacts || 0);
       qs("scopeCount").textContent = String(safeArray(snapshot.subscribed_scopes).length);
       qs("diagnosticCount").textContent = String(visible.length);
+      renderIrohConnectivity(snapshot, rows);
 
       const list = qs("diagnosticsList");
       if (!visible.length) {

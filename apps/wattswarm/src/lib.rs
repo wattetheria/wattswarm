@@ -86,5 +86,8 @@ pub mod ui_template;
 #[path = "../../../ui/startup_template.rs"]
 pub mod startup_template;
 
+#[path = "../../../ui/theme_template.rs"]
+pub mod theme_template;
+
 #[path = "../../wattswarm-cli/cli.rs"]
 pub mod cli;
