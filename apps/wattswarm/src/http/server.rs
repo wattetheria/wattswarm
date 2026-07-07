@@ -140,12 +140,17 @@ pub fn build_app(state: UiServerState) -> Router {
     Router::new()
         .route("/", get(pages::index))
         .route("/favicon.png", get(pages::favicon_png))
+        .route("/fonts/:file", get(pages::font_file))
         .route("/diagnostics", get(pages::diagnostics_page))
         .route("/console", get(pages::legacy_console_redirect))
         .route("/swarm", get(pages::swarm_page))
         .route("/api/node/up", post(node::node_up))
         .route("/api/node/down", post(node::node_down))
         .route("/api/node/status", get(node::node_status))
+        .route(
+            "/api/node/iroh-probe",
+            post(crate::http::network_bootstrap::network_iroh_probe),
+        )
         .route(
             "/api/network/local",
             get(crate::http::network_bootstrap::network_local),

@@ -26,6 +26,45 @@ fn register_contacted_peer(
 }
 
 #[test]
+fn probe_peer_contact_material_skips_disconnected_peer() {
+    let dir = temp_startup_dir("contact-material-disconnected-peer");
+    std::fs::write(dir.join("node_seed.hex"), hex::encode([121_u8; 32])).expect("write seed");
+    ensure_test_relay_urls(&dir);
+    let peer = NetworkNodeId::new(
+        wattswarm_network_transport_iroh::local_endpoint_id_from_state_dir(&dir)
+            .expect("peer endpoint")
+            .to_string(),
+    )
+    .expect("peer id");
+    let contact =
+        export_local_contact_material_for_network_peer_id(&dir, peer.as_str(), observed_at_ms())
+            .expect("contact");
+    let mut service = NetworkBridgeService::new(
+        test_network_node(NetworkP2pConfig::default()).expect("node"),
+        &[SwarmScope::Global],
+        &NetworkProtocolParams::default(),
+    )
+    .expect("service");
+    service
+        .runtime
+        .upsert_remote_contact_material(peer.to_string(), contact)
+        .expect("upsert contact");
+
+    let request_id = service
+        .probe_peer_contact_material(&peer)
+        .expect("probe disconnected peer");
+
+    assert_eq!(request_id, None);
+    assert_eq!(
+        service.pending_contact_material_request_count_for_peer(&peer),
+        0
+    );
+
+    wattswarm_network_transport_iroh::shutdown_local_iroh_data_plane(&dir);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
 fn smarter_backfill_prefers_peer_with_known_scope_activity() {
     let dir_a = temp_startup_dir("backfill-peer-a");
     let dir_b = temp_startup_dir("backfill-peer-b");
@@ -2380,7 +2419,7 @@ fn reconnect_supervision_abandons_stale_peer_until_rediscovered() {
 }
 
 #[test]
-fn reconnect_supervision_probes_relay_only_bootstrap_contact() {
+fn reconnect_supervision_does_not_probe_contact_material_for_disconnected_peer() {
     let local_dir = temp_startup_dir("reconnect-relay-only-local");
     let remote_dir = temp_startup_dir("reconnect-relay-only-remote");
     let local_seed = [109u8; 32];
@@ -2389,6 +2428,7 @@ fn reconnect_supervision_probes_relay_only_bootstrap_contact() {
         .expect("write local seed");
     std::fs::write(remote_dir.join("node_seed.hex"), hex::encode(remote_seed))
         .expect("write remote seed");
+    ensure_test_relay_urls(&local_dir);
     std::fs::write(
         remote_dir.join("startup_config.json"),
         serde_json::to_vec(&json!({"relay_urls":["https://relay.example.invalid/"]}))
@@ -2408,20 +2448,6 @@ fn reconnect_supervision_probes_relay_only_bootstrap_contact() {
     remote_contact.metadata.listen_addrs.clear();
     remote_contact.extra["direct_addrs"] = json!([]);
     remote_contact.extra["relay_urls"] = json!(["https://relay.wattetheria.com"]);
-    std::fs::write(
-        local_dir.join("startup_config.json"),
-        serde_json::to_vec(&json!({
-            "network_mode": "wan",
-            "relay_urls":["https://relay.example.invalid/"],
-            "bootstrap_contacts": [json!({
-                "node_id": remote_endpoint,
-                "peer_id": remote_contact.peer_id,
-                "transports": [remote_contact]
-            }).to_string()]
-        }))
-        .expect("startup config json"),
-    )
-    .expect("write startup config");
     let peer = NetworkNodeId::new(remote_endpoint).expect("remote peer id");
     let mut service = NetworkBridgeService::new(
         NetworkP2pNode::from_iroh_state_dir(
@@ -2435,6 +2461,9 @@ fn reconnect_supervision_probes_relay_only_bootstrap_contact() {
     )
     .expect("service");
     service.set_state_dir(local_dir.clone(), local_dir.join("ui.state"));
+    service
+        .upsert_remote_contact_material(peer.to_string(), remote_contact)
+        .expect("upsert relay-only remote contact");
 
     assert_eq!(service.known_remote_contact_count(), 1);
     assert_eq!(service.reconnect_attempts_for_peer(&peer), Some(0));
@@ -2446,13 +2475,17 @@ fn reconnect_supervision_probes_relay_only_bootstrap_contact() {
     assert_eq!(service.reconnect_attempts_for_peer(&peer), Some(1));
     assert_eq!(
         service.pending_contact_material_request_count_for_peer(&peer),
-        1
+        0
     );
     service.force_reconnect_due_for_peer(&peer);
     let attempts = service
         .run_reconnect_supervision()
-        .expect("pending probe suppresses duplicate reconnect");
-    assert_eq!(attempts, 0);
+        .expect("disconnected peer can retry reconnect without contact material probe");
+    assert_eq!(attempts, 1);
+    assert_eq!(
+        service.pending_contact_material_request_count_for_peer(&peer),
+        0
+    );
 
     wattswarm_network_transport_iroh::shutdown_local_iroh_data_plane(&local_dir);
     wattswarm_network_transport_iroh::shutdown_local_iroh_data_plane(&remote_dir);

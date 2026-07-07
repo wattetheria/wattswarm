@@ -1,7 +1,7 @@
 use crate::control::{
     ExecutorRegistryEntry, NodeMode, NodeState, RealTaskRunRequest, load_executor_registry_state,
-    node_state_path, open_node, open_node_in_mode, resolve_node_mode, run_real_task_flow,
-    save_executor_registry_state, write_node_state,
+    local_peer_id, node_state_path, open_node, open_node_in_mode, resolve_node_mode,
+    run_real_task_flow, save_executor_registry_state, write_node_state,
 };
 use crate::run_control;
 use crate::run_queue::{RunSubmitSpec, WorkerOptions};
@@ -18,7 +18,11 @@ use anyhow::{Context, Result, anyhow};
 use clap::{Args, Parser, Subcommand};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 use uuid::Uuid;
+
+const DEFAULT_NODE_API_URL: &str = "http://127.0.0.1:7788";
+const ENV_NODE_API_URL: &str = "WATTSWARM_NODE_API_URL";
 
 #[derive(Parser, Debug)]
 #[command(name = "wattswarm")]
@@ -63,6 +67,18 @@ enum NodeAction {
         contact: String,
         #[arg(long, default_value = "wan")]
         mode: String,
+    },
+    IrohProbe {
+        #[arg(value_name = "ENDPOINT_ID")]
+        endpoint_id: String,
+        #[arg(long = "direct-addr")]
+        direct_addr: Option<String>,
+        #[arg(long = "hold-ms", default_value_t = 10_000)]
+        hold_ms: u64,
+        #[arg(long = "timeout-ms", default_value_t = 30_000)]
+        timeout_ms: u64,
+        #[arg(long = "node-api-url")]
+        node_api_url: Option<String>,
     },
     BootstrapContacts,
     SignNetworkParams {
@@ -384,6 +400,44 @@ fn handle_node(cmd: NodeCommand, state_dir: &Path, db_path: &Path) -> Result<()>
             save_startup_config(&path, &config)?;
             println!("bootstrap contact added");
         }
+        NodeAction::IrohProbe {
+            endpoint_id,
+            direct_addr,
+            hold_ms,
+            timeout_ms,
+            node_api_url,
+        } => {
+            let trimmed = endpoint_id.trim();
+            if trimmed.is_empty() {
+                return Err(anyhow!("iroh probe endpoint id is required"));
+            }
+            let probe_target = format_iroh_probe_target(trimmed, direct_addr.as_deref());
+            let node_api_url = resolve_node_api_url(node_api_url.as_deref())?;
+            if let Some(result) =
+                try_running_node_iroh_probe(&node_api_url, &probe_target, hold_ms, timeout_ms)
+                    .with_context(|| {
+                        format!("call running wattswarm node iroh probe at {node_api_url}")
+                    })?
+            {
+                println!("{}", serde_json::to_string_pretty(&result)?);
+                return Ok(());
+            }
+            let peer_id = local_peer_id(state_dir)?;
+            let result =
+                wattswarm_network_transport_iroh::probe_iroh_route_endpoint_id_for_network_peer_id(
+                    state_dir,
+                    &peer_id,
+                    &probe_target,
+                    Duration::from_millis(hold_ms),
+                    Duration::from_millis(timeout_ms),
+                )
+                .with_context(|| {
+                    format!(
+                        "running node API unavailable at {node_api_url} and offline iroh probe failed"
+                    )
+                })?;
+            println!("{}", serde_json::to_string_pretty(&result)?);
+        }
         NodeAction::BootstrapContacts => {
             let config = load_startup_config(&startup_config_path(state_dir))?;
             for contact in config.bootstrap_contacts {
@@ -469,6 +523,14 @@ fn decode_hex_seed(raw: &str) -> Result<Vec<u8>> {
                 .with_context(|| format!("invalid seed hex at byte {}", idx / 2))
         })
         .collect()
+}
+
+fn format_iroh_probe_target(endpoint_id: &str, direct_addr: Option<&str>) -> String {
+    direct_addr
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|addr| format!("{endpoint_id}@{addr}"))
+        .unwrap_or_else(|| endpoint_id.to_owned())
 }
 
 fn load_network_protocol_params(path: Option<&Path>) -> Result<NetworkProtocolParamsMap> {
@@ -609,6 +671,78 @@ fn handle_executors(cmd: ExecutorsCommand, state_dir: &Path) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn resolve_node_api_url(explicit: Option<&str>) -> Result<String> {
+    let raw = explicit
+        .map(str::to_owned)
+        .or_else(|| std::env::var(ENV_NODE_API_URL).ok())
+        .unwrap_or_else(|| DEFAULT_NODE_API_URL.to_owned());
+    let trimmed = raw.trim().trim_end_matches('/');
+    if trimmed.is_empty() {
+        return Err(anyhow!(
+            "{ENV_NODE_API_URL} or --node-api-url cannot be empty"
+        ));
+    }
+    let url = reqwest::Url::parse(trimmed)
+        .with_context(|| format!("parse running node API URL {trimmed}"))?;
+    if url.scheme() != "http" && url.scheme() != "https" {
+        return Err(anyhow!("running node API URL must use http or https"));
+    }
+    Ok(trimmed.to_owned())
+}
+
+fn try_running_node_iroh_probe(
+    node_api_url: &str,
+    endpoint_id: &str,
+    hold_ms: u64,
+    timeout_ms: u64,
+) -> Result<Option<serde_json::Value>> {
+    let timeout = timeout_ms.saturating_add(5_000).max(5_000);
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_millis(timeout))
+        .build()
+        .context("build running node HTTP client")?;
+    let probe_url = format!("{node_api_url}/api/node/iroh-probe");
+    let response = match client
+        .post(&probe_url)
+        .json(&serde_json::json!({
+            "endpoint_id": endpoint_id,
+            "hold_ms": hold_ms,
+            "timeout_ms": timeout_ms,
+        }))
+        .send()
+    {
+        Ok(response) => response,
+        Err(error) if error.is_connect() => return Ok(None),
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "send running node iroh probe request to {probe_url}; \
+                     the EndpointId argument is the remote peer, this URL is the local node control API"
+                )
+            });
+        }
+    };
+    if response.status() == reqwest::StatusCode::NOT_FOUND {
+        return Ok(None);
+    }
+    let status = response.status();
+    let raw_body = response
+        .text()
+        .context("read running node iroh probe response")?;
+    if !status.is_success() {
+        return Err(anyhow!(
+            "running node iroh probe failed with {status}: {raw_body}"
+        ));
+    }
+    let body: serde_json::Value =
+        serde_json::from_str(&raw_body).context("decode running node iroh probe response")?;
+    let result = body
+        .get("result")
+        .cloned()
+        .ok_or_else(|| anyhow!("running node iroh probe response missing result"))?;
+    Ok(Some(result))
 }
 
 fn handle_task(cmd: TaskCommand, state_dir: &Path, db_path: &Path) -> Result<()> {

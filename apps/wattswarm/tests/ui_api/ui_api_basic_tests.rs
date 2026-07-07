@@ -905,6 +905,9 @@ fn ui_root_page_serves_startup_view_and_diagnostics_route_redirects_legacy_conso
             .await
             .unwrap();
         assert_eq!(root_res.status(), StatusCode::OK);
+        let root_body = to_bytes(root_res.into_body(), usize::MAX).await.unwrap();
+        let root_html = String::from_utf8_lossy(&root_body);
+        assert!(!root_html.contains("<h2>Iroh Connectivity</h2>"));
 
         let diagnostics_res = app
             .clone()
@@ -931,6 +934,22 @@ fn ui_root_page_serves_startup_view_and_diagnostics_route_redirects_legacy_conso
         assert!(diagnostics_html.contains("function renderRawJsonDetails(details)"));
         assert!(diagnostics_html.contains("function parseRawJsonString(value)"));
         assert!(diagnostics_html.contains("normalized.endsWith(\"_at\")"));
+        assert!(diagnostics_html.contains("<h2>Iroh Connectivity</h2>"));
+        assert!(diagnostics_html.contains(r#"id="irohCurrentPath""#));
+        assert!(diagnostics_html.contains(r#"id="irohDialTarget""#));
+        assert!(diagnostics_html.contains(r#"id="irohRoutePolicy""#));
+        assert!(diagnostics_html.contains(r#"id="irohTransportDetail""#));
+        assert!(diagnostics_html.contains("Iroh native direct-first"));
+        assert!(diagnostics_html.contains("managed by Iroh"));
+        assert!(
+            diagnostics_html.contains("function renderIrohConnectivity(snapshot, irohRouteRows)")
+        );
+        assert!(diagnostics_html.contains("function latestIrohRouteDiagnostic(rows)"));
+        assert!(diagnostics_html.contains("function fetchLatestIrohRouteDiagnostics()"));
+        assert!(diagnostics_html.contains(r#"params.set("phase", "iroh.route.selected")"#));
+        assert!(diagnostics_html.contains("iroh.route.selected"));
+        assert!(!diagnostics_html.contains(r#"id="irohSelectedPath""#));
+        assert!(!diagnostics_html.contains(r#"id="irohSelectedAddr""#));
         assert!(diagnostics_html.contains("Open to render formatted JSON."));
 
         let legacy_res = app
@@ -950,6 +969,43 @@ fn ui_root_page_serves_startup_view_and_diagnostics_route_redirects_legacy_conso
                 .get("location")
                 .and_then(|v| v.to_str().ok()),
             Some("/diagnostics")
+        );
+    });
+}
+
+#[test]
+fn ui_node_iroh_probe_rejects_empty_endpoint_id() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let dir = tempdir().unwrap();
+        let state_dir = dir.path().join("state");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        let db_path = state_dir.join("ui.state");
+        let app = build_app(UiServerState::new(state_dir, db_path));
+
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/node/iroh-probe")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"endpoint_id":"","hold_ms":0,"timeout_ms":1}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        let json = json_from(res).await;
+        assert_eq!(json["ok"].as_bool(), Some(false));
+        assert_eq!(
+            json["error"].as_str(),
+            Some("iroh probe endpoint id is required")
         );
     });
 }
@@ -1896,4 +1952,77 @@ fn ui_join_manifest_builds_relay_only_contact_without_exporting_local_iroh_endpo
             Some("https://relay.wattetheria.com")
         );
     });
+}
+
+#[test]
+fn ui_join_manifest_publishes_explicit_direct_contact_when_enabled() {
+    let _guard = env_lock();
+    let _db_lock = DbTestLock::acquire();
+    let schema = reset_test_schema("test");
+    let _schema_guard = EnvVarGuard::set("WATTSWARM_PG_SCHEMA", &schema);
+    let _mode_guard = EnvVarGuard::set("WATTSWARM_NODE_MODE", "network");
+    let _contacts_guard = EnvVarGuard::set("WATTSWARM_PUBLIC_BOOTSTRAP_CONTACTS", "");
+    let _relay_guard =
+        EnvVarGuard::set("WATTSWARM_IROH_RELAY_URLS", "https://relay.wattetheria.com");
+    let _direct_guard = EnvVarGuard::set("WATTSWARM_IROH_PUBLISH_DIRECT_ADDRS", "127.0.0.1:7777");
+    let dir = tempdir().unwrap();
+    let state_dir = dir.path().join("state");
+    std::fs::create_dir_all(&state_dir).unwrap();
+    let seed_hex = [46_u8; 32]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    std::fs::write(state_dir.join("node_seed.hex"), seed_hex).unwrap();
+    let db_path = state_dir.join("ui.state");
+    let genesis = NodeIdentity::from_seed([46_u8; 32]);
+    let genesis_node_id = genesis.node_id();
+    let network_id = "mainnet:wattetheria";
+    let store = wattswarm::storage::PgStore::open(&db_path).unwrap();
+    store
+        .ensure_mainnet_bootstrap_network_topology(
+            network_id,
+            "Wattetheria",
+            &genesis_node_id,
+            &genesis_node_id,
+            1_700_000_000_000,
+        )
+        .unwrap();
+    store
+        .put_network_protocol_params(network_id, &genesis, &NetworkProtocolParams::default())
+        .unwrap();
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let app = build_app(UiServerState::new(state_dir.clone(), db_path));
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/.well-known/wattswarm/join.json")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let json = json_from(res).await;
+        let contact = serde_json::from_str::<Value>(
+            json["bootstrap_contacts"][0]
+                .as_str()
+                .expect("bootstrap contact"),
+        )
+        .expect("contact json");
+        assert_eq!(
+            contact["transports"][0]["extra"]["direct_addrs"][0].as_str(),
+            Some("127.0.0.1:7777")
+        );
+        assert_eq!(
+            contact["transports"][0]["extra"]["relay_urls"][0].as_str(),
+            Some("https://relay.wattetheria.com")
+        );
+    });
+    wattswarm_network_transport_iroh::shutdown_local_iroh_data_plane(&state_dir);
 }

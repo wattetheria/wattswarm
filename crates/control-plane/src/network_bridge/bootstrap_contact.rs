@@ -445,17 +445,25 @@ fn transport_contact_from_short_bootstrap_contact(
 ) -> Result<TransportContactMaterial> {
     let (endpoint_id, raw_addr) = raw_contact
         .rsplit_once('@')
-        .ok_or_else(|| anyhow!("bootstrap contact must be <iroh-node-id>@<host:port>"))?;
+        .map_or((raw_contact, None), |(endpoint_id, raw_addr)| {
+            (endpoint_id, Some(raw_addr))
+        });
     let endpoint_id = NetworkNodeId::new(endpoint_id.to_owned())
         .context("bootstrap contact peer must be an iroh NodeId / EndpointId")?
         .to_string();
-    let raw_addr = raw_addr.trim();
-    if raw_addr.is_empty() {
-        bail!("bootstrap contact address is empty");
-    }
-    let _: SocketAddr = raw_addr
-        .parse()
-        .with_context(|| format!("parse bootstrap contact address {raw_addr}"))?;
+    let direct_addrs = raw_addr
+        .map(str::trim)
+        .map(|raw_addr| {
+            if raw_addr.is_empty() {
+                bail!("bootstrap contact address is empty");
+            }
+            let _: SocketAddr = raw_addr
+                .parse()
+                .with_context(|| format!("parse bootstrap contact address {raw_addr}"))?;
+            Ok(vec![raw_addr.to_owned()])
+        })
+        .transpose()?
+        .unwrap_or_default();
     let generated_at = observed_at_ms();
     let capabilities = PeerTransportCapabilities::iroh_direct_default();
     Ok(TransportContactMaterial {
@@ -466,13 +474,13 @@ fn transport_contact_from_short_bootstrap_contact(
             generated_at,
             endpoint_id: Some(endpoint_id.clone()),
             alpn: Some(wattswarm_network_transport_iroh::DEFAULT_IROH_ALPN.to_owned()),
-            listen_addrs: vec![raw_addr.to_owned()],
+            listen_addrs: direct_addrs.clone(),
             capabilities,
         },
         extra: json!({
             "endpoint_id": endpoint_id,
             "alpn": wattswarm_network_transport_iroh::DEFAULT_IROH_ALPN,
-            "direct_addrs": [raw_addr],
+            "direct_addrs": direct_addrs,
             "relay_urls": []
         }),
     })
@@ -587,4 +595,50 @@ fn upsert_startup_bootstrap_contact_material(
         last_identified_at: now,
     };
     crate::control::save_peer_metadata_record_state(state_dir, &record)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn short_bootstrap_contact_accepts_endpoint_id_only() {
+        let endpoint_id = "83393ad000151bc41e686a1fc892e07a440a2a53110bbaeae3d13e5978599956";
+
+        let contact =
+            transport_contact_from_short_bootstrap_contact(endpoint_id).expect("short contact");
+
+        assert_eq!(contact.peer_id, endpoint_id);
+        assert_eq!(contact.metadata.endpoint_id.as_deref(), Some(endpoint_id));
+        assert!(contact.metadata.listen_addrs.is_empty());
+        assert!(
+            contact.extra["direct_addrs"]
+                .as_array()
+                .expect("direct addrs")
+                .is_empty()
+        );
+        assert!(
+            contact.extra["relay_urls"]
+                .as_array()
+                .expect("relay urls")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn short_bootstrap_contact_keeps_legacy_endpoint_id_at_direct_addr() {
+        let endpoint_id = "83393ad000151bc41e686a1fc892e07a440a2a53110bbaeae3d13e5978599956";
+
+        let contact = transport_contact_from_short_bootstrap_contact(&format!(
+            "{endpoint_id}@127.0.0.1:4002"
+        ))
+        .expect("short contact");
+
+        assert_eq!(contact.peer_id, endpoint_id);
+        assert_eq!(contact.metadata.listen_addrs, vec!["127.0.0.1:4002"]);
+        assert_eq!(
+            contact.extra["direct_addrs"][0].as_str(),
+            Some("127.0.0.1:4002")
+        );
+    }
 }

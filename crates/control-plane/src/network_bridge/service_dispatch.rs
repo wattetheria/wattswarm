@@ -173,6 +173,9 @@ impl NetworkBridgeService {
         &mut self,
         peer: &NetworkNodeId,
     ) -> Result<Option<ContactMaterialRequestId>> {
+        if !self.connected_peers.contains(peer) {
+            return Ok(None);
+        }
         if self
             .pending_contact_material_requests
             .values()

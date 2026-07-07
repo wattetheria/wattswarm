@@ -17,11 +17,13 @@ use iroh_gossip::{
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::HashMap;
-use std::fs;
+use std::fs::{self, OpenOptions};
 use std::future::Future;
-use std::net::SocketAddr;
+use std::io::Write as _;
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::runtime::{Builder as RuntimeBuilder, Runtime, RuntimeFlavor};
@@ -51,6 +53,28 @@ const DEFAULT_GOSSIP_SHUFFLE_ACTIVE_VIEW_COUNT: usize = 4;
 const DEFAULT_GOSSIP_MAINTENANCE_INTERVAL_MS: u64 = 1_000;
 const DEFAULT_IROH_DATA_PLANE_START_TIMEOUT_MS: u64 = 120_000;
 const DEFAULT_IROH_CONTROL_STREAM_TIMEOUT_MS: u64 = 30_000;
+const IROH_ONLINE_WAIT_TIMEOUT_MS: u64 = 10_000;
+const PUBLIC_IP_RESOLVER_TIMEOUT_MS: u64 = 2_000;
+const PUBLIC_IP_CACHE_TTL_SECS: u64 = 300;
+const DIAGNOSTIC_LOG_RELATIVE_PATH: &str = "diagnostics/wattswarm_node.jsonl";
+const IROH_CONTACT_MATERIAL_EXPORT_PHASE: &str = "iroh.contact_material.export";
+const DEFAULT_PUBLIC_IP_RESOLVER_URLS: &[&str] = &[
+    "https://api.ipify.org",
+    "https://ifconfig.me/ip",
+    "https://icanhazip.com",
+];
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IrohRouteProbeResult {
+    pub peer_id: String,
+    pub endpoint_id: String,
+    pub selected_route: String,
+    pub path_count: usize,
+    pub stage: String,
+    pub runtime: String,
+    pub direct_capable: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback_reason: Option<String>,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IrohGossipRuntimeConfig {
@@ -170,6 +194,94 @@ fn parse_direct_addr_publish_env(raw: Option<&str>) -> Result<Vec<String>> {
         }
     }
     Ok(addrs)
+}
+
+fn observed_direct_addrs_for_publish(
+    observed_direct_addrs: Vec<String>,
+    bind_port: Option<u16>,
+) -> Vec<String> {
+    let mut published = Vec::new();
+    for raw in observed_direct_addrs {
+        // A relay-observed global address carries the NAT flow port, which is
+        // not cold-dialable; the deployment's inbound mapping listens on the
+        // local bind port, so global addresses are republished on that port.
+        let published_addr = match (raw.parse::<SocketAddr>(), bind_port) {
+            (Ok(addr), Some(port)) if ip_addr_is_global(&addr.ip()) => {
+                SocketAddr::new(addr.ip(), port).to_string()
+            }
+            (Ok(addr), _) => addr.to_string(),
+            (Err(_), _) => raw,
+        };
+        if !published.contains(&published_addr) {
+            published.push(published_addr);
+        }
+    }
+    published
+}
+
+fn observed_direct_addrs_for_publish_with_public_ip_fallback(
+    observed_direct_addrs: Vec<String>,
+    bind_port: Option<u16>,
+    public_ip: Option<IpAddr>,
+) -> Vec<String> {
+    let mut published = observed_direct_addrs_for_publish(observed_direct_addrs, bind_port)
+        .into_iter()
+        .filter(|raw| {
+            raw.parse::<SocketAddr>()
+                .is_ok_and(|addr| ip_addr_is_global(&addr.ip()))
+        })
+        .collect::<Vec<_>>();
+    let Some(port) = bind_port else {
+        return published;
+    };
+    if !published.is_empty() {
+        return published;
+    }
+    let Some(public_ip) = public_ip.filter(ip_addr_is_global) else {
+        return published;
+    };
+    let published_addr = SocketAddr::new(public_ip, port).to_string();
+    if !published.contains(&published_addr) {
+        published.push(published_addr);
+    }
+    published
+}
+
+fn ip_addr_is_global(ip: &IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            let [a, b, c, _] = v4.octets();
+            let is_this_network = a == 0;
+            let is_cgnat = a == 100 && (b & 0b1100_0000) == 64;
+            let is_ietf_protocol_assignment = a == 192 && b == 0 && c == 0;
+            let is_benchmarking = a == 198 && (b == 18 || b == 19);
+            let is_deprecated_6to4_relay_anycast = a == 192 && b == 88 && c == 99;
+            let is_reserved = a >= 240;
+            let is_non_global = v4.is_loopback()
+                || v4.is_private()
+                || v4.is_link_local()
+                || v4.is_unspecified()
+                || v4.is_broadcast()
+                || v4.is_documentation()
+                || v4.is_multicast()
+                || is_this_network
+                || is_cgnat
+                || is_ietf_protocol_assignment
+                || is_benchmarking
+                || is_deprecated_6to4_relay_anycast
+                || is_reserved;
+            !is_non_global
+        }
+        IpAddr::V6(v6) => {
+            let segments = v6.segments();
+            let first = segments[0];
+            let is_global_unicast = (first & 0xe000) == 0x2000;
+            let is_documentation = first == 0x2001 && segments[1] == 0x0db8;
+            let is_benchmarking = first == 0x2001 && segments[1] == 0x0002;
+            let is_orchid_v2 = first == 0x2001 && (segments[1] & 0xfff0) == 0x0020;
+            is_global_unicast && !(is_documentation || is_benchmarking || is_orchid_v2)
+        }
+    }
 }
 
 fn parse_positive_u64_env(key: &str, raw: Option<&str>, default: u64) -> Result<u64> {
@@ -335,6 +447,7 @@ impl DirectDataTransportAdapter for IrohTransportAdapter {
 }
 
 struct IrohDataPlaneService {
+    state_dir: PathBuf,
     runtime: Runtime,
     endpoint: Endpoint,
     router: Router,
@@ -345,6 +458,9 @@ struct IrohDataPlaneService {
     endpoint_options: IrohEndpointOptions,
     control_handlers: ControlStreamHandlers,
     op_lock: Mutex<()>,
+    endpoint_online_awaited: AtomicBool,
+    public_ip_cache: Mutex<Option<PublicIpCacheEntry>>,
+    contact_material_diagnostic_key: Mutex<Option<String>>,
     // Sentinel flock held for the lifetime of the service. Drop releases the
     // OS-level lock so a subsequent process can acquire it. Held to prevent two
     // wattswarm processes from sharing one state_dir (which would otherwise
@@ -359,6 +475,24 @@ struct IrohEndpointOptions {
     bind_addr: Option<SocketAddr>,
     publish_observed_direct_addrs: bool,
     published_direct_addrs: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PublicIpResolverResult {
+    ip: IpAddr,
+    source: String,
+}
+
+#[derive(Debug, Clone)]
+struct PublicIpCacheEntry {
+    resolved_at_secs: u64,
+    result: PublicIpResolverResult,
+}
+
+impl PublicIpCacheEntry {
+    fn is_fresh(&self, now_secs: u64) -> bool {
+        now_secs.saturating_sub(self.resolved_at_secs) <= PUBLIC_IP_CACHE_TTL_SECS
+    }
 }
 
 /// Relay URLs persisted by the control plane in `startup_config.json`,
@@ -422,9 +556,17 @@ impl IrohEndpointOptions {
         })
     }
 
-    fn published_direct_addrs(&self, observed_direct_addrs: Vec<String>) -> Vec<String> {
+    fn published_direct_addrs(
+        &self,
+        observed_direct_addrs: Vec<String>,
+        fallback_public_ip: Option<IpAddr>,
+    ) -> Vec<String> {
         if self.publish_observed_direct_addrs {
-            return observed_direct_addrs;
+            return observed_direct_addrs_for_publish_with_public_ip_fallback(
+                observed_direct_addrs,
+                self.bind_addr.map(|addr| addr.port()),
+                fallback_public_ip,
+            );
         }
         self.published_direct_addrs.clone()
     }
@@ -573,6 +715,96 @@ fn unix_timestamp_secs() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs())
         .unwrap_or_default()
+}
+
+fn unix_timestamp_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)
+        .unwrap_or_default()
+}
+
+fn parse_public_ip_response(raw: &str) -> Option<IpAddr> {
+    let trimmed = raw.trim();
+    if let Ok(ip) = trimmed.parse::<IpAddr>() {
+        return ip_addr_is_global(&ip).then_some(ip);
+    }
+    for line in trimmed.lines() {
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        if key.trim() != "ip" {
+            continue;
+        }
+        let Ok(ip) = value.trim().parse::<IpAddr>() else {
+            continue;
+        };
+        if ip_addr_is_global(&ip) {
+            return Some(ip);
+        }
+    }
+    None
+}
+
+fn append_iroh_contact_material_diagnostic(
+    state_dir: &Path,
+    entry: &serde_json::Value,
+) -> Result<()> {
+    let path = state_dir.join(DIAGNOSTIC_LOG_RELATIVE_PATH);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).context("create Wattswarm diagnostics directory")?;
+    }
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .with_context(|| format!("open Wattswarm diagnostics log {}", path.display()))?;
+    file.write_all(serde_json::to_string(entry)?.as_bytes())?;
+    file.write_all(b"\n")?;
+    Ok(())
+}
+
+async fn resolve_public_ip_from_default_endpoints() -> Result<Option<PublicIpResolverResult>> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_millis(PUBLIC_IP_RESOLVER_TIMEOUT_MS))
+        .build()
+        .context("build public IP resolver client")?;
+    let mut errors = Vec::new();
+    for source in DEFAULT_PUBLIC_IP_RESOLVER_URLS {
+        let response = match client.get(*source).send().await {
+            Ok(response) => response,
+            Err(error) => {
+                errors.push(format!("{source}: {error}"));
+                continue;
+            }
+        };
+        let status = response.status();
+        if !status.is_success() {
+            errors.push(format!("{source}: HTTP {status}"));
+            continue;
+        }
+        let body = match response.text().await {
+            Ok(body) => body,
+            Err(error) => {
+                errors.push(format!("{source}: {error}"));
+                continue;
+            }
+        };
+        if let Some(ip) = parse_public_ip_response(&body) {
+            return Ok(Some(PublicIpResolverResult {
+                ip,
+                source: (*source).to_owned(),
+            }));
+        }
+        errors.push(format!(
+            "{source}: response did not contain a global IP address"
+        ));
+    }
+    if errors.is_empty() {
+        Ok(None)
+    } else {
+        bail!("public IP resolver failed: {}", errors.join("; "))
+    }
 }
 
 async fn serve_incoming_fetch_request(state_dir: PathBuf, connection: Connection) -> Result<()> {
@@ -800,6 +1032,7 @@ impl IrohDataPlaneService {
         let (gossip, blob_store, router) =
             block_on_iroh_data_plane_start(&runtime, "initialize iroh router", router_future())?;
         Ok(Arc::new(Self {
+            state_dir: state_dir.to_path_buf(),
             runtime,
             endpoint,
             router,
@@ -810,6 +1043,9 @@ impl IrohDataPlaneService {
             endpoint_options,
             control_handlers,
             op_lock: Mutex::new(()),
+            endpoint_online_awaited: AtomicBool::new(false),
+            public_ip_cache: Mutex::new(None),
+            contact_material_diagnostic_key: Mutex::new(None),
             _data_plane_lock: data_plane_lock,
         }))
     }
@@ -829,19 +1065,209 @@ impl IrohDataPlaneService {
         }
     }
 
+    /// `Endpoint::addr()` is only complete after the endpoint has been online.
+    /// The wait is bounded so an unreachable relay cannot stall exports, and
+    /// awaited only once because online state is a latch.
+    fn await_endpoint_online_once(&self) -> &'static str {
+        if self.endpoint_online_awaited.swap(true, Ordering::SeqCst) {
+            return "already_awaited";
+        }
+        match self.block_on(async {
+            tokio::time::timeout(
+                Duration::from_millis(IROH_ONLINE_WAIT_TIMEOUT_MS),
+                self.endpoint.online(),
+            )
+            .await
+        }) {
+            Ok(()) => "online",
+            Err(_) => "timeout",
+        }
+    }
+
+    fn resolve_public_ip_for_publish(
+        &self,
+        online_wait_status: &str,
+    ) -> Option<PublicIpResolverResult> {
+        let now_secs = unix_timestamp_secs();
+        {
+            let cache = self
+                .public_ip_cache
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Some(entry) = cache.as_ref().filter(|entry| entry.is_fresh(now_secs)) {
+                return Some(entry.result.clone());
+            }
+        }
+        let resolved = match self.block_on(resolve_public_ip_from_default_endpoints()) {
+            Ok(Some(result)) => result,
+            Ok(None) => return None,
+            Err(error) => {
+                self.record_contact_material_export_diagnostic(
+                    "warn",
+                    "resolver_failed",
+                    "public IP resolver failed",
+                    online_wait_status,
+                    &[],
+                    &[],
+                    &[],
+                    None,
+                    Some(error.to_string()),
+                );
+                return None;
+            }
+        };
+        let mut cache = self
+            .public_ip_cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *cache = Some(PublicIpCacheEntry {
+            resolved_at_secs: now_secs,
+            result: resolved.clone(),
+        });
+        Some(resolved)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn record_contact_material_export_diagnostic(
+        &self,
+        level: &str,
+        status: &str,
+        message: &str,
+        online_wait_status: &str,
+        raw_ip_addrs: &[String],
+        published_direct_addrs: &[String],
+        relay_urls: &[String],
+        public_ip: Option<&PublicIpResolverResult>,
+        resolver_error: Option<String>,
+    ) {
+        let diagnostic_key = format!(
+            "{}|{}|{}|{}|{}|{}|{:?}|{}",
+            level,
+            status,
+            online_wait_status,
+            raw_ip_addrs.join(","),
+            published_direct_addrs.join(","),
+            relay_urls.join(","),
+            public_ip,
+            resolver_error.as_deref().unwrap_or_default()
+        );
+        {
+            let mut last_key = self
+                .contact_material_diagnostic_key
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if last_key.as_deref() == Some(diagnostic_key.as_str()) {
+                return;
+            }
+            *last_key = Some(diagnostic_key);
+        }
+        let details = json!({
+            "publish_observed_direct_addrs": self.endpoint_options.publish_observed_direct_addrs,
+            "bind_addr": self.endpoint_options.bind_addr.map(|addr| addr.to_string()),
+            "online_wait_status": online_wait_status,
+            "raw_ip_addrs": raw_ip_addrs,
+            "published_direct_addrs": published_direct_addrs,
+            "relay_urls": relay_urls,
+            "public_ip_resolver": public_ip.map(|result| json!({
+                "ip": result.ip.to_string(),
+                "source": result.source.clone(),
+            })),
+            "resolver_error": resolver_error,
+            "contains_global_direct_addr": published_direct_addrs.iter().any(|raw| {
+                raw.parse::<SocketAddr>()
+                    .is_ok_and(|addr| ip_addr_is_global(&addr.ip()))
+            }),
+        });
+        let entry = json!({
+            "id": format!("iroh-contact-material-{}", unix_timestamp_millis()),
+            "timestamp_ms": unix_timestamp_millis(),
+            "level": level,
+            "component": "wattswarm.network_transport_iroh",
+            "category": "transport",
+            "phase": IROH_CONTACT_MATERIAL_EXPORT_PHASE,
+            "status": status,
+            "message": message,
+            "object_kind": "peer",
+            "object_id": self.adapter.network_peer_id(),
+            "source_node_id": self.adapter.network_peer_id(),
+            "details": details,
+        });
+        let append_result = append_iroh_contact_material_diagnostic(&self.state_dir, &entry);
+        if let Err(error) = append_result {
+            eprintln!("wattswarm iroh diagnostic append failed: {error:#}");
+        }
+    }
+
     fn export_contact_material(&self, generated_at: u64) -> Result<TransportContactMaterial> {
+        let mut online_wait_status = "not_awaited";
+        if self.endpoint_options.publish_observed_direct_addrs {
+            online_wait_status = self.await_endpoint_online_once();
+        }
         let addr = self.endpoint.addr();
-        let direct_addrs = self
-            .endpoint_options
-            .published_direct_addrs(addr.ip_addrs().map(|value| value.to_string()).collect());
+        let raw_ip_addrs = addr
+            .ip_addrs()
+            .map(|value| value.to_string())
+            .collect::<Vec<_>>();
+        let public_ip = if self.endpoint_options.publish_observed_direct_addrs
+            && self.endpoint_options.bind_addr.is_some()
+            && !raw_ip_addrs.iter().any(|raw| {
+                raw.parse::<SocketAddr>()
+                    .is_ok_and(|addr| ip_addr_is_global(&addr.ip()))
+            }) {
+            self.resolve_public_ip_for_publish(online_wait_status)
+        } else {
+            None
+        };
+        let direct_addrs = self.endpoint_options.published_direct_addrs(
+            raw_ip_addrs.clone(),
+            public_ip.as_ref().map(|result| result.ip),
+        );
         let relay_urls = self.endpoint_options.published_relay_urls(
             addr.relay_urls()
                 .map(|value| value.to_string())
                 .collect::<Vec<_>>(),
         );
         if direct_addrs.is_empty() && relay_urls.is_empty() {
+            self.record_contact_material_export_diagnostic(
+                "error",
+                "empty",
+                "iroh contact material has no public direct addresses or relay urls",
+                online_wait_status,
+                &raw_ip_addrs,
+                &direct_addrs,
+                &relay_urls,
+                public_ip.as_ref(),
+                None,
+            );
             bail!("iroh contact material has no public direct addresses or relay urls");
         }
+        let contains_global_direct_addr = direct_addrs.iter().any(|raw| {
+            raw.parse::<SocketAddr>()
+                .is_ok_and(|addr| ip_addr_is_global(&addr.ip()))
+        });
+        self.record_contact_material_export_diagnostic(
+            if contains_global_direct_addr {
+                "info"
+            } else {
+                "warn"
+            },
+            if contains_global_direct_addr {
+                "published_global_direct_addr"
+            } else {
+                "no_global_direct_addr"
+            },
+            if contains_global_direct_addr {
+                "iroh contact material published a global direct address"
+            } else {
+                "iroh contact material did not publish a global direct address"
+            },
+            online_wait_status,
+            &raw_ip_addrs,
+            &direct_addrs,
+            &relay_urls,
+            public_ip.as_ref(),
+            None,
+        );
         Ok(self
             .adapter
             .material_payload(&direct_addrs, &relay_urls, generated_at))
@@ -939,6 +1365,36 @@ impl IrohDataPlaneService {
                 )
             })?
         })
+    }
+
+    fn probe_route(
+        &self,
+        remote: &TransportContactMaterial,
+        hold: Duration,
+        timeout: Duration,
+    ) -> Result<IrohRouteProbeResult> {
+        let endpoint_addr = endpoint_addr_from_contact_material(remote)?;
+        let connection = self.block_on(async {
+            tokio::time::timeout(timeout, async {
+                self.endpoint
+                    .connect(endpoint_addr, DEFAULT_IROH_CONTROL_ALPN.as_bytes())
+                    .await
+                    .context("connect iroh route probe endpoint")
+            })
+            .await
+            .with_context(|| {
+                format!("iroh route probe timed out after {}ms", timeout.as_millis())
+            })?
+        })?;
+        if !hold.is_zero() {
+            std::thread::sleep(hold);
+        }
+        Ok(iroh_route_probe_result(
+            remote,
+            &connection,
+            "probe",
+            "in_process",
+        ))
     }
 
     fn set_control_stream_handler(&self, kind: &str, handler: Option<ControlStreamHandler>) {
@@ -1066,10 +1522,45 @@ fn endpoint_addr_from_contact_material(contact: &TransportContactMaterial) -> Re
             Ok(TransportAddr::Relay(url))
         }))
         .collect::<Result<Vec<_>>>()?;
-    if addrs.is_empty() {
-        bail!("iroh contact material missing transport addresses");
-    }
     Ok(EndpointAddr::from_parts(endpoint_id, addrs))
+}
+
+fn iroh_route_probe_result(
+    remote: &TransportContactMaterial,
+    connection: &Connection,
+    stage: &str,
+    runtime: &str,
+) -> IrohRouteProbeResult {
+    let connection_info = connection.to_info();
+    let selected_path = connection_info.selected_path();
+    let selected_route = selected_path
+        .as_ref()
+        .map(|path| {
+            if path.is_ip() {
+                "direct"
+            } else if path.is_relay() {
+                "relay"
+            } else {
+                "custom"
+            }
+        })
+        .unwrap_or("unknown");
+    let path_count = connection_info.paths().into_iter().count();
+    IrohRouteProbeResult {
+        peer_id: remote.peer_id.clone(),
+        endpoint_id: remote
+            .metadata
+            .endpoint_id
+            .clone()
+            .unwrap_or_else(|| remote.peer_id.clone()),
+        selected_route: selected_route.to_owned(),
+        path_count,
+        stage: stage.to_owned(),
+        runtime: runtime.to_owned(),
+        direct_capable: selected_route == "direct",
+        fallback_reason: (selected_route != "direct")
+            .then(|| format!("iroh selected {selected_route} route")),
+    }
 }
 
 fn ensure_local_iroh_data_plane_for_network_peer_id(
@@ -1171,6 +1662,82 @@ pub fn send_control_stream_request_for_network_peer_id_with_timeout(
 ) -> Result<IrohControlStreamResponse> {
     ensure_local_iroh_data_plane_for_network_peer_id(state_dir, network_peer_id)?
         .send_control_stream_request(remote_contact, request, timeout)
+}
+
+pub fn probe_iroh_route_endpoint_id_for_network_peer_id(
+    state_dir: &Path,
+    network_peer_id: &str,
+    endpoint_target: &str,
+    hold: Duration,
+    timeout: Duration,
+) -> Result<IrohRouteProbeResult> {
+    let (endpoint_id, direct_addr) = parse_iroh_probe_target(endpoint_target)?;
+    let direct_addrs = direct_addr
+        .into_iter()
+        .map(|addr| addr.to_string())
+        .collect();
+    let remote_contact =
+        iroh_probe_contact_material(endpoint_id.as_str(), direct_addrs, Vec::new());
+    probe_iroh_route_for_network_peer_id(state_dir, network_peer_id, &remote_contact, hold, timeout)
+}
+
+pub fn probe_iroh_route_for_network_peer_id(
+    state_dir: &Path,
+    network_peer_id: &str,
+    remote_contact: &TransportContactMaterial,
+    hold: Duration,
+    timeout: Duration,
+) -> Result<IrohRouteProbeResult> {
+    ensure_local_iroh_data_plane_for_network_peer_id(state_dir, network_peer_id)?.probe_route(
+        remote_contact,
+        hold,
+        timeout,
+    )
+}
+
+fn parse_iroh_probe_target(raw: &str) -> Result<(String, Option<SocketAddr>)> {
+    let trimmed = raw.trim();
+    let (endpoint_id, direct_addr) = trimmed
+        .split_once('@')
+        .map_or((trimmed, None), |(endpoint_id, direct_addr)| {
+            (endpoint_id.trim(), Some(direct_addr.trim()))
+        });
+    EndpointId::from_str(endpoint_id).context("parse iroh probe endpoint id")?;
+    let direct_addr = direct_addr
+        .map(|addr| {
+            if addr.is_empty() {
+                bail!("iroh probe direct addr is empty");
+            }
+            addr.parse::<SocketAddr>()
+                .with_context(|| format!("parse iroh probe direct addr {addr}"))
+        })
+        .transpose()?;
+    Ok((endpoint_id.to_owned(), direct_addr))
+}
+
+fn iroh_probe_contact_material(
+    endpoint_id: &str,
+    direct_addrs: Vec<String>,
+    relay_urls: Vec<String>,
+) -> TransportContactMaterial {
+    TransportContactMaterial {
+        transport: TransportRoute::IrohDirect.as_str().to_owned(),
+        peer_id: endpoint_id.to_owned(),
+        metadata: TransportMetadata {
+            route: TransportRoute::IrohDirect,
+            generated_at: unix_timestamp_secs(),
+            endpoint_id: Some(endpoint_id.to_owned()),
+            alpn: Some(DEFAULT_IROH_CONTROL_ALPN.to_owned()),
+            listen_addrs: Vec::new(),
+            capabilities: PeerTransportCapabilities::iroh_direct_default(),
+        },
+        extra: json!(IrohTransportMaterial {
+            endpoint_id: endpoint_id.to_owned(),
+            alpn: DEFAULT_IROH_CONTROL_ALPN.to_owned(),
+            direct_addrs,
+            relay_urls,
+        }),
+    }
 }
 
 pub fn set_local_control_stream_handler_for_network_peer_id<H>(
@@ -1408,6 +1975,37 @@ mod tests {
     }
 
     #[test]
+    fn iroh_probe_target_accepts_endpoint_id_with_direct_addr() {
+        let (endpoint_id, direct_addr) = parse_iroh_probe_target(
+            "83393ad000151bc41e686a1fc892e07a440a2a53110bbaeae3d13e5978599956@18.206.214.6:4002",
+        )
+        .expect("probe target");
+
+        assert_eq!(
+            endpoint_id,
+            "83393ad000151bc41e686a1fc892e07a440a2a53110bbaeae3d13e5978599956"
+        );
+        assert_eq!(
+            direct_addr,
+            Some("18.206.214.6:4002".parse().expect("socket addr"))
+        );
+    }
+
+    #[test]
+    fn iroh_probe_contact_material_is_direct_only() {
+        let contact = iroh_probe_contact_material(
+            "83393ad000151bc41e686a1fc892e07a440a2a53110bbaeae3d13e5978599956",
+            vec!["18.206.214.6:4002".to_owned()],
+            Vec::new(),
+        );
+        let extra: IrohTransportMaterial =
+            serde_json::from_value(contact.extra).expect("iroh material");
+
+        assert_eq!(extra.direct_addrs, vec!["18.206.214.6:4002"]);
+        assert!(extra.relay_urls.is_empty());
+    }
+
+    #[test]
     fn exports_iroh_contact_material_with_capabilities() {
         let adapter = IrohTransportAdapter::from_seed_bytes([5u8; 32]).expect("adapter");
         let material = adapter.material_payload(
@@ -1465,7 +2063,7 @@ mod tests {
             vec!["https://relay.wattetheria.com".to_owned()]
         );
         assert_eq!(
-            options.published_direct_addrs(vec!["10.0.0.1:1234".to_owned()]),
+            options.published_direct_addrs(vec!["10.0.0.1:1234".to_owned()], None),
             Vec::<String>::new()
         );
         assert!(options.published_direct_addrs.is_empty());
@@ -1533,7 +2131,7 @@ mod tests {
             IrohEndpointOptions::from_raw_env(None, None, None).expect("endpoint options");
 
         assert_eq!(
-            options.published_direct_addrs(vec!["10.0.0.1:1234".to_owned()]),
+            options.published_direct_addrs(vec!["10.0.0.1:1234".to_owned()], None),
             Vec::<String>::new()
         );
         assert!(options.published_direct_addrs.is_empty());
@@ -1549,8 +2147,204 @@ mod tests {
             Some("0.0.0.0:4002".parse().expect("socket addr"))
         );
         assert_eq!(
-            options.published_direct_addrs(vec!["127.0.0.1:4002".to_owned()]),
-            vec!["127.0.0.1:4002".to_owned()]
+            options.published_direct_addrs(vec!["127.0.0.1:4002".to_owned()], None),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn observed_publish_rewrites_global_addr_port_to_bind_port() {
+        assert_eq!(
+            observed_direct_addrs_for_publish(
+                vec![
+                    "172.19.0.3:4002".to_owned(),
+                    "18.206.214.6:54321".to_owned()
+                ],
+                Some(4002),
+            ),
+            vec!["172.19.0.3:4002".to_owned(), "18.206.214.6:4002".to_owned()]
+        );
+    }
+
+    #[test]
+    fn observed_publish_keeps_ports_without_bind_port() {
+        assert_eq!(
+            observed_direct_addrs_for_publish(
+                vec![
+                    "172.19.0.3:4002".to_owned(),
+                    "18.206.214.6:54321".to_owned()
+                ],
+                None,
+            ),
+            vec![
+                "172.19.0.3:4002".to_owned(),
+                "18.206.214.6:54321".to_owned()
+            ]
+        );
+    }
+
+    #[test]
+    fn observed_publish_dedupes_rewritten_global_addrs() {
+        assert_eq!(
+            observed_direct_addrs_for_publish(
+                vec![
+                    "18.206.214.6:54321".to_owned(),
+                    "18.206.214.6:54999".to_owned()
+                ],
+                Some(4002),
+            ),
+            vec!["18.206.214.6:4002".to_owned()]
+        );
+    }
+
+    #[test]
+    fn observed_publish_never_rewrites_non_global_ranges() {
+        let non_global = vec![
+            "0.1.2.3:5000".to_owned(),
+            "127.0.0.1:5000".to_owned(),
+            "10.1.2.3:5000".to_owned(),
+            "192.168.1.20:5000".to_owned(),
+            "169.254.1.1:5000".to_owned(),
+            "100.64.0.1:5000".to_owned(),
+            "192.0.0.8:5000".to_owned(),
+            "192.88.99.1:5000".to_owned(),
+            "198.18.0.1:5000".to_owned(),
+            "198.19.255.255:5000".to_owned(),
+            "224.0.0.1:5000".to_owned(),
+            "240.0.0.1:5000".to_owned(),
+            "[fc00::1]:5000".to_owned(),
+            "[fe80::1]:5000".to_owned(),
+            "[::1]:5000".to_owned(),
+            "[2001:db8::1]:5000".to_owned(),
+            "[2001:2::1]:5000".to_owned(),
+            "[2001:20::1]:5000".to_owned(),
+            "[4000::1]:5000".to_owned(),
+            "[ff02::1]:5000".to_owned(),
+        ];
+
+        assert_eq!(
+            observed_direct_addrs_for_publish(non_global.clone(), Some(4002)),
+            non_global
+        );
+    }
+
+    #[test]
+    fn observed_publish_rewrites_global_ipv6_addr() {
+        assert_eq!(
+            observed_direct_addrs_for_publish(vec!["[2600::1]:53210".to_owned()], Some(4002)),
+            vec!["[2600::1]:4002".to_owned()]
+        );
+    }
+
+    #[test]
+    fn observed_publish_adds_public_ip_fallback_when_observed_addrs_are_not_global() {
+        assert_eq!(
+            observed_direct_addrs_for_publish_with_public_ip_fallback(
+                vec!["172.19.0.3:4002".to_owned(), "172.21.0.4:4002".to_owned()],
+                Some(4002),
+                Some("60.242.29.210".parse().expect("public ip")),
+            ),
+            vec!["60.242.29.210:4002".to_owned()]
+        );
+    }
+
+    #[test]
+    fn observed_publish_does_not_add_public_ip_fallback_when_global_observed_addr_exists() {
+        assert_eq!(
+            observed_direct_addrs_for_publish_with_public_ip_fallback(
+                vec![
+                    "172.19.0.3:4002".to_owned(),
+                    "18.206.214.6:54321".to_owned()
+                ],
+                Some(4002),
+                Some("60.242.29.210".parse().expect("public ip")),
+            ),
+            vec!["18.206.214.6:4002".to_owned()]
+        );
+    }
+
+    #[test]
+    fn observed_publish_ignores_public_ip_fallback_without_bind_port() {
+        assert_eq!(
+            observed_direct_addrs_for_publish_with_public_ip_fallback(
+                vec!["172.19.0.3:4002".to_owned()],
+                None,
+                Some("60.242.29.210".parse().expect("public ip")),
+            ),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn parse_public_ip_response_accepts_raw_and_cdn_cgi_trace_formats() {
+        assert_eq!(
+            parse_public_ip_response("60.242.29.210\n"),
+            Some("60.242.29.210".parse().expect("public ip"))
+        );
+        assert_eq!(
+            parse_public_ip_response("fl=abc\nip=60.242.29.210\nuag=curl\n"),
+            Some("60.242.29.210".parse().expect("public ip"))
+        );
+        assert_eq!(parse_public_ip_response("ip=172.19.0.3\n"), None);
+    }
+
+    #[test]
+    fn append_iroh_contact_material_diagnostic_writes_jsonl_entry() {
+        let dir = tempdir().expect("tempdir");
+        let entry = json!({
+            "id": "diag-1",
+            "timestamp_ms": 1,
+            "level": "info",
+            "component": "wattswarm.network_transport_iroh",
+            "category": "transport",
+            "phase": IROH_CONTACT_MATERIAL_EXPORT_PHASE,
+            "status": "published_global_direct_addr",
+            "message": "test",
+            "details": {
+                "published_direct_addrs": ["60.242.29.210:4002"]
+            }
+        });
+
+        append_iroh_contact_material_diagnostic(dir.path(), &entry).expect("append diagnostic");
+
+        let raw = fs::read_to_string(dir.path().join(DIAGNOSTIC_LOG_RELATIVE_PATH))
+            .expect("diagnostic log");
+        let saved: serde_json::Value = serde_json::from_str(raw.trim()).expect("diagnostic json");
+        assert_eq!(saved["phase"], IROH_CONTACT_MATERIAL_EXPORT_PHASE);
+        assert_eq!(
+            saved["details"]["published_direct_addrs"][0],
+            "60.242.29.210:4002"
+        );
+    }
+
+    #[test]
+    fn iroh_endpoint_options_true_mode_republishes_global_addr_on_bind_port() {
+        let options = IrohEndpointOptions::from_raw_env(None, Some("0.0.0.0:4002"), Some("true"))
+            .expect("endpoint options");
+
+        assert_eq!(
+            options.published_direct_addrs(
+                vec![
+                    "172.19.0.3:4002".to_owned(),
+                    "18.206.214.6:54321".to_owned(),
+                ],
+                None
+            ),
+            vec!["18.206.214.6:4002".to_owned()]
+        );
+    }
+
+    #[test]
+    fn iroh_endpoint_options_true_mode_uses_public_ip_fallback() {
+        let options = IrohEndpointOptions::from_raw_env(None, Some("0.0.0.0:4002"), Some("true"))
+            .expect("endpoint options");
+
+        assert_eq!(
+            options.published_direct_addrs(
+                vec!["172.19.0.3:4002".to_owned(), "172.21.0.4:4002".to_owned()],
+                Some("60.242.29.210".parse().expect("public ip")),
+            ),
+            vec!["60.242.29.210:4002".to_owned()]
         );
     }
 
@@ -1564,7 +2358,7 @@ mod tests {
         .expect("endpoint options");
 
         assert_eq!(
-            options.published_direct_addrs(vec!["172.20.0.4:4002".to_owned()]),
+            options.published_direct_addrs(vec!["172.20.0.4:4002".to_owned()], None),
             vec![
                 "203.0.113.10:4002".to_owned(),
                 "192.168.1.20:4002".to_owned()
@@ -1624,6 +2418,17 @@ mod tests {
             vec!["https://relay.wattetheria.com".to_owned()]
         );
         endpoint_addr_from_contact_material(&material).expect("relay-only endpoint addr");
+    }
+
+    #[test]
+    fn endpoint_only_contact_material_can_be_dial_target() {
+        let adapter = IrohTransportAdapter::from_seed_bytes([7u8; 32]).expect("adapter");
+        let material = adapter.material_payload(&[], &[], 42);
+
+        let endpoint_addr =
+            endpoint_addr_from_contact_material(&material).expect("endpoint-only endpoint addr");
+        assert_eq!(endpoint_addr.id, adapter.endpoint_id());
+        assert!(endpoint_addr.addrs.is_empty());
     }
 
     #[test]

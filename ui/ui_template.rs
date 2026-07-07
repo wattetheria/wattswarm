@@ -550,9 +550,10 @@ pub const INDEX_HTML: &str = r#"<!DOCTYPE html>
   </div>
 
   <script>
-    let lastPayload = null;
-    let lastRows = [];
-    let activeMode = "all";
+	    let lastPayload = null;
+	    let lastRows = [];
+	    let lastIrohRouteRows = [];
+	    let activeMode = "all";
 
     const STORAGE_KEY = "wattswarm-console";
     const themeOptions = ["forest", "matcha", "butter", "chocolate"];
@@ -849,16 +850,33 @@ pub const INDEX_HTML: &str = r#"<!DOCTYPE html>
       return params;
     }
 
-    async function refreshDiagnostics() {
-      const response = await fetch(`/api/diagnostics?${queryParams().toString()}`);
-      const payload = await response.json();
-      if (!response.ok || payload.ok === false) {
-        throw new Error(payload.error || `HTTP ${response.status}`);
-      }
-      lastPayload = payload;
-      lastRows = safeArray(payload.diagnostics);
-      render(payload, lastRows);
-    }
+	    async function refreshDiagnostics() {
+	      const response = await fetch(`/api/diagnostics?${queryParams().toString()}`);
+	      const payload = await response.json();
+	      if (!response.ok || payload.ok === false) {
+	        throw new Error(payload.error || `HTTP ${response.status}`);
+	      }
+	      lastPayload = payload;
+	      lastRows = safeArray(payload.diagnostics);
+	      try {
+	        lastIrohRouteRows = await fetchLatestIrohRouteDiagnostics();
+	      } catch (_) {
+	        lastIrohRouteRows = [];
+	      }
+	      render(payload, lastRows, lastIrohRouteRows);
+	    }
+
+	    async function fetchLatestIrohRouteDiagnostics() {
+	      const params = new URLSearchParams();
+	      params.set("phase", "iroh.route.selected");
+	      params.set("limit", "1");
+	      const response = await fetch(`/api/diagnostics?${params.toString()}`);
+	      const payload = await response.json();
+	      if (!response.ok || payload.ok === false) {
+	        throw new Error(payload.error || `HTTP ${response.status}`);
+	      }
+	      return safeArray(payload.diagnostics);
+	    }
 
     function isError(row) {
       const text = `${row.level || ""} ${row.status || ""}`.toLowerCase();
@@ -928,14 +946,14 @@ pub const INDEX_HTML: &str = r#"<!DOCTYPE html>
         : `Latest Iroh selected path: ${normalized}`;
     }
 
-    function renderIrohConnectivity(snapshot, rows) {
-      const endpointId = snapshot.local_iroh_endpoint_id || "-";
-      const relayUrls = safeArray(snapshot.relay_reservations);
-      const dialTarget = relayUrls.length
-        ? `EndpointAddr { id: ${compact(endpointId, 18)}, relay_urls: ${relayUrls.length} }`
-        : `EndpointId ${compact(endpointId, 28)}`;
-      const routeDiagnostic = latestIrohRouteDiagnostic(rows);
-      const routeDetails = routeDiagnostic ? diagnosticDetails(routeDiagnostic) : {};
+	    function renderIrohConnectivity(snapshot, irohRouteRows) {
+	      const endpointId = snapshot.local_iroh_endpoint_id || "-";
+	      const relayUrls = safeArray(snapshot.relay_reservations);
+	      const dialTarget = relayUrls.length
+	        ? `EndpointAddr { id: ${compact(endpointId, 18)}, relay_urls: ${relayUrls.length} }`
+	        : `EndpointId ${compact(endpointId, 28)}`;
+	      const routeDiagnostic = latestIrohRouteDiagnostic(irohRouteRows);
+	      const routeDetails = routeDiagnostic ? diagnosticDetails(routeDiagnostic) : {};
 
       setConnectivityText("irohEndpointId", endpointId, 42);
       setIrohCurrentPath(routeDetails.selected_route);
@@ -946,16 +964,16 @@ pub const INDEX_HTML: &str = r#"<!DOCTYPE html>
       setConnectivityText("irohTransportDetail", "managed by Iroh", 46);
     }
 
-    function render(payload, rows) {
-      const snapshot = payload.snapshot || {};
-      const visible = safeArray(rows).filter(modeMatches);
+	    function render(payload, rows, irohRouteRows = []) {
+	      const snapshot = payload.snapshot || {};
+	      const visible = safeArray(rows).filter(modeMatches);
       qs("generatedAt").textContent = `Refreshed ${formatTime(payload.generated_at || new Date().toISOString())}`;
       qs("serviceState").textContent = payload.network_service_started ? "running" : "stopped";
       qs("irohEndpoint").textContent = compact(snapshot.local_iroh_endpoint_id || "-", 24);
       qs("knownIrohContacts").textContent = String(snapshot.known_iroh_contacts || 0);
       qs("scopeCount").textContent = String(safeArray(snapshot.subscribed_scopes).length);
       qs("diagnosticCount").textContent = String(visible.length);
-      renderIrohConnectivity(snapshot, rows);
+	      renderIrohConnectivity(snapshot, irohRouteRows);
 
       const list = qs("diagnosticsList");
       if (!visible.length) {

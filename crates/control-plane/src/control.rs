@@ -450,7 +450,7 @@ fn normalize_manifest_bootstrap_contact(raw: &str) -> Option<(String, String)> {
 
     let mut contact = serde_json::from_str::<Value>(trimmed).ok()?;
     sanitize_manifest_bootstrap_contact(&mut contact);
-    if !manifest_contact_has_transport_address(&contact) {
+    if !manifest_contact_has_iroh_identity_or_transport_address(&contact) {
         return None;
     }
     let key = manifest_bootstrap_contact_key(&contact).unwrap_or_else(|| trimmed.to_owned());
@@ -542,21 +542,27 @@ fn string_field(value: &Value, field: &str) -> Option<String> {
         .map(str::to_owned)
 }
 
-fn manifest_contact_has_transport_address(contact: &Value) -> bool {
+fn manifest_contact_has_iroh_identity_or_transport_address(contact: &Value) -> bool {
     contact
         .get("transports")
         .and_then(Value::as_array)
-        .is_some_and(|transports| transports.iter().any(transport_has_transport_address))
-        || transport_has_transport_address(contact)
+        .is_some_and(|transports| {
+            transports
+                .iter()
+                .any(transport_has_iroh_identity_or_transport_address)
+        })
+        || transport_has_iroh_identity_or_transport_address(contact)
 }
 
-fn transport_has_transport_address(contact: &Value) -> bool {
+fn transport_has_iroh_identity_or_transport_address(contact: &Value) -> bool {
     contact.get("extra").is_some_and(|extra| {
-        value_array_has_strings(extra, "direct_addrs")
+        string_field(extra, "endpoint_id").is_some()
+            || value_array_has_strings(extra, "direct_addrs")
             || value_array_has_strings(extra, "relay_urls")
-    }) || contact
-        .get("metadata")
-        .is_some_and(|metadata| value_array_has_strings(metadata, "listen_addrs"))
+    }) || contact.get("metadata").is_some_and(|metadata| {
+        string_field(metadata, "endpoint_id").is_some()
+            || value_array_has_strings(metadata, "listen_addrs")
+    })
 }
 
 fn value_array_has_strings(value: &Value, field: &str) -> bool {
@@ -1249,6 +1255,69 @@ mod tests {
             &mut value,
             &[contact(endpoint_id, 3)]
         ));
+    }
+
+    #[test]
+    fn manifest_bootstrap_contacts_keep_endpoint_id_only_iroh_contact() {
+        let endpoint_id = "83393ad000151bc41e686a1fc892e07a440a2a53110bbaeae3d13e5978599956";
+        let contact = json!({
+            "generated_at": 1,
+            "listen_addrs": [],
+            "node_id": endpoint_id,
+            "peer_id": endpoint_id,
+            "recommended_routes": ["iroh_direct"],
+            "transports": [{
+                "transport": "iroh_direct",
+                "peer_id": endpoint_id,
+                "metadata": {
+                    "route": "iroh_direct",
+                    "generated_at": 1,
+                    "endpoint_id": endpoint_id,
+                    "alpn": "/wattswarm/iroh/1",
+                    "listen_addrs": [],
+                    "capabilities": {
+                        "supports_iroh_direct": true,
+                        "supports_streaming": true,
+                        "max_recommended_inline_bytes": 16384,
+                        "preferred_data_route": "iroh_direct"
+                    }
+                },
+                "extra": {
+                    "endpoint_id": endpoint_id,
+                    "alpn": "/wattswarm/iroh/1",
+                    "direct_addrs": [],
+                    "relay_urls": []
+                }
+            }]
+        })
+        .to_string();
+        let mut value = json!({
+            "network_mode": "wan",
+            "bootstrap_contacts": []
+        });
+
+        assert!(replace_manifest_bootstrap_contacts(&mut value, &[contact],));
+
+        let contacts = value["bootstrap_contacts"].as_array().expect("contacts");
+        assert_eq!(contacts.len(), 1);
+        let saved: serde_json::Value =
+            serde_json::from_str(contacts[0].as_str().expect("contact string")).unwrap();
+        assert_eq!(
+            saved["transports"][0]["extra"]["endpoint_id"].as_str(),
+            Some(endpoint_id)
+        );
+        assert!(
+            saved["transports"][0]["extra"]["direct_addrs"]
+                .as_array()
+                .expect("direct addrs")
+                .is_empty()
+        );
+        assert!(
+            saved["transports"][0]["extra"]["relay_urls"]
+                .as_array()
+                .expect("relay urls")
+                .is_empty()
+        );
     }
 
     #[test]

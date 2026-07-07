@@ -363,6 +363,52 @@ fn cli_node_exports_and_stores_bootstrap_contacts() {
 }
 
 #[test]
+fn cli_node_iroh_probe_command_is_exposed() {
+    let dir = tempdir().unwrap();
+    let schema = CliSchemaGuard::new();
+
+    cmd(schema.as_str())
+        .args([
+            "--state-dir",
+            dir.path().to_str().unwrap(),
+            "node",
+            "iroh-probe",
+            "--help",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("<ENDPOINT_ID>"))
+        .stdout(predicate::str::contains("--direct-addr"))
+        .stdout(predicate::str::contains("Usage: wattswarm node iroh-probe"))
+        .stdout(predicate::str::contains("--hold-ms"))
+        .stdout(predicate::str::contains("--timeout-ms"))
+        .stdout(predicate::str::contains("--node-api-url"))
+        .stdout(predicate::str::contains("--contact").not());
+}
+
+#[test]
+fn cli_node_iroh_probe_rejects_non_http_node_api_url() {
+    let dir = tempdir().unwrap();
+    let schema = CliSchemaGuard::new();
+
+    cmd(schema.as_str())
+        .args([
+            "--state-dir",
+            dir.path().to_str().unwrap(),
+            "node",
+            "iroh-probe",
+            "9b196ed13c0ec849dd7b8bf5add0b07ad2c88c1bf5d79e8591f6681ab1803258",
+            "--node-api-url",
+            "ftp://127.0.0.1:7788",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "running node API URL must use http or https",
+        ));
+}
+
+#[test]
 fn cli_submit_watch_and_decision() {
     let dir = tempdir().unwrap();
     let state_dir = dir.path().join("state");

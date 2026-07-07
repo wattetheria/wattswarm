@@ -418,12 +418,21 @@ impl SubstrateRuntime {
     }
 
     pub fn dial(&mut self, addr: NetworkAddress) -> Result<()> {
-        let Some((raw_peer, raw_direct_addr)) = addr.as_str().split_once('@') else {
-            return Ok(());
-        };
+        let (raw_peer, raw_direct_addr) = addr
+            .as_str()
+            .split_once('@')
+            .map_or((addr.as_str(), None), |(peer, raw_addr)| {
+                (peer, Some(raw_addr))
+            });
         let peer = NetworkNodeId::new(raw_peer.to_owned())?;
         EndpointId::from_str(raw_peer).context("parse iroh endpoint id from dial target")?;
-        let direct_addr = NetworkAddress::new(raw_direct_addr.to_owned())?;
+        let direct_addr = raw_direct_addr
+            .map(|raw_addr| NetworkAddress::new(raw_addr.to_owned()))
+            .transpose()?;
+        let listen_addrs = direct_addr
+            .as_ref()
+            .map(|addr| vec![addr.to_string()])
+            .unwrap_or_default();
         let contact = TransportContactMaterial {
             transport: TransportRoute::IrohDirect.as_str().to_owned(),
             peer_id: peer.to_string(),
@@ -432,23 +441,25 @@ impl SubstrateRuntime {
                 generated_at: unix_timestamp_millis(),
                 endpoint_id: Some(peer.to_string()),
                 alpn: Some(DEFAULT_IROH_CONTROL_ALPN.to_owned()),
-                listen_addrs: vec![direct_addr.to_string()],
+                listen_addrs: listen_addrs.clone(),
                 capabilities: PeerTransportCapabilities::iroh_direct_default(),
             },
             extra: serde_json::json!({
                 "endpoint_id": peer.to_string(),
                 "alpn": DEFAULT_IROH_CONTROL_ALPN,
-                "direct_addrs": [direct_addr.to_string()],
+                "direct_addrs": listen_addrs,
                 "relay_urls": [],
             }),
         };
         self.upsert_remote_contact_material(peer.to_string(), contact)?;
-        self.pending_events
-            .push_back(SubstrateRuntimeEvent::PeerDiscovered {
-                peer: peer.clone(),
-                address: direct_addr.clone(),
-                source: PeerDiscoverySourceKind::Bootstrap,
-            });
+        if let Some(direct_addr) = direct_addr {
+            self.pending_events
+                .push_back(SubstrateRuntimeEvent::PeerDiscovered {
+                    peer: peer.clone(),
+                    address: direct_addr,
+                    source: PeerDiscoverySourceKind::Bootstrap,
+                });
+        }
         Ok(())
     }
 
@@ -1106,19 +1117,32 @@ impl Drop for SubstrateRuntime {
 mod tests {
     use super::*;
 
+    static TEST_STATE_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
     fn runtime_for_test(config: SubstrateConfig) -> SubstrateRuntime {
         let (gossip_tx, gossip_rx) = mpsc::channel();
         let (control_tx, control_rx) = mpsc::channel();
+        let counter = TEST_STATE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let state_dir = std::env::temp_dir().join(format!(
-            "wattswarm-substrate-runtime-test-{}",
-            unix_timestamp_millis()
+            "wattswarm-substrate-runtime-test-{}-{}",
+            unix_timestamp_millis(),
+            counter
         ));
+        std::fs::create_dir_all(&state_dir).expect("create substrate runtime test state dir");
+        std::fs::write(state_dir.join("node_seed.hex"), "11".repeat(32))
+            .expect("write substrate runtime test seed");
+        let local_peer_id = NetworkNodeId::new(
+            local_endpoint_id_from_state_dir(&state_dir)
+                .expect("test local endpoint id")
+                .to_string(),
+        )
+        .expect("test local peer id");
         SubstrateRuntime {
             config,
             runtime: Some(Runtime::new().expect("tokio runtime")),
             state_dir,
-            local_peer_id: NetworkNodeId::random(),
-            local_endpoint_id: "local".to_owned(),
+            local_endpoint_id: local_peer_id.to_string(),
+            local_peer_id,
             local_listen_addrs: Vec::new(),
             subscriptions: HashSet::new(),
             gossip_topics: HashMap::new(),
@@ -1131,6 +1155,64 @@ mod tests {
             established_per_peer: HashMap::new(),
             counters: IrohRuntimeCounters::default(),
             next_request_id: 1,
+        }
+    }
+
+    #[test]
+    fn dial_accepts_endpoint_id_only_target() {
+        let peer = NetworkNodeId::random();
+        let mut runtime = runtime_for_test(SubstrateConfig::default());
+
+        runtime
+            .dial(NetworkAddress::new(peer.to_string()).expect("dial target"))
+            .expect("endpoint-only dial target");
+
+        let contact = runtime
+            .remote_contacts
+            .get(&peer.to_string())
+            .expect("remote contact");
+        assert_eq!(contact.peer_id, peer.to_string());
+        assert_eq!(contact.metadata.endpoint_id.as_deref(), Some(peer.as_str()));
+        assert!(contact.metadata.listen_addrs.is_empty());
+        assert_eq!(contact.extra["endpoint_id"].as_str(), Some(peer.as_str()));
+        assert!(
+            contact.extra["direct_addrs"]
+                .as_array()
+                .expect("direct addrs")
+                .is_empty()
+        );
+        assert!(runtime.try_next_event().unwrap().is_none());
+    }
+
+    #[test]
+    fn dial_keeps_legacy_endpoint_id_at_direct_addr_target() {
+        let peer = NetworkNodeId::random();
+        let mut runtime = runtime_for_test(SubstrateConfig::default());
+
+        runtime
+            .dial(NetworkAddress::new(format!("{peer}@127.0.0.1:4003")).expect("dial target"))
+            .expect("legacy direct dial target");
+
+        let contact = runtime
+            .remote_contacts
+            .get(&peer.to_string())
+            .expect("remote contact");
+        assert_eq!(contact.metadata.listen_addrs, vec!["127.0.0.1:4003"]);
+        assert_eq!(
+            contact.extra["direct_addrs"][0].as_str(),
+            Some("127.0.0.1:4003")
+        );
+        match runtime.try_next_event().unwrap() {
+            Some(SubstrateRuntimeEvent::PeerDiscovered {
+                peer: got,
+                address,
+                source,
+            }) => {
+                assert_eq!(got, peer);
+                assert_eq!(address.as_str(), "127.0.0.1:4003");
+                assert_eq!(source, PeerDiscoverySourceKind::Bootstrap);
+            }
+            other => panic!("expected peer discovered event, got {other:?}"),
         }
     }
 

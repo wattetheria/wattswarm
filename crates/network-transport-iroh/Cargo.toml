@@ -10,6 +10,7 @@ hex = { workspace = true }
 iroh = "0.97"
 iroh-blobs = { workspace = true }
 iroh-gossip = { workspace = true }
+reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
