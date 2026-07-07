@@ -321,16 +321,10 @@ pub fn connected_peer_helper_syncs_over_lan_state() {
     let mut node_b = make_node(identity_b, membership);
     let mut service_a = make_service();
     let mut service_b = make_service();
-    for _ in 0..4_096 {
-        let _ = pump_once(&mut service_a, &mut node_a);
-        let _ = pump_once(&mut service_b, &mut node_b);
-        if !service_a.listen_addrs().is_empty() && !service_b.listen_addrs().is_empty() {
-            break;
-        }
-        std::thread::yield_now();
-    }
-    assert!(!service_a.listen_addrs().is_empty());
-    assert!(!service_b.listen_addrs().is_empty());
+    // Iroh contact material may be relay/endpoint-only, so readiness must not
+    // depend on direct listen addresses being published.
+    let _ = service_contact_material(&mut service_a, &mut node_a);
+    let _ = service_contact_material(&mut service_b, &mut node_b);
 
     connect_services(&mut service_b, &mut node_b, &mut service_a, &mut node_a);
 

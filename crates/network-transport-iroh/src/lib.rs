@@ -205,7 +205,10 @@ fn observed_direct_addrs_for_publish(
         // A relay-observed global address carries the NAT flow port, which is
         // not cold-dialable; the deployment's inbound mapping listens on the
         // local bind port, so global addresses are republished on that port.
-        let published_addr = match (raw.parse::<SocketAddr>(), bind_port) {
+        let published_addr = match (
+            raw.parse::<SocketAddr>(),
+            bind_port.filter(|port| *port != 0),
+        ) {
             (Ok(addr), Some(port)) if ip_addr_is_global(&addr.ip()) => {
                 SocketAddr::new(addr.ip(), port).to_string()
             }
@@ -221,14 +224,17 @@ fn observed_direct_addrs_for_publish(
 
 fn observed_direct_addrs_for_publish_with_public_ip_fallback(
     observed_direct_addrs: Vec<String>,
-    bind_port: Option<u16>,
+    bind_addr: Option<SocketAddr>,
     public_ip: Option<IpAddr>,
 ) -> Vec<String> {
+    let bind_port = bind_addr.map(|addr| addr.port()).filter(|port| *port != 0);
+    let publish_loopback = bind_addr.is_some_and(|addr| addr.ip().is_loopback());
     let mut published = observed_direct_addrs_for_publish(observed_direct_addrs, bind_port)
         .into_iter()
         .filter(|raw| {
-            raw.parse::<SocketAddr>()
-                .is_ok_and(|addr| ip_addr_is_global(&addr.ip()))
+            raw.parse::<SocketAddr>().is_ok_and(|addr| {
+                ip_addr_is_global(&addr.ip()) || (publish_loopback && addr.ip().is_loopback())
+            })
         })
         .collect::<Vec<_>>();
     let Some(port) = bind_port else {
@@ -564,7 +570,7 @@ impl IrohEndpointOptions {
         if self.publish_observed_direct_addrs {
             return observed_direct_addrs_for_publish_with_public_ip_fallback(
                 observed_direct_addrs,
-                self.bind_addr.map(|addr| addr.port()),
+                self.bind_addr,
                 fallback_public_ip,
             );
         }
@@ -2241,7 +2247,7 @@ mod tests {
         assert_eq!(
             observed_direct_addrs_for_publish_with_public_ip_fallback(
                 vec!["172.19.0.3:4002".to_owned(), "172.21.0.4:4002".to_owned()],
-                Some(4002),
+                Some("0.0.0.0:4002".parse().expect("bind addr")),
                 Some("60.242.29.210".parse().expect("public ip")),
             ),
             vec!["60.242.29.210:4002".to_owned()]
@@ -2256,10 +2262,22 @@ mod tests {
                     "172.19.0.3:4002".to_owned(),
                     "18.206.214.6:54321".to_owned()
                 ],
-                Some(4002),
+                Some("0.0.0.0:4002".parse().expect("bind addr")),
                 Some("60.242.29.210".parse().expect("public ip")),
             ),
             vec!["18.206.214.6:4002".to_owned()]
+        );
+    }
+
+    #[test]
+    fn observed_publish_allows_loopback_when_bound_to_loopback() {
+        assert_eq!(
+            observed_direct_addrs_for_publish_with_public_ip_fallback(
+                vec!["127.0.0.1:54321".to_owned()],
+                Some("127.0.0.1:0".parse().expect("bind addr")),
+                Some("60.242.29.210".parse().expect("public ip")),
+            ),
+            vec!["127.0.0.1:54321".to_owned()]
         );
     }
 
@@ -2269,6 +2287,18 @@ mod tests {
             observed_direct_addrs_for_publish_with_public_ip_fallback(
                 vec!["172.19.0.3:4002".to_owned()],
                 None,
+                Some("60.242.29.210".parse().expect("public ip")),
+            ),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn observed_publish_ignores_public_ip_fallback_with_ephemeral_bind_port() {
+        assert_eq!(
+            observed_direct_addrs_for_publish_with_public_ip_fallback(
+                vec!["172.19.0.3:4002".to_owned()],
+                Some("127.0.0.1:0".parse().expect("bind addr")),
                 Some("60.242.29.210".parse().expect("public ip")),
             ),
             Vec::<String>::new()

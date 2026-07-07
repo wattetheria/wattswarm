@@ -179,6 +179,10 @@ fn make_service_with_config(
     ensure_test_relay_urls(&state_dir);
     unsafe {
         std::env::set_var(
+            wattswarm_network_transport_iroh::ENV_IROH_BIND_ADDR,
+            "127.0.0.1:0",
+        );
+        std::env::set_var(
             wattswarm_network_transport_iroh::ENV_IROH_PUBLISH_DIRECT_ADDRS,
             "true",
         );
@@ -203,6 +207,10 @@ fn make_service_with_config_and_state_dir(
     let identity = ensure_seeded_test_dir(state_dir);
     ensure_test_relay_urls(state_dir);
     unsafe {
+        std::env::set_var(
+            wattswarm_network_transport_iroh::ENV_IROH_BIND_ADDR,
+            "127.0.0.1:0",
+        );
         std::env::set_var(
             wattswarm_network_transport_iroh::ENV_IROH_PUBLISH_DIRECT_ADDRS,
             "true",
