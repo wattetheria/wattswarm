@@ -210,6 +210,7 @@ pub fn reconnect_recovers_missing_events_after_partition_like_disconnect() {
             remote_heads_json: "[]".to_owned(),
             backfill_successes: 0,
             backfill_failures: 0,
+            last_observed_at: None,
             updated_at: test_contact_generated_at_ms(),
         },
     )

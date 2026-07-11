@@ -1,9 +1,9 @@
 use crate::control::{
     PRIVATE_DM_FEED_KEY, PeerRelationshipAction, PeerRelationshipInitiator,
-    apply_peer_relationship_action_state, load_peer_dm_message_records_state,
-    load_peer_dm_thread_records_state, load_peer_metadata_records_state,
-    load_peer_relationship_records_state, open_configured_node, open_node, private_dm_scope_hint,
-    private_dm_thread_id,
+    apply_peer_relationship_action_state, load_network_peer_sync_state_records_state,
+    load_peer_dm_message_records_state, load_peer_dm_thread_records_state,
+    load_peer_metadata_records_state, load_peer_relationship_records_state, open_configured_node,
+    open_node, private_dm_scope_hint, private_dm_thread_id,
 };
 use crate::http::helpers::resolve_network_id;
 use crate::http::{ApiError, UiServerState, run_blocking};
@@ -18,8 +18,10 @@ use axum::Json;
 use axum::extract::{Query, State};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use uuid::Uuid;
+
+const NEARBY_PEER_RETENTION_MS: u64 = 60 * 60 * 1_000;
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct PeerRelationshipActionRequest {
@@ -506,8 +508,22 @@ fn build_peers_list_payload(
                 Err(_) => Vec::new(),
             }
         };
-    let discovered =
-        crate::control::load_discovered_peer_records_state(state_dir).unwrap_or_default();
+    let discovered = crate::control::load_discovered_peer_records_state(state_dir)?;
+    let scope_id = crate::storage::local_control_scope_id(state_dir);
+    let discovered_activity = crate::storage::local_control_store(state_dir)?
+        .list_local_discovered_peers(&scope_id)?
+        .into_iter()
+        .map(|row| (row.node_id, row.updated_at))
+        .collect::<HashMap<_, _>>();
+    let last_observed = load_network_peer_sync_state_records_state(state_dir)?
+        .into_iter()
+        .filter_map(|record| {
+            record
+                .last_observed_at
+                .map(|last_observed_at| (record.network_peer_id, last_observed_at))
+        })
+        .collect::<HashMap<_, _>>();
+    let now_ms = chrono::Utc::now().timestamp_millis().max(0) as u64;
     let metadata = load_peer_metadata_records_state(state_dir).unwrap_or_default();
     let relationships = load_peer_relationship_records_state(state_dir).unwrap_or_default();
     let mut records = BTreeMap::<String, Value>::new();
@@ -523,7 +539,13 @@ fn build_peers_list_payload(
             }),
         );
     }
-    for record in discovered {
+    for record in discovered.into_iter().filter(|record| {
+        nearby_peer_is_fresh(
+            discovered_activity.get(&record.node_id).copied(),
+            last_observed.get(&record.node_id).copied(),
+            now_ms,
+        )
+    }) {
         records.entry(record.node_id.clone()).or_insert_with(|| {
             json!({
                 "node_id": record.node_id,
@@ -535,28 +557,14 @@ fn build_peers_list_payload(
         })["discovery"] = serde_json::to_value(&record)?;
     }
     for record in metadata {
-        records.entry(record.node_id.clone()).or_insert_with(|| {
-            json!({
-                "node_id": record.node_id,
-                "connected": false,
-                "discovery": Value::Null,
-                "metadata": Value::Null,
-                "relationship": Value::Null,
-            })
-        })["metadata"] = serde_json::to_value(&record)?;
+        if let Some(entry) = records.get_mut(&record.node_id) {
+            entry["metadata"] = serde_json::to_value(&record)?;
+        }
     }
     for record in relationships {
-        records
-            .entry(record.remote_node_id.clone())
-            .or_insert_with(|| {
-                json!({
-                    "node_id": record.remote_node_id,
-                    "connected": false,
-                    "discovery": Value::Null,
-                    "metadata": Value::Null,
-                    "relationship": Value::Null,
-                })
-            })["relationship"] = serde_json::to_value(&record)?;
+        if let Some(entry) = records.get_mut(&record.remote_node_id) {
+            entry["relationship"] = serde_json::to_value(&record)?;
+        }
     }
     for peer in &connected_peers {
         if let Some(entry) = records.get_mut(peer) {
@@ -568,6 +576,20 @@ fn build_peers_list_payload(
         "peers": connected_peers,
         "records": records.into_values().collect::<Vec<_>>(),
     }))
+}
+
+fn nearby_peer_is_fresh(
+    last_discovered_at: Option<u64>,
+    last_observed_at: Option<u64>,
+    now_ms: u64,
+) -> bool {
+    last_discovered_at
+        .into_iter()
+        .chain(last_observed_at)
+        .max()
+        .is_some_and(|last_activity_at| {
+            now_ms.saturating_sub(last_activity_at) <= NEARBY_PEER_RETENTION_MS
+        })
 }
 
 fn build_peer_relationships_payload(state_dir: &std::path::Path) -> Result<Value> {
@@ -589,8 +611,8 @@ fn update_peer_relationship_payload(
 #[cfg(test)]
 mod tests {
     use super::{
-        build_peer_relationships_payload, build_peers_list_payload,
-        update_peer_relationship_payload,
+        NEARBY_PEER_RETENTION_MS, build_peer_relationships_payload, build_peers_list_payload,
+        nearby_peer_is_fresh, update_peer_relationship_payload,
     };
     use crate::control::{NodeState, node_state_path};
     use crate::http::background::mark_node_running_if_service_started;
@@ -699,6 +721,104 @@ mod tests {
             peer["relationship"]["relationship_state"].as_str(),
             Some("requested")
         );
+    }
+
+    #[test]
+    fn peers_list_payload_hides_expired_discovery_without_deleting_relationship() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state_dir = dir.path().join("state");
+        let db_path = state_dir.join("ui.state");
+        std::fs::create_dir_all(&state_dir).expect("create state dir");
+        let now_ms = chrono::Utc::now().timestamp_millis().max(0) as u64;
+        let expired_at = now_ms.saturating_sub(NEARBY_PEER_RETENTION_MS + 1);
+        let scope_id = crate::storage::local_control_scope_id(&state_dir);
+        crate::storage::local_control_store(&state_dir)
+            .expect("local control store")
+            .upsert_local_discovered_peer(
+                &scope_id,
+                "peer-expired",
+                "contact_material_probe",
+                expired_at,
+            )
+            .expect("save expired discovered peer");
+        crate::control::apply_peer_relationship_action_state(
+            &state_dir,
+            "peer-expired",
+            crate::control::PeerRelationshipAction::Request,
+            crate::control::PeerRelationshipInitiator::Local,
+        )
+        .expect("save relationship");
+
+        let peers = build_peers_list_payload(&state_dir, &db_path).expect("build peers payload");
+        assert!(
+            peers["records"]
+                .as_array()
+                .expect("peer records")
+                .iter()
+                .all(|record| record["node_id"] != "peer-expired")
+        );
+        let relationships =
+            build_peer_relationships_payload(&state_dir).expect("build relationships payload");
+        assert!(
+            relationships["relationships"]
+                .as_array()
+                .expect("relationships")
+                .iter()
+                .any(|record| record["remote_node_id"] == "peer-expired")
+        );
+    }
+
+    #[test]
+    fn peers_list_payload_keeps_peer_with_recent_authenticated_activity() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state_dir = dir.path().join("state");
+        let db_path = state_dir.join("ui.state");
+        std::fs::create_dir_all(&state_dir).expect("create state dir");
+        let now_ms = chrono::Utc::now().timestamp_millis().max(0) as u64;
+        let expired_at = now_ms.saturating_sub(NEARBY_PEER_RETENTION_MS + 1);
+        let scope_id = crate::storage::local_control_scope_id(&state_dir);
+        crate::storage::local_control_store(&state_dir)
+            .expect("local control store")
+            .upsert_local_discovered_peer(
+                &scope_id,
+                "peer-recently-seen",
+                "contact_material_probe",
+                expired_at,
+            )
+            .expect("save expired discovered peer");
+        crate::control::save_network_peer_sync_state_record_state(
+            &state_dir,
+            &crate::control::NetworkPeerSyncStateRecord {
+                network_peer_id: "peer-recently-seen".to_owned(),
+                known_scopes_json: "[]".to_owned(),
+                backfill_cursors_json: "[]".to_owned(),
+                remote_heads_json: "[]".to_owned(),
+                backfill_successes: 0,
+                backfill_failures: 0,
+                last_observed_at: Some(now_ms),
+                updated_at: now_ms,
+            },
+        )
+        .expect("save recent authenticated activity");
+
+        let peers = build_peers_list_payload(&state_dir, &db_path).expect("build peers payload");
+        assert!(
+            peers["records"]
+                .as_array()
+                .expect("peer records")
+                .iter()
+                .any(|record| record["node_id"] == "peer-recently-seen")
+        );
+    }
+
+    #[test]
+    fn nearby_freshness_uses_latest_discovery_or_authenticated_activity() {
+        let now_ms = 10_000_000;
+        let expired_at = now_ms - NEARBY_PEER_RETENTION_MS - 1;
+        assert!(!nearby_peer_is_fresh(Some(expired_at), None, now_ms));
+        assert!(nearby_peer_is_fresh(Some(now_ms), None, now_ms));
+        assert!(nearby_peer_is_fresh(Some(expired_at), Some(now_ms), now_ms));
+        assert!(!nearby_peer_is_fresh(None, None, now_ms));
     }
 
     #[test]

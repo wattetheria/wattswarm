@@ -211,6 +211,33 @@ fn pg_store_can_open_same_schema_multiple_times_in_one_process() {
 }
 
 #[test]
+fn pg_store_recreates_required_tables_removed_after_schema_cache_hit() {
+    with_test_schema(|| {
+        let state_path = "pg-store-schema-repair.state";
+        let _first = PgStore::open(state_path).expect("initialize pg store");
+        let conn = open_test_connection();
+        conn.execute_batch(
+            "DROP TABLE discovered_peers_local;
+             DROP TABLE network_ban_windows;",
+        )
+        .expect("drop required tables");
+
+        let _second = PgStore::open(state_path).expect("repair missing required tables");
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*)
+                 FROM information_schema.tables
+                 WHERE table_schema = current_schema()
+                   AND table_name IN ('discovered_peers_local', 'network_ban_windows')",
+                wattswarm_storage_core::params![],
+                |row| row.get(0),
+            )
+            .expect("query repaired required tables");
+        assert_eq!(count, 2);
+    });
+}
+
+#[test]
 fn statement_query_map_populates_column_names() {
     with_test_schema(|| {
         let conn = open_test_connection();
@@ -814,6 +841,7 @@ fn local_control_network_peer_sync_state_roundtrip() {
                     .to_string(),
                     backfill_successes: 3,
                     backfill_failures: 1,
+                    last_observed_at: Some(1_699_999_999_000),
                     updated_at: 1_700_000_000_000,
                 },
             )
@@ -826,6 +854,7 @@ fn local_control_network_peer_sync_state_roundtrip() {
         assert_eq!(rows[0].network_peer_id, test_iroh_endpoint_id(42));
         assert_eq!(rows[0].backfill_successes, 3);
         assert_eq!(rows[0].backfill_failures, 1);
+        assert_eq!(rows[0].last_observed_at, Some(1_699_999_999_000));
         assert_eq!(rows[0].updated_at, 1_700_000_000_000);
         assert!(rows[0].known_scopes_json.contains("crew-7"));
         assert!(rows[0].backfill_cursors_json.contains("\"cursor\":42"));

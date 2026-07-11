@@ -28,11 +28,11 @@ pub fn run(state_dir: PathBuf, db_path: PathBuf, listen: String) -> Result<()> {
     }
     if network_enabled {
         // Refresh once per process start, before the network service builds the
-        // iroh endpoint, so a restart picks up the network's current relay set.
+        // iroh endpoint, so a restart picks up current relay and peer addresses.
         match crate::control::refresh_startup_config_relay_urls_from_join_manifest(&state_dir) {
-            Ok(true) => eprintln!("wattswarm relay urls refreshed from join manifest"),
+            Ok(true) => eprintln!("wattswarm network contacts refreshed from join manifest"),
             Ok(false) => {}
-            Err(error) => eprintln!("wattswarm relay urls refresh skipped: {error:#}"),
+            Err(error) => eprintln!("wattswarm network contact refresh skipped: {error:#}"),
         }
     }
     let network_started = crate::network_bridge::maybe_start_background_network_service_with_hook(
@@ -50,7 +50,12 @@ pub fn run(state_dir: PathBuf, db_path: PathBuf, listen: String) -> Result<()> {
         eprintln!("wattswarm p2p network disabled");
     }
     if network_enabled {
-        crate::udp_announce::announce_startup("ui-startup", Some(&listen), node_id.as_deref());
+        crate::udp_announce::announce_startup_with_contact(
+            "ui-startup",
+            Some(&listen),
+            node_id.as_deref(),
+            &state_dir,
+        );
     }
     let state = UiServerState::new(state_dir, db_path);
     let runtime = tokio::runtime::Builder::new_multi_thread()

@@ -259,6 +259,8 @@ const ANNOUNCED_PEER_TTL: Duration = Duration::from_secs(60 * 60);
 const PEER_RECONNECT_INITIAL_DELAY: Duration = Duration::from_secs(1);
 const PEER_RECONNECT_MAX_DELAY: Duration = Duration::from_secs(60);
 const PEER_RECONNECT_MAX_ATTEMPTS: u32 = 10;
+const PENDING_CONTACT_MATERIAL_REQUEST_TTL: Duration = Duration::from_secs(60);
+const RECONNECT_CANDIDATE_RETENTION: Duration = Duration::from_secs(60 * 60);
 
 const ENV_P2P_ENABLED: &str = "WATTSWARM_P2P_ENABLED";
 const ENV_P2P_LOCAL_DISCOVERY: &str = "WATTSWARM_P2P_MDNS";
@@ -574,6 +576,8 @@ impl BackfillLaneKey {
 #[derive(Debug, Clone)]
 struct PeerSyncState {
     last_seen_at: Instant,
+    last_seen_observed: bool,
+    last_observed_at_ms: Option<u64>,
     last_backfill_request_at: Option<Instant>,
     next_retry_at: Instant,
     known_scopes: HashSet<SwarmScope>,
@@ -690,6 +694,7 @@ fn backfill_attempt_timeout(smoothed_latency_ms: Option<u64>) -> Duration {
 struct PeerReconnectState {
     attempts: u32,
     next_attempt_at: Instant,
+    last_attempt_at: Option<Instant>,
 }
 
 impl PeerReconnectState {
@@ -697,11 +702,13 @@ impl PeerReconnectState {
         Self {
             attempts: 0,
             next_attempt_at: Instant::now(),
+            last_attempt_at: None,
         }
     }
 
     fn schedule_next_attempt(&mut self, now: Instant) {
         self.attempts = self.attempts.saturating_add(1);
+        self.last_attempt_at = Some(now);
         let delay_secs = PEER_RECONNECT_INITIAL_DELAY
             .as_secs()
             .saturating_mul(2_u64.saturating_pow(self.attempts.saturating_sub(1)))
@@ -716,8 +723,13 @@ impl PeerReconnectState {
 
 impl PeerSyncState {
     fn new(now: Instant) -> Self {
+        let observed_age_ms =
+            u64::try_from(Instant::now().saturating_duration_since(now).as_millis())
+                .unwrap_or(u64::MAX);
         Self {
             last_seen_at: now,
+            last_seen_observed: true,
+            last_observed_at_ms: Some(observed_at_ms().saturating_sub(observed_age_ms)),
             last_backfill_request_at: None,
             next_retry_at: now,
             known_scopes: HashSet::new(),
@@ -732,12 +744,36 @@ impl PeerSyncState {
         }
     }
 
+    fn new_unobserved(now: Instant) -> Self {
+        let mut state = Self::new(now);
+        state.last_seen_observed = false;
+        state.last_observed_at_ms = None;
+        state
+    }
+
+    fn new_stale(now: Instant, last_observed_at_ms: Option<u64>) -> Self {
+        let stale_at = now
+            .checked_sub(PEER_LAST_SEEN_TTL + Duration::from_millis(1))
+            .unwrap_or(now);
+        let mut state = Self::new_unobserved(stale_at);
+        state.last_observed_at_ms = last_observed_at_ms;
+        state
+    }
+
     fn record_seen_at(&mut self, now: Instant) {
         self.last_seen_at = now;
+        self.last_seen_observed = true;
+        self.last_observed_at_ms = Some(observed_at_ms());
     }
 
     fn recently_seen_at(&self, now: Instant) -> bool {
-        now.saturating_duration_since(self.last_seen_at) <= PEER_LAST_SEEN_TTL
+        self.last_seen_observed
+            && now.saturating_duration_since(self.last_seen_at) <= PEER_LAST_SEEN_TTL
+    }
+
+    fn last_seen_age_ms_at(&self, now_ms: u64) -> Option<u64> {
+        self.last_observed_at_ms
+            .map(|last_observed_at_ms| now_ms.saturating_sub(last_observed_at_ms))
     }
 
     fn inflight_backfills(&self) -> usize {
@@ -1330,6 +1366,9 @@ pub struct NetworkBridgeService {
     known_peer_addrs: HashMap<NetworkNodeId, NetworkAddress>,
     peer_reconnect_state: HashMap<NetworkNodeId, PeerReconnectState>,
     abandoned_reconnect_peers: HashSet<NetworkNodeId>,
+    reconnect_candidate_activity: HashMap<NetworkNodeId, Instant>,
+    reconnect_probe_activity: HashMap<NetworkNodeId, Instant>,
+    abandoned_recovery_probe_activity: HashMap<NetworkNodeId, Instant>,
     global_publish_rate_guard: GlobalPublishRateGuard,
     anti_entropy_interval: Duration,
     backfill_retry_after: Duration,
@@ -1386,6 +1425,9 @@ impl NetworkBridgeService {
             known_peer_addrs: HashMap::new(),
             peer_reconnect_state: HashMap::new(),
             abandoned_reconnect_peers: HashSet::new(),
+            reconnect_candidate_activity: HashMap::new(),
+            reconnect_probe_activity: HashMap::new(),
+            abandoned_recovery_probe_activity: HashMap::new(),
             global_publish_rate_guard: GlobalPublishRateGuard::new(Instant::now()),
             anti_entropy_interval: Duration::from_secs(protocol_params.anti_entropy_interval_secs),
             backfill_retry_after: Duration::from_secs(protocol_params.backfill_retry_after_secs),
@@ -1434,7 +1476,7 @@ impl NetworkBridgeService {
                 Ok(peer) => peer,
                 Err(_) => continue,
             };
-            let mut state = PeerSyncState::new(now);
+            let mut state = PeerSyncState::new_stale(now, record.last_observed_at);
             state.known_scopes = serde_json::from_str::<Vec<SwarmScope>>(&record.known_scopes_json)
                 .unwrap_or_default()
                 .into_iter()
@@ -1524,8 +1566,11 @@ impl NetworkBridgeService {
         let updated = self
             .runtime
             .upsert_remote_contact_material(remote_network_peer_id, contact.clone())?;
-        self.remember_peer_address_from_contact(peer.as_str(), &contact);
-        self.schedule_peer_reconnect(peer);
+        if updated {
+            self.record_reconnect_candidate_activity(peer.clone(), Instant::now());
+            self.remember_peer_address_from_contact(peer.as_str(), &contact);
+            self.schedule_peer_reconnect(peer);
+        }
         Ok(updated)
     }
 
@@ -1564,6 +1609,16 @@ impl NetworkBridgeService {
             .values()
             .filter(|pending| &pending.peer == peer)
             .count()
+    }
+
+    #[cfg(test)]
+    pub fn force_pending_contact_material_request_stale_for_peer(&mut self, peer: &NetworkNodeId) {
+        for pending in self.pending_contact_material_requests.values_mut() {
+            if &pending.peer == peer {
+                pending.started_at =
+                    Instant::now() - PENDING_CONTACT_MATERIAL_REQUEST_TTL - Duration::from_secs(1);
+            }
+        }
     }
 
     #[cfg(test)]
@@ -1694,6 +1749,7 @@ fn peer_sync_state_record(
         remote_heads_json,
         backfill_successes: state.backfill_successes,
         backfill_failures: state.backfill_failures,
+        last_observed_at: state.last_observed_at_ms,
         updated_at,
     })
 }
@@ -1719,7 +1775,7 @@ fn migrate_legacy_peer_sync_state_records(
         let Ok(peer) = record.peer_id.parse::<NetworkNodeId>() else {
             continue;
         };
-        let mut state = PeerSyncState::new(Instant::now());
+        let mut state = PeerSyncState::new_unobserved(Instant::now());
         state.known_scopes = record.known_scopes.into_iter().collect();
         for cursor in record.backfill_cursors {
             state.backfill_cursors.insert(cursor.lane, cursor.cursor);

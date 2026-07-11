@@ -1,3 +1,4 @@
+use super::bootstrap_contact::transport_contact_direct_network_addrs;
 use super::*;
 
 impl NetworkBridgeService {
@@ -38,6 +39,7 @@ impl NetworkBridgeService {
         peer_ids.dedup();
 
         let now = Instant::now();
+        let now_ms = observed_at_ms();
         let connected_peer_count = self
             .connected_peers
             .iter()
@@ -70,10 +72,7 @@ impl NetworkBridgeService {
             let recently_seen = peer_id
                 .as_ref()
                 .is_some_and(|peer_id| self.peer_recently_seen_at(peer_id, now));
-            let last_seen_age_ms = sync.map(|state| {
-                now.saturating_duration_since(state.last_seen_at)
-                    .as_millis() as u64
-            });
+            let last_seen_age_ms = sync.and_then(|state| state.last_seen_age_ms_at(now_ms));
             peer_health.push(NetworkBridgePeerHealth {
                 network_peer_id: peer.clone(),
                 connected: mesh_connected && recently_seen,
@@ -223,7 +222,7 @@ impl NetworkBridgeService {
             let state = self
                 .peer_sync_state
                 .entry(peer.clone())
-                .or_insert_with(|| PeerSyncState::new(now));
+                .or_insert_with(|| PeerSyncState::new_unobserved(now));
             if state.inflight_backfills() >= MAX_INFLIGHT_BACKFILLS_PER_PEER
                 || (!ignore_retry_delay && state.next_retry_at > now)
                 || !state.backfill_peer_available_at(now)
@@ -307,7 +306,7 @@ impl NetworkBridgeService {
                 )?;
                 self.peer_sync_state
                     .entry(peer.clone())
-                    .or_insert_with(|| PeerSyncState::new(now))
+                    .or_insert_with(|| PeerSyncState::new_unobserved(now))
                     .record_pending_backfill_with_timeout(
                         request_id,
                         scope.clone(),
@@ -361,7 +360,7 @@ impl NetworkBridgeService {
                 )?;
                 self.peer_sync_state
                     .entry(peer.clone())
-                    .or_insert_with(|| PeerSyncState::new(now))
+                    .or_insert_with(|| PeerSyncState::new_unobserved(now))
                     .record_pending_backfill_with_timeout(
                         request_id,
                         scope.clone(),
@@ -557,6 +556,7 @@ impl NetworkBridgeService {
             .entry(peer.clone())
             .or_insert_with(|| PeerSyncState::new(now))
             .record_seen_at(now);
+        self.record_reconnect_candidate_activity(peer, now);
     }
 
     pub(crate) fn record_peer_scope_activity(&mut self, peer: NetworkNodeId, scope: &SwarmScope) {
@@ -644,6 +644,8 @@ impl NetworkBridgeService {
             .record_seen_at(now);
         self.peer_reconnect_state.remove(&peer);
         self.abandoned_reconnect_peers.remove(&peer);
+        self.abandoned_recovery_probe_activity.remove(&peer);
+        self.record_reconnect_candidate_activity(peer.clone(), now);
         self.persist_peer_sync_state_for_peer(&peer);
         inserted
     }
@@ -723,6 +725,48 @@ impl NetworkBridgeService {
         self.schedule_peer_reconnect(peer);
     }
 
+    pub(crate) fn expire_stale_contact_material_requests(&mut self, now: Instant) -> usize {
+        let stale_requests = self
+            .pending_contact_material_requests
+            .iter()
+            .filter_map(|(request_id, pending)| {
+                let age = now.saturating_duration_since(pending.started_at);
+                (age >= PENDING_CONTACT_MATERIAL_REQUEST_TTL).then(|| {
+                    (
+                        *request_id,
+                        pending.peer.clone(),
+                        pending.remote_node_id.clone(),
+                        age,
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        for (request_id, peer, remote_node_id, age) in &stale_requests {
+            self.pending_contact_material_requests.remove(request_id);
+            diagnostics::record_diagnostic(
+                self.state_dir.as_deref(),
+                diagnostics::DiagnosticEvent::new(
+                    "warn",
+                    "transport",
+                    "contact_material.pending.expired",
+                    "expired",
+                    format!("stale contact material request expired: {peer}"),
+                )
+                .object("peer", Some(peer.to_string()))
+                .source_node_id(Some(peer.to_string()))
+                .details(json!({
+                    "peer_id": peer.to_string(),
+                    "remote_node_id": remote_node_id,
+                    "request_id": format!("{request_id:?}"),
+                    "age_ms": age.as_millis(),
+                    "ttl_ms": PENDING_CONTACT_MATERIAL_REQUEST_TTL.as_millis(),
+                })),
+            );
+            self.schedule_peer_reconnect(peer.clone());
+        }
+        stale_requests.len()
+    }
+
     pub(crate) fn remember_peer_address(&mut self, peer: NetworkNodeId, address: NetworkAddress) {
         self.abandoned_reconnect_peers.remove(&peer);
         self.known_peer_addrs.insert(peer.clone(), address);
@@ -736,16 +780,58 @@ impl NetworkBridgeService {
         peer: &str,
         contact: &TransportContactMaterial,
     ) {
-        let Some(address) = contact.metadata.listen_addrs.first() else {
+        let Some(address) = transport_contact_direct_network_addrs(contact)
+            .into_iter()
+            .next()
+        else {
             return;
         };
         let Ok(peer) = NetworkNodeId::new(peer.to_owned()) else {
             return;
         };
-        let Ok(address) = NetworkAddress::new(address.clone()) else {
+        let Ok(address) = NetworkAddress::new(address) else {
             return;
         };
         self.remember_peer_address(peer, address);
+    }
+
+    pub(crate) fn record_reconnect_candidate_activity(
+        &mut self,
+        peer: NetworkNodeId,
+        observed_at: Instant,
+    ) {
+        self.reconnect_candidate_activity.insert(peer, observed_at);
+    }
+
+    fn recent_reconnect_candidate_activity(
+        &self,
+        peer: &NetworkNodeId,
+        now: Instant,
+    ) -> Option<Instant> {
+        self.reconnect_candidate_activity
+            .get(peer)
+            .copied()
+            .filter(|observed_at| {
+                now.saturating_duration_since(*observed_at) <= RECONNECT_CANDIDATE_RETENTION
+            })
+    }
+
+    fn reconnect_candidate_is_active(&self, peer: &NetworkNodeId, now: Instant) -> bool {
+        let Some(activity_at) = self.recent_reconnect_candidate_activity(peer, now) else {
+            return false;
+        };
+        self.reconnect_probe_activity
+            .get(peer)
+            .is_none_or(|last_probe_activity| *last_probe_activity < activity_at)
+    }
+
+    fn abandoned_recovery_probe_is_due(&self, peer: &NetworkNodeId, now: Instant) -> bool {
+        let Some(activity_at) = self.recent_reconnect_candidate_activity(peer, now) else {
+            return false;
+        };
+        self.abandoned_recovery_probe_activity
+            .get(peer)
+            .is_none_or(|last_probe_activity| *last_probe_activity < activity_at)
     }
 
     pub(crate) fn schedule_peer_reconnect(&mut self, peer: NetworkNodeId) {
@@ -761,15 +847,32 @@ impl NetworkBridgeService {
         }
     }
 
+    pub(crate) fn reactivate_discovered_peer_reconnect(
+        &mut self,
+        peer: NetworkNodeId,
+        contact_updated: bool,
+    ) {
+        if !contact_updated {
+            return;
+        }
+        if self.abandoned_reconnect_peers.remove(&peer) {
+            self.abandoned_recovery_probe_activity.remove(&peer);
+            self.peer_reconnect_state
+                .insert(peer, PeerReconnectState::ready_now());
+        } else {
+            self.schedule_peer_reconnect(peer);
+        }
+    }
+
     pub fn run_reconnect_supervision(&mut self) -> Result<usize> {
         let now = Instant::now();
-        let mut reconnect_candidates = self
-            .known_peer_addrs
-            .keys()
-            .cloned()
+        self.expire_stale_contact_material_requests(now);
+        let reconnect_candidates = self
+            .runtime
+            .remote_contact_peer_ids()
+            .into_iter()
             .collect::<HashSet<_>>();
-        reconnect_candidates.extend(self.runtime.remote_contact_peer_ids());
-        let peers = reconnect_candidates
+        let mut peers = reconnect_candidates
             .into_iter()
             .filter(|peer| !self.connected_peers.contains(peer))
             .filter(|peer| {
@@ -783,31 +886,45 @@ impl NetworkBridgeService {
                     .get(peer)
                     .is_none_or(|state| state.next_attempt_at <= now)
             })
-            .filter(|peer| !self.abandoned_reconnect_peers.contains(peer))
+            .filter(|peer| {
+                if self.abandoned_reconnect_peers.contains(peer) {
+                    return self.abandoned_recovery_probe_is_due(peer, now);
+                }
+                self.reconnect_candidate_is_active(peer, now)
+            })
             .collect::<Vec<_>>();
+        peers.sort_by_key(|peer| {
+            (
+                self.peer_reconnect_state
+                    .get(peer)
+                    .and_then(|state| state.last_attempt_at),
+                peer.to_string(),
+            )
+        });
         let mut attempts = 0usize;
+        let mut contact_probe_pending = !self.pending_contact_material_requests.is_empty();
         for peer in peers {
             let reconnect_address = self.known_peer_addrs.get(&peer).cloned();
-            let reconnect_route = if reconnect_address.is_some() {
-                "direct_addr"
-            } else {
-                "iroh_contact"
-            };
-            let reconnect_phase = if reconnect_address.is_some() {
-                "reconnect.dial"
-            } else {
-                "reconnect.bootstrap"
-            };
-            let result = if let Some(address) = reconnect_address.clone() {
-                let dial_target = NetworkAddress::new(format!("{peer}@{address}"))?;
-                self.runtime.dial(dial_target)
-            } else {
-                match self.runtime.rejoin_gossip_with_remote_contact(&peer) {
-                    Ok(true) => self.probe_peer_contact_material(&peer).map(|_| ()),
-                    Ok(false) => Err(anyhow!("missing iroh contact material for {peer}")),
-                    Err(err) => Err(err),
+            if contact_probe_pending {
+                continue;
+            }
+            let reconnect_route = "iroh_contact";
+            let reconnect_phase = "reconnect.bootstrap";
+            if let Some(activity_at) = self.recent_reconnect_candidate_activity(&peer, now) {
+                self.reconnect_probe_activity
+                    .insert(peer.clone(), activity_at);
+                if self.abandoned_reconnect_peers.contains(&peer) {
+                    self.abandoned_recovery_probe_activity
+                        .insert(peer.clone(), activity_at);
                 }
+            }
+            let result = match self.runtime.rejoin_gossip_with_remote_contact(&peer) {
+                Ok(true) => self.probe_peer_contact_material(&peer).map(|_| ()),
+                Ok(false) => Err(anyhow!("missing iroh contact material for {peer}")),
+                Err(err) => Err(err),
             };
+            // Iroh control requests are serialized by the data plane.
+            contact_probe_pending = !self.pending_contact_material_requests.is_empty();
             let reconnect_attempts = {
                 let state = self
                     .peer_reconnect_state
@@ -874,13 +991,19 @@ impl NetworkBridgeService {
         Ok(attempts)
     }
 
-    fn abandon_peer_reconnect(
+    pub(super) fn abandon_peer_reconnect(
         &mut self,
         peer: NetworkNodeId,
         attempts: u32,
         route: &str,
         address: Option<NetworkAddress>,
     ) {
+        if let Some(activity_at) = self.recent_reconnect_candidate_activity(&peer, Instant::now()) {
+            self.abandoned_recovery_probe_activity
+                .insert(peer.clone(), activity_at);
+        }
+        self.pending_contact_material_requests
+            .retain(|_, pending| pending.peer != peer);
         self.peer_reconnect_state.remove(&peer);
         self.known_peer_addrs.remove(&peer);
         self.abandoned_reconnect_peers.insert(peer.clone());
@@ -946,7 +1069,7 @@ impl NetworkBridgeService {
     ) {
         self.peer_sync_state
             .entry(peer.clone())
-            .or_insert_with(|| PeerSyncState::new(Instant::now()))
+            .or_insert_with(|| PeerSyncState::new_unobserved(Instant::now()))
             .record_remote_head_event_ids(scope, feed_key, head_event_ids);
         self.persist_peer_sync_state_for_peer(&peer);
     }
@@ -961,7 +1084,7 @@ impl NetworkBridgeService {
     ) {
         self.peer_sync_state
             .entry(peer.clone())
-            .or_insert_with(|| PeerSyncState::new(Instant::now()))
+            .or_insert_with(|| PeerSyncState::new_unobserved(Instant::now()))
             .record_backfill_cursor(scope, feed_key, next_from_event_seq);
         self.persist_peer_sync_state_for_peer(&peer);
     }

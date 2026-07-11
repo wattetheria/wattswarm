@@ -792,10 +792,11 @@ fn run_background_network_service_with_hook(
                     match tick {
                         NetworkBridgeTick::Listening { address } => {
                             if !announced_listen {
-                                crate::udp_announce::announce_startup(
+                                crate::udp_announce::announce_startup_with_contact(
                                     "p2p-startup",
                                     Some(&address.to_string()),
                                     Some(&node_id),
+                                    state_dir,
                                 );
                                 announced_listen = true;
                             }
@@ -845,6 +846,17 @@ fn run_background_network_service_with_hook(
         );
         if expired_connected > 0 {
             did_work = true;
+        }
+        for received in crate::udp_announce::drain_received_contacts(state_dir) {
+            let remote_peer_id = received.contact.peer_id.clone();
+            match service.upsert_remote_contact_material(remote_peer_id, received.contact) {
+                Ok(true) => {
+                    node.discover_peer(received.remote_node_id);
+                    did_work = true;
+                }
+                Ok(false) => {}
+                Err(error) => eprintln!("udp announce contact registration failed: {error:#}"),
+            }
         }
         let reconnect_started_at = Instant::now();
         match service

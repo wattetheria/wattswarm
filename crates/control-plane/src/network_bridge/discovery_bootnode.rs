@@ -509,9 +509,10 @@ pub(super) fn apply_discovery_bootnode_record(
             remote_network_peer_id
         );
     }
-    let registered = service
-        .runtime
-        .upsert_remote_contact_material(remote_network_peer_id.clone(), contact)?;
+    let remote_peer = NetworkNodeId::new(remote_network_peer_id.clone())?;
+    let registered =
+        service.upsert_remote_contact_material(remote_network_peer_id.clone(), contact)?;
+    service.reactivate_discovered_peer_reconnect(remote_peer, registered);
     if !registered {
         return Ok(false);
     }

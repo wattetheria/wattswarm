@@ -31,7 +31,9 @@ use wattswarm_control_plane::control::{
 };
 use wattswarm_control_plane::crypto::{NodeIdentity, sha256_hex};
 use wattswarm_control_plane::network_bridge::maybe_start_background_network_service;
-use wattswarm_control_plane::storage::{local_control_scope_id, storage::pg::Connection};
+use wattswarm_control_plane::storage::{
+    local_control_scope_id, local_control_store, storage::pg::Connection,
+};
 use wattswarm_control_plane::task_template::sample_contract;
 use wattswarm_control_plane::types::{
     Membership, NetworkBootstrapBundle, NetworkJoinManifest, NetworkKind, NetworkProtocolParams,

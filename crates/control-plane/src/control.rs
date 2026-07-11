@@ -620,12 +620,13 @@ fn persist_join_manifest_startup_config(
     Ok(())
 }
 
-/// Refresh the locally persisted relay URLs from the network join manifest.
+/// Refresh locally persisted relay URLs and bootstrap contacts from the network join manifest.
 ///
 /// Runs once per process startup so an already-joined node picks up the
-/// network's current relay set on restart. The fetched list overwrites the
-/// `relay_urls` field in `startup_config.json`; fetch failures leave the
-/// local value untouched and must not block node startup.
+/// network's current transport coordinates on restart. Non-empty relay lists
+/// replace the local relay set, while bootstrap contacts update matching peers
+/// without removing local-only contacts. Fetch failures leave local values
+/// untouched and must not block node startup.
 pub fn refresh_startup_config_relay_urls_from_join_manifest(state_dir: &Path) -> Result<bool> {
     let mode = configured_node_mode(state_dir)?;
     if !matches!(mode, Some(NodeMode::Network) | Some(NodeMode::Lan)) {
@@ -639,12 +640,14 @@ pub fn refresh_startup_config_relay_urls_from_join_manifest(state_dir: &Path) ->
     for endpoint in endpoints {
         match retry_runtime_probe(|| fetch_network_join_manifest(&endpoint)) {
             Ok(manifest) => {
-                if manifest.relay_urls.is_empty() {
-                    // The manifest endpoint reports no relay set (for example an
-                    // older genesis version); keep the local value.
+                if manifest.relay_urls.is_empty() && manifest.bootstrap_contacts.is_empty() {
                     return Ok(false);
                 }
-                return persist_startup_config_relay_urls(state_dir, &manifest.relay_urls);
+                return persist_startup_config_relay_urls(
+                    state_dir,
+                    &manifest.relay_urls,
+                    &manifest.bootstrap_contacts,
+                );
             }
             Err(err) => {
                 last_err = Some(err.context(format!("fetch join manifest from {endpoint}")));
@@ -654,7 +657,11 @@ pub fn refresh_startup_config_relay_urls_from_join_manifest(state_dir: &Path) ->
     Err(last_err.unwrap_or_else(|| anyhow!("no reachable join manifest endpoint")))
 }
 
-fn persist_startup_config_relay_urls(state_dir: &Path, relay_urls: &[String]) -> Result<bool> {
+fn persist_startup_config_relay_urls(
+    state_dir: &Path,
+    relay_urls: &[String],
+    bootstrap_contacts: &[String],
+) -> Result<bool> {
     let mut seen = BTreeSet::new();
     let sanitized: Vec<String> = relay_urls
         .iter()
@@ -662,9 +669,6 @@ fn persist_startup_config_relay_urls(state_dir: &Path, relay_urls: &[String]) ->
         .filter(|url| !url.is_empty())
         .filter(|url| seen.insert(url.clone()))
         .collect();
-    if sanitized.is_empty() {
-        return Ok(false);
-    }
     fs::create_dir_all(state_dir)?;
     let path = state_dir.join("startup_config.json");
     let mut value = if path.exists() {
@@ -676,11 +680,32 @@ fn persist_startup_config_relay_urls(state_dir: &Path, relay_urls: &[String]) ->
     if !value.is_object() {
         value = json!({});
     }
-    let next = json!(sanitized);
-    if value.get("relay_urls") == Some(&next) {
+    let mut changed = false;
+    if !sanitized.is_empty() {
+        let next = json!(sanitized);
+        if value.get("relay_urls") != Some(&next) {
+            value["relay_urls"] = next;
+            changed = true;
+        }
+    }
+    if bootstrap_contacts
+        .iter()
+        .any(|raw| normalize_manifest_bootstrap_contact(raw).is_some())
+    {
+        let merged_contacts: Vec<String> = value
+            .get("bootstrap_contacts")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .map(str::to_owned)
+            .chain(bootstrap_contacts.iter().cloned())
+            .collect();
+        changed |= replace_manifest_bootstrap_contacts(&mut value, &merged_contacts);
+    }
+    if !changed {
         return Ok(false);
     }
-    value["relay_urls"] = next;
     let nonce = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()

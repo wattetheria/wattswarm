@@ -1142,7 +1142,6 @@ impl NetworkBridgeService {
                 request,
                 request_id,
             } => {
-                self.record_peer_liveness(peer.clone());
                 let received_at_ms = observed_at_ms();
                 let local_node_id = self.local_peer_id().to_string();
                 let request_source_node_id = request.source_node_id.clone();
@@ -1174,6 +1173,15 @@ impl NetworkBridgeService {
                         applied: false,
                         contact_material: None,
                         detail: Some("contact material request source_node_id mismatch".to_owned()),
+                        updated_at: received_at_ms,
+                    }
+                } else if request_target_node_id != local_node_id {
+                    RawContactMaterialResponse {
+                        source_node_id: local_node_id.clone(),
+                        target_node_id: request_source_node_id.clone(),
+                        applied: false,
+                        contact_material: None,
+                        detail: Some("contact material request target_node_id mismatch".to_owned()),
                         updated_at: received_at_ms,
                     }
                 } else if let Some(state_dir) = self.state_dir.as_ref() {
@@ -1254,6 +1262,12 @@ impl NetworkBridgeService {
                         "detail": response_detail,
                     })),
                 );
+                if response_applied {
+                    let newly_connected = self.mark_peer_connected(peer.clone());
+                    if newly_connected {
+                        return Ok(NetworkBridgeTick::Connected { peer });
+                    }
+                }
                 Ok(NetworkBridgeTick::TransportNotice {
                     detail: format!("contact_material_served peer={peer}"),
                 })
@@ -1326,6 +1340,9 @@ impl NetworkBridgeService {
                     }
                 }
                 let _ = self.request_backfill_for_peer_now(&peer, node)?;
+                if newly_connected {
+                    return Ok(NetworkBridgeTick::Connected { peer });
+                }
                 Ok(NetworkBridgeTick::TransportNotice {
                     detail: format!("contact_material_updated peer={peer}"),
                 })

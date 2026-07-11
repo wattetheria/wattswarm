@@ -602,6 +602,33 @@ fn relay_refresh_manifest(relay_urls: Vec<String>) -> NetworkJoinManifest {
     }
 }
 
+fn manifest_bootstrap_contact(peer_id: &str, generated_at: u64, direct_addrs: &[&str]) -> String {
+    json!({
+        "node_id": peer_id,
+        "peer_id": peer_id,
+        "generated_at": generated_at,
+        "listen_addrs": direct_addrs,
+        "transports": [{
+            "transport": "iroh_direct",
+            "peer_id": peer_id,
+            "metadata": {
+                "endpoint_id": peer_id,
+                "generated_at": generated_at,
+                "listen_addrs": direct_addrs
+            },
+            "extra": {
+                "endpoint_id": peer_id,
+                "direct_addrs": direct_addrs,
+                "relay_urls": [
+                    "https://relay.wattetheria.com",
+                    "https://relay2.wattetheria.com"
+                ]
+            }
+        }]
+    })
+    .to_string()
+}
+
 fn write_relay_refresh_startup_config(state_dir: &std::path::Path) {
     fs::create_dir_all(state_dir).expect("create state dir");
     fs::write(
@@ -650,6 +677,84 @@ fn refresh_relay_urls_overwrites_startup_config_from_join_manifest() {
         wattswarm_control_plane::refresh_startup_config_relay_urls_from_join_manifest(&state_dir)
             .expect("refresh relay urls again");
     assert!(!unchanged, "identical relay set must not rewrite the file");
+
+    cleanup_dir(&dir);
+}
+
+#[test]
+fn refresh_manifest_replaces_stale_bootstrap_contact_with_direct_address() {
+    let _guard = env_lock();
+    let peer_id = "83393ad000151bc41e686a1fc892e07a440a2a53110bbaeae3d13e5978599956";
+    let local_peer_id = "23e5cc7ecbb45bfcd2f1807ecea663a596ec7785fe77bf23eeb1d0b146845843";
+    let stale_contact = manifest_bootstrap_contact(peer_id, 1, &[]);
+    let local_contact = manifest_bootstrap_contact(local_peer_id, 1, &["192.0.2.10:4002"]);
+    let fresh_contact = manifest_bootstrap_contact(peer_id, 2, &["18.206.214.6:4002"]);
+    let mut manifest = relay_refresh_manifest(vec![
+        "https://relay.wattetheria.com".to_owned(),
+        "https://relay2.wattetheria.com".to_owned(),
+    ]);
+    manifest.bootstrap_contacts = vec![fresh_contact];
+    let stub = JoinManifestStub::start(manifest);
+    let _mode_guard = EnvVarGuard::remove("WATTSWARM_NODE_MODE");
+    let _manifest_guard =
+        EnvVarGuard::set("WATTSWARM_NETWORK_JOIN_MANIFEST_URLS", &stub.manifest_url());
+    let dir = temp_test_dir("refresh-bootstrap-contact-direct-address");
+    let state_dir = dir.join("state");
+    fs::create_dir_all(&state_dir).expect("create state dir");
+    fs::write(
+        state_dir.join("startup_config.json"),
+        json!({
+            "network_mode": "wan",
+            "bootstrap_contacts": [stale_contact, local_contact],
+            "relay_urls": [
+                "https://relay.wattetheria.com",
+                "https://relay2.wattetheria.com"
+            ]
+        })
+        .to_string(),
+    )
+    .expect("write stale startup config");
+
+    let changed =
+        wattswarm_control_plane::refresh_startup_config_relay_urls_from_join_manifest(&state_dir)
+            .expect("refresh bootstrap contact");
+    assert!(changed);
+    let startup_config: serde_json::Value =
+        serde_json::from_slice(&fs::read(state_dir.join("startup_config.json")).unwrap()).unwrap();
+    let contacts: Vec<serde_json::Value> = startup_config["bootstrap_contacts"]
+        .as_array()
+        .expect("bootstrap contacts")
+        .iter()
+        .map(|raw| {
+            serde_json::from_str(raw.as_str().expect("bootstrap contact string"))
+                .expect("bootstrap contact JSON")
+        })
+        .collect();
+    assert_eq!(contacts.len(), 2, "local-only contact must be preserved");
+    let refreshed_contact = contacts
+        .iter()
+        .find(|contact| contact["peer_id"] == peer_id)
+        .expect("refreshed manifest contact");
+    assert_eq!(refreshed_contact["generated_at"], json!(2));
+    assert_eq!(
+        refreshed_contact["listen_addrs"],
+        json!(["18.206.214.6:4002"])
+    );
+    assert_eq!(
+        refreshed_contact["transports"][0]["extra"]["direct_addrs"],
+        json!(["18.206.214.6:4002"])
+    );
+    assert!(
+        contacts
+            .iter()
+            .any(|contact| contact["peer_id"] == local_peer_id),
+        "manifest refresh must not remove local-only contacts"
+    );
+
+    let unchanged =
+        wattswarm_control_plane::refresh_startup_config_relay_urls_from_join_manifest(&state_dir)
+            .expect("refresh bootstrap contact again");
+    assert!(!unchanged, "identical manifest must not rewrite the file");
 
     cleanup_dir(&dir);
 }

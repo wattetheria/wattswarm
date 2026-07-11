@@ -319,14 +319,15 @@ impl SubstrateRuntime {
             );
         }
         contact.metadata.endpoint_id = Some(contact_endpoint.clone());
-        if self
-            .remote_contacts
-            .get(&remote_network_peer_id)
-            .is_some_and(|existing| existing.metadata.generated_at > contact.metadata.generated_at)
-        {
-            self.counters.stale_contact_material_drops =
-                self.counters.stale_contact_material_drops.saturating_add(1);
-            return Ok(false);
+        if let Some(existing) = self.remote_contacts.get(&remote_network_peer_id) {
+            if existing.metadata.generated_at > contact.metadata.generated_at {
+                self.counters.stale_contact_material_drops =
+                    self.counters.stale_contact_material_drops.saturating_add(1);
+                return Ok(false);
+            }
+            if existing.metadata.generated_at == contact.metadata.generated_at {
+                return Ok(false);
+            }
         }
         register_remote_contact_material_for_network_peer_id(
             &self.state_dir,
@@ -433,25 +434,39 @@ impl SubstrateRuntime {
             .as_ref()
             .map(|addr| vec![addr.to_string()])
             .unwrap_or_default();
-        let contact = TransportContactMaterial {
-            transport: TransportRoute::IrohDirect.as_str().to_owned(),
-            peer_id: peer.to_string(),
-            metadata: TransportMetadata {
-                route: TransportRoute::IrohDirect,
-                generated_at: unix_timestamp_millis(),
-                endpoint_id: Some(peer.to_string()),
-                alpn: Some(DEFAULT_IROH_CONTROL_ALPN.to_owned()),
-                listen_addrs: listen_addrs.clone(),
-                capabilities: PeerTransportCapabilities::iroh_direct_default(),
-            },
-            extra: serde_json::json!({
-                "endpoint_id": peer.to_string(),
-                "alpn": DEFAULT_IROH_CONTROL_ALPN,
-                "direct_addrs": listen_addrs,
-                "relay_urls": [],
-            }),
-        };
-        self.upsert_remote_contact_material(peer.to_string(), contact)?;
+        if let Some(existing) = self.remote_contacts.get(&peer.to_string()) {
+            // The stored contact material stays authoritative: hand iroh a
+            // registration-only copy that adds the dial target next to the
+            // contact's own direct and relay candidates, so path selection
+            // and relay fallback stay with the transport.
+            let merged = merge_contact_dial_addrs(existing, &listen_addrs);
+            register_remote_contact_material_for_network_peer_id(
+                &self.state_dir,
+                self.local_peer_id.as_str(),
+                &merged,
+            )?;
+            self.schedule_gossip_bootstrap_join()?;
+        } else {
+            let contact = TransportContactMaterial {
+                transport: TransportRoute::IrohDirect.as_str().to_owned(),
+                peer_id: peer.to_string(),
+                metadata: TransportMetadata {
+                    route: TransportRoute::IrohDirect,
+                    generated_at: unix_timestamp_millis(),
+                    endpoint_id: Some(peer.to_string()),
+                    alpn: Some(DEFAULT_IROH_CONTROL_ALPN.to_owned()),
+                    listen_addrs: listen_addrs.clone(),
+                    capabilities: PeerTransportCapabilities::iroh_direct_default(),
+                },
+                extra: serde_json::json!({
+                    "endpoint_id": peer.to_string(),
+                    "alpn": DEFAULT_IROH_CONTROL_ALPN,
+                    "direct_addrs": listen_addrs,
+                    "relay_urls": [],
+                }),
+            };
+            self.upsert_remote_contact_material(peer.to_string(), contact)?;
+        }
         if let Some(direct_addr) = direct_addr {
             self.pending_events
                 .push_back(SubstrateRuntimeEvent::PeerDiscovered {
@@ -1087,6 +1102,37 @@ impl SubstrateRuntime {
     }
 }
 
+/// Copy of `contact` with `dial_addrs` appended to its direct address
+/// candidates, used only for iroh address registration. The caller keeps the
+/// stored contact material untouched so authentic relay URLs and the peer's
+/// own `generated_at` survive direct-address dials.
+fn merge_contact_dial_addrs(
+    contact: &TransportContactMaterial,
+    dial_addrs: &[String],
+) -> TransportContactMaterial {
+    let mut merged = contact.clone();
+    if let Some(extra) = merged.extra.as_object_mut() {
+        let mut direct_addrs = extra
+            .get("direct_addrs")
+            .and_then(serde_json::Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        for dial_addr in dial_addrs {
+            if !direct_addrs
+                .iter()
+                .any(|known| known.as_str() == Some(dial_addr.as_str()))
+            {
+                direct_addrs.push(serde_json::Value::String(dial_addr.clone()));
+            }
+        }
+        extra.insert(
+            "direct_addrs".to_owned(),
+            serde_json::Value::Array(direct_addrs),
+        );
+    }
+    merged
+}
+
 impl Drop for SubstrateRuntime {
     fn drop(&mut self) {
         for (_, topic) in self.gossip_topics.drain() {
@@ -1214,6 +1260,104 @@ mod tests {
             }
             other => panic!("expected peer discovered event, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn dial_preserves_existing_contact_material_and_merges_direct_addr() {
+        let peer = NetworkNodeId::random();
+        let mut runtime = runtime_for_test(SubstrateConfig::default());
+        let contact = TransportContactMaterial {
+            transport: TransportRoute::IrohDirect.as_str().to_owned(),
+            peer_id: peer.to_string(),
+            metadata: TransportMetadata {
+                route: TransportRoute::IrohDirect,
+                generated_at: 1_000,
+                endpoint_id: Some(peer.to_string()),
+                alpn: Some(DEFAULT_IROH_CONTROL_ALPN.to_owned()),
+                listen_addrs: Vec::new(),
+                capabilities: PeerTransportCapabilities::iroh_direct_default(),
+            },
+            extra: serde_json::json!({
+                "endpoint_id": peer.to_string(),
+                "alpn": DEFAULT_IROH_CONTROL_ALPN,
+                "direct_addrs": [],
+                "relay_urls": ["https://relay.example.com"],
+            }),
+        };
+        assert!(
+            runtime
+                .upsert_remote_contact_material(peer.to_string(), contact)
+                .expect("seed authentic contact")
+        );
+
+        runtime
+            .dial(NetworkAddress::new(format!("{peer}@127.0.0.1:4003")).expect("dial target"))
+            .expect("dial with existing contact");
+
+        let stored = runtime
+            .remote_contacts
+            .get(&peer.to_string())
+            .expect("remote contact");
+        assert_eq!(stored.metadata.generated_at, 1_000);
+        assert_eq!(
+            stored.extra["relay_urls"][0].as_str(),
+            Some("https://relay.example.com")
+        );
+        assert!(
+            stored.extra["direct_addrs"]
+                .as_array()
+                .expect("direct addrs")
+                .is_empty(),
+            "dial must not mutate the stored contact material"
+        );
+        match runtime.try_next_event().unwrap() {
+            Some(SubstrateRuntimeEvent::PeerDiscovered {
+                peer: got, address, ..
+            }) => {
+                assert_eq!(got, peer);
+                assert_eq!(address.as_str(), "127.0.0.1:4003");
+            }
+            other => panic!("expected peer discovered event, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn merge_contact_dial_addrs_appends_new_addr_and_keeps_relay_urls() {
+        let peer = NetworkNodeId::random();
+        let contact = TransportContactMaterial {
+            transport: TransportRoute::IrohDirect.as_str().to_owned(),
+            peer_id: peer.to_string(),
+            metadata: TransportMetadata {
+                route: TransportRoute::IrohDirect,
+                generated_at: 1_000,
+                endpoint_id: Some(peer.to_string()),
+                alpn: Some(DEFAULT_IROH_CONTROL_ALPN.to_owned()),
+                listen_addrs: Vec::new(),
+                capabilities: PeerTransportCapabilities::iroh_direct_default(),
+            },
+            extra: serde_json::json!({
+                "endpoint_id": peer.to_string(),
+                "alpn": DEFAULT_IROH_CONTROL_ALPN,
+                "direct_addrs": ["10.0.0.7:4002"],
+                "relay_urls": ["https://relay.example.com"],
+            }),
+        };
+
+        let merged = merge_contact_dial_addrs(
+            &contact,
+            &["10.0.0.7:4002".to_owned(), "18.206.214.6:4002".to_owned()],
+        );
+
+        assert_eq!(
+            merged.extra["direct_addrs"],
+            serde_json::json!(["10.0.0.7:4002", "18.206.214.6:4002"]),
+            "dial addrs must be deduplicated and appended"
+        );
+        assert_eq!(
+            merged.extra["relay_urls"],
+            serde_json::json!(["https://relay.example.com"])
+        );
+        assert_eq!(merged.metadata.generated_at, 1_000);
     }
 
     #[test]

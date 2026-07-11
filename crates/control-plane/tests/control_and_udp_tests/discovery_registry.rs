@@ -62,8 +62,29 @@ fn add_discovered_peer_dedups_and_sorts() {
     );
     assert!(!add_discovered_peer(&dir, "   ").expect("add empty"));
 
+    let scope_id = local_control_scope_id(&dir);
+    let store = local_control_store(&dir).expect("open local control store");
+    assert!(
+        store
+            .upsert_local_discovered_peer(&scope_id, "node-refresh", "probe", 1_000)
+            .expect("insert refresh peer")
+    );
+    assert!(
+        !store
+            .upsert_local_discovered_peer(&scope_id, "node-refresh", "probe", 2_000)
+            .expect("refresh same-source peer")
+    );
+    let refreshed = store
+        .list_local_discovered_peers(&scope_id)
+        .expect("list local discovered peers")
+        .into_iter()
+        .find(|row| row.node_id == "node-refresh")
+        .expect("refreshed peer row");
+    assert_eq!(refreshed.discovered_at, 1_000);
+    assert_eq!(refreshed.updated_at, 2_000);
+
     let peers = load_discovered_peers_state(&dir).expect("load peers");
-    assert_eq!(peers, vec!["node-a", "node-b", "node-c"]);
+    assert_eq!(peers, vec!["node-a", "node-b", "node-c", "node-refresh"]);
     let records = load_discovered_peer_records_state(&dir).expect("load peer records");
     assert_eq!(
         records,
@@ -79,6 +100,10 @@ fn add_discovered_peer_dedups_and_sorts() {
             DiscoveredPeerRecord {
                 node_id: "node-c".to_owned(),
                 source_kind: "unknown".to_owned(),
+            },
+            DiscoveredPeerRecord {
+                node_id: "node-refresh".to_owned(),
+                source_kind: "probe".to_owned(),
             }
         ]
     );
@@ -119,6 +144,11 @@ fn add_discovered_peer_dedups_and_sorts() {
                 local_control_scope_id(&dir),
                 "node-c".to_owned(),
                 "unknown".to_owned(),
+            ),
+            (
+                local_control_scope_id(&dir),
+                "node-refresh".to_owned(),
+                "probe".to_owned(),
             ),
         ]
     );

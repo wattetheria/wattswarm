@@ -50,6 +50,7 @@ pub(super) struct PendingPeerRelationshipRequest {
 pub(super) struct PendingContactMaterialRequest {
     pub(super) peer: NetworkNodeId,
     pub(super) remote_node_id: String,
+    pub(super) started_at: Instant,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

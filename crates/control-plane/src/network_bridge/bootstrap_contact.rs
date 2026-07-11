@@ -274,7 +274,9 @@ pub(super) fn candidate_peer_addrs(
     Ok(addrs)
 }
 
-fn transport_contact_direct_network_addrs(contact: &TransportContactMaterial) -> Vec<String> {
+pub(super) fn transport_contact_direct_network_addrs(
+    contact: &TransportContactMaterial,
+) -> Vec<String> {
     let mut seen = HashSet::new();
     let mut addrs = Vec::new();
     if let Some(items) = contact.extra.get("direct_addrs").and_then(Value::as_array) {
@@ -324,7 +326,8 @@ impl NetworkBridgeService {
                         })?;
                     if let Ok(peer) = NetworkNodeId::new(remote_network_peer_id) {
                         self.remember_global_backfill_provider(peer.clone());
-                        self.schedule_peer_reconnect(peer);
+                        self.record_reconnect_candidate_activity(peer.clone(), Instant::now());
+                        self.schedule_peer_reconnect(peer.clone());
                     }
                 }
             }
@@ -350,9 +353,6 @@ impl NetworkBridgeService {
                     let _ = self
                         .runtime
                         .upsert_remote_contact_material(remote_network_peer_id.clone(), contact)?;
-                    if let Ok(peer) = NetworkNodeId::new(remote_network_peer_id) {
-                        self.schedule_peer_reconnect(peer);
-                    }
                 }
             }
         }

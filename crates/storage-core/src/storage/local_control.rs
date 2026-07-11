@@ -246,7 +246,15 @@ impl PgStore {
             normalized_source
         };
         match existing {
-            Some(current_source) if current_source == normalized_source => Ok(false),
+            Some(current_source) if current_source == normalized_source => {
+                conn.execute(
+                    "UPDATE discovered_peers_local
+                     SET updated_at = TIMESTAMPTZ 'epoch' + ($3::bigint * INTERVAL '1 millisecond')
+                     WHERE scope_id = $1 AND node_id = $2",
+                    params![scope_id, node_id, now as i64],
+                )?;
+                Ok(false)
+            }
             Some(_) => {
                 conn.execute(
                     "UPDATE discovered_peers_local
@@ -716,6 +724,10 @@ impl PgStore {
                     remote_heads_json,
                     backfill_successes,
                     backfill_failures,
+                    CASE
+                        WHEN last_observed_at IS NULL THEN -1
+                        ELSE (EXTRACT(EPOCH FROM last_observed_at) * 1000)::BIGINT
+                    END AS last_observed_at_ms,
                     (EXTRACT(EPOCH FROM updated_at) * 1000)::BIGINT AS updated_at_ms
              FROM network_peer_sync_state_local
              WHERE scope_id = $1
@@ -729,7 +741,11 @@ impl PgStore {
                 remote_heads_json: r.get(3)?,
                 backfill_successes: r.get::<_, i64>(4)? as u64,
                 backfill_failures: r.get::<_, i64>(5)? as u64,
-                updated_at: r.get::<_, i64>(6)? as u64,
+                last_observed_at: match r.get::<_, i64>(6)? {
+                    value if value >= 0 => Some(value as u64),
+                    _ => None,
+                },
+                updated_at: r.get::<_, i64>(7)? as u64,
             })
         })?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
@@ -754,6 +770,7 @@ impl PgStore {
                 remote_heads_json,
                 backfill_successes,
                 backfill_failures,
+                last_observed_at,
                 updated_at
              )
              VALUES (
@@ -764,7 +781,11 @@ impl PgStore {
                 $5,
                 $6,
                 $7,
-                TIMESTAMPTZ 'epoch' + ($8::bigint * INTERVAL '1 millisecond')
+                CASE
+                    WHEN $8::bigint < 0 THEN NULL
+                    ELSE TIMESTAMPTZ 'epoch' + ($8::bigint * INTERVAL '1 millisecond')
+                END,
+                TIMESTAMPTZ 'epoch' + ($9::bigint * INTERVAL '1 millisecond')
              )
              ON CONFLICT(scope_id, network_peer_id) DO UPDATE SET
                 known_scopes_json = excluded.known_scopes_json,
@@ -772,6 +793,7 @@ impl PgStore {
                 remote_heads_json = excluded.remote_heads_json,
                 backfill_successes = excluded.backfill_successes,
                 backfill_failures = excluded.backfill_failures,
+                last_observed_at = excluded.last_observed_at,
                 updated_at = excluded.updated_at",
             params![
                 scope_id,
@@ -781,6 +803,7 @@ impl PgStore {
                 &row.remote_heads_json,
                 row.backfill_successes as i64,
                 row.backfill_failures as i64,
+                row.last_observed_at.map(|value| value as i64).unwrap_or(-1),
                 row.updated_at as i64
             ],
         )?;

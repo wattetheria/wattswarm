@@ -703,6 +703,71 @@ fn observability_snapshot_reports_network_and_sync_health() {
 }
 
 #[test]
+fn observability_snapshot_reports_persisted_last_seen_without_restoring_liveness() {
+    let dir = temp_startup_dir("observability-reloaded-peer-last-seen");
+    let peer = random_network_node_id();
+    let last_observed_at = observed_at_ms().saturating_sub(120_000);
+    let identity = NodeIdentity::random();
+    let node_id = identity.node_id();
+    let store = PgStore::open_in_memory().expect("store");
+    let topology = store
+        .ensure_mainnet_bootstrap_network_topology(
+            "mainnet:watt-galaxy",
+            "Watt Galaxy",
+            &node_id,
+            &node_id,
+            1_700_000_000_000,
+        )
+        .expect("mainnet topology");
+    let membership = membership_with_roles(std::slice::from_ref(&node_id));
+    let node = Node::new(
+        identity,
+        store.for_org(topology.org.org_id.clone()),
+        membership,
+    )
+    .expect("node");
+    crate::control::save_network_peer_sync_state_record_state(
+        &dir,
+        &crate::control::NetworkPeerSyncStateRecord {
+            network_peer_id: peer.to_string(),
+            known_scopes_json: serde_json::to_string(&vec![SwarmScope::Global])
+                .expect("known scopes JSON"),
+            backfill_cursors_json: "[]".to_owned(),
+            remote_heads_json: "[]".to_owned(),
+            backfill_successes: 0,
+            backfill_failures: 0,
+            last_observed_at: Some(last_observed_at),
+            updated_at: 1,
+        },
+    )
+    .expect("save peer sync row");
+    let mut service = NetworkBridgeService::new(
+        test_network_node(NetworkP2pConfig::default()).expect("service node"),
+        &[SwarmScope::Global],
+        &NetworkProtocolParams::default(),
+    )
+    .expect("service");
+    service.set_state_dir(dir.clone(), dir.join("ui.state"));
+
+    let snapshot = service
+        .observability_snapshot(&node)
+        .expect("observability snapshot");
+    let health = snapshot
+        .peer_health
+        .iter()
+        .find(|entry| entry.network_peer_id == peer.to_string())
+        .expect("reloaded peer health");
+
+    assert!(!health.connected);
+    assert!(!health.recently_seen);
+    let last_seen_age_ms = health.last_seen_age_ms.expect("persisted last seen age");
+    let expected_age_ms = observed_at_ms().saturating_sub(last_observed_at);
+    assert!(last_seen_age_ms.abs_diff(expected_age_ms) < 1_000);
+
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
 fn summary_revocation_and_penalty_remove_imported_state() {
     let mut node =
         Node::open_in_memory_with_roles(&[Role::Proposer, Role::Finalizer]).expect("node");

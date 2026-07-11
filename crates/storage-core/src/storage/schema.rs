@@ -33,6 +33,18 @@ fn current_schema_init_key(conn: &Connection) -> Result<String> {
     .map_err(Into::into)
 }
 
+fn schema_has_required_tables(conn: &Connection) -> Result<bool> {
+    let count = conn.query_row(
+        "SELECT COUNT(*)
+         FROM information_schema.tables
+         WHERE table_schema = current_schema()
+           AND table_name IN ('discovered_peers_local', 'network_ban_windows')",
+        params![],
+        |row| row.get::<_, i64>(0),
+    )?;
+    Ok(count == 2)
+}
+
 fn column_exists(conn: &Connection, table: &str, column: &str) -> bool {
     conn.query_row(
         "SELECT 1
@@ -283,6 +295,17 @@ fn migrate_network_peer_sync_state_identity_schema(conn: &Connection) -> Result<
         ADD CONSTRAINT network_peer_sync_state_local_pkey PRIMARY KEY (scope_id, network_peer_id);
         ",
     )?;
+    Ok(())
+}
+
+fn migrate_network_peer_sync_state_last_observed_schema(conn: &Connection) -> Result<()> {
+    if !column_exists(conn, "network_peer_sync_state_local", "last_observed_at") {
+        conn.execute(
+            "ALTER TABLE network_peer_sync_state_local
+             ADD COLUMN last_observed_at TIMESTAMPTZ",
+            [],
+        )?;
+    }
     Ok(())
 }
 
@@ -755,14 +778,17 @@ impl PgStore {
         let init_key = current_schema_init_key(&conn)?;
 
         {
-            let initialized = initialized_schema_keys()
+            let mut initialized = initialized_schema_keys()
                 .lock()
                 .map_err(|_| SwarmError::Storage("schema init cache poisoned".into()))?;
             if initialized.contains(&init_key) {
-                return Ok(Self {
-                    conn: Arc::new(Mutex::new(conn)),
-                    org_id: Arc::new(UNSET_ORG_ID.to_owned()),
-                });
+                if schema_has_required_tables(&conn)? {
+                    return Ok(Self {
+                        conn: Arc::new(Mutex::new(conn)),
+                        org_id: Arc::new(UNSET_ORG_ID.to_owned()),
+                    });
+                }
+                initialized.remove(&init_key);
             }
         }
 
@@ -773,20 +799,23 @@ impl PgStore {
         )?;
 
         {
-            let initialized = initialized_schema_keys()
+            let mut initialized = initialized_schema_keys()
                 .lock()
                 .map_err(|_| SwarmError::Storage("schema init cache poisoned".into()))?;
             if initialized.contains(&init_key) {
-                let unlock_result = conn.query_row(
-                    "SELECT pg_advisory_unlock($1)",
-                    params![INIT_LOCK_KEY],
-                    |_| Ok(()),
-                );
-                unlock_result?;
-                return Ok(Self {
-                    conn: Arc::new(Mutex::new(conn)),
-                    org_id: Arc::new(UNSET_ORG_ID.to_owned()),
-                });
+                if schema_has_required_tables(&conn)? {
+                    let unlock_result = conn.query_row(
+                        "SELECT pg_advisory_unlock($1)",
+                        params![INIT_LOCK_KEY],
+                        |_| Ok(()),
+                    );
+                    unlock_result?;
+                    return Ok(Self {
+                        conn: Arc::new(Mutex::new(conn)),
+                        org_id: Arc::new(UNSET_ORG_ID.to_owned()),
+                    });
+                }
+                initialized.remove(&init_key);
             }
         }
 
@@ -917,6 +946,7 @@ impl PgStore {
                 remote_heads_json TEXT NOT NULL DEFAULT '[]',
                 backfill_successes BIGINT NOT NULL DEFAULT 0,
                 backfill_failures BIGINT NOT NULL DEFAULT 0,
+                last_observed_at TIMESTAMPTZ,
                 updated_at TIMESTAMPTZ NOT NULL,
                 PRIMARY KEY(scope_id, network_peer_id)
             );
@@ -2071,6 +2101,7 @@ impl PgStore {
             migrate_peer_metadata_local_contact_material_schema(&conn)?;
             migrate_agent_event_bus_local_agent_envelope_schema(&conn)?;
             migrate_network_peer_sync_state_identity_schema(&conn)?;
+            migrate_network_peer_sync_state_last_observed_schema(&conn)?;
             migrate_feed_subscription_network_id_schema(&conn)?;
             migrate_events_swarm_scope_schema(&conn)?;
             migrate_topic_cursor_network_id_schema(&conn)?;

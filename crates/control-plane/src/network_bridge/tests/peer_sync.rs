@@ -26,7 +26,7 @@ fn register_contacted_peer(
 }
 
 #[test]
-fn probe_peer_contact_material_skips_disconnected_peer() {
+fn probe_peer_contact_material_sends_for_disconnected_peer_with_contact_material() {
     let dir = temp_startup_dir("contact-material-disconnected-peer");
     std::fs::write(dir.join("node_seed.hex"), hex::encode([121_u8; 32])).expect("write seed");
     ensure_test_relay_urls(&dir);
@@ -54,14 +54,108 @@ fn probe_peer_contact_material_skips_disconnected_peer() {
         .probe_peer_contact_material(&peer)
         .expect("probe disconnected peer");
 
-    assert_eq!(request_id, None);
+    assert!(request_id.is_some());
     assert_eq!(
         service.pending_contact_material_request_count_for_peer(&peer),
-        0
+        1
     );
 
     wattswarm_network_transport_iroh::shutdown_local_iroh_data_plane(&dir);
     let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn successful_contact_probe_emits_connected_only_on_first_liveness_transition() {
+    let local_dir = temp_startup_dir("contact-material-connected-tick-local");
+    let remote_dir = temp_startup_dir("contact-material-connected-tick-remote");
+    std::fs::write(local_dir.join("node_seed.hex"), hex::encode([122_u8; 32]))
+        .expect("write local seed");
+    std::fs::write(remote_dir.join("node_seed.hex"), hex::encode([123_u8; 32]))
+        .expect("write remote seed");
+    ensure_test_relay_urls(&local_dir);
+    ensure_test_relay_urls(&remote_dir);
+    let remote_peer = NetworkNodeId::new(
+        wattswarm_network_transport_iroh::local_endpoint_id_from_state_dir(&remote_dir)
+            .expect("remote endpoint")
+            .to_string(),
+    )
+    .expect("remote peer id");
+    let remote_contact = export_local_contact_material_for_network_peer_id(
+        &remote_dir,
+        remote_peer.as_str(),
+        observed_at_ms(),
+    )
+    .expect("remote contact");
+    let raw_remote_contact =
+        build_contact_material(&remote_dir, remote_peer.as_str()).expect("raw remote contact");
+    let mut node = Node::open_in_memory_with_roles(&[Role::Proposer]).expect("node");
+    let mut service = NetworkBridgeService::new(
+        NetworkP2pNode::from_iroh_state_dir(
+            NetworkP2pConfig::default(),
+            local_dir.clone(),
+            [122_u8; 32],
+        )
+        .expect("iroh node"),
+        &[SwarmScope::Global],
+        &NetworkProtocolParams::default(),
+    )
+    .expect("service");
+    service.set_state_dir(local_dir.clone(), local_dir.join("ui.state"));
+    service
+        .upsert_remote_contact_material(remote_peer.to_string(), remote_contact.clone())
+        .expect("upsert remote contact");
+
+    let response_for = |target_node_id: String| RawContactMaterialResponse {
+        source_node_id: remote_peer.to_string(),
+        target_node_id,
+        applied: true,
+        contact_material: Some(raw_remote_contact.clone()),
+        detail: None,
+        updated_at: observed_at_ms(),
+    };
+    let first_request_id = service
+        .probe_peer_contact_material(&remote_peer)
+        .expect("first contact probe")
+        .expect("first request id");
+    let first = service
+        .process_runtime_event(
+            &mut node,
+            NetworkRuntimeEvent::ContactMaterialResponse {
+                peer: remote_peer.clone(),
+                request_id: first_request_id,
+                response: response_for(service.local_peer_id().to_string()),
+            },
+        )
+        .expect("first contact response");
+    assert!(matches!(
+        first,
+        NetworkBridgeTick::Connected { peer } if peer == remote_peer
+    ));
+
+    let repeated_request_id = service
+        .probe_peer_contact_material(&remote_peer)
+        .expect("repeated contact probe")
+        .expect("repeated request id");
+    let repeated = service
+        .process_runtime_event(
+            &mut node,
+            NetworkRuntimeEvent::ContactMaterialResponse {
+                peer: remote_peer.clone(),
+                request_id: repeated_request_id,
+                response: response_for(service.local_peer_id().to_string()),
+            },
+        )
+        .expect("repeated contact response");
+    assert!(matches!(
+        repeated,
+        NetworkBridgeTick::TransportNotice { detail }
+            if detail == format!("contact_material_updated peer={remote_peer}")
+    ));
+
+    wattswarm_network_transport_iroh::shutdown_local_iroh_data_plane(&local_dir);
+    wattswarm_network_transport_iroh::shutdown_local_iroh_data_plane(&remote_dir);
+    std::fs::remove_dir_all(local_dir).expect("cleanup local");
+    std::fs::remove_dir_all(remote_dir).expect("cleanup remote");
 }
 
 #[test]
@@ -216,6 +310,49 @@ fn global_backfill_requires_provider_and_scoped_backfill_requires_known_scope() 
 }
 
 #[test]
+fn outbound_backfill_request_does_not_record_peer_liveness() {
+    let dir = temp_startup_dir("outbound-backfill-no-liveness");
+    std::fs::write(dir.join("node_seed.hex"), hex::encode([45_u8; 32])).expect("write seed");
+    ensure_test_relay_urls(&dir);
+    let peer = NetworkNodeId::new(
+        wattswarm_network_transport_iroh::local_endpoint_id_from_state_dir(&dir)
+            .expect("peer endpoint")
+            .to_string(),
+    )
+    .expect("peer id");
+    let contact =
+        export_local_contact_material_for_network_peer_id(&dir, peer.as_str(), observed_at_ms())
+            .expect("contact");
+    let node = Node::open_in_memory_with_roles(&[Role::Proposer]).expect("node");
+    let mut service = NetworkBridgeService::new(
+        test_network_node(NetworkP2pConfig::default()).expect("service node"),
+        &[SwarmScope::Global],
+        &NetworkProtocolParams::default(),
+    )
+    .expect("service");
+    service
+        .runtime
+        .upsert_remote_contact_material(peer.to_string(), contact)
+        .expect("upsert contact");
+    service.remember_global_backfill_provider(peer.clone());
+
+    assert!(
+        service
+            .request_backfill_scopes_for_peer_now(&peer, &node, &[SwarmScope::Global])
+            .expect("send outbound backfill request")
+    );
+    let state = service
+        .peer_sync_state
+        .get(&peer)
+        .expect("outbound peer sync state");
+    assert!(!state.recently_seen_at(Instant::now()));
+    assert_eq!(state.last_seen_age_ms_at(observed_at_ms()), None);
+
+    wattswarm_network_transport_iroh::shutdown_local_iroh_data_plane(&dir);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
 fn stale_connected_peer_is_not_backfill_eligible_until_liveness_refresh() {
     let mut service = NetworkBridgeService::new(
         test_network_node(NetworkP2pConfig::default()).expect("node"),
@@ -265,6 +402,47 @@ fn peer_liveness_refresh_does_not_persist_peer_sync_state() {
     let persisted = crate::control::load_network_peer_sync_state_records_state(&dir)
         .expect("load peer sync rows");
     assert!(persisted.is_empty());
+
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn persisted_last_seen_survives_reload_without_restoring_liveness() {
+    let dir = temp_startup_dir("peer-last-seen-reload");
+    let mut service = NetworkBridgeService::new(
+        test_network_node(NetworkP2pConfig::default()).expect("node"),
+        &[SwarmScope::Global],
+        &NetworkProtocolParams::default(),
+    )
+    .expect("service");
+    service.set_state_dir(dir.clone(), dir.join("ui.state"));
+    let peer = random_network_node_id();
+    let observed_after = observed_at_ms();
+
+    assert!(service.mark_peer_connected(peer.clone()));
+    service.record_peer_liveness(peer.clone());
+    assert!(service.mark_peer_disconnected(peer.clone()));
+
+    let persisted = crate::control::load_network_peer_sync_state_records_state(&dir)
+        .expect("load peer sync rows");
+    let last_observed_at = persisted[0]
+        .last_observed_at
+        .expect("persisted last observed timestamp");
+    assert!(last_observed_at >= observed_after);
+
+    let mut reloaded = NetworkBridgeService::new(
+        test_network_node(NetworkP2pConfig::default()).expect("reloaded node"),
+        &[SwarmScope::Global],
+        &NetworkProtocolParams::default(),
+    )
+    .expect("reloaded service");
+    reloaded.set_state_dir(dir.clone(), dir.join("ui.state"));
+    let state = reloaded
+        .peer_sync_state
+        .get(&peer)
+        .expect("reloaded peer sync state");
+    assert!(!state.recently_seen_at(Instant::now()));
+    assert!(state.last_seen_age_ms_at(observed_at_ms()).is_some());
 
     let _ = std::fs::remove_dir_all(dir);
 }
@@ -853,6 +1031,8 @@ fn peer_sync_state_persists_scope_cursor_and_remote_heads() {
             .get(&BackfillLaneKey::new(&scope, Some("crew.chat"))),
         Some(&vec!["evt-head".to_owned()])
     );
+    assert!(!state.recently_seen_at(Instant::now()));
+    assert!(state.last_seen_age_ms_at(observed_at_ms()).is_some());
     assert!(!dir.join("network_peer_sync_state.json").exists());
     let persisted = crate::control::load_network_peer_sync_state_records_state(&dir)
         .expect("load peer sync DB rows");
@@ -882,6 +1062,7 @@ fn peer_scope_activity_persists_only_changed_peer() {
                 remote_heads_json: "[]".to_owned(),
                 backfill_successes: 0,
                 backfill_failures: 0,
+                last_observed_at: None,
                 updated_at,
             },
         )
@@ -2188,7 +2369,98 @@ fn set_state_dir_loads_persisted_iroh_contact_material_into_runtime() {
 
     assert_eq!(service.known_remote_contact_count(), 1);
     let remote_peer = NetworkNodeId::new(remote_endpoint.clone()).expect("remote peer id");
-    assert_eq!(service.reconnect_attempts_for_peer(&remote_peer), Some(0));
+    assert_eq!(service.reconnect_attempts_for_peer(&remote_peer), None);
+    assert_eq!(
+        service
+            .run_reconnect_supervision()
+            .expect("persisted contact remains an address-book entry"),
+        0
+    );
+
+    wattswarm_network_transport_iroh::shutdown_local_iroh_data_plane(&local_dir);
+    wattswarm_network_transport_iroh::shutdown_local_iroh_data_plane(&remote_dir);
+    std::fs::remove_dir_all(local_dir).expect("cleanup local");
+    std::fs::remove_dir_all(remote_dir).expect("cleanup remote");
+}
+
+#[test]
+fn persisted_dead_contacts_do_not_become_startup_reconnect_jobs() {
+    let local_dir = temp_startup_dir("persisted-dead-contacts-local");
+    let remote_dir = temp_startup_dir("persisted-dead-contacts-remote");
+    let local_seed = [201u8; 32];
+    let remote_seed = [202u8; 32];
+    std::fs::write(local_dir.join("node_seed.hex"), hex::encode(local_seed))
+        .expect("write local seed");
+    std::fs::write(remote_dir.join("node_seed.hex"), hex::encode(remote_seed))
+        .expect("write remote seed");
+    ensure_test_relay_urls(&local_dir);
+    ensure_test_relay_urls(&remote_dir);
+    let remote_endpoint =
+        wattswarm_network_transport_iroh::local_endpoint_id_from_state_dir(&remote_dir)
+            .expect("remote endpoint")
+            .to_string();
+    let base_contact = export_local_contact_material_for_network_peer_id(
+        &remote_dir,
+        &remote_endpoint,
+        observed_at_ms(),
+    )
+    .expect("remote contact");
+
+    for _ in 0..20 {
+        let peer = random_network_node_id();
+        let mut contact = base_contact.clone();
+        contact.peer_id = peer.to_string();
+        contact.metadata.endpoint_id = Some(peer.to_string());
+        contact.extra["endpoint_id"] = json!(peer.to_string());
+        crate::control::save_peer_metadata_record_state(
+            &local_dir,
+            &crate::control::PeerMetadataRecord {
+                node_id: peer.to_string(),
+                network_id: Some("mainnet".to_owned()),
+                params_version: None,
+                params_hash: None,
+                agent_version_raw: None,
+                agent_version_prefix: None,
+                protocol_version: None,
+                observed_addr: None,
+                listen_addrs: Vec::new(),
+                protocols: Vec::new(),
+                handshake_status: "contact_material".to_owned(),
+                last_error: None,
+                contact_material: Some(json!({
+                    "node_id": peer,
+                    "peer_id": contact.peer_id,
+                    "transports": [contact],
+                })),
+                contact_material_signature: None,
+                contact_material_updated_at: Some(observed_at_ms()),
+                first_identified_at: observed_at_ms(),
+                last_identified_at: observed_at_ms(),
+            },
+        )
+        .expect("save dead peer contact");
+    }
+
+    let mut service = NetworkBridgeService::new(
+        NetworkP2pNode::from_iroh_state_dir(
+            NetworkP2pConfig::default(),
+            local_dir.clone(),
+            local_seed,
+        )
+        .expect("iroh node"),
+        &[SwarmScope::Global],
+        &NetworkProtocolParams::default(),
+    )
+    .expect("service");
+    service.set_state_dir(local_dir.clone(), local_dir.join("ui.state"));
+
+    assert_eq!(service.known_remote_contact_count(), 20);
+    assert_eq!(
+        service
+            .run_reconnect_supervision()
+            .expect("historical contacts are address book entries only"),
+        0
+    );
 
     wattswarm_network_transport_iroh::shutdown_local_iroh_data_plane(&local_dir);
     wattswarm_network_transport_iroh::shutdown_local_iroh_data_plane(&remote_dir);
@@ -2250,6 +2522,13 @@ fn set_state_dir_loads_startup_iroh_bootstrap_contacts_into_runtime() {
     let remote_peer = NetworkNodeId::new(remote_endpoint.clone()).expect("remote peer id");
     assert_eq!(service.reconnect_attempts_for_peer(&remote_peer), Some(0));
     assert!(service.is_global_backfill_provider(&remote_peer));
+    assert_eq!(
+        service
+            .run_reconnect_supervision()
+            .expect("startup contact reconnect supervision"),
+        1
+    );
+    assert_eq!(service.reconnect_attempts_for_peer(&remote_peer), Some(1));
     let rows =
         crate::control::load_peer_metadata_records_state(&local_dir).expect("peer metadata rows");
     assert!(rows.iter().any(|row| {
@@ -2305,7 +2584,7 @@ fn network_config_bootstrap_peers_are_global_backfill_providers() {
 }
 
 #[test]
-fn reconnect_supervision_redials_remembered_peer_address() {
+fn reconnect_supervision_requires_registered_iroh_contact() {
     let local_dir = temp_startup_dir("reconnect-local");
     let remote_dir = temp_startup_dir("reconnect-remote");
     let local_seed = [93u8; 32];
@@ -2346,9 +2625,323 @@ fn reconnect_supervision_redials_remembered_peer_address() {
         .run_reconnect_supervision()
         .expect("run reconnect supervision");
 
+    assert_eq!(attempts, 0);
+    assert_eq!(service.known_remote_contact_count(), 0);
+    assert_eq!(service.reconnect_attempts_for_peer(&peer), Some(0));
+
+    wattswarm_network_transport_iroh::shutdown_local_iroh_data_plane(&local_dir);
+    wattswarm_network_transport_iroh::shutdown_local_iroh_data_plane(&remote_dir);
+    std::fs::remove_dir_all(local_dir).expect("cleanup local");
+    std::fs::remove_dir_all(remote_dir).expect("cleanup remote");
+}
+
+#[test]
+fn reconnect_supervision_uses_iroh_contact_with_direct_and_relay_candidates() {
+    let local_dir = temp_startup_dir("reconnect-full-contact-local");
+    let remote_dir = temp_startup_dir("reconnect-full-contact-remote");
+    let local_seed = [103u8; 32];
+    let remote_seed = [104u8; 32];
+    std::fs::write(local_dir.join("node_seed.hex"), hex::encode(local_seed))
+        .expect("write local seed");
+    std::fs::write(remote_dir.join("node_seed.hex"), hex::encode(remote_seed))
+        .expect("write remote seed");
+    ensure_test_relay_urls(&local_dir);
+    ensure_test_relay_urls(&remote_dir);
+    let remote_endpoint =
+        wattswarm_network_transport_iroh::local_endpoint_id_from_state_dir(&remote_dir)
+            .expect("remote endpoint")
+            .to_string();
+    let mut remote_contact = export_local_contact_material_for_network_peer_id(
+        &remote_dir,
+        &remote_endpoint,
+        observed_at_ms(),
+    )
+    .expect("remote contact");
+    remote_contact.metadata.listen_addrs = vec!["127.0.0.1:4002".to_owned()];
+    remote_contact.extra["direct_addrs"] = json!(["127.0.0.1:4002"]);
+    remote_contact.extra["relay_urls"] = json!(["https://relay.wattetheria.com"]);
+    let peer = NetworkNodeId::new(remote_endpoint).expect("remote peer id");
+    let mut service = NetworkBridgeService::new(
+        NetworkP2pNode::from_iroh_state_dir(
+            NetworkP2pConfig::default(),
+            local_dir.clone(),
+            local_seed,
+        )
+        .expect("iroh node"),
+        &[SwarmScope::Global],
+        &NetworkProtocolParams::default(),
+    )
+    .expect("service");
+    service.set_state_dir(local_dir.clone(), local_dir.join("ui.state"));
+    service
+        .upsert_remote_contact_material(peer.to_string(), remote_contact)
+        .expect("upsert full remote contact");
+
+    let attempts = service
+        .run_reconnect_supervision()
+        .expect("run reconnect supervision");
+
     assert_eq!(attempts, 1);
-    assert_eq!(service.known_remote_contact_count(), 1);
-    assert_eq!(service.reconnect_attempts_for_peer(&peer), Some(1));
+    assert_eq!(
+        service.pending_contact_material_request_count_for_peer(&peer),
+        1,
+        "one Iroh control probe must receive all direct and relay candidates"
+    );
+    let diagnostics = std::fs::read_to_string(local_dir.join("diagnostics/wattswarm_node.jsonl"))
+        .expect("reconnect diagnostics");
+    assert!(diagnostics.contains("\"phase\":\"reconnect.bootstrap\""));
+    assert!(diagnostics.contains("\"route\":\"iroh_contact\""));
+    assert!(!diagnostics.contains("\"route\":\"direct_addr\""));
+
+    wattswarm_network_transport_iroh::shutdown_local_iroh_data_plane(&local_dir);
+    wattswarm_network_transport_iroh::shutdown_local_iroh_data_plane(&remote_dir);
+    std::fs::remove_dir_all(local_dir).expect("cleanup local");
+    std::fs::remove_dir_all(remote_dir).expect("cleanup remote");
+}
+
+#[test]
+fn remote_contact_uses_extra_direct_address_when_metadata_listen_addrs_are_empty() {
+    let local_dir = temp_startup_dir("reconnect-extra-direct-local");
+    let remote_dir = temp_startup_dir("reconnect-extra-direct-remote");
+    let local_seed = [124u8; 32];
+    let remote_seed = [125u8; 32];
+    std::fs::write(local_dir.join("node_seed.hex"), hex::encode(local_seed))
+        .expect("write local seed");
+    std::fs::write(remote_dir.join("node_seed.hex"), hex::encode(remote_seed))
+        .expect("write remote seed");
+    ensure_test_relay_urls(&local_dir);
+    ensure_test_relay_urls(&remote_dir);
+    let remote_endpoint =
+        wattswarm_network_transport_iroh::local_endpoint_id_from_state_dir(&remote_dir)
+            .expect("remote endpoint")
+            .to_string();
+    let peer = NetworkNodeId::new(remote_endpoint.clone()).expect("remote peer id");
+    let mut contact = export_local_contact_material_for_network_peer_id(
+        &remote_dir,
+        &remote_endpoint,
+        observed_at_ms(),
+    )
+    .expect("remote contact");
+    contact.metadata.listen_addrs.clear();
+    contact.extra["direct_addrs"] = json!(["18.206.214.6:4002"]);
+    contact.extra["relay_urls"] = json!(["https://relay.wattetheria.com"]);
+    let mut service = NetworkBridgeService::new(
+        NetworkP2pNode::from_iroh_state_dir(
+            NetworkP2pConfig::default(),
+            local_dir.clone(),
+            local_seed,
+        )
+        .expect("iroh node"),
+        &[SwarmScope::Global],
+        &NetworkProtocolParams::default(),
+    )
+    .expect("service");
+
+    service
+        .upsert_remote_contact_material(peer.to_string(), contact)
+        .expect("upsert contact");
+
+    assert_eq!(
+        service
+            .known_peer_addrs
+            .get(&peer)
+            .map(NetworkAddress::as_str),
+        Some("18.206.214.6:4002")
+    );
+
+    wattswarm_network_transport_iroh::shutdown_local_iroh_data_plane(&local_dir);
+    wattswarm_network_transport_iroh::shutdown_local_iroh_data_plane(&remote_dir);
+    std::fs::remove_dir_all(local_dir).expect("cleanup local");
+    std::fs::remove_dir_all(remote_dir).expect("cleanup remote");
+}
+
+#[test]
+fn reconnect_supervision_fairly_rotates_serialized_contact_probes() {
+    let local_dir = temp_startup_dir("reconnect-fair-local");
+    let remote_dir = temp_startup_dir("reconnect-fair-remote");
+    let local_seed = [105u8; 32];
+    let remote_seed = [106u8; 32];
+    std::fs::write(local_dir.join("node_seed.hex"), hex::encode(local_seed))
+        .expect("write local seed");
+    std::fs::write(remote_dir.join("node_seed.hex"), hex::encode(remote_seed))
+        .expect("write remote seed");
+    ensure_test_relay_urls(&local_dir);
+    ensure_test_relay_urls(&remote_dir);
+    let remote_endpoint =
+        wattswarm_network_transport_iroh::local_endpoint_id_from_state_dir(&remote_dir)
+            .expect("remote endpoint")
+            .to_string();
+    let mut base_contact = export_local_contact_material_for_network_peer_id(
+        &remote_dir,
+        &remote_endpoint,
+        observed_at_ms(),
+    )
+    .expect("remote contact");
+    base_contact.metadata.listen_addrs.clear();
+    base_contact.extra["direct_addrs"] = json!([]);
+    base_contact.extra["relay_urls"] = json!(["https://relay.wattetheria.com"]);
+    let mut service = NetworkBridgeService::new(
+        NetworkP2pNode::from_iroh_state_dir(
+            NetworkP2pConfig::default(),
+            local_dir.clone(),
+            local_seed,
+        )
+        .expect("iroh node"),
+        &[SwarmScope::Global],
+        &NetworkProtocolParams::default(),
+    )
+    .expect("service");
+    service.set_state_dir(local_dir.clone(), local_dir.join("ui.state"));
+
+    let mut peers = (0..3).map(|_| random_network_node_id()).collect::<Vec<_>>();
+    peers.sort_by_key(ToString::to_string);
+    for peer in &peers {
+        let mut contact = base_contact.clone();
+        contact.peer_id = peer.to_string();
+        contact.metadata.endpoint_id = Some(peer.to_string());
+        contact.extra["endpoint_id"] = json!(peer.to_string());
+        assert!(
+            service
+                .upsert_remote_contact_material(peer.to_string(), contact)
+                .expect("upsert relay-only contact")
+        );
+    }
+
+    let mut selected = Vec::new();
+    for _ in 0..peers.len() {
+        if let Some(previous) = selected.last() {
+            service.force_pending_contact_material_request_stale_for_peer(previous);
+        }
+        for peer in &peers {
+            service.force_reconnect_due_for_peer(peer);
+        }
+        assert_eq!(
+            service
+                .run_reconnect_supervision()
+                .expect("run fair reconnect supervision"),
+            1
+        );
+        let current = peers
+            .iter()
+            .find(|peer| service.pending_contact_material_request_count_for_peer(peer) == 1)
+            .expect("one pending contact probe")
+            .clone();
+        assert!(
+            !selected.contains(&current),
+            "a peer must not receive a second probe before every due peer receives one"
+        );
+        selected.push(current);
+    }
+    assert_eq!(selected.len(), peers.len());
+
+    let previous = selected.last().expect("last selected peer").clone();
+    service.force_pending_contact_material_request_stale_for_peer(&previous);
+    for peer in &peers {
+        service.force_reconnect_due_for_peer(peer);
+    }
+    assert_eq!(
+        service
+            .run_reconnect_supervision()
+            .expect("same activity does not restart fair rotation"),
+        0
+    );
+    service.record_reconnect_candidate_activity(selected[0].clone(), Instant::now());
+    service.force_reconnect_due_for_peer(&selected[0]);
+    assert_eq!(
+        service
+            .run_reconnect_supervision()
+            .expect("new activity starts one new probe"),
+        1
+    );
+    assert_eq!(
+        service.pending_contact_material_request_count_for_peer(&selected[0]),
+        1,
+        "only a peer with new activity may be probed again"
+    );
+
+    wattswarm_network_transport_iroh::shutdown_local_iroh_data_plane(&local_dir);
+    wattswarm_network_transport_iroh::shutdown_local_iroh_data_plane(&remote_dir);
+    std::fs::remove_dir_all(local_dir).expect("cleanup local");
+    std::fs::remove_dir_all(remote_dir).expect("cleanup remote");
+}
+
+#[test]
+fn reconnect_supervision_skips_expired_contact_candidates() {
+    let local_dir = temp_startup_dir("reconnect-active-retention-local");
+    let remote_dir = temp_startup_dir("reconnect-active-retention-remote");
+    let local_seed = [126u8; 32];
+    let remote_seed = [127u8; 32];
+    std::fs::write(local_dir.join("node_seed.hex"), hex::encode(local_seed))
+        .expect("write local seed");
+    std::fs::write(remote_dir.join("node_seed.hex"), hex::encode(remote_seed))
+        .expect("write remote seed");
+    ensure_test_relay_urls(&local_dir);
+    ensure_test_relay_urls(&remote_dir);
+    let remote_endpoint =
+        wattswarm_network_transport_iroh::local_endpoint_id_from_state_dir(&remote_dir)
+            .expect("remote endpoint")
+            .to_string();
+    let mut base_contact = export_local_contact_material_for_network_peer_id(
+        &remote_dir,
+        &remote_endpoint,
+        observed_at_ms(),
+    )
+    .expect("remote contact");
+    base_contact.metadata.listen_addrs.clear();
+    base_contact.extra["direct_addrs"] = json!([]);
+    base_contact.extra["relay_urls"] = json!(["https://relay.wattetheria.com"]);
+    let mut service = NetworkBridgeService::new(
+        NetworkP2pNode::from_iroh_state_dir(
+            NetworkP2pConfig::default(),
+            local_dir.clone(),
+            local_seed,
+        )
+        .expect("iroh node"),
+        &[SwarmScope::Global],
+        &NetworkProtocolParams::default(),
+    )
+    .expect("service");
+    service.set_state_dir(local_dir.clone(), local_dir.join("ui.state"));
+
+    let expired_activity = Instant::now() - RECONNECT_CANDIDATE_RETENTION - Duration::from_secs(1);
+    let mut expired_peers = Vec::new();
+    for _ in 0..20 {
+        let peer = random_network_node_id();
+        let mut contact = base_contact.clone();
+        contact.peer_id = peer.to_string();
+        contact.metadata.endpoint_id = Some(peer.to_string());
+        contact.extra["endpoint_id"] = json!(peer.to_string());
+        service
+            .upsert_remote_contact_material(peer.to_string(), contact)
+            .expect("upsert expired contact");
+        service
+            .reconnect_candidate_activity
+            .insert(peer.clone(), expired_activity);
+        expired_peers.push(peer);
+    }
+    let fresh_peer = random_network_node_id();
+    let mut fresh_contact = base_contact;
+    fresh_contact.peer_id = fresh_peer.to_string();
+    fresh_contact.metadata.endpoint_id = Some(fresh_peer.to_string());
+    fresh_contact.extra["endpoint_id"] = json!(fresh_peer.to_string());
+    service
+        .upsert_remote_contact_material(fresh_peer.to_string(), fresh_contact)
+        .expect("upsert fresh contact");
+
+    assert_eq!(
+        service
+            .run_reconnect_supervision()
+            .expect("run active reconnect supervision"),
+        1
+    );
+    assert_eq!(
+        service.pending_contact_material_request_count_for_peer(&fresh_peer),
+        1
+    );
+    assert!(expired_peers.iter().all(|peer| {
+        service.pending_contact_material_request_count_for_peer(peer) == 0
+            && service.reconnect_attempts_for_peer(peer) == Some(0)
+    }));
 
     wattswarm_network_transport_iroh::shutdown_local_iroh_data_plane(&local_dir);
     wattswarm_network_transport_iroh::shutdown_local_iroh_data_plane(&remote_dir);
@@ -2367,11 +2960,18 @@ fn reconnect_supervision_abandons_stale_peer_until_rediscovered() {
     std::fs::write(remote_dir.join("node_seed.hex"), hex::encode(remote_seed))
         .expect("write remote seed");
     ensure_test_relay_urls(&local_dir);
+    ensure_test_relay_urls(&remote_dir);
     let remote_endpoint =
         wattswarm_network_transport_iroh::local_endpoint_id_from_state_dir(&remote_dir)
             .expect("remote endpoint")
             .to_string();
-    let peer = NetworkNodeId::new(remote_endpoint).expect("remote peer id");
+    let peer = NetworkNodeId::new(remote_endpoint.clone()).expect("remote peer id");
+    let remote_contact = export_local_contact_material_for_network_peer_id(
+        &remote_dir,
+        &remote_endpoint,
+        observed_at_ms(),
+    )
+    .expect("remote contact");
     let address = NetworkAddress::new("127.0.0.1:4002".to_owned()).expect("address");
     let mut service = NetworkBridgeService::new(
         NetworkP2pNode::from_iroh_state_dir(
@@ -2385,13 +2985,18 @@ fn reconnect_supervision_abandons_stale_peer_until_rediscovered() {
     )
     .expect("service");
 
+    service
+        .upsert_remote_contact_material(peer.to_string(), remote_contact)
+        .expect("upsert remote contact");
     service.remember_peer_address(peer.clone(), address.clone());
     for _ in 0..PEER_RECONNECT_MAX_ATTEMPTS {
+        service.record_reconnect_candidate_activity(peer.clone(), Instant::now());
+        service.force_pending_contact_material_request_stale_for_peer(&peer);
+        service.force_reconnect_due_for_peer(&peer);
         let attempts = service
             .run_reconnect_supervision()
             .expect("run reconnect supervision");
         assert_eq!(attempts, 1);
-        service.force_reconnect_due_for_peer(&peer);
     }
 
     assert!(service.reconnect_abandoned_for_peer(&peer));
@@ -2404,6 +3009,7 @@ fn reconnect_supervision_abandons_stale_peer_until_rediscovered() {
     );
 
     service.remember_peer_address(peer.clone(), address);
+    service.record_peer_liveness(peer.clone());
     assert!(!service.reconnect_abandoned_for_peer(&peer));
     assert_eq!(
         service
@@ -2419,7 +3025,195 @@ fn reconnect_supervision_abandons_stale_peer_until_rediscovered() {
 }
 
 #[test]
-fn reconnect_supervision_does_not_probe_contact_material_for_disconnected_peer() {
+fn repeated_contact_generation_does_not_reactivate_abandoned_peer() {
+    let local_dir = temp_startup_dir("reconnect-generation-local");
+    let remote_dir = temp_startup_dir("reconnect-generation-remote");
+    let local_seed = [111u8; 32];
+    let remote_seed = [112u8; 32];
+    std::fs::write(local_dir.join("node_seed.hex"), hex::encode(local_seed))
+        .expect("write local seed");
+    std::fs::write(remote_dir.join("node_seed.hex"), hex::encode(remote_seed))
+        .expect("write remote seed");
+    ensure_test_relay_urls(&local_dir);
+    ensure_test_relay_urls(&remote_dir);
+    let peer = NetworkNodeId::new(
+        wattswarm_network_transport_iroh::local_endpoint_id_from_state_dir(&remote_dir)
+            .expect("remote endpoint")
+            .to_string(),
+    )
+    .expect("remote peer id");
+    let mut contact = export_local_contact_material_for_network_peer_id(
+        &remote_dir,
+        peer.as_str(),
+        observed_at_ms(),
+    )
+    .expect("remote contact");
+    contact.metadata.listen_addrs.clear();
+    contact.extra["direct_addrs"] = json!([]);
+    contact.extra["relay_urls"] = json!(["https://relay.wattetheria.com"]);
+    let mut service = NetworkBridgeService::new(
+        NetworkP2pNode::from_iroh_state_dir(
+            NetworkP2pConfig::default(),
+            local_dir.clone(),
+            local_seed,
+        )
+        .expect("iroh node"),
+        &[SwarmScope::Global],
+        &NetworkProtocolParams::default(),
+    )
+    .expect("service");
+
+    assert!(
+        service
+            .upsert_remote_contact_material(peer.to_string(), contact.clone())
+            .expect("insert contact")
+    );
+    service.abandon_peer_reconnect(
+        peer.clone(),
+        PEER_RECONNECT_MAX_ATTEMPTS,
+        "iroh_contact",
+        None,
+    );
+    assert!(service.reconnect_abandoned_for_peer(&peer));
+
+    let repeated = service
+        .upsert_remote_contact_material(peer.to_string(), contact.clone())
+        .expect("repeat contact generation");
+    assert!(!repeated);
+    service.reactivate_discovered_peer_reconnect(peer.clone(), repeated);
+    assert!(service.reconnect_abandoned_for_peer(&peer));
+
+    contact.metadata.generated_at = contact.metadata.generated_at.saturating_add(1);
+    let updated = service
+        .upsert_remote_contact_material(peer.to_string(), contact)
+        .expect("update contact generation");
+    assert!(updated);
+    service.reactivate_discovered_peer_reconnect(peer.clone(), updated);
+    assert!(!service.reconnect_abandoned_for_peer(&peer));
+    assert_eq!(service.reconnect_attempts_for_peer(&peer), Some(0));
+
+    wattswarm_network_transport_iroh::shutdown_local_iroh_data_plane(&local_dir);
+    wattswarm_network_transport_iroh::shutdown_local_iroh_data_plane(&remote_dir);
+    std::fs::remove_dir_all(local_dir).expect("cleanup local");
+    std::fs::remove_dir_all(remote_dir).expect("cleanup remote");
+}
+
+#[test]
+fn fresh_discovery_allows_one_abandoned_recovery_probe_until_success() {
+    let local_dir = temp_startup_dir("reconnect-abandoned-recovery-local");
+    let remote_dir = temp_startup_dir("reconnect-abandoned-recovery-remote");
+    let local_seed = [128u8; 32];
+    let remote_seed = [129u8; 32];
+    std::fs::write(local_dir.join("node_seed.hex"), hex::encode(local_seed))
+        .expect("write local seed");
+    std::fs::write(remote_dir.join("node_seed.hex"), hex::encode(remote_seed))
+        .expect("write remote seed");
+    ensure_test_relay_urls(&local_dir);
+    ensure_test_relay_urls(&remote_dir);
+    let remote_endpoint =
+        wattswarm_network_transport_iroh::local_endpoint_id_from_state_dir(&remote_dir)
+            .expect("remote endpoint")
+            .to_string();
+    let peer = NetworkNodeId::new(remote_endpoint.clone()).expect("remote peer id");
+    let mut contact = export_local_contact_material_for_network_peer_id(
+        &remote_dir,
+        &remote_endpoint,
+        observed_at_ms(),
+    )
+    .expect("remote contact");
+    contact.metadata.listen_addrs.clear();
+    contact.extra["direct_addrs"] = json!([]);
+    contact.extra["relay_urls"] = json!(["https://relay.wattetheria.com"]);
+    let raw_contact =
+        build_contact_material(&remote_dir, &remote_endpoint).expect("raw remote contact");
+    let mut node = Node::open_in_memory_with_roles(&[Role::Proposer]).expect("node");
+    let mut service = NetworkBridgeService::new(
+        NetworkP2pNode::from_iroh_state_dir(
+            NetworkP2pConfig::default(),
+            local_dir.clone(),
+            local_seed,
+        )
+        .expect("iroh node"),
+        &[SwarmScope::Global],
+        &NetworkProtocolParams::default(),
+    )
+    .expect("service");
+    service.set_state_dir(local_dir.clone(), local_dir.join("ui.state"));
+    assert!(
+        service
+            .upsert_remote_contact_material(peer.to_string(), contact.clone())
+            .expect("insert contact")
+    );
+    service.abandon_peer_reconnect(
+        peer.clone(),
+        PEER_RECONNECT_MAX_ATTEMPTS,
+        "iroh_contact",
+        None,
+    );
+
+    assert!(service.reconnect_abandoned_for_peer(&peer));
+    assert!(
+        !service
+            .upsert_remote_contact_material(peer.to_string(), contact.clone())
+            .expect("repeat contact generation")
+    );
+    assert_eq!(
+        service
+            .run_reconnect_supervision()
+            .expect("equal contact alone does not recover"),
+        0
+    );
+
+    contact.metadata.generated_at = contact.metadata.generated_at.saturating_add(1);
+    assert!(
+        service
+            .upsert_remote_contact_material(peer.to_string(), contact)
+            .expect("updated contact generation")
+    );
+    service.reactivate_discovered_peer_reconnect(peer.clone(), true);
+    assert_eq!(
+        service
+            .run_reconnect_supervision()
+            .expect("fresh discovery recovery probe"),
+        1
+    );
+    assert!(!service.reconnect_abandoned_for_peer(&peer));
+    let request_id = *service
+        .pending_contact_material_requests
+        .keys()
+        .next()
+        .expect("pending recovery probe");
+    let tick = service
+        .process_runtime_event(
+            &mut node,
+            NetworkRuntimeEvent::ContactMaterialResponse {
+                peer: peer.clone(),
+                request_id,
+                response: RawContactMaterialResponse {
+                    source_node_id: peer.to_string(),
+                    target_node_id: service.local_peer_id().to_string(),
+                    applied: true,
+                    contact_material: Some(raw_contact),
+                    detail: None,
+                    updated_at: observed_at_ms(),
+                },
+            },
+        )
+        .expect("successful recovery response");
+    assert!(matches!(
+        tick,
+        NetworkBridgeTick::Connected { peer: connected } if connected == peer
+    ));
+    assert!(!service.reconnect_abandoned_for_peer(&peer));
+
+    wattswarm_network_transport_iroh::shutdown_local_iroh_data_plane(&local_dir);
+    wattswarm_network_transport_iroh::shutdown_local_iroh_data_plane(&remote_dir);
+    std::fs::remove_dir_all(local_dir).expect("cleanup local");
+    std::fs::remove_dir_all(remote_dir).expect("cleanup remote");
+}
+
+#[test]
+fn reconnect_supervision_probes_contact_material_for_disconnected_peer() {
     let local_dir = temp_startup_dir("reconnect-relay-only-local");
     let remote_dir = temp_startup_dir("reconnect-relay-only-remote");
     let local_seed = [109u8; 32];
@@ -2462,7 +3256,7 @@ fn reconnect_supervision_does_not_probe_contact_material_for_disconnected_peer()
     .expect("service");
     service.set_state_dir(local_dir.clone(), local_dir.join("ui.state"));
     service
-        .upsert_remote_contact_material(peer.to_string(), remote_contact)
+        .upsert_remote_contact_material(peer.to_string(), remote_contact.clone())
         .expect("upsert relay-only remote contact");
 
     assert_eq!(service.known_remote_contact_count(), 1);
@@ -2475,16 +3269,42 @@ fn reconnect_supervision_does_not_probe_contact_material_for_disconnected_peer()
     assert_eq!(service.reconnect_attempts_for_peer(&peer), Some(1));
     assert_eq!(
         service.pending_contact_material_request_count_for_peer(&peer),
-        0
+        1
     );
     service.force_reconnect_due_for_peer(&peer);
     let attempts = service
         .run_reconnect_supervision()
-        .expect("disconnected peer can retry reconnect without contact material probe");
-    assert_eq!(attempts, 1);
+        .expect("pending contact material request blocks duplicate reconnect probe");
+    assert_eq!(attempts, 0);
+    assert_eq!(
+        service.pending_contact_material_request_count_for_peer(&peer),
+        1
+    );
+    service.force_pending_contact_material_request_stale_for_peer(&peer);
+    service.force_reconnect_due_for_peer(&peer);
+    let attempts = service
+        .run_reconnect_supervision()
+        .expect("stale pending contact material request does not loop");
+    assert_eq!(attempts, 0);
     assert_eq!(
         service.pending_contact_material_request_count_for_peer(&peer),
         0
+    );
+    remote_contact.metadata.generated_at = remote_contact.metadata.generated_at.saturating_add(1);
+    assert!(
+        service
+            .upsert_remote_contact_material(peer.to_string(), remote_contact)
+            .expect("updated contact generation")
+    );
+    service.reactivate_discovered_peer_reconnect(peer.clone(), true);
+    service.force_reconnect_due_for_peer(&peer);
+    let attempts = service
+        .run_reconnect_supervision()
+        .expect("fresh discovery triggers one new probe");
+    assert_eq!(attempts, 1);
+    assert_eq!(
+        service.pending_contact_material_request_count_for_peer(&peer),
+        1
     );
 
     wattswarm_network_transport_iroh::shutdown_local_iroh_data_plane(&local_dir);

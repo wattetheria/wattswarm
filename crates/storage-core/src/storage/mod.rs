@@ -292,6 +292,7 @@ pub struct LocalNetworkPeerSyncStateRow {
     pub remote_heads_json: String,
     pub backfill_successes: u64,
     pub backfill_failures: u64,
+    pub last_observed_at: Option<u64>,
     pub updated_at: u64,
 }
 

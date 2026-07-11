@@ -76,7 +76,7 @@ fn discovery_bootnode_record_registers_iroh_contact_inside_radius_without_markin
         &local_peer_id,
         DEFAULT_NETWORK_CONTEXT_ID,
         &settings,
-        record,
+        record.clone(),
         observed_at_ms(),
     )
     .expect("apply discovery record");
@@ -109,6 +109,55 @@ fn discovery_bootnode_record_registers_iroh_contact_inside_radius_without_markin
     );
     let remote_peer = NetworkNodeId::new(remote_node_id.clone()).expect("remote peer id");
     assert!(!service.is_global_backfill_provider(&remote_peer));
+    assert_eq!(service.reconnect_attempts_for_peer(&remote_peer), Some(0));
+
+    service.abandon_peer_reconnect(
+        remote_peer.clone(),
+        PEER_RECONNECT_MAX_ATTEMPTS,
+        "iroh_contact",
+        None,
+    );
+    assert!(service.reconnect_abandoned_for_peer(&remote_peer));
+    let repeated = apply_discovery_bootnode_record(
+        &mut service,
+        &mut node,
+        &local_dir,
+        &local_peer_id,
+        DEFAULT_NETWORK_CONTEXT_ID,
+        &settings,
+        record.clone(),
+        observed_at_ms(),
+    )
+    .expect("reapply same discovery record");
+    assert!(!repeated);
+    assert!(service.reconnect_abandoned_for_peer(&remote_peer));
+
+    let mut updated_body = record.body;
+    updated_body.seq = updated_body.seq.saturating_add(1);
+    updated_body.updated_at_ms = updated_body.updated_at_ms.saturating_add(1);
+    updated_body
+        .transport_contact
+        .as_mut()
+        .expect("transport contact")
+        .metadata
+        .generated_at = updated_body.updated_at_ms;
+    let updated_record =
+        SignedDiscoveryNodeRecord::sign(updated_body, &NodeIdentity::from_seed(remote_seed))
+            .expect("sign updated discovery record");
+    let updated = apply_discovery_bootnode_record(
+        &mut service,
+        &mut node,
+        &local_dir,
+        &local_peer_id,
+        DEFAULT_NETWORK_CONTEXT_ID,
+        &settings,
+        updated_record,
+        observed_at_ms(),
+    )
+    .expect("apply updated discovery record");
+    assert!(updated);
+    assert!(!service.reconnect_abandoned_for_peer(&remote_peer));
+    assert_eq!(service.reconnect_attempts_for_peer(&remote_peer), Some(0));
 
     wattswarm_network_transport_iroh::shutdown_local_iroh_data_plane(&local_dir);
     wattswarm_network_transport_iroh::shutdown_local_iroh_data_plane(&remote_dir);
@@ -253,6 +302,8 @@ fn discovery_bootnode_record_accepts_candidate_without_local_geo() {
         crate::control::load_peer_metadata_records_state(&local_dir).expect("peer metadata");
     assert_eq!(metadata[0].node_id, remote_node_id);
     assert_eq!(metadata[0].handshake_status, "discovery_v1");
+    let remote_peer = NetworkNodeId::new(remote_node_id.clone()).expect("remote peer id");
+    assert_eq!(service.reconnect_attempts_for_peer(&remote_peer), Some(0));
 
     wattswarm_network_transport_iroh::shutdown_local_iroh_data_plane(&local_dir);
     wattswarm_network_transport_iroh::shutdown_local_iroh_data_plane(&remote_dir);

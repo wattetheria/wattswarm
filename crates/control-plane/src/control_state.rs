@@ -395,6 +395,8 @@ pub struct NetworkPeerSyncStateRecord {
     pub backfill_successes: u64,
     #[serde(default)]
     pub backfill_failures: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_observed_at: Option<u64>,
     pub updated_at: u64,
 }
 
@@ -1221,6 +1223,7 @@ pub fn load_network_peer_sync_state_records_state(
             remote_heads_json: row.remote_heads_json,
             backfill_successes: row.backfill_successes,
             backfill_failures: row.backfill_failures,
+            last_observed_at: row.last_observed_at,
             updated_at: row.updated_at,
         })
         .collect())
@@ -1240,6 +1243,7 @@ pub fn save_network_peer_sync_state_record_state(
             remote_heads_json: record.remote_heads_json.clone(),
             backfill_successes: record.backfill_successes,
             backfill_failures: record.backfill_failures,
+            last_observed_at: record.last_observed_at,
             updated_at: record.updated_at,
         },
     )
