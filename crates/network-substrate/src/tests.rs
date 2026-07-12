@@ -24,6 +24,7 @@ fn backfill_request_validate_enforces_bounds() {
         scope: SwarmScope::Global,
         from_event_seq: 10,
         limit: 5,
+        head_only: false,
         feed_key: Some("feed".to_owned()),
         known_event_ids: Vec::new(),
     };
@@ -53,6 +54,25 @@ fn backfill_request_validate_enforces_bounds() {
         .validate(10, 20)
         .is_err()
     );
+}
+
+#[test]
+fn backfill_wire_defaults_head_only_for_older_payloads() {
+    let request: RawBackfillRequest = serde_json::from_value(serde_json::json!({
+        "scope": "global",
+        "from_event_seq": 7,
+        "limit": 3
+    }))
+    .expect("legacy request");
+    let response: RawBackfillResponse = serde_json::from_value(serde_json::json!({
+        "scope": "global",
+        "next_from_event_seq": 7,
+        "items": []
+    }))
+    .expect("legacy response");
+
+    assert!(!request.head_only);
+    assert!(!response.head_only);
 }
 
 #[test]
@@ -140,6 +160,7 @@ fn inbound_backfill_peer_uses_transport_remote_identity() {
         scope: SwarmScope::Global,
         from_event_seq: 0,
         limit: 1,
+        head_only: false,
         feed_key: None,
         known_event_ids: Vec::new(),
     };
@@ -157,6 +178,7 @@ fn backfill_response_validate_enforces_bounds() {
     let response = RawBackfillResponse {
         scope: SwarmScope::Global,
         next_from_event_seq: 10,
+        head_only: false,
         feed_key: Some("feed".to_owned()),
         head_event_ids: vec!["evt-1".to_owned()],
         items: vec![b"event".to_vec()],
@@ -202,6 +224,7 @@ fn raw_control_request_and_response_validate_payloads() {
     let invalid_response = RawControlResponse::Backfill(RawBackfillResponse {
         scope: SwarmScope::Global,
         next_from_event_seq: 1,
+        head_only: false,
         feed_key: None,
         head_event_ids: Vec::new(),
         items: vec![b"event".to_vec(); 25],

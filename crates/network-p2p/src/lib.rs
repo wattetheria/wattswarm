@@ -84,6 +84,8 @@ impl EventEnvelope {
 pub struct BackfillResponse {
     pub scope: SwarmScope,
     pub next_from_event_seq: u64,
+    #[serde(default)]
+    pub head_only: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub feed_key: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -546,7 +548,7 @@ impl NetworkRuntime {
         peer: &NetworkNodeId,
         request: BackfillRequest,
         timeout: Duration,
-    ) -> Result<BackfillRequestId> {
+    ) -> Result<Option<BackfillRequestId>> {
         self.inner.send_backfill_request(peer, request, timeout)
     }
 
@@ -569,6 +571,7 @@ impl NetworkRuntime {
             RawBackfillResponse {
                 scope: response.scope,
                 next_from_event_seq: response.next_from_event_seq,
+                head_only: response.head_only,
                 feed_key: response.feed_key,
                 head_event_ids: response.head_event_ids,
                 items,
@@ -812,6 +815,7 @@ fn decode_backfill_response(response: RawBackfillResponse) -> Result<BackfillRes
     Ok(BackfillResponse {
         scope: response.scope,
         next_from_event_seq: response.next_from_event_seq,
+        head_only: response.head_only,
         feed_key: response.feed_key,
         head_event_ids: response.head_event_ids,
         events,
@@ -941,6 +945,7 @@ mod tests {
         let response = decode_backfill_response(RawBackfillResponse {
             scope: SwarmScope::Global,
             next_from_event_seq: 2,
+            head_only: false,
             feed_key: None,
             head_event_ids: Vec::new(),
             items: vec![envelope.encode_json().unwrap()],

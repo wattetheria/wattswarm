@@ -10,7 +10,10 @@ use std::{
     future::Future,
     path::{Path, PathBuf},
     str::FromStr,
-    sync::mpsc::{self, Receiver, Sender},
+    sync::{
+        Arc,
+        mpsc::{self, Receiver, Sender},
+    },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio::runtime::{Runtime, RuntimeFlavor};

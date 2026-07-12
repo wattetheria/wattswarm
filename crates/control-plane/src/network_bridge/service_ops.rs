@@ -165,17 +165,20 @@ impl NetworkBridgeService {
         from_event_seq: u64,
         limit: usize,
     ) -> Result<BackfillRequestId> {
-        self.runtime.send_backfill_request(
-            peer,
-            BackfillRequest {
-                scope: SwarmScope::Global,
-                from_event_seq,
-                limit,
-                feed_key: None,
-                known_event_ids: Vec::new(),
-            },
-            BACKFILL_TIMEOUT_FALLBACK,
-        )
+        self.runtime
+            .send_backfill_request(
+                peer,
+                BackfillRequest {
+                    scope: SwarmScope::Global,
+                    from_event_seq,
+                    limit,
+                    head_only: false,
+                    feed_key: None,
+                    known_event_ids: Vec::new(),
+                },
+                BACKFILL_TIMEOUT_FALLBACK,
+            )?
+            .ok_or_else(|| anyhow!("local backfill capacity exhausted"))
     }
 
     pub fn tick(&mut self, node: &mut Node) -> Result<NetworkBridgeTick> {
@@ -192,13 +195,14 @@ impl NetworkBridgeService {
         self.request_backfill_scopes_for_peer_now(peer, node, &scopes)
     }
 
+    #[cfg(test)]
     pub(crate) fn request_backfill_scopes_for_peer(
         &mut self,
         peer: &NetworkNodeId,
         node: &Node,
         scopes: &[SwarmScope],
     ) -> Result<bool> {
-        self.request_backfill_scopes_for_peer_inner(peer, node, scopes, false)
+        self.request_backfill_scopes_for_peer_inner(peer, node, scopes, false, false)
     }
 
     pub(crate) fn request_backfill_scopes_for_peer_now(
@@ -207,7 +211,16 @@ impl NetworkBridgeService {
         node: &Node,
         scopes: &[SwarmScope],
     ) -> Result<bool> {
-        self.request_backfill_scopes_for_peer_inner(peer, node, scopes, true)
+        self.request_backfill_scopes_for_peer_inner(peer, node, scopes, true, false)
+    }
+
+    fn request_backfill_digests_for_peer(
+        &mut self,
+        peer: &NetworkNodeId,
+        node: &Node,
+        scopes: &[SwarmScope],
+    ) -> Result<bool> {
+        self.request_backfill_scopes_for_peer_inner(peer, node, scopes, false, true)
     }
 
     fn request_backfill_scopes_for_peer_inner(
@@ -216,6 +229,7 @@ impl NetworkBridgeService {
         node: &Node,
         scopes: &[SwarmScope],
         ignore_retry_delay: bool,
+        head_only: bool,
     ) -> Result<bool> {
         let now = Instant::now();
         let inflight = {
@@ -248,7 +262,35 @@ impl NetworkBridgeService {
         let active_subscriptions = node
             .store
             .list_active_feed_subscriptions(&network_id, &local_node_id)?;
+        let mut lanes = Vec::new();
+        for scope in &scopes {
+            let scope_hint = scope_hint_label(scope);
+            let request_scope_history =
+                *scope == SwarmScope::Global || self.subscribed_scope_kinds.contains_key(scope);
+            if request_scope_history {
+                lanes.push(BackfillLaneKey::new(scope, None));
+            }
+            for subscription in active_subscriptions
+                .iter()
+                .filter(|subscription| subscription.scope_hint == scope_hint)
+            {
+                let lane = BackfillLaneKey::new(scope, Some(&subscription.feed_key));
+                if !lanes.contains(&lane) {
+                    lanes.push(lane);
+                }
+            }
+        }
+        if lanes.is_empty() {
+            return Ok(false);
+        }
+        let lane_count = lanes.len();
+        let start = self
+            .peer_sync_state
+            .get(peer)
+            .map_or(0, |state| state.next_backfill_lane_index % lane_count);
+        lanes.rotate_left(start);
         let mut requests_sent = 0usize;
+        let mut lanes_examined = 0usize;
         let selected_route = self
             .state_dir
             .as_ref()
@@ -268,117 +310,111 @@ impl NetworkBridgeService {
                 }),
             );
         }
-        'scopes: for scope in scopes.iter().cloned() {
+        for lane in lanes {
             if requests_sent >= available_slots {
                 break;
             }
-            let scope_hint = scope_hint_label(&scope);
-            let request_scope_history =
-                scope == SwarmScope::Global || self.subscribed_scope_kinds.contains_key(&scope);
-            if request_scope_history
-                && self.peer_backfill_available(peer, now)
-                && self.peer_backfill_lane_available(peer, &scope, None, now)
-            {
-                let from_event_seq = self
-                    .peer_sync_state
-                    .get(peer)
-                    .map_or(0, |state| state.backfill_cursor(&scope, None));
-                let known_event_ids = recent_backfill_lane_event_ids(
-                    node,
-                    &scope,
-                    None,
-                    BACKFILL_KNOWN_EVENT_IDS_LIMIT,
-                )?;
-                let timeout = self.peer_sync_state.get(peer).map_or(
-                    BACKFILL_TIMEOUT_FALLBACK,
-                    PeerSyncState::backfill_request_timeout,
-                );
-                let request_id = self.runtime.send_backfill_request(
+            lanes_examined = lanes_examined.saturating_add(1);
+            if !self.peer_backfill_available(peer, now)
+                || !self.peer_backfill_lane_available(
                     peer,
-                    BackfillRequest {
-                        scope: scope.clone(),
-                        from_event_seq,
-                        limit: BACKFILL_BATCH_EVENTS,
-                        feed_key: None,
-                        known_event_ids,
-                    },
-                    timeout,
-                )?;
-                self.peer_sync_state
-                    .entry(peer.clone())
-                    .or_insert_with(|| PeerSyncState::new_unobserved(now))
-                    .record_pending_backfill_with_timeout(
-                        request_id,
-                        scope.clone(),
-                        None,
-                        now,
-                        timeout,
-                    );
-                requests_sent += 1;
-            }
-            for subscription in active_subscriptions
-                .iter()
-                .filter(|subscription| subscription.scope_hint == scope_hint)
-            {
-                if requests_sent >= available_slots {
-                    break 'scopes;
-                }
-                if !self.peer_backfill_available(peer, now) {
-                    break 'scopes;
-                }
-                if !self.peer_backfill_lane_available(
-                    peer,
-                    &scope,
-                    Some(&subscription.feed_key),
+                    &lane.scope,
+                    lane.feed_key.as_deref(),
                     now,
-                ) {
-                    continue;
-                }
-                let from_event_seq = self.peer_sync_state.get(peer).map_or(0, |state| {
-                    state.backfill_cursor(&scope, Some(&subscription.feed_key))
-                });
-                let known_event_ids = recent_backfill_lane_event_ids(
-                    node,
-                    &scope,
-                    Some(&subscription.feed_key),
-                    BACKFILL_KNOWN_EVENT_IDS_LIMIT,
-                )?;
-                let timeout = self.peer_sync_state.get(peer).map_or(
-                    BACKFILL_TIMEOUT_FALLBACK,
-                    PeerSyncState::backfill_request_timeout,
-                );
-                let request_id = self.runtime.send_backfill_request(
-                    peer,
-                    BackfillRequest {
-                        scope: scope.clone(),
-                        from_event_seq,
-                        limit: BACKFILL_BATCH_EVENTS,
-                        feed_key: Some(subscription.feed_key.clone()),
-                        known_event_ids,
-                    },
-                    timeout,
-                )?;
-                self.peer_sync_state
-                    .entry(peer.clone())
-                    .or_insert_with(|| PeerSyncState::new_unobserved(now))
-                    .record_pending_backfill_with_timeout(
-                        request_id,
-                        scope.clone(),
-                        Some(subscription.feed_key.clone()),
-                        now,
-                        timeout,
-                    );
-                requests_sent += 1;
+                )
+            {
+                continue;
             }
+            if !self.dispatch_backfill_lane(peer, node, &lane, head_only, now)? {
+                break;
+            }
+            requests_sent += 1;
         }
-        if requests_sent > 0 {
-            if let Some(state) = self.peer_sync_state.get_mut(peer) {
+        if let Some(state) = self.peer_sync_state.get_mut(peer) {
+            state.next_backfill_lane_index = (start + lanes_examined.max(1)) % lane_count;
+            if requests_sent > 0 {
                 state.last_backfill_request_at = Some(now);
                 state.next_retry_at = now + self.backfill_retry_after;
             }
+        }
+        if requests_sent > 0 {
             self.persist_peer_sync_state_for_peer(peer);
         }
         Ok(requests_sent > 0)
+    }
+
+    fn dispatch_backfill_lane(
+        &mut self,
+        peer: &NetworkNodeId,
+        node: &Node,
+        lane: &BackfillLaneKey,
+        head_only: bool,
+        now: Instant,
+    ) -> Result<bool> {
+        if !self.peer_backfill_available(peer, now)
+            || !self.peer_backfill_lane_available(peer, &lane.scope, lane.feed_key.as_deref(), now)
+        {
+            return Ok(false);
+        }
+        let from_event_seq = self.peer_sync_state.get(peer).map_or(0, |state| {
+            state.backfill_cursor(&lane.scope, lane.feed_key.as_deref())
+        });
+        let known_event_ids = if head_only {
+            Vec::new()
+        } else {
+            recent_backfill_lane_event_ids(
+                node,
+                &lane.scope,
+                lane.feed_key.as_deref(),
+                BACKFILL_KNOWN_EVENT_IDS_LIMIT,
+            )?
+        };
+        let timeout = self.peer_sync_state.get(peer).map_or(
+            BACKFILL_TIMEOUT_FALLBACK,
+            PeerSyncState::backfill_request_timeout,
+        );
+        let Some(request_id) = self.runtime.send_backfill_request(
+            peer,
+            BackfillRequest {
+                scope: lane.scope.clone(),
+                from_event_seq,
+                limit: BACKFILL_BATCH_EVENTS,
+                head_only,
+                feed_key: lane.feed_key.clone(),
+                known_event_ids,
+            },
+            timeout,
+        )?
+        else {
+            return Ok(false);
+        };
+        self.peer_sync_state
+            .entry(peer.clone())
+            .or_insert_with(|| PeerSyncState::new_unobserved(now))
+            .record_pending_backfill_with_timeout(
+                request_id,
+                lane.scope.clone(),
+                lane.feed_key.clone(),
+                now,
+                timeout,
+            );
+        Ok(true)
+    }
+
+    pub(crate) fn request_backfill_lane_for_peer_now(
+        &mut self,
+        peer: &NetworkNodeId,
+        node: &Node,
+        scope: &SwarmScope,
+        feed_key: Option<&str>,
+    ) -> Result<bool> {
+        self.dispatch_backfill_lane(
+            peer,
+            node,
+            &BackfillLaneKey::new(scope, feed_key),
+            false,
+            Instant::now(),
+        )
     }
 
     pub fn run_anti_entropy(&mut self, node: &Node) -> Result<usize> {
@@ -393,8 +429,22 @@ impl NetworkBridgeService {
             };
             requests_by_peer.entry(peer).or_default().push(scope);
         }
+        let mut requests_by_peer = requests_by_peer.into_iter().collect::<Vec<_>>();
+        requests_by_peer.sort_by(|(left, _), (right, _)| {
+            let left_last = self
+                .peer_sync_state
+                .get(left)
+                .and_then(|state| state.last_backfill_request_at);
+            let right_last = self
+                .peer_sync_state
+                .get(right)
+                .and_then(|state| state.last_backfill_request_at);
+            left_last
+                .cmp(&right_last)
+                .then_with(|| left.as_str().cmp(right.as_str()))
+        });
         for (peer, scopes) in requests_by_peer {
-            if self.request_backfill_scopes_for_peer(&peer, node, &scopes)? {
+            if self.request_backfill_digests_for_peer(&peer, node, &scopes)? {
                 requested += 1;
             }
         }
@@ -457,9 +507,10 @@ impl NetworkBridgeService {
         feed_key: Option<&str>,
         now: Instant,
     ) -> bool {
-        self.peer_sync_state
-            .get(peer)
-            .is_none_or(|state| state.backfill_lane_available_at(scope, feed_key, now))
+        self.peer_sync_state.get(peer).is_none_or(|state| {
+            !state.has_inflight_backfill_lane(scope, feed_key)
+                && state.backfill_lane_available_at(scope, feed_key, now)
+        })
     }
 
     pub(crate) fn best_peer_for_scope<I>(
@@ -1101,9 +1152,24 @@ impl NetworkBridgeService {
                 .is_some();
             if was_pending {
                 state.record_peer_backfill_timeout_at(now);
-                state.next_retry_at = now + self.backfill_retry_after;
+                state.next_retry_at =
+                    now + backfill_retry_delay_with_jitter(self.backfill_retry_after);
                 state.backfill_failures = state.backfill_failures.saturating_add(1);
             }
+        }
+        self.persist_peer_sync_state_for_peer(&peer);
+    }
+
+    pub(crate) fn defer_backfill_request(
+        &mut self,
+        peer: NetworkNodeId,
+        request_id: BackfillRequestId,
+    ) {
+        let now = Instant::now();
+        if let Some(state) = self.peer_sync_state.get_mut(&peer)
+            && state.record_backfill_request_deferred(request_id)
+        {
+            state.next_retry_at = now + backfill_retry_delay_with_jitter(self.backfill_retry_after);
         }
         self.persist_peer_sync_state_for_peer(&peer);
     }
@@ -1135,7 +1201,8 @@ impl NetworkBridgeService {
                 peer_cooldowns
                     .entry(peer.clone())
                     .or_insert_with(|| state.record_peer_backfill_timeout_at(now));
-                state.next_retry_at = now + self.backfill_retry_after;
+                state.next_retry_at =
+                    now + backfill_retry_delay_with_jitter(self.backfill_retry_after);
                 state.backfill_failures = state.backfill_failures.saturating_add(1);
                 cooldown_event = Some(event);
             }

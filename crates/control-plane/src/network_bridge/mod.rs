@@ -237,7 +237,9 @@ const REPUTATION_SUMMARY_KIND: &str = "reputation_runtime_profile_v1";
 const TASK_OUTCOME_SUMMARY_KIND: &str = "task_outcome_v1";
 const AGENT_PAYMENT_SUMMARY_KIND: &str = "agent_payment_session_v1";
 const CORE_AGENT_EXECUTOR_NAME: &str = "core-agent";
-const MAX_INFLIGHT_BACKFILLS_PER_PEER: usize = 8;
+const MAX_INFLIGHT_BACKFILLS_PER_PEER: usize = 2;
+const BACKFILL_RETRY_JITTER_MAX: Duration = Duration::from_secs(5);
+const CONTROL_BUSY_ERROR_PREFIX: &str = "control_busy";
 // Adaptive per-peer backfill request timeout, using the same broad shape as
 // DM attempt timeout but with batch-backfill-specific bounds. The timeout
 // is computed once per request and passed to the underlying control request so
@@ -591,6 +593,7 @@ struct PeerSyncState {
     // EWMA of observed successful backfill round-trip latency (ms). Runtime-only;
     // `None` until the first sample, which falls back to the conservative timeout.
     smoothed_backfill_latency_ms: Option<u64>,
+    next_backfill_lane_index: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -690,6 +693,17 @@ fn backfill_attempt_timeout(smoothed_latency_ms: Option<u64>) -> Duration {
     }
 }
 
+fn backfill_retry_delay_with_jitter(base: Duration) -> Duration {
+    let max_jitter_ms =
+        u64::try_from((base / 4).min(BACKFILL_RETRY_JITTER_MAX).as_millis()).unwrap_or(u64::MAX);
+    let jitter_ms = if max_jitter_ms == 0 {
+        0
+    } else {
+        rand::random::<u64>() % (max_jitter_ms + 1)
+    };
+    base + Duration::from_millis(jitter_ms)
+}
+
 #[derive(Debug, Clone)]
 struct PeerReconnectState {
     attempts: u32,
@@ -741,6 +755,7 @@ impl PeerSyncState {
             backfill_successes: 0,
             backfill_failures: 0,
             smoothed_backfill_latency_ms: None,
+            next_backfill_lane_index: 0,
         }
     }
 
@@ -778,6 +793,13 @@ impl PeerSyncState {
 
     fn inflight_backfills(&self) -> usize {
         self.inflight_backfill_requests.len()
+    }
+
+    fn has_inflight_backfill_lane(&self, scope: &SwarmScope, feed_key: Option<&str>) -> bool {
+        let lane = BackfillLaneKey::new(scope, feed_key);
+        self.inflight_backfill_requests
+            .values()
+            .any(|pending| pending.lane_key() == lane)
     }
 
     #[cfg(test)]
@@ -886,6 +908,17 @@ impl PeerSyncState {
                     BACKFILL_LANE_COOLDOWN_MAX,
                 ),
         )
+    }
+
+    fn record_backfill_request_deferred(&mut self, request_id: BackfillRequestId) -> bool {
+        let removed = self
+            .inflight_backfill_requests
+            .remove(&request_id)
+            .is_some();
+        if removed {
+            self.clear_backfill_recovery_probes();
+        }
+        removed
     }
 
     fn record_peer_backfill_timeout_at(&mut self, now: Instant) -> BackfillCooldownEvent {

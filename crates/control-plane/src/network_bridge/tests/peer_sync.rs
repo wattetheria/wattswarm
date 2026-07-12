@@ -963,6 +963,7 @@ fn inbound_backfill_authorization_keeps_global_open_and_requires_scoped_activity
         scope: SwarmScope::Global,
         from_event_seq: 0,
         limit: 8,
+        head_only: false,
         feed_key: None,
         known_event_ids: Vec::new(),
     };
@@ -970,6 +971,7 @@ fn inbound_backfill_authorization_keeps_global_open_and_requires_scoped_activity
         scope: served_scope.clone(),
         from_event_seq: 0,
         limit: 8,
+        head_only: false,
         feed_key: None,
         known_event_ids: Vec::new(),
     };
@@ -977,6 +979,7 @@ fn inbound_backfill_authorization_keeps_global_open_and_requires_scoped_activity
         scope: unserved_scope.clone(),
         from_event_seq: 0,
         limit: 8,
+        head_only: false,
         feed_key: None,
         known_event_ids: Vec::new(),
     };
@@ -1133,6 +1136,7 @@ fn backfill_response_progress_persists_peer_sync_state_once() {
                 response: BackfillResponse {
                     scope: scope.clone(),
                     next_from_event_seq: 42,
+                    head_only: false,
                     feed_key: Some(feed_key.to_owned()),
                     head_event_ids: Vec::new(),
                     events: Vec::new(),
@@ -1177,6 +1181,104 @@ fn backfill_response_progress_persists_peer_sync_state_once() {
     assert_eq!(reloaded_state.backfill_cursor(&scope, Some(feed_key)), 42);
 
     let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn head_only_response_without_gap_does_not_schedule_event_page() {
+    let peer = random_network_node_id();
+    let scope = SwarmScope::Global;
+    let request_id = BackfillRequestId::new(78);
+    let mut node = Node::open_in_memory_with_roles(&[Role::Proposer]).expect("node");
+    let local_event = node
+        .emit_at(
+            1,
+            crate::types::EventPayload::CheckpointCreated(crate::types::CheckpointCreatedPayload {
+                checkpoint_id: "cp-local-head".to_owned(),
+                up_to_seq: 0,
+            }),
+            100,
+        )
+        .expect("local event");
+    let mut service = NetworkBridgeService::new(
+        test_network_node(NetworkP2pConfig::default()).expect("network node"),
+        std::slice::from_ref(&scope),
+        &NetworkProtocolParams::default(),
+    )
+    .expect("service");
+    let mut state = PeerSyncState::new(Instant::now());
+    state.record_backfill_cursor(&scope, None, 1);
+    state.record_pending_backfill(request_id, scope.clone(), None, Instant::now());
+    service.peer_sync_state.insert(peer.clone(), state);
+
+    let tick = service
+        .process_runtime_event(
+            &mut node,
+            NetworkRuntimeEvent::BackfillResponse {
+                peer: peer.clone(),
+                request_id,
+                response: BackfillResponse {
+                    scope: scope.clone(),
+                    next_from_event_seq: 1,
+                    head_only: true,
+                    feed_key: None,
+                    head_event_ids: vec![local_event.event_id],
+                    events: Vec::new(),
+                },
+            },
+        )
+        .expect("head response");
+
+    assert!(matches!(
+        tick,
+        NetworkBridgeTick::TransportNotice { detail }
+            if detail.contains("gap=false") && detail.contains("full_request_sent=false")
+    ));
+    assert_eq!(service.peer_sync_state[&peer].inflight_backfills(), 0);
+}
+
+#[test]
+fn head_only_response_with_unknown_head_schedules_one_event_page() {
+    let peer = random_network_node_id();
+    let scope = SwarmScope::Global;
+    let request_id = BackfillRequestId::new(79);
+    let mut node = Node::open_in_memory_with_roles(&[Role::Proposer]).expect("node");
+    let mut service = NetworkBridgeService::new(
+        test_network_node(NetworkP2pConfig::default()).expect("network node"),
+        std::slice::from_ref(&scope),
+        &NetworkProtocolParams::default(),
+    )
+    .expect("service");
+    let mut state = PeerSyncState::new(Instant::now());
+    state.record_backfill_cursor(&scope, None, 42);
+    state.record_pending_backfill(request_id, scope.clone(), None, Instant::now());
+    service.peer_sync_state.insert(peer.clone(), state);
+
+    let tick = service
+        .process_runtime_event(
+            &mut node,
+            NetworkRuntimeEvent::BackfillResponse {
+                peer: peer.clone(),
+                request_id,
+                response: BackfillResponse {
+                    scope: scope.clone(),
+                    next_from_event_seq: 42,
+                    head_only: true,
+                    feed_key: None,
+                    head_event_ids: vec!["missing-event".to_owned()],
+                    events: Vec::new(),
+                },
+            },
+        )
+        .expect("head response");
+
+    assert!(matches!(
+        tick,
+        NetworkBridgeTick::TransportNotice { detail }
+            if detail.contains("gap=true") && detail.contains("full_request_sent=true")
+    ));
+    let state = &service.peer_sync_state[&peer];
+    assert_eq!(state.inflight_backfills(), 1);
+    assert_eq!(state.backfill_cursor(&scope, None), 0);
 }
 
 #[test]
@@ -1537,6 +1639,71 @@ fn backfill_attempt_timeout_scales_and_clamps_for_batch_requests() {
 }
 
 #[test]
+fn backfill_retry_jitter_is_bounded() {
+    let base = Duration::from_secs(20);
+    for _ in 0..32 {
+        let delay = backfill_retry_delay_with_jitter(base);
+        assert!(delay >= base);
+        assert!(delay <= base + BACKFILL_RETRY_JITTER_MAX);
+    }
+}
+
+#[test]
+fn peer_sync_allows_only_one_inflight_request_per_lane() {
+    let now = Instant::now();
+    let scope = SwarmScope::Group("crew-lane".to_owned());
+    let mut state = PeerSyncState::new(now);
+    state.record_pending_backfill(
+        BackfillRequestId::new(650),
+        scope.clone(),
+        Some("crew.chat".to_owned()),
+        now,
+    );
+
+    assert!(state.has_inflight_backfill_lane(&scope, Some("crew.chat")));
+    assert!(!state.has_inflight_backfill_lane(&scope, Some("crew.tasks")));
+}
+
+#[test]
+fn remote_busy_defers_without_marking_peer_failed() {
+    let peer = random_network_node_id();
+    let request_id = BackfillRequestId::new(651);
+    let now = Instant::now();
+    let mut node = Node::open_in_memory_with_roles(&[Role::Proposer]).expect("node");
+    let mut service = NetworkBridgeService::new(
+        test_network_node(NetworkP2pConfig::default()).expect("network node"),
+        &[SwarmScope::Global],
+        &NetworkProtocolParams::default(),
+    )
+    .expect("service");
+    let mut state = PeerSyncState::new(now);
+    state.record_pending_backfill(request_id, SwarmScope::Global, None, now);
+    service.peer_sync_state.insert(peer.clone(), state);
+
+    let tick = service
+        .process_runtime_event(
+            &mut node,
+            NetworkRuntimeEvent::BackfillOutboundFailure {
+                peer: peer.clone(),
+                request_id,
+                error: "control_busy retry_after_ms=1000".to_owned(),
+            },
+        )
+        .expect("busy response");
+
+    assert!(matches!(
+        tick,
+        NetworkBridgeTick::TransportNotice { detail }
+            if detail.contains("backfill_deferred_remote_busy")
+    ));
+    let state = &service.peer_sync_state[&peer];
+    assert_eq!(state.inflight_backfills(), 0);
+    assert_eq!(state.backfill_failures, 0);
+    assert_eq!(state.backfill_peer_health.cooldown, Duration::ZERO);
+    assert!(state.next_retry_at >= now + service.backfill_retry_after);
+}
+
+#[test]
 fn backfill_latency_ewma_smooths_round_trip_samples() {
     let mut state = PeerSyncState::new(Instant::now());
     assert_eq!(state.smoothed_backfill_latency_ms, None);
@@ -1669,6 +1836,67 @@ fn backfill_requests_respect_remaining_peer_slots() {
             .inflight_backfills(),
         MAX_INFLIGHT_BACKFILLS_PER_PEER
     );
+}
+
+#[test]
+fn bounded_backfill_scheduler_rotates_across_lanes() {
+    let peer = random_network_node_id();
+    let node = Node::open_in_memory_with_roles(&[Role::Proposer]).expect("node");
+    let scopes = vec![
+        SwarmScope::Group("crew-a".to_owned()),
+        SwarmScope::Group("crew-b".to_owned()),
+        SwarmScope::Group("crew-c".to_owned()),
+    ];
+    let mut service = NetworkBridgeService::new(
+        test_network_node(NetworkP2pConfig::default()).expect("network node"),
+        &scopes,
+        &NetworkProtocolParams::default(),
+    )
+    .expect("service");
+
+    assert!(
+        service
+            .request_backfill_scopes_for_peer_now(&peer, &node, &scopes)
+            .expect("first scheduling pass")
+    );
+    let first_lanes = service.peer_sync_state[&peer]
+        .inflight_backfill_requests
+        .values()
+        .map(PendingBackfillRequest::lane_key)
+        .collect::<HashSet<_>>();
+    assert_eq!(first_lanes.len(), MAX_INFLIGHT_BACKFILLS_PER_PEER);
+    let completed = service.peer_sync_state[&peer]
+        .inflight_backfill_requests
+        .keys()
+        .copied()
+        .collect::<Vec<_>>();
+    for request_id in completed {
+        assert!(
+            service
+                .peer_sync_state
+                .get_mut(&peer)
+                .expect("peer state")
+                .record_backfill_request_completed(request_id, Instant::now())
+        );
+    }
+    service
+        .peer_sync_state
+        .get_mut(&peer)
+        .expect("peer state")
+        .next_retry_at = Instant::now();
+
+    assert!(
+        service
+            .request_backfill_scopes_for_peer_now(&peer, &node, &scopes)
+            .expect("second scheduling pass")
+    );
+    let all_lanes = service.peer_sync_state[&peer]
+        .inflight_backfill_requests
+        .values()
+        .map(PendingBackfillRequest::lane_key)
+        .chain(first_lanes)
+        .collect::<HashSet<_>>();
+    assert_eq!(all_lanes.len(), scopes.len());
 }
 
 #[test]

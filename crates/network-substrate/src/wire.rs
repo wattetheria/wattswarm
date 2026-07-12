@@ -6,6 +6,8 @@ pub struct RawBackfillRequest {
     pub scope: SwarmScope,
     pub from_event_seq: u64,
     pub limit: usize,
+    #[serde(default)]
+    pub head_only: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub feed_key: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -64,6 +66,8 @@ impl InboundControlPeer for RawBackfillRequest {
 pub struct RawBackfillResponse {
     pub scope: SwarmScope,
     pub next_from_event_seq: u64,
+    #[serde(default)]
+    pub head_only: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub feed_key: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]

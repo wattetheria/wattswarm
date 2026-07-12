@@ -160,6 +160,7 @@ fn backfill_response_for_request_wraps_public_control_events() {
             scope: SwarmScope::Global,
             from_event_seq: 0,
             limit: 8,
+            head_only: false,
             feed_key: None,
             known_event_ids: Vec::new(),
         },
@@ -201,6 +202,7 @@ fn backfill_response_metrics_record_page_and_filter_work() {
             scope: SwarmScope::Global,
             from_event_seq: 0,
             limit: 8,
+            head_only: false,
             feed_key: None,
             known_event_ids: Vec::new(),
         },
@@ -216,6 +218,49 @@ fn backfill_response_metrics_record_page_and_filter_work() {
     assert_eq!(metrics.known_event_skips, 0);
     assert_eq!(metrics.sync_filter_skips, 0);
     assert_eq!(metrics.lane_filter_skips, 0);
+}
+
+#[test]
+fn head_only_backfill_returns_digest_without_reading_event_pages() {
+    let local = NodeIdentity::random();
+    let remote = NodeIdentity::random();
+    let membership = membership_with_roles(&[local.node_id(), remote.node_id()]);
+    let mut node =
+        Node::new(local, PgStore::open_in_memory().expect("store"), membership).expect("node");
+    let event = node
+        .emit_at(
+            1,
+            crate::types::EventPayload::CheckpointCreated(crate::types::CheckpointCreatedPayload {
+                checkpoint_id: "cp-backfill-head".to_owned(),
+                up_to_seq: 0,
+            }),
+            100,
+        )
+        .expect("emit checkpoint");
+
+    let (response, metrics) = backfill_response_for_request_with_metrics(
+        &node,
+        "peer-local",
+        &BackfillRequest {
+            scope: SwarmScope::Global,
+            from_event_seq: 0,
+            limit: 8,
+            head_only: true,
+            feed_key: None,
+            known_event_ids: Vec::new(),
+        },
+        32,
+        64,
+    )
+    .expect("head-only response");
+
+    assert!(response.head_only);
+    assert!(response.events.is_empty());
+    assert_eq!(response.head_event_ids, vec![event.event_id]);
+    assert_eq!(response.next_from_event_seq, 1);
+    assert_eq!(metrics.pages_read, 0);
+    assert_eq!(metrics.rows_read, 0);
+    assert_eq!(metrics.events_returned, 0);
 }
 
 #[test]
@@ -254,6 +299,7 @@ fn backfill_response_repairs_missed_global_control_event() {
             scope: SwarmScope::Global,
             from_event_seq: 0,
             limit: 8,
+            head_only: false,
             feed_key: None,
             known_event_ids: Vec::new(),
         },
@@ -307,6 +353,7 @@ fn backfill_response_scopes_feed_subscription_updates_to_target_scope() {
             scope: SwarmScope::Global,
             from_event_seq: 0,
             limit: 8,
+            head_only: false,
             feed_key: None,
             known_event_ids: Vec::new(),
         },
@@ -324,6 +371,7 @@ fn backfill_response_scopes_feed_subscription_updates_to_target_scope() {
             scope: target_scope.clone(),
             from_event_seq: 0,
             limit: 8,
+            head_only: false,
             feed_key: None,
             known_event_ids: Vec::new(),
         },
@@ -346,6 +394,7 @@ fn ingest_backfill_response_rejects_scope_mismatch() {
     let response = crate::network_p2p::BackfillResponse {
         scope: SwarmScope::Global,
         next_from_event_seq: 1,
+        head_only: false,
         feed_key: None,
         head_event_ids: Vec::new(),
         events: vec![EventEnvelope {
@@ -376,6 +425,7 @@ fn ingest_backfill_response_skips_feed_subscription_wrong_lane() {
     let response = crate::network_p2p::BackfillResponse {
         scope: SwarmScope::Global,
         next_from_event_seq: 1,
+        head_only: false,
         feed_key: None,
         head_event_ids: Vec::new(),
         events: vec![EventEnvelope {
@@ -465,6 +515,7 @@ fn backfill_skipped_feed_subscription_wrong_lane_does_not_write_event_diagnostic
                 response: crate::network_p2p::BackfillResponse {
                     scope: SwarmScope::Global,
                     next_from_event_seq: 1,
+                    head_only: false,
                     feed_key: None,
                     head_event_ids: Vec::new(),
                     events: vec![EventEnvelope {
@@ -527,6 +578,7 @@ fn topic_backfill_response_filters_by_feed_key() {
             scope: SwarmScope::Group("crew-7".to_owned()),
             from_event_seq: 0,
             limit: 8,
+            head_only: false,
             feed_key: Some("crew.chat".to_owned()),
             known_event_ids: Vec::new(),
         },
@@ -590,6 +642,7 @@ fn topic_backfill_response_advances_local_cursor() {
     let response = crate::network_p2p::BackfillResponse {
         scope: SwarmScope::Group("crew-7".to_owned()),
         next_from_event_seq: 7,
+        head_only: false,
         feed_key: Some("crew.chat".to_owned()),
         head_event_ids: Vec::new(),
         events: vec![EventEnvelope {
@@ -674,6 +727,7 @@ fn backfill_response_scope_indexed_isolates_and_advances_cursor() {
             scope: alpha.clone(),
             from_event_seq: 0,
             limit: 2,
+            head_only: false,
             feed_key: None,
             known_event_ids: Vec::new(),
         },
@@ -697,6 +751,7 @@ fn backfill_response_scope_indexed_isolates_and_advances_cursor() {
             scope: alpha.clone(),
             from_event_seq: first.next_from_event_seq,
             limit: 2,
+            head_only: false,
             feed_key: None,
             known_event_ids: Vec::new(),
         },
@@ -719,6 +774,7 @@ fn backfill_response_scope_indexed_isolates_and_advances_cursor() {
             scope: alpha,
             from_event_seq: 0,
             limit: 8,
+            head_only: false,
             feed_key: None,
             known_event_ids: vec![a1, a2],
         },

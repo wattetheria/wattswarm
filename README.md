@@ -294,9 +294,17 @@ scope's own size rather than the global event count.
 - The column is derived from the event's signed `swarm_scope` and is filled by
   an idempotent schema migration that backfills existing rows on first upgrade;
   new events populate it on insert.
-- Behavior is unchanged: live gossip ingest, revocation replay, and the
-  completeness safeguards (sequence-cursor paging, head-id divergence detection,
-  and signature/scope validation on ingest) all stay as-is.
+- Existing correctness behavior remains: live gossip ingest, revocation replay,
+  sequence-cursor paging, head-id divergence detection, and signature/scope
+  validation on ingest.
+- Periodic anti-entropy starts with a head-only lane digest. A node requests an
+  event page only when the remote lane cursor is ahead or a remote head event is
+  absent locally; explicit recovery requests still start paging immediately.
+- Backfill work is bounded to 16 outbound requests per node, two per peer, and
+  one per scope/feed lane. Inbound providers admit at most 16 backfills at once
+  and return a retryable busy response beyond that limit. Busy and timeout
+  retries use backoff with bounded jitter, while interactive control requests
+  keep a separate capacity pool.
 
 ## CLI Overview
 

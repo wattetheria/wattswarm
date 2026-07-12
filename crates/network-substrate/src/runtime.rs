@@ -1,4 +1,53 @@
 use super::*;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use tokio::sync::Semaphore;
+
+const MAX_CONCURRENT_BACKFILL_REQUESTS: usize = 16;
+const MAX_CONCURRENT_INTERACTIVE_CONTROL_REQUESTS: usize = 4;
+const MAX_CONCURRENT_INBOUND_BACKFILLS: usize = 16;
+const CONTROL_BUSY_ERROR_PREFIX: &str = "control_busy";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ControlRequestClass {
+    Backfill,
+    Interactive,
+}
+
+#[derive(Debug)]
+struct InboundRequestAdmission {
+    active: AtomicUsize,
+    max_active: usize,
+}
+
+impl InboundRequestAdmission {
+    fn new(max_active: usize) -> Self {
+        Self {
+            active: AtomicUsize::new(0),
+            max_active,
+        }
+    }
+
+    fn try_acquire(self: &Arc<Self>) -> Option<InboundRequestPermit> {
+        self.active
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
+                (active < self.max_active).then_some(active + 1)
+            })
+            .ok()?;
+        Some(InboundRequestPermit {
+            admission: self.clone(),
+        })
+    }
+}
+
+struct InboundRequestPermit {
+    admission: Arc<InboundRequestAdmission>,
+}
+
+impl Drop for InboundRequestPermit {
+    fn drop(&mut self) {
+        self.admission.active.fetch_sub(1, Ordering::AcqRel);
+    }
+}
 
 #[derive(Debug)]
 #[allow(clippy::large_enum_variant)]
@@ -154,6 +203,8 @@ pub struct SubstrateRuntime {
     gossip_rx: Receiver<IrohGossipInbound>,
     control_tx: Sender<SubstrateRuntimeEvent>,
     control_rx: Receiver<SubstrateRuntimeEvent>,
+    backfill_request_slots: Arc<Semaphore>,
+    interactive_control_request_slots: Arc<Semaphore>,
     pending_events: VecDeque<SubstrateRuntimeEvent>,
     remote_contacts: HashMap<String, TransportContactMaterial>,
     /// Per-peer count of gossip topic memberships. iroh-gossip multiplexes all
@@ -198,6 +249,10 @@ impl SubstrateRuntime {
             gossip_rx,
             control_tx,
             control_rx,
+            backfill_request_slots: Arc::new(Semaphore::new(MAX_CONCURRENT_BACKFILL_REQUESTS)),
+            interactive_control_request_slots: Arc::new(Semaphore::new(
+                MAX_CONCURRENT_INTERACTIVE_CONTROL_REQUESTS,
+            )),
             pending_events: VecDeque::new(),
             remote_contacts: HashMap::new(),
             established_per_peer: HashMap::new(),
@@ -506,7 +561,7 @@ impl SubstrateRuntime {
         peer: &NetworkNodeId,
         request: RawBackfillRequest,
         timeout: Duration,
-    ) -> Result<BackfillRequestId> {
+    ) -> Result<Option<BackfillRequestId>> {
         let request_id = BackfillRequestId::new(self.reserve_request_number());
         let (kind, payload) = match encode_raw_control_request(RawControlRequest::Backfill(request))
             .and_then(|(kind, payload)| {
@@ -524,7 +579,7 @@ impl SubstrateRuntime {
                         request_id,
                         error: err.to_string(),
                     });
-                return Ok(request_id);
+                return Ok(Some(request_id));
             }
         };
         let Some(remote_contact) = self.remote_contacts.get(peer.as_str()).cloned() else {
@@ -534,16 +589,16 @@ impl SubstrateRuntime {
                     request_id,
                     error: format!("missing iroh contact material for {peer}"),
                 });
-            return Ok(request_id);
+            return Ok(Some(request_id));
         };
         self.counters.stream_request_attempts =
             self.counters.stream_request_attempts.saturating_add(1);
-        self.spawn_control_request(
+        let dispatched = self.spawn_control_request(
             peer,
-            kind,
-            payload,
+            IrohControlStreamRequest { kind, payload },
             remote_contact,
             timeout,
+            ControlRequestClass::Backfill,
             move |peer, response| match response {
                 Ok(RawControlResponse::Backfill(response)) => {
                     SubstrateRuntimeEvent::BackfillResponse {
@@ -564,7 +619,12 @@ impl SubstrateRuntime {
                 },
             },
         );
-        Ok(request_id)
+        if dispatched {
+            Ok(Some(request_id))
+        } else {
+            self.counters.request_limit_drops = self.counters.request_limit_drops.saturating_add(1);
+            Ok(None)
+        }
     }
 
     pub fn send_backfill_response(
@@ -608,12 +668,12 @@ impl SubstrateRuntime {
         };
         self.counters.stream_request_attempts =
             self.counters.stream_request_attempts.saturating_add(1);
-        self.spawn_control_request(
+        let dispatched = self.spawn_control_request(
             peer,
-            kind,
-            payload,
+            IrohControlStreamRequest { kind, payload },
             remote_contact,
             Duration::from_millis(self.config.control_request_timeout_ms),
+            ControlRequestClass::Interactive,
             move |peer, response| match response {
                 Ok(RawControlResponse::ContactMaterial(response)) => {
                     SubstrateRuntimeEvent::ContactMaterialResponse {
@@ -634,6 +694,14 @@ impl SubstrateRuntime {
                 },
             },
         );
+        if !dispatched {
+            self.pending_events
+                .push_back(SubstrateRuntimeEvent::ContactMaterialOutboundFailure {
+                    peer: peer.clone(),
+                    request_id,
+                    error: "local interactive control capacity exhausted".to_owned(),
+                });
+        }
         Ok(request_id)
     }
 
@@ -678,12 +746,12 @@ impl SubstrateRuntime {
         };
         self.counters.stream_request_attempts =
             self.counters.stream_request_attempts.saturating_add(1);
-        self.spawn_control_request(
+        let dispatched = self.spawn_control_request(
             peer,
-            kind,
-            payload,
+            IrohControlStreamRequest { kind, payload },
             remote_contact,
             Duration::from_millis(self.config.control_request_timeout_ms),
+            ControlRequestClass::Interactive,
             move |peer, response| match response {
                 Ok(RawControlResponse::PeerRelationship(response)) => {
                     SubstrateRuntimeEvent::PeerRelationshipResponse {
@@ -704,6 +772,14 @@ impl SubstrateRuntime {
                 },
             },
         );
+        if !dispatched {
+            self.pending_events
+                .push_back(SubstrateRuntimeEvent::PeerRelationshipOutboundFailure {
+                    peer: peer.clone(),
+                    request_id,
+                    error: "local interactive control capacity exhausted".to_owned(),
+                });
+        }
         Ok(request_id)
     }
 
@@ -720,35 +796,46 @@ impl SubstrateRuntime {
     fn spawn_control_request(
         &self,
         peer: &NetworkNodeId,
-        kind: String,
-        payload: Vec<u8>,
+        request: IrohControlStreamRequest,
         remote_contact: TransportContactMaterial,
         timeout: Duration,
+        class: ControlRequestClass,
         build_event: impl FnOnce(
             NetworkNodeId,
             std::result::Result<RawControlResponse, anyhow::Error>,
         ) -> SubstrateRuntimeEvent
         + Send
         + 'static,
-    ) {
+    ) -> bool {
+        let slots = match class {
+            ControlRequestClass::Backfill => self.backfill_request_slots.clone(),
+            ControlRequestClass::Interactive => self.interactive_control_request_slots.clone(),
+        };
+        let Ok(permit) = slots.try_acquire_owned() else {
+            return false;
+        };
         let state_dir = self.state_dir.clone();
         let local_peer_id = self.local_peer_id.clone();
         let peer = peer.clone();
         let control_tx = self.control_tx.clone();
-        std::thread::spawn(move || {
-            let response = send_control_stream_request_for_network_peer_id_with_timeout(
-                &state_dir,
-                local_peer_id.as_str(),
-                &remote_contact,
-                &IrohControlStreamRequest {
-                    kind: kind.clone(),
-                    payload,
-                },
-                timeout,
-            )
-            .and_then(|response| decode_raw_control_response(&kind, response));
+        self.runtime().spawn(async move {
+            let response = tokio::task::spawn_blocking(move || {
+                let _permit = permit;
+                let kind = request.kind.clone();
+                send_control_stream_request_for_network_peer_id_with_timeout(
+                    &state_dir,
+                    local_peer_id.as_str(),
+                    &remote_contact,
+                    &request,
+                    timeout,
+                )
+                .and_then(|response| decode_raw_control_response(&kind, response))
+            })
+            .await
+            .unwrap_or_else(|err| Err(anyhow!("join control request task: {err}")));
             let _ = control_tx.send(build_event(peer, response));
         });
+        true
     }
 
     pub async fn next_event(&mut self) -> Result<SubstrateRuntimeEvent> {
@@ -877,6 +964,7 @@ impl SubstrateRuntime {
     fn install_control_handlers(&mut self) -> Result<()> {
         self.install_typed_control_handler::<RawBackfillRequest, RawBackfillResponse>(
             IROH_CONTROL_KIND_BACKFILL,
+            Some(MAX_CONCURRENT_INBOUND_BACKFILLS),
             |peer, request, channel| SubstrateRuntimeEvent::BackfillRequest {
                 peer,
                 request,
@@ -885,6 +973,7 @@ impl SubstrateRuntime {
         )?;
         self.install_typed_control_handler::<RawContactMaterialRequest, RawContactMaterialResponse>(
             IROH_CONTROL_KIND_CONTACT_MATERIAL,
+            None,
             |peer, request, channel| SubstrateRuntimeEvent::ContactMaterialRequest {
                 peer,
                 request,
@@ -893,6 +982,7 @@ impl SubstrateRuntime {
         )?;
         self.install_typed_control_handler::<RawPeerRelationshipRequest, RawPeerRelationshipResponse>(
             IROH_CONTROL_KIND_PEER_RELATIONSHIP,
+            None,
             |peer, request, channel| SubstrateRuntimeEvent::PeerRelationshipRequest {
                 peer,
                 request,
@@ -905,6 +995,7 @@ impl SubstrateRuntime {
     fn install_typed_control_handler<Req, Resp>(
         &self,
         kind: &'static str,
+        max_inflight: Option<usize>,
         build_event: impl Fn(NetworkNodeId, Req, Sender<Resp>) -> SubstrateRuntimeEvent
         + Send
         + Sync
@@ -918,12 +1009,28 @@ impl SubstrateRuntime {
         let pending_tx = self.control_tx.clone();
         let local_peer_id = self.local_peer_id.clone();
         let timeout = Duration::from_millis(self.config.control_request_timeout_ms);
+        let admission = max_inflight.map(|limit| Arc::new(InboundRequestAdmission::new(limit)));
         set_local_control_stream_handler_for_network_peer_id(
             &self.state_dir,
             self.local_peer_id.as_str(),
             kind,
             Some(
                 move |remote_peer_id: String, request: IrohControlStreamRequest| {
+                    let _admission_permit = match admission.as_ref() {
+                        Some(admission) => match admission.try_acquire() {
+                            Some(permit) => Some(permit),
+                            None => {
+                                return IrohControlStreamResponse {
+                                    ok: false,
+                                    error: Some(format!(
+                                        "{CONTROL_BUSY_ERROR_PREFIX} retry_after_ms=1000"
+                                    )),
+                                    payload: Vec::new(),
+                                };
+                            }
+                        },
+                        None => None,
+                    };
                     if request.kind != kind {
                         return IrohControlStreamResponse {
                             ok: false,
@@ -1196,12 +1303,59 @@ mod tests {
             gossip_rx,
             control_tx,
             control_rx,
+            backfill_request_slots: Arc::new(Semaphore::new(MAX_CONCURRENT_BACKFILL_REQUESTS)),
+            interactive_control_request_slots: Arc::new(Semaphore::new(
+                MAX_CONCURRENT_INTERACTIVE_CONTROL_REQUESTS,
+            )),
             pending_events: VecDeque::new(),
             remote_contacts: HashMap::new(),
             established_per_peer: HashMap::new(),
             counters: IrohRuntimeCounters::default(),
             next_request_id: 1,
         }
+    }
+
+    #[test]
+    fn inbound_backfill_admission_enforces_limit_and_releases_capacity() {
+        let admission = Arc::new(InboundRequestAdmission::new(2));
+        let first = admission.try_acquire().expect("first permit");
+        let second = admission.try_acquire().expect("second permit");
+
+        assert!(admission.try_acquire().is_none());
+        drop(first);
+        assert!(admission.try_acquire().is_some());
+        drop(second);
+    }
+
+    #[test]
+    fn backfill_and_interactive_control_use_separate_bounded_capacity() {
+        let runtime = runtime_for_test(SubstrateConfig::default());
+        let mut backfill_permits = Vec::new();
+        for _ in 0..MAX_CONCURRENT_BACKFILL_REQUESTS {
+            backfill_permits.push(
+                runtime
+                    .backfill_request_slots
+                    .clone()
+                    .try_acquire_owned()
+                    .expect("backfill permit"),
+            );
+        }
+
+        assert!(
+            runtime
+                .backfill_request_slots
+                .clone()
+                .try_acquire_owned()
+                .is_err()
+        );
+        assert!(
+            runtime
+                .interactive_control_request_slots
+                .clone()
+                .try_acquire_owned()
+                .is_ok()
+        );
+        drop(backfill_permits);
     }
 
     #[test]

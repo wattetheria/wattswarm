@@ -60,11 +60,21 @@ pub(super) fn recent_backfill_lane_event_ids(
     feed_key: Option<&str>,
     limit: usize,
 ) -> Result<Vec<String>> {
+    Ok(recent_backfill_lane_digest(node, scope, feed_key, limit)?.0)
+}
+
+fn recent_backfill_lane_digest(
+    node: &Node,
+    scope: &SwarmScope,
+    feed_key: Option<&str>,
+    limit: usize,
+) -> Result<(Vec<String>, u64)> {
     if limit == 0 {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), 0));
     }
     let scope_label = scope_hint_label(scope);
     let mut event_ids = Vec::new();
+    let mut head_event_seq = 0;
     let mut before: Option<u64> = None;
     loop {
         let batch =
@@ -79,16 +89,17 @@ pub(super) fn recent_backfill_lane_event_ids(
             if !event_matches_backfill_lane(node, &event, scope, feed_key)? {
                 continue;
             }
+            head_event_seq = head_event_seq.max(seq);
             event_ids.push(event.event_id);
             if event_ids.len() >= limit {
-                return Ok(event_ids);
+                return Ok((event_ids, head_event_seq));
             }
         }
         if batch_len < SCOPE_LANE_SCAN_BATCH {
             break;
         }
     }
-    Ok(event_ids)
+    Ok((event_ids, head_event_seq))
 }
 
 pub fn backfill_response_for_request(
@@ -146,7 +157,7 @@ fn backfill_response_for_request_inner(
         .map(String::as_str)
         .collect::<HashSet<_>>();
     let head_started_at = metrics.is_some().then(Instant::now);
-    let head_event_ids = recent_backfill_lane_event_ids(
+    let (head_event_ids, head_event_seq) = recent_backfill_lane_digest(
         node,
         &request.scope,
         request.feed_key.as_deref(),
@@ -154,6 +165,17 @@ fn backfill_response_for_request_inner(
     )?;
     if let (Some(metrics), Some(started_at)) = (metrics.as_deref_mut(), head_started_at) {
         metrics.head_scan_ms = duration_millis(started_at.elapsed());
+    }
+
+    if request.head_only {
+        return Ok(BackfillResponse {
+            scope: request.scope.clone(),
+            next_from_event_seq: head_event_seq,
+            head_only: true,
+            feed_key: request.feed_key.clone(),
+            head_event_ids,
+            events: Vec::new(),
+        });
     }
 
     while envelopes.len() < request.limit {
@@ -232,6 +254,7 @@ fn backfill_response_for_request_inner(
     Ok(BackfillResponse {
         scope: request.scope.clone(),
         next_from_event_seq,
+        head_only: false,
         feed_key: request.feed_key.clone(),
         head_event_ids,
         events: envelopes,

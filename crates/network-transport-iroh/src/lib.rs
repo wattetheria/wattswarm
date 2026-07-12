@@ -463,7 +463,7 @@ struct IrohDataPlaneService {
     adapter: IrohTransportAdapter,
     endpoint_options: IrohEndpointOptions,
     control_handlers: ControlStreamHandlers,
-    op_lock: Mutex<()>,
+    fetch_lock: Mutex<()>,
     endpoint_online_awaited: AtomicBool,
     public_ip_cache: Mutex<Option<PublicIpCacheEntry>>,
     contact_material_diagnostic_key: Mutex<Option<String>>,
@@ -1048,7 +1048,7 @@ impl IrohDataPlaneService {
             adapter,
             endpoint_options,
             control_handlers,
-            op_lock: Mutex::new(()),
+            fetch_lock: Mutex::new(()),
             endpoint_online_awaited: AtomicBool::new(false),
             public_ip_cache: Mutex::new(None),
             contact_material_diagnostic_key: Mutex::new(None),
@@ -1285,7 +1285,7 @@ impl IrohDataPlaneService {
         request: &DirectDataFetchRequest,
     ) -> Result<DirectDataFetchResponse> {
         let _guard = self
-            .op_lock
+            .fetch_lock
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let endpoint_addr = endpoint_addr_from_contact_material(remote)?;
@@ -1330,10 +1330,6 @@ impl IrohDataPlaneService {
         request: &IrohControlStreamRequest,
         timeout: Duration,
     ) -> Result<IrohControlStreamResponse> {
-        let _guard = self
-            .op_lock
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let endpoint_addr = endpoint_addr_from_contact_material(remote)?;
         let request_bytes = serde_json::to_vec(request)?;
         if request_bytes.len() > MAX_CONTROL_REQUEST_BYTES {
@@ -2712,6 +2708,106 @@ mod tests {
 
         assert!(response.ok);
         assert_eq!(response.payload, b"echo.v1:page-1");
+
+        shutdown_local_iroh_data_plane(dir_a.path());
+        shutdown_local_iroh_data_plane(dir_b.path());
+    }
+
+    #[test]
+    fn slow_control_request_does_not_serialize_other_requests() {
+        let dir_a = tempdir().expect("node a tempdir");
+        let dir_b = tempdir().expect("node b tempdir");
+        seed_state_dir(dir_a.path(), [33u8; 32]);
+        seed_state_dir(dir_b.path(), [34u8; 32]);
+        write_test_relay_urls(dir_a.path());
+        write_test_relay_urls(dir_b.path());
+        let endpoint_a = local_endpoint_id_from_state_dir(dir_a.path()).expect("endpoint a");
+        let endpoint_b = local_endpoint_id_from_state_dir(dir_b.path()).expect("endpoint b");
+        let peer_a = endpoint_a.to_string();
+        let peer_b = endpoint_b.to_string();
+        export_local_contact_material_for_network_peer_id(dir_a.path(), &peer_a, 1)
+            .expect("contact a");
+        let contact_b = export_local_contact_material_for_network_peer_id(dir_b.path(), &peer_b, 1)
+            .expect("contact b");
+        if !contact_has_direct_addr(&contact_b) {
+            shutdown_local_iroh_data_plane(dir_a.path());
+            shutdown_local_iroh_data_plane(dir_b.path());
+            return;
+        }
+        let (slow_entered_tx, slow_entered_rx) = std::sync::mpsc::channel();
+        set_local_control_stream_handler_for_network_peer_id(
+            dir_b.path(),
+            &peer_b,
+            "parallel.v1",
+            Some(
+                move |_remote_peer_id: String, request: IrohControlStreamRequest| {
+                    if request.payload == b"slow" {
+                        let _ = slow_entered_tx.send(());
+                        std::thread::sleep(Duration::from_millis(750));
+                    }
+                    IrohControlStreamResponse {
+                        ok: true,
+                        error: None,
+                        payload: request.payload,
+                    }
+                },
+            ),
+        )
+        .expect("set control handler");
+
+        let state_dir = dir_a.path().to_path_buf();
+        let slow_peer = peer_a.clone();
+        let slow_contact = contact_b.clone();
+        let slow = std::thread::spawn(move || {
+            send_control_stream_request_for_network_peer_id(
+                &state_dir,
+                &slow_peer,
+                &slow_contact,
+                &IrohControlStreamRequest {
+                    kind: "parallel.v1".to_owned(),
+                    payload: b"slow".to_vec(),
+                },
+            )
+        });
+        slow_entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("slow request entered handler");
+
+        let state_dir = dir_a.path().to_path_buf();
+        let fast_peer = peer_a.clone();
+        let fast_contact = contact_b.clone();
+        let (fast_done_tx, fast_done_rx) = std::sync::mpsc::channel();
+        let fast = std::thread::spawn(move || {
+            let response = send_control_stream_request_for_network_peer_id(
+                &state_dir,
+                &fast_peer,
+                &fast_contact,
+                &IrohControlStreamRequest {
+                    kind: "parallel.v1".to_owned(),
+                    payload: b"fast".to_vec(),
+                },
+            );
+            let _ = fast_done_tx.send(());
+            response
+        });
+
+        fast_done_rx
+            .recv_timeout(Duration::from_millis(500))
+            .expect("fast request must complete while slow request is active");
+        assert_eq!(
+            fast.join()
+                .expect("fast thread")
+                .expect("fast response")
+                .payload,
+            b"fast"
+        );
+        assert_eq!(
+            slow.join()
+                .expect("slow thread")
+                .expect("slow response")
+                .payload,
+            b"slow"
+        );
 
         shutdown_local_iroh_data_plane(dir_a.path());
         shutdown_local_iroh_data_plane(dir_b.path());

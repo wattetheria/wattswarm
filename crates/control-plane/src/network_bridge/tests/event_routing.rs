@@ -243,6 +243,7 @@ fn backfill_task_claimed_delivers_local_agent_event() {
                 response: crate::network_p2p::BackfillResponse {
                     scope: scope.clone(),
                     next_from_event_seq: 1,
+                    head_only: false,
                     feed_key: None,
                     head_event_ids: vec![claim_event.event_id.clone()],
                     events: vec![EventEnvelope {
@@ -358,6 +359,7 @@ fn backfill_unrelated_task_claim_skips_local_agent_event() {
                 response: crate::network_p2p::BackfillResponse {
                     scope: scope.clone(),
                     next_from_event_seq: 2,
+                    head_only: false,
                     feed_key: None,
                     head_event_ids: vec![
                         task_created_event.event_id.clone(),
@@ -500,6 +502,7 @@ fn backfill_completion_decision_delivers_to_local_claimer_without_target_envelop
                 response: crate::network_p2p::BackfillResponse {
                     scope: scope.clone(),
                     next_from_event_seq: 2,
+                    head_only: false,
                     feed_key: None,
                     head_event_ids: vec![
                         task_created_event.event_id.clone(),
@@ -584,6 +587,7 @@ fn backfill_unsubscribed_topic_message_skips_local_agent_event() {
                 response: crate::network_p2p::BackfillResponse {
                     scope: scope.clone(),
                     next_from_event_seq: 1,
+                    head_only: false,
                     feed_key: None,
                     head_event_ids: vec![remote_event.event_id.clone()],
                     events: vec![EventEnvelope {
@@ -653,6 +657,7 @@ fn backfill_subscribed_topic_message_delivers_local_agent_event() {
                 response: crate::network_p2p::BackfillResponse {
                     scope: scope.clone(),
                     next_from_event_seq: 1,
+                    head_only: false,
                     feed_key: None,
                     head_event_ids: vec![remote_event.event_id.clone()],
                     events: vec![EventEnvelope {
@@ -737,6 +742,7 @@ fn backfill_encrypted_private_hive_topic_skips_local_agent_event() {
                 response: crate::network_p2p::BackfillResponse {
                     scope: scope.clone(),
                     next_from_event_seq: 1,
+                    head_only: false,
                     feed_key: Some(feed_key.to_owned()),
                     head_event_ids: vec![remote_event.event_id.clone()],
                     events: vec![EventEnvelope {
@@ -853,6 +859,7 @@ fn backfill_encrypted_private_hive_topic_records_decrypt_diagnostic() {
                 response: crate::network_p2p::BackfillResponse {
                     scope: scope.clone(),
                     next_from_event_seq: 1,
+                    head_only: false,
                     feed_key: Some(feed_key.to_owned()),
                     head_event_ids: vec![remote_event.event_id.clone()],
                     events: vec![EventEnvelope {
@@ -1706,6 +1713,7 @@ fn backfill_private_dm_topic_delivers_local_agent_event() {
                 response: crate::network_p2p::BackfillResponse {
                     scope: scope.clone(),
                     next_from_event_seq: 1,
+                    head_only: false,
                     feed_key: Some(crate::control::PRIVATE_DM_FEED_KEY.to_owned()),
                     head_event_ids: vec![remote_event.event_id.clone()],
                     events: vec![EventEnvelope {
@@ -1861,6 +1869,7 @@ fn backfill_self_authored_private_dm_topic_skips_agent_event() {
                 response: crate::network_p2p::BackfillResponse {
                     scope: scope.clone(),
                     next_from_event_seq: 1,
+                    head_only: false,
                     feed_key: Some(crate::control::PRIVATE_DM_FEED_KEY.to_owned()),
                     head_event_ids: vec![local_event.event_id.clone()],
                     events: vec![EventEnvelope {
@@ -2318,6 +2327,7 @@ fn backfill_agent_payment_event_delivers_local_agent_event() {
                 response: crate::network_p2p::BackfillResponse {
                     scope: scope.clone(),
                     next_from_event_seq: 1,
+                    head_only: false,
                     feed_key: None,
                     head_event_ids: vec![payment_event.event_id.clone()],
                     events: vec![EventEnvelope {

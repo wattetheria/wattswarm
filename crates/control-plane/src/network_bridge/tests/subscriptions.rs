@@ -262,6 +262,7 @@ fn remote_feed_subscription_gossip_authorizes_peer_for_target_scope_backfill() {
         scope: target_scope.clone(),
         from_event_seq: 0,
         limit: 8,
+        head_only: false,
         feed_key: None,
         known_event_ids: Vec::new(),
     };

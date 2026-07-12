@@ -902,6 +902,7 @@ impl NetworkBridgeService {
                     crate::network_p2p::BackfillResponse {
                         scope: request.scope.clone(),
                         next_from_event_seq: request.from_event_seq,
+                        head_only: request.head_only,
                         feed_key: request.feed_key.clone(),
                         head_event_ids: Vec::new(),
                         events: Vec::new(),
@@ -994,6 +995,60 @@ impl NetworkBridgeService {
                 request_id,
                 response,
             } => {
+                if response.head_only {
+                    let local_cursor = self.peer_sync_state.get(&peer).map_or(0, |state| {
+                        state.backfill_cursor(&response.scope, response.feed_key.as_deref())
+                    });
+                    let mut has_gap = response.next_from_event_seq > local_cursor;
+                    for event_id in &response.head_event_ids {
+                        if node.store.event_seq_for_event_id(event_id)?.is_none() {
+                            has_gap = true;
+                            break;
+                        }
+                    }
+                    self.record_peer_backfill_response_progress(
+                        peer.clone(),
+                        &response.scope,
+                        response.feed_key.as_deref(),
+                        &response.head_event_ids,
+                        request_id,
+                        response.next_from_event_seq,
+                        has_gap,
+                    );
+                    let full_request_sent = has_gap
+                        && self.request_backfill_lane_for_peer_now(
+                            &peer,
+                            node,
+                            &response.scope,
+                            response.feed_key.as_deref(),
+                        )?;
+                    diagnostics::record_diagnostic(
+                        self.state_dir.as_deref(),
+                        diagnostics::DiagnosticEvent::new(
+                            "info",
+                            "backfill",
+                            "head.compare",
+                            "ok",
+                            format!("backfill head compared peer={peer} gap={has_gap}"),
+                        )
+                        .source_node_id(Some(peer.to_string()))
+                        .scope(&response.scope)
+                        .details(json!({
+                            "request_id": request_id.to_string(),
+                            "feed_key": response.feed_key,
+                            "head_event_ids": response.head_event_ids,
+                            "local_cursor": local_cursor,
+                            "remote_cursor": response.next_from_event_seq,
+                            "has_gap": has_gap,
+                            "full_request_sent": full_request_sent,
+                        })),
+                    );
+                    return Ok(NetworkBridgeTick::TransportNotice {
+                        detail: format!(
+                            "backfill_head_compared peer={peer} gap={has_gap} full_request_sent={full_request_sent}"
+                        ),
+                    });
+                }
                 let applied_envelopes = ingest_backfill_response_events(node, &response)?;
                 let events = applied_envelopes.len();
                 let mut unknown_empty_head = false;
@@ -1090,6 +1145,7 @@ impl NetworkBridgeService {
                 let applied_response = BackfillResponse {
                     scope: response.scope.clone(),
                     next_from_event_seq: response.next_from_event_seq,
+                    head_only: false,
                     feed_key: response.feed_key.clone(),
                     head_event_ids: response.head_event_ids.clone(),
                     events: applied_envelopes,
@@ -1112,6 +1168,14 @@ impl NetworkBridgeService {
                 request_id,
                 error,
             } => {
+                if error.starts_with(CONTROL_BUSY_ERROR_PREFIX) {
+                    self.defer_backfill_request(peer.clone(), request_id);
+                    return Ok(NetworkBridgeTick::TransportNotice {
+                        detail: format!(
+                            "backfill_deferred_remote_busy peer={peer} request_id={request_id}"
+                        ),
+                    });
+                }
                 self.mark_backfill_failed(peer.clone(), request_id);
                 self.mark_peer_control_stream_failed(peer.clone());
                 if is_missing_iroh_contact_material_error(&error) {
@@ -1951,6 +2015,7 @@ mod tests {
             scope: SwarmScope::Global,
             from_event_seq: 0,
             limit: 8,
+            head_only: false,
             feed_key: None,
             known_event_ids: Vec::new(),
         };
