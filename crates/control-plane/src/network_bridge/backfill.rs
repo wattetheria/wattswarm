@@ -33,14 +33,21 @@ fn event_matches_backfill_lane(
     event: &crate::types::Event,
     scope: &SwarmScope,
     feed_key: Option<&str>,
+    exclude_topic_events: bool,
 ) -> Result<bool> {
-    if let Some(feed_key) = feed_key {
-        let crate::types::EventPayload::TopicMessagePosted(payload) = &event.payload else {
-            return Ok(false);
-        };
-        if payload.feed_key != feed_key {
+    match &event.payload {
+        crate::types::EventPayload::TopicMessagePosted(_) if exclude_topic_events => {
             return Ok(false);
         }
+        crate::types::EventPayload::TopicMessagePosted(payload) => {
+            if let Some(feed_key) = feed_key
+                && payload.feed_key != feed_key
+            {
+                return Ok(false);
+            }
+        }
+        _ if feed_key.is_some() => return Ok(false),
+        _ => {}
     }
     let Some(route) = event_transport_route(node, event)? else {
         return Ok(false);
@@ -58,15 +65,17 @@ pub(super) fn recent_backfill_lane_event_ids(
     node: &Node,
     scope: &SwarmScope,
     feed_key: Option<&str>,
+    exclude_topic_events: bool,
     limit: usize,
 ) -> Result<Vec<String>> {
-    Ok(recent_backfill_lane_digest(node, scope, feed_key, limit)?.0)
+    Ok(recent_backfill_lane_digest(node, scope, feed_key, exclude_topic_events, limit)?.0)
 }
 
 fn recent_backfill_lane_digest(
     node: &Node,
     scope: &SwarmScope,
     feed_key: Option<&str>,
+    exclude_topic_events: bool,
     limit: usize,
 ) -> Result<(Vec<String>, u64)> {
     if limit == 0 {
@@ -86,7 +95,7 @@ fn recent_backfill_lane_digest(
             if !should_sync_event(node, &event)? {
                 continue;
             }
-            if !event_matches_backfill_lane(node, &event, scope, feed_key)? {
+            if !event_matches_backfill_lane(node, &event, scope, feed_key, exclude_topic_events)? {
                 continue;
             }
             head_event_seq = head_event_seq.max(seq);
@@ -161,6 +170,7 @@ fn backfill_response_for_request_inner(
         node,
         &request.scope,
         request.feed_key.as_deref(),
+        request.exclude_topic_events,
         BACKFILL_HEAD_EVENT_IDS_LIMIT,
     )?;
     if let (Some(metrics), Some(started_at)) = (metrics.as_deref_mut(), head_started_at) {
@@ -225,6 +235,7 @@ fn backfill_response_for_request_inner(
                 &event,
                 &request.scope,
                 request.feed_key.as_deref(),
+                request.exclude_topic_events,
             )?;
             if let (Some(metrics), Some(started_at)) = (metrics.as_deref_mut(), lane_started_at) {
                 metrics.lane_filter_ms = metrics
@@ -282,7 +293,10 @@ pub(super) fn ingest_backfill_response_events(
                 return Err(anyhow!("topic backfill response feed_key mismatch"));
             }
         }
-        if ingest_event_envelope(node, envelope).is_ok() {
+        if node
+            .ingest_remote_if_new(envelope.event.clone())
+            .unwrap_or(false)
+        {
             applied.push(envelope.clone());
         }
     }

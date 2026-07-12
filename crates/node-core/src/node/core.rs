@@ -134,23 +134,33 @@ impl Node {
     }
 
     pub fn ingest(&mut self, event: Event) -> Result<()> {
+        self.ingest_if_new(event).map(|_| ())
+    }
+
+    fn ingest_if_new(&mut self, event: Event) -> Result<bool> {
         self.validate_event(&event)?;
-        if let Err(err) = self.store.append_event(&event) {
-            if is_duplicate_event_error(&err) {
-                return Ok(());
-            }
-            return Err(err.context("append event"));
+        if self
+            .store
+            .append_event_if_new(&event)
+            .context("append event")?
+            .is_none()
+        {
+            return Ok(false);
         }
         if event_requires_projection_rebuild(&event.payload) {
             self.replay_rebuild_projection()?;
         } else {
             self.apply_to_projection(&event)?;
         }
-        Ok(())
+        Ok(true)
     }
 
     pub fn ingest_remote(&mut self, event: Event) -> Result<()> {
         self.ingest(event)
+    }
+
+    pub fn ingest_remote_if_new(&mut self, event: Event) -> Result<bool> {
+        self.ingest_if_new(event)
     }
 
     pub fn head_seq(&self) -> Result<u64> {
@@ -197,7 +207,7 @@ impl Node {
         let missing = peer.store.load_events_page(local_head, max_events)?;
         let mut applied = 0usize;
         for (_, event) in missing {
-            if self.ingest_remote(event).is_ok() {
+            if self.ingest_remote_if_new(event).unwrap_or(false) {
                 applied += 1;
             }
         }

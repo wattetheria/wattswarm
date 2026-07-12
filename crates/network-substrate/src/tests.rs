@@ -26,6 +26,7 @@ fn backfill_request_validate_enforces_bounds() {
         limit: 5,
         head_only: false,
         feed_key: Some("feed".to_owned()),
+        exclude_topic_events: false,
         known_event_ids: Vec::new(),
     };
     req.validate(10, 20).unwrap();
@@ -40,6 +41,14 @@ fn backfill_request_validate_enforces_bounds() {
     assert!(
         RawBackfillRequest {
             limit: 25,
+            ..req.clone()
+        }
+        .validate(10, 20)
+        .is_err()
+    );
+    assert!(
+        RawBackfillRequest {
+            exclude_topic_events: true,
             ..req.clone()
         }
         .validate(10, 20)
@@ -72,7 +81,18 @@ fn backfill_wire_defaults_head_only_for_older_payloads() {
     .expect("legacy response");
 
     assert!(!request.head_only);
+    assert!(!request.exclude_topic_events);
     assert!(!response.head_only);
+
+    let selective_request = RawBackfillRequest {
+        exclude_topic_events: true,
+        ..request
+    };
+    let encoded = serde_json::to_value(&selective_request).expect("encode selective request");
+    assert_eq!(encoded["exclude_topic_events"], serde_json::json!(true));
+    let decoded: RawBackfillRequest =
+        serde_json::from_value(encoded).expect("decode selective request");
+    assert!(decoded.exclude_topic_events);
 }
 
 #[test]
@@ -162,6 +182,7 @@ fn inbound_backfill_peer_uses_transport_remote_identity() {
         limit: 1,
         head_only: false,
         feed_key: None,
+        exclude_topic_events: false,
         known_event_ids: Vec::new(),
     };
 

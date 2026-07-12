@@ -174,6 +174,7 @@ impl NetworkBridgeService {
                     limit,
                     head_only: false,
                     feed_key: None,
+                    exclude_topic_events: true,
                     known_event_ids: Vec::new(),
                 },
                 BACKFILL_TIMEOUT_FALLBACK,
@@ -366,6 +367,7 @@ impl NetworkBridgeService {
                 node,
                 &lane.scope,
                 lane.feed_key.as_deref(),
+                lane.feed_key.is_none(),
                 BACKFILL_KNOWN_EVENT_IDS_LIMIT,
             )?
         };
@@ -381,6 +383,7 @@ impl NetworkBridgeService {
                 limit: BACKFILL_BATCH_EVENTS,
                 head_only,
                 feed_key: lane.feed_key.clone(),
+                exclude_topic_events: lane.feed_key.is_none(),
                 known_event_ids,
             },
             timeout,

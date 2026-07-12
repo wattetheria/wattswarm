@@ -31,6 +31,7 @@ fn record_backfill_serve_diagnostic(
         "from_event_seq": request.from_event_seq,
         "requested_limit": request.limit,
         "known_event_ids": request.known_event_ids.len(),
+        "exclude_topic_events": request.exclude_topic_events,
         "events": events,
         "send_ms": send_ms,
     });
@@ -2017,6 +2018,7 @@ mod tests {
             limit: 8,
             head_only: false,
             feed_key: None,
+            exclude_topic_events: true,
             known_event_ids: Vec::new(),
         };
         let request_id: crate::network_p2p::InboundRequestId =
@@ -2054,6 +2056,7 @@ mod tests {
         let raw = fs::read_to_string(dir.join("diagnostics/wattswarm_node.jsonl"))
             .expect("diagnostic log");
         assert!(raw.contains("\"phase\":\"backfill.serve\""));
+        assert!(raw.contains("\"exclude_topic_events\":true"));
 
         let _ = fs::remove_dir_all(dir);
     }

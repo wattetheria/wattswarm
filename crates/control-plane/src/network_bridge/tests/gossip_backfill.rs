@@ -162,6 +162,7 @@ fn backfill_response_for_request_wraps_public_control_events() {
             limit: 8,
             head_only: false,
             feed_key: None,
+            exclude_topic_events: true,
             known_event_ids: Vec::new(),
         },
         32,
@@ -204,6 +205,7 @@ fn backfill_response_metrics_record_page_and_filter_work() {
             limit: 8,
             head_only: false,
             feed_key: None,
+            exclude_topic_events: false,
             known_event_ids: Vec::new(),
         },
         32,
@@ -247,6 +249,7 @@ fn head_only_backfill_returns_digest_without_reading_event_pages() {
             limit: 8,
             head_only: true,
             feed_key: None,
+            exclude_topic_events: false,
             known_event_ids: Vec::new(),
         },
         32,
@@ -301,6 +304,7 @@ fn backfill_response_repairs_missed_global_control_event() {
             limit: 8,
             head_only: false,
             feed_key: None,
+            exclude_topic_events: false,
             known_event_ids: Vec::new(),
         },
         32,
@@ -322,29 +326,47 @@ fn backfill_response_repairs_missed_global_control_event() {
 }
 
 #[test]
-fn backfill_response_scopes_feed_subscription_updates_to_target_scope() {
+fn generic_backfill_lane_excludes_topic_events_served_by_feed_lane() {
     let local = NodeIdentity::random();
     let local_node_id = local.node_id();
     let membership = membership_with_roles(std::slice::from_ref(&local_node_id));
     let mut node =
         Node::new(local, PgStore::open_in_memory().expect("store"), membership).expect("node");
-    node.emit_at(
-        1,
-        crate::types::EventPayload::FeedSubscriptionUpdated(
-            crate::types::FeedSubscriptionUpdatedPayload {
-                network_id: "default".to_owned(),
-                subscriber_node_id: local_node_id,
-                feed_key: "watt.gossip.dm".to_owned(),
-                scope_hint: "group:dm-crew-7".to_owned(),
-                gossip_kinds: vec!["events".to_owned()],
-                provider_capabilities: None,
-                agent_envelope: None,
-                active: true,
-            },
-        ),
-        100,
-    )
-    .expect("emit subscription update");
+    let subscription_event = node
+        .emit_at(
+            1,
+            crate::types::EventPayload::FeedSubscriptionUpdated(
+                crate::types::FeedSubscriptionUpdatedPayload {
+                    network_id: "default".to_owned(),
+                    subscriber_node_id: local_node_id.clone(),
+                    feed_key: "watt.gossip.dm".to_owned(),
+                    scope_hint: "group:dm-crew-7".to_owned(),
+                    gossip_kinds: vec!["events".to_owned()],
+                    provider_capabilities: None,
+                    agent_envelope: None,
+                    active: true,
+                },
+            ),
+            100,
+        )
+        .expect("emit subscription update");
+    let topic_event = node
+        .emit_at(
+            1,
+            crate::types::EventPayload::TopicMessagePosted(
+                crate::types::TopicMessagePostedPayload {
+                    network_id: "default".to_owned(),
+                    feed_key: "watt.gossip.dm".to_owned(),
+                    scope_hint: "group:dm-crew-7".to_owned(),
+                    content_ref: sample_topic_content_ref("sha256:lane-topic", &local_node_id),
+                    local_content_cache: Some(json!({"text":"feed-specific"})),
+                    reply_to_message_id: None,
+                    agent_envelope: None,
+                },
+            ),
+            101,
+        )
+        .expect("emit topic message");
 
     let global_response = backfill_response_for_request(
         &node,
@@ -355,6 +377,7 @@ fn backfill_response_scopes_feed_subscription_updates_to_target_scope() {
             limit: 8,
             head_only: false,
             feed_key: None,
+            exclude_topic_events: true,
             known_event_ids: Vec::new(),
         },
         32,
@@ -373,6 +396,7 @@ fn backfill_response_scopes_feed_subscription_updates_to_target_scope() {
             limit: 8,
             head_only: false,
             feed_key: None,
+            exclude_topic_events: true,
             known_event_ids: Vec::new(),
         },
         32,
@@ -381,10 +405,38 @@ fn backfill_response_scopes_feed_subscription_updates_to_target_scope() {
     .expect("scoped backfill response");
 
     assert_eq!(scoped_response.events.len(), 1);
+    assert_eq!(
+        scoped_response.head_event_ids,
+        vec![subscription_event.event_id]
+    );
     assert_eq!(scoped_response.events[0].scope, target_scope);
     assert!(matches!(
         scoped_response.events[0].event.payload,
         crate::types::EventPayload::FeedSubscriptionUpdated(_)
+    ));
+
+    let feed_response = backfill_response_for_request(
+        &node,
+        "peer-local",
+        &BackfillRequest {
+            scope: target_scope.clone(),
+            from_event_seq: 0,
+            limit: 8,
+            head_only: false,
+            feed_key: Some("watt.gossip.dm".to_owned()),
+            exclude_topic_events: false,
+            known_event_ids: Vec::new(),
+        },
+        32,
+        64,
+    )
+    .expect("feed backfill response");
+
+    assert_eq!(feed_response.events.len(), 1);
+    assert_eq!(feed_response.head_event_ids, vec![topic_event.event_id]);
+    assert!(matches!(
+        feed_response.events[0].event.payload,
+        crate::types::EventPayload::TopicMessagePosted(_)
     ));
 }
 
@@ -416,6 +468,52 @@ fn ingest_backfill_response_rejects_scope_mismatch() {
     };
 
     assert!(ingest_backfill_response(&mut node, &response).is_err());
+}
+
+#[test]
+fn ingest_backfill_response_does_not_count_duplicate_events_as_applied() {
+    let local = NodeIdentity::random();
+    let remote = NodeIdentity::random();
+    let membership = membership_with_roles(&[local.node_id(), remote.node_id()]);
+    let mut node =
+        Node::new(local, PgStore::open_in_memory().expect("store"), membership).expect("node");
+    let remote_event = build_event_for_external(
+        &remote,
+        1,
+        10,
+        crate::types::EventPayload::TopicMessagePosted(crate::types::TopicMessagePostedPayload {
+            network_id: "default".to_owned(),
+            feed_key: "crew.chat".to_owned(),
+            scope_hint: "group:crew-7".to_owned(),
+            content_ref: sample_topic_content_ref("sha256:duplicate", &remote.node_id()),
+            local_content_cache: Some(json!({"text":"duplicate"})),
+            reply_to_message_id: None,
+            agent_envelope: None,
+        }),
+    )
+    .expect("signed event");
+    let response = crate::network_p2p::BackfillResponse {
+        scope: SwarmScope::Group("crew-7".to_owned()),
+        next_from_event_seq: 1,
+        head_only: false,
+        feed_key: Some("crew.chat".to_owned()),
+        head_event_ids: vec![remote_event.event_id.clone()],
+        events: vec![EventEnvelope {
+            scope: SwarmScope::Group("crew-7".to_owned()),
+            event: remote_event,
+            content_source_node_id: None,
+        }],
+    };
+
+    assert_eq!(
+        ingest_backfill_response(&mut node, &response).expect("ingest new event"),
+        1
+    );
+    assert_eq!(
+        ingest_backfill_response(&mut node, &response).expect("ignore duplicate event"),
+        0
+    );
+    assert_eq!(node.head_seq().expect("head seq"), 1);
 }
 
 #[test]
@@ -580,6 +678,7 @@ fn topic_backfill_response_filters_by_feed_key() {
             limit: 8,
             head_only: false,
             feed_key: Some("crew.chat".to_owned()),
+            exclude_topic_events: false,
             known_event_ids: Vec::new(),
         },
         32,
@@ -693,19 +792,19 @@ fn recent_backfill_lane_event_ids_scope_indexed_matches_expected() {
     let alpha = SwarmScope::Group("alpha".to_owned());
 
     // Newest-first, isolated to the requested scope.
-    let ids = recent_backfill_lane_event_ids(&node, &alpha, None, 10).expect("lane ids");
+    let ids = recent_backfill_lane_event_ids(&node, &alpha, None, false, 10).expect("lane ids");
     assert_eq!(ids, vec![alpha3.clone(), alpha2.clone(), alpha1.clone()]);
 
     // Limit is applied after filtering.
-    let ids = recent_backfill_lane_event_ids(&node, &alpha, None, 2).expect("lane ids");
+    let ids = recent_backfill_lane_event_ids(&node, &alpha, None, false, 2).expect("lane ids");
     assert_eq!(ids, vec![alpha3.clone(), alpha2.clone()]);
 
     // feed_key narrows within the scope.
-    let ids =
-        recent_backfill_lane_event_ids(&node, &alpha, Some("crew.chat"), 10).expect("lane ids");
+    let ids = recent_backfill_lane_event_ids(&node, &alpha, Some("crew.chat"), false, 10)
+        .expect("lane ids");
     assert_eq!(ids, vec![alpha3, alpha2, alpha1]);
-    let none =
-        recent_backfill_lane_event_ids(&node, &alpha, Some("other.chat"), 10).expect("lane ids");
+    let none = recent_backfill_lane_event_ids(&node, &alpha, Some("other.chat"), false, 10)
+        .expect("lane ids");
     assert!(none.is_empty());
 }
 
@@ -729,6 +828,7 @@ fn backfill_response_scope_indexed_isolates_and_advances_cursor() {
             limit: 2,
             head_only: false,
             feed_key: None,
+            exclude_topic_events: false,
             known_event_ids: Vec::new(),
         },
         32,
@@ -753,6 +853,7 @@ fn backfill_response_scope_indexed_isolates_and_advances_cursor() {
             limit: 2,
             head_only: false,
             feed_key: None,
+            exclude_topic_events: false,
             known_event_ids: Vec::new(),
         },
         32,
@@ -776,6 +877,7 @@ fn backfill_response_scope_indexed_isolates_and_advances_cursor() {
             limit: 8,
             head_only: false,
             feed_key: None,
+            exclude_topic_events: false,
             known_event_ids: vec![a1, a2],
         },
         32,

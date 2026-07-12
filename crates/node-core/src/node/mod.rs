@@ -15,7 +15,6 @@ use crate::reason_codes::{
     REASON_TASK_EXPIRED, REASON_TASK_TIMEOUT, REASON_UNKNOWN, is_protocol_reason_code,
 };
 use crate::runtime::{ExecuteRequest, RuntimeClient, VerifyRequest, verifier_result_from_response};
-use crate::storage::pg::ErrorCode;
 use crate::storage::{PgStore, RuntimeMetricObservation, TaskProjectionRow, VoteRevealRow};
 use crate::types::{
     ArtifactRef, Candidate, CandidateProposedPayload, ClaimPayload, ClaimReleasePayload,
@@ -130,42 +129,6 @@ pub fn build_event_for_external(
         }
         Ok(event)
     })
-}
-
-fn is_duplicate_event_error(err: &anyhow::Error) -> bool {
-    err.chain().any(|cause| {
-        cause
-            .downcast_ref::<crate::storage::pg::Error>()
-            .map(|e| match e {
-                crate::storage::pg::Error::DbFailure(inner, message) => {
-                    let message = message.as_deref().unwrap_or_default();
-                    inner.code == ErrorCode::ConstraintViolation
-                        && (message.contains("events.event_id")
-                            || message.contains("events_event_id_key"))
-                }
-                _ => false,
-            })
-            .unwrap_or(false)
-    })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn duplicate_event_error_matches_postgres_unique_constraint_name() {
-        let err = anyhow!(crate::storage::pg::Error::DbFailure(
-            crate::storage::pg::DbFailureError {
-                code: ErrorCode::ConstraintViolation,
-            },
-            Some(
-                "duplicate key value violates unique constraint \"events_event_id_key\"".to_owned(),
-            ),
-        ));
-
-        assert!(is_duplicate_event_error(&err));
-    }
 }
 
 fn is_timeout_error(err: &anyhow::Error) -> bool {

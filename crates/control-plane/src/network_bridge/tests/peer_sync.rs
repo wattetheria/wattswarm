@@ -965,6 +965,7 @@ fn inbound_backfill_authorization_keeps_global_open_and_requires_scoped_activity
         limit: 8,
         head_only: false,
         feed_key: None,
+        exclude_topic_events: false,
         known_event_ids: Vec::new(),
     };
     let served_request = BackfillRequest {
@@ -973,6 +974,7 @@ fn inbound_backfill_authorization_keeps_global_open_and_requires_scoped_activity
         limit: 8,
         head_only: false,
         feed_key: None,
+        exclude_topic_events: false,
         known_event_ids: Vec::new(),
     };
     let unserved_request = BackfillRequest {
@@ -981,6 +983,7 @@ fn inbound_backfill_authorization_keeps_global_open_and_requires_scoped_activity
         limit: 8,
         head_only: false,
         feed_key: None,
+        exclude_topic_events: false,
         known_event_ids: Vec::new(),
     };
 
@@ -1006,6 +1009,7 @@ fn peer_sync_state_persists_scope_cursor_and_remote_heads() {
     service.set_state_dir(dir.clone(), dir.join("store.state"));
 
     service.record_peer_scope_activity(peer.clone(), &scope);
+    service.record_peer_backfill_cursor(peer.clone(), &scope, None, 24);
     service.record_peer_backfill_cursor(peer.clone(), &scope, Some("crew.chat"), 42);
     service.record_peer_remote_head_event_ids(
         peer.clone(),
@@ -1027,6 +1031,7 @@ fn peer_sync_state_persists_scope_cursor_and_remote_heads() {
         .expect("reloaded peer sync state");
 
     assert!(state.known_scopes.contains(&scope));
+    assert_eq!(state.backfill_cursor(&scope, None), 24);
     assert_eq!(state.backfill_cursor(&scope, Some("crew.chat")), 42);
     assert_eq!(
         state
@@ -1104,11 +1109,10 @@ fn peer_scope_activity_persists_only_changed_peer() {
 }
 
 #[test]
-fn backfill_response_progress_persists_peer_sync_state_once() {
+fn backfill_response_progress_persists_generic_lane_cursor() {
     let dir = temp_startup_dir("peer-sync-backfill-response-progress");
     let peer = random_network_node_id();
     let scope = SwarmScope::Group("crew-7".to_owned());
-    let feed_key = "crew.chat";
     let request_id = BackfillRequestId::new(77);
     let mut node = Node::open_in_memory_with_roles(&[Role::Proposer]).expect("node");
     let mut service = NetworkBridgeService::new(
@@ -1119,12 +1123,7 @@ fn backfill_response_progress_persists_peer_sync_state_once() {
     .expect("service");
     service.set_state_dir(dir.clone(), dir.join("store.state"));
     let mut state = PeerSyncState::new(Instant::now());
-    state.record_pending_backfill(
-        request_id,
-        scope.clone(),
-        Some(feed_key.to_owned()),
-        Instant::now(),
-    );
+    state.record_pending_backfill(request_id, scope.clone(), None, Instant::now());
     service.peer_sync_state.insert(peer.clone(), state);
 
     let tick = service
@@ -1137,7 +1136,7 @@ fn backfill_response_progress_persists_peer_sync_state_once() {
                     scope: scope.clone(),
                     next_from_event_seq: 42,
                     head_only: false,
-                    feed_key: Some(feed_key.to_owned()),
+                    feed_key: None,
                     head_event_ids: Vec::new(),
                     events: Vec::new(),
                 },
@@ -1161,7 +1160,7 @@ fn backfill_response_progress_persists_peer_sync_state_once() {
     assert_eq!(state.inflight_backfills(), 0);
     assert_eq!(state.backfill_successes, 1);
     assert_eq!(state.backfill_failures, 0);
-    assert_eq!(state.backfill_cursor(&scope, Some(feed_key)), 42);
+    assert_eq!(state.backfill_cursor(&scope, None), 42);
 
     let mut reloaded = NetworkBridgeService::new(
         test_network_node(NetworkP2pConfig::default()).expect("node"),
@@ -1178,7 +1177,7 @@ fn backfill_response_progress_persists_peer_sync_state_once() {
     assert_eq!(reloaded_state.inflight_backfills(), 0);
     assert_eq!(reloaded_state.backfill_successes, 1);
     assert_eq!(reloaded_state.backfill_failures, 0);
-    assert_eq!(reloaded_state.backfill_cursor(&scope, Some(feed_key)), 42);
+    assert_eq!(reloaded_state.backfill_cursor(&scope, None), 42);
 
     let _ = std::fs::remove_dir_all(dir);
 }

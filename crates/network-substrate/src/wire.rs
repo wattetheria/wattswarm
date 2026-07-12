@@ -1,6 +1,10 @@
 use super::*;
 use serde::Deserializer;
 
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RawBackfillRequest {
     pub scope: SwarmScope,
@@ -10,6 +14,9 @@ pub struct RawBackfillRequest {
     pub head_only: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub feed_key: Option<String>,
+    /// Keeps topic history on feed-specific lanes while this generic lane serves other events.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub exclude_topic_events: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub known_event_ids: Vec<String>,
 }
@@ -29,6 +36,9 @@ impl RawBackfillRequest {
             && feed_key.trim().is_empty()
         {
             bail!("backfill feed_key must not be empty");
+        }
+        if self.exclude_topic_events && self.feed_key.is_some() {
+            bail!("backfill topic exclusion cannot be combined with feed_key");
         }
         if self.known_event_ids.len() > MAX_BACKFILL_KNOWN_EVENT_IDS {
             bail!("backfill known_event_ids exceeds configured max");

@@ -956,6 +956,10 @@ fn event_log_round_trip_and_clear_projection_keeps_events() {
     );
 
     let seq1 = store.append_event(&created).expect("append evt-1");
+    let duplicate_seq = store
+        .append_event_if_new(&created)
+        .expect("ignore duplicate evt-1");
+    assert_eq!(duplicate_seq, None);
     let seq2 = store.append_event(&expired).expect("append evt-2");
     assert_eq!(seq1, 1);
     assert_eq!(seq2, 2);

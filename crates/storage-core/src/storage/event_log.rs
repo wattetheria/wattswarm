@@ -2,16 +2,24 @@ use super::*;
 
 impl PgStore {
     pub fn append_event(&self, event: &Event) -> Result<u64> {
+        self.append_event_if_new(event)?.ok_or_else(|| {
+            SwarmError::Storage(format!("event already exists: {}", event.event_id)).into()
+        })
+    }
+
+    pub fn append_event_if_new(&self, event: &Event) -> Result<Option<u64>> {
         let event_json = serde_json::to_string(event)?;
         let swarm_scope = canonical_swarm_scope(&event.swarm_scope);
         let conn = self
             .conn
             .lock()
             .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
-        let seq: i64 = conn
+        let seq: Option<i64> = conn
             .query_row(
                 "INSERT INTO events(org_id, event_id, protocol_version, task_id, epoch, event_kind, author_node_id, created_at, event_json, swarm_scope)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, TIMESTAMPTZ 'epoch' + ($8::bigint * INTERVAL '1 millisecond'), $9, $10)
+                 SELECT $1, $2, $3, $4, $5, $6, $7, TIMESTAMPTZ 'epoch' + ($8::bigint * INTERVAL '1 millisecond'), $9, $10
+                 WHERE NOT EXISTS (SELECT 1 FROM events WHERE event_id = $2)
+                 ON CONFLICT (event_id) DO NOTHING
                  RETURNING seq",
                 params![
                     self.org_id(),
@@ -27,8 +35,9 @@ impl PgStore {
                 ],
                 |r| r.get(0),
             )
+            .optional()
             .context("insert event")?;
-        Ok(seq as u64)
+        Ok(seq.map(|seq: i64| seq as u64))
     }
 
     pub fn head_seq(&self) -> Result<u64> {

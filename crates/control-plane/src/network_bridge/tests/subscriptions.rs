@@ -264,6 +264,7 @@ fn remote_feed_subscription_gossip_authorizes_peer_for_target_scope_backfill() {
         limit: 8,
         head_only: false,
         feed_key: None,
+        exclude_topic_events: false,
         known_event_ids: Vec::new(),
     };
     assert!(service.peer_has_scope_activity(&propagation_source, &target_scope));
