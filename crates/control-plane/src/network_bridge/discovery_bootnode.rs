@@ -50,22 +50,31 @@ type DiscoveryBootnodeFailureLogStates = HashMap<String, DiscoveryBootnodeFailur
 static DISCOVERY_BOOTNODE_FAILURE_LOG_STATES: OnceLock<Mutex<DiscoveryBootnodeFailureLogStates>> =
     OnceLock::new();
 
-#[derive(Debug, Deserialize)]
-#[serde(untagged)]
-enum DiscoveryBootnodeRecordItem {
-    Direct(SignedDiscoveryNodeRecord),
-    Nearby {
-        record: SignedDiscoveryNodeRecord,
-        #[serde(default, rename = "distance_km")]
-        _distance_km: Option<f64>,
-    },
+#[derive(Debug)]
+struct DiscoveryBootnodeRecordItem(SignedDiscoveryNodeRecord);
+
+impl<'de> Deserialize<'de> for DiscoveryBootnodeRecordItem {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = Value::deserialize(deserializer)?;
+        let record = match value {
+            Value::Object(mut object) => match object.remove("record") {
+                Some(record) => record,
+                None => Value::Object(object),
+            },
+            value => value,
+        };
+        serde_json::from_value(record)
+            .map(Self)
+            .map_err(serde::de::Error::custom)
+    }
 }
 
 impl DiscoveryBootnodeRecordItem {
     fn into_record(self) -> SignedDiscoveryNodeRecord {
-        match self {
-            Self::Direct(record) | Self::Nearby { record, .. } => record,
-        }
+        self.0
     }
 }
 

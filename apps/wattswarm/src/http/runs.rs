@@ -158,6 +158,34 @@ pub(crate) async fn run_cancel(
     Ok(Json(payload))
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn run_submit_payload_decodes_numeric_fields_in_direct_and_envelope_forms() {
+        let spec = json!({
+            "run_id": "run-direct",
+            "retry": {
+                "max_attempts": 3,
+                "backoff_ms": 1_500
+            },
+            "aggregation": {
+                "mode": "all_done",
+                "quorum": 2
+            }
+        });
+        serde_json::from_str::<RunSubmitPayload>(&spec.to_string())
+            .expect("direct run submit payload");
+        let envelope = json!({
+            "kickoff": true,
+            "spec": spec
+        });
+        serde_json::from_str::<RunSubmitPayload>(&envelope.to_string())
+            .expect("enveloped run submit payload");
+    }
+}
+
 pub(crate) async fn run_retry(
     State(state): State<UiServerState>,
     Path(run_id): Path<String>,
