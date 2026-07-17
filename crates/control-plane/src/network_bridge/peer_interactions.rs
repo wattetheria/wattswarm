@@ -1,5 +1,6 @@
 use super::*;
-use watt_did::{Did, VerifiedAgentContext};
+use base64::Engine as _;
+use watt_did::{Did, DidKey, DidKeyPublicKey, VerifiedAgentContext};
 
 const PENDING_NETWORK_COMMAND_INITIAL_RETRY_MS: i64 = 5_000;
 const PENDING_NETWORK_COMMAND_MAX_RETRY_MS: i64 = 60_000;
@@ -504,6 +505,31 @@ struct UnsignedSourceAgentCard<'a> {
     issued_at: u64,
 }
 
+fn verify_agent_signature_ref(
+    public_key_ref: &str,
+    message: &[u8],
+    signature_b64: &str,
+) -> Result<()> {
+    let public_key = if public_key_ref.starts_with("did:key:") {
+        let did = Did::parse(public_key_ref).context("parse did:key")?;
+        let did_key = DidKey::from_did(did).context("validate did:key")?;
+        match did_key.decode_public_key().context("decode did:key")? {
+            DidKeyPublicKey::Ed25519(bytes) => bytes.to_vec(),
+            DidKeyPublicKey::X25519(_) | DidKeyPublicKey::Secp256k1Compressed(_) => {
+                bail!("did:key is not an Ed25519 verification key")
+            }
+        }
+    } else {
+        base64::engine::general_purpose::STANDARD
+            .decode(public_key_ref)
+            .context("decode base64 public key")?
+    };
+    let signature = base64::engine::general_purpose::STANDARD
+        .decode(signature_b64)
+        .context("decode signature")?;
+    crate::crypto::verify_signature_bytes(&public_key, message, &signature)
+}
+
 pub(super) fn verify_agent_envelope_signature_for_source(
     envelope: &RawAgentEnvelope,
     expected_source_node_id: Option<&str>,
@@ -532,7 +558,7 @@ pub(super) fn verify_agent_envelope_signature_for_source(
         message_json: &envelope.message_json,
         extensions_json: envelope.extensions_json.as_ref(),
     };
-    crate::crypto::verify_signature_ref(
+    verify_agent_signature_ref(
         signer_ref,
         serde_jcs::to_string(&unsigned)?.as_bytes(),
         signature,
@@ -615,7 +641,7 @@ fn verify_source_agent_card(
         card_hash: &card.card_hash,
         issued_at: card.issued_at,
     };
-    crate::crypto::verify_signature_ref(
+    verify_agent_signature_ref(
         &card.agent_id,
         serde_jcs::to_string(&unsigned)?.as_bytes(),
         signature,
@@ -1364,7 +1390,6 @@ pub(super) fn process_pending_network_commands(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use base64::Engine as _;
     use ed25519_dalek::{Signer, SigningKey};
     use serde::Serialize;
     use serde_json::json;
@@ -1466,6 +1491,45 @@ mod tests {
         let envelope = signed_envelope_with_card("node-a", "node-b");
         verify_agent_envelope_signature_for_source(&envelope, Some("node-a"))
             .expect("valid source agent card and envelope signature");
+    }
+
+    #[test]
+    fn agent_signature_ref_accepts_legacy_base64_public_key() {
+        let identity = crate::crypto::NodeIdentity::random();
+        let message = b"agent-envelope";
+        let public_key =
+            base64::engine::general_purpose::STANDARD.encode(identity.verifying_key().as_bytes());
+        let signature = base64::engine::general_purpose::STANDARD.encode(
+            SigningKey::from_bytes(&identity.secret_bytes())
+                .sign(message)
+                .to_bytes(),
+        );
+
+        verify_agent_signature_ref(&public_key, message, &signature)
+            .expect("verify legacy Base64 public key");
+    }
+
+    #[test]
+    fn agent_signature_ref_rejects_non_ed25519_did_key() {
+        let identity = crate::crypto::NodeIdentity::random();
+        let message = b"agent-envelope";
+        let signature = base64::engine::general_purpose::STANDARD.encode(
+            SigningKey::from_bytes(&identity.secret_bytes())
+                .sign(message)
+                .to_bytes(),
+        );
+        let mut multicodec = vec![0xec, 0x01];
+        multicodec.extend_from_slice(&[7u8; 32]);
+        let did_key = format!("did:key:z{}", bs58::encode(multicodec).into_string());
+
+        let error = verify_agent_signature_ref(&did_key, message, &signature)
+            .expect_err("X25519 did:key must not be accepted for signature verification");
+
+        assert!(
+            error
+                .to_string()
+                .contains("did:key is not an Ed25519 verification key")
+        );
     }
 
     #[test]

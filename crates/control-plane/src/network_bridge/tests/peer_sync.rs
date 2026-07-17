@@ -2721,6 +2721,16 @@ fn set_state_dir_loads_startup_iroh_bootstrap_contacts_into_runtime() {
         observed_at_ms(),
     )
     .expect("remote contact");
+    let existing_contact = build_contact_material(&remote_dir, &remote_endpoint)
+        .expect("existing remote contact material");
+    upsert_contact_material_for_peer(&local_dir, &remote_endpoint, &existing_contact)
+        .expect("save existing contact without network id");
+    assert_eq!(
+        crate::control::load_peer_metadata_records_state(&local_dir)
+            .expect("existing peer metadata rows")[0]
+            .network_id,
+        None
+    );
     std::fs::write(
         local_dir.join("startup_config.json"),
         serde_json::to_vec(&json!({
@@ -2732,13 +2742,11 @@ fn set_state_dir_loads_startup_iroh_bootstrap_contacts_into_runtime() {
     )
     .expect("write startup config");
 
+    let mut config = NetworkP2pConfig::default();
+    config.namespace.network_id = "mainnet:wattetheria".to_owned();
     let mut service = NetworkBridgeService::new(
-        NetworkP2pNode::from_iroh_state_dir(
-            NetworkP2pConfig::default(),
-            local_dir.clone(),
-            local_seed,
-        )
-        .expect("iroh node"),
+        NetworkP2pNode::from_iroh_state_dir(config, local_dir.clone(), local_seed)
+            .expect("iroh node"),
         &[SwarmScope::Global],
         &NetworkProtocolParams::default(),
     )
@@ -2759,7 +2767,9 @@ fn set_state_dir_loads_startup_iroh_bootstrap_contacts_into_runtime() {
     let rows =
         crate::control::load_peer_metadata_records_state(&local_dir).expect("peer metadata rows");
     assert!(rows.iter().any(|row| {
-        row.node_id == remote_endpoint && row.handshake_status == "startup_contact"
+        row.node_id == remote_endpoint
+            && row.network_id.as_deref() == Some("mainnet:wattetheria")
+            && row.handshake_status == "startup_contact"
     }));
 
     wattswarm_network_transport_iroh::shutdown_local_iroh_data_plane(&local_dir);

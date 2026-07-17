@@ -11,6 +11,7 @@ run-queue-legacy = []
 
 [dependencies]
 anyhow = { workspace = true }
+base64 = { workspace = true }
 chrono = { workspace = true }
 hex = { workspace = true }
 rand = { workspace = true }
@@ -33,6 +34,5 @@ wattswarm-storage-core = { workspace = true }
 watt-did = { workspace = true }
 
 [dev-dependencies]
-base64 = { workspace = true }
 bs58 = { workspace = true }
 ed25519-dalek = { workspace = true }

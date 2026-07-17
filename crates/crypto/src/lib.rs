@@ -15,8 +15,6 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret};
 
-const DID_KEY_PREFIX: &str = "did:key:";
-const ED25519_MULTICODEC_PREFIX: [u8; 2] = [0xed, 0x01];
 const PRIVATE_DM_SCHEME: &str = "wattswarm.private.dm.v1";
 const PRIVATE_GROUP_SCHEME: &str = "wattswarm.private.group.gss.v1";
 const PRIVATE_DM_HKDF_SALT: &[u8] = b"wattswarm-private-dm-v1";
@@ -104,57 +102,20 @@ impl NodeIdentity {
 pub fn verify_signature(public_key_hex: &str, message: &[u8], signature_hex: &str) -> Result<()> {
     let key_bytes = hex::decode(public_key_hex).context("decode pubkey")?;
     let sig_bytes = hex::decode(signature_hex).context("decode signature")?;
-    let key_array: [u8; 32] = key_bytes
-        .try_into()
-        .map_err(|_| anyhow::anyhow!("invalid pubkey length"))?;
-    let sig_array: [u8; 64] = sig_bytes
-        .try_into()
-        .map_err(|_| anyhow::anyhow!("invalid signature length"))?;
-
-    let key = VerifyingKey::from_bytes(&key_array)?;
-    let signature = Signature::from_bytes(&sig_array);
-    key.verify(message, &signature)?;
-    Ok(())
+    verify_signature_bytes(&key_bytes, message, &sig_bytes)
 }
 
-pub fn verify_signature_ref(
-    public_key_ref: &str,
-    message: &[u8],
-    signature_b64: &str,
-) -> Result<()> {
-    let key_bytes = decode_public_key_from_ref(public_key_ref)?;
-    let sig_bytes = base64::engine::general_purpose::STANDARD
-        .decode(signature_b64)
-        .context("decode signature")?;
-    let key_array: [u8; 32] = key_bytes
+pub fn verify_signature_bytes(public_key: &[u8], message: &[u8], signature: &[u8]) -> Result<()> {
+    let key_array: [u8; 32] = public_key
         .try_into()
         .map_err(|_| anyhow::anyhow!("invalid pubkey length"))?;
-    let sig_array: [u8; 64] = sig_bytes
+    let sig_array: [u8; 64] = signature
         .try_into()
         .map_err(|_| anyhow::anyhow!("invalid signature length"))?;
     let key = VerifyingKey::from_bytes(&key_array)?;
     let signature = Signature::from_bytes(&sig_array);
     key.verify(message, &signature)?;
     Ok(())
-}
-
-fn decode_public_key_from_ref(public_key_ref: &str) -> Result<Vec<u8>> {
-    if let Some(encoded) = public_key_ref.strip_prefix(DID_KEY_PREFIX) {
-        let encoded = encoded
-            .strip_prefix('z')
-            .ok_or_else(|| anyhow::anyhow!("unsupported did:key multibase"))?;
-        let decoded = bs58::decode(encoded).into_vec().context("decode did:key")?;
-        if decoded.len() < ED25519_MULTICODEC_PREFIX.len() + 32 {
-            anyhow::bail!("did:key is too short");
-        }
-        if decoded[..2] != ED25519_MULTICODEC_PREFIX {
-            anyhow::bail!("did:key is not ed25519");
-        }
-        return Ok(decoded[2..].to_vec());
-    }
-    base64::engine::general_purpose::STANDARD
-        .decode(public_key_ref)
-        .context("decode base64 public key")
 }
 
 pub fn verify_event_signature(event: &Event) -> Result<()> {
@@ -399,20 +360,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn verify_signature_ref_accepts_base64_and_did_key() {
+    fn verify_signature_bytes_accepts_valid_ed25519_signature() {
         let identity = NodeIdentity::random();
         let message = b"agent-envelope";
-        let signature = base64::engine::general_purpose::STANDARD
-            .encode(identity.signing_key.sign(message).to_bytes());
-        let public_key_b64 =
-            base64::engine::general_purpose::STANDARD.encode(identity.verifying_key().as_bytes());
-        verify_signature_ref(&public_key_b64, message, &signature).expect("verify b64");
+        let signature = identity.signing_key.sign(message).to_bytes();
 
-        let mut multicodec = Vec::with_capacity(2 + 32);
-        multicodec.extend_from_slice(&ED25519_MULTICODEC_PREFIX);
-        multicodec.extend_from_slice(identity.verifying_key().as_bytes());
-        let did_key = format!("did:key:z{}", bs58::encode(multicodec).into_string());
-        verify_signature_ref(&did_key, message, &signature).expect("verify did:key");
+        verify_signature_bytes(identity.verifying_key().as_bytes(), message, &signature)
+            .expect("verify raw Ed25519 signature");
+        assert!(
+            verify_signature_bytes(identity.verifying_key().as_bytes(), b"tampered", &signature)
+                .is_err()
+        );
     }
 
     #[test]

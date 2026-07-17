@@ -300,6 +300,7 @@ pub(super) fn transport_contact_direct_network_addrs(
 
 impl NetworkBridgeService {
     pub(super) fn load_startup_bootstrap_contacts(&mut self, state_dir: &Path) -> Result<()> {
+        let network_id = self.runtime.config().namespace.network_id.clone();
         for raw_contact in load_bootstrap_contacts_from_startup_config(state_dir) {
             let (remote_node_id, material, contacts) =
                 match parse_startup_bootstrap_contact(&raw_contact) {
@@ -309,10 +310,15 @@ impl NetworkBridgeService {
                         continue;
                     }
                 };
-            upsert_startup_bootstrap_contact_material(state_dir, &remote_node_id, material)
-                .with_context(|| {
-                    format!("persist startup bootstrap contact material for {remote_node_id}")
-                })?;
+            upsert_startup_bootstrap_contact_material(
+                state_dir,
+                &remote_node_id,
+                &network_id,
+                material,
+            )
+            .with_context(|| {
+                format!("persist startup bootstrap contact material for {remote_node_id}")
+            })?;
             for contact in contacts {
                 if contact.transport == DataTransportRoute::IrohDirect.as_str() {
                     let remote_network_peer_id = iroh_contact_network_peer_id(&contact)?;
@@ -534,6 +540,7 @@ pub(super) fn iroh_contact_network_peer_id(contact: &TransportContactMaterial) -
 fn upsert_startup_bootstrap_contact_material(
     state_dir: &Path,
     remote_node_id: &str,
+    network_id: &str,
     material: Value,
 ) -> Result<()> {
     let now = observed_at_ms();
@@ -561,7 +568,8 @@ fn upsert_startup_bootstrap_contact_material(
             .get("network_id")
             .and_then(Value::as_str)
             .map(str::to_owned)
-            .or_else(|| existing.as_ref().and_then(|entry| entry.network_id.clone())),
+            .or_else(|| existing.as_ref().and_then(|entry| entry.network_id.clone()))
+            .or_else(|| Some(network_id.to_owned())),
         params_version: existing.as_ref().and_then(|entry| entry.params_version),
         params_hash: existing
             .as_ref()

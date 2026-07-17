@@ -38,7 +38,7 @@ rand = "0.8"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-serde_jcs = "0.1"
+serde_jcs = "0.2"
 sha2 = "0.10"
 thiserror = "2.0"
 tokio = { version = "1.42", features = ["macros", "rt-multi-thread", "net"] }
@@ -64,4 +64,4 @@ wattswarm-storage-core = { path = "crates/storage-core" }
 wattswarm-node-core = { path = "crates/node-core" }
 wattswarm-control-plane = { path = "crates/control-plane" }
 wattswarm-run-queue = { path = "crates/run-queue" }
-watt-did = { path = "../watt-did" }
+watt-did = { git = "https://github.com/wattetheria/watt-did.git", branch = "main" }
