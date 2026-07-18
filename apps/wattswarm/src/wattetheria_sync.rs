@@ -289,7 +289,11 @@ impl TopicActivitySnapshot {
 
 impl SocialProjectionSnapshot {
     fn frame(&self) -> Result<ProjectionFrame> {
-        projection_frame("social_projection", self.generated_at, self)
+        let mut frame = projection_frame("social_projection", self.generated_at, self)?;
+        let social_payload =
+            serde_json::to_string(&(&self.relationships, &self.threads, &self.messages))?;
+        frame.cursor = payload_cursor(&social_payload);
+        Ok(frame)
     }
 }
 
@@ -1281,4 +1285,35 @@ pub async fn serve_grpc(state: UiServerState, listen: String) -> Result<()> {
         .serve(addr)
         .await
         .context("serve Wattetheria sync gRPC")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn social_snapshot(generated_at: u64, messages: Vec<Value>) -> SocialProjectionSnapshot {
+        SocialProjectionSnapshot {
+            generated_at,
+            relationships: vec![json!({"relationship_id": "relationship-1"})],
+            threads: vec![json!({"thread_id": "thread-1"})],
+            messages,
+        }
+    }
+
+    #[test]
+    fn social_projection_cursor_tracks_content_not_generation_time() {
+        let first = social_snapshot(1, vec![json!({"message_id": "message-1"})])
+            .frame()
+            .unwrap();
+        let refreshed = social_snapshot(2, vec![json!({"message_id": "message-1"})])
+            .frame()
+            .unwrap();
+        let changed = social_snapshot(3, vec![json!({"message_id": "message-2"})])
+            .frame()
+            .unwrap();
+
+        assert_eq!(first.cursor, refreshed.cursor);
+        assert_ne!(first.cursor, changed.cursor);
+        assert_ne!(first.json_payload, refreshed.json_payload);
+    }
 }
