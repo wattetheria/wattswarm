@@ -473,6 +473,62 @@ fn discovery_bootnode_topic_provider_endpoint(
     Ok(url.to_string())
 }
 
+pub(super) fn record_discovery_signature_verification_diagnostic(
+    state_dir: &Path,
+    record: &SignedDiscoveryNodeRecord,
+    verification: &Result<()>,
+) {
+    if !diagnostics::debug_diagnostics_enabled() {
+        return;
+    }
+    let source_agent_id = record
+        .body
+        .source_agent_card
+        .as_ref()
+        .map(|card| card.agent_id.as_str());
+    let error = verification
+        .as_ref()
+        .err()
+        .map(|error| format!("{error:#}"));
+    diagnostics::record_diagnostic(
+        Some(state_dir),
+        diagnostics::DiagnosticEvent::new(
+            if verification.is_ok() { "info" } else { "warn" },
+            "identity",
+            "discovery_v1.signature.verify",
+            if verification.is_ok() {
+                "success"
+            } else {
+                "failed"
+            },
+            format!(
+                "discovery record signature verification {} peer={}",
+                if verification.is_ok() {
+                    "succeeded"
+                } else {
+                    "failed"
+                },
+                record.body.node_id
+            ),
+        )
+        .object("peer", Some(record.body.node_id.clone()))
+        .source_node_id(Some(record.body.node_id.clone()))
+        .details(json!({
+            "peer_id": record.body.node_id,
+            "source_agent_id": source_agent_id,
+            "has_source_agent_card": record.body.source_agent_card.is_some(),
+            "has_source_agent_card_signature": record
+                .body
+                .source_agent_card
+                .as_ref()
+                .is_some_and(|card| card.signature.is_some()),
+            "verification_scope": "node_signature_and_source_agent_card_hash",
+            "did_agent_signature_checked": false,
+            "error": error,
+        })),
+    );
+}
+
 pub(super) fn apply_discovery_bootnode_record(
     service: &mut NetworkBridgeService,
     node: &mut Node,
@@ -483,7 +539,9 @@ pub(super) fn apply_discovery_bootnode_record(
     record: SignedDiscoveryNodeRecord,
     now_ms: u64,
 ) -> Result<bool> {
-    record.verify_fresh_at(now_ms)?;
+    let verification = record.verify_fresh_at(now_ms);
+    record_discovery_signature_verification_diagnostic(state_dir, &record, &verification);
+    verification?;
     if record.body.network_id != network_id {
         return Ok(false);
     }

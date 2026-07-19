@@ -449,6 +449,9 @@ fn persisted_last_seen_survives_reload_without_restoring_liveness() {
 
 #[test]
 fn stale_connected_peer_expires_and_becomes_reconnect_candidate() {
+    let _env_lock = lock_env_test_mutex();
+    let _debug_diagnostics =
+        EnvVarGuard::set(diagnostics::ENV_NETWORK_DEBUG_DIAGNOSTICS, Some("true"));
     let service_dir = temp_startup_dir("stale-connected-peer-diagnostic");
     let mut service = NetworkBridgeService::new(
         test_network_node(NetworkP2pConfig::default()).expect("node"),
@@ -459,6 +462,7 @@ fn stale_connected_peer_expires_and_becomes_reconnect_candidate() {
     service.set_state_dir(service_dir.clone(), service_dir.join("ui.state"));
     let (dir, peer) =
         register_contacted_peer(&mut service, "stale-connected-peer-expire", [48_u8; 32]);
+    service.record_peer_liveness_from(peer.clone(), "backfill_request");
     let now = Instant::now();
     service
         .peer_sync_state
@@ -485,6 +489,16 @@ fn stale_connected_peer_expires_and_becomes_reconnect_candidate() {
         "peer_last_seen_ttl_expired"
     );
     assert_eq!(diagnostic["details"]["peer_id"], peer.to_string());
+    assert_eq!(diagnostic["details"]["last_seen_observed"], true);
+    assert_eq!(
+        diagnostic["details"]["last_seen_source"],
+        "backfill_request"
+    );
+    assert!(diagnostic["details"]["last_observed_at_ms"].is_number());
+    assert_eq!(
+        diagnostic["details"]["stale_after_ms"],
+        u64::try_from(PEER_LAST_SEEN_TTL.as_millis()).expect("stale ttl fits u64")
+    );
     assert_eq!(diagnostic["details"]["inflight_backfills"], 0);
     assert_eq!(diagnostic["details"]["known_scope_count"], 0);
 
@@ -627,6 +641,9 @@ fn peer_relationship_action_records_outbound_contact_material_diagnostic() {
 
 #[test]
 fn contact_material_failures_record_peer_diagnostics() {
+    let _env_lock = lock_env_test_mutex();
+    let _debug_diagnostics =
+        EnvVarGuard::set(diagnostics::ENV_NETWORK_DEBUG_DIAGNOSTICS, Some("true"));
     let dir = temp_startup_dir("contact-material-failure-diagnostic");
     let peer = random_network_node_id();
     let mut node = Node::open_in_memory_with_roles(&[Role::Proposer]).expect("node");
@@ -644,7 +661,14 @@ fn contact_material_failures_record_peer_diagnostics() {
             Ok(NetworkRuntimeEvent::ContactMaterialOutboundFailure {
                 peer: peer.clone(),
                 request_id: crate::network_p2p::ContactMaterialRequestId::new(42),
-                error: "relay stream closed".to_owned(),
+                error: format!(
+                    concat!(
+                        "iroh control stream request timed out stage=read timeout_ms=30000 contact=",
+                        "{{\"peer_id\":\"{0}\",\"endpoint_id\":\"{0}\",",
+                        "\"relay_urls\":[\"https://relay.wattetheria.com\"]}}"
+                    ),
+                    peer
+                ),
             }),
         )
         .expect("outbound failure");
@@ -666,7 +690,9 @@ fn contact_material_failures_record_peer_diagnostics() {
     assert!(raw.contains(&format!("\"object_id\":\"{}\"", peer)));
     assert!(raw.contains(&format!("\"source_node_id\":\"{}\"", peer)));
     assert!(raw.contains("\"request_id\":\"ContactMaterialRequestId(42)\""));
-    assert!(raw.contains("\"error\":\"relay stream closed\""));
+    assert!(raw.contains("\"timed_out\":true"));
+    assert!(raw.contains("\"control_stage\":\"read\""));
+    assert!(raw.contains("\"relay_urls\":[\"https://relay.wattetheria.com\"]"));
     assert!(raw.contains("\"error\":\"malformed contact material\""));
 
     let rows = diagnostics::list_diagnostics(
@@ -1392,6 +1418,9 @@ fn connection_closed_with_zero_remaining_preserves_peer_sync_state() {
 
 #[test]
 fn stale_backfill_requests_expire_and_release_peer_slot() {
+    let _env_lock = lock_env_test_mutex();
+    let _debug_diagnostics =
+        EnvVarGuard::set(diagnostics::ENV_NETWORK_DEBUG_DIAGNOSTICS, Some("true"));
     let state_dir = temp_startup_dir("backfill-timeout-release");
     let peer = random_network_node_id();
     let mut service = NetworkBridgeService::new(
@@ -1427,6 +1456,10 @@ fn stale_backfill_requests_expire_and_release_peer_slot() {
         .expect("diagnostics");
     assert!(raw.contains("\"phase\":\"request.timeout\""));
     assert!(raw.contains("\"cooldown_ms\":30000"));
+    assert!(raw.contains(&format!("\"peer_id\":\"{peer}\"")));
+    assert!(raw.contains(&format!("\"endpoint_id\":\"{peer}\"")));
+    assert!(raw.contains("\"feed_key\":null"));
+    assert!(raw.contains("\"timeout_reason\":\"deadline_exceeded_without_runtime_response\""));
 }
 
 #[test]
@@ -1700,6 +1733,81 @@ fn remote_busy_defers_without_marking_peer_failed() {
     assert_eq!(state.backfill_failures, 0);
     assert_eq!(state.backfill_peer_health.cooldown, Duration::ZERO);
     assert!(state.next_retry_at >= now + service.backfill_retry_after);
+}
+
+#[test]
+fn backfill_transport_timeout_records_peer_lane_stage_and_contact() {
+    let _env_lock = lock_env_test_mutex();
+    let _debug_diagnostics =
+        EnvVarGuard::set(diagnostics::ENV_NETWORK_DEBUG_DIAGNOSTICS, Some("true"));
+    let state_dir = temp_startup_dir("backfill-transport-timeout-diagnostic");
+    let peer = random_network_node_id();
+    let request_id = BackfillRequestId::new(652);
+    let scope = SwarmScope::Group("crew-7".to_owned());
+    let mut node = Node::open_in_memory_with_roles(&[Role::Proposer]).expect("node");
+    let mut service = NetworkBridgeService::new(
+        test_network_node(NetworkP2pConfig::default()).expect("network node"),
+        &[SwarmScope::Global],
+        &NetworkProtocolParams::default(),
+    )
+    .expect("service");
+    service.set_state_dir(state_dir.clone(), state_dir.join("control.sqlite"));
+    let mut state = PeerSyncState::new(Instant::now());
+    state.record_pending_backfill_with_timeout(
+        request_id,
+        scope.clone(),
+        Some("crew.chat".to_owned()),
+        Instant::now() - Duration::from_secs(5),
+        Duration::from_secs(5),
+    );
+    service.peer_sync_state.insert(peer.clone(), state);
+    let error = format!(
+        concat!(
+            "iroh control stream request timed out stage=connect timeout_ms=5000 contact=",
+            "{{\"peer_id\":\"{0}\",\"endpoint_id\":\"{0}\",",
+            "\"relay_urls\":[\"https://relay.wattetheria.com\"]}}"
+        ),
+        peer
+    );
+
+    let tick = service
+        .process_runtime_event(
+            &mut node,
+            NetworkRuntimeEvent::BackfillOutboundFailure {
+                peer: peer.clone(),
+                request_id,
+                error,
+            },
+        )
+        .expect("process timeout");
+    assert!(matches!(
+        tick,
+        NetworkBridgeTick::BackfillFailed {
+            peer: failed_peer,
+            request_id: failed_request,
+            ..
+        } if failed_peer == peer && failed_request == request_id
+    ));
+
+    let diagnostic = fs::read_to_string(state_dir.join("diagnostics/wattswarm_node.jsonl"))
+        .expect("diagnostic log")
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).expect("diagnostic json"))
+        .find(|entry| entry["phase"] == "request.transport_timeout")
+        .expect("backfill transport timeout diagnostic");
+    assert_eq!(diagnostic["details"]["peer_id"], peer.to_string());
+    assert_eq!(diagnostic["details"]["endpoint_id"], peer.to_string());
+    assert_eq!(diagnostic["details"]["feed_key"], "crew.chat");
+    assert_eq!(diagnostic["details"]["scope"], "group:crew-7");
+    assert_eq!(diagnostic["details"]["timeout_ms"], 5_000);
+    assert_eq!(diagnostic["details"]["timed_out"], true);
+    assert_eq!(diagnostic["details"]["control_stage"], "connect");
+    assert_eq!(
+        diagnostic["details"]["contact_summary"]["relay_urls"],
+        json!(["https://relay.wattetheria.com"])
+    );
+
+    let _ = fs::remove_dir_all(state_dir);
 }
 
 #[test]
@@ -3079,21 +3187,13 @@ fn reconnect_supervision_fairly_rotates_serialized_contact_probes() {
     assert_eq!(
         service
             .run_reconnect_supervision()
-            .expect("same activity does not restart fair rotation"),
-        0
-    );
-    service.record_reconnect_candidate_activity(selected[0].clone(), Instant::now());
-    service.force_reconnect_due_for_peer(&selected[0]);
-    assert_eq!(
-        service
-            .run_reconnect_supervision()
-            .expect("new activity starts one new probe"),
+            .expect("same activity continues the bounded retry cycle"),
         1
     );
     assert_eq!(
         service.pending_contact_material_request_count_for_peer(&selected[0]),
         1,
-        "only a peer with new activity may be probed again"
+        "the oldest attempted peer starts the next fair retry round"
     );
 
     wattswarm_network_transport_iroh::shutdown_local_iroh_data_plane(&local_dir);
@@ -3227,7 +3327,6 @@ fn reconnect_supervision_abandons_stale_peer_until_rediscovered() {
         .expect("upsert remote contact");
     service.remember_peer_address(peer.clone(), address.clone());
     for _ in 0..PEER_RECONNECT_MAX_ATTEMPTS {
-        service.record_reconnect_candidate_activity(peer.clone(), Instant::now());
         service.force_pending_contact_material_request_stale_for_peer(&peer);
         service.force_reconnect_due_for_peer(&peer);
         let attempts = service
@@ -3521,27 +3620,13 @@ fn reconnect_supervision_probes_contact_material_for_disconnected_peer() {
     service.force_reconnect_due_for_peer(&peer);
     let attempts = service
         .run_reconnect_supervision()
-        .expect("stale pending contact material request does not loop");
-    assert_eq!(attempts, 0);
-    assert_eq!(
-        service.pending_contact_material_request_count_for_peer(&peer),
-        0
-    );
-    remote_contact.metadata.generated_at = remote_contact.metadata.generated_at.saturating_add(1);
-    assert!(
-        service
-            .upsert_remote_contact_material(peer.to_string(), remote_contact)
-            .expect("updated contact generation")
-    );
-    service.reactivate_discovered_peer_reconnect(peer.clone(), true);
-    service.force_reconnect_due_for_peer(&peer);
-    let attempts = service
-        .run_reconnect_supervision()
-        .expect("fresh discovery triggers one new probe");
+        .expect("stale pending request advances the bounded retry cycle");
     assert_eq!(attempts, 1);
+    assert_eq!(service.reconnect_attempts_for_peer(&peer), Some(2));
     assert_eq!(
         service.pending_contact_material_request_count_for_peer(&peer),
-        1
+        1,
+        "the retry creates a replacement contact probe"
     );
 
     wattswarm_network_transport_iroh::shutdown_local_iroh_data_plane(&local_dir);

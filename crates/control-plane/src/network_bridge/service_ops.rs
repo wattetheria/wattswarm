@@ -604,22 +604,37 @@ impl NetworkBridgeService {
             .is_some_and(|state| state.recently_seen_at(now))
     }
 
+    #[cfg(test)]
     pub(crate) fn record_peer_liveness(&mut self, peer: NetworkNodeId) {
+        self.record_peer_liveness_from(peer, "liveness");
+    }
+
+    pub(crate) fn record_peer_liveness_from(&mut self, peer: NetworkNodeId, source: &'static str) {
         let now = Instant::now();
         self.peer_sync_state
             .entry(peer.clone())
             .or_insert_with(|| PeerSyncState::new(now))
-            .record_seen_at(now);
+            .record_seen_at(now, source);
         self.record_reconnect_candidate_activity(peer, now);
     }
 
+    #[cfg(test)]
     pub(crate) fn record_peer_scope_activity(&mut self, peer: NetworkNodeId, scope: &SwarmScope) {
+        self.record_peer_scope_activity_from(peer, scope, "scope_activity");
+    }
+
+    pub(crate) fn record_peer_scope_activity_from(
+        &mut self,
+        peer: NetworkNodeId,
+        scope: &SwarmScope,
+        source: &'static str,
+    ) {
         let now = Instant::now();
         let state = self
             .peer_sync_state
             .entry(peer.clone())
             .or_insert_with(|| PeerSyncState::new(now));
-        state.record_seen_at(now);
+        state.record_seen_at(now, source);
         state.known_scopes.insert(scope.clone());
         self.persist_peer_sync_state_for_peer(&peer);
     }
@@ -689,13 +704,22 @@ impl NetworkBridgeService {
         stats.backfill_events_applied += events as u64;
     }
 
+    #[cfg(test)]
     pub(crate) fn mark_peer_connected(&mut self, peer: NetworkNodeId) -> bool {
+        self.mark_peer_connected_from(peer, "connected")
+    }
+
+    pub(crate) fn mark_peer_connected_from(
+        &mut self,
+        peer: NetworkNodeId,
+        source: &'static str,
+    ) -> bool {
         let now = Instant::now();
         let inserted = self.connected_peers.insert(peer.clone());
         self.peer_sync_state
             .entry(peer.clone())
             .or_insert_with(|| PeerSyncState::new(now))
-            .record_seen_at(now);
+            .record_seen_at(now, source);
         self.peer_reconnect_state.remove(&peer);
         self.abandoned_reconnect_peers.remove(&peer);
         self.abandoned_recovery_probe_activity.remove(&peer);
@@ -705,6 +729,7 @@ impl NetworkBridgeService {
     }
 
     pub(crate) fn expire_stale_connected_peers(&mut self, now: Instant) -> usize {
+        let debug_diagnostics = diagnostics::debug_diagnostics_enabled();
         let stale_peers = self
             .connected_peers
             .iter()
@@ -713,23 +738,73 @@ impl NetworkBridgeService {
             .collect::<Vec<_>>();
         let mut expired = 0usize;
         for peer in stale_peers {
-            let (last_seen_age_ms, inflight_backfills, known_scope_count, next_retry_in_ms) = self
+            let (
+                last_seen_age_ms,
+                last_seen_observed,
+                last_seen_source,
+                last_observed_at_ms,
+                inflight_backfills,
+                known_scope_count,
+                next_retry_in_ms,
+                backfill_successes,
+                backfill_failures,
+            ) = self
                 .peer_sync_state
                 .get(&peer)
                 .map(|state| {
                     (
                         now.saturating_duration_since(state.last_seen_at)
                             .as_millis(),
+                        state.last_seen_observed,
+                        state.last_seen_source,
+                        state.last_observed_at_ms,
                         state.inflight_backfills(),
                         state.known_scopes.len(),
                         state
                             .next_retry_at
                             .saturating_duration_since(now)
                             .as_millis(),
+                        state.backfill_successes,
+                        state.backfill_failures,
                     )
                 })
-                .unwrap_or((0, 0, 0, 0));
+                .unwrap_or((0, false, None, None, 0, 0, 0, 0, 0));
+            let had_known_addr = self.known_peer_addrs.contains_key(&peer);
+            let is_global_backfill_provider = self.is_global_backfill_provider(&peer);
+            let allows_outbound_backfill = self.runtime.allows_outbound_backfill_to(&peer);
             if self.mark_peer_disconnected(peer.clone()) {
+                let mut details = json!({
+                    "peer_id": peer.to_string(),
+                    "last_seen_age_ms": last_seen_age_ms,
+                    "inflight_backfills": inflight_backfills,
+                    "known_scope_count": known_scope_count,
+                    "next_retry_in_ms": next_retry_in_ms,
+                });
+                if debug_diagnostics && let Some(object) = details.as_object_mut() {
+                    object.insert("reason".to_owned(), json!("peer_last_seen_ttl_expired"));
+                    object.insert("last_seen_observed".to_owned(), json!(last_seen_observed));
+                    object.insert("last_seen_source".to_owned(), json!(last_seen_source));
+                    object.insert("last_observed_at_ms".to_owned(), json!(last_observed_at_ms));
+                    object.insert(
+                        "stale_after_ms".to_owned(),
+                        json!(PEER_LAST_SEEN_TTL.as_millis()),
+                    );
+                    object.insert("backfill_successes".to_owned(), json!(backfill_successes));
+                    object.insert("backfill_failures".to_owned(), json!(backfill_failures));
+                    object.insert("had_known_direct_addr".to_owned(), json!(had_known_addr));
+                    object.insert(
+                        "is_global_backfill_provider".to_owned(),
+                        json!(is_global_backfill_provider),
+                    );
+                    object.insert(
+                        "allows_outbound_backfill".to_owned(),
+                        json!(allows_outbound_backfill),
+                    );
+                    object.insert(
+                        "reconnect_scheduled".to_owned(),
+                        json!(had_known_addr || allows_outbound_backfill),
+                    );
+                }
                 diagnostics::record_diagnostic(
                     self.state_dir.as_deref(),
                     diagnostics::DiagnosticEvent::new(
@@ -745,15 +820,7 @@ impl NetworkBridgeService {
                     ))
                     .object("peer", Some(peer.to_string()))
                     .source_node_id(Some(peer.to_string()))
-                    .details(json!({
-                        "peer_id": peer.to_string(),
-                        "reason": "peer_last_seen_ttl_expired",
-                        "last_seen_age_ms": last_seen_age_ms,
-                        "stale_after_ms": PEER_LAST_SEEN_TTL.as_millis(),
-                        "inflight_backfills": inflight_backfills,
-                        "known_scope_count": known_scope_count,
-                        "next_retry_in_ms": next_retry_in_ms,
-                    })),
+                    .details(details),
                 );
                 self.schedule_peer_reconnect(peer);
                 expired += 1;
@@ -871,6 +938,13 @@ impl NetworkBridgeService {
     }
 
     fn reconnect_candidate_is_active(&self, peer: &NetworkNodeId, now: Instant) -> bool {
+        if self
+            .peer_reconnect_state
+            .get(peer)
+            .is_some_and(|state| state.attempts > 0 && !state.should_abandon())
+        {
+            return true;
+        }
         let Some(activity_at) = self.recent_reconnect_candidate_activity(peer, now) else {
             return false;
         };
@@ -1096,7 +1170,7 @@ impl NetworkBridgeService {
             .peer_sync_state
             .entry(peer.clone())
             .or_insert_with(|| PeerSyncState::new(now));
-        state.record_seen_at(now);
+        state.record_seen_at(now, "backfill_response");
         state.known_scopes.insert(scope.clone());
         state.record_remote_head_event_ids(scope, feed_key, head_event_ids);
         let was_pending = state.record_backfill_request_completed(request_id, now);
@@ -1178,6 +1252,7 @@ impl NetworkBridgeService {
     }
 
     pub(crate) fn expire_stale_backfill_requests(&mut self, now: Instant) -> usize {
+        let debug_diagnostics = diagnostics::debug_diagnostics_enabled();
         let mut expired = Vec::new();
         for (peer, state) in &self.peer_sync_state {
             for (request_id, pending) in &state.inflight_backfill_requests {
@@ -1209,6 +1284,50 @@ impl NetworkBridgeService {
                 state.backfill_failures = state.backfill_failures.saturating_add(1);
                 cooldown_event = Some(event);
             }
+            let mut details = json!({
+                "request_id": request_id.to_string(),
+                "feed_key": feed_key,
+                "timeout_ms": timeout.as_millis(),
+                "cooldown_ms": cooldown_event.map(|event| {
+                    u64::try_from(event.cooldown.as_millis()).unwrap_or(u64::MAX)
+                }),
+                "recovery_probe": cooldown_event.is_some_and(|event| event.was_recovery_probe),
+                "peer_cooldown_ms": peer_cooldowns.get(peer).map(|event| {
+                    u64::try_from(event.cooldown.as_millis()).unwrap_or(u64::MAX)
+                }),
+                "peer_recovery_probe": peer_cooldowns
+                    .get(peer)
+                    .is_some_and(|event| event.was_recovery_probe),
+            });
+            if debug_diagnostics && let Some(object) = details.as_object_mut() {
+                object.insert("peer_id".to_owned(), json!(peer.to_string()));
+                object.insert("endpoint_id".to_owned(), json!(peer.to_string()));
+                object.insert("scope".to_owned(), json!(scope_hint_label(scope)));
+                object.insert(
+                    "timeout_reason".to_owned(),
+                    json!("deadline_exceeded_without_runtime_response"),
+                );
+                object.insert(
+                    "last_seen_source".to_owned(),
+                    json!(
+                        self.peer_sync_state
+                            .get(peer)
+                            .and_then(|state| state.last_seen_source)
+                    ),
+                );
+                object.insert(
+                    "last_observed_at_ms".to_owned(),
+                    json!(
+                        self.peer_sync_state
+                            .get(peer)
+                            .and_then(|state| state.last_observed_at_ms)
+                    ),
+                );
+                object.insert(
+                    "allows_outbound_backfill".to_owned(),
+                    json!(self.runtime.allows_outbound_backfill_to(peer)),
+                );
+            }
             diagnostics::record_diagnostic(
                 self.state_dir.as_deref(),
                 diagnostics::DiagnosticEvent::new(
@@ -1221,21 +1340,7 @@ impl NetworkBridgeService {
                 .object("backfill", Some(request_id.to_string()))
                 .source_node_id(Some(peer.to_string()))
                 .scope(scope)
-                .details(json!({
-                    "request_id": request_id.to_string(),
-                    "feed_key": feed_key,
-                    "timeout_ms": timeout.as_millis(),
-                    "cooldown_ms": cooldown_event.map(|event| {
-                        u64::try_from(event.cooldown.as_millis()).unwrap_or(u64::MAX)
-                    }),
-                    "recovery_probe": cooldown_event.is_some_and(|event| event.was_recovery_probe),
-                    "peer_cooldown_ms": peer_cooldowns.get(peer).map(|event| {
-                        u64::try_from(event.cooldown.as_millis()).unwrap_or(u64::MAX)
-                    }),
-                    "peer_recovery_probe": peer_cooldowns
-                        .get(peer)
-                        .is_some_and(|event| event.was_recovery_probe),
-                })),
+                .details(details),
             );
         }
         self.persist_peer_sync_state();

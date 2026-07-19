@@ -38,7 +38,7 @@ fn env_test_lock() -> &'static Mutex<()> {
     ENV_LOCK.get_or_init(|| Mutex::new(()))
 }
 
-fn lock_env_test_mutex() -> std::sync::MutexGuard<'static, ()> {
+pub(super) fn lock_env_test_mutex() -> std::sync::MutexGuard<'static, ()> {
     env_test_lock()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())

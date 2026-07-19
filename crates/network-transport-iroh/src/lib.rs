@@ -25,7 +25,7 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::runtime::{Builder as RuntimeBuilder, Runtime, RuntimeFlavor};
 use wattswarm_artifact_store::{ArtifactKind, ArtifactStore};
 use wattswarm_network_transport_core::{
@@ -42,6 +42,7 @@ pub const ENV_IROH_RELAY_URLS: &str = "WATTSWARM_IROH_RELAY_URLS";
 pub const ENV_IROH_BIND_ADDR: &str = "WATTSWARM_IROH_BIND_ADDR";
 pub const ENV_IROH_PUBLISH_DIRECT_ADDRS: &str = "WATTSWARM_IROH_PUBLISH_DIRECT_ADDRS";
 pub const ENV_IROH_DATA_PLANE_START_TIMEOUT_MS: &str = "WATTSWARM_IROH_DATA_PLANE_START_TIMEOUT_MS";
+const ENV_NETWORK_DEBUG_DIAGNOSTICS: &str = "WATTSWARM_NETWORK_DEBUG_DIAGNOSTICS";
 const MAX_FETCH_REQUEST_BYTES: usize = 64 * 1024;
 const MAX_FETCH_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_CONTROL_REQUEST_BYTES: usize = 1024 * 1024;
@@ -54,6 +55,8 @@ const DEFAULT_GOSSIP_MAINTENANCE_INTERVAL_MS: u64 = 1_000;
 const DEFAULT_IROH_DATA_PLANE_START_TIMEOUT_MS: u64 = 120_000;
 const DEFAULT_IROH_CONTROL_STREAM_TIMEOUT_MS: u64 = 30_000;
 const IROH_ONLINE_WAIT_TIMEOUT_MS: u64 = 10_000;
+const CONTROL_STREAM_RECOVERY_TIMEOUT_THRESHOLD: u32 = 3;
+const CONTROL_STREAM_RECOVERY_COOLDOWN: Duration = Duration::from_secs(60);
 const PUBLIC_IP_RESOLVER_TIMEOUT_MS: u64 = 2_000;
 const PUBLIC_IP_CACHE_TTL_SECS: u64 = 300;
 const DIAGNOSTIC_LOG_RELATIVE_PATH: &str = "diagnostics/wattswarm_node.jsonl";
@@ -465,6 +468,7 @@ struct IrohDataPlaneService {
     control_handlers: ControlStreamHandlers,
     fetch_lock: Mutex<()>,
     endpoint_online_awaited: AtomicBool,
+    control_stream_recovery: Mutex<ControlStreamRecoveryState>,
     public_ip_cache: Mutex<Option<PublicIpCacheEntry>>,
     contact_material_diagnostic_key: Mutex<Option<String>>,
     // Sentinel flock held for the lifetime of the service. Drop releases the
@@ -477,7 +481,6 @@ struct IrohDataPlaneService {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct IrohEndpointOptions {
     relay_urls: Vec<RelayUrl>,
-    published_relay_urls: Vec<String>,
     bind_addr: Option<SocketAddr>,
     publish_observed_direct_addrs: bool,
     published_direct_addrs: Vec<String>,
@@ -493,6 +496,33 @@ struct PublicIpResolverResult {
 struct PublicIpCacheEntry {
     resolved_at_secs: u64,
     result: PublicIpResolverResult,
+}
+
+#[derive(Debug, Default)]
+struct ControlStreamRecoveryState {
+    consecutive_timeouts: u32,
+    last_network_change_at: Option<Instant>,
+}
+
+impl ControlStreamRecoveryState {
+    fn record_outcome(&mut self, timed_out: bool, now: Instant) -> bool {
+        if !timed_out {
+            self.consecutive_timeouts = 0;
+            return false;
+        }
+        self.consecutive_timeouts = self.consecutive_timeouts.saturating_add(1);
+        if self.consecutive_timeouts < CONTROL_STREAM_RECOVERY_TIMEOUT_THRESHOLD {
+            return false;
+        }
+        if self.last_network_change_at.is_some_and(|last| {
+            now.saturating_duration_since(last) < CONTROL_STREAM_RECOVERY_COOLDOWN
+        }) {
+            return false;
+        }
+        self.consecutive_timeouts = 0;
+        self.last_network_change_at = Some(now);
+        true
+    }
 }
 
 impl PublicIpCacheEntry {
@@ -554,7 +584,6 @@ impl IrohEndpointOptions {
             })
             .unwrap_or(false);
         Ok(Self {
-            published_relay_urls: relay_urls.iter().map(normalize_public_relay_url).collect(),
             relay_urls,
             bind_addr: parse_optional_socket_addr_env(ENV_IROH_BIND_ADDR, bind_addr)?,
             publish_observed_direct_addrs,
@@ -578,14 +607,14 @@ impl IrohEndpointOptions {
     }
 
     fn published_relay_urls(&self, observed_relay_urls: Vec<String>) -> Vec<String> {
-        let mut relay_urls = self.published_relay_urls.clone();
-        for url in observed_relay_urls {
-            let normalized = url.trim().trim_end_matches('/').to_owned();
-            if !normalized.is_empty() && !relay_urls.contains(&normalized) {
-                relay_urls.push(normalized);
-            }
-        }
-        relay_urls
+        observed_relay_urls
+            .into_iter()
+            .find_map(|url| {
+                let normalized = url.trim().trim_end_matches('/').to_owned();
+                (!normalized.is_empty()).then_some(normalized)
+            })
+            .into_iter()
+            .collect()
     }
 }
 
@@ -1050,6 +1079,7 @@ impl IrohDataPlaneService {
             control_handlers,
             fetch_lock: Mutex::new(()),
             endpoint_online_awaited: AtomicBool::new(false),
+            control_stream_recovery: Mutex::new(ControlStreamRecoveryState::default()),
             public_ip_cache: Mutex::new(None),
             contact_material_diagnostic_key: Mutex::new(None),
             _data_plane_lock: data_plane_lock,
@@ -1233,20 +1263,6 @@ impl IrohDataPlaneService {
                 .map(|value| value.to_string())
                 .collect::<Vec<_>>(),
         );
-        if direct_addrs.is_empty() && relay_urls.is_empty() {
-            self.record_contact_material_export_diagnostic(
-                "error",
-                "empty",
-                "iroh contact material has no public direct addresses or relay urls",
-                online_wait_status,
-                &raw_ip_addrs,
-                &direct_addrs,
-                &relay_urls,
-                public_ip.as_ref(),
-                None,
-            );
-            bail!("iroh contact material has no public direct addresses or relay urls");
-        }
         let contains_global_direct_addr = direct_addrs.iter().any(|raw| {
             raw.parse::<SocketAddr>()
                 .is_ok_and(|addr| ip_addr_is_global(&addr.ip()))
@@ -1335,38 +1351,97 @@ impl IrohDataPlaneService {
         if request_bytes.len() > MAX_CONTROL_REQUEST_BYTES {
             bail!("iroh control stream request exceeds max request bytes");
         }
-        self.block_on(async {
-            tokio::time::timeout(timeout, async {
-                let connection = self
-                    .endpoint
-                    .connect(endpoint_addr, DEFAULT_IROH_CONTROL_ALPN.as_bytes())
-                    .await
-                    .context("connect iroh control stream endpoint")?;
-                let (mut send, mut recv) = connection
-                    .open_bi()
-                    .await
-                    .context("open iroh control stream")?;
+        if !network_debug_diagnostics_enabled() {
+            let result = self.block_on(async {
+                match tokio::time::timeout(timeout, async {
+                    let connection = self
+                        .endpoint
+                        .connect(endpoint_addr, DEFAULT_IROH_CONTROL_ALPN.as_bytes())
+                        .await
+                        .context("connect iroh control stream endpoint")?;
+                    let (mut send, mut recv) = connection
+                        .open_bi()
+                        .await
+                        .context("open iroh control stream")?;
+                    send.write_all(&request_bytes)
+                        .await
+                        .context("write iroh control stream request")?;
+                    send.finish().context("finish control stream request")?;
+                    let response_bytes = recv
+                        .read_to_end(MAX_CONTROL_RESPONSE_BYTES)
+                        .await
+                        .context("read iroh control stream response")?;
+                    serde_json::from_slice(&response_bytes)
+                        .context("decode iroh control stream response")
+                })
+                .await
+                {
+                    Ok(result) => result,
+                    Err(_) => Err(ControlStreamTimeout::request(timeout).into()),
+                }
+            });
+            return self.finish_control_stream_request(result);
+        }
+
+        let contact_summary = control_stream_contact_summary(remote)?;
+        let result = self.block_on(async {
+            let deadline = tokio::time::Instant::now() + timeout;
+            let connection =
+                await_control_stream_stage(deadline, "connect", timeout, &contact_summary, async {
+                    self.endpoint
+                        .connect(endpoint_addr, DEFAULT_IROH_CONTROL_ALPN.as_bytes())
+                        .await
+                        .context("connect iroh control stream endpoint")
+                })
+                .await?;
+            let (mut send, mut recv) =
+                await_control_stream_stage(deadline, "open_bi", timeout, &contact_summary, async {
+                    connection
+                        .open_bi()
+                        .await
+                        .context("open iroh control stream")
+                })
+                .await?;
+            await_control_stream_stage(deadline, "write", timeout, &contact_summary, async {
                 send.write_all(&request_bytes)
                     .await
                     .context("write iroh control stream request")?;
-                send.finish().context("finish control stream request")?;
-                let response_bytes = recv
-                    .read_to_end(MAX_CONTROL_RESPONSE_BYTES)
-                    .await
-                    .context("read iroh control stream response")?;
-                let response: IrohControlStreamResponse =
-                    serde_json::from_slice(&response_bytes)
-                        .context("decode iroh control stream response")?;
-                Ok(response)
+                send.finish().context("finish control stream request")
             })
-            .await
-            .with_context(|| {
-                format!(
-                    "iroh control stream request timed out after {}ms",
-                    timeout.as_millis()
-                )
-            })?
-        })
+            .await?;
+            let response_bytes =
+                await_control_stream_stage(deadline, "read", timeout, &contact_summary, async {
+                    recv.read_to_end(MAX_CONTROL_RESPONSE_BYTES)
+                        .await
+                        .context("read iroh control stream response")
+                })
+                .await?;
+            serde_json::from_slice(&response_bytes).with_context(|| {
+                format!("decode iroh control stream response stage=read contact={contact_summary}")
+            })
+        });
+        self.finish_control_stream_request(result)
+    }
+
+    fn finish_control_stream_request(
+        &self,
+        result: Result<IrohControlStreamResponse>,
+    ) -> Result<IrohControlStreamResponse> {
+        let timed_out = result.as_ref().err().is_some_and(|error| {
+            error
+                .chain()
+                .find_map(|cause| cause.downcast_ref::<ControlStreamTimeout>())
+                .is_some_and(ControlStreamTimeout::triggers_network_recovery)
+        });
+        let notify_network_change = self
+            .control_stream_recovery
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .record_outcome(timed_out, Instant::now());
+        if notify_network_change {
+            self.block_on(self.endpoint.network_change());
+        }
+        result
     }
 
     fn probe_route(
@@ -1526,6 +1601,93 @@ fn endpoint_addr_from_contact_material(contact: &TransportContactMaterial) -> Re
         .collect::<Result<Vec<_>>>()?;
     Ok(EndpointAddr::from_parts(endpoint_id, addrs))
 }
+
+fn network_debug_diagnostics_enabled() -> bool {
+    std::env::var(ENV_NETWORK_DEBUG_DIAGNOSTICS)
+        .ok()
+        .is_some_and(|value| network_debug_diagnostics_value_enabled(&value))
+}
+
+fn network_debug_diagnostics_value_enabled(value: &str) -> bool {
+    matches!(value.trim(), "1" | "true" | "TRUE" | "yes" | "on" | "ON")
+}
+
+fn control_stream_contact_summary(contact: &TransportContactMaterial) -> Result<String> {
+    let extra: IrohTransportMaterial =
+        serde_json::from_value(contact.extra.clone()).context("decode iroh contact material")?;
+    serde_json::to_string(&json!({
+        "peer_id": contact.peer_id,
+        "endpoint_id": extra.endpoint_id,
+        "transport": contact.transport,
+        "generated_at": contact.metadata.generated_at,
+        "relay_urls": extra.relay_urls,
+        "direct_addr_count": extra.direct_addrs.len(),
+    }))
+    .context("encode iroh control stream contact summary")
+}
+
+async fn await_control_stream_stage<T>(
+    deadline: tokio::time::Instant,
+    stage: &'static str,
+    timeout: Duration,
+    contact_summary: &str,
+    future: impl Future<Output = Result<T>>,
+) -> Result<T> {
+    match tokio::time::timeout_at(deadline, future).await {
+        Ok(result) => result.with_context(|| {
+            format!("iroh control stream failed stage={stage} contact={contact_summary}")
+        }),
+        Err(_) => Err(ControlStreamTimeout::stage(stage, timeout, contact_summary).into()),
+    }
+}
+
+#[derive(Debug)]
+struct ControlStreamTimeout {
+    stage: Option<&'static str>,
+    timeout: Duration,
+    contact_summary: Option<String>,
+}
+
+impl ControlStreamTimeout {
+    fn request(timeout: Duration) -> Self {
+        Self {
+            stage: None,
+            timeout,
+            contact_summary: None,
+        }
+    }
+
+    fn stage(stage: &'static str, timeout: Duration, contact_summary: &str) -> Self {
+        Self {
+            stage: Some(stage),
+            timeout,
+            contact_summary: Some(contact_summary.to_owned()),
+        }
+    }
+
+    fn triggers_network_recovery(&self) -> bool {
+        self.stage.is_none_or(|stage| stage == "connect")
+    }
+}
+
+impl std::fmt::Display for ControlStreamTimeout {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match (self.stage, self.contact_summary.as_deref()) {
+            (Some(stage), Some(contact_summary)) => write!(
+                formatter,
+                "iroh control stream request timed out stage={stage} timeout_ms={} contact={contact_summary}",
+                self.timeout.as_millis()
+            ),
+            _ => write!(
+                formatter,
+                "iroh control stream request timed out after {}ms",
+                self.timeout.as_millis()
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ControlStreamTimeout {}
 
 fn iroh_route_probe_result(
     remote: &TransportContactMaterial,
@@ -1977,6 +2139,103 @@ mod tests {
     }
 
     #[test]
+    fn control_stream_timeout_reports_stage_and_contact_summary() {
+        let adapter = IrohTransportAdapter::from_seed_bytes([7_u8; 32]).expect("adapter");
+        let contact = adapter.material_payload(
+            &["203.0.113.7:4002".to_owned()],
+            &[
+                "https://relay.wattetheria.com".to_owned(),
+                "https://relay2.wattetheria.com".to_owned(),
+            ],
+            42,
+        );
+        let summary = control_stream_contact_summary(&contact).expect("contact summary");
+        let summary_json: serde_json::Value = serde_json::from_str(&summary).expect("summary json");
+        assert_eq!(summary_json["peer_id"], contact.peer_id);
+        assert_eq!(summary_json["endpoint_id"], contact.peer_id);
+        assert_eq!(summary_json["generated_at"], 42);
+        assert_eq!(summary_json["direct_addr_count"], 1);
+        assert_eq!(
+            summary_json["relay_urls"],
+            json!([
+                "https://relay.wattetheria.com",
+                "https://relay2.wattetheria.com"
+            ])
+        );
+
+        let runtime = RuntimeBuilder::new_current_thread()
+            .enable_time()
+            .build()
+            .expect("runtime");
+        for stage in ["connect", "open_bi", "write", "read"] {
+            let error = runtime
+                .block_on(await_control_stream_stage(
+                    tokio::time::Instant::now() + Duration::from_millis(1),
+                    stage,
+                    Duration::from_millis(30_000),
+                    &summary,
+                    std::future::pending::<Result<()>>(),
+                ))
+                .expect_err("stage must time out");
+            let error = error.to_string();
+            assert!(error.contains(&format!("stage={stage}")), "{error}");
+            assert!(error.contains("timeout_ms=30000"), "{error}");
+            assert!(error.contains("https://relay2.wattetheria.com"), "{error}");
+            assert!(error.contains(&contact.peer_id), "{error}");
+        }
+    }
+
+    #[test]
+    fn control_stream_diagnostics_env_values_match_network_debug_contract() {
+        for value in ["1", "true", "TRUE", "yes", "on", "ON"] {
+            assert!(
+                network_debug_diagnostics_value_enabled(value),
+                "{value} must enable diagnostics"
+            );
+        }
+        for value in ["", "0", "false", "FALSE", "no", "off", "debug"] {
+            assert!(
+                !network_debug_diagnostics_value_enabled(value),
+                "{value} must not enable diagnostics"
+            );
+        }
+    }
+
+    #[test]
+    fn control_stream_recovery_is_bounded_and_resets_after_success() {
+        let start = Instant::now();
+        let mut state = ControlStreamRecoveryState::default();
+
+        assert!(!state.record_outcome(true, start));
+        assert!(!state.record_outcome(true, start + Duration::from_secs(1)));
+        assert!(state.record_outcome(true, start + Duration::from_secs(2)));
+
+        assert!(!state.record_outcome(true, start + Duration::from_secs(3)));
+        assert!(!state.record_outcome(true, start + Duration::from_secs(4)));
+        assert!(!state.record_outcome(true, start + Duration::from_secs(5)));
+        assert!(!state.record_outcome(false, start + Duration::from_secs(6)));
+
+        assert!(!state.record_outcome(true, start + CONTROL_STREAM_RECOVERY_COOLDOWN));
+        assert!(!state.record_outcome(
+            true,
+            start + CONTROL_STREAM_RECOVERY_COOLDOWN + Duration::from_secs(1)
+        ));
+        assert!(state.record_outcome(
+            true,
+            start + CONTROL_STREAM_RECOVERY_COOLDOWN + Duration::from_secs(2)
+        ));
+        assert!(ControlStreamTimeout::request(Duration::from_secs(1)).triggers_network_recovery());
+        assert!(
+            ControlStreamTimeout::stage("connect", Duration::from_secs(1), "{}")
+                .triggers_network_recovery()
+        );
+        assert!(
+            !ControlStreamTimeout::stage("read", Duration::from_secs(1), "{}")
+                .triggers_network_recovery()
+        );
+    }
+
+    #[test]
     fn iroh_probe_target_accepts_endpoint_id_with_direct_addr() {
         let (endpoint_id, direct_addr) = parse_iroh_probe_target(
             "83393ad000151bc41e686a1fc892e07a440a2a53110bbaeae3d13e5978599956@18.206.214.6:4002",
@@ -2060,15 +2319,37 @@ mod tests {
         )
         .expect("endpoint options");
 
+        assert_eq!(options.relay_urls.len(), 1);
         assert_eq!(
-            options.published_relay_urls,
-            vec!["https://relay.wattetheria.com".to_owned()]
+            normalize_public_relay_url(&options.relay_urls[0]),
+            "https://relay.wattetheria.com"
         );
         assert_eq!(
             options.published_direct_addrs(vec!["10.0.0.1:1234".to_owned()], None),
             Vec::<String>::new()
         );
         assert!(options.published_direct_addrs.is_empty());
+    }
+
+    #[test]
+    fn published_relay_urls_use_only_the_observed_home_relay() {
+        let options = IrohEndpointOptions::from_raw_env(
+            Some("https://relay.wattetheria.com,https://relay2.wattetheria.com"),
+            None,
+            Some("false"),
+        )
+        .expect("endpoint options");
+
+        assert_eq!(
+            options.published_relay_urls(vec![
+                "https://relay2.wattetheria.com/".to_owned(),
+                "https://relay2.wattetheria.com".to_owned(),
+                "https://relay.wattetheria.com".to_owned(),
+            ]),
+            vec!["https://relay2.wattetheria.com".to_owned()]
+        );
+        assert!(options.published_relay_urls(Vec::new()).is_empty());
+        assert_eq!(options.relay_urls.len(), 2);
     }
 
     #[test]
@@ -2121,9 +2402,10 @@ mod tests {
         .expect("write startup config");
 
         let options = IrohEndpointOptions::resolve(dir.path()).expect("resolve options");
+        assert_eq!(options.relay_urls.len(), 1);
         assert_eq!(
-            options.published_relay_urls,
-            vec!["https://relay2.wattetheria.com".to_owned()]
+            normalize_public_relay_url(&options.relay_urls[0]),
+            "https://relay2.wattetheria.com"
         );
     }
 

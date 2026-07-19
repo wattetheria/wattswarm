@@ -1,8 +1,41 @@
 use super::*;
 
 #[test]
+fn discovery_signature_diagnostics_require_debug_env() {
+    let _lock = lock_env_test_mutex();
+    let dir = temp_startup_dir("discovery-signature-debug-env");
+    fs::write(dir.join("node_seed.hex"), hex::encode([102_u8; 32])).expect("write node seed");
+    let record = signed_discovery_record_for_test(
+        &dir,
+        [102_u8; 32],
+        DEFAULT_NETWORK_CONTEXT_ID,
+        0.0,
+        0.0,
+        20.0,
+    );
+
+    let disabled = EnvVarGuard::set(diagnostics::ENV_NETWORK_DEBUG_DIAGNOSTICS, None);
+    record_discovery_signature_verification_diagnostic(&dir, &record, &Ok(()));
+    let disabled_raw =
+        fs::read_to_string(dir.join("diagnostics/wattswarm_node.jsonl")).unwrap_or_default();
+    assert!(!disabled_raw.contains("\"phase\":\"discovery_v1.signature.verify\""));
+    drop(disabled);
+
+    let _enabled = EnvVarGuard::set(diagnostics::ENV_NETWORK_DEBUG_DIAGNOSTICS, Some("true"));
+    record_discovery_signature_verification_diagnostic(&dir, &record, &Ok(()));
+    let raw =
+        fs::read_to_string(dir.join("diagnostics/wattswarm_node.jsonl")).expect("diagnostic log");
+    assert!(raw.contains("\"phase\":\"discovery_v1.signature.verify\""));
+    assert!(raw.contains("\"status\":\"success\""));
+
+    fs::remove_dir_all(dir).expect("cleanup");
+}
+
+#[test]
 fn discovery_bootnode_record_registers_iroh_contact_inside_radius_without_marking_connected() {
     let _lock = lock_env_test_mutex();
+    let _debug_diagnostics =
+        EnvVarGuard::set(diagnostics::ENV_NETWORK_DEBUG_DIAGNOSTICS, Some("true"));
     let local_dir = temp_startup_dir("discovery-v1-local");
     let remote_dir = temp_startup_dir("discovery-v1-remote");
     let local_seed = [103u8; 32];
@@ -158,6 +191,27 @@ fn discovery_bootnode_record_registers_iroh_contact_inside_radius_without_markin
     assert!(updated);
     assert!(!service.reconnect_abandoned_for_peer(&remote_peer));
     assert_eq!(service.reconnect_attempts_for_peer(&remote_peer), Some(0));
+    let signature_diagnostics =
+        fs::read_to_string(local_dir.join("diagnostics/wattswarm_node.jsonl"))
+            .expect("discovery signature diagnostics")
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).expect("diagnostic json"))
+            .filter(|entry| entry["phase"] == "discovery_v1.signature.verify")
+            .collect::<Vec<_>>();
+    assert_eq!(signature_diagnostics.len(), 1);
+    assert!(
+        signature_diagnostics
+            .iter()
+            .all(|entry| entry["status"] == "success")
+    );
+    assert_eq!(
+        signature_diagnostics[0]["details"]["source_agent_id"],
+        "did:key:zRemoteDiscoveryAgent"
+    );
+    assert_eq!(
+        signature_diagnostics[0]["details"]["did_agent_signature_checked"],
+        false
+    );
 
     wattswarm_network_transport_iroh::shutdown_local_iroh_data_plane(&local_dir);
     wattswarm_network_transport_iroh::shutdown_local_iroh_data_plane(&remote_dir);
@@ -313,6 +367,9 @@ fn discovery_bootnode_record_accepts_candidate_without_local_geo() {
 
 #[test]
 fn discovery_bootnode_record_rejects_self_stale_and_out_of_radius_records() {
+    let _lock = lock_env_test_mutex();
+    let _debug_diagnostics =
+        EnvVarGuard::set(diagnostics::ENV_NETWORK_DEBUG_DIAGNOSTICS, Some("true"));
     let local_dir = temp_startup_dir("discovery-v1-reject-local");
     let remote_dir = temp_startup_dir("discovery-v1-reject-remote");
     let local_seed = [105u8; 32];
@@ -392,6 +449,19 @@ fn discovery_bootnode_record_rejects_self_stale_and_out_of_radius_records() {
             observed_at_ms(),
         )
         .is_err()
+    );
+    let signature_failure = fs::read_to_string(local_dir.join("diagnostics/wattswarm_node.jsonl"))
+        .expect("discovery signature failure diagnostic")
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).expect("diagnostic json"))
+        .find(|entry| {
+            entry["phase"] == "discovery_v1.signature.verify" && entry["status"] == "failed"
+        })
+        .expect("failed signature diagnostic");
+    assert!(
+        signature_failure["details"]["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("expired"))
     );
 
     let self_record = signed_discovery_record_for_test(

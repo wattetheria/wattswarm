@@ -2019,9 +2019,14 @@ fn ui_join_manifest_publishes_explicit_direct_contact_when_enabled() {
             contact["transports"][0]["extra"]["direct_addrs"][0].as_str(),
             Some("127.0.0.1:7777")
         );
-        assert_eq!(
-            contact["transports"][0]["extra"]["relay_urls"][0].as_str(),
-            Some("https://relay.wattetheria.com")
+        let relay_urls = contact["transports"][0]["extra"]["relay_urls"]
+            .as_array()
+            .expect("relay urls");
+        assert!(relay_urls.len() <= 1);
+        assert!(
+            relay_urls
+                .iter()
+                .all(|relay| { relay.as_str() == Some("https://relay.wattetheria.com") })
         );
     });
     wattswarm_network_transport_iroh::shutdown_local_iroh_data_plane(&state_dir);

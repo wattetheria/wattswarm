@@ -199,7 +199,8 @@ use discovery_bootnode::{
 };
 #[cfg(test)]
 use discovery_bootnode::{
-    discovery_bootnode_failure_log_decision, reset_discovery_bootnode_failure_log_state,
+    discovery_bootnode_failure_log_decision, record_discovery_signature_verification_diagnostic,
+    reset_discovery_bootnode_failure_log_state,
 };
 use event_relevance::EventRelevanceFilter;
 #[cfg(test)]
@@ -579,6 +580,7 @@ impl BackfillLaneKey {
 struct PeerSyncState {
     last_seen_at: Instant,
     last_seen_observed: bool,
+    last_seen_source: Option<&'static str>,
     last_observed_at_ms: Option<u64>,
     last_backfill_request_at: Option<Instant>,
     next_retry_at: Instant,
@@ -743,6 +745,7 @@ impl PeerSyncState {
         Self {
             last_seen_at: now,
             last_seen_observed: true,
+            last_seen_source: Some("init"),
             last_observed_at_ms: Some(observed_at_ms().saturating_sub(observed_age_ms)),
             last_backfill_request_at: None,
             next_retry_at: now,
@@ -762,6 +765,7 @@ impl PeerSyncState {
     fn new_unobserved(now: Instant) -> Self {
         let mut state = Self::new(now);
         state.last_seen_observed = false;
+        state.last_seen_source = None;
         state.last_observed_at_ms = None;
         state
     }
@@ -775,9 +779,10 @@ impl PeerSyncState {
         state
     }
 
-    fn record_seen_at(&mut self, now: Instant) {
+    fn record_seen_at(&mut self, now: Instant, source: &'static str) {
         self.last_seen_at = now;
         self.last_seen_observed = true;
+        self.last_seen_source = Some(source);
         self.last_observed_at_ms = Some(observed_at_ms());
     }
 

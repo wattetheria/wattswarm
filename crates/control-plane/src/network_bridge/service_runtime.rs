@@ -80,6 +80,203 @@ fn is_missing_iroh_contact_material_error(error: &str) -> bool {
     error.starts_with("missing iroh contact material for ")
 }
 
+fn control_stream_failure_stage(error: &str) -> Option<&'static str> {
+    ["connect", "open_bi", "write", "read"]
+        .into_iter()
+        .find(|stage| error.contains(&format!("stage={stage}")))
+}
+
+fn control_stream_contact_summary_from_error(error: &str) -> Option<Value> {
+    let (_, raw) = error.split_once(" contact=")?;
+    serde_json::from_str(raw).ok()
+}
+
+fn record_backfill_outbound_failure_diagnostic(
+    state_dir: Option<&Path>,
+    peer: &NetworkNodeId,
+    request_id: BackfillRequestId,
+    error: &str,
+    pending: Option<&PendingBackfillRequest>,
+    failure_at: Instant,
+) {
+    if !diagnostics::debug_diagnostics_enabled() {
+        return;
+    }
+    let timed_out = error.contains("timed out");
+    let control_stage = control_stream_failure_stage(error);
+    let contact_summary = control_stream_contact_summary_from_error(error);
+    let endpoint_id = contact_summary
+        .as_ref()
+        .and_then(|summary| summary.get("endpoint_id"))
+        .and_then(Value::as_str)
+        .unwrap_or(peer.as_str())
+        .to_owned();
+    let mut diagnostic = diagnostics::DiagnosticEvent::new(
+        "warn",
+        "backfill",
+        if timed_out {
+            "request.transport_timeout"
+        } else {
+            "request.transport_failure"
+        },
+        "failed",
+        format!("backfill outbound failed peer={peer} request_id={request_id} error={error}"),
+    )
+    .object("peer", Some(peer.to_string()))
+    .source_node_id(Some(peer.to_string()))
+    .details(json!({
+        "peer_id": peer.to_string(),
+        "endpoint_id": endpoint_id,
+        "request_id": request_id.to_string(),
+        "feed_key": pending.and_then(|request| request.feed_key.as_deref()),
+        "scope": pending.map(|request| scope_hint_label(&request.scope)),
+        "timeout_ms": pending.map(|request| request.timeout.as_millis()),
+        "elapsed_ms": pending.map(|request| {
+            failure_at
+                .saturating_duration_since(request.sent_at)
+                .as_millis()
+        }),
+        "timed_out": timed_out,
+        "timeout_reason": timed_out.then_some(error),
+        "control_stage": control_stage,
+        "contact_summary": contact_summary,
+        "error": error,
+    }));
+    if let Some(pending) = pending {
+        diagnostic = diagnostic.scope(&pending.scope);
+    }
+    diagnostics::record_diagnostic(state_dir, diagnostic);
+}
+
+fn record_agent_signature_verification_diagnostic(
+    state_dir: Option<&Path>,
+    peer: &NetworkNodeId,
+    envelope: &RawAgentEnvelope,
+    verification_context: &'static str,
+    result: &Result<()>,
+) {
+    if !diagnostics::debug_diagnostics_enabled() {
+        return;
+    }
+    let source_agent_id = envelope.source_agent_id.as_deref().or_else(|| {
+        envelope
+            .source_agent_card
+            .as_ref()
+            .map(|card| card.agent_id.as_str())
+    });
+    let (did_parse_status, did_parse_error) = match source_agent_id {
+        Some(agent_id) if agent_id.starts_with("did:") => match watt_did::Did::parse(agent_id) {
+            Ok(_) => ("success", None),
+            Err(error) => ("failed", Some(error.to_string())),
+        },
+        Some(_) => ("not_applicable", None),
+        None => ("missing", None),
+    };
+    let verification_error = result.as_ref().err().map(|error| format!("{error:#}"));
+    let verification_performed = envelope.signature.is_some()
+        || envelope
+            .source_agent_card
+            .as_ref()
+            .is_some_and(|card| card.signature.is_some());
+    diagnostics::record_diagnostic(
+        state_dir,
+        diagnostics::DiagnosticEvent::new(
+            if result.is_ok() { "info" } else { "warn" },
+            "identity",
+            "agent.signature.verify",
+            if result.is_ok() { "success" } else { "failed" },
+            format!(
+                "agent signature verification {} peer={peer} context={verification_context}",
+                if result.is_ok() {
+                    "succeeded"
+                } else {
+                    "failed"
+                }
+            ),
+        )
+        .object("peer", Some(peer.to_string()))
+        .source_node_id(Some(peer.to_string()))
+        .details(json!({
+            "peer_id": peer.to_string(),
+            "verification_context": verification_context,
+            "verification_performed": verification_performed,
+            "source_agent_id": source_agent_id,
+            "source_node_id": envelope.source_node_id,
+            "expected_source_node_id": peer.to_string(),
+            "has_agent_signature": envelope.signature.is_some(),
+            "has_source_agent_card": envelope.source_agent_card.is_some(),
+            "has_source_agent_card_signature": envelope
+                .source_agent_card
+                .as_ref()
+                .is_some_and(|card| card.signature.is_some()),
+            "did_parse_status": did_parse_status,
+            "did_parse_error": did_parse_error,
+            "error": verification_error,
+        })),
+    );
+}
+
+fn contact_material_outbound_failure_diagnostic_details(
+    peer: &NetworkNodeId,
+    request_id: ContactMaterialRequestId,
+    error: &str,
+) -> Value {
+    let mut details = json!({
+        "peer_id": peer.to_string(),
+        "request_id": format!("{request_id:?}"),
+        "error": error,
+    });
+    if diagnostics::debug_diagnostics_enabled()
+        && let Some(object) = details.as_object_mut()
+    {
+        object.insert("timed_out".to_owned(), json!(error.contains("timed out")));
+        object.insert(
+            "control_stage".to_owned(),
+            json!(control_stream_failure_stage(error)),
+        );
+        object.insert(
+            "contact_summary".to_owned(),
+            json!(control_stream_contact_summary_from_error(error)),
+        );
+    }
+    details
+}
+
+fn record_peer_relationship_outbound_failure_diagnostic(
+    state_dir: Option<&Path>,
+    peer: &NetworkNodeId,
+    request_id: PeerRelationshipRequestId,
+    action: crate::control::PeerRelationshipAction,
+    error: &str,
+) {
+    if !diagnostics::debug_diagnostics_enabled() {
+        return;
+    }
+    diagnostics::record_diagnostic(
+        state_dir,
+        diagnostics::DiagnosticEvent::new(
+            "warn",
+            "transport",
+            "peer_relationship.outbound",
+            "failed",
+            format!(
+                "peer_relationship_outbound_failure peer={peer} request_id={request_id:?} error={error}"
+            ),
+        )
+        .object("peer", Some(peer.to_string()))
+        .source_node_id(Some(peer.to_string()))
+        .details(json!({
+            "peer_id": peer.to_string(),
+            "request_id": format!("{request_id:?}"),
+            "action": action.as_str(),
+            "timed_out": error.contains("timed out"),
+            "control_stage": control_stream_failure_stage(error),
+            "contact_summary": control_stream_contact_summary_from_error(error),
+            "error": error,
+        })),
+    );
+}
+
 fn peer_metadata_needs_private_message_contact_material(
     state_dir: &Path,
     peer: &NetworkNodeId,
@@ -479,7 +676,8 @@ impl NetworkBridgeService {
                 {
                     self.remember_peer_address(peer.clone(), remote_addr.clone());
                 }
-                let newly_connected = self.mark_peer_connected(peer.clone());
+                let newly_connected =
+                    self.mark_peer_connected_from(peer.clone(), "connection_established");
                 if let Some(state_dir) = &self.state_dir {
                     let remote_addr_text = remote_addr.to_string();
                     let _ = crate::control::add_discovered_peer_endpoint_with_source(
@@ -541,7 +739,7 @@ impl NetworkBridgeService {
                 Ok(NetworkBridgeTick::Connected { peer })
             }
             NetworkRuntimeEvent::GossipNeighborUp { peer, scope, kind } => {
-                self.record_peer_scope_activity(peer.clone(), &scope);
+                self.record_peer_scope_activity_from(peer.clone(), &scope, "gossip_neighbor_up");
                 Ok(NetworkBridgeTick::TransportNotice {
                     detail: format!("gossip_neighbor_up peer={peer} scope={scope:?} kind={kind:?}"),
                 })
@@ -692,9 +890,10 @@ impl NetworkBridgeService {
                                 ),
                             });
                         }
-                        self.record_peer_scope_activity(
+                        self.record_peer_scope_activity_from(
                             propagation_source.clone(),
                             &envelope.scope,
+                            "gossip_event",
                         );
                         let ingested_event = ingest_event_envelope(node, &envelope)?;
                         diagnostics::record_diagnostic(
@@ -733,9 +932,10 @@ impl NetworkBridgeService {
                         })
                     }
                     GossipMessage::Chat(envelope) => {
-                        self.record_peer_scope_activity(
+                        self.record_peer_scope_activity_from(
                             propagation_source.clone(),
                             &envelope.scope,
+                            "gossip_chat",
                         );
                         let ingested_event = ingest_event_envelope(node, &envelope)?;
                         diagnostics::record_diagnostic(
@@ -802,7 +1002,11 @@ impl NetworkBridgeService {
                         })
                     }
                     GossipMessage::Summary(summary) => {
-                        self.record_peer_scope_activity(propagation_source.clone(), &summary.scope);
+                        self.record_peer_scope_activity_from(
+                            propagation_source.clone(),
+                            &summary.scope,
+                            "gossip_summary",
+                        );
                         apply_summary_announcement(node, &summary)?;
                         diagnostics::record_diagnostic(
                             self.state_dir.as_deref(),
@@ -834,7 +1038,11 @@ impl NetworkBridgeService {
                         })
                     }
                     GossipMessage::Rule(rule) => {
-                        self.record_peer_scope_activity(propagation_source.clone(), &rule.scope);
+                        self.record_peer_scope_activity_from(
+                            propagation_source.clone(),
+                            &rule.scope,
+                            "gossip_rule",
+                        );
                         apply_rule_announcement(node, &rule)?;
                         self.record_scope_rule_applied(&rule.scope);
                         Ok(NetworkBridgeTick::RuleApplied {
@@ -844,9 +1052,10 @@ impl NetworkBridgeService {
                         })
                     }
                     GossipMessage::Checkpoint(checkpoint) => {
-                        self.record_peer_scope_activity(
+                        self.record_peer_scope_activity_from(
                             propagation_source.clone(),
                             &checkpoint.scope,
+                            "gossip_checkpoint",
                         );
                         apply_checkpoint_announcement(node, &checkpoint)?;
                         if let Some(state_dir) = &self.state_dir {
@@ -875,7 +1084,7 @@ impl NetworkBridgeService {
                 request,
                 request_id,
             } => {
-                self.record_peer_liveness(peer.clone());
+                self.record_peer_liveness_from(peer.clone(), "backfill_request");
                 let authorized = self.inbound_backfill_authorized(&peer, &request);
                 let debug_diagnostics = diagnostics::debug_diagnostics_enabled();
                 let mut serve_metrics = None;
@@ -1177,6 +1386,20 @@ impl NetworkBridgeService {
                         ),
                     });
                 }
+                let failure_at = Instant::now();
+                let pending = self
+                    .peer_sync_state
+                    .get(&peer)
+                    .and_then(|state| state.inflight_backfill_requests.get(&request_id))
+                    .cloned();
+                record_backfill_outbound_failure_diagnostic(
+                    self.state_dir.as_deref(),
+                    &peer,
+                    request_id,
+                    &error,
+                    pending.as_ref(),
+                    failure_at,
+                );
                 self.mark_backfill_failed(peer.clone(), request_id);
                 self.mark_peer_control_stream_failed(peer.clone());
                 if is_missing_iroh_contact_material_error(&error) {
@@ -1328,7 +1551,8 @@ impl NetworkBridgeService {
                     })),
                 );
                 if response_applied {
-                    let newly_connected = self.mark_peer_connected(peer.clone());
+                    let newly_connected =
+                        self.mark_peer_connected_from(peer.clone(), "contact_material_request");
                     if newly_connected {
                         return Ok(NetworkBridgeTick::Connected { peer });
                     }
@@ -1342,7 +1566,7 @@ impl NetworkBridgeService {
                 request_id,
                 response,
             } => {
-                self.record_peer_liveness(peer.clone());
+                self.record_peer_liveness_from(peer.clone(), "contact_material_response");
                 let Some(pending) = self.pending_contact_material_requests.remove(&request_id)
                 else {
                     return Ok(NetworkBridgeTick::TransportNotice {
@@ -1381,7 +1605,8 @@ impl NetworkBridgeService {
                         contact_material,
                     )?;
                 }
-                let newly_connected = self.mark_peer_connected(peer.clone());
+                let newly_connected =
+                    self.mark_peer_connected_from(peer.clone(), "contact_material_response");
                 if let Some(state_dir) = &self.state_dir {
                     let _ = crate::control::add_discovered_peer_endpoint_with_source(
                         state_dir,
@@ -1419,6 +1644,8 @@ impl NetworkBridgeService {
             } => {
                 self.pending_contact_material_requests.remove(&request_id);
                 self.mark_peer_control_stream_failed(peer.clone());
+                let details =
+                    contact_material_outbound_failure_diagnostic_details(&peer, request_id, &error);
                 diagnostics::record_diagnostic(
                     self.state_dir.as_deref(),
                     diagnostics::DiagnosticEvent::new(
@@ -1432,11 +1659,7 @@ impl NetworkBridgeService {
                     )
                     .object("peer", Some(peer.to_string()))
                     .source_node_id(Some(peer.to_string()))
-                    .details(json!({
-                        "peer_id": peer.to_string(),
-                        "request_id": format!("{request_id:?}"),
-                        "error": &error,
-                    })),
+                    .details(details),
                 );
                 Ok(NetworkBridgeTick::TransportNotice {
                     detail: format!(
@@ -1470,7 +1693,7 @@ impl NetworkBridgeService {
                 request,
                 request_id,
             } => {
-                self.record_peer_liveness(peer.clone());
+                self.record_peer_liveness_from(peer.clone(), "peer_relationship_request");
                 let action = control_peer_relationship_action(request.action);
                 let local_node_id = self.local_peer_id().to_string();
                 let now = observed_at_ms();
@@ -1575,10 +1798,18 @@ impl NetworkBridgeService {
                         )?;
                     }
                     if let Some(agent_envelope) = request.agent_envelope.as_ref() {
-                        verify_agent_envelope_signature_for_source(
+                        let verification = verify_agent_envelope_signature_for_source(
                             agent_envelope,
                             Some(&request.source_node_id),
-                        )?;
+                        );
+                        record_agent_signature_verification_diagnostic(
+                            Some(&state_dir),
+                            &peer,
+                            agent_envelope,
+                            "peer_relationship.request",
+                            &verification,
+                        );
+                        verification?;
                     }
                     match crate::control::apply_peer_relationship_action_state(
                         &state_dir,
@@ -1767,7 +1998,7 @@ impl NetworkBridgeService {
                 request_id,
                 response,
             } => {
-                self.record_peer_liveness(peer.clone());
+                self.record_peer_liveness_from(peer.clone(), "peer_relationship_response");
                 let Some(pending) = self.pending_relationship_requests.remove(&request_id) else {
                     return Ok(NetworkBridgeTick::TransportNotice {
                         detail: format!(
@@ -1912,6 +2143,13 @@ impl NetworkBridgeService {
                     .as_ref()
                     .map(|pending| pending.action)
                     .unwrap_or(crate::control::PeerRelationshipAction::Request);
+                record_peer_relationship_outbound_failure_diagnostic(
+                    self.state_dir.as_deref(),
+                    &peer,
+                    request_id,
+                    action,
+                    &error,
+                );
                 if let (Some(state_dir), Some(pending)) = (self.state_dir.as_deref(), pending) {
                     record_peer_relationship_action_command_failure(
                         state_dir,
@@ -2008,6 +2246,7 @@ mod tests {
 
     #[test]
     fn backfill_serve_diagnostics_require_debug_env() {
+        let _env_lock = crate::network_bridge::tests::lock_env_test_mutex();
         let dir = service_runtime_test_dir("backfill-serve-debug-env");
         let peer =
             NetworkNodeId::new("9b196ed13c0ec849dd7b8bf5add0b07ad2c88c1bf5d79e8591f6681ab1803258")
@@ -2057,6 +2296,220 @@ mod tests {
             .expect("diagnostic log");
         assert!(raw.contains("\"phase\":\"backfill.serve\""));
         assert!(raw.contains("\"exclude_topic_events\":true"));
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn control_stream_failure_metadata_is_extracted_for_diagnostics() {
+        let error = concat!(
+            "iroh control stream request timed out stage=open_bi timeout_ms=30000 contact=",
+            "{\"peer_id\":\"peer-a\",\"endpoint_id\":\"endpoint-a\",",
+            "\"relay_urls\":[\"https://relay.wattetheria.com\"]}"
+        );
+
+        assert_eq!(control_stream_failure_stage(error), Some("open_bi"));
+        let summary =
+            control_stream_contact_summary_from_error(error).expect("contact summary json");
+        assert_eq!(summary["peer_id"], "peer-a");
+        assert_eq!(summary["endpoint_id"], "endpoint-a");
+        assert_eq!(
+            summary["relay_urls"],
+            json!(["https://relay.wattetheria.com"])
+        );
+    }
+
+    #[test]
+    fn backfill_failure_diagnostics_require_debug_env() {
+        let _env_lock = crate::network_bridge::tests::lock_env_test_mutex();
+        let dir = service_runtime_test_dir("backfill-failure-debug-env");
+        let peer =
+            NetworkNodeId::new("9b196ed13c0ec849dd7b8bf5add0b07ad2c88c1bf5d79e8591f6681ab1803258")
+                .expect("peer id");
+        let request_id = BackfillRequestId::new(652);
+        let failure_at = Instant::now();
+        let pending = PendingBackfillRequest {
+            scope: SwarmScope::Group("crew-7".to_owned()),
+            feed_key: Some("crew.chat".to_owned()),
+            sent_at: failure_at - Duration::from_secs(5),
+            timeout: Duration::from_secs(5),
+        };
+        let error = format!(
+            concat!(
+                "iroh control stream request timed out stage=connect timeout_ms=5000 contact=",
+                "{{\"peer_id\":\"{0}\",\"endpoint_id\":\"{0}\",",
+                "\"relay_urls\":[\"https://relay.wattetheria.com\"]}}"
+            ),
+            peer
+        );
+
+        let disabled = EnvVarGuard::set(diagnostics::ENV_NETWORK_DEBUG_DIAGNOSTICS, None);
+        record_backfill_outbound_failure_diagnostic(
+            Some(&dir),
+            &peer,
+            request_id,
+            &error,
+            Some(&pending),
+            failure_at,
+        );
+        assert!(!dir.join("diagnostics/wattswarm_node.jsonl").exists());
+        drop(disabled);
+
+        let _enabled = EnvVarGuard::set(diagnostics::ENV_NETWORK_DEBUG_DIAGNOSTICS, Some("true"));
+        record_backfill_outbound_failure_diagnostic(
+            Some(&dir),
+            &peer,
+            request_id,
+            &error,
+            Some(&pending),
+            failure_at,
+        );
+        let diagnostic = fs::read_to_string(dir.join("diagnostics/wattswarm_node.jsonl"))
+            .expect("diagnostic log")
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).expect("diagnostic json"))
+            .find(|entry| entry["phase"] == "request.transport_timeout")
+            .expect("backfill timeout diagnostic");
+        assert_eq!(diagnostic["details"]["peer_id"], peer.to_string());
+        assert_eq!(diagnostic["details"]["feed_key"], "crew.chat");
+        assert_eq!(diagnostic["details"]["control_stage"], "connect");
+        assert_eq!(
+            diagnostic["details"]["contact_summary"]["relay_urls"],
+            json!(["https://relay.wattetheria.com"])
+        );
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn contact_material_failure_details_require_debug_env() {
+        let _env_lock = crate::network_bridge::tests::lock_env_test_mutex();
+        let peer =
+            NetworkNodeId::new("9b196ed13c0ec849dd7b8bf5add0b07ad2c88c1bf5d79e8591f6681ab1803258")
+                .expect("peer id");
+        let request_id = ContactMaterialRequestId::new(42);
+        let error = format!(
+            concat!(
+                "iroh control stream request timed out stage=read timeout_ms=30000 contact=",
+                "{{\"peer_id\":\"{0}\",\"endpoint_id\":\"{0}\",",
+                "\"relay_urls\":[\"https://relay.wattetheria.com\"]}}"
+            ),
+            peer
+        );
+
+        let disabled = EnvVarGuard::set(diagnostics::ENV_NETWORK_DEBUG_DIAGNOSTICS, None);
+        let details =
+            contact_material_outbound_failure_diagnostic_details(&peer, request_id, &error);
+        assert!(details.get("timed_out").is_none());
+        assert!(details.get("control_stage").is_none());
+        assert!(details.get("contact_summary").is_none());
+        drop(disabled);
+
+        let _enabled = EnvVarGuard::set(diagnostics::ENV_NETWORK_DEBUG_DIAGNOSTICS, Some("true"));
+        let details =
+            contact_material_outbound_failure_diagnostic_details(&peer, request_id, &error);
+        assert_eq!(details["timed_out"], true);
+        assert_eq!(details["control_stage"], "read");
+        assert_eq!(
+            details["contact_summary"]["relay_urls"],
+            json!(["https://relay.wattetheria.com"])
+        );
+    }
+
+    #[test]
+    fn peer_relationship_failure_diagnostics_require_debug_env() {
+        let _env_lock = crate::network_bridge::tests::lock_env_test_mutex();
+        let dir = service_runtime_test_dir("peer-relationship-failure-debug-env");
+        let peer =
+            NetworkNodeId::new("9b196ed13c0ec849dd7b8bf5add0b07ad2c88c1bf5d79e8591f6681ab1803258")
+                .expect("peer id");
+        let request_id = PeerRelationshipRequestId::new(43);
+        let error = "iroh control stream request timed out stage=open_bi timeout_ms=30000";
+
+        let disabled = EnvVarGuard::set(diagnostics::ENV_NETWORK_DEBUG_DIAGNOSTICS, None);
+        record_peer_relationship_outbound_failure_diagnostic(
+            Some(&dir),
+            &peer,
+            request_id,
+            crate::control::PeerRelationshipAction::Request,
+            error,
+        );
+        assert!(!dir.join("diagnostics/wattswarm_node.jsonl").exists());
+        drop(disabled);
+
+        let _enabled = EnvVarGuard::set(diagnostics::ENV_NETWORK_DEBUG_DIAGNOSTICS, Some("true"));
+        record_peer_relationship_outbound_failure_diagnostic(
+            Some(&dir),
+            &peer,
+            request_id,
+            crate::control::PeerRelationshipAction::Request,
+            error,
+        );
+        let raw = fs::read_to_string(dir.join("diagnostics/wattswarm_node.jsonl"))
+            .expect("diagnostic log");
+        assert!(raw.contains("\"phase\":\"peer_relationship.outbound\""));
+        assert!(raw.contains("\"control_stage\":\"open_bi\""));
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn agent_signature_diagnostics_record_success_and_failure_reason() {
+        let _env_lock = crate::network_bridge::tests::lock_env_test_mutex();
+        let dir = service_runtime_test_dir("agent-signature-verification");
+        let peer =
+            NetworkNodeId::new("9b196ed13c0ec849dd7b8bf5add0b07ad2c88c1bf5d79e8591f6681ab1803258")
+                .expect("peer id");
+        let identity = crate::crypto::NodeIdentity::random();
+        let mut encoded = vec![0xed, 0x01];
+        encoded.extend_from_slice(identity.verifying_key().as_bytes());
+        let agent_id = format!("did:key:z{}", bs58::encode(encoded).into_string());
+        let envelope = RawAgentEnvelope {
+            source_agent_id: Some(agent_id),
+            source_node_id: Some(peer.to_string()),
+            signature: Some("signature".to_owned()),
+            ..RawAgentEnvelope::default()
+        };
+
+        let disabled = EnvVarGuard::set(diagnostics::ENV_NETWORK_DEBUG_DIAGNOSTICS, None);
+        record_agent_signature_verification_diagnostic(
+            Some(&dir),
+            &peer,
+            &envelope,
+            "test.disabled",
+            &Ok(()),
+        );
+        assert!(!dir.join("diagnostics/wattswarm_node.jsonl").exists());
+        drop(disabled);
+
+        let _enabled = EnvVarGuard::set(diagnostics::ENV_NETWORK_DEBUG_DIAGNOSTICS, Some("true"));
+        record_agent_signature_verification_diagnostic(
+            Some(&dir),
+            &peer,
+            &envelope,
+            "test.success",
+            &Ok(()),
+        );
+        record_agent_signature_verification_diagnostic(
+            Some(&dir),
+            &peer,
+            &envelope,
+            "test.failed",
+            &Err(anyhow!("DID signature mismatch")),
+        );
+
+        let entries = fs::read_to_string(dir.join("diagnostics/wattswarm_node.jsonl"))
+            .expect("diagnostic log")
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).expect("diagnostic json"))
+            .collect::<Vec<_>>();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0]["phase"], "agent.signature.verify");
+        assert_eq!(entries[0]["status"], "success");
+        assert_eq!(entries[0]["details"]["did_parse_status"], "success");
+        assert_eq!(entries[0]["details"]["verification_performed"], true);
+        assert_eq!(entries[1]["status"], "failed");
+        assert_eq!(entries[1]["details"]["error"], "DID signature mismatch");
 
         let _ = fs::remove_dir_all(dir);
     }
