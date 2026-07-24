@@ -38,6 +38,7 @@ pub(crate) async fn swarm_tick(
         let mut node = open_node(&state_clone.state_dir, &state_clone.db_path)?;
         let dashboard = tick_real_swarm(&mut node, &state_clone.state_dir, &executor, &profile)?;
         let _ = crate::run_queue::network_bridge::evaluate_open_stigmergy_rounds_for_state(
+            &node,
             &state_clone.state_dir,
         );
         Ok(dashboard)

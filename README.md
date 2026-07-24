@@ -31,7 +31,7 @@ topology guides, and troubleshooting live in the docs site.
 
 - Coordinates task execution across one or more agent runtimes.
 - Persists a structured append-only event log and replayable projections.
-- Uses PostgreSQL for node-local state and the multi-agent run queue.
+- Uses PostgreSQL or SQLite for node-local state and the multi-agent run queue.
 - Stores large or referenced payloads through node-local artifact/object storage.
 - Supports claim, execute, verify, vote, commit, finalize, retry, and expiry flows.
 - Provides commit-reveal voting, quorum rules, aggregation policies, and memory reuse.
@@ -48,6 +48,16 @@ docker compose up -d --build
 
 This starts PostgreSQL, the Wattswarm kernel UI, the reference runtime, and a
 worker process.
+
+PostgreSQL remains the default. To run the kernel and worker against SQLite,
+set the backend in `.env` before starting Compose:
+
+```bash
+WATTSWARM_STORAGE_BACKEND=sqlite
+```
+
+SQLite stores the complete node state, local control state, and run queue in
+one persisted `/var/lib/wattswarm/wattswarm.db` database.
 
 Default local entry points:
 
@@ -271,17 +281,42 @@ specialization / faster closure / more stable network-level behavior"]
 
 ## Storage Model
 
-Node state is intentionally local.
+Node state is intentionally local. The same binary supports PostgreSQL and
+SQLite through the storage adapter selected by `WATTSWARM_STORAGE_BACKEND`.
+PostgreSQL remains the default.
 
-- PostgreSQL stores the SEL event log, projections, task state, run queue,
-  executor registry, knowledge, reputation, metrics, settlement state, and local
-  dashboard queries.
+- PostgreSQL is the default backend for server and high-concurrency
+  deployments.
+- SQLite is the embedded backend for a single node installation, including the
+  SEL event log, projections, task state, executor registry, knowledge,
+  reputation, metrics, settlement state, and dashboard queries.
+- In SQLite mode, every backend storage path resolves to the canonical
+  `<state-dir>/wattswarm.db`: the event log and projections, local peer,
+  executor and agent-delivery state, plus `runs`, `run_steps`, and
+  `run_events`.
+- On first startup, data from the earlier `wattswarm.state`,
+  `local-control.state`, and `run-queue.sqlite3` layout is imported
+  transactionally and idempotently. The legacy files are retained as rollback
+  copies after a successful import.
 - The filesystem artifact store holds references, message bodies, task outputs,
   evidence blobs, checkpoints, snapshots, event batches, and availability
   manifests.
-- Nodes do not replicate PostgreSQL databases. They exchange signed events,
-  summaries, checkpoint metadata, and artifact references, then re-apply that
-  state locally.
+- Nodes do not replicate database files. PostgreSQL and SQLite nodes exchange
+  the same signed events, summaries, checkpoint metadata, and artifact
+  references, then re-apply that state locally. This also keeps Wattetheria's
+  own SQLite database separate from Wattswarm storage.
+
+SQLite connections enable foreign keys, WAL mode, a bounded busy timeout, and
+immediate write transactions. A state directory should be owned by one
+Wattswarm node installation; do not mount the same SQLite files into several
+independent node containers. Startup also verifies the primary-key and unique
+constraints required by the storage and run-queue schemas. An incompatible
+in-place SQLite schema fails initialization explicitly instead of silently
+continuing with weaker constraints.
+
+The current Compose topology still starts its PostgreSQL service in SQLite
+mode for one-stack compatibility, but the Wattswarm kernel and worker do not
+connect to it.
 
 ### Scoped backfill reads
 
@@ -317,7 +352,7 @@ Common command groups:
 - `log`: inspect, replay, and verify the structured event log
 - `executors`: register and health-check runtime executors
 - `task`: submit task contracts and read decisions
-- `run`: operate the PostgreSQL multi-agent run queue
+- `run`: operate the PostgreSQL or SQLite multi-agent run queue
 - `knowledge`: export decision memory bundles
 - `governance`: manage membership, revocation, and penalty events
 - `ui`: start the built-in HTTP UI console
@@ -338,9 +373,42 @@ kernel:
 The reference runtime lives in `apps/Wattswarm-runtime`. Custom runtimes should
 follow the [Runtime executor API](https://mx-6c34bcc6.mintlify.app/api/runtime-overview).
 
+### SQLite quick start
+
+SQLite does not require a PostgreSQL service:
+
+```bash
+export WATTSWARM_STORAGE_BACKEND=sqlite
+
+cargo run -p wattswarm --bin wattswarm -- \
+  --state-dir .wattswarm \
+  --store wattswarm.db \
+  node up --mode local
+
+cargo run -p wattswarm --bin wattswarm -- \
+  --state-dir .wattswarm \
+  --store wattswarm.db \
+  run init
+```
+
+SQLite always resolves application storage to `<state-dir>/wattswarm.db`, so
+older scripts that pass a different `--store` value cannot accidentally split
+the node across several database files.
+
+Use `WATTSWARM_STORAGE_BACKEND=postgres` (or leave it unset) for the existing
+PostgreSQL deployment. `--pg-url`, `WATTSWARM_PG_URL`, and
+`WATTSWARM_PG_SCHEMA` continue to apply only to PostgreSQL mode.
+
+When a deployment first switches the run queue from the historical `public`
+schema to a custom `WATTSWARM_PG_SCHEMA`, `run init` copies existing
+`public.runs`, `public.run_steps`, and `public.run_events` into the custom
+schema in one transaction. A migration marker makes this import idempotent;
+the source tables remain unchanged.
+
 ## Multi-Agent Run Queue
 
-The run queue uses PostgreSQL tables to coordinate multi-agent runs:
+The run queue uses the selected database backend to coordinate multi-agent
+runs:
 
 - `run submit` creates a run and its steps.
 - `run kickoff` moves pending work into the queue.
@@ -348,8 +416,13 @@ The run queue uses PostgreSQL tables to coordinate multi-agent runs:
 - `run watch`, `run events`, and `run result` inspect progress and output.
 - `run cancel` and `run retry` control terminal or failed runs.
 
+The PostgreSQL path keeps row locking and `SKIP LOCKED` for server concurrency.
+The SQLite path uses WAL plus serialized immediate write transactions and is
+intended for one embedded node installation. Both paths expose the same run
+queue API and network event protocol.
+
 The queue is DB-native and does not require RabbitMQ, Kafka, or Redis for the
-current scope. See the
+current scope. Docker Compose continues to use PostgreSQL by default. See the
 [multi-agent runs guide](https://mx-6c34bcc6.mintlify.app/guides/multi-agent-runs)
 and [run CLI reference](https://mx-6c34bcc6.mintlify.app/cli/run).
 
@@ -359,7 +432,7 @@ Prerequisites:
 
 - Rust toolchain
 - Docker, for the full local stack
-- PostgreSQL, if running without Docker Compose
+- PostgreSQL, when using the default PostgreSQL backend without Docker Compose
 
 Useful local checks:
 
@@ -392,9 +465,9 @@ crates/
   node-core/           Core task lifecycle logic
   policy-engine/       Verification policy registry and evaluation
   protocol/            Shared protocol types and envelopes
-  run-queue/           PostgreSQL multi-agent run queue
+  run-queue/           PostgreSQL/SQLite multi-agent run queue
   runtime-client/      Executor HTTP client
-  storage-core/        PostgreSQL storage and projections
+  storage-core/        PostgreSQL/SQLite storage adapter and projections
 docs/                  Project design notes and implementation plans
 scripts/               Local automation helpers
 ui/                    Built-in console and swarm dashboard assets

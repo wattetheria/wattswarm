@@ -4,6 +4,7 @@ use serde_json::{Value, json};
 use std::fs;
 use std::io::{ErrorKind, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
@@ -36,7 +37,7 @@ use wattswarm_network_discovery::{
     DiscoveryTopicProvider, DiscoveryTopicProviderCapabilities, SignedDiscoveryNodeRecord,
 };
 use wattswarm_protocol::types::SourceAgentCard;
-use wattswarm_storage_core::storage::pg::Connection;
+use wattswarm_storage_core::storage::pg::{BackendKind, Connection, configured_backend_kind};
 use wattswarm_storage_core::types::ArtifactRef;
 
 static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -107,7 +108,7 @@ impl Drop for EnvVarGuard {
 }
 
 struct DbTestLock {
-    conn: Connection,
+    conn: Option<Connection>,
 }
 
 #[derive(Clone)]
@@ -520,6 +521,9 @@ fn handle_source_agent_card_stub_conn(
 
 impl DbTestLock {
     fn acquire() -> Self {
+        if configured_backend_kind().expect("resolve storage backend") == BackendKind::Sqlite {
+            return Self { conn: None };
+        }
         let conn = Connection::open("ui-db-lock").expect("open db lock connection");
         conn.query_row(
             "SELECT pg_advisory_lock($1)",
@@ -527,13 +531,16 @@ impl DbTestLock {
             |_| Ok(()),
         )
         .expect("acquire advisory lock");
-        Self { conn }
+        Self { conn: Some(conn) }
     }
 }
 
 impl Drop for DbTestLock {
     fn drop(&mut self) {
-        let _ = self.conn.query_row(
+        let Some(conn) = &self.conn else {
+            return;
+        };
+        let _ = conn.query_row(
             "SELECT pg_advisory_unlock($1)",
             wattswarm_storage_core::params![TEST_DB_LOCK_KEY],
             |_| Ok(()),
@@ -543,6 +550,9 @@ impl Drop for DbTestLock {
 
 fn reset_test_schema(schema: &str) -> String {
     let schema = next_test_schema(schema);
+    if configured_backend_kind().expect("resolve storage backend") == BackendKind::Sqlite {
+        return schema;
+    }
     let prev_schema = std::env::var("WATTSWARM_PG_SCHEMA").ok();
     // SAFETY: tests serialize env mutations via ENV_LOCK.
     unsafe {
@@ -565,8 +575,37 @@ fn reset_test_schema(schema: &str) -> String {
     schema
 }
 
-fn count_projection_rows(table: &str) -> i64 {
-    let conn = Connection::open("ui-count-projection-rows").expect("open pg connection");
+fn init_test_run_queue(state_dir: &Path) {
+    let pg_url = run_control::resolve_run_queue_pg_url(None);
+    run_control::init_run_queue(state_dir, &pg_url).expect("initialize test run queue");
+}
+
+fn count_projection_rows(db_path: &Path, table: &str) -> i64 {
+    assert!(
+        table
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+    );
+    let conn = Connection::open(db_path).expect("open projection database");
+    if conn.backend_kind() == BackendKind::Sqlite {
+        let table_exists = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = $1",
+                wattswarm_storage_core::params![table],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("check projection table existence");
+        if table_exists == 0 {
+            return 0;
+        }
+        return conn
+            .query_row(
+                &format!("SELECT COUNT(*) FROM {table}"),
+                wattswarm_storage_core::params![],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("count projection rows");
+    }
     let schema = std::env::var("WATTSWARM_PG_SCHEMA").unwrap_or_else(|_| "public".to_owned());
     let table_exists = conn
         .query_row(

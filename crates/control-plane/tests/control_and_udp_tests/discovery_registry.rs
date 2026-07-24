@@ -108,7 +108,7 @@ fn add_discovered_peer_dedups_and_sorts() {
         ]
     );
 
-    let conn = Connection::open(dir.join("local-control.state")).expect("open local control db");
+    let conn = Connection::open(dir.join("wattswarm.db")).expect("open unified Wattswarm db");
     let mut stmt = conn
         .prepare(
             "SELECT scope_id, node_id, source_kind

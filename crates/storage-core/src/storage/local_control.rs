@@ -5,7 +5,7 @@ const LOCAL_CONFIG_KEY_EGRESS_AGENT: &str = "egress_agent";
 const LOCAL_CONTROL_SCOPE_SEP: &str = "\u{1f}";
 
 pub fn local_control_store(state_dir: &Path) -> Result<PgStore> {
-    PgStore::open(state_dir.join("local-control.state"))
+    PgStore::open(sqlite_layout::sqlite_database_path(state_dir))
 }
 
 pub fn local_control_scope_id(state_dir: &Path) -> String {

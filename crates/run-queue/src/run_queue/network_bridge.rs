@@ -11,10 +11,11 @@
 //!    `REMOTE_DISPATCHED` status), write the result back into the run_steps
 //!    table so the run-queue aggregation can finalize.
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use serde_json::{Value, json};
 use std::io::Write;
 use std::path::Path;
+use wattswarm_storage_core::storage::pg::{BackendKind, configured_backend_kind};
 
 use super::queue::PgRunQueue;
 use super::stigmergy::StigmergyCompletionSource;
@@ -31,22 +32,18 @@ pub const RUN_QUEUE_FEED_KEY: &str = "venue.run_queue";
 //   - `process_pending_bridge_tasks()` and `process_pending_run_queue_results()`
 //     consume them from the background service post-tick hook.
 
-/// Resolve PgRunQueue from environment variables, using the node's real org_id.
-fn resolve_run_queue(state_dir: &Path) -> Option<PgRunQueue> {
+/// Resolve the configured run queue using the already-open node's real org.
+fn resolve_run_queue(state_dir: &Path, org_id: &str) -> Option<PgRunQueue> {
+    let backend = configured_backend_kind().ok()?;
     let db_url = std::env::var("DATABASE_URL")
         .or_else(|_| std::env::var("WATTSWARM_PG_URL"))
-        .ok()?;
-    let db_path = std::path::Path::new(&db_url);
-    let schema = std::env::var("WATTSWARM_PG_SCHEMA").ok();
-    let queue = match schema {
-        Some(s) => PgRunQueue::with_schema(&db_url, s),
-        None => PgRunQueue::new(&db_url),
-    };
-
-    // Open a node to resolve the actual org_id for any mode (local/lan/network).
-    let node = crate::control::open_node(state_dir, db_path).ok()?;
-    let org_id = node.store.org_id().to_owned();
-    Some(queue.for_org(org_id))
+        .ok();
+    if backend == BackendKind::Postgres && db_url.is_none() {
+        return None;
+    }
+    PgRunQueue::from_runtime_config(db_url.unwrap_or_default(), state_dir)
+        .ok()
+        .map(|queue| queue.for_org(org_id.to_owned()))
 }
 
 fn ensure_author_confirmed_execution_set_member(
@@ -79,11 +76,11 @@ fn ensure_author_confirmed_execution_set_member(
 /// by querying the node-core PgStore (which owns the execution_set_projection table).
 fn complete_remote_step(
     queue: &PgRunQueue,
+    node: &crate::control::node::Node,
     task_id: &str,
     candidate_id: &str,
     output: &Value,
     author_node_id: &str,
-    state_dir: &Path,
 ) -> Result<()> {
     let now = chrono::Utc::now().timestamp_millis();
     let result_json = json!({
@@ -121,8 +118,6 @@ fn complete_remote_step(
     // Verify the author is a confirmed execution set member using the
     // node-core PgStore which owns the execution_set_projection table.
     let execution_set_id = format!("remote-bridge:{task_id}");
-    let node = crate::control::open_node(state_dir, std::path::Path::new(&queue.database_url))
-        .context("run_queue_bridge: open node to verify execution set membership")?;
     let members = node
         .store
         .list_execution_set_members(task_id, &execution_set_id)?;
@@ -247,7 +242,10 @@ pub fn process_pending_bridge_tasks(
 /// Process pending run-queue results written by the coordinator-side gossip hook.
 /// Each line in `pending_run_queue_results.jsonl` contains a CandidateProposed
 /// result that should be written back to a REMOTE_DISPATCHED run_step.
-pub fn process_pending_run_queue_results(state_dir: &Path) -> Result<u64> {
+pub fn process_pending_run_queue_results(
+    node: &crate::control::node::Node,
+    state_dir: &Path,
+) -> Result<u64> {
     let results_path = state_dir.join("pending_run_queue_results.jsonl");
     let processing_path = state_dir.join("pending_run_queue_results.processing.jsonl");
 
@@ -264,7 +262,7 @@ pub fn process_pending_run_queue_results(state_dir: &Path) -> Result<u64> {
         return Ok(0);
     }
 
-    let queue = match resolve_run_queue(state_dir) {
+    let queue = match resolve_run_queue(state_dir, node.store.org_id()) {
         Some(q) => q,
         None => return Ok(0), // Processing file remains — retry next tick.
     };
@@ -294,32 +292,21 @@ pub fn process_pending_run_queue_results(state_dir: &Path) -> Result<u64> {
             continue;
         }
 
-        let output =
-            match crate::control::open_node(state_dir, std::path::Path::new(&queue.database_url))
-                .ok()
-                .and_then(|node| {
-                    node.store
-                        .get_candidate_by_id(task_id, candidate_id)
-                        .ok()
-                        .flatten()
-                })
-                .map(|candidate| candidate.output)
-            {
-                Some(output) => output,
-                None => {
-                    failed_lines.push(line.to_owned());
-                    continue;
-                }
-            };
+        let output = match node
+            .store
+            .get_candidate_by_id(task_id, candidate_id)
+            .ok()
+            .flatten()
+            .map(|candidate| candidate.output)
+        {
+            Some(output) => output,
+            None => {
+                failed_lines.push(line.to_owned());
+                continue;
+            }
+        };
 
-        match complete_remote_step(
-            &queue,
-            task_id,
-            candidate_id,
-            &output,
-            author_node_id,
-            state_dir,
-        ) {
+        match complete_remote_step(&queue, node, task_id, candidate_id, &output, author_node_id) {
             Ok(()) => processed += 1,
             Err(err) => {
                 eprintln!(
@@ -346,7 +333,10 @@ pub fn process_pending_run_queue_results(state_dir: &Path) -> Result<u64> {
     Ok(processed)
 }
 
-pub fn process_pending_stigmergy_contributions(state_dir: &Path) -> Result<u64> {
+pub fn process_pending_stigmergy_contributions(
+    node: &crate::control::node::Node,
+    state_dir: &Path,
+) -> Result<u64> {
     let pending_path = state_dir.join("pending_stigmergy_contributions.jsonl");
     let processing_path = state_dir.join("pending_stigmergy_contributions.processing.jsonl");
 
@@ -363,7 +353,7 @@ pub fn process_pending_stigmergy_contributions(state_dir: &Path) -> Result<u64> 
         return Ok(0);
     }
 
-    let queue = match resolve_run_queue(state_dir) {
+    let queue = match resolve_run_queue(state_dir, node.store.org_id()) {
         Some(q) => q,
         None => return Ok(0),
     };
@@ -424,18 +414,11 @@ pub fn process_pending_stigmergy_contributions(state_dir: &Path) -> Result<u64> 
                     .filter(|value| !value.is_null())
                     .or_else(|| {
                         let candidate_id = entry.get("candidate_id").and_then(Value::as_str)?;
-                        crate::control::open_node(
-                            state_dir,
-                            std::path::Path::new(&queue.database_url),
-                        )
-                        .ok()
-                        .and_then(|node| {
-                            node.store
-                                .get_candidate_by_id(task_id, candidate_id)
-                                .ok()
-                                .flatten()
-                        })
-                        .map(|candidate| candidate.output)
+                        node.store
+                            .get_candidate_by_id(task_id, candidate_id)
+                            .ok()
+                            .flatten()
+                            .map(|candidate| candidate.output)
                     })
                     .unwrap_or(Value::Null);
                 queue
@@ -478,8 +461,11 @@ pub fn process_pending_stigmergy_contributions(state_dir: &Path) -> Result<u64> 
     Ok(processed)
 }
 
-pub fn evaluate_open_stigmergy_rounds_for_state(state_dir: &Path) -> Result<u64> {
-    let Some(queue) = resolve_run_queue(state_dir) else {
+pub fn evaluate_open_stigmergy_rounds_for_state(
+    node: &crate::control::node::Node,
+    state_dir: &Path,
+) -> Result<u64> {
+    let Some(queue) = resolve_run_queue(state_dir, node.store.org_id()) else {
         return Ok(0);
     };
     let now = chrono::Utc::now().timestamp_millis().max(0) as u64;

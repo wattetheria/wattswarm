@@ -1177,7 +1177,7 @@ fn ui_exposes_network_bootstrap_bundle() {
             1_700_000_000_000,
         )
         .unwrap();
-    let conn = Connection::open("ui-network-bootstrap-setup").unwrap();
+    let conn = Connection::open(&db_path).unwrap();
     conn.execute(
         "UPDATE org_registry SET name = 'Aether Genesis' WHERE org_id = $1",
         wattswarm_storage_core::params![org_id],

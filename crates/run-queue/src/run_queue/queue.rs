@@ -1,8 +1,13 @@
 use anyhow::{Result, anyhow};
-use postgres::{Client, NoTls, Transaction};
 use serde_json::{Value, json};
 use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use wattswarm_storage_core::storage::pg::{
+    BackendKind, DatabaseClient as Client, DatabaseTransaction as Transaction,
+    configured_backend_kind,
+};
+use wattswarm_storage_core::storage::sqlite_layout::{WATTSWARM_SQLITE_FILE, sqlite_database_path};
 
 use super::aggregation::{AggregationNextAction, build_run_summary_tx};
 use super::status::{
@@ -17,9 +22,31 @@ pub struct PgRunQueue {
     pub(crate) database_url: String,
     pub(crate) schema: Option<String>,
     pub(crate) org_id: Arc<String>,
+    pub(crate) backend: BackendKind,
+    pub(crate) legacy_postgres_schema: Option<String>,
+    sqlite_cleanup: Option<Arc<SqliteCleanup>>,
 }
 
 const UNSET_RUN_QUEUE_ORG_ID: &str = "__unset_org__";
+pub const DEFAULT_RUN_QUEUE_PG_URL: &str = "postgres://postgres:postgres@127.0.0.1:55432/wattswarm";
+pub const RUN_QUEUE_SQLITE_FILE: &str = WATTSWARM_SQLITE_FILE;
+
+#[derive(Debug)]
+struct SqliteCleanup {
+    path: PathBuf,
+}
+
+impl Drop for SqliteCleanup {
+    fn drop(&mut self) {
+        for path in [
+            self.path.clone(),
+            PathBuf::from(format!("{}-wal", self.path.display())),
+            PathBuf::from(format!("{}-shm", self.path.display())),
+        ] {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
 
 impl PgRunQueue {
     pub fn new(database_url: impl Into<String>) -> Self {
@@ -27,6 +54,9 @@ impl PgRunQueue {
             database_url: database_url.into(),
             schema: None,
             org_id: Arc::new(UNSET_RUN_QUEUE_ORG_ID.to_owned()),
+            backend: BackendKind::Postgres,
+            legacy_postgres_schema: None,
+            sqlite_cleanup: None,
         }
     }
 
@@ -35,6 +65,62 @@ impl PgRunQueue {
             database_url: database_url.into(),
             schema: Some(sanitize_ident(schema.as_ref())),
             org_id: Arc::new(UNSET_RUN_QUEUE_ORG_ID.to_owned()),
+            backend: BackendKind::Postgres,
+            legacy_postgres_schema: None,
+            sqlite_cleanup: None,
+        }
+    }
+
+    pub fn open_sqlite(path: impl AsRef<Path>) -> Self {
+        Self {
+            database_url: path.as_ref().to_string_lossy().into_owned(),
+            schema: None,
+            org_id: Arc::new(UNSET_RUN_QUEUE_ORG_ID.to_owned()),
+            backend: BackendKind::Sqlite,
+            legacy_postgres_schema: None,
+            sqlite_cleanup: None,
+        }
+    }
+
+    pub fn open_in_memory_sqlite() -> Self {
+        let path = std::env::temp_dir().join(format!(
+            "wattswarm-run-queue-{}.sqlite",
+            uuid::Uuid::new_v4().simple()
+        ));
+        Self {
+            database_url: path.to_string_lossy().into_owned(),
+            schema: None,
+            org_id: Arc::new(UNSET_RUN_QUEUE_ORG_ID.to_owned()),
+            backend: BackendKind::Sqlite,
+            legacy_postgres_schema: None,
+            sqlite_cleanup: Some(Arc::new(SqliteCleanup { path })),
+        }
+    }
+
+    pub fn from_runtime_config(
+        database_url: impl Into<String>,
+        state_dir: impl AsRef<Path>,
+    ) -> Result<Self> {
+        let database_url = database_url.into();
+        match configured_backend_kind().map_err(|err| anyhow!(err.to_string()))? {
+            BackendKind::Postgres => Ok(Self::from_postgres_runtime_config(
+                database_url,
+                std::env::var("WATTSWARM_PG_SCHEMA").ok(),
+            )),
+            BackendKind::Sqlite => Ok(Self::open_sqlite(sqlite_database_path(state_dir.as_ref()))),
+        }
+    }
+
+    fn from_postgres_runtime_config(database_url: String, schema: Option<String>) -> Self {
+        match schema {
+            Some(schema) if !schema.trim().is_empty() => {
+                let mut queue = Self::with_schema(database_url, schema);
+                if queue.schema.as_deref() != Some("public") {
+                    queue.legacy_postgres_schema = Some("public".to_owned());
+                }
+                queue
+            }
+            _ => Self::new(database_url),
         }
     }
 
@@ -43,7 +129,14 @@ impl PgRunQueue {
             database_url: self.database_url.clone(),
             schema: self.schema.clone(),
             org_id: Arc::new(org_id.into()),
+            backend: self.backend,
+            legacy_postgres_schema: self.legacy_postgres_schema.clone(),
+            sqlite_cleanup: self.sqlite_cleanup.clone(),
         }
+    }
+
+    pub fn backend_kind(&self) -> BackendKind {
+        self.backend
     }
 
     pub fn org_id(&self) -> &str {
@@ -55,9 +148,15 @@ impl PgRunQueue {
     }
 
     pub fn connect(&self) -> Result<Client> {
-        let mut client = Client::connect(&self.database_url, NoTls)
-            .map_err(|err| anyhow!("connect postgres {}: {err}", self.database_url))?;
-        if let Some(schema) = &self.schema {
+        let mut client = match self.backend {
+            BackendKind::Postgres => Client::connect_postgres(&self.database_url)
+                .map_err(|err| anyhow!("connect postgres {}: {err}", self.database_url))?,
+            BackendKind::Sqlite => Client::open_sqlite(&self.database_url)
+                .map_err(|err| anyhow!("open sqlite {}: {err}", self.database_url))?,
+        };
+        if self.backend == BackendKind::Postgres
+            && let Some(schema) = &self.schema
+        {
             client.batch_execute(&format!(
                 "CREATE SCHEMA IF NOT EXISTS {schema};
                  SET search_path TO {schema}, public;"
@@ -404,6 +503,7 @@ fn sanitize_ident(raw: &str) -> String {
 #[cfg(test)]
 mod tests {
     use serde_json::json;
+    use tempfile::tempdir;
 
     use super::super::types::{
         AggregationPolicy, NullResolverMode, NullTrigger, RetryPolicy, RunAgentSpec, RunSubmitSpec,
@@ -412,6 +512,9 @@ mod tests {
     use super::super::utils::{build_step_inputs, retry_delay_ms};
     use super::PgRunQueue;
     use wattswarm_control_plane::round_policy::RoundPolicy;
+    use wattswarm_storage_core::storage::sqlite_layout::{
+        LEGACY_RUN_QUEUE_SQLITE_FILE, WATTSWARM_SQLITE_FILE,
+    };
 
     fn sample_agent(agent_id: &str) -> RunAgentSpec {
         RunAgentSpec {
@@ -458,6 +561,106 @@ mod tests {
             retry: RetryPolicy::default(),
             aggregation: AggregationPolicy::default(),
         }
+    }
+
+    #[test]
+    fn custom_runtime_postgres_schema_enables_legacy_public_queue_migration() {
+        let queue = PgRunQueue::from_postgres_runtime_config(
+            "postgres://example/wattswarm".to_owned(),
+            Some("Tenant-A".to_owned()),
+        );
+        assert_eq!(queue.schema.as_deref(), Some("tenant_a"));
+        assert_eq!(queue.legacy_postgres_schema.as_deref(), Some("public"));
+
+        let public_queue = PgRunQueue::from_postgres_runtime_config(
+            "postgres://example/wattswarm".to_owned(),
+            Some("public".to_owned()),
+        );
+        assert_eq!(public_queue.schema.as_deref(), Some("public"));
+        assert_eq!(public_queue.legacy_postgres_schema, None);
+    }
+
+    #[test]
+    fn unified_sqlite_database_migrates_legacy_run_queue_once() {
+        let dir = tempdir().expect("temp dir");
+        let org_id = "local:run-queue-migration:bootstrap";
+        let legacy_path = dir.path().join(LEGACY_RUN_QUEUE_SQLITE_FILE);
+        let legacy = PgRunQueue::open_sqlite(&legacy_path).for_org(org_id);
+        legacy.init_schema().expect("initialize legacy run queue");
+        legacy
+            .submit_run(sample_spec())
+            .expect("write legacy run queue");
+        drop(legacy);
+
+        let unified_path = dir.path().join(WATTSWARM_SQLITE_FILE);
+        let unified = PgRunQueue::open_sqlite(&unified_path).for_org(org_id);
+        unified
+            .init_schema()
+            .expect("initialize and migrate unified run queue");
+        assert_eq!(
+            unified.run_view("run-1").expect("migrated run").run_id,
+            "run-1"
+        );
+
+        unified.init_schema().expect("repeat idempotent migration");
+        let mut client = unified.connect().expect("open migration probe");
+        let run_count: i64 = client
+            .query_one(
+                "SELECT COUNT(*) FROM runs WHERE org_id = $1 AND run_id = $2",
+                &[&org_id, &"run-1"],
+            )
+            .expect("count migrated runs")
+            .get(0);
+        assert_eq!(run_count, 1);
+        assert!(legacy_path.is_file());
+    }
+
+    #[test]
+    fn unified_sqlite_rejects_invalid_legacy_queue_atomically() {
+        let dir = tempdir().expect("temp dir");
+        let org_id = "local:run-queue-invalid-migration:bootstrap";
+        let legacy_path = dir.path().join(LEGACY_RUN_QUEUE_SQLITE_FILE);
+        let legacy = PgRunQueue::open_sqlite(&legacy_path).for_org(org_id);
+        legacy.init_schema().expect("initialize legacy run queue");
+        legacy
+            .submit_run(sample_spec())
+            .expect("write legacy run queue");
+        let mut legacy_client = legacy.connect().expect("open legacy queue");
+        legacy_client
+            .batch_execute("PRAGMA foreign_keys = OFF")
+            .expect("disable legacy foreign keys");
+        legacy_client
+            .execute(
+                "DELETE FROM runs WHERE org_id = $1 AND run_id = $2",
+                &[&org_id, &"run-1"],
+            )
+            .expect("leave orphaned legacy step");
+        drop(legacy_client);
+        drop(legacy);
+
+        let unified_path = dir.path().join(WATTSWARM_SQLITE_FILE);
+        let unified = PgRunQueue::open_sqlite(&unified_path).for_org(org_id);
+        let error = unified
+            .init_schema()
+            .expect_err("invalid legacy queue must not migrate");
+        assert!(error.to_string().contains("invalid foreign key"));
+
+        let mut client = unified.connect().expect("open unified migration probe");
+        let step_count: i64 = client
+            .query_one("SELECT COUNT(*) FROM run_steps", &[])
+            .expect("count rolled-back steps")
+            .get(0);
+        let marker_count: i64 = client
+            .query_one(
+                "SELECT COUNT(*)
+                 FROM wattswarm_sqlite_migrations
+                 WHERE migration_key = 'legacy-run-queue-v1'",
+                &[],
+            )
+            .expect("count rolled-back migration markers")
+            .get(0);
+        assert_eq!(step_count, 0);
+        assert_eq!(marker_count, 0);
     }
 
     #[test]

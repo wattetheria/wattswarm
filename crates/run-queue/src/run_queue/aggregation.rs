@@ -1,8 +1,8 @@
 use anyhow::Result;
-use postgres::Transaction;
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
 use wattswarm_crypto::sha256_hex;
+use wattswarm_storage_core::storage::pg::DatabaseTransaction as Transaction;
 
 use super::types::{
     AggregationPolicy, ConfidenceWeightedPolicy, MissingReputationPolicy, NullResolverMode,

@@ -1,5 +1,4 @@
 use anyhow::Result;
-use postgres::Transaction;
 use serde_json::{Value, json};
 use std::collections::HashMap;
 #[cfg(test)]
@@ -7,6 +6,7 @@ use wattswarm_control_plane::round_policy::required_count_for_observed;
 use wattswarm_control_plane::round_policy::{
     RoundDecision, RoundPolicy, RoundState, evaluate_round_policy,
 };
+use wattswarm_storage_core::storage::pg::DatabaseTransaction as Transaction;
 
 use super::aggregation::{AggregationNextAction, build_run_summary_tx};
 use super::queue::PgRunQueue;

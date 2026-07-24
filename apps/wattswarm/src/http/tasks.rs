@@ -144,7 +144,14 @@ fn current_org_run_queue_or_log(
             return None;
         }
     };
-    Some(PgRunQueue::new(pg_url).for_org(node.store.org_id().to_owned()))
+    let queue = match PgRunQueue::from_runtime_config(pg_url, state_dir) {
+        Ok(queue) => queue,
+        Err(error) => {
+            eprintln!("stigmergy local sink skipped: open run queue failed: {error:#}");
+            return None;
+        }
+    };
+    Some(queue.for_org(node.store.org_id().to_owned()))
 }
 
 fn record_local_stigmergy_claim_if_applicable(

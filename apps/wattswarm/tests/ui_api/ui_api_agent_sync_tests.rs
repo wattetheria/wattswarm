@@ -168,6 +168,7 @@ fn ui_google_a2a_message_send_supports_direct_and_group_modes() {
     let state_dir = dir.path().join("state");
     std::fs::create_dir_all(&state_dir).unwrap();
     let db_path = state_dir.join("ui.state");
+    init_test_run_queue(&state_dir);
     let app = build_app(UiServerState::new(state_dir.clone(), db_path));
     let execute_requests = Arc::new(Mutex::new(Vec::<Value>::new()));
     let runtime_server = UiStubRuntimeServer::start(UiStubRuntimeConfig {
@@ -484,6 +485,7 @@ fn ui_exposes_wattetheria_sync_http_boundaries() {
     let state_dir = dir.path().join("state");
     std::fs::create_dir_all(&state_dir).unwrap();
     let db_path = state_dir.join("ui.state");
+    init_test_run_queue(&state_dir);
     let app = build_app(UiServerState::new(state_dir.clone(), db_path.clone()));
     let runtime_server = UiStubRuntimeServer::start(UiStubRuntimeConfig {
         health_body: "{}".to_owned(),
@@ -973,6 +975,7 @@ fn ui_exposes_wattetheria_sync_grpc_streams() {
     let state_dir = dir.path().join("state");
     std::fs::create_dir_all(&state_dir).unwrap();
     let db_path = state_dir.join("ui.state");
+    init_test_run_queue(&state_dir);
     let app = build_app(UiServerState::new(state_dir.clone(), db_path.clone()));
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -1285,6 +1288,6 @@ fn ui_rejects_node_up_until_mode_is_configured() {
         );
     });
 
-    assert_eq!(count_projection_rows("network_registry"), 0);
-    assert_eq!(count_projection_rows("node_registry"), 0);
+    assert_eq!(count_projection_rows(&db_path, "network_registry"), 0);
+    assert_eq!(count_projection_rows(&db_path, "node_registry"), 0);
 }

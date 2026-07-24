@@ -17,7 +17,7 @@ fn open_node_network_mode_uses_existing_network_topology_only() {
 
     let _bootstrap_store = wattswarm_control_plane::storage::PgStore::open(&db_path)
         .expect("open store for bootstrap network setup");
-    let conn = Connection::open("network-bootstrap-setup").expect("open setup connection");
+    let conn = Connection::open(&db_path).expect("open setup connection");
     conn.execute(
         "INSERT INTO network_registry(network_id, network_kind, parent_network_id, name, status, genesis_node_id, created_at)
          VALUES ($1, 'mainnet', NULL, 'Watt Galaxy', 'active', $2, TIMESTAMPTZ 'epoch' + ($3::bigint * INTERVAL '1 millisecond'))",
@@ -40,7 +40,7 @@ fn open_node_network_mode_uses_existing_network_topology_only() {
     let node = open_node(&state_dir, &db_path).expect("open node in network mode");
     assert_eq!(node.store.org_id(), org_id);
 
-    let conn = Connection::open("network-bootstrap-verify").expect("open verification connection");
+    let conn = Connection::open(&db_path).expect("open verification connection");
     let local_network_count = conn
         .query_row(
             "SELECT COUNT(*) FROM network_registry WHERE network_id = $1",
@@ -93,7 +93,7 @@ fn open_node_network_mode_rejects_unsigned_network_params() {
 
     let _bootstrap_store = wattswarm_control_plane::storage::PgStore::open(&db_path)
         .expect("open store for unsigned bootstrap setup");
-    let conn = Connection::open("network-bootstrap-unsigned-setup").expect("open setup connection");
+    let conn = Connection::open(&db_path).expect("open setup connection");
     conn.execute(
         "INSERT INTO network_registry(network_id, network_kind, parent_network_id, name, status, genesis_node_id, created_at)
          VALUES ($1, 'mainnet', NULL, 'Watt Galaxy', 'active', $2, TIMESTAMPTZ 'epoch' + ($3::bigint * INTERVAL '1 millisecond'))",
@@ -152,7 +152,7 @@ fn open_node_network_mode_auto_syncs_signed_bootstrap_bundle_from_remote() {
                 1_700_000_000_000,
             )
             .expect("create remote mainnet bootstrap topology");
-        let conn = Connection::open("remote-bootstrap-bundle-setup")
+        let conn = Connection::open(&remote_db_path)
             .expect("open remote bootstrap bundle setup connection");
         conn.execute(
             "UPDATE org_registry SET name = 'Aether Genesis' WHERE org_id = $1",
@@ -200,8 +200,7 @@ fn open_node_network_mode_auto_syncs_signed_bootstrap_bundle_from_remote() {
     assert_eq!(verified.signed.signed_by, remote_node_id);
     assert_eq!(verified.signed, bundle.signed_params);
 
-    let conn = Connection::open("network-bootstrap-auto-sync-verify")
-        .expect("open auto-sync verification connection");
+    let conn = Connection::open(&db_path).expect("open auto-sync verification connection");
     let imported_org: (String, bool) = conn
         .query_row(
             "SELECT name, is_default FROM org_registry WHERE org_id = $1",
@@ -241,7 +240,7 @@ fn network_mode_loads_subnet_topology_as_network_subtype() {
     let org_id = "subnet:alpha:bootstrap";
 
     let store = wattswarm_control_plane::storage::PgStore::open(&db_path).expect("open store");
-    let conn = Connection::open("subnet-bootstrap-setup").expect("open setup connection");
+    let conn = Connection::open(&db_path).expect("open setup connection");
     conn.execute(
         "INSERT INTO network_registry(network_id, network_kind, parent_network_id, name, status, genesis_node_id, created_at)
          VALUES ($1, 'subnet', $2, 'Subnet Alpha', 'active', $3, TIMESTAMPTZ 'epoch' + ($4::bigint * INTERVAL '1 millisecond'))",

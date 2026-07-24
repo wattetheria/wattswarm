@@ -2,7 +2,7 @@
 set -eu
 
 STATE_DIR="${WATTSWARM_STATE_DIR:-/var/lib/wattswarm}"
-STORE_NAME="${WATTSWARM_STORE_NAME:-wattswarm.state}"
+STORE_NAME="${WATTSWARM_STORE_NAME:-wattswarm.db}"
 PG_URL="${WATTSWARM_PG_URL:-postgres://postgres:postgres@postgres:5432/wattswarm}"
 UI_LISTEN="${WATTSWARM_UI_LISTEN:-0.0.0.0:7788}"
 BOOTSTRAP_EXECUTOR_NAME="${WATTSWARM_BOOTSTRAP_EXECUTOR_NAME:-rt}"

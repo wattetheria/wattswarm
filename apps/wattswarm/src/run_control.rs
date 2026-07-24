@@ -19,13 +19,16 @@ pub fn resolve_run_queue_pg_url(flag_value: Option<String>) -> String {
         .unwrap_or_else(|| DEFAULT_RUN_QUEUE_PG_URL.to_owned())
 }
 
-pub fn init_run_queue(pg_url: &str) -> Result<()> {
-    PgRunQueue::new(pg_url.to_owned()).init_schema()
+pub fn init_run_queue(state_dir: &Path, pg_url: &str) -> Result<()> {
+    PgRunQueue::from_runtime_config(pg_url.to_owned(), state_dir)?.init_schema()
 }
 
 fn current_org_queue(state_dir: &Path, db_path: &Path, pg_url: &str) -> Result<PgRunQueue> {
     let node = open_configured_node(state_dir, db_path)?;
-    Ok(PgRunQueue::new(pg_url.to_owned()).for_org(node.store.org_id().to_owned()))
+    Ok(
+        PgRunQueue::from_runtime_config(pg_url.to_owned(), state_dir)?
+            .for_org(node.store.org_id().to_owned()),
+    )
 }
 
 fn annotate_and_filter_distributed_run_spec(

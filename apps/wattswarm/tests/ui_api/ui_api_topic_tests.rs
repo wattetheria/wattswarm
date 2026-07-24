@@ -1027,6 +1027,7 @@ fn task_facts_snapshot_exposes_remote_bridge_facts() {
     let state_dir = dir.path().join("state");
     std::fs::create_dir_all(&state_dir).unwrap();
     let db_path = state_dir.join("ui.state");
+    init_test_run_queue(&state_dir);
     let app = build_app(UiServerState::new(state_dir.clone(), db_path.clone()));
     let stub = UiStubRuntimeServer::start(UiStubRuntimeConfig {
         health_body: r#"{"ok":true}"#.to_owned(),
@@ -1321,6 +1322,7 @@ fn task_facts_snapshot_exposes_parent_run_round_state_for_run_queue_tasks() {
     let state_dir = dir.path().join("state");
     std::fs::create_dir_all(&state_dir).unwrap();
     let db_path = state_dir.join("ui.state");
+    init_test_run_queue(&state_dir);
     let app = build_app(UiServerState::new(state_dir.clone(), db_path.clone()));
     let stub = UiStubRuntimeServer::start(UiStubRuntimeConfig {
         health_body: r#"{"ok":true}"#.to_owned(),

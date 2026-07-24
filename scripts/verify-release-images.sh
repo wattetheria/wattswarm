@@ -44,7 +44,8 @@ require_text "$ENTRYPOINT" '--store "${STORE_NAME}"' "kernel entrypoint must pas
 
 require_text "$COMPOSE_FILE" "wattswarm_state_data:/var/lib/wattswarm" "compose must persist Wattswarm state"
 require_text "$COMPOSE_FILE" "WATTSWARM_STATE_DIR: /var/lib/wattswarm" "compose must point services at persisted state"
-require_text "$COMPOSE_FILE" "WATTSWARM_STORE_NAME: wattswarm.state" "compose must keep the expected store name"
+require_text "$COMPOSE_FILE" "WATTSWARM_STORE_NAME: wattswarm.db" "compose must keep the unified SQLite store name"
+require_text "$COMPOSE_FILE" 'WATTSWARM_STORAGE_BACKEND: ${WATTSWARM_STORAGE_BACKEND:-postgres}' "compose must pass the selected storage backend"
 require_text "$COMPOSE_FILE" "github_token:" "compose must declare the GitHub token build secret"
 require_text "$COMPOSE_FILE" "environment: GITHUB_TOKEN" "compose must source the build secret from GITHUB_TOKEN"
 require_text "$COMPOSE_FILE" 'WATTSWARM_IROH_BIND_ADDR: ${WATTSWARM_IROH_BIND_ADDR:-0.0.0.0:4002}' "compose must default Iroh to a fixed UDP bind port"
@@ -52,6 +53,12 @@ require_text "$COMPOSE_FILE" 'WATTSWARM_IROH_PUBLISH_DIRECT_ADDRS: ${WATTSWARM_I
 require_text "$COMPOSE_FILE" '${WATTSWARM_IROH_HOST_PORT:-4002}:${WATTSWARM_IROH_CONTAINER_PORT:-4002}/udp' "compose must expose the fixed Iroh UDP port"
 require_text "$COMPOSE_FILE" 'entrypoint: ["/app/target/release/wattswarm-runtime"]' "runtime service must override the shared image entrypoint"
 require_text "$COMPOSE_FILE" 'entrypoint: ["/app/target/release/wattswarm"]' "worker service must override the shared image entrypoint"
+
+storage_backend_count="$(grep -Fc 'WATTSWARM_STORAGE_BACKEND: ${WATTSWARM_STORAGE_BACKEND:-postgres}' "$COMPOSE_FILE")"
+if [ "$storage_backend_count" -ne 2 ]; then
+  echo "release image check failed: kernel and worker must both receive the storage backend" >&2
+  exit 1
+fi
 
 if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then
   GITHUB_TOKEN="${GITHUB_TOKEN:-release-image-check-placeholder}" docker compose -f "$COMPOSE_FILE" config >/dev/null

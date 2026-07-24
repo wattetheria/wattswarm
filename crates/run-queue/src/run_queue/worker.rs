@@ -1,10 +1,10 @@
 use anyhow::Result;
-use postgres::Transaction;
 use serde_json::{Value, json};
 use std::path::Path;
 use std::thread;
 use std::time::Duration;
 use uuid::Uuid;
+use wattswarm_storage_core::storage::pg::DatabaseTransaction as Transaction;
 
 use crate::control::{
     ExecutorKind, RealTaskRunRequest, load_executor_registry_state, normalize_executor_name,
@@ -317,7 +317,7 @@ impl PgRunQueue {
         // REMOTE_DISPATCHED steps expire when the remote node fails to return results
         // within the lease window.
         let recovered = tx.execute(
-            "UPDATE run_steps s
+            "UPDATE run_steps AS s
              SET status = $1,
                  lease_id = NULL,
                  lease_owner = NULL,
@@ -600,32 +600,44 @@ mod tests {
     use super::*;
     use serde_json::json;
     use std::path::Path;
-    use std::sync::{Mutex, OnceLock};
+    use std::sync::{Arc, Barrier, Mutex, OnceLock};
     use std::thread;
     use std::time::Duration;
     use uuid::Uuid;
+    use wattswarm_storage_core::storage::PgStore;
+    use wattswarm_storage_core::storage::sqlite_layout::WATTSWARM_SQLITE_FILE;
+    use wattswarm_storage_core::types::{Event, EventPayload, TaskExpiredPayload};
     const TEST_DB_LOCK_KEY: i64 = 1_987_654_321;
 
     struct DbTestLock {
-        client: postgres::Client,
+        client: Option<wattswarm_storage_core::storage::pg::DatabaseClient>,
     }
 
     impl DbTestLock {
         fn acquire(queue: &PgRunQueue) -> Option<Self> {
+            if queue.backend_kind() == wattswarm_storage_core::storage::pg::BackendKind::Sqlite {
+                return Some(Self { client: None });
+            }
             let mut client = queue.connect().ok()?;
             client
                 .query_one("SELECT pg_advisory_lock($1)", &[&TEST_DB_LOCK_KEY])
                 .ok()?;
-            Some(Self { client })
+            Some(Self {
+                client: Some(client),
+            })
         }
     }
 
     impl Drop for DbTestLock {
         fn drop(&mut self) {
-            let _ = self
-                .client
-                .query("SELECT pg_advisory_unlock($1)", &[&TEST_DB_LOCK_KEY]);
+            if let Some(client) = self.client.as_mut() {
+                let _ = client.query("SELECT pg_advisory_unlock($1)", &[&TEST_DB_LOCK_KEY]);
+            }
         }
+    }
+
+    fn sqlite_tests() -> bool {
+        std::env::var("WATTSWARM_RUN_QUEUE_TEST_BACKEND").as_deref() == Ok("sqlite")
     }
 
     fn test_pg_url() -> String {
@@ -637,15 +649,23 @@ mod tests {
     const TEST_ORG_ID: &str = "local:test-worker:bootstrap";
 
     fn queue_or_skip() -> Option<PgRunQueue> {
-        let queue = PgRunQueue::new(test_pg_url()).for_org(TEST_ORG_ID);
+        let queue = if sqlite_tests() {
+            PgRunQueue::open_in_memory_sqlite()
+        } else {
+            PgRunQueue::new(test_pg_url())
+        }
+        .for_org(TEST_ORG_ID);
         if queue.connect().is_err() {
-            eprintln!("skip run-queue worker tests: postgres not reachable");
+            eprintln!("skip run-queue worker tests: database not reachable");
             return None;
         }
         Some(queue)
     }
 
     fn shared_db_is_busy(queue: &PgRunQueue) -> bool {
+        if queue.backend_kind() == wattswarm_storage_core::storage::pg::BackendKind::Sqlite {
+            return false;
+        }
         let Ok(mut client) = queue.connect() else {
             return false;
         };
@@ -684,6 +704,24 @@ mod tests {
             round_policy: None,
             retry: RetryPolicy::default(),
             aggregation: AggregationPolicy::default(),
+        }
+    }
+
+    fn network_event(index: usize) -> Event {
+        let payload = EventPayload::TaskExpired(TaskExpiredPayload {
+            task_id: format!("network-task-{index}"),
+        });
+        Event {
+            event_id: format!("network-event-{index}"),
+            protocol_version: "0.1.0".to_owned(),
+            event_kind: payload.kind(),
+            task_id: payload.task_id().map(ToOwned::to_owned),
+            swarm_scope: "group:sqlite-concurrency".to_owned(),
+            epoch: 1,
+            author_node_id: "node-local".to_owned(),
+            created_at: 1_700_000_000_000 + index as u64,
+            payload,
+            signature_hex: "test-signature".to_owned(),
         }
     }
 
@@ -785,7 +823,7 @@ mod tests {
                     once: true,
                 },
                 Path::new("."),
-                Path::new("wattswarm.state"),
+                Path::new("wattswarm.db"),
             )
             .expect("run worker once");
     }
@@ -932,6 +970,126 @@ mod tests {
     }
 
     #[test]
+    fn sqlite_concurrent_claims_do_not_double_lease_step() {
+        let _guard = test_guard();
+        let queue = PgRunQueue::open_in_memory_sqlite()
+            .for_org("local:test-worker-sqlite-concurrency:bootstrap");
+        queue.init_schema().expect("init sqlite schema");
+        let run_id = format!("worker-sqlite-concurrent-{}", Uuid::new_v4().simple());
+        queue.submit_run(sample_spec(&run_id)).expect("submit");
+        queue.kickoff_run(&run_id).expect("kickoff");
+
+        let start = Arc::new(Barrier::new(3));
+        let handles = ["sqlite-worker-a", "sqlite-worker-b"].map(|worker_id| {
+            let queue = queue.clone();
+            let start = Arc::clone(&start);
+            thread::spawn(move || {
+                start.wait();
+                queue
+                    .claim_steps(worker_id, 1, 30_000)
+                    .map(|claimed| (worker_id, claimed))
+            })
+        });
+        start.wait();
+
+        let outcomes = handles.map(|handle| {
+            handle
+                .join()
+                .expect("concurrent claim thread")
+                .expect("concurrent sqlite claim")
+        });
+        let claimed_count: usize = outcomes.iter().map(|(_, claimed)| claimed.len()).sum();
+        assert_eq!(claimed_count, 1);
+
+        let (winner_id, claimed) = outcomes
+            .iter()
+            .find_map(|(worker_id, claimed)| claimed.first().map(|step| (*worker_id, step)))
+            .expect("one worker should claim the step");
+        assert_eq!(claimed.run_id, run_id);
+        assert_eq!(claimed.attempt, 1);
+
+        let mut client = queue.connect().expect("connect");
+        let row = client
+            .query_one(
+                "SELECT status, lease_owner, attempt, lease_id
+                 FROM run_steps
+                 WHERE org_id = $1 AND run_id = $2",
+                &[&queue.org_id(), &run_id],
+            )
+            .expect("leased step");
+        let status: String = row.get(0);
+        let lease_owner: Option<String> = row.get(1);
+        let attempt: i32 = row.get(2);
+        let lease_id: Option<String> = row.get(3);
+        assert_eq!(status, STEP_STATUS_LEASED);
+        assert_eq!(lease_owner.as_deref(), Some(winner_id));
+        assert_eq!(attempt, 1);
+        assert_eq!(lease_id.as_deref(), Some(claimed.lease_id.as_str()));
+
+        cleanup_run(&queue, &run_id);
+    }
+
+    #[test]
+    fn unified_sqlite_handles_network_and_run_queue_writes_concurrently() {
+        const WRITE_COUNT: usize = 30;
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db_path = dir.path().join(WATTSWARM_SQLITE_FILE);
+        let org_id = "local:sqlite-shared-write:bootstrap";
+        let store = PgStore::open_sqlite(&db_path)
+            .expect("open unified storage")
+            .for_org(org_id);
+        let queue = PgRunQueue::open_sqlite(&db_path).for_org(org_id);
+        queue.init_schema().expect("initialize unified run queue");
+
+        let start = Arc::new(Barrier::new(3));
+        let event_handle = {
+            let start = Arc::clone(&start);
+            let store = store.clone();
+            thread::spawn(move || {
+                start.wait();
+                for index in 0..WRITE_COUNT {
+                    store
+                        .append_event(&network_event(index))
+                        .expect("append concurrent network event");
+                }
+            })
+        };
+        let queue_handle = {
+            let start = Arc::clone(&start);
+            let queue = queue.clone();
+            thread::spawn(move || {
+                start.wait();
+                let mut claimed_count = 0;
+                for index in 0..WRITE_COUNT {
+                    let run_id = format!("shared-sqlite-run-{index}");
+                    queue
+                        .submit_run(sample_spec(&run_id))
+                        .expect("submit concurrent run");
+                    queue.kickoff_run(&run_id).expect("kick off concurrent run");
+                    claimed_count += queue
+                        .claim_steps("shared-sqlite-worker", 1, 30_000)
+                        .expect("claim concurrent run step")
+                        .len();
+                }
+                claimed_count
+            })
+        };
+        start.wait();
+
+        event_handle.join().expect("network event writer");
+        let claimed_count = queue_handle.join().expect("run queue writer");
+        assert_eq!(
+            store.head_seq().expect("network event count"),
+            WRITE_COUNT as u64
+        );
+        assert_eq!(claimed_count, WRITE_COUNT);
+        assert!(db_path.is_file());
+        assert!(!dir.path().join("local-control.state").exists());
+        assert!(!dir.path().join("run-queue.sqlite3").exists());
+    }
+
+    #[test]
     fn mark_remote_dispatched_persists_task_id_for_result_bridge() {
         let _guard = test_guard();
         let Some(queue) = queue_or_skip() else {
@@ -1072,11 +1230,7 @@ mod tests {
         claimed.run_status = RUN_STATUS_CANCELLING.to_owned();
 
         queue
-            .process_step(
-                claimed.clone(),
-                Path::new("."),
-                Path::new("wattswarm.state"),
-            )
+            .process_step(claimed.clone(), Path::new("."), Path::new("wattswarm.db"))
             .expect("process cancelling");
 
         let row = client

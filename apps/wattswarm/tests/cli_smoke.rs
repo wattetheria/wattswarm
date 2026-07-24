@@ -14,11 +14,22 @@ use wattswarm::types::{
     SignedNetworkProtocolParamsEnvelope,
 };
 use wattswarm::{control::NodeMode, storage::PgStore};
-use wattswarm_storage_core::storage::pg::Connection;
+use wattswarm_storage_core::storage::pg::{BackendKind, Connection, configured_backend_kind};
 
 fn cmd(schema: &str) -> std::process::Command {
     let mut cmd = std::process::Command::new(assert_cmd::cargo::cargo_bin!("wattswarm"));
     cmd.env("WATTSWARM_PG_SCHEMA", schema);
+    cmd
+}
+
+fn sqlite_cmd(state_dir: &std::path::Path) -> std::process::Command {
+    let mut cmd = std::process::Command::new(assert_cmd::cargo::cargo_bin!("wattswarm"));
+    cmd.env("WATTSWARM_STORAGE_BACKEND", "sqlite").args([
+        "--state-dir",
+        state_dir.to_str().expect("utf-8 state dir"),
+        "--store",
+        "node.sqlite3",
+    ]);
     cmd
 }
 
@@ -72,6 +83,9 @@ fn wait_for_runtime(base_url: &str) {
 }
 
 fn reset_test_schema(schema: &str) {
+    if configured_backend_kind().expect("resolve storage backend") == BackendKind::Sqlite {
+        return;
+    }
     let conn = Connection::open("cli-smoke-schema-reset").expect("open pg connection");
     conn.execute_batch(&format!(
         "DROP SCHEMA IF EXISTS {schema} CASCADE;
@@ -81,6 +95,9 @@ fn reset_test_schema(schema: &str) {
 }
 
 fn drop_test_schema(schema: &str) {
+    if configured_backend_kind().expect("resolve storage backend") == BackendKind::Sqlite {
+        return;
+    }
     let conn = Connection::open("cli-smoke-schema-drop").expect("open pg connection");
     let _ = conn.execute_batch(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE;"));
 }
@@ -936,10 +953,12 @@ fn cli_governance_commands_require_mainnet_genesis_and_emit_events() {
 fn cli_run_queue_lifecycle_smoke() {
     let dir = tempdir().unwrap();
     let state_dir = dir.path().join("state");
+    let state_dir = state_dir.to_str().unwrap();
+    let store = "test.state";
     let run_id = format!("run-cli-{}", Uuid::new_v4().simple());
     let schema = CliSchemaGuard::new();
     let spec_file = dir.path().join("run.json");
-    std::fs::create_dir_all(&state_dir).unwrap();
+    std::fs::create_dir_all(state_dir).unwrap();
     std::fs::write(
         &spec_file,
         serde_json::to_vec_pretty(&serde_json::json!({
@@ -961,6 +980,10 @@ fn cli_run_queue_lifecycle_smoke() {
 
     cmd(schema.as_str())
         .args([
+            "--state-dir",
+            state_dir,
+            "--store",
+            store,
             "run",
             "--pg-url",
             "postgres://postgres:postgres@127.0.0.1:55432/wattswarm",
@@ -973,7 +996,16 @@ fn cli_run_queue_lifecycle_smoke() {
     let mut submit = cmd(schema.as_str());
     submit.env("WATTSWARM_NODE_MODE", "local");
     submit
-        .args(["run", "submit", spec_file.to_str().unwrap(), "--kickoff"])
+        .args([
+            "--state-dir",
+            state_dir,
+            "--store",
+            store,
+            "run",
+            "submit",
+            spec_file.to_str().unwrap(),
+            "--kickoff",
+        ])
         .assert()
         .success()
         .stdout(predicate::str::contains("\"ok\": true"))
@@ -982,7 +1014,15 @@ fn cli_run_queue_lifecycle_smoke() {
     let mut watch = cmd(schema.as_str());
     watch.env("WATTSWARM_NODE_MODE", "local");
     watch
-        .args(["run", "watch", &run_id])
+        .args([
+            "--state-dir",
+            state_dir,
+            "--store",
+            store,
+            "run",
+            "watch",
+            &run_id,
+        ])
         .assert()
         .success()
         .stdout(predicate::str::contains(&run_id))
@@ -991,7 +1031,17 @@ fn cli_run_queue_lifecycle_smoke() {
     let mut events = cmd(schema.as_str());
     events.env("WATTSWARM_NODE_MODE", "local");
     events
-        .args(["run", "events", &run_id, "--limit", "1"])
+        .args([
+            "--state-dir",
+            state_dir,
+            "--store",
+            store,
+            "run",
+            "events",
+            &run_id,
+            "--limit",
+            "1",
+        ])
         .assert()
         .success()
         .stdout(predicate::str::contains("RUN_"));
@@ -999,7 +1049,15 @@ fn cli_run_queue_lifecycle_smoke() {
     let mut cancel = cmd(schema.as_str());
     cancel.env("WATTSWARM_NODE_MODE", "local");
     cancel
-        .args(["run", "cancel", &run_id])
+        .args([
+            "--state-dir",
+            state_dir,
+            "--store",
+            store,
+            "run",
+            "cancel",
+            &run_id,
+        ])
         .assert()
         .success()
         .stdout(predicate::str::contains("cancel requested"));
@@ -1007,7 +1065,15 @@ fn cli_run_queue_lifecycle_smoke() {
     let mut result = cmd(schema.as_str());
     result.env("WATTSWARM_NODE_MODE", "local");
     result
-        .args(["run", "result", &run_id])
+        .args([
+            "--state-dir",
+            state_dir,
+            "--store",
+            store,
+            "run",
+            "result",
+            &run_id,
+        ])
         .assert()
         .success()
         .stdout(predicate::str::contains("\"status\": \"CANCELL"));
@@ -1015,10 +1081,99 @@ fn cli_run_queue_lifecycle_smoke() {
     let mut retry = cmd(schema.as_str());
     retry.env("WATTSWARM_NODE_MODE", "local");
     retry
-        .args(["run", "retry", "run-does-not-exist"])
+        .args([
+            "--state-dir",
+            state_dir,
+            "--store",
+            store,
+            "run",
+            "retry",
+            "run-does-not-exist",
+        ])
         .assert()
         .failure()
         .stderr(predicate::str::contains("run not found"));
+}
+
+#[test]
+fn cli_sqlite_node_and_run_queue_lifecycle_smoke() {
+    let dir = tempdir().unwrap();
+    let state_dir = dir.path().join("state");
+    let run_id = format!("run-sqlite-cli-{}", Uuid::new_v4().simple());
+    let spec_file = dir.path().join("run.json");
+    std::fs::write(
+        &spec_file,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "run_id": run_id,
+            "task_type": "sqlite_smoke",
+            "shared_inputs": {"source":"cli"},
+            "agents": [{
+                "agent_id": "a1",
+                "executor": "rt",
+                "profile": "default",
+                "prompt": "review"
+            }]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    sqlite_cmd(&state_dir)
+        .args(["node", "up", "--mode", "local"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("node is up"));
+
+    sqlite_cmd(&state_dir)
+        .args(["run", "init"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("run queue schema initialized"));
+
+    sqlite_cmd(&state_dir)
+        .args(["run", "submit", spec_file.to_str().unwrap(), "--kickoff"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"ok\": true"))
+        .stdout(predicate::str::contains(&run_id));
+
+    sqlite_cmd(&state_dir)
+        .args(["run", "watch", &run_id])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(&run_id))
+        .stdout(predicate::str::contains("\"status\": \"QUEUED\""));
+
+    sqlite_cmd(&state_dir)
+        .args(["run", "cancel", &run_id])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("cancel requested"));
+
+    let unified_db = state_dir.join("wattswarm.db");
+    assert!(unified_db.is_file());
+    assert!(!state_dir.join("node.sqlite3").exists());
+    assert!(!state_dir.join("local-control.state").exists());
+    assert!(!state_dir.join("run-queue.sqlite3").exists());
+
+    let conn = Connection::open_sqlite(&unified_db).expect("open unified sqlite database");
+    let complete_table_count = conn
+        .query_row(
+            "SELECT COUNT(*)
+             FROM sqlite_master
+             WHERE type = 'table'
+               AND name IN (
+                   'events',
+                   'executor_registry_local',
+                   'runs',
+                   'run_steps',
+                   'run_events'
+               )",
+            wattswarm_storage_core::params![],
+            |row| row.get::<usize, i64>(0),
+        )
+        .expect("count unified storage tables");
+    assert_eq!(complete_table_count, 5);
 }
 
 #[test]

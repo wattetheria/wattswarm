@@ -20,6 +20,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use uuid::Uuid;
+use wattswarm_storage_core::storage::pg::{BackendKind, configured_backend_kind};
+use wattswarm_storage_core::storage::sqlite_layout::{WATTSWARM_SQLITE_FILE, sqlite_database_path};
 
 const DEFAULT_NODE_API_URL: &str = "http://127.0.0.1:7788";
 const ENV_NODE_API_URL: &str = "WATTSWARM_NODE_API_URL";
@@ -34,7 +36,7 @@ pub struct Cli {
     #[arg(long, default_value = ".wattswarm")]
     state_dir: PathBuf,
 
-    #[arg(long = "store", default_value = "wattswarm.state")]
+    #[arg(long = "store", default_value = WATTSWARM_SQLITE_FILE)]
     store: PathBuf,
 }
 
@@ -314,10 +316,14 @@ pub fn run() -> Result<()> {
     let cli = Cli::parse();
     fs::create_dir_all(&cli.state_dir)?;
 
-    let store_path = if cli.store.is_absolute() {
+    let requested_store_path = if cli.store.is_absolute() {
         cli.store
     } else {
         cli.state_dir.join(cli.store)
+    };
+    let store_path = match configured_backend_kind()? {
+        BackendKind::Postgres => requested_store_path,
+        BackendKind::Sqlite => sqlite_database_path(&cli.state_dir),
     };
 
     match cli.command {
@@ -809,7 +815,7 @@ fn handle_run(cmd: RunCommand, state_dir: &Path, db_path: &Path) -> Result<()> {
     let pg_url = run_control::resolve_run_queue_pg_url(cmd.pg_url);
     match cmd.action {
         RunAction::Init => {
-            run_control::init_run_queue(&pg_url)?;
+            run_control::init_run_queue(state_dir, &pg_url)?;
             println!("run queue schema initialized");
         }
         RunAction::Submit { file, kickoff } => {

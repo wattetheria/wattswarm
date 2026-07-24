@@ -37,6 +37,6 @@ fn ui_wattetheria_snapshot_does_not_initialize_local_topology_when_unconfigured(
         );
     });
 
-    assert_eq!(count_projection_rows("network_registry"), 0);
-    assert_eq!(count_projection_rows("node_registry"), 0);
+    assert_eq!(count_projection_rows(&db_path, "network_registry"), 0);
+    assert_eq!(count_projection_rows(&db_path, "node_registry"), 0);
 }

@@ -9,7 +9,7 @@ mod types;
 mod utils;
 mod worker;
 
-pub use queue::PgRunQueue;
+pub use queue::{DEFAULT_RUN_QUEUE_PG_URL, PgRunQueue, RUN_QUEUE_SQLITE_FILE};
 pub use stigmergy::{STIGMERGY_EXECUTOR, STIGMERGY_PROFILE, StigmergyCompletionSource};
 pub use types::{
     AggregationPolicy, NullPolicy, NullResolverMode, NullTrigger, RetryPolicy, RunAgentSpec,

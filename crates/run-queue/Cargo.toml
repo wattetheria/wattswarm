@@ -19,3 +19,7 @@ uuid = { workspace = true }
 wattswarm-control-plane = { workspace = true }
 wattswarm-crypto = { workspace = true }
 wattswarm-protocol = { workspace = true }
+wattswarm-storage-core = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

@@ -1,3 +1,4 @@
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Mutex, OnceLock};
 
 use wattswarm_crypto::NodeIdentity;
@@ -132,6 +133,7 @@ fn reset_test_schema(schema: &str) {
 
 fn with_test_schema<T>(f: impl FnOnce() -> T) -> T {
     let _guard = env_lock();
+    let _backend_guard = EnvVarGuard::set("WATTSWARM_STORAGE_BACKEND", "postgres");
     let _db_lock = DbTestLock::acquire();
     reset_test_schema(TEST_SCHEMA);
     let _schema_guard = EnvVarGuard::set("WATTSWARM_PG_SCHEMA", TEST_SCHEMA);
@@ -234,6 +236,198 @@ fn pg_store_recreates_required_tables_removed_after_schema_cache_hit() {
             )
             .expect("query repaired required tables");
         assert_eq!(count, 2);
+    });
+}
+
+fn postgres_primary_keys(conn: &Connection) -> BTreeMap<String, Vec<String>> {
+    let mut statement = conn
+        .prepare(
+            "SELECT tc.table_name, kcu.column_name
+             FROM information_schema.table_constraints tc
+             JOIN information_schema.key_column_usage kcu
+               ON kcu.constraint_schema = tc.constraint_schema
+              AND kcu.constraint_name = tc.constraint_name
+              AND kcu.table_name = tc.table_name
+             WHERE tc.table_schema = current_schema()
+               AND tc.constraint_type = 'PRIMARY KEY'
+             ORDER BY tc.table_name, kcu.ordinal_position",
+        )
+        .expect("prepare PostgreSQL primary key query");
+    let rows = statement
+        .query_map(wattswarm_storage_core::params![], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .expect("query PostgreSQL primary keys");
+    let mut keys = BTreeMap::<String, Vec<String>>::new();
+    for row in rows {
+        let (table, column) = row.expect("decode PostgreSQL primary key");
+        keys.entry(table).or_default().push(column);
+    }
+    keys
+}
+
+fn sqlite_primary_keys(
+    conn: &Connection,
+    tables: &BTreeSet<String>,
+) -> BTreeMap<String, Vec<String>> {
+    let mut keys = BTreeMap::new();
+    for table in tables {
+        let mut statement = conn
+            .prepare(&format!("PRAGMA table_info({table})"))
+            .expect("prepare SQLite primary key query");
+        let rows = statement
+            .query_map(wattswarm_storage_core::params![], |row| {
+                Ok((row.get::<_, i64>(5)?, row.get::<_, String>(1)?))
+            })
+            .expect("query SQLite primary key");
+        let mut columns = rows
+            .collect::<Result<Vec<_>, _>>()
+            .expect("collect SQLite primary key")
+            .into_iter()
+            .filter(|(position, _)| *position > 0)
+            .collect::<Vec<_>>();
+        columns.sort_by_key(|(position, _)| *position);
+        if !columns.is_empty() {
+            keys.insert(
+                table.clone(),
+                columns.into_iter().map(|(_, column)| column).collect(),
+            );
+        }
+    }
+    keys
+}
+
+fn postgres_unique_keys(conn: &Connection) -> BTreeSet<(String, Vec<String>)> {
+    let mut statement = conn
+        .prepare(
+            "SELECT tc.table_name, tc.constraint_name, kcu.column_name
+             FROM information_schema.table_constraints tc
+             JOIN information_schema.key_column_usage kcu
+               ON kcu.constraint_schema = tc.constraint_schema
+              AND kcu.constraint_name = tc.constraint_name
+              AND kcu.table_name = tc.table_name
+             WHERE tc.table_schema = current_schema()
+               AND tc.constraint_type = 'UNIQUE'
+             ORDER BY tc.table_name, tc.constraint_name, kcu.ordinal_position",
+        )
+        .expect("prepare PostgreSQL unique key query");
+    let rows = statement
+        .query_map(wattswarm_storage_core::params![], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })
+        .expect("query PostgreSQL unique keys");
+    let mut grouped = BTreeMap::<(String, String), Vec<String>>::new();
+    for row in rows {
+        let (table, constraint, column) = row.expect("decode PostgreSQL unique key");
+        grouped.entry((table, constraint)).or_default().push(column);
+    }
+    grouped
+        .into_iter()
+        .map(|((table, _), columns)| (table, columns))
+        .collect()
+}
+
+fn sqlite_unique_keys(
+    conn: &Connection,
+    tables: &BTreeSet<String>,
+) -> BTreeSet<(String, Vec<String>)> {
+    let mut keys = BTreeSet::new();
+    for table in tables {
+        let mut statement = conn
+            .prepare(&format!("PRAGMA index_list({table})"))
+            .expect("prepare SQLite index list");
+        let indexes = statement
+            .query_map(wattswarm_storage_core::params![], |row| {
+                Ok((
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })
+            .expect("query SQLite index list")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("collect SQLite index list");
+        for (index_name, unique, origin) in indexes {
+            if unique == 0 || origin != "u" {
+                continue;
+            }
+            let escaped_index = index_name.replace('"', "\"\"");
+            let mut index_statement = conn
+                .prepare(&format!("PRAGMA index_info(\"{escaped_index}\")"))
+                .expect("prepare SQLite unique key query");
+            let mut columns = index_statement
+                .query_map(wattswarm_storage_core::params![], |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, String>(2)?))
+                })
+                .expect("query SQLite unique key")
+                .collect::<Result<Vec<_>, _>>()
+                .expect("collect SQLite unique key");
+            columns.sort_by_key(|(position, _)| *position);
+            keys.insert((
+                table.clone(),
+                columns.into_iter().map(|(_, column)| column).collect(),
+            ));
+        }
+    }
+    keys
+}
+
+#[test]
+fn sqlite_and_postgres_initialize_the_same_storage_tables() {
+    with_test_schema(|| {
+        let _pg_store = PgStore::open("schema-parity.state").expect("initialize postgres schema");
+        let pg_conn = open_test_connection();
+        let mut pg_stmt = pg_conn
+            .prepare(
+                "SELECT table_name
+                 FROM information_schema.tables
+                 WHERE table_schema = current_schema()
+                   AND table_type = 'BASE TABLE'
+                 ORDER BY table_name",
+            )
+            .expect("prepare postgres table query");
+        let pg_tables = pg_stmt
+            .query_map(wattswarm_storage_core::params![], |row| {
+                row.get::<_, String>(0)
+            })
+            .expect("query postgres tables")
+            .collect::<Result<BTreeSet<_>, _>>()
+            .expect("collect postgres tables");
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let sqlite_path = dir.path().join("schema-parity.sqlite3");
+        let _sqlite_store = PgStore::open_sqlite(&sqlite_path).expect("initialize sqlite schema");
+        let sqlite_conn = Connection::open_sqlite(&sqlite_path).expect("open sqlite schema probe");
+        let mut sqlite_stmt = sqlite_conn
+            .prepare(
+                "SELECT name
+                 FROM sqlite_master
+                 WHERE type = 'table'
+                   AND name NOT LIKE 'sqlite_%'
+                 ORDER BY name",
+            )
+            .expect("prepare sqlite table query");
+        let sqlite_tables = sqlite_stmt
+            .query_map(wattswarm_storage_core::params![], |row| {
+                row.get::<_, String>(0)
+            })
+            .expect("query sqlite tables")
+            .collect::<Result<BTreeSet<_>, _>>()
+            .expect("collect sqlite tables");
+
+        assert_eq!(sqlite_tables, pg_tables);
+        assert_eq!(
+            sqlite_primary_keys(&sqlite_conn, &sqlite_tables),
+            postgres_primary_keys(&pg_conn)
+        );
+        assert_eq!(
+            sqlite_unique_keys(&sqlite_conn, &sqlite_tables),
+            postgres_unique_keys(&pg_conn)
+        );
     });
 }
 

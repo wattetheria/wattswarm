@@ -14,6 +14,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 pub mod pg;
+pub mod sqlite_layout;
 
 #[derive(Clone)]
 pub struct PgStore {

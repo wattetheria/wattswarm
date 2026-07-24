@@ -32,7 +32,8 @@ use wattswarm_control_plane::control::{
 use wattswarm_control_plane::crypto::{NodeIdentity, sha256_hex};
 use wattswarm_control_plane::network_bridge::maybe_start_background_network_service;
 use wattswarm_control_plane::storage::{
-    local_control_scope_id, local_control_store, storage::pg::Connection,
+    local_control_scope_id, local_control_store,
+    storage::pg::{BackendKind, Connection, configured_backend_kind},
 };
 use wattswarm_control_plane::task_template::sample_contract;
 use wattswarm_control_plane::types::{
@@ -308,11 +309,14 @@ impl Drop for EnvVarGuard {
 }
 
 struct DbTestLock {
-    conn: Connection,
+    conn: Option<Connection>,
 }
 
 impl DbTestLock {
     fn acquire() -> Self {
+        if configured_backend_kind().expect("resolve storage backend") == BackendKind::Sqlite {
+            return Self { conn: None };
+        }
         let conn = Connection::open("control-db-lock").expect("open db lock connection");
         conn.query_row(
             "SELECT pg_advisory_lock($1)",
@@ -320,13 +324,16 @@ impl DbTestLock {
             |_| Ok(()),
         )
         .expect("acquire advisory lock");
-        Self { conn }
+        Self { conn: Some(conn) }
     }
 }
 
 impl Drop for DbTestLock {
     fn drop(&mut self) {
-        let _ = self.conn.query_row(
+        let Some(conn) = &self.conn else {
+            return;
+        };
+        let _ = conn.query_row(
             "SELECT pg_advisory_unlock($1)",
             wattswarm_storage_core::params![TEST_DB_LOCK_KEY],
             |_| Ok(()),
@@ -335,6 +342,9 @@ impl Drop for DbTestLock {
 }
 
 fn reset_test_schema(schema: &str) {
+    if configured_backend_kind().expect("resolve storage backend") == BackendKind::Sqlite {
+        return;
+    }
     let prev_schema = std::env::var("WATTSWARM_PG_SCHEMA").ok();
     // SAFETY: tests serialize env mutations via ENV_LOCK.
     unsafe {

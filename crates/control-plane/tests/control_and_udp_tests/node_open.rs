@@ -49,7 +49,7 @@ fn open_node_bootstraps_local_network_and_default_org() {
     let network_id = format!("local:{node_id}");
     let org_id = format!("{network_id}:bootstrap");
 
-    let conn = Connection::open("bootstrap-verify").expect("open verification connection");
+    let conn = Connection::open(&db_path).expect("open verification connection");
     let network_row = conn
         .query_row(
             "SELECT network_kind, genesis_node_id FROM network_registry WHERE network_id = $1",
@@ -119,7 +119,7 @@ fn open_node_bootstraps_lan_network_and_default_org() {
     let network_id = format!("lan:{node_id}");
     let org_id = format!("{network_id}:bootstrap");
 
-    let conn = Connection::open("lan-bootstrap-verify").expect("open verification connection");
+    let conn = Connection::open(&db_path).expect("open verification connection");
     let network_row = conn
         .query_row(
             "SELECT network_kind, genesis_node_id FROM network_registry WHERE network_id = $1",

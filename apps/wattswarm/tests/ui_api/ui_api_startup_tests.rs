@@ -251,8 +251,7 @@ fn ui_startup_config_roundtrips_network_settings_without_agent_binding() {
         assert_eq!(status_json["mode"].as_str(), Some("local"));
     });
 
-    let conn =
-        Connection::open(state_dir.join("local-control.state")).expect("open local control db");
+    let conn = Connection::open(state_dir.join("wattswarm.db")).expect("open unified Wattswarm db");
     let mut stmt = conn
         .prepare(
             "SELECT scope_id, executor_name, base_url

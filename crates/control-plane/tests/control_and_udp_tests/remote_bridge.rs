@@ -116,8 +116,8 @@ fn remote_task_bridge_materializes_executes_and_dedupes() {
     assert_eq!(members[0].status, "confirmed");
 
     let bridge_rows =
-        wattswarm_control_plane::storage::PgStore::open(state_dir.join("local-control.state"))
-            .expect("open local control store")
+        wattswarm_control_plane::storage::PgStore::open(state_dir.join("wattswarm.db"))
+            .expect("open unified Wattswarm store")
             .list_local_remote_task_bridges(&local_control_scope_id(&state_dir))
             .expect("list local remote task bridges");
     let registry = RemoteTaskBridgeRegistry {
@@ -160,8 +160,8 @@ fn remote_task_bridge_materializes_executes_and_dedupes() {
     assert_eq!(deduped["candidate_id"], out["candidate_id"]);
 
     let registry_after =
-        wattswarm_control_plane::storage::PgStore::open(state_dir.join("local-control.state"))
-            .expect("open local control store after")
+        wattswarm_control_plane::storage::PgStore::open(state_dir.join("wattswarm.db"))
+            .expect("open unified Wattswarm store after")
             .list_local_remote_task_bridges(&local_control_scope_id(&state_dir))
             .expect("list local remote task bridges after");
     assert_eq!(registry_after.len(), 1);
@@ -393,8 +393,8 @@ fn remote_task_bridge_rejects_node_scoped_tasks_for_other_nodes() {
     .expect_err("bridge should reject mismatched node scope");
     assert!(err.to_string().contains("not eligible for local node"));
     assert!(
-        wattswarm_control_plane::storage::PgStore::open(state_dir.join("local-control.state"))
-            .expect("open local control store")
+        wattswarm_control_plane::storage::PgStore::open(state_dir.join("wattswarm.db"))
+            .expect("open unified Wattswarm store")
             .list_local_remote_task_bridges(&local_control_scope_id(&state_dir))
             .expect("list local remote task bridges")
             .is_empty(),

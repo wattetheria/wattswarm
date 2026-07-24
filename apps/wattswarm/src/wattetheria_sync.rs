@@ -429,12 +429,13 @@ fn vote_reveal_snapshot(row: VoteRevealRow) -> TaskVoteRevealSnapshot {
 }
 
 fn task_coordinator_run_snapshot(
-    _state_dir: &Path,
+    state_dir: &Path,
     org_id: &str,
     task_id: &str,
 ) -> Result<Option<TaskCoordinatorRunSnapshot>> {
     let pg_url = run_control::resolve_run_queue_pg_url(None);
-    let queue = crate::run_queue::PgRunQueue::new(pg_url).for_org(org_id.to_owned());
+    let queue = crate::run_queue::PgRunQueue::from_runtime_config(pg_url, state_dir)?
+        .for_org(org_id.to_owned());
     let Some(run_id) = queue.run_id_for_task_id(task_id)? else {
         return Ok(None);
     };
@@ -538,7 +539,7 @@ pub fn build_task_run_projection_snapshot(
             Err(error) => Some(Err(error)),
         })
         .collect::<Result<Vec<_>>>()?;
-    let runs = crate::run_queue::PgRunQueue::new(pg_url.to_owned())
+    let runs = crate::run_queue::PgRunQueue::from_runtime_config(pg_url.to_owned(), state_dir)?
         .for_org(node.store.org_id().to_owned())
         .list_runs(run_limit.clamp(1, 200))?;
     Ok(TaskRunProjectionSnapshot {

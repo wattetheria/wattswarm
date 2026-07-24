@@ -1,6 +1,8 @@
 use anyhow::{Result, anyhow};
-use postgres::{Client, Transaction};
 use serde_json::{Map, Value};
+use wattswarm_storage_core::storage::pg::{
+    DatabaseClient as Client, DatabaseRow as Row, DatabaseTransaction as Transaction,
+};
 
 use super::status::{
     STEP_STATUS_CANCELLED, STEP_STATUS_CREATED, STEP_STATUS_FAILED, STEP_STATUS_LEASED,
@@ -62,7 +64,7 @@ pub(crate) fn step_counts_tx(
     Ok(accumulate_counts(rows))
 }
 
-pub(crate) fn accumulate_counts(rows: Vec<postgres::Row>) -> RunStepCounts {
+pub(crate) fn accumulate_counts(rows: Vec<Row>) -> RunStepCounts {
     let mut counts = RunStepCounts::default();
     for row in rows {
         let status: String = row.get(0);

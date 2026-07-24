@@ -563,25 +563,34 @@ mod tests {
     const TEST_DB_LOCK_KEY: i64 = 1_987_654_321;
 
     struct DbTestLock {
-        client: postgres::Client,
+        client: Option<postgres::Client>,
     }
 
     impl DbTestLock {
         fn acquire() -> Option<Self> {
+            if sqlite_tests() {
+                return Some(Self { client: None });
+            }
             let mut client = postgres::Client::connect(&test_pg_url(), postgres::NoTls).ok()?;
             client
                 .query_one("SELECT pg_advisory_lock($1)", &[&TEST_DB_LOCK_KEY])
                 .ok()?;
-            Some(Self { client })
+            Some(Self {
+                client: Some(client),
+            })
         }
     }
 
     impl Drop for DbTestLock {
         fn drop(&mut self) {
-            let _ = self
-                .client
-                .query("SELECT pg_advisory_unlock($1)", &[&TEST_DB_LOCK_KEY]);
+            if let Some(client) = self.client.as_mut() {
+                let _ = client.query("SELECT pg_advisory_unlock($1)", &[&TEST_DB_LOCK_KEY]);
+            }
         }
+    }
+
+    fn sqlite_tests() -> bool {
+        std::env::var("WATTSWARM_RUN_QUEUE_TEST_BACKEND").as_deref() == Ok("sqlite")
     }
 
     fn test_pg_url() -> String {
@@ -591,6 +600,9 @@ mod tests {
     }
 
     fn reset_test_schema_or_skip() -> bool {
+        if sqlite_tests() {
+            return true;
+        }
         let Ok(mut client) = postgres::Client::connect(&test_pg_url(), postgres::NoTls) else {
             eprintln!("skip run-queue admin_api tests: postgres not reachable");
             return false;
@@ -604,9 +616,14 @@ mod tests {
     }
 
     fn queue_or_skip() -> Option<PgRunQueue> {
-        let queue = PgRunQueue::with_schema(test_pg_url(), TEST_SCHEMA).for_org(TEST_ORG_ID);
+        let queue = if sqlite_tests() {
+            PgRunQueue::open_in_memory_sqlite()
+        } else {
+            PgRunQueue::with_schema(test_pg_url(), TEST_SCHEMA)
+        }
+        .for_org(TEST_ORG_ID);
         if queue.connect().is_err() {
-            eprintln!("skip run-queue admin_api tests: postgres not reachable");
+            eprintln!("skip run-queue admin_api tests: database not reachable");
             return None;
         }
         Some(queue)

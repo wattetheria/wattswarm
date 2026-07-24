@@ -34,6 +34,17 @@ fn current_schema_init_key(conn: &Connection) -> Result<String> {
 }
 
 fn schema_has_required_tables(conn: &Connection) -> Result<bool> {
+    if conn.backend_kind() == pg::BackendKind::Sqlite {
+        let count = conn.query_row(
+            "SELECT COUNT(*)
+             FROM sqlite_master
+             WHERE type = 'table'
+               AND name IN ('discovered_peers_local', 'network_ban_windows')",
+            params![],
+            |row| row.get::<_, i64>(0),
+        )?;
+        return Ok(count == 2);
+    }
     let count = conn.query_row(
         "SELECT COUNT(*)
          FROM information_schema.tables
@@ -46,6 +57,23 @@ fn schema_has_required_tables(conn: &Connection) -> Result<bool> {
 }
 
 fn column_exists(conn: &Connection, table: &str, column: &str) -> bool {
+    if conn.backend_kind() == pg::BackendKind::Sqlite {
+        if !table
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+        {
+            return false;
+        }
+        let Ok(mut statement) = conn.prepare(&format!("PRAGMA table_info({table})")) else {
+            return false;
+        };
+        let Ok(rows) = statement.query_map(params![], |row| row.get::<_, String>(1)) else {
+            return false;
+        };
+        return rows
+            .filter_map(std::result::Result::ok)
+            .any(|name| name == column);
+    }
     conn.query_row(
         "SELECT 1
          FROM information_schema.columns
@@ -59,6 +87,215 @@ fn column_exists(conn: &Connection, table: &str, column: &str) -> bool {
     .optional()
     .map(|v| v.is_some())
     .unwrap_or(false)
+}
+
+const SQLITE_REQUIRED_PRIMARY_KEYS: &[(&str, &[&str])] = &[
+    ("network_registry", &["network_id"]),
+    ("network_params", &["network_id"]),
+    (
+        "network_authority_sets",
+        &["network_id", "authority_set_id"],
+    ),
+    ("network_control_log", &["network_id", "control_seq"]),
+    ("node_registry", &["node_id"]),
+    ("node_network_membership", &["node_id", "network_id"]),
+    ("org_registry", &["org_id"]),
+    ("local_config_json", &["config_key"]),
+    ("executor_registry_local", &["scope_id", "executor_name"]),
+    ("discovered_peers_local", &["scope_id", "node_id"]),
+    ("peer_metadata_local", &["scope_id", "node_id"]),
+    (
+        "network_peer_sync_state_local",
+        &["scope_id", "network_peer_id"],
+    ),
+    ("peer_relationships_local", &["scope_id", "remote_node_id"]),
+    ("peer_dm_threads_local", &["scope_id", "thread_id"]),
+    ("peer_dm_messages_local", &["scope_id", "message_id"]),
+    (
+        "data_plane_status_local",
+        &["scope_id", "object_kind", "object_id"],
+    ),
+    ("agent_payments_local", &["scope_id", "payment_id"]),
+    ("agent_event_bus_local", &["scope_id", "event_id"]),
+    ("agent_event_delivery_local", &["scope_id", "delivery_id"]),
+    (
+        "remote_task_bridge_registry_local",
+        &["task_id", "executor", "profile"],
+    ),
+    (
+        "data_source_bindings_local",
+        &["scope_id", "binding_kind", "binding_scope", "binding_key"],
+    ),
+    ("events", &["seq"]),
+    ("task_projection", &["org_id", "task_id"]),
+    ("leases", &["org_id", "task_id", "role"]),
+    ("candidates", &["org_id", "task_id", "candidate_id"]),
+    (
+        "candidate_output_cache",
+        &["org_id", "task_id", "candidate_id"],
+    ),
+    (
+        "verifier_results",
+        &["org_id", "task_id", "candidate_id", "verifier_node_id"],
+    ),
+    (
+        "evidence_added",
+        &["org_id", "task_id", "candidate_id", "evidence_digest"],
+    ),
+    (
+        "evidence_available",
+        &[
+            "org_id",
+            "task_id",
+            "candidate_id",
+            "verifier_node_id",
+            "evidence_digest",
+        ],
+    ),
+    ("vote_commits", &["org_id", "task_id", "voter_node_id"]),
+    ("vote_reveals", &["org_id", "task_id", "voter_node_id"]),
+    ("finalizations", &["org_id", "task_id", "epoch"]),
+    ("checkpoints", &["org_id", "checkpoint_id"]),
+    (
+        "feed_subscriptions",
+        &["org_id", "network_id", "subscriber_node_id", "feed_key"],
+    ),
+    ("task_announcements", &["org_id", "announcement_id"]),
+    ("topic_messages", &["org_id", "message_id"]),
+    (
+        "topic_cursors",
+        &["org_id", "network_id", "subscriber_node_id", "feed_key"],
+    ),
+    (
+        "execution_set_projection",
+        &[
+            "org_id",
+            "task_id",
+            "execution_set_id",
+            "participant_node_id",
+        ],
+    ),
+    (
+        "network_rule_announcements",
+        &["org_id", "scope_key", "rule_set", "rule_version"],
+    ),
+    (
+        "network_checkpoint_announcements",
+        &["org_id", "scope_key", "checkpoint_id"],
+    ),
+    ("membership_projection", &["org_id", "singleton"]),
+    ("decision_memory", &["org_id", "task_id", "epoch"]),
+    ("evidence_summary", &["org_id", "cid"]),
+    (
+        "runtime_metrics",
+        &[
+            "org_id",
+            "runtime_id",
+            "profile_id",
+            "task_type",
+            "window_start",
+            "window_end",
+        ],
+    ),
+    ("task_settlement", &["org_id", "task_id", "epoch"]),
+    ("task_stage_usage", &["org_id", "task_id", "epoch"]),
+    ("task_cost_reports", &["org_id", "task_id", "epoch"]),
+    ("reputation_state", &["org_id", "runtime_id", "profile_id"]),
+    (
+        "reuse_blacklist",
+        &["org_id", "task_id", "epoch", "candidate_hash"],
+    ),
+    ("advisory_state", &["advisory_id"]),
+    ("unknown_reason_observations", &["id"]),
+    ("event_revocations", &["org_id", "event_id"]),
+    ("summary_revocations", &["org_id", "summary_id"]),
+    ("penalized_nodes", &["node_id"]),
+    ("network_ban_windows", &["org_id", "node_id", "starts_at"]),
+    (
+        "imported_decision_memory",
+        &["org_id", "summary_id", "task_id", "epoch"],
+    ),
+    (
+        "imported_reputation_state",
+        &["org_id", "summary_id", "runtime_id", "profile_id"],
+    ),
+    (
+        "imported_task_outcomes",
+        &["org_id", "summary_id", "task_id"],
+    ),
+];
+
+const SQLITE_REQUIRED_UNIQUE_KEYS: &[(&str, &[&str])] = &[
+    ("network_control_log", &["network_id", "control_hash"]),
+    ("node_registry", &["public_key"]),
+    ("events", &["event_id"]),
+];
+
+fn sqlite_primary_key_columns(conn: &Connection, table: &str) -> Result<Vec<String>> {
+    let mut statement = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let rows = statement.query_map(params![], |row| {
+        Ok((row.get::<_, i64>(5)?, row.get::<_, String>(1)?))
+    })?;
+    let mut columns = rows
+        .collect::<std::result::Result<Vec<_>, _>>()?
+        .into_iter()
+        .filter(|(position, _)| *position > 0)
+        .collect::<Vec<_>>();
+    columns.sort_by_key(|(position, _)| *position);
+    Ok(columns.into_iter().map(|(_, name)| name).collect())
+}
+
+fn sqlite_unique_keys(conn: &Connection, table: &str) -> Result<HashSet<Vec<String>>> {
+    let mut statement = conn.prepare(&format!("PRAGMA index_list({table})"))?;
+    let rows = statement.query_map(params![], |row| {
+        Ok((row.get::<_, String>(1)?, row.get::<_, i64>(2)?))
+    })?;
+    let indexes = rows.collect::<std::result::Result<Vec<_>, _>>()?;
+    let mut keys = HashSet::new();
+    for (index_name, unique) in indexes {
+        if unique == 0 {
+            continue;
+        }
+        let escaped_index = index_name.replace('"', "\"\"");
+        let mut index_statement =
+            conn.prepare(&format!("PRAGMA index_info(\"{escaped_index}\")"))?;
+        let mut columns = index_statement
+            .query_map(params![], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(2)?))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        columns.sort_by_key(|(position, _)| *position);
+        keys.insert(columns.into_iter().map(|(_, name)| name).collect());
+    }
+    Ok(keys)
+}
+
+fn validate_sqlite_schema_constraints(conn: &Connection) -> Result<()> {
+    for (table, expected) in SQLITE_REQUIRED_PRIMARY_KEYS {
+        let actual = sqlite_primary_key_columns(conn, table)?;
+        if actual != *expected {
+            anyhow::bail!(
+                "SQLite schema constraint mismatch for {table}: expected primary key ({}) but \
+                 found ({})",
+                expected.join(", "),
+                actual.join(", ")
+            );
+        }
+    }
+    for (table, expected) in SQLITE_REQUIRED_UNIQUE_KEYS {
+        let actual = sqlite_unique_keys(conn, table)?;
+        let expected = expected
+            .iter()
+            .map(|column| (*column).to_owned())
+            .collect::<Vec<_>>();
+        if !actual.contains(&expected) {
+            anyhow::bail!(
+                "SQLite schema constraint mismatch for {table}: missing unique key ({})",
+                expected.join(", ")
+            );
+        }
+    }
+    Ok(())
 }
 
 fn column_data_type(conn: &Connection, table: &str, column: &str) -> Result<Option<String>> {
@@ -77,6 +314,9 @@ fn column_data_type(conn: &Connection, table: &str, column: &str) -> Result<Opti
 }
 
 fn ensure_timestamp_column(conn: &Connection, table: &str, column: &str) -> Result<()> {
+    if conn.backend_kind() == pg::BackendKind::Sqlite {
+        return Ok(());
+    }
     let Some(data_type) = column_data_type(conn, table, column)? else {
         return Ok(());
     };
@@ -106,6 +346,9 @@ fn ensure_boolean_column(
     column: &str,
     default_value: Option<&str>,
 ) -> Result<()> {
+    if conn.backend_kind() == pg::BackendKind::Sqlite {
+        return Ok(());
+    }
     let Some(data_type) = column_data_type(conn, table, column)? else {
         return Ok(());
     };
@@ -315,6 +558,9 @@ fn migrate_feed_subscription_network_id_schema(conn: &Connection) -> Result<()> 
             "ALTER TABLE feed_subscriptions ADD COLUMN network_id TEXT NOT NULL DEFAULT ''",
         )?;
     }
+    if conn.backend_kind() == pg::BackendKind::Sqlite {
+        return Ok(());
+    }
     conn.execute_batch(
         "
         ALTER TABLE feed_subscriptions
@@ -386,6 +632,9 @@ fn migrate_topic_cursor_network_id_schema(conn: &Connection) -> Result<()> {
         conn.execute_batch(
             "ALTER TABLE topic_cursors ADD COLUMN network_id TEXT NOT NULL DEFAULT ''",
         )?;
+    }
+    if conn.backend_kind() == pg::BackendKind::Sqlite {
+        return Ok(());
     }
     conn.execute_batch(
         "
@@ -630,6 +879,9 @@ fn migrate_penalized_nodes_network_ban_schema(conn: &Connection) -> Result<()> {
             ",
         )?;
     }
+    if conn.backend_kind() == pg::BackendKind::Sqlite {
+        return Ok(());
+    }
     conn.execute_batch(
         "
         ALTER TABLE network_ban_windows
@@ -764,8 +1016,14 @@ fn ensure_discovered_peers_local_scope_index(conn: &Connection) -> Result<()> {
 
 impl PgStore {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
-        let conn = Connection::open(path)?;
-        Self::initialize(conn)
+        match pg::configured_backend_kind()? {
+            pg::BackendKind::Postgres => Self::initialize(Connection::open_postgres()?),
+            pg::BackendKind::Sqlite => {
+                let requested_path = path.as_ref();
+                let state_dir = requested_path.parent().unwrap_or_else(|| Path::new("."));
+                Self::open_sqlite(sqlite_layout::sqlite_database_path(state_dir))
+            }
+        }
     }
 
     pub fn open_in_memory() -> Result<Self> {
@@ -773,11 +1031,31 @@ impl PgStore {
         Self::initialize(conn)
     }
 
+    pub fn open_sqlite(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref().to_path_buf();
+        let store = Self::initialize(Connection::open_sqlite(&path)?)?;
+        if sqlite_layout::migrate_legacy_storage_databases(&path)? {
+            drop(store);
+            return Self::initialize(Connection::open_sqlite(path)?);
+        }
+        Ok(store)
+    }
+
+    pub fn open_in_memory_sqlite() -> Result<Self> {
+        let conn = Connection::open_in_memory_sqlite()?;
+        Self::initialize(conn)
+    }
+
     fn initialize(conn: Connection) -> Result<Self> {
         const INIT_LOCK_KEY: i64 = 0x7773_696e_6974; // "wsinit"
-        let init_key = current_schema_init_key(&conn)?;
+        let sqlite = conn.backend_kind() == pg::BackendKind::Sqlite;
+        let init_key = if sqlite {
+            String::new()
+        } else {
+            current_schema_init_key(&conn)?
+        };
 
-        {
+        if !sqlite {
             let mut initialized = initialized_schema_keys()
                 .lock()
                 .map_err(|_| SwarmError::Storage("schema init cache poisoned".into()))?;
@@ -792,13 +1070,15 @@ impl PgStore {
             }
         }
 
-        conn.query_row(
-            "SELECT pg_advisory_lock($1)",
-            params![INIT_LOCK_KEY],
-            |_| Ok(()),
-        )?;
+        if !sqlite {
+            conn.query_row(
+                "SELECT pg_advisory_lock($1)",
+                params![INIT_LOCK_KEY],
+                |_| Ok(()),
+            )?;
+        }
 
-        {
+        if !sqlite {
             let mut initialized = initialized_schema_keys()
                 .lock()
                 .map_err(|_| SwarmError::Storage("schema init cache poisoned".into()))?;
@@ -817,6 +1097,10 @@ impl PgStore {
                 }
                 initialized.remove(&init_key);
             }
+        }
+
+        if sqlite {
+            conn.execute_batch("BEGIN IMMEDIATE")?;
         }
 
         let init_result: Result<()> = (|| {
@@ -1114,7 +1398,8 @@ impl PgStore {
                 event_kind TEXT NOT NULL,
                 author_node_id TEXT NOT NULL,
                 created_at TIMESTAMPTZ NOT NULL,
-                event_json TEXT NOT NULL
+                event_json TEXT NOT NULL,
+                swarm_scope TEXT
             );
 
             CREATE TABLE IF NOT EXISTS task_projection (
@@ -1329,7 +1614,8 @@ impl PgStore {
             CREATE TABLE IF NOT EXISTS membership_projection (
                 org_id TEXT NOT NULL DEFAULT '__unset_org__',
                 singleton BIGINT NOT NULL DEFAULT 1 CHECK (singleton = 1),
-                membership_json TEXT NOT NULL
+                membership_json TEXT NOT NULL,
+                PRIMARY KEY(org_id, singleton)
             );
 
             CREATE TABLE IF NOT EXISTS decision_memory (
@@ -1494,7 +1780,8 @@ impl PgStore {
                 event_id TEXT NOT NULL,
                 reason TEXT NOT NULL,
                 revoked_by_node_id TEXT NOT NULL,
-                revoked_at TIMESTAMPTZ NOT NULL
+                revoked_at TIMESTAMPTZ NOT NULL,
+                PRIMARY KEY(org_id, event_id)
             );
 
             CREATE TABLE IF NOT EXISTS summary_revocations (
@@ -1503,7 +1790,8 @@ impl PgStore {
                 summary_kind TEXT NOT NULL,
                 reason TEXT NOT NULL,
                 revoked_by_node_id TEXT NOT NULL,
-                revoked_at TIMESTAMPTZ NOT NULL
+                revoked_at TIMESTAMPTZ NOT NULL,
+                PRIMARY KEY(org_id, summary_id)
             );
 
             CREATE TABLE IF NOT EXISTS penalized_nodes (
@@ -1966,43 +2254,46 @@ impl PgStore {
                 ensure_timestamp_column(&conn, table, column)?;
             }
 
-            for table in [
-                "events",
-                "task_projection",
-                "leases",
-                "candidates",
-                "verifier_results",
-                "evidence_added",
-                "evidence_available",
-                "vote_commits",
-                "vote_reveals",
-                "finalizations",
-                "checkpoints",
-                "decision_memory",
-                "evidence_summary",
-                "runtime_metrics",
-                "task_settlement",
-                "task_stage_usage",
-                "task_cost_reports",
-                "reputation_state",
-                "knowledge_lookups",
-                "reuse_blacklist",
-                "unknown_reason_observations",
-                "membership_projection",
-                "event_revocations",
-                "summary_revocations",
-                "imported_decision_memory",
-                "imported_reputation_state",
-                "imported_task_outcomes",
-            ] {
-                conn.execute(
-                    &format!("ALTER TABLE {table} ALTER COLUMN org_id SET DEFAULT '__unset_org__'"),
-                    params![],
-                )?;
-            }
+            if !sqlite {
+                for table in [
+                    "events",
+                    "task_projection",
+                    "leases",
+                    "candidates",
+                    "verifier_results",
+                    "evidence_added",
+                    "evidence_available",
+                    "vote_commits",
+                    "vote_reveals",
+                    "finalizations",
+                    "checkpoints",
+                    "decision_memory",
+                    "evidence_summary",
+                    "runtime_metrics",
+                    "task_settlement",
+                    "task_stage_usage",
+                    "task_cost_reports",
+                    "reputation_state",
+                    "knowledge_lookups",
+                    "reuse_blacklist",
+                    "unknown_reason_observations",
+                    "membership_projection",
+                    "event_revocations",
+                    "summary_revocations",
+                    "imported_decision_memory",
+                    "imported_reputation_state",
+                    "imported_task_outcomes",
+                ] {
+                    conn.execute(
+                        &format!(
+                            "ALTER TABLE {table} ALTER COLUMN org_id SET DEFAULT '__unset_org__'"
+                        ),
+                        params![],
+                    )?;
+                }
 
-            conn.execute_batch(
-                "
+                conn.execute_batch(
+                    "
                 ALTER TABLE task_projection DROP CONSTRAINT IF EXISTS task_projection_pkey;
                 ALTER TABLE task_projection ADD CONSTRAINT task_projection_pkey PRIMARY KEY (org_id, task_id);
 
@@ -2075,7 +2366,8 @@ impl PgStore {
                 ALTER TABLE imported_task_outcomes DROP CONSTRAINT IF EXISTS imported_task_outcomes_pkey;
                 ALTER TABLE imported_task_outcomes ADD CONSTRAINT imported_task_outcomes_pkey PRIMARY KEY (org_id, summary_id, task_id);
                 ",
-            )?;
+                )?;
+            }
 
             ensure_boolean_column(&conn, "vote_reveals", "valid", None)?;
             ensure_boolean_column(&conn, "verifier_results", "passed", Some("FALSE"))?;
@@ -2111,21 +2403,36 @@ impl PgStore {
             migrate_candidates_content_ref_schema(&conn)?;
             migrate_penalized_nodes_network_ban_schema(&conn)?;
             ensure_discovered_peers_local_scope_index(&conn)?;
+            if sqlite {
+                validate_sqlite_schema_constraints(&conn)?;
+            }
             Ok(())
         })();
 
-        let unlock_result = conn.query_row(
-            "SELECT pg_advisory_unlock($1)",
-            params![INIT_LOCK_KEY],
-            |_| Ok(()),
-        );
-
-        init_result?;
-        unlock_result?;
-        initialized_schema_keys()
-            .lock()
-            .map_err(|_| SwarmError::Storage("schema init cache poisoned".into()))?
-            .insert(init_key);
+        if sqlite {
+            match init_result {
+                Ok(()) => {
+                    conn.execute_batch("PRAGMA user_version = 1")?;
+                    conn.execute_batch("COMMIT")?;
+                }
+                Err(error) => {
+                    let _ = conn.execute_batch("ROLLBACK");
+                    return Err(error);
+                }
+            }
+        } else {
+            let unlock_result = conn.query_row(
+                "SELECT pg_advisory_unlock($1)",
+                params![INIT_LOCK_KEY],
+                |_| Ok(()),
+            );
+            init_result?;
+            unlock_result?;
+            initialized_schema_keys()
+                .lock()
+                .map_err(|_| SwarmError::Storage("schema init cache poisoned".into()))?
+                .insert(init_key);
+        }
 
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
