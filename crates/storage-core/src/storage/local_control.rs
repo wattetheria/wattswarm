@@ -904,6 +904,90 @@ impl PgStore {
         Ok(())
     }
 
+    pub fn list_local_peer_relationship_requests(
+        &self,
+        scope_id: &str,
+    ) -> Result<Vec<LocalPeerRelationshipRequestRow>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
+        let mut stmt = conn.prepare(
+            "SELECT request_id,
+                    remote_node_id,
+                    relationship_state,
+                    last_action,
+                    initiated_by,
+                    agent_envelope_json,
+                    (EXTRACT(EPOCH FROM requested_at) * 1000)::BIGINT AS requested_at_ms,
+                    (EXTRACT(EPOCH FROM responded_at) * 1000)::BIGINT AS responded_at_ms,
+                    (EXTRACT(EPOCH FROM updated_at) * 1000)::BIGINT AS updated_at_ms
+             FROM peer_relationship_requests_local
+             WHERE scope_id = $1
+             ORDER BY remote_node_id ASC, updated_at DESC, request_id ASC",
+        )?;
+        let rows = stmt.query_map(params![scope_id], |r| {
+            Ok(LocalPeerRelationshipRequestRow {
+                request_id: r.get(0)?,
+                remote_node_id: r.get(1)?,
+                relationship_state: r.get(2)?,
+                last_action: r.get(3)?,
+                initiated_by: r.get(4)?,
+                agent_envelope_json: r.get(5)?,
+                requested_at: r.get::<_, i64>(6)? as u64,
+                responded_at: r.get::<_, Option<i64>>(7)?.map(|value| value as u64),
+                updated_at: r.get::<_, i64>(8)? as u64,
+            })
+        })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
+    pub fn upsert_local_peer_relationship_request(
+        &self,
+        scope_id: &str,
+        row: &LocalPeerRelationshipRequestRow,
+    ) -> Result<()> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
+        let responded_at_ms = row.responded_at.map(|value| value as i64).unwrap_or(-1);
+        conn.execute(
+            "INSERT INTO peer_relationship_requests_local(
+                scope_id, remote_node_id, request_id, relationship_state, last_action,
+                initiated_by, agent_envelope_json, requested_at, responded_at, updated_at
+             ) VALUES (
+                $1, $2, $3, $4, $5,
+                $6, $7,
+                TIMESTAMPTZ 'epoch' + ($8::bigint * INTERVAL '1 millisecond'),
+                CASE WHEN $9::bigint < 0::bigint THEN NULL ELSE TIMESTAMPTZ 'epoch' + ($9::bigint * INTERVAL '1 millisecond') END,
+                TIMESTAMPTZ 'epoch' + ($10::bigint * INTERVAL '1 millisecond')
+             )
+             ON CONFLICT(scope_id, remote_node_id, request_id) DO UPDATE SET
+                relationship_state = excluded.relationship_state,
+                last_action = excluded.last_action,
+                initiated_by = excluded.initiated_by,
+                agent_envelope_json = excluded.agent_envelope_json,
+                requested_at = excluded.requested_at,
+                responded_at = excluded.responded_at,
+                updated_at = excluded.updated_at",
+            params![
+                scope_id,
+                &row.remote_node_id,
+                &row.request_id,
+                &row.relationship_state,
+                &row.last_action,
+                &row.initiated_by,
+                &row.agent_envelope_json,
+                row.requested_at as i64,
+                responded_at_ms,
+                row.updated_at as i64,
+            ],
+        )?;
+        Ok(())
+    }
+
     pub fn list_local_peer_dm_threads(&self, scope_id: &str) -> Result<Vec<LocalPeerDmThreadRow>> {
         let conn = self
             .conn

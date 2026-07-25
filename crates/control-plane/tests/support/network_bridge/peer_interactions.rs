@@ -59,10 +59,16 @@ pub fn two_nodes_execute_peer_relationship_request_and_accept_over_network() {
         )
         .expect("send relationship request");
     assert_eq!(
-        relationship_message_for(&dir_a, &remote_b).and_then(|message| message
-            .get("payload")
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_owned)),
+        load_peer_relationship_request_records_state(&dir_a)
+            .expect("load outbound identity requests")
+            .into_iter()
+            .find(|record| record.request_id == "request-1")
+            .and_then(|record| record
+                .agent_envelope
+                .message
+                .get("payload")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)),
         Some("hello from node a".to_owned()),
         "outbound request should persist its agent envelope in the sender relationship view"
     );
@@ -84,8 +90,18 @@ pub fn two_nodes_execute_peer_relationship_request_and_accept_over_network() {
         relationship_state_for(&dir_b, &remote_a)
     );
 
+    let accept_envelope = default_agent_envelope(
+        &remote_b,
+        &remote_a,
+        "social.friend.accept",
+        json!({"action": "accept", "request_id": "request-1"}),
+    );
     service_b
-        .send_peer_relationship_action(&remote_a, PeerRelationshipAction::Accept, None)
+        .send_peer_relationship_action(
+            &remote_a,
+            PeerRelationshipAction::Accept,
+            Some(accept_envelope),
+        )
         .expect("send relationship accept");
 
     let accepted = wait_until(scaled_timeout(Duration::from_secs(10)), || {
@@ -129,6 +145,49 @@ pub fn two_nodes_execute_peer_relationship_request_and_accept_over_network() {
     assert!(
         has_private_dm_subscription(&dir_b, &remote_b, &remote_a),
         "accepting peer should subscribe to the private dm group after accept"
+    );
+
+    let second_request = default_agent_envelope(
+        &remote_a,
+        &remote_b,
+        "social.friend.request",
+        json!({
+            "action": "request",
+            "source_public_id": "agent-a-second",
+            "target_public_id": "agent-b-second",
+            "request_id": "request-2"
+        }),
+    );
+    service_a
+        .send_peer_relationship_action(
+            &remote_b,
+            PeerRelationshipAction::Request,
+            Some(second_request),
+        )
+        .expect("send second identity request across accepted nodes");
+    let second_request_synced = wait_until(scaled_timeout(Duration::from_secs(10)), || {
+        for _ in 0..32 {
+            let _ = pump_once(&mut service_a, &mut node_a);
+            let _ = pump_once(&mut service_b, &mut node_b);
+        }
+        let has_second_request = |state_dir: &std::path::Path, remote_node_id: &str| {
+            load_peer_relationship_request_records_state(state_dir)
+                .expect("load identity requests")
+                .iter()
+                .any(|record| {
+                    record.remote_node_id == remote_node_id
+                        && record.request_id == "request-2"
+                        && record.relationship_state == PeerRelationshipState::Requested
+                })
+        };
+        has_second_request(&dir_a, &remote_b)
+            && has_second_request(&dir_b, &remote_a)
+            && relationship_state_for(&dir_a, &remote_b) == Some(PeerRelationshipState::Accepted)
+            && relationship_state_for(&dir_b, &remote_a) == Some(PeerRelationshipState::Accepted)
+    });
+    assert!(
+        second_request_synced,
+        "a second identity request must sync without regressing accepted node relationships"
     );
 
     cleanup_dir(&dir_a);

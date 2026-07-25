@@ -422,6 +422,182 @@ fn raw_agent_envelope_to_control_record(
     }
 }
 
+pub(super) fn raw_relationship_request_id(envelope: &RawAgentEnvelope) -> Option<String> {
+    serde_json::from_str::<Value>(&envelope.message_json)
+        .ok()?
+        .get("request_id")?
+        .as_str()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn stored_relationship_request_id(record: &crate::control::PeerRelationshipRecord) -> Option<&str> {
+    record
+        .agent_envelope
+        .as_ref()?
+        .message
+        .get("request_id")?
+        .as_str()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+fn seed_legacy_relationship_request(
+    state_dir: &Path,
+    request_id: &str,
+    node_record: Option<&crate::control::PeerRelationshipRecord>,
+) -> Result<()> {
+    let Some(node_record) =
+        node_record.filter(|record| stored_relationship_request_id(record) == Some(request_id))
+    else {
+        return Ok(());
+    };
+    let already_seeded = crate::control::load_peer_relationship_request_records_state(state_dir)?
+        .iter()
+        .any(|record| {
+            record.remote_node_id == node_record.remote_node_id && record.request_id == request_id
+        });
+    if already_seeded {
+        return Ok(());
+    }
+    let Some(envelope) = node_record.agent_envelope.clone() else {
+        return Ok(());
+    };
+    let request_initiator =
+        if envelope.source_node_id.as_deref() == Some(node_record.remote_node_id.as_str()) {
+            crate::control::PeerRelationshipInitiator::Remote
+        } else {
+            crate::control::PeerRelationshipInitiator::Local
+        };
+    crate::control::apply_peer_relationship_request_action_state(
+        state_dir,
+        &node_record.remote_node_id,
+        request_id,
+        crate::control::PeerRelationshipAction::Request,
+        request_initiator,
+        envelope.clone(),
+    )?;
+    let final_action = match node_record.relationship_state {
+        crate::control::PeerRelationshipState::Accepted => {
+            Some(crate::control::PeerRelationshipAction::Accept)
+        }
+        crate::control::PeerRelationshipState::Rejected => {
+            Some(crate::control::PeerRelationshipAction::Reject)
+        }
+        _ => None,
+    };
+    if let Some(final_action) = final_action {
+        crate::control::apply_peer_relationship_request_action_state(
+            state_dir,
+            &node_record.remote_node_id,
+            request_id,
+            final_action,
+            node_record.initiated_by,
+            envelope,
+        )?;
+    }
+    Ok(())
+}
+
+pub(super) fn apply_peer_relationship_action_projection(
+    state_dir: &Path,
+    remote_node_id: &str,
+    action: crate::control::PeerRelationshipAction,
+    initiated_by: crate::control::PeerRelationshipInitiator,
+    envelope: &RawAgentEnvelope,
+) -> Result<(crate::control::PeerRelationshipRecord, bool)> {
+    let request_id = raw_relationship_request_id(envelope);
+    let request_scoped = matches!(
+        action,
+        crate::control::PeerRelationshipAction::Request
+            | crate::control::PeerRelationshipAction::Accept
+            | crate::control::PeerRelationshipAction::Reject
+            | crate::control::PeerRelationshipAction::Cancel
+            | crate::control::PeerRelationshipAction::Remove
+    );
+    let Some(request_id) = request_id.filter(|_| request_scoped) else {
+        let mut record = crate::control::apply_peer_relationship_action_state(
+            state_dir,
+            remote_node_id,
+            action,
+            initiated_by,
+        )?;
+        if initiated_by == crate::control::PeerRelationshipInitiator::Remote {
+            record.agent_envelope = Some(raw_agent_envelope_to_control_record(envelope));
+            crate::control::save_peer_relationship_record_state(state_dir, &record)?;
+        }
+        return Ok((record, false));
+    };
+    let existing_node = crate::control::load_peer_relationship_records_state(state_dir)?
+        .into_iter()
+        .find(|record| record.remote_node_id == remote_node_id);
+    if action == crate::control::PeerRelationshipAction::Request
+        && existing_node.as_ref().is_some_and(|record| {
+            record.relationship_state == crate::control::PeerRelationshipState::Blocked
+        })
+    {
+        bail!("cannot request relationship while remote_node_id={remote_node_id} is blocked");
+    };
+    seed_legacy_relationship_request(state_dir, &request_id, existing_node.as_ref())?;
+    let (request_record, replayed) = crate::control::apply_peer_relationship_request_action_state(
+        state_dir,
+        remote_node_id,
+        &request_id,
+        action,
+        initiated_by,
+        raw_agent_envelope_to_control_record(envelope),
+    )?;
+    if replayed {
+        return Ok((request_record.into(), true));
+    }
+
+    let related_requests = crate::control::load_peer_relationship_request_records_state(state_dir)?;
+    let has_other_pending = related_requests.iter().any(|record| {
+        record.remote_node_id == remote_node_id
+            && record.request_id != request_id
+            && record.relationship_state == crate::control::PeerRelationshipState::Requested
+    });
+    let has_other_accepted = related_requests.iter().any(|record| {
+        record.remote_node_id == remote_node_id
+            && record.request_id != request_id
+            && record.relationship_state == crate::control::PeerRelationshipState::Accepted
+    });
+    let node_state = existing_node
+        .as_ref()
+        .map(|record| record.relationship_state)
+        .unwrap_or(crate::control::PeerRelationshipState::None);
+    let should_apply_node_action = match action {
+        crate::control::PeerRelationshipAction::Request => !matches!(
+            node_state,
+            crate::control::PeerRelationshipState::Requested
+                | crate::control::PeerRelationshipState::Accepted
+        ),
+        crate::control::PeerRelationshipAction::Accept => {
+            node_state != crate::control::PeerRelationshipState::Accepted
+        }
+        crate::control::PeerRelationshipAction::Reject
+        | crate::control::PeerRelationshipAction::Cancel => {
+            node_state != crate::control::PeerRelationshipState::Accepted && !has_other_pending
+        }
+        crate::control::PeerRelationshipAction::Remove => !has_other_accepted,
+        crate::control::PeerRelationshipAction::Block
+        | crate::control::PeerRelationshipAction::Unblock => true,
+    };
+    if should_apply_node_action {
+        crate::control::apply_peer_relationship_action_state(
+            state_dir,
+            remote_node_id,
+            action,
+            initiated_by,
+        )?;
+        if initiated_by == crate::control::PeerRelationshipInitiator::Remote {
+            attach_agent_envelope_to_relationship(state_dir, remote_node_id, envelope)?;
+        }
+    }
+    Ok((request_record.into(), false))
+}
+
 pub(super) fn raw_agent_envelope_to_protocol(
     envelope: &RawAgentEnvelope,
 ) -> wattswarm_protocol::types::AgentEnvelope {
@@ -1312,14 +1488,23 @@ pub(super) fn process_pending_network_commands(
                     retry.push(serde_json::to_string(&command)?);
                     continue;
                 }
-                service.send_peer_relationship_action(
+                match service.send_peer_relationship_action(
                     &remote_node_id,
                     action,
                     Some(agent_envelope),
-                )?;
-                command.record_dispatch_attempt(now_ms);
-                retry.push(serde_json::to_string(&command)?);
-                Ok(())
+                ) {
+                    Ok(_) => {
+                        command.record_dispatch_attempt(now_ms);
+                        match serde_json::to_string(&command) {
+                            Ok(serialized) => {
+                                retry.push(serialized);
+                                Ok(())
+                            }
+                            Err(error) => Err(error.into()),
+                        }
+                    }
+                    Err(error) => Err(error),
+                }
             }
             PendingNetworkCommand::AgentPayment {
                 remote_node_id,
@@ -1659,6 +1844,255 @@ mod tests {
             Some("Hello from the original friend request")
         );
         assert_eq!(merged.signature.as_deref(), Some("original-signature"));
+    }
+
+    #[test]
+    fn local_relationship_decision_preserves_remote_agent_card_on_node_record() {
+        let state_dir = std::env::temp_dir().join(format!(
+            "wattswarm-peer-remote-card-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        fs::create_dir_all(&state_dir).expect("create state dir");
+        let mut remote_request = signed_envelope_with_card("remote-node", "local-node");
+        remote_request.capability = Some("social.friend.request".to_owned());
+        remote_request.message_json = json!({
+            "action": "request",
+            "request_id": "request-remote-card"
+        })
+        .to_string();
+        apply_peer_relationship_action_projection(
+            &state_dir,
+            "remote-node",
+            crate::control::PeerRelationshipAction::Request,
+            crate::control::PeerRelationshipInitiator::Remote,
+            &remote_request,
+        )
+        .expect("apply remote request");
+        let local_reject = default_agent_envelope(
+            "local-node",
+            "remote-node",
+            "social.friend.reject",
+            json!({
+                "action": "reject",
+                "request_id": "request-remote-card"
+            }),
+        );
+
+        apply_peer_relationship_action_projection(
+            &state_dir,
+            "remote-node",
+            crate::control::PeerRelationshipAction::Reject,
+            crate::control::PeerRelationshipInitiator::Local,
+            &local_reject,
+        )
+        .expect("reject remote request");
+
+        let relationship = crate::control::load_peer_relationship_records_state(&state_dir)
+            .expect("load node relationships")
+            .into_iter()
+            .next()
+            .expect("node relationship");
+        let stored_envelope = relationship.agent_envelope.expect("remote agent envelope");
+        assert_eq!(
+            stored_envelope.source_node_id.as_deref(),
+            Some("remote-node")
+        );
+        assert!(stored_envelope.source_agent_card.is_some());
+        fs::remove_dir_all(state_dir).expect("remove state dir");
+    }
+
+    #[test]
+    fn local_relationship_request_does_not_bind_local_card_to_remote_node() {
+        let state_dir = std::env::temp_dir().join(format!(
+            "wattswarm-peer-local-card-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        fs::create_dir_all(&state_dir).expect("create state dir");
+        let mut local_request = signed_envelope_with_card("local-node", "remote-node");
+        local_request.capability = Some("social.friend.request".to_owned());
+        local_request.message_json = json!({
+            "action": "request",
+            "request_id": "request-local-card"
+        })
+        .to_string();
+
+        apply_peer_relationship_action_projection(
+            &state_dir,
+            "remote-node",
+            crate::control::PeerRelationshipAction::Request,
+            crate::control::PeerRelationshipInitiator::Local,
+            &local_request,
+        )
+        .expect("apply local request");
+
+        let relationship = crate::control::load_peer_relationship_records_state(&state_dir)
+            .expect("load node relationships")
+            .into_iter()
+            .next()
+            .expect("node relationship");
+        assert!(relationship.agent_envelope.is_none());
+        let requests = crate::control::load_peer_relationship_request_records_state(&state_dir)
+            .expect("load request-scoped relationships");
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].agent_envelope.source_agent_card.is_some());
+        fs::remove_dir_all(state_dir).expect("remove state dir");
+    }
+
+    #[test]
+    fn accepted_node_allows_second_identity_request_and_rejects_stale_response() {
+        let state_dir = std::env::temp_dir().join(format!(
+            "wattswarm-peer-identity-requests-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        fs::create_dir_all(&state_dir).expect("create state dir");
+        let first_request = default_agent_envelope(
+            "remote-node",
+            "local-node",
+            "social.friend.request",
+            json!({"request_id": "request-first"}),
+        );
+        apply_peer_relationship_action_projection(
+            &state_dir,
+            "remote-node",
+            crate::control::PeerRelationshipAction::Request,
+            crate::control::PeerRelationshipInitiator::Remote,
+            &first_request,
+        )
+        .expect("apply first identity request");
+        let requested_node = crate::control::load_peer_relationship_records_state(&state_dir)
+            .expect("load requested node relationship")
+            .into_iter()
+            .next()
+            .expect("requested node relationship");
+        assert_eq!(
+            stored_relationship_request_id(&requested_node),
+            Some("request-first")
+        );
+        let first_accept = default_agent_envelope(
+            "local-node",
+            "remote-node",
+            "social.friend.accept",
+            json!({"request_id": "request-first"}),
+        );
+        apply_peer_relationship_action_projection(
+            &state_dir,
+            "remote-node",
+            crate::control::PeerRelationshipAction::Accept,
+            crate::control::PeerRelationshipInitiator::Local,
+            &first_accept,
+        )
+        .expect("accept first identity request");
+        let second_request = default_agent_envelope(
+            "remote-node",
+            "local-node",
+            "social.friend.request",
+            json!({"request_id": "request-second"}),
+        );
+
+        let (second_projection, replayed) = apply_peer_relationship_action_projection(
+            &state_dir,
+            "remote-node",
+            crate::control::PeerRelationshipAction::Request,
+            crate::control::PeerRelationshipInitiator::Remote,
+            &second_request,
+        )
+        .expect("accepted node must allow a second identity request");
+
+        assert!(!replayed);
+        assert_eq!(
+            second_projection.relationship_state,
+            crate::control::PeerRelationshipState::Requested
+        );
+        let node_relationship = crate::control::load_peer_relationship_records_state(&state_dir)
+            .expect("load node relationship")
+            .into_iter()
+            .next()
+            .expect("node relationship");
+        assert_eq!(
+            node_relationship.relationship_state,
+            crate::control::PeerRelationshipState::Accepted
+        );
+        assert_eq!(
+            stored_relationship_request_id(&node_relationship),
+            Some("request-first")
+        );
+
+        let stale_reject = default_agent_envelope(
+            "local-node",
+            "remote-node",
+            "social.friend.reject",
+            json!({"request_id": "request-first"}),
+        );
+        let error = apply_peer_relationship_action_projection(
+            &state_dir,
+            "remote-node",
+            crate::control::PeerRelationshipAction::Reject,
+            crate::control::PeerRelationshipInitiator::Local,
+            &stale_reject,
+        )
+        .expect_err("accepted request must reject a stale reject action");
+        assert!(error.to_string().contains("from state=accepted"));
+        let requests = crate::control::load_peer_relationship_request_records_state(&state_dir)
+            .expect("load identity requests");
+        assert!(requests.iter().any(|record| {
+            record.request_id == "request-second"
+                && record.relationship_state == crate::control::PeerRelationshipState::Requested
+        }));
+        fs::remove_dir_all(state_dir).expect("remove state dir");
+    }
+
+    #[test]
+    fn legacy_accepted_relationship_replay_seeds_request_ledger_without_new_event() {
+        let state_dir = std::env::temp_dir().join(format!(
+            "wattswarm-peer-legacy-request-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        fs::create_dir_all(&state_dir).expect("create state dir");
+        let request = default_agent_envelope(
+            "remote-node",
+            "local-node",
+            "social.friend.request",
+            json!({"request_id": "legacy-request"}),
+        );
+        crate::control::apply_peer_relationship_action_state(
+            &state_dir,
+            "remote-node",
+            crate::control::PeerRelationshipAction::Request,
+            crate::control::PeerRelationshipInitiator::Remote,
+        )
+        .expect("seed legacy node request");
+        attach_agent_envelope_to_relationship(&state_dir, "remote-node", &request)
+            .expect("attach legacy request envelope");
+        crate::control::apply_peer_relationship_action_state(
+            &state_dir,
+            "remote-node",
+            crate::control::PeerRelationshipAction::Accept,
+            crate::control::PeerRelationshipInitiator::Local,
+        )
+        .expect("accept legacy node relationship");
+
+        let (projection, replayed) = apply_peer_relationship_action_projection(
+            &state_dir,
+            "remote-node",
+            crate::control::PeerRelationshipAction::Request,
+            crate::control::PeerRelationshipInitiator::Remote,
+            &request,
+        )
+        .expect("replay legacy request");
+
+        assert!(replayed);
+        assert_eq!(
+            projection.relationship_state,
+            crate::control::PeerRelationshipState::Accepted
+        );
+        let requests = crate::control::load_peer_relationship_request_records_state(&state_dir)
+            .expect("load seeded request ledger");
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            requests[0].relationship_state,
+            crate::control::PeerRelationshipState::Accepted
+        );
+        fs::remove_dir_all(state_dir).expect("remove state dir");
     }
 
     #[test]

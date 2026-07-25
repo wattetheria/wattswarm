@@ -2,8 +2,9 @@ use crate::control::{
     PRIVATE_DM_FEED_KEY, PeerRelationshipAction, PeerRelationshipInitiator,
     apply_peer_relationship_action_state, load_network_peer_sync_state_records_state,
     load_peer_dm_message_records_state, load_peer_dm_thread_records_state,
-    load_peer_metadata_records_state, load_peer_relationship_records_state, open_configured_node,
-    open_node, private_dm_scope_hint, private_dm_thread_id,
+    load_peer_metadata_records_state, load_peer_relationship_records_state,
+    load_peer_relationship_request_records_state, open_configured_node, open_node,
+    private_dm_scope_hint, private_dm_thread_id,
 };
 use crate::http::helpers::resolve_network_id;
 use crate::http::{ApiError, UiServerState, run_blocking};
@@ -18,7 +19,7 @@ use axum::Json;
 use axum::extract::{Query, State};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use uuid::Uuid;
 
 const NEARBY_PEER_RETENTION_MS: u64 = 60 * 60 * 1_000;
@@ -593,7 +594,35 @@ fn nearby_peer_is_fresh(
 }
 
 fn build_peer_relationships_payload(state_dir: &std::path::Path) -> Result<Value> {
-    let relationships = load_peer_relationship_records_state(state_dir)?;
+    let node_relationships = load_peer_relationship_records_state(state_dir)?;
+    let blocked_nodes = node_relationships
+        .iter()
+        .filter(|record| {
+            record.relationship_state == crate::control::PeerRelationshipState::Blocked
+        })
+        .map(|record| record.remote_node_id.clone())
+        .collect::<BTreeSet<_>>();
+    let request_relationships = load_peer_relationship_request_records_state(state_dir)?
+        .into_iter()
+        .filter(|record| !blocked_nodes.contains(&record.remote_node_id))
+        .collect::<Vec<_>>();
+    let request_nodes = request_relationships
+        .iter()
+        .map(|record| record.remote_node_id.clone())
+        .collect::<BTreeSet<_>>();
+    let mut relationships = node_relationships
+        .into_iter()
+        .filter(|record| {
+            blocked_nodes.contains(&record.remote_node_id)
+                || !request_nodes.contains(&record.remote_node_id)
+        })
+        .chain(request_relationships.into_iter().map(Into::into))
+        .collect::<Vec<crate::control::PeerRelationshipRecord>>();
+    relationships.sort_by(|left, right| {
+        left.remote_node_id
+            .cmp(&right.remote_node_id)
+            .then_with(|| right.updated_at.cmp(&left.updated_at))
+    });
     Ok(json!({"ok": true, "relationships": relationships}))
 }
 
@@ -766,6 +795,79 @@ mod tests {
                 .iter()
                 .any(|record| record["remote_node_id"] == "peer-expired")
         );
+    }
+
+    #[test]
+    fn relationship_payload_lists_identity_requests_for_accepted_node() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state_dir = dir.path().join("state");
+        std::fs::create_dir_all(&state_dir).expect("create state dir");
+        crate::control::apply_peer_relationship_action_state(
+            &state_dir,
+            "peer-multi-identity",
+            crate::control::PeerRelationshipAction::Request,
+            crate::control::PeerRelationshipInitiator::Remote,
+        )
+        .expect("seed node request");
+        crate::control::apply_peer_relationship_action_state(
+            &state_dir,
+            "peer-multi-identity",
+            crate::control::PeerRelationshipAction::Accept,
+            crate::control::PeerRelationshipInitiator::Local,
+        )
+        .expect("accept node relationship");
+        for (request_id, action) in [
+            (
+                "identity-request-accepted",
+                crate::control::PeerRelationshipAction::Accept,
+            ),
+            (
+                "identity-request-pending",
+                crate::control::PeerRelationshipAction::Request,
+            ),
+        ] {
+            let envelope = crate::control::AgentInteractionEnvelope {
+                protocol: "google_a2a".to_owned(),
+                message: serde_json::json!({"request_id": request_id}),
+                ..Default::default()
+            };
+            crate::control::apply_peer_relationship_request_action_state(
+                &state_dir,
+                "peer-multi-identity",
+                request_id,
+                crate::control::PeerRelationshipAction::Request,
+                crate::control::PeerRelationshipInitiator::Remote,
+                envelope.clone(),
+            )
+            .expect("save identity request");
+            if action == crate::control::PeerRelationshipAction::Accept {
+                crate::control::apply_peer_relationship_request_action_state(
+                    &state_dir,
+                    "peer-multi-identity",
+                    request_id,
+                    action,
+                    crate::control::PeerRelationshipInitiator::Local,
+                    envelope,
+                )
+                .expect("accept identity request");
+            }
+        }
+
+        let payload =
+            build_peer_relationships_payload(&state_dir).expect("build relationship projections");
+        let relationships = payload["relationships"]
+            .as_array()
+            .expect("relationship projections");
+
+        assert_eq!(relationships.len(), 2);
+        assert!(relationships.iter().any(|record| {
+            record["relationship_state"] == "accepted"
+                && record["agent_envelope"]["message"]["request_id"] == "identity-request-accepted"
+        }));
+        assert!(relationships.iter().any(|record| {
+            record["relationship_state"] == "requested"
+                && record["agent_envelope"]["message"]["request_id"] == "identity-request-pending"
+        }));
     }
 
     #[test]

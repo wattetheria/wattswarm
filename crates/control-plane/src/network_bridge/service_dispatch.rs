@@ -15,12 +15,6 @@ impl NetworkBridgeService {
         };
         let (remote_node_id, peer) =
             self.peer_for_relationship_action(&state_dir, remote_node_id)?;
-        let relationship_record = crate::control::apply_peer_relationship_action_state(
-            &state_dir,
-            &remote_node_id,
-            action,
-            crate::control::PeerRelationshipInitiator::Local,
-        )?;
         let local_node_id = self.local_peer_id().to_string();
         let capability = match action {
             crate::control::PeerRelationshipAction::Request => "peer.relationship.request",
@@ -42,9 +36,13 @@ impl NetworkBridgeService {
                 }),
             )
         });
-        if action == crate::control::PeerRelationshipAction::Request {
-            attach_agent_envelope_to_relationship(&state_dir, &remote_node_id, &envelope)?;
-        }
+        let (relationship_record, _) = apply_peer_relationship_action_projection(
+            &state_dir,
+            &remote_node_id,
+            action,
+            crate::control::PeerRelationshipInitiator::Local,
+            &envelope,
+        )?;
         if action == crate::control::PeerRelationshipAction::Accept
             && relationship_record.relationship_state
                 == crate::control::PeerRelationshipState::Accepted

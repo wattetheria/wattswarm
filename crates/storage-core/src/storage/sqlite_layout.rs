@@ -21,6 +21,7 @@ const LOCAL_CONTROL_TABLES: &[&str] = &[
     "peer_metadata_local",
     "network_peer_sync_state_local",
     "peer_relationships_local",
+    "peer_relationship_requests_local",
     "peer_dm_threads_local",
     "peer_dm_messages_local",
     "data_plane_status_local",

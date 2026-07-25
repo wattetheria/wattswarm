@@ -7,6 +7,17 @@ fn should_record_backfill_response_diagnostic(events_applied: usize) -> bool {
     events_applied > 0
 }
 
+fn friend_request_event_dedupe_key(
+    source_node_id: &str,
+    agent_envelope: Option<&RawAgentEnvelope>,
+    requested_at: u64,
+) -> String {
+    let request_key = agent_envelope
+        .and_then(raw_relationship_request_id)
+        .unwrap_or_else(|| requested_at.to_string());
+    format!("friend_request:{source_node_id}:{request_key}")
+}
+
 fn record_backfill_serve_diagnostic(
     state_dir: Option<&Path>,
     peer: &NetworkNodeId,
@@ -1811,21 +1822,42 @@ impl NetworkBridgeService {
                         );
                         verification?;
                     }
-                    match crate::control::apply_peer_relationship_action_state(
-                        &state_dir,
-                        &request.source_node_id,
-                        action,
-                        crate::control::PeerRelationshipInitiator::Remote,
-                    ) {
-                        Ok(record) => {
-                            if let Some(agent_envelope) = request.agent_envelope.as_ref() {
+                    let action_result: Result<(crate::control::PeerRelationshipRecord, bool)> =
+                        if let Some(agent_envelope) = request.agent_envelope.as_ref() {
+                            apply_peer_relationship_action_projection(
+                                &state_dir,
+                                &request.source_node_id,
+                                action,
+                                crate::control::PeerRelationshipInitiator::Remote,
+                                agent_envelope,
+                            )
+                        } else {
+                            crate::control::apply_peer_relationship_action_state(
+                                &state_dir,
+                                &request.source_node_id,
+                                action,
+                                crate::control::PeerRelationshipInitiator::Remote,
+                            )
+                            .map(|record| (record, false))
+                        };
+                    match action_result {
+                        Ok((record, replayed_request)) => {
+                            if !replayed_request
+                                && request.agent_envelope.as_ref().is_some_and(|envelope| {
+                                    raw_relationship_request_id(envelope).is_none()
+                                })
+                                && let Some(agent_envelope) = request.agent_envelope.as_ref()
+                            {
                                 attach_agent_envelope_to_relationship(
                                     &state_dir,
                                     &request.source_node_id,
                                     agent_envelope,
                                 )?;
                             }
-                            if action == crate::control::PeerRelationshipAction::Request {
+                            if action == crate::control::PeerRelationshipAction::Request
+                                && !replayed_request
+                            {
+                                let requested_at = record.requested_at.unwrap_or(record.updated_at);
                                 let event = build_agent_event_with_agent_envelope(
                                     wattswarm_protocol::types::AgentEventType::FriendRequest,
                                     wattswarm_protocol::types::AgentEventSourceKind::PeerRelationship,
@@ -1852,9 +1884,10 @@ impl NetworkBridgeService {
                                         "block".to_owned(),
                                     ],
                                     Some(request.source_node_id.clone()),
-                                    Some(format!(
-                                        "friend_request:{}:{}",
-                                        request.source_node_id, record.updated_at
+                                    Some(friend_request_event_dedupe_key(
+                                        &request.source_node_id,
+                                        request.agent_envelope.as_ref(),
+                                        requested_at,
                                     )),
                                 );
                                 let _ = deliver_agent_event_to_local_executor(
@@ -2242,6 +2275,49 @@ mod tests {
     fn backfill_response_diagnostics_skip_empty_responses() {
         assert!(!should_record_backfill_response_diagnostic(0));
         assert!(should_record_backfill_response_diagnostic(1));
+    }
+
+    #[test]
+    fn repeated_friend_request_uses_one_agent_event_dedupe_key() {
+        let dir = service_runtime_test_dir("friend-request-event-dedupe");
+        let envelope = default_agent_envelope(
+            "remote-node",
+            "local-node",
+            "social.friend.request",
+            json!({
+                "action": "request",
+                "request_id": "request-1",
+                "correlation_id": "correlation-1"
+            }),
+        );
+        let first_key = friend_request_event_dedupe_key("remote-node", Some(&envelope), 10);
+        let retry_key = friend_request_event_dedupe_key("remote-node", Some(&envelope), 20);
+        assert_eq!(first_key, retry_key);
+
+        for key in [first_key, retry_key] {
+            let event = build_agent_event_with_agent_envelope(
+                wattswarm_protocol::types::AgentEventType::FriendRequest,
+                wattswarm_protocol::types::AgentEventSourceKind::PeerRelationship,
+                Some("remote-node".to_owned()),
+                None,
+                Some(raw_agent_envelope_to_protocol(&envelope)),
+                json!({"action": "request"}),
+                true,
+                vec!["accept".to_owned(), "reject".to_owned(), "block".to_owned()],
+                Some("correlation-1".to_owned()),
+                Some(key),
+            );
+            deliver_agent_event_to_local_executor(&dir, None, &event)
+                .expect("deliver friend request event");
+        }
+
+        let scope_id = crate::storage::local_control_scope_id(&dir);
+        let events = crate::storage::local_control_store(&dir)
+            .expect("open local control store")
+            .list_local_agent_events(&scope_id)
+            .expect("list local agent events");
+        assert_eq!(events.len(), 1);
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]

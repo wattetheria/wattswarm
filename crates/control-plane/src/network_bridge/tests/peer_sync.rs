@@ -889,6 +889,72 @@ fn queued_peer_relationship_command_remains_pending_until_runtime_ack() {
 }
 
 #[test]
+fn queued_peer_relationship_command_retries_synchronous_dispatch_failure() {
+    let local_dir = temp_startup_dir("relationship-command-sync-failure");
+    let local_seed = [117u8; 32];
+    std::fs::write(local_dir.join("node_seed.hex"), hex::encode(local_seed))
+        .expect("write local seed");
+    ensure_test_relay_urls(&local_dir);
+
+    let local_endpoint =
+        wattswarm_network_transport_iroh::local_endpoint_id_from_state_dir(&local_dir)
+            .expect("local endpoint")
+            .to_string();
+    let local = NodeIdentity::random();
+    let membership = membership_with_roles(&[local.node_id()]);
+    let mut node =
+        Node::new(local, PgStore::open_in_memory().expect("store"), membership).expect("node");
+    let mut service = NetworkBridgeService::new(
+        NetworkP2pNode::from_iroh_state_dir(
+            NetworkP2pConfig::default(),
+            local_dir.clone(),
+            local_seed,
+        )
+        .expect("local node"),
+        &[SwarmScope::Global],
+        &NetworkProtocolParams::default(),
+    )
+    .expect("service");
+    service.set_state_dir(local_dir.clone(), local_dir.join("ui.state"));
+    let envelope = default_agent_envelope(
+        &local_endpoint,
+        "missing-peer",
+        "social.friend.accept",
+        json!({
+            "action": "accept",
+            "correlation_id": "correlation-sync-failure",
+            "request_id": "request-sync-failure"
+        }),
+    );
+    enqueue_peer_relationship_action_command(
+        &local_dir,
+        "missing-peer",
+        crate::control::PeerRelationshipAction::Accept,
+        envelope,
+    )
+    .expect("enqueue relationship command");
+
+    let processed = process_pending_network_commands(&mut node, &mut service, &local_dir)
+        .expect("retain failed pending command");
+
+    assert_eq!(processed, 0);
+    let pending = std::fs::read_to_string(local_dir.join("pending_network_commands.jsonl"))
+        .expect("read pending commands");
+    let pending_command: serde_json::Value =
+        serde_json::from_str(pending.lines().next().expect("pending command line"))
+            .expect("pending command json");
+    assert_eq!(pending_command["attempts"], json!(1));
+    assert!(
+        pending_command["last_error"]
+            .as_str()
+            .is_some_and(|error| !error.is_empty())
+    );
+
+    wattswarm_network_transport_iroh::shutdown_local_iroh_data_plane(&local_dir);
+    let _ = std::fs::remove_dir_all(local_dir);
+}
+
+#[test]
 fn gossip_source_does_not_mark_peer_connected_for_backfill() {
     let dir = temp_startup_dir("gossip-source-not-connected");
     std::fs::write(dir.join("node_seed.hex"), hex::encode([43_u8; 32])).expect("write seed");

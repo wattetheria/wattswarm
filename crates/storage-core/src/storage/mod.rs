@@ -312,6 +312,19 @@ pub struct LocalPeerRelationshipRow {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalPeerRelationshipRequestRow {
+    pub request_id: String,
+    pub remote_node_id: String,
+    pub relationship_state: String,
+    pub last_action: String,
+    pub initiated_by: String,
+    pub agent_envelope_json: String,
+    pub requested_at: u64,
+    pub responded_at: Option<u64>,
+    pub updated_at: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LocalPeerDmThreadRow {
     pub remote_node_id: String,
     pub thread_id: String,

@@ -13,8 +13,9 @@ use wattswarm_control_plane::control::{
     PeerRelationshipAction, PeerRelationshipState, artifact_store_path,
     emit_topic_message_with_content, load_data_plane_status_records_state,
     load_peer_dm_message_records_state, load_peer_dm_thread_records_state,
-    load_peer_metadata_records_state, load_peer_relationship_records_state, open_node,
-    private_dm_scope_hint, private_dm_thread_id,
+    load_peer_metadata_records_state, load_peer_relationship_records_state,
+    load_peer_relationship_request_records_state, open_node, private_dm_scope_hint,
+    private_dm_thread_id,
 };
 use wattswarm_control_plane::crypto::{NodeIdentity, sha256_hex};
 use wattswarm_control_plane::network_bridge::{

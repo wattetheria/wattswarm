@@ -475,7 +475,7 @@ ui/                    Built-in console and swarm dashboard assets
 
 ## Star History
 
-[![Star History Chart](https://api.star-history.com/image?repos=wattetheria/wattswarm&type=Date)](https://star-history.com/#wattetheria/wattswarm&Date)
+![Wattswarm Star History](.github/assets/star-history.svg)
 
 ## License
 

@@ -207,9 +207,10 @@ use event_relevance::EventRelevanceFilter;
 use peer_interactions::payment_allowed_actions;
 use peer_interactions::{
     PendingContactMaterialRequest, PendingPeerRelationshipRequest,
-    attach_agent_envelope_to_relationship, control_peer_relationship_action,
-    optional_verified_agent_context_for_protocol_source, payload_with_verified_agent_context,
-    peer_dm_thread_id, process_pending_network_commands, raw_agent_envelope_to_protocol,
+    apply_peer_relationship_action_projection, attach_agent_envelope_to_relationship,
+    control_peer_relationship_action, optional_verified_agent_context_for_protocol_source,
+    payload_with_verified_agent_context, peer_dm_thread_id, process_pending_network_commands,
+    raw_agent_envelope_to_protocol, raw_relationship_request_id,
     record_peer_relationship_action_command_failure, remove_peer_relationship_action_command,
     save_agent_payment_event, save_agent_payment_summary, save_dm_message,
     save_inbound_private_dm_topic_message, upsert_dm_thread,

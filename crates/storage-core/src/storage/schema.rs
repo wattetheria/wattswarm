@@ -39,21 +39,29 @@ fn schema_has_required_tables(conn: &Connection) -> Result<bool> {
             "SELECT COUNT(*)
              FROM sqlite_master
              WHERE type = 'table'
-               AND name IN ('discovered_peers_local', 'network_ban_windows')",
+               AND name IN (
+                   'discovered_peers_local',
+                   'network_ban_windows',
+                   'peer_relationship_requests_local'
+               )",
             params![],
             |row| row.get::<_, i64>(0),
         )?;
-        return Ok(count == 2);
+        return Ok(count == 3);
     }
     let count = conn.query_row(
         "SELECT COUNT(*)
          FROM information_schema.tables
          WHERE table_schema = current_schema()
-           AND table_name IN ('discovered_peers_local', 'network_ban_windows')",
+           AND table_name IN (
+               'discovered_peers_local',
+               'network_ban_windows',
+               'peer_relationship_requests_local'
+           )",
         params![],
         |row| row.get::<_, i64>(0),
     )?;
-    Ok(count == 2)
+    Ok(count == 3)
 }
 
 fn column_exists(conn: &Connection, table: &str, column: &str) -> bool {
@@ -109,6 +117,10 @@ const SQLITE_REQUIRED_PRIMARY_KEYS: &[(&str, &[&str])] = &[
         &["scope_id", "network_peer_id"],
     ),
     ("peer_relationships_local", &["scope_id", "remote_node_id"]),
+    (
+        "peer_relationship_requests_local",
+        &["scope_id", "remote_node_id", "request_id"],
+    ),
     ("peer_dm_threads_local", &["scope_id", "thread_id"]),
     ("peer_dm_messages_local", &["scope_id", "message_id"]),
     (
@@ -1249,6 +1261,28 @@ impl PgStore {
                 updated_at TIMESTAMPTZ NOT NULL,
                 PRIMARY KEY(scope_id, remote_node_id)
             );
+
+            CREATE TABLE IF NOT EXISTS peer_relationship_requests_local (
+                scope_id TEXT NOT NULL DEFAULT '',
+                remote_node_id TEXT NOT NULL,
+                request_id TEXT NOT NULL,
+                relationship_state TEXT NOT NULL,
+                last_action TEXT NOT NULL,
+                initiated_by TEXT NOT NULL,
+                agent_envelope_json TEXT NOT NULL,
+                requested_at TIMESTAMPTZ NOT NULL,
+                responded_at TIMESTAMPTZ,
+                updated_at TIMESTAMPTZ NOT NULL,
+                PRIMARY KEY(scope_id, remote_node_id, request_id)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_peer_relationship_requests_local_updated
+                ON peer_relationship_requests_local(
+                    scope_id,
+                    remote_node_id,
+                    updated_at DESC,
+                    request_id ASC
+                );
 
             CREATE TABLE IF NOT EXISTS peer_dm_threads_local (
                 scope_id TEXT NOT NULL DEFAULT '',
