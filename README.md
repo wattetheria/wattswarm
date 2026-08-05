@@ -164,6 +164,52 @@ better decision / less duplicate work / adaptive retry"]
     K4 --> K5
 ```
 
+## Network Layer
+
+Wattswarm selects one network backend per node. `p2p` remains the default and
+keeps the existing Iroh Gossip, Relay, Backfill, and Anti-Entropy wire behavior.
+`client_server` sends the same signed Events and lane records through a separate
+HTTPS Message Gateway; ordinary nodes never receive RabbitMQ credentials.
+
+```bash
+# Existing/default backend
+WATTSWARM_NETWORK_BACKEND=p2p
+
+# ClientServer distribution
+WATTSWARM_NETWORK_BACKEND=client_server
+WATTSWARM_CLIENT_SERVER_URL=https://message-gateway.example.com
+```
+
+Networked P2P and ClientServer nodes run one `NodeMaintenanceLoop` and one
+bounded Agent Inbox worker per canonical `state_dir`. A process-local registry
+and `.wattswarm-node-maintenance.lock` prevent duplicate owners. Pure Local mode
+does not start these workers and rejects an explicitly enabled maintenance
+owner, preserving its existing background RuntimeClient behavior.
+
+ClientServer uses four private outbound progress partitions (Global/non-Global
+times Interactive/Bulk), while the business protocol remains the existing five
+lanes: Events, Messages, Rules, Checkpoints, and Summaries. Each logical Agent
+Tenant has exactly two bounded RabbitMQ quorum mailboxes. Gateway publisher
+confirm is required before outbound progress advances; inbound delivery state,
+gaps, and pending commit receipts are durable locally before cumulative commit.
+PostgreSQL and SQLite use the same queue, lease, retry, failed/requeue, progress,
+and delivery-state contracts.
+
+The center is not a history service. ACKed or expired mailbox copies are not
+recoverable through ClientServer Backfill. Artifact references are fetched from
+the authenticated HTTPS Object API and verified by digest and size before the
+related delivery is committed. Each local transport database keeps a stable
+instance id in the signed Gateway session proof; replacing the database or
+`state_dir` makes the Gateway return `history_unavailable` instead of implying
+that the new local Store contains previously ACKed history. Full design and
+operational limits are recorded in
+[CLIENT_SERVER_SCOPED_TRANSPORT_DESIGN.md](CLIENT_SERVER_SCOPED_TRANSPORT_DESIGN.md).
+
+The existing backend-status API remains backend-neutral while exposing
+ClientServer details for session expiry and authentication latency, publisher
+confirm latency, DeliveryPage latency, per-partition source-head/cursor lag and
+retry isolation, plus pending cumulative-commit retry state.
+
 ```mermaid
 flowchart LR
     T["Task stream over time"] --> M["Local multi-agent node

@@ -748,6 +748,26 @@ fn materialize_reference_artifact(
     Ok(manifest)
 }
 
+pub(crate) fn materialize_content_artifact_from_reference(
+    state_dir: &Path,
+    kind: ArtifactKind,
+    reference: &crate::types::ArtifactRef,
+    bytes: &[u8],
+    observed_at: u64,
+) -> Result<ArtifactAvailabilityManifest> {
+    materialize_reference_artifact(
+        state_dir,
+        kind,
+        &reference.digest,
+        &reference.uri,
+        &reference.digest,
+        &reference.mime,
+        reference.size_bytes,
+        bytes,
+        observed_at,
+    )
+}
+
 fn fetch_reference_artifact(
     state_dir: &Path,
     kind: ArtifactKind,

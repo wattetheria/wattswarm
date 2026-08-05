@@ -315,6 +315,32 @@ impl Connection {
         }
     }
 
+    pub fn with_transaction<T>(
+        &self,
+        operation: impl FnOnce(&mut DatabaseTransaction<'_>) -> Result<T>,
+    ) -> Result<T> {
+        match &self.inner.backend {
+            Backend::Postgres(backend) => {
+                let mut client = backend
+                    .client
+                    .lock()
+                    .map_err(|_| Error::Db("mutex poisoned".to_owned()))?;
+                let transaction = client.transaction().map_err(map_db_err)?;
+                finish_transaction(DatabaseTransaction::Postgres(transaction), operation)
+            }
+            Backend::Sqlite(backend) => {
+                let mut client = backend
+                    .client
+                    .lock()
+                    .map_err(|_| Error::Db("mutex poisoned".to_owned()))?;
+                let transaction = client
+                    .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                    .map_err(map_sqlite_err)?;
+                finish_transaction(DatabaseTransaction::Sqlite(transaction), operation)
+            }
+        }
+    }
+
     pub fn execute<P: Params>(&self, sql: &str, params: P) -> Result<usize> {
         let values = params.to_values();
         match &self.inner.backend {
@@ -386,6 +412,23 @@ impl Connection {
             sql: sql.to_owned(),
             column_names: Vec::new(),
         })
+    }
+}
+
+fn finish_transaction<T>(
+    mut transaction: DatabaseTransaction<'_>,
+    operation: impl FnOnce(&mut DatabaseTransaction<'_>) -> Result<T>,
+) -> Result<T> {
+    let result = operation(&mut transaction);
+    match result {
+        Ok(value) => {
+            transaction.commit()?;
+            Ok(value)
+        }
+        Err(error) => {
+            let _ = transaction.rollback();
+            Err(error)
+        }
     }
 }
 

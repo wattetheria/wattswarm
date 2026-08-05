@@ -19,6 +19,71 @@ fn topic_catalog_uses_namespace_scope_and_kind() {
 }
 
 #[test]
+fn propagation_lane_adapter_preserves_all_gossip_kinds() {
+    for kind in GossipKind::ALL {
+        let lane = wattswarm_network_transport_core::PropagationLane::from(kind);
+        assert_eq!(lane.as_str(), kind.as_str());
+        assert_eq!(GossipKind::from(lane), kind);
+    }
+}
+
+#[test]
+fn p2p_scope_topic_and_topic_id_golden() {
+    let namespace = TopicNamespace {
+        network: "Swarm/Net".to_owned(),
+        network_id: "main/alpha".to_owned(),
+    };
+    let scope = SwarmScope::Region("sol-1/alpha".to_owned());
+    let scope_label = scope.label().unwrap();
+    let topic_name = namespace.topic_name(&scope, GossipKind::Messages).unwrap();
+    let topic_id = derive_gossip_topic_id(
+        &namespace.network_id,
+        &scope_label,
+        GossipKind::Messages.as_str(),
+    );
+
+    assert_eq!(scope_label, "region.sol-1-alpha");
+    assert_eq!(
+        topic_name,
+        "swarm-net.main-alpha.region.sol-1-alpha.messages"
+    );
+    assert_eq!(
+        hex::encode(topic_id.as_bytes()),
+        "24be5f33678be38e34250b8d4cf4e1d78fd031e8a21a74fd84c188701f5f7980"
+    );
+}
+
+#[test]
+fn raw_backfill_wire_json_golden() {
+    let request = RawBackfillRequest {
+        scope: SwarmScope::Group("hive-7".to_owned()),
+        from_event_seq: 11,
+        limit: 32,
+        head_only: true,
+        feed_key: None,
+        exclude_topic_events: true,
+        known_event_ids: vec!["evt-a".to_owned(), "evt-b".to_owned()],
+    };
+    let response = RawBackfillResponse {
+        scope: SwarmScope::Group("hive-7".to_owned()),
+        next_from_event_seq: 43,
+        head_only: true,
+        feed_key: Some("feed-7".to_owned()),
+        head_event_ids: vec!["evt-z".to_owned()],
+        items: vec![b"{}".to_vec()],
+    };
+
+    assert_eq!(
+        serde_json::to_string(&request).unwrap(),
+        r#"{"scope":{"group":"hive-7"},"from_event_seq":11,"limit":32,"head_only":true,"exclude_topic_events":true,"known_event_ids":["evt-a","evt-b"]}"#
+    );
+    assert_eq!(
+        serde_json::to_string(&response).unwrap(),
+        r#"{"scope":{"group":"hive-7"},"next_from_event_seq":43,"head_only":true,"feed_key":"feed-7","head_event_ids":["evt-z"],"items":[[123,125]]}"#
+    );
+}
+
+#[test]
 fn backfill_request_validate_enforces_bounds() {
     let req = RawBackfillRequest {
         scope: SwarmScope::Global,

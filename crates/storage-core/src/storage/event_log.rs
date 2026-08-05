@@ -514,28 +514,11 @@ impl PgStore {
     }
 
     pub fn is_node_network_banned(&self, node_id: &str) -> Result<bool> {
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
-        let exists = conn.query_row(
-            "SELECT EXISTS(
-                 SELECT 1
-                 FROM network_ban_windows
-                 WHERE org_id = $1
-                   AND node_id = $2
-                   AND (
-                     starts_at <= (EXTRACT(EPOCH FROM NOW()) * 1000)::BIGINT
-                     AND (
-                       until_ms IS NULL
-                       OR until_ms > (EXTRACT(EPOCH FROM NOW()) * 1000)::BIGINT
-                     )
-                   )
-             )",
-            params![self.org_id(), node_id],
-            |r| r.get::<_, bool>(0),
-        )?;
-        Ok(exists)
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .context("system clock is before the Unix epoch")?
+            .as_millis() as u64;
+        self.is_node_network_banned_at(node_id, now_ms)
     }
 
     pub fn is_node_network_banned_at(&self, node_id: &str, at_ms: u64) -> Result<bool> {

@@ -610,6 +610,44 @@ pub(super) fn apply_discovery_bootnode_record(
     Ok(registered)
 }
 
+pub(super) fn apply_discovery_bootnode_record_client_server(
+    node: &mut Node,
+    state_dir: &Path,
+    local_node_id: &str,
+    network_id: &str,
+    settings: &DiscoveryBootnodeSettings,
+    record: SignedDiscoveryNodeRecord,
+    now_ms: u64,
+) -> Result<bool> {
+    let verification = record.verify_fresh_at(now_ms);
+    record_discovery_signature_verification_diagnostic(state_dir, &record, &verification);
+    verification?;
+    if record.body.network_id != network_id || record.body.node_id == local_node_id {
+        return Ok(false);
+    }
+    if settings.has_local_geo() {
+        let Some(remote_geo) = &record.body.geo else {
+            return Ok(false);
+        };
+        let Some(distance_km) = discovery_record_distance_km(settings, remote_geo) else {
+            return Ok(false);
+        };
+        if distance_km > settings.radius_km.min(remote_geo.radius_km) {
+            return Ok(false);
+        }
+    }
+    if record.body.transport_contact.is_some() {
+        upsert_contact_material_for_peer(
+            state_dir,
+            &record.body.node_id,
+            &raw_contact_material_from_discovery_record(&record)?,
+        )?;
+        mark_peer_metadata_discovery_v1(state_dir, &record.body.node_id, &record.body.network_id)?;
+    }
+    node.discover_peer(record.body.node_id);
+    Ok(true)
+}
+
 fn discovery_record_distance_km(
     settings: &DiscoveryBootnodeSettings,
     remote_geo: &DiscoveryGeo,

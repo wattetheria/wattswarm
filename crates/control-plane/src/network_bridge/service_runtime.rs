@@ -302,6 +302,95 @@ fn peer_metadata_needs_private_message_contact_material(
         .is_some_and(|record| record.private_message_public_key_b64().is_none())
 }
 
+pub(super) fn decrypt_private_hive_topic_event(
+    node: &Node,
+    state_dir: &Path,
+    event: &crate::types::Event,
+    payload: &crate::types::TopicMessagePostedPayload,
+) -> Result<bool> {
+    if !crate::control::is_private_hive_route(&payload.feed_key, &payload.scope_hint) {
+        return Ok(false);
+    }
+    let Some(topic_message) = node.store.get_topic_message(&event.event_id)? else {
+        return Ok(false);
+    };
+    if topic_message.content.get("kind").and_then(Value::as_str) != Some("private_encrypted")
+        || topic_message
+            .content
+            .get("private_kind")
+            .and_then(Value::as_str)
+            != Some("hive_message")
+    {
+        return Ok(false);
+    }
+    let Some(message_id) = topic_message
+        .content
+        .get("message_id")
+        .and_then(Value::as_str)
+    else {
+        return Ok(false);
+    };
+    let Some(key) = crate::control::find_private_hive_key_record_state(
+        state_dir,
+        &payload.feed_key,
+        &payload.scope_hint,
+    )?
+    else {
+        return Ok(false);
+    };
+    let Some(encrypted) = topic_message.content.get("encrypted") else {
+        return Ok(false);
+    };
+    let Ok(encrypted) =
+        serde_json::from_value::<crate::crypto::PrivateGroupEncryptedPayload>(encrypted.clone())
+    else {
+        return Ok(false);
+    };
+    let Ok(plaintext) = crate::crypto::decrypt_private_group_content(
+        &key.shared_secret_b64,
+        &encrypted,
+        &crate::control::private_hive_encryption_aad(
+            &payload.feed_key,
+            &payload.scope_hint,
+            message_id,
+        ),
+    ) else {
+        return Ok(false);
+    };
+    let Ok(private_plaintext) = serde_json::from_slice::<Value>(&plaintext) else {
+        return Ok(false);
+    };
+    let Ok((content, agent_envelope)) =
+        crate::control::decode_private_hive_plaintext_payload(private_plaintext)
+    else {
+        return Ok(false);
+    };
+    node.store.update_topic_message_content_and_agent_envelope(
+        &event.event_id,
+        &content,
+        agent_envelope.as_ref(),
+        event.created_at,
+    )?;
+    record_private_hive_crypto_diagnostic(
+        state_dir,
+        PrivateHiveCryptoDiagnostic {
+            phase: "private_hive.decrypt",
+            message: "private hive message decrypted from network transport",
+            event_id: Some(&event.event_id),
+            source_node_id: &event.author_node_id,
+            local_node_id: &node.node_id(),
+            feed_key: &payload.feed_key,
+            scope_hint: &payload.scope_hint,
+            message_id,
+            group_id: &encrypted.group_id,
+            epoch: encrypted.epoch,
+            scheme: &encrypted.scheme,
+            cipher: &encrypted.cipher,
+        },
+    );
+    Ok(true)
+}
+
 impl NetworkBridgeService {
     fn save_inbound_private_dm_topic_if_applicable(
         &self,
@@ -357,94 +446,10 @@ impl NetworkBridgeService {
         event: &crate::types::Event,
         payload: &crate::types::TopicMessagePostedPayload,
     ) {
-        if !crate::control::is_private_hive_route(&payload.feed_key, &payload.scope_hint) {
-            return;
-        }
         let Some(state_dir) = &self.state_dir else {
             return;
         };
-        let Ok(Some(topic_message)) = node.store.get_topic_message(&event.event_id) else {
-            return;
-        };
-        if topic_message.content.get("kind").and_then(Value::as_str) != Some("private_encrypted")
-            || topic_message
-                .content
-                .get("private_kind")
-                .and_then(Value::as_str)
-                != Some("hive_message")
-        {
-            return;
-        }
-        let Some(message_id) = topic_message
-            .content
-            .get("message_id")
-            .and_then(Value::as_str)
-        else {
-            return;
-        };
-        let Ok(Some(key)) = crate::control::find_private_hive_key_record_state(
-            state_dir,
-            &payload.feed_key,
-            &payload.scope_hint,
-        ) else {
-            return;
-        };
-        let Some(encrypted) = topic_message.content.get("encrypted") else {
-            return;
-        };
-        let Ok(encrypted) = serde_json::from_value::<crate::crypto::PrivateGroupEncryptedPayload>(
-            encrypted.clone(),
-        ) else {
-            return;
-        };
-        let Ok(plaintext) = crate::crypto::decrypt_private_group_content(
-            &key.shared_secret_b64,
-            &encrypted,
-            &crate::control::private_hive_encryption_aad(
-                &payload.feed_key,
-                &payload.scope_hint,
-                message_id,
-            ),
-        ) else {
-            return;
-        };
-        let Ok(private_plaintext) = serde_json::from_slice::<Value>(&plaintext) else {
-            return;
-        };
-        let Ok((content, agent_envelope)) =
-            crate::control::decode_private_hive_plaintext_payload(private_plaintext)
-        else {
-            return;
-        };
-        if node
-            .store
-            .update_topic_message_content_and_agent_envelope(
-                &event.event_id,
-                &content,
-                agent_envelope.as_ref(),
-                event.created_at,
-            )
-            .is_err()
-        {
-            return;
-        }
-        record_private_hive_crypto_diagnostic(
-            state_dir,
-            PrivateHiveCryptoDiagnostic {
-                phase: "private_hive.decrypt",
-                message: "private hive message decrypted from network transport",
-                event_id: Some(&event.event_id),
-                source_node_id: &event.author_node_id,
-                local_node_id: &node.node_id(),
-                feed_key: &payload.feed_key,
-                scope_hint: &payload.scope_hint,
-                message_id,
-                group_id: &encrypted.group_id,
-                epoch: encrypted.epoch,
-                scheme: &encrypted.scheme,
-                cipher: &encrypted.cipher,
-            },
-        );
+        let _ = decrypt_private_hive_topic_event(node, state_dir, event, payload);
     }
 
     fn deliver_task_lifecycle_agent_event(&self, node: &Node, event: &crate::types::Event) {
@@ -458,20 +463,12 @@ impl NetworkBridgeService {
         match &event.payload {
             crate::types::EventPayload::TaskClaimed(payload) => {
                 if let Ok(agent_event) = task_claim_agent_event(node, event, payload) {
-                    let _ = deliver_agent_event_to_local_executor(
-                        state_dir,
-                        self.db_path.as_deref(),
-                        &agent_event,
-                    );
+                    let _ = enqueue_agent_event_for_local_executor(state_dir, &agent_event);
                 }
             }
             crate::types::EventPayload::TaskClaimDecided(payload) => {
                 if let Ok(agent_event) = task_claim_decision_agent_event(node, event, payload) {
-                    let _ = deliver_agent_event_to_local_executor(
-                        state_dir,
-                        self.db_path.as_deref(),
-                        &agent_event,
-                    );
+                    let _ = enqueue_agent_event_for_local_executor(state_dir, &agent_event);
                 }
             }
             crate::types::EventPayload::CandidateProposed(_)
@@ -480,30 +477,18 @@ impl NetworkBridgeService {
             | crate::types::EventPayload::TaskError(_)
             | crate::types::EventPayload::TaskRetryScheduled(_) => {
                 if let Ok(Some(agent_event)) = task_result_agent_event(node, event) {
-                    let _ = deliver_agent_event_to_local_executor(
-                        state_dir,
-                        self.db_path.as_deref(),
-                        &agent_event,
-                    );
+                    let _ = enqueue_agent_event_for_local_executor(state_dir, &agent_event);
                 }
             }
             crate::types::EventPayload::TaskCompletionDecided(payload) => {
                 if let Ok(agent_event) = task_completion_decision_agent_event(node, event, payload)
                 {
-                    let _ = deliver_agent_event_to_local_executor(
-                        state_dir,
-                        self.db_path.as_deref(),
-                        &agent_event,
-                    );
+                    let _ = enqueue_agent_event_for_local_executor(state_dir, &agent_event);
                 }
             }
             crate::types::EventPayload::TaskSettled(payload) => {
                 if let Ok(agent_event) = task_settled_agent_event(node, event, payload) {
-                    let _ = deliver_agent_event_to_local_executor(
-                        state_dir,
-                        self.db_path.as_deref(),
-                        &agent_event,
-                    );
+                    let _ = enqueue_agent_event_for_local_executor(state_dir, &agent_event);
                 }
             }
             _ => {}
@@ -527,11 +512,7 @@ impl NetworkBridgeService {
             return;
         }
         if let Ok(Some(agent_event)) = topic_message_agent_event(node, event, payload) {
-            let _ = deliver_agent_event_to_local_executor(
-                state_dir,
-                self.db_path.as_deref(),
-                &agent_event,
-            );
+            let _ = enqueue_agent_event_for_local_executor(state_dir, &agent_event);
         }
     }
 
@@ -1890,11 +1871,7 @@ impl NetworkBridgeService {
                                         requested_at,
                                     )),
                                 );
-                                let _ = deliver_agent_event_to_local_executor(
-                                    &state_dir,
-                                    self.db_path.as_deref(),
-                                    &event,
-                                );
+                                let _ = enqueue_agent_event_for_local_executor(&state_dir, &event);
                             }
                             if action == crate::control::PeerRelationshipAction::Accept
                                 && record.relationship_state

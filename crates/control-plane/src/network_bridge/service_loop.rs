@@ -304,7 +304,7 @@ fn format_duration_stats(stats: &HashMap<String, DurationStats>) -> String {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum NetworkServiceStatus {
+pub(super) enum NetworkServiceStatus {
     Starting,
     Running,
     Retrying,
@@ -323,16 +323,16 @@ impl NetworkServiceStatus {
         }
     }
 
-    fn is_active(self) -> bool {
+    pub(super) fn is_active(self) -> bool {
         matches!(self, Self::Starting | Self::Running | Self::Retrying)
     }
 }
 
-fn network_service_statuses() -> &'static Mutex<HashMap<PathBuf, NetworkServiceStatus>> {
+pub(super) fn network_service_statuses() -> &'static Mutex<HashMap<PathBuf, NetworkServiceStatus>> {
     NETWORK_SERVICE_STATUSES.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn set_network_service_status(state_dir: &Path, status: NetworkServiceStatus) {
+pub(super) fn set_network_service_status(state_dir: &Path, status: NetworkServiceStatus) {
     let mut statuses = network_service_statuses()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -514,7 +514,9 @@ pub fn configured_network_scopes_from_env() -> Vec<SwarmScope> {
 }
 
 pub fn network_enabled_from_env() -> bool {
-    parse_bool_env_with_default(ENV_P2P_ENABLED, true)
+    crate::network_service::NetworkBackend::from_env()
+        .map(crate::network_service::network_service_enabled_from_env)
+        .unwrap_or(false)
 }
 
 pub fn network_config_from_env() -> NetworkP2pConfig {
@@ -564,15 +566,24 @@ pub fn maybe_start_background_network_service_with_hook(
     db_path: PathBuf,
     post_tick_hook: Option<PostTickHook>,
 ) -> Result<bool> {
-    if !network_enabled_from_env() {
+    let backend = crate::network_service::NetworkBackend::from_env()?;
+    if !crate::network_service::network_service_enabled_from_env(backend) {
         return Ok(false);
     }
     let Some(mode) = crate::control::configured_node_mode(&state_dir)? else {
-        eprintln!("wattswarm p2p network deferred (node mode not configured yet)");
+        eprintln!("wattswarm network service deferred (node mode not configured yet)");
         return Ok(false);
     };
-    if matches!(mode, crate::control::NodeMode::Local) {
+    if matches!(mode, crate::control::NodeMode::Local)
+        && backend == crate::network_service::NetworkBackend::P2p
+    {
         return Ok(false);
+    }
+
+    if backend == crate::network_service::NetworkBackend::ClientServer {
+        return super::client_server_network::maybe_start_client_server_network_service(
+            state_dir, db_path,
+        );
     }
 
     let config = network_config_from_state_dir(&state_dir);

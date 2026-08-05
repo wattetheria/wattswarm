@@ -75,29 +75,6 @@ pub(super) fn event_matches_signed_scope(event: &crate::types::Event, scope: &Sw
     true
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct EventTransportRoute {
-    pub(super) scope: SwarmScope,
-    pub(super) address: String,
-    pub(super) public_global_control: bool,
-}
-
-impl EventTransportRoute {
-    fn new(
-        scope: SwarmScope,
-        event_kind: crate::types::EventKind,
-        public_global_control: bool,
-    ) -> Result<Self> {
-        let event_kind_label = format!("{event_kind:?}");
-        let address = format!("ws.{}.{}", scope.label()?, event_kind_label);
-        Ok(Self {
-            scope,
-            address,
-            public_global_control,
-        })
-    }
-}
-
 pub(super) fn node_has_active_subscription_scope_kinds(
     node: &Node,
     node_id: &str,
@@ -153,9 +130,15 @@ fn route_for_scope(
     event_kind: crate::types::EventKind,
     public_global_control: bool,
 ) -> Result<Option<EventTransportRoute>> {
-    Ok(Some(EventTransportRoute::new(
+    let lane = if event_kind == crate::types::EventKind::TopicMessagePosted {
+        PropagationLane::Messages
+    } else {
+        PropagationLane::Events
+    };
+    Ok(Some(EventTransportRoute::from_kind_label(
         scope,
-        event_kind,
+        lane,
+        &format!("{event_kind:?}"),
         public_global_control,
     )?))
 }

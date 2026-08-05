@@ -360,6 +360,38 @@ mod tests {
     use super::*;
 
     #[test]
+    fn membership_event_signature_survives_json_round_trip() {
+        let identity = NodeIdentity::from_seed([7; 32]);
+        let member = NodeIdentity::from_seed([8; 32]);
+        let mut membership = types::Membership::new();
+        membership.grant(&member.node_id(), types::Role::Verifier);
+        membership.grant(&identity.node_id(), types::Role::Finalizer);
+        membership.grant(&identity.node_id(), types::Role::Proposer);
+        let membership_signature = types::SignatureEnvelope {
+            signer_node_id: identity.node_id(),
+            signature_hex: identity.sign_bytes(&serde_json::to_vec(&membership).unwrap()),
+        };
+        let unsigned = types::UnsignedEvent::from_payload_with_scope(
+            "1".to_owned(),
+            identity.node_id(),
+            1,
+            1,
+            "global".to_owned(),
+            types::EventPayload::MembershipUpdated(types::MembershipUpdatedPayload {
+                new_membership: membership,
+                quorum_threshold: 1,
+                quorum_signatures: vec![membership_signature],
+            }),
+        );
+        let signed = identity.sign_unsigned_event(&unsigned).unwrap();
+        let decoded: types::Event =
+            serde_json::from_slice(&serde_json::to_vec(&signed).unwrap()).unwrap();
+
+        verify_event_signature(&decoded).unwrap();
+        assert_eq!(decoded.event_id, signed.event_id);
+    }
+
+    #[test]
     fn verify_signature_bytes_accepts_valid_ed25519_signature() {
         let identity = NodeIdentity::random();
         let message = b"agent-envelope";

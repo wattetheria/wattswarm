@@ -599,10 +599,19 @@ mod event_log;
 mod export;
 mod local_control;
 pub use local_control::{local_control_scope_id, local_control_store};
+mod client_server_state;
 mod metrics;
 mod projection;
 mod registry;
 mod schema;
+mod transport_state;
+pub use client_server_state::{
+    CsMailboxDeliveryState, CsMailboxPendingCommitRow, CsOutboundProgressRow,
+    NetworkBackendStatusRow,
+};
+pub use transport_state::{
+    ClaimedLocalAgentEventRow, ClaimedPendingNetworkCommandRow, PendingNetworkCommandInsert,
+};
 
 pub use registry::{
     VerifiedNetworkProtocolParams, bootstrap_org_id, lan_network_id, local_network_id,

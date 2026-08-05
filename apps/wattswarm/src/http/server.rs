@@ -35,19 +35,14 @@ pub fn run(state_dir: PathBuf, db_path: PathBuf, listen: String) -> Result<()> {
             Err(error) => eprintln!("wattswarm network contact refresh skipped: {error:#}"),
         }
     }
-    let network_started = crate::network_bridge::maybe_start_background_network_service_with_hook(
-        state_dir.clone(),
-        db_path.clone(),
-        Some(Box::new(|node, sd| {
-            crate::network_hooks::run_background_post_tick(node, sd);
-        })),
-    )?;
+    let network_started =
+        crate::node_runtime::start_node_runtime(state_dir.clone(), db_path.clone())?;
     if network_started {
         mark_node_running_if_service_started(&state_dir, true)?;
         spawn_periodic_discovery_bootnode_announce(state_dir.clone(), db_path.clone());
-        eprintln!("wattswarm p2p network enabled");
+        eprintln!("wattswarm network service enabled");
     } else {
-        eprintln!("wattswarm p2p network disabled");
+        eprintln!("wattswarm network service disabled");
     }
     if network_enabled {
         crate::udp_announce::announce_startup_with_contact(

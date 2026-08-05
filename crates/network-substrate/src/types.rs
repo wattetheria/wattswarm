@@ -110,26 +110,6 @@ pub type BackfillResponseChannel = Sender<RawBackfillResponse>;
 pub type ContactMaterialResponseChannel = Sender<RawContactMaterialResponse>;
 pub type PeerRelationshipResponseChannel = Sender<RawPeerRelationshipResponse>;
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SwarmScope {
-    Global,
-    Region(String),
-    Node(String),
-    Group(String),
-}
-
-impl SwarmScope {
-    pub fn label(&self) -> Result<String> {
-        match self {
-            Self::Global => Ok("global".to_owned()),
-            Self::Region(region_id) => Ok(format!("region.{}", sanitize_segment(region_id)?)),
-            Self::Node(node_id) => Ok(format!("node.{}", sanitize_segment(node_id)?)),
-            Self::Group(group_id) => Ok(format!("group.{}", sanitize_segment(group_id)?)),
-        }
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum GossipKind {
@@ -156,6 +136,30 @@ impl GossipKind {
             Self::Rules => "rules",
             Self::Checkpoints => "checkpoints",
             Self::Summaries => "summaries",
+        }
+    }
+}
+
+impl From<GossipKind> for wattswarm_network_transport_core::PropagationLane {
+    fn from(value: GossipKind) -> Self {
+        match value {
+            GossipKind::Events => Self::Events,
+            GossipKind::Messages => Self::Messages,
+            GossipKind::Rules => Self::Rules,
+            GossipKind::Checkpoints => Self::Checkpoints,
+            GossipKind::Summaries => Self::Summaries,
+        }
+    }
+}
+
+impl From<wattswarm_network_transport_core::PropagationLane> for GossipKind {
+    fn from(value: wattswarm_network_transport_core::PropagationLane) -> Self {
+        match value {
+            wattswarm_network_transport_core::PropagationLane::Events => Self::Events,
+            wattswarm_network_transport_core::PropagationLane::Messages => Self::Messages,
+            wattswarm_network_transport_core::PropagationLane::Rules => Self::Rules,
+            wattswarm_network_transport_core::PropagationLane::Checkpoints => Self::Checkpoints,
+            wattswarm_network_transport_core::PropagationLane::Summaries => Self::Summaries,
         }
     }
 }

@@ -15,12 +15,9 @@ pub(crate) async fn node_up(State(state): State<UiServerState>) -> Result<Json<V
         let node = open_configured_node(&state_clone.state_dir, &state_clone.db_path)?;
         let mode = require_configured_node_mode(&state_clone.state_dir)?;
         write_node_state(&state_clone.state_dir, true, mode)?;
-        let _ = crate::network_bridge::maybe_start_background_network_service_with_hook(
+        let _ = crate::node_runtime::start_node_runtime(
             state_clone.state_dir.clone(),
             state_clone.db_path.clone(),
-            Some(Box::new(|node, sd| {
-                crate::network_hooks::run_background_post_tick(node, sd);
-            })),
         )?;
         if crate::network_bridge::network_enabled_from_env() {
             crate::udp_announce::announce_startup_with_contact(
@@ -59,7 +56,7 @@ pub(crate) async fn node_status(
         let node_id = local_node_id(&state_clone.state_dir).unwrap_or_default();
 
         // Only read peer info if node has been explicitly started (has topology in DB).
-        let dist = if runtime_state.running {
+        let (dist, network_backend) = if runtime_state.running {
             match open_configured_node(&state_clone.state_dir, &state_clone.db_path) {
                 Ok(node) => {
                     let peers = node
@@ -69,12 +66,33 @@ pub(crate) async fn node_status(
                     for (version, count) in peers {
                         dist.insert(version, Value::from(count));
                     }
-                    dist
+                    let scope_id = wattswarm_storage_core::storage::local_control_scope_id(
+                        &state_clone.state_dir,
+                    );
+                    let backend =
+                        node.store
+                            .load_network_backend_status(&scope_id)?
+                            .map(|status| {
+                                json!({
+                                    "backend": status.backend,
+                                    "status": status.status,
+                                    "published": status.published,
+                                    "received": status.received,
+                                    "retries": status.retries,
+                                    "last_error": status.reason,
+                                    "updated_at": status.updated_at,
+                                    "backend_details": serde_json::from_str::<Value>(
+                                        &status.backend_details_json,
+                                    )
+                                    .unwrap_or_else(|_| json!({})),
+                                })
+                            });
+                    (dist, backend)
                 }
-                Err(_) => serde_json::Map::new(),
+                Err(_) => (serde_json::Map::new(), None),
             }
         } else {
-            serde_json::Map::new()
+            (serde_json::Map::new(), None)
         };
         Ok(json!({
             "ok": true,
@@ -82,7 +100,8 @@ pub(crate) async fn node_status(
             "node_id": node_id,
             "mode": runtime_state.mode.as_str(),
             "local_protocol_version": crate::constants::LOCAL_PROTOCOL_VERSION,
-            "peer_protocol_distribution": dist
+            "peer_protocol_distribution": dist,
+            "network_backend": network_backend,
         }))
     })
     .await?;

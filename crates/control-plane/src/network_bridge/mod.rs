@@ -1,7 +1,9 @@
 mod agent_delivery;
+mod agent_event_inbox;
 mod announcements;
 mod backfill;
 mod bootstrap_contact;
+mod client_server_network;
 mod diagnostics;
 mod discovery_bootnode;
 mod event_relevance;
@@ -28,13 +30,14 @@ use crate::network_p2p::{
     RawContactMaterialRequest, RawContactMaterialResponse, RawPeerRelationshipAction,
     RawSourceAgentCard, SummaryAnnouncement, SwarmScope,
 };
+#[cfg(test)]
+use crate::network_service::ENV_P2P_ENABLED;
 use crate::node::Node;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
-use std::io::Write;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
@@ -44,14 +47,16 @@ use tokio::runtime::Runtime;
 use uuid::Uuid;
 use wattswarm_network_discovery::{DiscoveryGeo, SignedDiscoveryNodeRecord};
 use wattswarm_network_transport_core::{
-    PeerTransportCapabilities, TransferIntent, TransferKind, TransportContactMaterial,
-    TransportMetadata, TransportRoute as DataTransportRoute, TransportRouter,
+    EventTransportRoute, PeerTransportCapabilities, PropagationLane, TransferIntent, TransferKind,
+    TransportContactMaterial, TransportMetadata, TransportRoute as DataTransportRoute,
+    TransportRouter,
 };
 use wattswarm_network_transport_iroh::{
     export_local_contact_material_for_network_peer_id, local_endpoint_id_from_state_dir,
 };
 use wattswarm_protocol::types::NetworkProtocolParams;
 
+pub use agent_event_inbox::{AgentInboxWorker, process_agent_event_inbox_once};
 pub use announcements::{
     apply_checkpoint_announcement, apply_rule_announcement, sign_rule_announcement,
 };
@@ -175,9 +180,11 @@ pub fn record_private_hive_crypto_diagnostic(
 }
 
 #[cfg(test)]
-use agent_delivery::{build_agent_event, topic_message_requires_reply};
 use agent_delivery::{
-    build_agent_event_with_agent_envelope, deliver_agent_event_to_local_executor,
+    build_agent_event, deliver_agent_event_to_local_executor, topic_message_requires_reply,
+};
+use agent_delivery::{
+    build_agent_event_with_agent_envelope, enqueue_agent_event_for_local_executor,
     task_claim_agent_event, task_claim_decision_agent_event, task_completion_decision_agent_event,
     task_result_agent_event, task_settled_agent_event, topic_message_agent_event,
 };
@@ -194,8 +201,8 @@ pub use bootstrap_contact::{
     export_local_contact_material, upsert_contact_material_for_peer, validate_bootstrap_contact,
 };
 use discovery_bootnode::{
-    apply_discovery_bootnode_record, discovery_bootnode_settings_from_state_dir,
-    query_discovery_bootnodes_for_candidate_records,
+    apply_discovery_bootnode_record, apply_discovery_bootnode_record_client_server,
+    discovery_bootnode_settings_from_state_dir, query_discovery_bootnodes_for_candidate_records,
 };
 #[cfg(test)]
 use discovery_bootnode::{
@@ -209,7 +216,8 @@ use peer_interactions::{
     PendingContactMaterialRequest, PendingPeerRelationshipRequest,
     apply_peer_relationship_action_projection, attach_agent_envelope_to_relationship,
     control_peer_relationship_action, optional_verified_agent_context_for_protocol_source,
-    payload_with_verified_agent_context, peer_dm_thread_id, process_pending_network_commands,
+    payload_with_verified_agent_context, peer_dm_thread_id,
+    process_pending_client_server_network_commands, process_pending_network_commands,
     raw_agent_envelope_to_protocol, raw_relationship_request_id,
     record_peer_relationship_action_command_failure, remove_peer_relationship_action_command,
     save_agent_payment_event, save_agent_payment_summary, save_dm_message,
@@ -226,6 +234,7 @@ use scope::{
 use service_loop::{
     clear_latest_network_observability_snapshot, store_latest_network_observability_snapshot,
 };
+use service_runtime::decrypt_private_hive_topic_event;
 use summary::{
     knowledge_summary_for_event, mirror_summary_controls_to_parent_network,
     mirror_summary_to_parent_network, reputation_summary_for_event, task_outcome_summary_for_event,
@@ -266,7 +275,6 @@ const PEER_RECONNECT_MAX_ATTEMPTS: u32 = 10;
 const PENDING_CONTACT_MATERIAL_REQUEST_TTL: Duration = Duration::from_secs(60);
 const RECONNECT_CANDIDATE_RETENTION: Duration = Duration::from_secs(60 * 60);
 
-const ENV_P2P_ENABLED: &str = "WATTSWARM_P2P_ENABLED";
 const ENV_P2P_LOCAL_DISCOVERY: &str = "WATTSWARM_P2P_MDNS";
 const ENV_P2P_PORT: &str = "WATTSWARM_P2P_PORT";
 const ENV_P2P_LISTEN_ADDRS: &str = "WATTSWARM_P2P_LISTEN_ADDRS";

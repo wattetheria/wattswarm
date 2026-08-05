@@ -20,6 +20,7 @@ use tokio::runtime::{Runtime, RuntimeFlavor};
 use wattswarm_network_transport_core::{
     PeerTransportCapabilities, TransportContactMaterial, TransportMetadata, TransportRoute,
 };
+pub use wattswarm_network_transport_core::{SwarmScope, sanitize_segment};
 use wattswarm_network_transport_iroh::{
     DEFAULT_IROH_CONTROL_ALPN, IrohControlStreamRequest, IrohControlStreamResponse,
     IrohGossipRuntimeConfig, derive_gossip_topic_id,
@@ -55,8 +56,7 @@ pub use types::{
     BackfillRequestId, BackfillResponseChannel, ContactMaterialRequestId,
     ContactMaterialResponseChannel, GossipKind, NetworkAddress, NetworkNodeId,
     PeerHandshakeMetadata, PeerMetadata, PeerRelationshipRequestId,
-    PeerRelationshipResponseChannel, SubstrateConfig, SubstrateNode, SwarmScope, TopicCatalog,
-    TopicNamespace,
+    PeerRelationshipResponseChannel, SubstrateConfig, SubstrateNode, TopicCatalog, TopicNamespace,
 };
 use wire::InboundControlPeer;
 pub use wire::{
@@ -216,23 +216,6 @@ fn validate_max_bytes(label: &str, value: &str, max_bytes: usize) -> Result<()> 
         bail!("{label} exceeds configured max bytes");
     }
     Ok(())
-}
-
-pub fn sanitize_segment(raw: &str) -> Result<String> {
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        bail!("network segment cannot be empty");
-    }
-
-    let mut out = String::with_capacity(trimmed.len());
-    for ch in trimmed.chars() {
-        if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_') {
-            out.push(ch.to_ascii_lowercase());
-        } else {
-            out.push('-');
-        }
-    }
-    Ok(out)
 }
 
 fn default_network_context_id() -> String {

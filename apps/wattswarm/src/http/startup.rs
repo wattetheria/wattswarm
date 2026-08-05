@@ -76,13 +76,8 @@ pub(crate) async fn startup_config_save(
         }
     })
     .await?;
-    let network_started = crate::network_bridge::maybe_start_background_network_service_with_hook(
-        state.state_dir.clone(),
-        state.db_path.clone(),
-        Some(Box::new(|node, sd| {
-            crate::network_hooks::run_background_post_tick(node, sd);
-        })),
-    )?;
+    let network_started =
+        crate::node_runtime::start_node_runtime(state.state_dir.clone(), state.db_path.clone())?;
     mark_node_running_if_service_started(&state.state_dir, network_started)?;
     Ok(Json(json!({
         "ok": true,

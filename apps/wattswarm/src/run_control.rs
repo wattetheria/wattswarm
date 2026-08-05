@@ -178,15 +178,7 @@ pub fn run_worker(
     if logged_waiting {
         eprintln!("wattswarm worker detected node mode configuration; resuming queue loop");
     }
-    // Start network bridge with run-queue hook so remote dispatch and
-    // result collection work in CLI-only mode (not just UI).
-    let _ = crate::network_bridge::maybe_start_background_network_service_with_hook(
-        state_dir.to_path_buf(),
-        db_path.to_path_buf(),
-        Some(Box::new(|node, sd| {
-            crate::network_hooks::run_background_post_tick(node, sd);
-        })),
-    );
+    crate::node_runtime::start_node_runtime(state_dir.to_path_buf(), db_path.to_path_buf())?;
     current_org_queue(state_dir, db_path, pg_url)?.run_worker(opts, state_dir, db_path)
 }
 

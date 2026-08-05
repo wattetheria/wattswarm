@@ -1,7 +1,6 @@
 use anyhow::{Result, anyhow};
 use iroh::EndpointId;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 use std::{collections::HashMap, path::PathBuf, time::Duration};
 use wattswarm_network_substrate::{
     self as substrate, RawBackfillResponse, RawGossipMessage, SubstrateConfig, SubstrateNode,
@@ -18,6 +17,9 @@ pub use substrate::{
     RawContactMaterial, RawContactMaterialRequest, RawContactMaterialResponse,
     RawPeerRelationshipAction, RawSourceAgentCard, SwarmScope, TopicCatalog, TopicNamespace,
     TrafficGuardPeerHealth, sanitize_segment,
+};
+pub use wattswarm_network_transport_core::{
+    CheckpointAnnouncement, RuleAnnouncement, SummaryAnnouncement,
 };
 
 pub type BackfillRequest = substrate::RawBackfillRequest;
@@ -91,41 +93,6 @@ pub struct BackfillResponse {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub head_event_ids: Vec<String>,
     pub events: Vec<EventEnvelope>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RuleAnnouncement {
-    pub scope: SwarmScope,
-    pub rule_set: String,
-    pub rule_version: u64,
-    pub activation_epoch: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub authority_signer_node_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub authority_signature_hex: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CheckpointAnnouncement {
-    pub scope: SwarmScope,
-    pub checkpoint_id: String,
-    pub artifact_path: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub authority_signer_node_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub authority_signature_hex: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct SummaryAnnouncement {
-    pub summary_id: String,
-    pub source_node_id: String,
-    pub scope: SwarmScope,
-    pub summary_kind: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub artifact_path: Option<String>,
-    #[serde(default)]
-    pub payload: Value,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -875,6 +842,10 @@ mod tests {
             content_source_node_id: None,
         });
         let encoded = message.encode_json().unwrap();
+        assert_eq!(
+            String::from_utf8(encoded.clone()).unwrap(),
+            r#"{"type":"Event","payload":{"scope":"global","event":{"event_id":"evt-1","protocol_version":"1","event_kind":"CHECKPOINT_CREATED","task_id":"task-1","swarm_scope":"global","epoch":0,"author_node_id":"node-1","created_at":1,"payload":{"type":"CheckpointCreated","payload":{"checkpoint_id":"cp-1","up_to_seq":1}},"signature_hex":"sig"}}}"#
+        );
         let decoded = GossipMessage::decode_json(&encoded).unwrap();
         assert_eq!(decoded, message);
     }

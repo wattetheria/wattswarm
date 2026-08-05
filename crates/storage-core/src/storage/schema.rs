@@ -42,12 +42,19 @@ fn schema_has_required_tables(conn: &Connection) -> Result<bool> {
                AND name IN (
                    'discovered_peers_local',
                    'network_ban_windows',
-                   'peer_relationship_requests_local'
+                   'peer_relationship_requests_local',
+                   'cs_tenant_instance_local'
                )",
             params![],
             |row| row.get::<_, i64>(0),
         )?;
-        return Ok(count == 3);
+        return Ok(count == 4
+            && column_exists(
+                conn,
+                "cs_outbound_progress_local",
+                "delivery_policy_version",
+            )
+            && column_exists(conn, "cs_mailbox_gap_local", "page_id"));
     }
     let count = conn.query_row(
         "SELECT COUNT(*)
@@ -56,12 +63,19 @@ fn schema_has_required_tables(conn: &Connection) -> Result<bool> {
            AND table_name IN (
                'discovered_peers_local',
                'network_ban_windows',
-               'peer_relationship_requests_local'
+               'peer_relationship_requests_local',
+               'cs_tenant_instance_local'
            )",
         params![],
         |row| row.get::<_, i64>(0),
     )?;
-    Ok(count == 3)
+    Ok(count == 4
+        && column_exists(
+            conn,
+            "cs_outbound_progress_local",
+            "delivery_policy_version",
+        )
+        && column_exists(conn, "cs_mailbox_gap_local", "page_id"))
 }
 
 fn column_exists(conn: &Connection, table: &str, column: &str) -> bool {
@@ -130,6 +144,25 @@ const SQLITE_REQUIRED_PRIMARY_KEYS: &[(&str, &[&str])] = &[
     ("agent_payments_local", &["scope_id", "payment_id"]),
     ("agent_event_bus_local", &["scope_id", "event_id"]),
     ("agent_event_delivery_local", &["scope_id", "delivery_id"]),
+    (
+        "pending_network_commands_local",
+        &["scope_id", "command_id"],
+    ),
+    (
+        "cs_outbound_progress_local",
+        &["scope_id", "source_id", "outbound_partition"],
+    ),
+    ("cs_tenant_instance_local", &["scope_id"]),
+    (
+        "cs_mailbox_delivery_state_local",
+        &["scope_id", "delivery_id"],
+    ),
+    (
+        "cs_mailbox_pending_commit_local",
+        &["scope_id", "page_id", "delivery_class"],
+    ),
+    ("cs_mailbox_gap_local", &["scope_id", "gap_id"]),
+    ("network_backend_status_local", &["scope_id"]),
     (
         "remote_task_bridge_registry_local",
         &["task_id", "executor", "profile"],
@@ -395,6 +428,85 @@ fn ensure_boolean_column(
     Ok(())
 }
 
+fn migrate_pending_network_command_status_schema(conn: &Connection) -> Result<()> {
+    if conn.backend_kind() == pg::BackendKind::Sqlite {
+        let table_sql: String = conn.query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = $1",
+            params!["pending_network_commands_local"],
+            |row| row.get(0),
+        )?;
+        if table_sql.contains("'failed'") {
+            return Ok(());
+        }
+        conn.execute_batch(
+            "ALTER TABLE pending_network_commands_local
+                 RENAME TO pending_network_commands_local_legacy_status;
+             CREATE TABLE pending_network_commands_local (
+                 scope_id TEXT NOT NULL DEFAULT '',
+                 command_id TEXT NOT NULL,
+                 dedup_key TEXT,
+                 command_kind TEXT NOT NULL,
+                 payload_json TEXT NOT NULL,
+                 status TEXT NOT NULL DEFAULT 'queued',
+                 attempts BIGINT NOT NULL DEFAULT 0,
+                 next_retry_at TIMESTAMPTZ,
+                 last_error TEXT,
+                 lease_owner TEXT,
+                 lease_token TEXT,
+                 lease_expires_at TIMESTAMPTZ,
+                 created_at TIMESTAMPTZ NOT NULL,
+                 updated_at TIMESTAMPTZ NOT NULL,
+                 PRIMARY KEY(scope_id, command_id),
+                 CHECK(status IN ('queued', 'in_flight', 'awaiting_ack', 'failed'))
+             );
+             INSERT INTO pending_network_commands_local(
+                 scope_id, command_id, dedup_key, command_kind, payload_json, status,
+                 attempts, next_retry_at, last_error, lease_owner, lease_token,
+                 lease_expires_at, created_at, updated_at
+             )
+             SELECT scope_id, command_id, dedup_key, command_kind, payload_json, status,
+                    attempts, next_retry_at, last_error, lease_owner, lease_token,
+                    lease_expires_at, created_at, updated_at
+             FROM pending_network_commands_local_legacy_status;
+             DROP TABLE pending_network_commands_local_legacy_status;
+             CREATE UNIQUE INDEX idx_pending_network_commands_local_dedup
+                 ON pending_network_commands_local(scope_id, dedup_key)
+                 WHERE dedup_key IS NOT NULL;
+             CREATE INDEX idx_pending_network_commands_local_due
+                 ON pending_network_commands_local(
+                     scope_id, status, next_retry_at, lease_expires_at, created_at, command_id
+                 );",
+        )?;
+        return Ok(());
+    }
+
+    conn.execute_batch(
+        "ALTER TABLE pending_network_commands_local
+             DROP CONSTRAINT IF EXISTS pending_network_commands_local_status_check;
+         ALTER TABLE pending_network_commands_local
+             ADD CONSTRAINT pending_network_commands_local_status_check
+             CHECK(status IN ('queued', 'in_flight', 'awaiting_ack', 'failed'));",
+    )?;
+    Ok(())
+}
+
+fn migrate_client_server_transport_schema(conn: &Connection) -> Result<()> {
+    if !column_exists(
+        conn,
+        "cs_outbound_progress_local",
+        "delivery_policy_version",
+    ) {
+        conn.execute_batch(
+            "ALTER TABLE cs_outbound_progress_local
+             ADD COLUMN delivery_policy_version BIGINT NOT NULL DEFAULT 1",
+        )?;
+    }
+    if !column_exists(conn, "cs_mailbox_gap_local", "page_id") {
+        conn.execute_batch("ALTER TABLE cs_mailbox_gap_local ADD COLUMN page_id TEXT")?;
+    }
+    Ok(())
+}
+
 fn migrate_discovered_peers_local_scope_schema(conn: &Connection) -> Result<()> {
     if column_exists(conn, "discovered_peers_local", "scope_id") {
         return Ok(());
@@ -530,6 +642,35 @@ fn migrate_agent_event_bus_local_agent_envelope_schema(conn: &Connection) -> Res
             [],
         )?;
     }
+    Ok(())
+}
+
+fn migrate_agent_event_inbox_scheduler_schema(conn: &Connection) -> Result<()> {
+    for (column, definition) in [
+        ("attempts", "BIGINT NOT NULL DEFAULT 0"),
+        ("next_retry_at", "TIMESTAMPTZ"),
+        ("lease_owner", "TEXT"),
+        ("lease_token", "TEXT"),
+        ("lease_expires_at", "TIMESTAMPTZ"),
+        ("last_error", "TEXT"),
+    ] {
+        if !column_exists(conn, "agent_event_bus_local", column) {
+            conn.execute_batch(&format!(
+                "ALTER TABLE agent_event_bus_local ADD COLUMN {column} {definition};"
+            ))?;
+        }
+    }
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_agent_event_bus_local_due
+             ON agent_event_bus_local(
+                 scope_id,
+                 status,
+                 next_retry_at,
+                 lease_expires_at,
+                 created_at,
+                 event_id
+             );",
+    )?;
     Ok(())
 }
 
@@ -1363,6 +1504,12 @@ impl PgStore {
                 status TEXT NOT NULL,
                 dedupe_key TEXT,
                 correlation_id TEXT,
+                attempts BIGINT NOT NULL DEFAULT 0,
+                next_retry_at TIMESTAMPTZ,
+                lease_owner TEXT,
+                lease_token TEXT,
+                lease_expires_at TIMESTAMPTZ,
+                last_error TEXT,
                 created_at TIMESTAMPTZ NOT NULL,
                 updated_at TIMESTAMPTZ NOT NULL,
                 PRIMARY KEY(scope_id, event_id)
@@ -1392,6 +1539,132 @@ impl PgStore {
 
             CREATE INDEX IF NOT EXISTS idx_agent_event_delivery_local_event_attempt
                 ON agent_event_delivery_local(scope_id, event_id, attempt_no DESC);
+
+            CREATE TABLE IF NOT EXISTS pending_network_commands_local (
+                scope_id TEXT NOT NULL DEFAULT '',
+                command_id TEXT NOT NULL,
+                dedup_key TEXT,
+                command_kind TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'queued',
+                attempts BIGINT NOT NULL DEFAULT 0,
+                next_retry_at TIMESTAMPTZ,
+                last_error TEXT,
+                lease_owner TEXT,
+                lease_token TEXT,
+                lease_expires_at TIMESTAMPTZ,
+                created_at TIMESTAMPTZ NOT NULL,
+                updated_at TIMESTAMPTZ NOT NULL,
+                PRIMARY KEY(scope_id, command_id),
+                CHECK(status IN ('queued', 'in_flight', 'awaiting_ack', 'failed'))
+            );
+
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_pending_network_commands_local_dedup
+                ON pending_network_commands_local(scope_id, dedup_key)
+                WHERE dedup_key IS NOT NULL;
+
+            CREATE INDEX IF NOT EXISTS idx_pending_network_commands_local_due
+                ON pending_network_commands_local(
+                    scope_id,
+                    status,
+                    next_retry_at,
+                    lease_expires_at,
+                    created_at,
+                    command_id
+                );
+
+            CREATE TABLE IF NOT EXISTS cs_outbound_progress_local (
+                scope_id TEXT NOT NULL DEFAULT '',
+                source_id TEXT NOT NULL,
+                outbound_partition TEXT NOT NULL,
+                scanned_sequence BIGINT NOT NULL,
+                cutover_sequence BIGINT NOT NULL,
+                delivery_policy_version BIGINT NOT NULL DEFAULT 1,
+                retry_attempts BIGINT NOT NULL DEFAULT 0,
+                next_retry_at TIMESTAMPTZ,
+                last_error TEXT,
+                updated_at TIMESTAMPTZ NOT NULL,
+                PRIMARY KEY(scope_id, source_id, outbound_partition),
+                CHECK(outbound_partition IN (
+                    'global_interactive',
+                    'global_bulk',
+                    'non_global_interactive',
+                    'non_global_bulk'
+                ))
+            );
+
+            CREATE TABLE IF NOT EXISTS cs_tenant_instance_local (
+                scope_id TEXT NOT NULL DEFAULT '',
+                instance_id TEXT NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL,
+                PRIMARY KEY(scope_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS cs_mailbox_delivery_state_local (
+                scope_id TEXT NOT NULL DEFAULT '',
+                delivery_id TEXT NOT NULL,
+                record_id TEXT NOT NULL,
+                delivery_class TEXT NOT NULL,
+                delivery_policy_version BIGINT NOT NULL,
+                result_status TEXT NOT NULL,
+                page_id TEXT,
+                pending_commit_token TEXT,
+                last_error TEXT,
+                applied_at TIMESTAMPTZ,
+                committed_at TIMESTAMPTZ,
+                updated_at TIMESTAMPTZ NOT NULL,
+                PRIMARY KEY(scope_id, delivery_id),
+                CHECK(delivery_class IN ('interactive', 'bulk')),
+                CHECK(result_status IN ('applied', 'deduped', 'commit_pending', 'committed', 'failed'))
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_cs_mailbox_delivery_state_local_pending
+                ON cs_mailbox_delivery_state_local(scope_id, result_status, updated_at, delivery_id);
+
+            CREATE TABLE IF NOT EXISTS cs_mailbox_pending_commit_local (
+                scope_id TEXT NOT NULL DEFAULT '',
+                page_id TEXT NOT NULL,
+                delivery_class TEXT NOT NULL,
+                commit_token TEXT NOT NULL,
+                attempts BIGINT NOT NULL DEFAULT 0,
+                last_error TEXT,
+                created_at TIMESTAMPTZ NOT NULL,
+                updated_at TIMESTAMPTZ NOT NULL,
+                PRIMARY KEY(scope_id, page_id, delivery_class),
+                CHECK(delivery_class IN ('interactive', 'bulk'))
+            );
+
+            CREATE TABLE IF NOT EXISTS cs_mailbox_gap_local (
+                scope_id TEXT NOT NULL DEFAULT '',
+                gap_id TEXT NOT NULL,
+                delivery_class TEXT NOT NULL,
+                delivery_policy_version BIGINT NOT NULL,
+                route_json TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                first_affected_at TIMESTAMPTZ NOT NULL,
+                last_affected_at TIMESTAMPTZ NOT NULL,
+                approximate_count BIGINT NOT NULL,
+                page_id TEXT,
+                acknowledged_at TIMESTAMPTZ,
+                updated_at TIMESTAMPTZ NOT NULL,
+                PRIMARY KEY(scope_id, gap_id),
+                CHECK(delivery_class IN ('interactive', 'bulk'))
+            );
+
+            CREATE TABLE IF NOT EXISTS network_backend_status_local (
+                scope_id TEXT NOT NULL DEFAULT '',
+                backend TEXT,
+                status TEXT NOT NULL,
+                reason TEXT,
+                published BIGINT NOT NULL DEFAULT 0,
+                received BIGINT NOT NULL DEFAULT 0,
+                retries BIGINT NOT NULL DEFAULT 0,
+                backend_details_json TEXT NOT NULL DEFAULT '{}',
+                updated_at TIMESTAMPTZ NOT NULL,
+                PRIMARY KEY(scope_id),
+                CHECK(backend IS NULL OR backend IN ('p2p', 'client_server')),
+                CHECK(status IN ('starting', 'ready', 'degraded', 'failed', 'stopped'))
+            );
 
             CREATE TABLE IF NOT EXISTS remote_task_bridge_registry_local (
                 task_id TEXT NOT NULL,
@@ -2426,6 +2699,9 @@ impl PgStore {
             migrate_discovered_peers_local_trim_listen_addr_schema(&conn)?;
             migrate_peer_metadata_local_contact_material_schema(&conn)?;
             migrate_agent_event_bus_local_agent_envelope_schema(&conn)?;
+            migrate_agent_event_inbox_scheduler_schema(&conn)?;
+            migrate_pending_network_command_status_schema(&conn)?;
+            migrate_client_server_transport_schema(&conn)?;
             migrate_network_peer_sync_state_identity_schema(&conn)?;
             migrate_network_peer_sync_state_last_observed_schema(&conn)?;
             migrate_feed_subscription_network_id_schema(&conn)?;

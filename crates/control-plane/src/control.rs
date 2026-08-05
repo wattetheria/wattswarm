@@ -37,6 +37,7 @@ pub use control_state::*;
 mod artifacts;
 mod task_flow;
 
+pub(crate) use artifacts::materialize_content_artifact_from_reference;
 pub use artifacts::{
     emit_topic_message_with_content, emit_topic_message_with_content_and_agent_envelope,
     fetch_checkpoint_artifact_json, fetch_evidence_artifact, fetch_json_content_artifact_via_iroh,

@@ -26,9 +26,36 @@ pub enum Role {
     Finalizer,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct Membership {
     pub members: HashMap<String, HashSet<Role>>,
+}
+
+impl Serialize for Membership {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct;
+
+        let members = self
+            .members
+            .iter()
+            .map(|(node_id, roles)| {
+                let mut roles = roles.iter().copied().collect::<Vec<_>>();
+                roles.sort_by_key(|role| match role {
+                    Role::Proposer => 0,
+                    Role::Verifier => 1,
+                    Role::Committer => 2,
+                    Role::Finalizer => 3,
+                });
+                (node_id, roles)
+            })
+            .collect::<std::collections::BTreeMap<_, _>>();
+        let mut state = serializer.serialize_struct("Membership", 1)?;
+        state.serialize_field("members", &members)?;
+        state.end()
+    }
 }
 
 impl Membership {

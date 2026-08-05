@@ -32,6 +32,7 @@ pub mod types {
 
 pub mod control;
 pub mod network_bridge;
+pub mod network_service;
 pub mod round_policy;
 pub mod task_template;
 pub mod topic_consensus;

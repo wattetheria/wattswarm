@@ -8,6 +8,7 @@ const DEFAULT_AGENT_EVENT_CALLBACK_TIMEOUT_MS: u64 = 60_000;
 const DEFAULT_AGENT_EVENT_CALLBACK_MAX_ATTEMPTS: usize = 3;
 const DEFAULT_AGENT_EVENT_CALLBACK_RETRY_BACKOFF_MS: u64 = 1_000;
 const MAX_AGENT_EVENT_CALLBACK_ATTEMPTS: usize = 8;
+#[cfg(test)]
 const MAX_AGENT_EVENT_CALLBACK_DIAGNOSTIC_BODY_BYTES: usize = 4096;
 
 fn agent_event_status_label(status: wattswarm_protocol::types::AgentEventStatus) -> String {
@@ -54,16 +55,19 @@ fn retryable_agent_event_callback_response(status_code: i64) -> bool {
     status_code == 408 || status_code == 429 || status_code >= 500
 }
 
+#[cfg(test)]
 fn diagnostic_response_body(body: &str) -> String {
     body.chars()
         .take(MAX_AGENT_EVENT_CALLBACK_DIAGNOSTIC_BODY_BYTES)
         .collect()
 }
 
+#[cfg(test)]
 fn diagnostic_json<T: serde::Serialize>(value: &T) -> Value {
     serde_json::to_value(value).unwrap_or(Value::Null)
 }
 
+#[cfg(test)]
 fn diagnostic_response_value(body: &str) -> Value {
     serde_json::from_str::<Value>(body).unwrap_or(Value::Null)
 }
@@ -940,11 +944,10 @@ pub(super) fn build_agent_event_with_agent_envelope(
     }
 }
 
-pub(super) fn deliver_agent_event_to_local_executor(
+pub(super) fn enqueue_agent_event_for_local_executor(
     state_dir: &Path,
-    db_path: Option<&Path>,
     event: &wattswarm_protocol::types::AgentEvent,
-) -> Result<()> {
+) -> Result<bool> {
     if let Some(dedupe_key) = event.dedupe_key.as_deref()
         && crate::control::find_agent_event_record_by_dedupe_key(state_dir, dedupe_key)?.is_some()
     {
@@ -965,7 +968,7 @@ pub(super) fn deliver_agent_event_to_local_executor(
                 "dedupe_key": dedupe_key,
             })),
         );
-        return Ok(());
+        return Ok(false);
     }
 
     let now = observed_at_ms();
@@ -999,6 +1002,27 @@ pub(super) fn deliver_agent_event_to_local_executor(
         })),
     );
 
+    Ok(true)
+}
+
+#[cfg(test)]
+pub(super) fn deliver_agent_event_to_local_executor(
+    state_dir: &Path,
+    db_path: Option<&Path>,
+    event: &wattswarm_protocol::types::AgentEvent,
+) -> Result<()> {
+    if !enqueue_agent_event_for_local_executor(state_dir, event)? {
+        return Ok(());
+    }
+    deliver_persisted_agent_event_to_local_executor(state_dir, db_path, event)
+}
+
+#[cfg(test)]
+pub(super) fn deliver_persisted_agent_event_to_local_executor(
+    state_dir: &Path,
+    db_path: Option<&Path>,
+    event: &wattswarm_protocol::types::AgentEvent,
+) -> Result<()> {
     let registry = crate::control::load_executor_registry_state(state_dir)?;
     let Some(entry) = registry
         .entries
@@ -1391,4 +1415,234 @@ pub(super) fn deliver_agent_event_to_local_executor(
     }
 
     Ok(())
+}
+
+pub(super) enum AgentEventAttemptOutcome {
+    Finished {
+        status: wattswarm_protocol::types::AgentEventStatus,
+        error: Option<String>,
+    },
+    Retry {
+        retry_at: u64,
+        error: String,
+    },
+}
+
+pub(super) fn attempt_persisted_agent_event_to_local_executor(
+    state_dir: &Path,
+    db_path: Option<&Path>,
+    event: &wattswarm_protocol::types::AgentEvent,
+    attempt_no: u32,
+) -> Result<AgentEventAttemptOutcome> {
+    let registry = crate::control::load_executor_registry_state(state_dir)?;
+    let Some(entry) = registry
+        .entries
+        .into_iter()
+        .find(|candidate| candidate.name == CORE_AGENT_EXECUTOR_NAME)
+    else {
+        let error = "core-agent executor is not registered".to_owned();
+        append_worker_delivery_record(
+            state_dir,
+            event,
+            attempt_no,
+            "",
+            "failed",
+            None,
+            None,
+            Some(&error),
+            None,
+        )?;
+        return Ok(AgentEventAttemptOutcome::Finished {
+            status: wattswarm_protocol::types::AgentEventStatus::Failed,
+            error: Some(error),
+        });
+    };
+
+    let callback_base_url = entry
+        .agent_event_callback_base_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| entry.base_url.trim_end_matches('/'));
+    let endpoint_url = format!("{}/agent-events", callback_base_url.trim_end_matches('/'));
+    let callback_timeout = agent_event_callback_timeout();
+    let callback_request = wattswarm_protocol::types::AgentEventCallbackRequest {
+        event: event.clone(),
+    };
+    let response = reqwest::blocking::Client::builder()
+        .timeout(callback_timeout)
+        .build()
+        .context("build agent event callback client")?
+        .post(&endpoint_url)
+        .json(&callback_request)
+        .send();
+
+    let max_attempts = agent_event_callback_max_attempts() as u32;
+    let started_at = observed_at_ms();
+    let response = match response {
+        Ok(response) => response,
+        Err(error) => {
+            let error = error.to_string();
+            if attempt_no < max_attempts {
+                let retry_at =
+                    next_retry_at_ms(agent_event_callback_retry_delay(attempt_no as usize));
+                append_worker_delivery_record(
+                    state_dir,
+                    event,
+                    attempt_no,
+                    &endpoint_url,
+                    "retrying",
+                    None,
+                    None,
+                    Some(&error),
+                    Some(retry_at),
+                )?;
+                return Ok(AgentEventAttemptOutcome::Retry { retry_at, error });
+            }
+            append_worker_delivery_record(
+                state_dir,
+                event,
+                attempt_no,
+                &endpoint_url,
+                "failed",
+                None,
+                None,
+                Some(&error),
+                None,
+            )?;
+            return Ok(AgentEventAttemptOutcome::Finished {
+                status: wattswarm_protocol::types::AgentEventStatus::Failed,
+                error: Some(error),
+            });
+        }
+    };
+
+    let response_code = response.status().as_u16() as i64;
+    let body = response.text().unwrap_or_default();
+    if retryable_agent_event_callback_response(response_code) && attempt_no < max_attempts {
+        let error = format!("retryable agent event callback response {response_code}");
+        let retry_at = next_retry_at_ms(agent_event_callback_retry_delay(attempt_no as usize));
+        append_worker_delivery_record(
+            state_dir,
+            event,
+            attempt_no,
+            &endpoint_url,
+            "retrying",
+            Some(response_code),
+            Some(&body),
+            Some(&error),
+            Some(retry_at),
+        )?;
+        return Ok(AgentEventAttemptOutcome::Retry { retry_at, error });
+    }
+
+    let parsed =
+        serde_json::from_str::<wattswarm_protocol::types::AgentEventCallbackResponse>(&body).ok();
+    let callback_ok = parsed.as_ref().is_some_and(|ack| ack.ok);
+    let mut status = if (200..300).contains(&response_code) {
+        if callback_ok {
+            wattswarm_protocol::types::AgentEventStatus::Acked
+        } else if parsed.is_some() {
+            wattswarm_protocol::types::AgentEventStatus::Failed
+        } else {
+            wattswarm_protocol::types::AgentEventStatus::Delivered
+        }
+    } else {
+        wattswarm_protocol::types::AgentEventStatus::Failed
+    };
+    let mut error = matches!(status, wattswarm_protocol::types::AgentEventStatus::Failed)
+        .then(|| format!("agent event callback returned {response_code}"));
+    append_worker_delivery_record(
+        state_dir,
+        event,
+        attempt_no,
+        &endpoint_url,
+        &agent_event_status_label(status.clone()),
+        Some(response_code),
+        Some(&body),
+        error.as_deref(),
+        None,
+    )?;
+
+    if let Some(decision) = parsed.and_then(|ack| ack.decision) {
+        match route_agent_decision(state_dir, db_path, event, &decision, &entry) {
+            Ok(commit_result) => {
+                status = wattswarm_protocol::types::AgentEventStatus::Completed;
+                error = None;
+                if let Some((commit_url, commit_code, commit_body)) = commit_result {
+                    append_worker_delivery_record(
+                        state_dir,
+                        event,
+                        attempt_no,
+                        &commit_url,
+                        "completed",
+                        Some(commit_code),
+                        Some(&commit_body),
+                        None,
+                        None,
+                    )?;
+                }
+            }
+            Err(route_error) => {
+                status = wattswarm_protocol::types::AgentEventStatus::Failed;
+                error = Some(route_error.to_string());
+            }
+        }
+    }
+    let diagnostic_status = if matches!(status, wattswarm_protocol::types::AgentEventStatus::Failed)
+    {
+        "failed"
+    } else {
+        "delivered"
+    };
+    diagnostics::record_diagnostic(
+        Some(state_dir),
+        diagnostics::DiagnosticEvent::new(
+            if error.is_none() { "info" } else { "warn" },
+            "agent_event",
+            "delivery.worker_attempt",
+            diagnostic_status,
+            format!("agent event worker callback returned {response_code}"),
+        )
+        .event_id(event.event_id.clone())
+        .object("agent_event", event.correlation_id.clone())
+        .source_node_id(event.source_node_id.clone())
+        .details(json!({
+            "attempt_no": attempt_no,
+            "max_attempts": max_attempts,
+            "endpoint_url": endpoint_url,
+            "response_code": response_code,
+            "elapsed_ms": observed_at_ms().saturating_sub(started_at),
+        })),
+    );
+    Ok(AgentEventAttemptOutcome::Finished { status, error })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn append_worker_delivery_record(
+    state_dir: &Path,
+    event: &wattswarm_protocol::types::AgentEvent,
+    attempt_no: u32,
+    endpoint_url: &str,
+    status: &str,
+    response_code: Option<i64>,
+    response_body: Option<&str>,
+    error: Option<&str>,
+    next_retry_at: Option<u64>,
+) -> Result<()> {
+    crate::control::append_agent_event_delivery_record_state(
+        state_dir,
+        &crate::storage::LocalAgentEventDeliveryRow {
+            delivery_id: Uuid::new_v4().to_string(),
+            event_id: event.event_id.clone(),
+            attempt_no: i64::from(attempt_no),
+            endpoint_url: endpoint_url.to_owned(),
+            delivery_status: status.to_owned(),
+            response_code,
+            response_body: response_body.map(ToOwned::to_owned),
+            error_text: error.map(ToOwned::to_owned),
+            next_retry_at,
+            created_at: observed_at_ms(),
+        },
+    )
 }

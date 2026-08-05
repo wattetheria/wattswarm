@@ -847,24 +847,23 @@ fn queued_peer_relationship_command_remains_pending_until_runtime_ack() {
 
     assert_eq!(processed, 1);
     assert_eq!(service.pending_relationship_requests.len(), 1);
-    let pending = std::fs::read_to_string(local_dir.join("pending_network_commands.jsonl"))
+    let store = crate::storage::local_control_store(&local_dir).expect("local control store");
+    let scope_id = crate::storage::local_control_scope_id(&local_dir);
+    let pending = store
+        .list_pending_network_commands(&scope_id)
         .expect("read pending commands");
-    assert_eq!(
-        pending
-            .lines()
-            .filter(|line| !line.trim().is_empty())
-            .count(),
-        1
-    );
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].status, "awaiting_ack");
     for pending in service.pending_relationship_requests.values_mut() {
         pending.started_at_ms = (observed_at_ms() as i64).saturating_sub(40_000);
     }
-    let pending_path = local_dir.join("pending_network_commands.jsonl");
-    let mut pending_command: serde_json::Value =
-        serde_json::from_str(pending.lines().next().expect("pending command line"))
-            .expect("pending command json");
-    pending_command["next_retry_at"] = json!(0);
-    std::fs::write(&pending_path, format!("{pending_command}\n"))
+    store
+        .schedule_pending_network_command_by_dedup_key(
+            &scope_id,
+            pending[0].dedup_key.as_deref().expect("dedup key"),
+            0,
+            observed_at_ms(),
+        )
         .expect("force pending command due");
 
     let processed = process_pending_network_commands(&mut node, &mut service, &local_dir)
@@ -872,14 +871,13 @@ fn queued_peer_relationship_command_remains_pending_until_runtime_ack() {
 
     assert_eq!(processed, 0);
     assert!(service.pending_relationship_requests.is_empty());
-    let pending = std::fs::read_to_string(&pending_path).expect("read pending commands");
-    let pending_command: serde_json::Value =
-        serde_json::from_str(pending.lines().next().expect("pending command line"))
-            .expect("pending command json");
-    assert_eq!(pending_command["attempts"], json!(1));
+    let pending = store
+        .list_pending_network_commands(&scope_id)
+        .expect("read pending commands");
+    assert_eq!(pending[0].attempts, 2);
     assert_eq!(
-        pending_command["last_error"],
-        json!("peer relationship request timed out without runtime result")
+        pending[0].last_error.as_deref(),
+        Some("peer relationship request timed out without runtime result")
     );
 
     wattswarm_network_transport_iroh::shutdown_local_iroh_data_plane(&local_dir);
@@ -938,15 +936,16 @@ fn queued_peer_relationship_command_retries_synchronous_dispatch_failure() {
         .expect("retain failed pending command");
 
     assert_eq!(processed, 0);
-    let pending = std::fs::read_to_string(local_dir.join("pending_network_commands.jsonl"))
+    let store = crate::storage::local_control_store(&local_dir).expect("local control store");
+    let scope_id = crate::storage::local_control_scope_id(&local_dir);
+    let pending = store
+        .list_pending_network_commands(&scope_id)
         .expect("read pending commands");
-    let pending_command: serde_json::Value =
-        serde_json::from_str(pending.lines().next().expect("pending command line"))
-            .expect("pending command json");
-    assert_eq!(pending_command["attempts"], json!(1));
+    assert_eq!(pending[0].attempts, 1);
     assert!(
-        pending_command["last_error"]
-            .as_str()
+        pending[0]
+            .last_error
+            .as_deref()
             .is_some_and(|error| !error.is_empty())
     );
 
