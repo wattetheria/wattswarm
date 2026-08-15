@@ -882,7 +882,7 @@ pub fn local_node_id(state_dir: &Path) -> Result<String> {
     Ok(load_or_create_identity(&state_dir.join("node_seed.hex"))?.node_id())
 }
 
-pub(crate) fn load_local_identity(state_dir: &Path) -> Result<NodeIdentity> {
+pub fn load_local_identity(state_dir: &Path) -> Result<NodeIdentity> {
     load_or_create_identity(&state_dir.join("node_seed.hex"))
 }
 

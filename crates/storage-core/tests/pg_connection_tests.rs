@@ -1,7 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Mutex, OnceLock};
 
-use wattswarm_crypto::NodeIdentity;
+use wattswarm_crypto::{NodeIdentity, sign_network_membership_grant};
+use wattswarm_protocol::types::{NETWORK_MEMBERSHIP_GRANT_VERSION, UnsignedNetworkMembershipGrant};
 use wattswarm_storage_core::storage::pg::ErrorCode;
 use wattswarm_storage_core::storage::pg::{
     Connection, Error, OptionalExtension, ParamValue, types::ValueRef,
@@ -239,6 +240,38 @@ fn pg_store_recreates_required_tables_removed_after_schema_cache_hit() {
             )
             .expect("query repaired required tables");
         assert_eq!(count, 2);
+    });
+}
+
+#[test]
+fn postgres_network_membership_grant_roundtrips_with_optional_expiry() {
+    with_test_schema(|| {
+        let store = PgStore::open_in_memory().expect("open postgres store");
+        let genesis = NodeIdentity::from_seed([103_u8; 32]);
+        let member = NodeIdentity::from_seed([104_u8; 32]);
+        let grant = sign_network_membership_grant(
+            &UnsignedNetworkMembershipGrant {
+                version: NETWORK_MEMBERSHIP_GRANT_VERSION,
+                network_id: "network:postgres-grant".to_owned(),
+                principal_id: member.node_id(),
+                public_key_hex: member.node_id(),
+                issuer_genesis_id: genesis.node_id(),
+                issued_at: 100,
+                expires_at: Some(200),
+            },
+            &genesis,
+        )
+        .expect("sign grant");
+
+        store
+            .put_network_membership_grant(&grant, 150)
+            .expect("store grant");
+        assert_eq!(
+            store
+                .load_network_membership_grant(&grant.network_id, &grant.principal_id)
+                .expect("load grant"),
+            Some(grant)
+        );
     });
 }
 
@@ -1612,6 +1645,19 @@ fn postgres_migrates_legacy_client_server_transport_columns() {
             .expect("load migrated progress")
             .expect("legacy progress retained");
         assert_eq!(progress.delivery_policy_version, 1);
+        let conn = open_test_connection();
+        let cutover_column_count = conn
+            .query_row(
+                "SELECT COUNT(*)
+                 FROM information_schema.columns
+                 WHERE table_schema = current_schema()
+                   AND table_name = 'cs_outbound_progress_local'
+                   AND column_name = 'cutover_sequence'",
+                wattswarm_storage_core::params![],
+                |row| row.get::<usize, i64>(0),
+            )
+            .expect("query migrated PostgreSQL columns");
+        assert_eq!(cutover_column_count, 0);
         store
             .save_cs_mailbox_gap(
                 "scope",
@@ -1650,18 +1696,18 @@ fn postgres_client_server_progress_and_delivery_state_are_durable() {
             "non_global_bulk",
         ];
         store
-            .initialize_cs_outbound_progress("scope", "events", &partitions, 40, 1, 40, 100)
+            .initialize_cs_outbound_progress("scope", "events", &partitions, 1, 0, 100)
             .expect("initialize progress");
         store
-            .initialize_cs_outbound_progress("scope", "events", &partitions, 99, 1, 44, 101)
+            .initialize_cs_outbound_progress("scope", "events", &partitions, 1, 4, 101)
             .expect("idempotent progress initialization");
         assert_eq!(
             store
                 .load_cs_outbound_progress("scope", "events", "global_bulk")
                 .expect("load progress")
                 .expect("progress exists")
-                .cutover_sequence,
-            40
+                .scanned_sequence,
+            0
         );
         assert_eq!(
             store
@@ -1677,7 +1723,7 @@ fn postgres_client_server_progress_and_delivery_state_are_durable() {
                     "scope",
                     "events",
                     "global_bulk",
-                    40,
+                    0,
                     200,
                     "backpressure",
                     110,
@@ -1686,7 +1732,7 @@ fn postgres_client_server_progress_and_delivery_state_are_durable() {
         );
         assert!(
             store
-                .advance_cs_outbound_progress("scope", "events", "global_bulk", 40, 44, 120)
+                .advance_cs_outbound_progress("scope", "events", "global_bulk", 0, 4, 120)
                 .expect("advance accepted partition")
         );
         assert_eq!(
@@ -1695,11 +1741,11 @@ fn postgres_client_server_progress_and_delivery_state_are_durable() {
                 .expect("load independent partition")
                 .expect("independent partition exists")
                 .scanned_sequence,
-            40
+            0
         );
         assert!(
             store
-                .initialize_cs_outbound_progress("scope", "events", &partitions, 40, 2, 44, 121)
+                .initialize_cs_outbound_progress("scope", "events", &partitions, 2, 4, 121)
                 .is_err(),
             "policy upgrade must wait until every partition reaches the source head"
         );
@@ -1710,12 +1756,12 @@ fn postgres_client_server_progress_and_delivery_state_are_durable() {
         ] {
             assert!(
                 store
-                    .advance_cs_outbound_progress("scope", "events", partition, 40, 44, 122)
+                    .advance_cs_outbound_progress("scope", "events", partition, 0, 4, 122)
                     .expect("drain partition")
             );
         }
         store
-            .initialize_cs_outbound_progress("scope", "events", &partitions, 40, 2, 44, 123)
+            .initialize_cs_outbound_progress("scope", "events", &partitions, 2, 4, 123)
             .expect("upgrade drained policy");
         assert_eq!(
             store

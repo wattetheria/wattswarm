@@ -577,6 +577,78 @@ fn value_array_has_strings(value: &Value, field: &str) -> bool {
         })
 }
 
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct PersistedNetworkTransportConfig {
+    #[serde(default)]
+    pub network_backend: Option<String>,
+    #[serde(default)]
+    pub client_server_url: Option<String>,
+    #[serde(default)]
+    pub network_registration_url: Option<String>,
+    #[serde(default)]
+    pub cs_auto_register: Option<bool>,
+}
+
+pub fn load_persisted_network_transport_config(
+    state_dir: &Path,
+) -> Result<PersistedNetworkTransportConfig> {
+    let path = state_dir.join("startup_config.json");
+    if !path.exists() {
+        return Ok(PersistedNetworkTransportConfig::default());
+    }
+    let mut config: PersistedNetworkTransportConfig = serde_json::from_slice(&fs::read(&path)?)
+        .with_context(|| format!("parse startup config at {}", path.display()))?;
+    config.network_backend = config
+        .network_backend
+        .take()
+        .and_then(|raw| normalize_network_backend(&raw));
+    config.client_server_url = config
+        .client_server_url
+        .take()
+        .and_then(|raw| normalize_optional_url(&raw));
+    config.network_registration_url = config
+        .network_registration_url
+        .take()
+        .and_then(|raw| normalize_optional_url(&raw));
+    Ok(config)
+}
+
+pub fn normalize_network_backend(value: &str) -> Option<String> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "p2p" => Some("p2p".to_owned()),
+        "client_server" | "client-server" => Some("client_server".to_owned()),
+        _ => None,
+    }
+}
+
+pub fn normalize_optional_url(value: &str) -> Option<String> {
+    let normalized = value.trim().trim_end_matches('/');
+    (!normalized.is_empty()).then(|| normalized.to_owned())
+}
+
+fn replace_manifest_scalar(value: &mut Value, field: &str, replacement: Option<String>) -> bool {
+    let Some(normalized) = replacement else {
+        return false;
+    };
+    let replacement = Value::String(normalized);
+    if value.get(field) == Some(&replacement) {
+        return false;
+    }
+    value[field] = replacement;
+    true
+}
+
+fn replace_manifest_bool(value: &mut Value, field: &str, replacement: Option<bool>) -> bool {
+    let Some(replacement) = replacement.map(Value::Bool) else {
+        return false;
+    };
+    if value.get(field) == Some(&replacement) {
+        return false;
+    }
+    value[field] = replacement;
+    true
+}
+
 fn persist_join_manifest_startup_config(
     state_dir: &Path,
     manifest: &NetworkJoinManifest,
@@ -587,6 +659,10 @@ fn persist_join_manifest_startup_config(
     if manifest.bootstrap_contacts.is_empty()
         && manifest.gateway_urls.is_empty()
         && manifest.relay_urls.is_empty()
+        && manifest.network_backend.is_none()
+        && manifest.client_server_url.is_none()
+        && manifest.cs_auto_register.is_none()
+        && manifest.registration_urls.is_empty()
     {
         return Ok(());
     }
@@ -615,19 +691,35 @@ fn persist_join_manifest_startup_config(
     if !manifest.relay_urls.is_empty() {
         changed |= replace_manifest_values(&mut value, "relay_urls", &manifest.relay_urls, true);
     }
+    let network_backend = manifest
+        .network_backend
+        .as_deref()
+        .and_then(normalize_network_backend);
+    changed |= replace_manifest_scalar(&mut value, "network_backend", network_backend);
+    let client_server_url = manifest
+        .client_server_url
+        .as_deref()
+        .and_then(normalize_optional_url);
+    changed |= replace_manifest_scalar(&mut value, "client_server_url", client_server_url);
+    changed |= replace_manifest_bool(&mut value, "cs_auto_register", manifest.cs_auto_register);
+    let registration_url = manifest
+        .registration_urls
+        .first()
+        .and_then(|value| normalize_optional_url(value));
+    changed |= replace_manifest_scalar(&mut value, "network_registration_url", registration_url);
     if changed {
         fs::write(&path, serde_json::to_vec_pretty(&value)?)?;
     }
     Ok(())
 }
 
-/// Refresh locally persisted relay URLs and bootstrap contacts from the network join manifest.
+/// Refresh locally persisted network transport coordinates from the network join manifest.
 ///
 /// Runs once per process startup so an already-joined node picks up the
-/// network's current transport coordinates on restart. Non-empty relay lists
-/// replace the local relay set, while bootstrap contacts update matching peers
-/// without removing local-only contacts. Fetch failures leave local values
-/// untouched and must not block node startup.
+/// network's current relay, bootstrap, and client-server coordinates on restart.
+/// Non-empty relay lists replace the local relay set, while bootstrap contacts
+/// update matching peers without removing local-only contacts. Fetch failures
+/// leave local values untouched and must not block node startup.
 pub fn refresh_startup_config_relay_urls_from_join_manifest(state_dir: &Path) -> Result<bool> {
     let mode = configured_node_mode(state_dir)?;
     if !matches!(mode, Some(NodeMode::Network) | Some(NodeMode::Lan)) {
@@ -641,13 +733,23 @@ pub fn refresh_startup_config_relay_urls_from_join_manifest(state_dir: &Path) ->
     for endpoint in endpoints {
         match retry_runtime_probe(|| fetch_network_join_manifest(&endpoint)) {
             Ok(manifest) => {
-                if manifest.relay_urls.is_empty() && manifest.bootstrap_contacts.is_empty() {
+                if manifest.relay_urls.is_empty()
+                    && manifest.bootstrap_contacts.is_empty()
+                    && manifest.network_backend.is_none()
+                    && manifest.client_server_url.is_none()
+                    && manifest.cs_auto_register.is_none()
+                    && manifest.registration_urls.is_empty()
+                {
                     return Ok(false);
                 }
                 return persist_startup_config_relay_urls(
                     state_dir,
                     &manifest.relay_urls,
                     &manifest.bootstrap_contacts,
+                    manifest.network_backend.as_deref(),
+                    manifest.client_server_url.as_deref(),
+                    manifest.registration_urls.first().map(String::as_str),
+                    manifest.cs_auto_register,
                 );
             }
             Err(err) => {
@@ -662,6 +764,10 @@ fn persist_startup_config_relay_urls(
     state_dir: &Path,
     relay_urls: &[String],
     bootstrap_contacts: &[String],
+    network_backend: Option<&str>,
+    client_server_url: Option<&str>,
+    network_registration_url: Option<&str>,
+    cs_auto_register: Option<bool>,
 ) -> Result<bool> {
     let mut seen = BTreeSet::new();
     let sanitized: Vec<String> = relay_urls
@@ -704,6 +810,17 @@ fn persist_startup_config_relay_urls(
             .collect();
         changed |= replace_manifest_bootstrap_contacts(&mut value, &merged_contacts);
     }
+    let network_backend = network_backend.and_then(normalize_network_backend);
+    changed |= replace_manifest_scalar(&mut value, "network_backend", network_backend);
+    let client_server_url = client_server_url.and_then(normalize_optional_url);
+    changed |= replace_manifest_scalar(&mut value, "client_server_url", client_server_url);
+    let network_registration_url = network_registration_url.and_then(normalize_optional_url);
+    changed |= replace_manifest_scalar(
+        &mut value,
+        "network_registration_url",
+        network_registration_url,
+    );
+    changed |= replace_manifest_bool(&mut value, "cs_auto_register", cs_auto_register);
     if !changed {
         return Ok(false);
     }

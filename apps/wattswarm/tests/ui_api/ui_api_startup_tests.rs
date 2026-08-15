@@ -7,6 +7,7 @@ fn ui_startup_config_roundtrips_network_settings_without_agent_binding() {
     let schema = reset_test_schema("test");
     let _schema_guard = EnvVarGuard::set("WATTSWARM_PG_SCHEMA", &schema);
     let _p2p_guard = EnvVarGuard::set("WATTSWARM_P2P_ENABLED", "0");
+    let _network_service_guard = EnvVarGuard::set("WATTSWARM_NETWORK_SERVICE_ENABLED", "false");
     let dir = tempdir().unwrap();
     let state_dir = dir.path().join("state");
     std::fs::create_dir_all(&state_dir).unwrap();
@@ -288,7 +289,9 @@ fn ui_startup_config_save_preserves_managed_geo_coordinates() {
         serde_json::to_vec(&json!({
             "network_mode": "wan",
             "latitude": 37.0,
-            "longitude": -122.0
+            "longitude": -122.0,
+            "network_backend": "client_server",
+            "client_server_url": "https://message-gateway.example.test"
         }))
         .unwrap(),
     )
@@ -324,6 +327,14 @@ fn ui_startup_config_save_preserves_managed_geo_coordinates() {
         let save_json = json_from(save_res).await;
         assert_eq!(save_json["config"]["latitude"].as_f64(), Some(37.0));
         assert_eq!(save_json["config"]["longitude"].as_f64(), Some(-122.0));
+        assert_eq!(
+            save_json["config"]["network_backend"].as_str(),
+            Some("client_server")
+        );
+        assert_eq!(
+            save_json["config"]["client_server_url"].as_str(),
+            Some("https://message-gateway.example.test")
+        );
     });
 }
 

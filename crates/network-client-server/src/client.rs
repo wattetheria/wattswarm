@@ -1,6 +1,7 @@
 use crate::{
-    ChallengeRequest, ChallengeResponse, ClientServerConfig, CommitRequest, ControlAcceptance,
-    ControlFrame, PublishAcceptance, PublishFrame, SessionProofRequest, SessionResponse,
+    AutoRegistrationRequest, AutoRegistrationResponse, ChallengeRequest, ChallengeResponse,
+    ClientServerConfig, CommitRequest, ControlAcceptance, ControlFrame, GrantAdmissionRequest,
+    GrantAdmissionResponse, PublishAcceptance, PublishFrame, SessionProofRequest, SessionResponse,
 };
 use anyhow::{Context, Result, bail};
 use reqwest::blocking::{Client, RequestBuilder};
@@ -41,6 +42,51 @@ impl ClientServerClient {
         }
         Ok(request.bearer_auth(token))
     }
+
+    pub fn auto_register(
+        &self,
+        registration_url: &str,
+        request: &AutoRegistrationRequest,
+    ) -> Result<AutoRegistrationResponse> {
+        let response: AutoRegistrationResponse = self
+            .http
+            .post(endpoint_for(
+                registration_url,
+                "api/network/registration/auto",
+            ))
+            .json(request)
+            .send()?
+            .error_for_status()?
+            .json()?;
+        if response.network_id != request.network_id
+            || response.principal_id != request.principal_id
+            || response.grant.network_id != request.network_id
+            || response.grant.principal_id != request.principal_id
+            || response.grant.public_key_hex != request.public_key_hex
+            || response.status != "active"
+        {
+            bail!("ClientServer auto registration response does not match request");
+        }
+        Ok(response)
+    }
+
+    pub fn admit_grant(&self, request: &GrantAdmissionRequest) -> Result<GrantAdmissionResponse> {
+        Ok(self
+            .http
+            .post(self.endpoint("v1/admission/grant"))
+            .json(request)
+            .send()?
+            .error_for_status()?
+            .json()?)
+    }
+}
+
+fn endpoint_for(base_url: &str, path: &str) -> String {
+    format!(
+        "{}/{}",
+        base_url.trim_end_matches('/'),
+        path.trim_start_matches('/')
+    )
 }
 
 impl ClientServerTransport for ClientServerClient {

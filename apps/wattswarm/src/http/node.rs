@@ -19,7 +19,7 @@ pub(crate) async fn node_up(State(state): State<UiServerState>) -> Result<Json<V
             state_clone.state_dir.clone(),
             state_clone.db_path.clone(),
         )?;
-        if crate::network_bridge::network_enabled_from_env() {
+        if crate::network_bridge::network_enabled_from_state_dir(&state_clone.state_dir) {
             crate::udp_announce::announce_startup_with_contact(
                 "node-up-api",
                 None,

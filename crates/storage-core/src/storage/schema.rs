@@ -43,12 +43,13 @@ fn schema_has_required_tables(conn: &Connection) -> Result<bool> {
                    'discovered_peers_local',
                    'network_ban_windows',
                    'peer_relationship_requests_local',
-                   'cs_tenant_instance_local'
+                   'cs_tenant_instance_local',
+                   'network_membership_grants'
                )",
             params![],
             |row| row.get::<_, i64>(0),
         )?;
-        return Ok(count == 4
+        return Ok(count == 5
             && column_exists(
                 conn,
                 "cs_outbound_progress_local",
@@ -64,12 +65,13 @@ fn schema_has_required_tables(conn: &Connection) -> Result<bool> {
                'discovered_peers_local',
                'network_ban_windows',
                'peer_relationship_requests_local',
-               'cs_tenant_instance_local'
+               'cs_tenant_instance_local',
+               'network_membership_grants'
            )",
         params![],
         |row| row.get::<_, i64>(0),
     )?;
-    Ok(count == 4
+    Ok(count == 5
         && column_exists(
             conn,
             "cs_outbound_progress_local",
@@ -121,6 +123,7 @@ const SQLITE_REQUIRED_PRIMARY_KEYS: &[(&str, &[&str])] = &[
     ("network_control_log", &["network_id", "control_seq"]),
     ("node_registry", &["node_id"]),
     ("node_network_membership", &["node_id", "network_id"]),
+    ("network_membership_grants", &["network_id", "principal_id"]),
     ("org_registry", &["org_id"]),
     ("local_config_json", &["config_key"]),
     ("executor_registry_local", &["scope_id", "executor_name"]),
@@ -499,6 +502,12 @@ fn migrate_client_server_transport_schema(conn: &Connection) -> Result<()> {
         conn.execute_batch(
             "ALTER TABLE cs_outbound_progress_local
              ADD COLUMN delivery_policy_version BIGINT NOT NULL DEFAULT 1",
+        )?;
+    }
+    if column_exists(conn, "cs_outbound_progress_local", "cutover_sequence") {
+        conn.execute_batch(
+            "ALTER TABLE cs_outbound_progress_local
+             DROP COLUMN cutover_sequence",
         )?;
     }
     if !column_exists(conn, "cs_mailbox_gap_local", "page_id") {
@@ -1314,6 +1323,18 @@ impl PgStore {
                 PRIMARY KEY(node_id, network_id)
             );
 
+            CREATE TABLE IF NOT EXISTS network_membership_grants (
+                network_id TEXT NOT NULL,
+                principal_id TEXT NOT NULL,
+                issuer_genesis_id TEXT NOT NULL,
+                grant_json TEXT NOT NULL,
+                issued_at BIGINT NOT NULL,
+                expires_at BIGINT,
+                created_at BIGINT NOT NULL,
+                updated_at BIGINT NOT NULL,
+                PRIMARY KEY(network_id, principal_id)
+            );
+
             CREATE TABLE IF NOT EXISTS org_registry (
                 org_id TEXT PRIMARY KEY,
                 network_id TEXT NOT NULL,
@@ -1578,7 +1599,6 @@ impl PgStore {
                 source_id TEXT NOT NULL,
                 outbound_partition TEXT NOT NULL,
                 scanned_sequence BIGINT NOT NULL,
-                cutover_sequence BIGINT NOT NULL,
                 delivery_policy_version BIGINT NOT NULL DEFAULT 1,
                 retry_attempts BIGINT NOT NULL DEFAULT 0,
                 next_retry_at TIMESTAMPTZ,

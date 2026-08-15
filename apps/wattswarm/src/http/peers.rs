@@ -102,10 +102,7 @@ pub(crate) async fn peers_list(
     State(state): State<UiServerState>,
 ) -> Result<Json<Value>, ApiError> {
     let state_clone = state.clone();
-    let payload = run_blocking(move || {
-        build_peers_list_payload(&state_clone.state_dir, &state_clone.db_path)
-    })
-    .await?;
+    let payload = run_blocking(move || build_peers_list_payload(&state_clone.state_dir)).await?;
     Ok(Json(payload))
 }
 
@@ -496,19 +493,11 @@ pub(crate) async fn agent_payment_send(
     Ok(Json(payload))
 }
 
-fn build_peers_list_payload(
-    state_dir: &std::path::Path,
-    db_path: &std::path::Path,
-) -> Result<Value> {
+fn build_peers_list_payload(state_dir: &std::path::Path) -> Result<Value> {
+    // `Node::peers()` is persisted discovery state, not proof of a live connection.
+    // Only the runtime observability snapshot may mark a peer as connected.
     let connected_peers =
-        if let Some(peers) = crate::network_bridge::latest_connected_peer_ids(state_dir) {
-            peers
-        } else {
-            match open_configured_node(state_dir, db_path) {
-                Ok(node) => node.peers(),
-                Err(_) => Vec::new(),
-            }
-        };
+        crate::network_bridge::latest_connected_peer_ids(state_dir).unwrap_or_default();
     let discovered = crate::control::load_discovered_peer_records_state(state_dir)?;
     let scope_id = crate::storage::local_control_scope_id(state_dir);
     let discovered_activity = crate::storage::local_control_store(state_dir)?
@@ -662,6 +651,10 @@ mod tests {
                 network_mode: NetworkMode::Wan,
                 bootstrap_contacts: vec!["iroh-bootstrap-contact".to_owned()],
                 gateway_urls: Vec::new(),
+                network_backend: None,
+                client_server_url: None,
+                network_registration_url: None,
+                cs_auto_register: None,
                 core_agent: CoreAgentConfig::default(),
             },
         )
@@ -693,7 +686,6 @@ mod tests {
     fn peers_list_payload_includes_discovery_metadata_and_relationship_state() {
         let dir = tempfile::tempdir().expect("tempdir");
         let state_dir = dir.path().join("state");
-        let db_path = state_dir.join("ui.state");
         std::fs::create_dir_all(&state_dir).expect("create state dir");
         crate::control::save_discovered_peer_records_state(
             &state_dir,
@@ -735,7 +727,7 @@ mod tests {
             crate::control::PeerRelationshipInitiator::Local,
         )
         .expect("save relationship");
-        let payload = build_peers_list_payload(&state_dir, &db_path).expect("build peers payload");
+        let payload = build_peers_list_payload(&state_dir).expect("build peers payload");
         let records = payload["records"].as_array().expect("records array");
         let peer = records
             .iter()
@@ -756,7 +748,6 @@ mod tests {
     fn peers_list_payload_hides_expired_discovery_without_deleting_relationship() {
         let dir = tempfile::tempdir().expect("tempdir");
         let state_dir = dir.path().join("state");
-        let db_path = state_dir.join("ui.state");
         std::fs::create_dir_all(&state_dir).expect("create state dir");
         let now_ms = chrono::Utc::now().timestamp_millis().max(0) as u64;
         let expired_at = now_ms.saturating_sub(NEARBY_PEER_RETENTION_MS + 1);
@@ -778,7 +769,7 @@ mod tests {
         )
         .expect("save relationship");
 
-        let peers = build_peers_list_payload(&state_dir, &db_path).expect("build peers payload");
+        let peers = build_peers_list_payload(&state_dir).expect("build peers payload");
         assert!(
             peers["records"]
                 .as_array()
@@ -794,6 +785,57 @@ mod tests {
                 .expect("relationships")
                 .iter()
                 .any(|record| record["remote_node_id"] == "peer-expired")
+        );
+    }
+
+    #[test]
+    fn peers_list_payload_does_not_mark_persisted_discovery_as_connected() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state_dir = dir.path().join("state");
+        std::fs::create_dir_all(&state_dir).expect("create state dir");
+        save_startup_config(
+            &startup_config_path(&state_dir),
+            &StartupConfig {
+                latitude: None,
+                longitude: None,
+                network_mode: NetworkMode::Local,
+                bootstrap_contacts: Vec::new(),
+                gateway_urls: Vec::new(),
+                network_backend: Some("client_server".to_owned()),
+                client_server_url: Some("https://gateway.example.test".to_owned()),
+                network_registration_url: None,
+                cs_auto_register: Some(true),
+                core_agent: CoreAgentConfig::default(),
+            },
+        )
+        .expect("save startup config");
+
+        let now_ms = chrono::Utc::now().timestamp_millis().max(0) as u64;
+        let scope_id = crate::storage::local_control_scope_id(&state_dir);
+        crate::storage::local_control_store(&state_dir)
+            .expect("local control store")
+            .upsert_local_discovered_peer(
+                &scope_id,
+                "persisted-discovery-peer",
+                "discovery",
+                now_ms,
+            )
+            .expect("save persisted discovery peer");
+
+        let peers = build_peers_list_payload(&state_dir).expect("build peers payload");
+        let record = peers["records"]
+            .as_array()
+            .expect("peer records")
+            .iter()
+            .find(|record| record["node_id"] == "persisted-discovery-peer")
+            .expect("persisted discovery peer record");
+        assert_eq!(record["connected"], false);
+        assert!(
+            !peers["peers"]
+                .as_array()
+                .expect("connected peers")
+                .iter()
+                .any(|peer| peer == "persisted-discovery-peer")
         );
     }
 
@@ -874,7 +916,6 @@ mod tests {
     fn peers_list_payload_keeps_peer_with_recent_authenticated_activity() {
         let dir = tempfile::tempdir().expect("tempdir");
         let state_dir = dir.path().join("state");
-        let db_path = state_dir.join("ui.state");
         std::fs::create_dir_all(&state_dir).expect("create state dir");
         let now_ms = chrono::Utc::now().timestamp_millis().max(0) as u64;
         let expired_at = now_ms.saturating_sub(NEARBY_PEER_RETENTION_MS + 1);
@@ -903,7 +944,7 @@ mod tests {
         )
         .expect("save recent authenticated activity");
 
-        let peers = build_peers_list_payload(&state_dir, &db_path).expect("build peers payload");
+        let peers = build_peers_list_payload(&state_dir).expect("build peers payload");
         assert!(
             peers["records"]
                 .as_array()

@@ -1179,6 +1179,61 @@ pub struct NetworkTopology {
     pub org: OrgDescriptor,
 }
 
+pub const NETWORK_MEMBERSHIP_GRANT_VERSION: u32 = 1;
+pub const NETWORK_MEMBERSHIP_GRANT_DOMAIN: &str = "wattswarm:network-membership-grant:v1";
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UnsignedNetworkMembershipGrant {
+    pub version: u32,
+    pub network_id: String,
+    pub principal_id: String,
+    pub public_key_hex: String,
+    pub issuer_genesis_id: String,
+    pub issued_at: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NetworkMembershipGrant {
+    pub version: u32,
+    pub network_id: String,
+    pub principal_id: String,
+    pub public_key_hex: String,
+    pub issuer_genesis_id: String,
+    pub issued_at: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<u64>,
+    pub signature_hex: String,
+}
+
+impl UnsignedNetworkMembershipGrant {
+    pub fn signing_bytes(&self) -> Result<Vec<u8>, serde_json::Error> {
+        let mut bytes = NETWORK_MEMBERSHIP_GRANT_DOMAIN.as_bytes().to_vec();
+        bytes.push(0);
+        bytes.extend(serde_jcs::to_vec(self)?);
+        Ok(bytes)
+    }
+}
+
+impl NetworkMembershipGrant {
+    pub fn unsigned_payload(&self) -> UnsignedNetworkMembershipGrant {
+        UnsignedNetworkMembershipGrant {
+            version: self.version,
+            network_id: self.network_id.clone(),
+            principal_id: self.principal_id.clone(),
+            public_key_hex: self.public_key_hex.clone(),
+            issuer_genesis_id: self.issuer_genesis_id.clone(),
+            issued_at: self.issued_at,
+            expires_at: self.expires_at,
+        }
+    }
+
+    pub fn signing_bytes(&self) -> Result<Vec<u8>, serde_json::Error> {
+        self.unsigned_payload().signing_bytes()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NetworkBootstrapBundle {
     pub topology: NetworkTopology,
@@ -1193,6 +1248,14 @@ pub struct NetworkJoinManifest {
     pub network_id: String,
     pub genesis_node_id: String,
     pub params_hash: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network_backend: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_server_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cs_auto_register: Option<bool>,
+    #[serde(default)]
+    pub registration_urls: Vec<String>,
     #[serde(default)]
     pub bootstrap_urls: Vec<String>,
     #[serde(default)]

@@ -2,7 +2,8 @@ use anyhow::Result;
 use std::path::PathBuf;
 
 pub fn start_node_runtime(state_dir: PathBuf, db_path: PathBuf) -> Result<bool> {
-    let backend = crate::control::network_service::NetworkBackend::from_env()?;
+    let backend =
+        crate::control::network_service::NetworkBackend::from_env_or_startup_config(&state_dir)?;
     let mode = crate::control::configured_node_mode(&state_dir)?;
     let maintenance_required = maintenance_required(mode, backend);
 

@@ -519,6 +519,12 @@ pub fn network_enabled_from_env() -> bool {
         .unwrap_or(false)
 }
 
+pub fn network_enabled_from_state_dir(state_dir: &Path) -> bool {
+    crate::network_service::NetworkBackend::from_env_or_startup_config(state_dir)
+        .map(crate::network_service::network_service_enabled_from_env)
+        .unwrap_or(false)
+}
+
 pub fn network_config_from_env() -> NetworkP2pConfig {
     let listen_addrs = env::var(ENV_P2P_LISTEN_ADDRS)
         .ok()
@@ -566,7 +572,7 @@ pub fn maybe_start_background_network_service_with_hook(
     db_path: PathBuf,
     post_tick_hook: Option<PostTickHook>,
 ) -> Result<bool> {
-    let backend = crate::network_service::NetworkBackend::from_env()?;
+    let backend = crate::network_service::NetworkBackend::from_env_or_startup_config(&state_dir)?;
     if !crate::network_service::network_service_enabled_from_env(backend) {
         return Ok(false);
     }

@@ -3,8 +3,8 @@ use crate::crypto::{NodeIdentity, sha256_hex, verify_signature};
 use std::collections::{HashMap, HashSet};
 use wattswarm_protocol::types::{
     AuthoritySet, DEFAULT_CONTROL_RANGE_LIMIT, NetworkBootstrapBundle, NetworkControlRecord,
-    NetworkDescriptor, NetworkKind, NetworkProtocolParams, NetworkProtocolParamsMap,
-    NetworkTopology, OrgDescriptor, SignedNetworkAuthoritySetEnvelope,
+    NetworkDescriptor, NetworkKind, NetworkMembershipGrant, NetworkProtocolParams,
+    NetworkProtocolParamsMap, NetworkTopology, OrgDescriptor, SignedNetworkAuthoritySetEnvelope,
     SignedNetworkProtocolParamsEnvelope, UnsignedNetworkAuthoritySetEnvelope,
     UnsignedNetworkProtocolParamsEnvelope, UnsignedNetworkProtocolParamsKvEnvelope,
     network_protocol_params_kv_from_value,
@@ -1076,6 +1076,72 @@ impl PgStore {
             |r| r.get::<_, bool>(0),
         )?;
         Ok(exists)
+    }
+
+    pub fn put_network_membership_grant(
+        &self,
+        grant: &NetworkMembershipGrant,
+        now_ms: u64,
+    ) -> Result<()> {
+        let now_ms =
+            i64::try_from(now_ms).map_err(|_| anyhow::anyhow!("grant timestamp overflow"))?;
+        let issued_at = i64::try_from(grant.issued_at)
+            .map_err(|_| anyhow::anyhow!("grant issued_at overflow"))?;
+        let expires_at = grant
+            .expires_at
+            .map(i64::try_from)
+            .transpose()
+            .map_err(|_| anyhow::anyhow!("grant expires_at overflow"))?;
+        let grant_json = serde_json::to_string(grant)?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
+        conn.execute(
+            "INSERT INTO network_membership_grants(
+                 network_id, principal_id, issuer_genesis_id, grant_json,
+                 issued_at, expires_at, created_at, updated_at
+             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $7)
+             ON CONFLICT(network_id, principal_id) DO UPDATE SET
+                 issuer_genesis_id = excluded.issuer_genesis_id,
+                 grant_json = excluded.grant_json,
+                 issued_at = excluded.issued_at,
+                 expires_at = excluded.expires_at,
+                 updated_at = excluded.updated_at",
+            params![
+                &grant.network_id,
+                &grant.principal_id,
+                &grant.issuer_genesis_id,
+                grant_json,
+                issued_at,
+                expires_at,
+                now_ms,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn load_network_membership_grant(
+        &self,
+        network_id: &str,
+        principal_id: &str,
+    ) -> Result<Option<NetworkMembershipGrant>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
+        let grant_json = conn
+            .query_row(
+                "SELECT grant_json
+                 FROM network_membership_grants
+                 WHERE network_id = $1 AND principal_id = $2",
+                params![network_id, principal_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        grant_json
+            .map(|json| serde_json::from_str(&json).map_err(Into::into))
+            .transpose()
     }
 
     pub fn join_node_to_network_topology(

@@ -178,8 +178,19 @@ pub fn run_worker(
     if logged_waiting {
         eprintln!("wattswarm worker detected node mode configuration; resuming queue loop");
     }
-    crate::node_runtime::start_node_runtime(state_dir.to_path_buf(), db_path.to_path_buf())?;
+    start_worker_network_service(state_dir, db_path)?;
     current_org_queue(state_dir, db_path, pg_url)?.run_worker(opts, state_dir, db_path)
+}
+
+fn start_worker_network_service(state_dir: &Path, db_path: &Path) -> Result<()> {
+    crate::network_bridge::maybe_start_background_network_service_with_hook(
+        state_dir.to_path_buf(),
+        db_path.to_path_buf(),
+        Some(Box::new(|node, state_dir| {
+            crate::network_hooks::run_background_post_tick(node, state_dir);
+        })),
+    )?;
+    Ok(())
 }
 
 fn should_log_waiting_for_mode(wait_polls: u64) -> bool {
@@ -188,7 +199,50 @@ fn should_log_waiting_for_mode(wait_polls: u64) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::should_log_waiting_for_mode;
+    use super::{should_log_waiting_for_mode, start_worker_network_service};
+    use std::env;
+    use std::ffi::OsString;
+    use std::fs;
+    use std::sync::{Mutex, OnceLock};
+
+    static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+    struct EnvVarGuard {
+        key: &'static str,
+        previous: Option<OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let previous = env::var_os(key);
+            // SAFETY: this test serializes environment mutations with ENV_LOCK.
+            unsafe {
+                env::set_var(key, value);
+            }
+            Self { key, previous }
+        }
+
+        fn remove(key: &'static str) -> Self {
+            let previous = env::var_os(key);
+            // SAFETY: this test serializes environment mutations with ENV_LOCK.
+            unsafe {
+                env::remove_var(key);
+            }
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            // SAFETY: this test serializes environment mutations with ENV_LOCK.
+            unsafe {
+                match &self.previous {
+                    Some(value) => env::set_var(self.key, value),
+                    None => env::remove_var(self.key),
+                }
+            }
+        }
+    }
 
     #[test]
     fn worker_wait_logging_repeats_every_interval() {
@@ -197,5 +251,57 @@ mod tests {
         assert!(!should_log_waiting_for_mode(1_199));
         assert!(should_log_waiting_for_mode(1_200));
         assert!(should_log_waiting_for_mode(2_400));
+    }
+
+    #[test]
+    fn worker_propagates_client_server_startup_errors() {
+        let _env_lock = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        let _backend = EnvVarGuard::set("WATTSWARM_NETWORK_BACKEND", "client_server");
+        let _url = EnvVarGuard::remove("WATTSWARM_CLIENT_SERVER_URL");
+        let _p2p = EnvVarGuard::set("WATTSWARM_P2P_ENABLED", "true");
+        let _network_service = EnvVarGuard::remove("WATTSWARM_NETWORK_SERVICE_ENABLED");
+        let dir = tempfile::tempdir().unwrap();
+        let state_dir = dir.path().join("state");
+        fs::create_dir_all(&state_dir).unwrap();
+        fs::write(
+            state_dir.join("startup_config.json"),
+            r#"{"network_mode":"wan"}"#,
+        )
+        .unwrap();
+
+        let error = start_worker_network_service(&state_dir, &state_dir.join("wattswarm.db"))
+            .expect_err("missing client-server URL must fail worker startup");
+
+        assert!(
+            error
+                .to_string()
+                .contains("WATTSWARM_CLIENT_SERVER_URL is required")
+        );
+    }
+
+    #[test]
+    fn worker_client_server_does_not_start_node_maintenance() {
+        let _env_lock = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        let _backend = EnvVarGuard::set("WATTSWARM_NETWORK_BACKEND", "client_server");
+        let _url = EnvVarGuard::set(
+            "WATTSWARM_CLIENT_SERVER_URL",
+            "https://message-gateway.example.test",
+        );
+        let _p2p = EnvVarGuard::set("WATTSWARM_P2P_ENABLED", "true");
+        let _network_service = EnvVarGuard::remove("WATTSWARM_NETWORK_SERVICE_ENABLED");
+        let _maintenance = EnvVarGuard::remove("WATTSWARM_NODE_MAINTENANCE_ENABLED");
+        let dir = tempfile::tempdir().unwrap();
+        let state_dir = dir.path().join("state");
+        fs::create_dir_all(&state_dir).unwrap();
+        fs::write(
+            state_dir.join("startup_config.json"),
+            r#"{"network_mode":"wan"}"#,
+        )
+        .unwrap();
+
+        start_worker_network_service(&state_dir, &state_dir.join("wattswarm.db"))
+            .expect("client-server network service start");
+
+        assert!(!state_dir.join(".wattswarm-node-maintenance.lock").exists());
     }
 }

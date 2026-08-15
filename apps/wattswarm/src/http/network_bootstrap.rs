@@ -1,6 +1,6 @@
-use crate::control::{local_peer_id, open_configured_node};
+use crate::control::{load_local_identity, local_peer_id, open_configured_node};
 use crate::http::{ApiError, UiServerState, run_blocking};
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use axum::Json;
 use axum::extract::State;
 use serde::Deserialize;
@@ -9,12 +9,15 @@ use std::fs::{self, OpenOptions};
 use std::io::Write as _;
 use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use wattswarm_network_client_server::{AutoRegistrationRequest, AutoRegistrationResponse};
 use wattswarm_network_p2p::NetworkNodeId;
 use wattswarm_network_transport_iroh::IrohRouteProbeResult;
+use wattswarm_protocol::types::{NETWORK_MEMBERSHIP_GRANT_VERSION, UnsignedNetworkMembershipGrant};
 
 const ENV_PUBLIC_BOOTSTRAP_URLS: &str = "WATTSWARM_PUBLIC_BOOTSTRAP_URLS";
 const ENV_PUBLIC_BOOTSTRAP_CONTACTS: &str = "WATTSWARM_PUBLIC_BOOTSTRAP_CONTACTS";
 const ENV_PUBLIC_GATEWAY_URLS: &str = "WATTSWARM_PUBLIC_GATEWAY_URLS";
+const ENV_NETWORK_GRANT_TTL_SECONDS: &str = "WATTSWARM_NETWORK_GRANT_TTL_SECONDS";
 const ENV_PUBLIC_DISCOVERY_URLS: &str = "WATTSWARM_PUBLIC_DISCOVERY_URLS";
 const ENV_IROH_RELAY_URLS: &str = "WATTSWARM_IROH_RELAY_URLS";
 const ENV_IROH_PUBLISH_DIRECT_ADDRS: &str = "WATTSWARM_IROH_PUBLISH_DIRECT_ADDRS";
@@ -87,6 +90,7 @@ fn record_iroh_probe_route_diagnostic(
 pub(crate) async fn network_local(
     State(state): State<UiServerState>,
 ) -> Result<Json<Value>, ApiError> {
+    let network_enabled = crate::network_bridge::network_enabled_from_state_dir(&state.state_dir);
     let state_clone = state.clone();
     let (peer_id, listen_addrs) = run_blocking(move || -> Result<(String, Vec<String>)> {
         let peer_id = local_peer_id(&state_clone.state_dir)?;
@@ -98,7 +102,7 @@ pub(crate) async fn network_local(
     .await?;
     Ok(Json(json!({
         "ok": true,
-        "network_enabled": crate::network_bridge::network_enabled_from_env(),
+        "network_enabled": network_enabled,
         "local_peer_id": peer_id,
         "listen_addrs": listen_addrs
     })))
@@ -162,6 +166,117 @@ pub(crate) async fn network_bootstrap(
     })))
 }
 
+pub(crate) async fn network_auto_registration(
+    State(state): State<UiServerState>,
+    Json(request): Json<AutoRegistrationRequest>,
+) -> Result<Json<AutoRegistrationResponse>, ApiError> {
+    let state_clone = state.clone();
+    let response =
+        run_blocking(move || issue_network_membership_grant(&state_clone, &request)).await?;
+    Ok(Json(response))
+}
+
+fn issue_network_membership_grant(
+    state: &UiServerState,
+    request: &AutoRegistrationRequest,
+) -> Result<AutoRegistrationResponse> {
+    validate_registration_request(request)?;
+    if !crate::control::network_service::client_server_auto_registration_enabled(&state.state_dir)?
+    {
+        bail!("automatic network registration is disabled by the Genesis policy");
+    }
+    let node = open_configured_node(&state.state_dir, &state.db_path)?;
+    let identity = load_local_identity(&state.state_dir)?;
+    let topology = node
+        .store
+        .load_network_topology_for_org(node.store.org_id())?;
+    if topology.network.network_id != request.network_id {
+        bail!(
+            "registration network mismatch expected={} got={}",
+            topology.network.network_id,
+            request.network_id
+        );
+    }
+    if topology.network.genesis_node_id != identity.node_id() {
+        bail!("only the Genesis node can issue network membership grants");
+    }
+    let signing_message = request.signing_message()?;
+    wattswarm_crypto::verify_signature(
+        &request.public_key_hex,
+        &signing_message,
+        &request.signature_hex,
+    )?;
+    let issued_at = unix_timestamp_millis();
+    let grant = wattswarm_crypto::sign_network_membership_grant(
+        &UnsignedNetworkMembershipGrant {
+            version: NETWORK_MEMBERSHIP_GRANT_VERSION,
+            network_id: request.network_id.clone(),
+            principal_id: request.principal_id.clone(),
+            public_key_hex: request.public_key_hex.clone(),
+            issuer_genesis_id: identity.node_id(),
+            issued_at,
+            expires_at: network_grant_expiry(issued_at)?,
+        },
+        &identity,
+    )?;
+    node.store.join_node_to_network_topology(
+        &request.network_id,
+        &request.principal_id,
+        &request.public_key_hex,
+        issued_at,
+    )?;
+    node.store.put_network_membership_grant(&grant, issued_at)?;
+    Ok(AutoRegistrationResponse {
+        network_id: request.network_id.clone(),
+        principal_id: request.principal_id.clone(),
+        grant,
+        status: "active".to_owned(),
+    })
+}
+
+fn validate_registration_request(request: &AutoRegistrationRequest) -> Result<()> {
+    if request.network_id.trim().is_empty() || request.network_id.len() > 256 {
+        bail!("registration network id is invalid");
+    }
+    if request.nonce.trim().is_empty() || request.nonce.len() > 256 {
+        bail!("registration nonce is invalid");
+    }
+    if request.principal_id != request.public_key_hex
+        || !matches!(hex::decode(&request.public_key_hex), Ok(bytes) if bytes.len() == 32)
+    {
+        bail!("registration principal identity is invalid");
+    }
+    if request
+        .tenant_instance_id
+        .as_deref()
+        .is_some_and(|value| value.trim().is_empty() || value.len() > 128)
+    {
+        bail!("registration tenant instance is invalid");
+    }
+    Ok(())
+}
+
+fn network_grant_expiry(issued_at: u64) -> Result<Option<u64>> {
+    let Some(raw) = std::env::var_os(ENV_NETWORK_GRANT_TTL_SECONDS) else {
+        return Ok(None);
+    };
+    let ttl_seconds: u64 = raw
+        .to_string_lossy()
+        .trim()
+        .parse()
+        .context("parse WATTSWARM_NETWORK_GRANT_TTL_SECONDS")?;
+    if ttl_seconds == 0 {
+        return Ok(None);
+    }
+    let ttl_ms = ttl_seconds
+        .checked_mul(1_000)
+        .context("network grant TTL is too large")?;
+    issued_at
+        .checked_add(ttl_ms)
+        .map(Some)
+        .context("network grant expiry overflow")
+}
+
 pub(crate) async fn network_join_manifest(
     State(state): State<UiServerState>,
 ) -> Result<Json<crate::types::NetworkJoinManifest>, ApiError> {
@@ -169,6 +284,10 @@ pub(crate) async fn network_join_manifest(
     let manifest = run_blocking(move || -> Result<crate::types::NetworkJoinManifest> {
         let node = open_configured_node(&state_clone.state_dir, &state_clone.db_path)?;
         let bundle = node.store.load_network_bootstrap_bundle()?;
+        let transport_config =
+            crate::control::network_service::network_transport_config_from_env_or_startup_config(
+                &state_clone.state_dir,
+            )?;
         let relay_urls = split_public_manifest_values(ENV_IROH_RELAY_URLS);
         let mut bootstrap_contacts =
             public_manifest_bootstrap_contacts(ENV_PUBLIC_BOOTSTRAP_CONTACTS, &relay_urls)?;
@@ -188,6 +307,13 @@ pub(crate) async fn network_join_manifest(
             network_id: bundle.topology.network.network_id,
             genesis_node_id: bundle.topology.network.genesis_node_id,
             params_hash: bundle.signed_params.params_hash,
+            network_backend: transport_config.network_backend,
+            client_server_url: transport_config.client_server_url,
+            cs_auto_register: Some(transport_config.cs_auto_register.unwrap_or(true)),
+            registration_urls: transport_config
+                .network_registration_url
+                .into_iter()
+                .collect(),
             bootstrap_urls: split_public_manifest_values(ENV_PUBLIC_BOOTSTRAP_URLS),
             bootstrap_contacts,
             gateway_urls: split_public_manifest_values(ENV_PUBLIC_GATEWAY_URLS),

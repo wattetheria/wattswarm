@@ -1,9 +1,10 @@
 use crate::node::Node;
 use crate::types::{ArtifactRef, EventPayload};
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::env;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -11,6 +12,8 @@ pub const ENV_NETWORK_BACKEND: &str = "WATTSWARM_NETWORK_BACKEND";
 pub const ENV_NETWORK_SERVICE_ENABLED: &str = "WATTSWARM_NETWORK_SERVICE_ENABLED";
 pub const ENV_NODE_MAINTENANCE_ENABLED: &str = "WATTSWARM_NODE_MAINTENANCE_ENABLED";
 pub const ENV_CLIENT_SERVER_URL: &str = "WATTSWARM_CLIENT_SERVER_URL";
+pub const ENV_NETWORK_REGISTRATION_URL: &str = "WATTSWARM_NETWORK_REGISTRATION_URL";
+pub const ENV_CS_AUTO_REGISTER: &str = "WATTSWARM_CS_AUTO_REGISTER";
 pub(crate) const ENV_P2P_ENABLED: &str = "WATTSWARM_P2P_ENABLED";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -23,15 +26,20 @@ pub enum NetworkBackend {
 
 impl NetworkBackend {
     pub fn from_env() -> Result<Self> {
-        match env::var(ENV_NETWORK_BACKEND)
-            .unwrap_or_else(|_| "p2p".to_owned())
-            .trim()
-            .to_ascii_lowercase()
-            .as_str()
-        {
-            "p2p" => Ok(Self::P2p),
-            "client_server" | "client-server" => Ok(Self::ClientServer),
-            value => bail!("unsupported Wattswarm network backend: {value}"),
+        Self::from_value(non_empty_env(ENV_NETWORK_BACKEND).as_deref())
+    }
+
+    pub fn from_env_or_startup_config(state_dir: &Path) -> Result<Self> {
+        let config = network_transport_config_from_env_or_startup_config(state_dir)?;
+        Self::from_value(config.network_backend.as_deref())
+    }
+
+    fn from_value(value: Option<&str>) -> Result<Self> {
+        let raw = value.unwrap_or("p2p");
+        match crate::control::normalize_network_backend(raw).as_deref() {
+            Some("p2p") => Ok(Self::P2p),
+            Some("client_server") => Ok(Self::ClientServer),
+            _ => bail!("unsupported Wattswarm network backend: {}", raw.trim()),
         }
     }
 
@@ -41,6 +49,68 @@ impl NetworkBackend {
             Self::ClientServer => "client_server",
         }
     }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct NetworkTransportConfig {
+    pub network_backend: Option<String>,
+    pub client_server_url: Option<String>,
+    pub network_registration_url: Option<String>,
+    pub cs_auto_register: Option<bool>,
+}
+
+pub fn network_transport_config_from_env_or_startup_config(
+    state_dir: &Path,
+) -> Result<NetworkTransportConfig> {
+    let persisted = crate::control::load_persisted_network_transport_config(state_dir)?;
+    let network_backend = non_empty_env(ENV_NETWORK_BACKEND)
+        .map(|raw| {
+            NetworkBackend::from_value(Some(&raw)).map(|backend| backend.as_str().to_owned())
+        })
+        .transpose()?
+        .or(persisted.network_backend);
+    let client_server_url = non_empty_env(ENV_CLIENT_SERVER_URL)
+        .and_then(|raw| crate::control::normalize_optional_url(&raw))
+        .or(persisted.client_server_url);
+    let network_registration_url = non_empty_env(ENV_NETWORK_REGISTRATION_URL)
+        .and_then(|raw| crate::control::normalize_optional_url(&raw))
+        .or(persisted.network_registration_url);
+    let cs_auto_register = persisted
+        .cs_auto_register
+        .or(parse_optional_bool_env(ENV_CS_AUTO_REGISTER));
+    Ok(NetworkTransportConfig {
+        network_backend,
+        client_server_url,
+        network_registration_url,
+        cs_auto_register,
+    })
+}
+
+pub fn client_server_url_from_env_or_startup_config(state_dir: &Path) -> Result<String> {
+    network_transport_config_from_env_or_startup_config(state_dir)?
+        .client_server_url
+        .context("WATTSWARM_CLIENT_SERVER_URL is required for client_server backend")
+}
+
+pub fn client_server_auto_registration_enabled(state_dir: &Path) -> Result<bool> {
+    Ok(
+        network_transport_config_from_env_or_startup_config(state_dir)?
+            .cs_auto_register
+            .unwrap_or(true),
+    )
+}
+
+pub fn network_registration_url_from_env_or_startup_config(state_dir: &Path) -> Result<String> {
+    network_transport_config_from_env_or_startup_config(state_dir)?
+        .network_registration_url
+        .context("WATTSWARM_NETWORK_REGISTRATION_URL is required for auto registration")
+}
+
+fn non_empty_env(key: &str) -> Option<String> {
+    env::var(key)
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
 }
 
 pub fn network_service_enabled_from_env(backend: NetworkBackend) -> bool {
@@ -353,6 +423,40 @@ mod tests {
 
     static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
+    struct EnvVarGuard {
+        key: &'static str,
+        previous: Option<String>,
+    }
+
+    impl EnvVarGuard {
+        fn remove(key: &'static str) -> Self {
+            let previous = env::var(key).ok();
+            // SAFETY: the test holds ENV_LOCK and restores the variable on drop.
+            unsafe { env::remove_var(key) };
+            Self { key, previous }
+        }
+
+        fn set(key: &'static str, value: &str) -> Self {
+            let previous = env::var(key).ok();
+            // SAFETY: the test holds ENV_LOCK and restores the variable on drop.
+            unsafe { env::set_var(key, value) };
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            // SAFETY: the test restores the variable captured at construction.
+            unsafe {
+                if let Some(previous) = &self.previous {
+                    env::set_var(self.key, previous);
+                } else {
+                    env::remove_var(self.key);
+                }
+            }
+        }
+    }
+
     #[test]
     fn backend_defaults_to_p2p_and_new_enable_flag_wins() {
         let _guard = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
@@ -367,6 +471,140 @@ mod tests {
             env::remove_var(ENV_NETWORK_SERVICE_ENABLED);
             env::remove_var(ENV_P2P_ENABLED);
         }
+    }
+
+    #[test]
+    fn backend_and_client_server_url_fall_back_to_persisted_startup_config() {
+        let _guard = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        let _backend = EnvVarGuard::remove(ENV_NETWORK_BACKEND);
+        let _url = EnvVarGuard::remove(ENV_CLIENT_SERVER_URL);
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("startup_config.json"),
+            serde_json::json!({
+                "network_backend": "client_server",
+                "client_server_url": "https://message-gateway.example.test",
+                "network_registration_url": "https://genesis.example.test",
+                "cs_auto_register": false
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            NetworkBackend::from_env_or_startup_config(dir.path()).unwrap(),
+            NetworkBackend::ClientServer
+        );
+        assert_eq!(
+            client_server_url_from_env_or_startup_config(dir.path()).unwrap(),
+            "https://message-gateway.example.test"
+        );
+        assert_eq!(
+            network_registration_url_from_env_or_startup_config(dir.path()).unwrap(),
+            "https://genesis.example.test"
+        );
+        assert_eq!(
+            network_transport_config_from_env_or_startup_config(dir.path())
+                .unwrap()
+                .cs_auto_register,
+            Some(false)
+        );
+        assert!(!client_server_auto_registration_enabled(dir.path()).unwrap());
+    }
+
+    #[test]
+    fn explicit_environment_values_override_persisted_startup_config() {
+        let _guard = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        let _backend = EnvVarGuard::set(ENV_NETWORK_BACKEND, "p2p");
+        let _url = EnvVarGuard::set(ENV_CLIENT_SERVER_URL, "https://env-gateway.example.test");
+        let _auto_register = EnvVarGuard::set(ENV_CS_AUTO_REGISTER, "true");
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("startup_config.json"),
+            serde_json::json!({
+                "network_backend": "client_server",
+                "client_server_url": "https://persisted-gateway.example.test",
+                "cs_auto_register": false
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            NetworkBackend::from_env_or_startup_config(dir.path()).unwrap(),
+            NetworkBackend::P2p
+        );
+        assert_eq!(
+            client_server_url_from_env_or_startup_config(dir.path()).unwrap(),
+            "https://env-gateway.example.test"
+        );
+        assert!(!client_server_auto_registration_enabled(dir.path()).unwrap());
+    }
+
+    #[test]
+    fn invalid_persisted_transport_values_use_p2p_defaults() {
+        let _guard = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        let _backend = EnvVarGuard::remove(ENV_NETWORK_BACKEND);
+        let _url = EnvVarGuard::remove(ENV_CLIENT_SERVER_URL);
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("startup_config.json"),
+            serde_json::json!({
+                "network_backend": "future_backend",
+                "client_server_url": "///"
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let config = network_transport_config_from_env_or_startup_config(dir.path()).unwrap();
+        assert_eq!(config.network_backend, None);
+        assert_eq!(config.client_server_url, None);
+        assert_eq!(
+            NetworkBackend::from_env_or_startup_config(dir.path()).unwrap(),
+            NetworkBackend::P2p
+        );
+    }
+
+    #[test]
+    fn invalid_environment_backend_is_rejected() {
+        let _guard = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        let _backend = EnvVarGuard::set(ENV_NETWORK_BACKEND, "future_backend");
+        let dir = tempfile::tempdir().unwrap();
+
+        let error = NetworkBackend::from_env_or_startup_config(dir.path())
+            .expect_err("invalid environment backend must be rejected");
+
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported Wattswarm network backend: future_backend")
+        );
+    }
+
+    #[test]
+    fn client_server_auto_registration_defaults_on_and_can_be_disabled() {
+        let _guard = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        let _auto_register = EnvVarGuard::remove(ENV_CS_AUTO_REGISTER);
+        let dir = tempfile::tempdir().unwrap();
+        assert!(client_server_auto_registration_enabled(dir.path()).unwrap());
+
+        let _disabled = EnvVarGuard::set(ENV_CS_AUTO_REGISTER, "false");
+        assert!(!client_server_auto_registration_enabled(dir.path()).unwrap());
+    }
+
+    #[test]
+    fn network_registration_url_is_trimmed_and_read_from_environment() {
+        let _guard = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        let _url = EnvVarGuard::set(
+            ENV_NETWORK_REGISTRATION_URL,
+            "  https://genesis.example.test/  ",
+        );
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            network_registration_url_from_env_or_startup_config(dir.path()).unwrap(),
+            "https://genesis.example.test"
+        );
     }
 
     fn artifact(bytes: &[u8], uri: String) -> ArtifactRef {

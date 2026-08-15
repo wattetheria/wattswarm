@@ -2,7 +2,10 @@ pub mod types {
     pub use wattswarm_protocol::types::*;
 }
 
-use crate::types::{Candidate, Event, UnsignedEvent, VoteChoice};
+use crate::types::{
+    Candidate, Event, NETWORK_MEMBERSHIP_GRANT_VERSION, NetworkMembershipGrant, UnsignedEvent,
+    UnsignedNetworkMembershipGrant, VoteChoice,
+};
 use anyhow::{Context, Result};
 use base64::Engine as _;
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
@@ -115,6 +118,87 @@ pub fn verify_signature_bytes(public_key: &[u8], message: &[u8], signature: &[u8
     let key = VerifyingKey::from_bytes(&key_array)?;
     let signature = Signature::from_bytes(&sig_array);
     key.verify(message, &signature)?;
+    Ok(())
+}
+
+pub fn sign_network_membership_grant(
+    payload: &UnsignedNetworkMembershipGrant,
+    signer: &NodeIdentity,
+) -> Result<NetworkMembershipGrant> {
+    if payload.version != NETWORK_MEMBERSHIP_GRANT_VERSION {
+        anyhow::bail!(
+            "unsupported network membership grant version {}",
+            payload.version
+        );
+    }
+    validate_network_membership_grant_identity(&payload.principal_id, &payload.public_key_hex)?;
+    if payload.issuer_genesis_id != signer.node_id() {
+        anyhow::bail!("network membership grant issuer does not match signer");
+    }
+    if payload
+        .expires_at
+        .is_some_and(|expires_at| expires_at <= payload.issued_at)
+    {
+        anyhow::bail!("network membership grant expiry must be after issued_at");
+    }
+    let signing_bytes = payload.signing_bytes()?;
+    Ok(NetworkMembershipGrant {
+        version: payload.version,
+        network_id: payload.network_id.clone(),
+        principal_id: payload.principal_id.clone(),
+        public_key_hex: payload.public_key_hex.clone(),
+        issuer_genesis_id: payload.issuer_genesis_id.clone(),
+        issued_at: payload.issued_at,
+        expires_at: payload.expires_at,
+        signature_hex: signer.sign_bytes(&signing_bytes),
+    })
+}
+
+pub fn verify_network_membership_grant(
+    grant: &NetworkMembershipGrant,
+    expected_issuer_genesis_id: &str,
+    now_ms: u64,
+) -> Result<()> {
+    if grant.version != NETWORK_MEMBERSHIP_GRANT_VERSION {
+        anyhow::bail!(
+            "unsupported network membership grant version {}",
+            grant.version
+        );
+    }
+    if grant.issuer_genesis_id != expected_issuer_genesis_id {
+        anyhow::bail!("network membership grant issuer is not trusted");
+    }
+    validate_network_membership_grant_identity(&grant.principal_id, &grant.public_key_hex)?;
+    if grant.issued_at > now_ms.saturating_add(5 * 60 * 1_000) {
+        anyhow::bail!("network membership grant is issued in the future");
+    }
+    if grant
+        .expires_at
+        .is_some_and(|expires_at| expires_at <= now_ms)
+    {
+        anyhow::bail!("network membership grant has expired");
+    }
+    verify_signature(
+        expected_issuer_genesis_id,
+        &grant.signing_bytes()?,
+        &grant.signature_hex,
+    )
+}
+
+pub fn network_membership_grant_id(grant: &NetworkMembershipGrant) -> Result<String> {
+    Ok(sha256_hex(&grant.signing_bytes()?))
+}
+
+fn validate_network_membership_grant_identity(
+    principal_id: &str,
+    public_key_hex: &str,
+) -> Result<()> {
+    if principal_id != public_key_hex {
+        anyhow::bail!("network membership grant principal must match public key");
+    }
+    if !matches!(hex::decode(public_key_hex), Ok(bytes) if bytes.len() == 32) {
+        anyhow::bail!("network membership grant public key must be an Ed25519 key");
+    }
     Ok(())
 }
 
@@ -403,6 +487,59 @@ mod tests {
             verify_signature_bytes(identity.verifying_key().as_bytes(), b"tampered", &signature)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn network_membership_grant_round_trips_and_rejects_tampering() {
+        let genesis = NodeIdentity::from_seed([41; 32]);
+        let member = NodeIdentity::from_seed([42; 32]);
+        let unsigned = UnsignedNetworkMembershipGrant {
+            version: NETWORK_MEMBERSHIP_GRANT_VERSION,
+            network_id: "mainnet:test".to_owned(),
+            principal_id: member.node_id(),
+            public_key_hex: member.node_id(),
+            issuer_genesis_id: genesis.node_id(),
+            issued_at: 1_700_000_000_000,
+            expires_at: None,
+        };
+        let grant = sign_network_membership_grant(&unsigned, &genesis).unwrap();
+        verify_network_membership_grant(&grant, &genesis.node_id(), 1_700_000_001_000).unwrap();
+
+        let mut tampered = grant.clone();
+        tampered.network_id = "mainnet:other".to_owned();
+        assert!(
+            verify_network_membership_grant(&tampered, &genesis.node_id(), 1_700_000_001_000)
+                .is_err()
+        );
+
+        let mut expiry_tampered = grant;
+        expiry_tampered.expires_at = Some(1_800_000_000_000);
+        assert!(
+            verify_network_membership_grant(
+                &expiry_tampered,
+                &genesis.node_id(),
+                1_700_000_001_000
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn network_membership_grant_expiry_is_checked_by_verifier() {
+        let genesis = NodeIdentity::from_seed([43; 32]);
+        let member = NodeIdentity::from_seed([44; 32]);
+        let unsigned = UnsignedNetworkMembershipGrant {
+            version: NETWORK_MEMBERSHIP_GRANT_VERSION,
+            network_id: "mainnet:expiry".to_owned(),
+            principal_id: member.node_id(),
+            public_key_hex: member.node_id(),
+            issuer_genesis_id: genesis.node_id(),
+            issued_at: 100,
+            expires_at: Some(200),
+        };
+        let grant = sign_network_membership_grant(&unsigned, &genesis).unwrap();
+        assert!(verify_network_membership_grant(&grant, &genesis.node_id(), 199).is_ok());
+        assert!(verify_network_membership_grant(&grant, &genesis.node_id(), 200).is_err());
     }
 
     #[test]

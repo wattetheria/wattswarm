@@ -1,6 +1,8 @@
 use std::sync::{Arc, Barrier, Mutex, OnceLock};
 use std::thread;
 use tempfile::tempdir;
+use wattswarm_crypto::{NodeIdentity, sign_network_membership_grant};
+use wattswarm_protocol::types::{NETWORK_MEMBERSHIP_GRANT_VERSION, UnsignedNetworkMembershipGrant};
 use wattswarm_storage_core::storage::pg::{
     BackendKind, Connection, DatabaseClient, Error, ErrorCode, OptionalExtension, types::ValueRef,
 };
@@ -665,6 +667,36 @@ fn sqlite_transport_queues_preserve_lease_and_retry_semantics() {
 }
 
 #[test]
+fn sqlite_network_membership_grant_roundtrips_with_optional_expiry() {
+    let store = PgStore::open_in_memory_sqlite().expect("open sqlite store");
+    let genesis = NodeIdentity::from_seed([101_u8; 32]);
+    let member = NodeIdentity::from_seed([102_u8; 32]);
+    let grant = sign_network_membership_grant(
+        &UnsignedNetworkMembershipGrant {
+            version: NETWORK_MEMBERSHIP_GRANT_VERSION,
+            network_id: "network:sqlite-grant".to_owned(),
+            principal_id: member.node_id(),
+            public_key_hex: member.node_id(),
+            issuer_genesis_id: genesis.node_id(),
+            issued_at: 100,
+            expires_at: Some(200),
+        },
+        &genesis,
+    )
+    .expect("sign grant");
+
+    store
+        .put_network_membership_grant(&grant, 150)
+        .expect("store grant");
+    assert_eq!(
+        store
+            .load_network_membership_grant(&grant.network_id, &grant.principal_id)
+            .expect("load grant"),
+        Some(grant)
+    );
+}
+
+#[test]
 fn sqlite_migrates_legacy_pending_command_status_constraint() {
     let dir = tempdir().expect("temp dir");
     let path = dir.path().join("legacy-command-status.sqlite3");
@@ -745,6 +777,18 @@ fn sqlite_migrates_legacy_client_server_transport_columns() {
         .expect("load migrated progress")
         .expect("legacy progress retained");
     assert_eq!(progress.delivery_policy_version, 1);
+    let conn = Connection::open_sqlite(&path).expect("open migrated sqlite probe");
+    let mut columns = conn
+        .prepare("PRAGMA table_info(cs_outbound_progress_local)")
+        .expect("prepare migrated SQLite columns");
+    let column_names = columns
+        .query_map(wattswarm_storage_core::params![], |row| {
+            row.get::<usize, String>(1)
+        })
+        .expect("query migrated SQLite columns")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("collect migrated SQLite columns");
+    assert!(!column_names.iter().any(|name| name == "cutover_sequence"));
     store
         .save_cs_mailbox_gap(
             "scope",
@@ -783,17 +827,16 @@ fn sqlite_client_server_progress_and_delivery_state_are_durable() {
         "non_global_bulk",
     ];
     store
-        .initialize_cs_outbound_progress("scope", "events", &partitions, 40, 1, 40, 100)
+        .initialize_cs_outbound_progress("scope", "events", &partitions, 1, 0, 100)
         .expect("initialize progress");
     store
-        .initialize_cs_outbound_progress("scope", "events", &partitions, 99, 1, 44, 101)
+        .initialize_cs_outbound_progress("scope", "events", &partitions, 1, 4, 101)
         .expect("idempotent progress initialization");
     let initial = store
         .load_cs_outbound_progress("scope", "events", "global_bulk")
         .expect("load progress")
         .expect("progress exists");
-    assert_eq!(initial.scanned_sequence, 40);
-    assert_eq!(initial.cutover_sequence, 40);
+    assert_eq!(initial.scanned_sequence, 0);
     assert_eq!(initial.delivery_policy_version, 1);
     assert!(
         store
@@ -801,7 +844,7 @@ fn sqlite_client_server_progress_and_delivery_state_are_durable() {
                 "scope",
                 "events",
                 "global_bulk",
-                40,
+                0,
                 200,
                 "backpressure",
                 110,
@@ -810,12 +853,12 @@ fn sqlite_client_server_progress_and_delivery_state_are_durable() {
     );
     assert!(
         store
-            .advance_cs_outbound_progress("scope", "events", "global_bulk", 40, 44, 120)
+            .advance_cs_outbound_progress("scope", "events", "global_bulk", 0, 4, 120)
             .expect("advance accepted partition")
     );
     assert!(
         !store
-            .advance_cs_outbound_progress("scope", "events", "global_bulk", 40, 45, 121)
+            .advance_cs_outbound_progress("scope", "events", "global_bulk", 0, 5, 121)
             .expect("reject stale cursor advance")
     );
     assert_eq!(
@@ -824,11 +867,11 @@ fn sqlite_client_server_progress_and_delivery_state_are_durable() {
             .expect("load independent partition")
             .expect("independent partition exists")
             .scanned_sequence,
-        40
+        0
     );
     assert!(
         store
-            .initialize_cs_outbound_progress("scope", "events", &partitions, 40, 2, 44, 121)
+            .initialize_cs_outbound_progress("scope", "events", &partitions, 2, 4, 121)
             .is_err(),
         "policy upgrade must wait until every partition reaches the source head"
     );
@@ -839,12 +882,12 @@ fn sqlite_client_server_progress_and_delivery_state_are_durable() {
     ] {
         assert!(
             store
-                .advance_cs_outbound_progress("scope", "events", partition, 40, 44, 122)
+                .advance_cs_outbound_progress("scope", "events", partition, 0, 4, 122)
                 .expect("drain partition")
         );
     }
     store
-        .initialize_cs_outbound_progress("scope", "events", &partitions, 40, 2, 44, 123)
+        .initialize_cs_outbound_progress("scope", "events", &partitions, 2, 4, 123)
         .expect("upgrade drained policy");
     assert_eq!(
         store

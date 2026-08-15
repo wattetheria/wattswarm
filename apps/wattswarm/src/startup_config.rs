@@ -1,5 +1,6 @@
 use crate::control::{
-    ExecutorRegistryEntry, load_executor_registry_state, save_executor_registry_state,
+    ExecutorRegistryEntry, load_executor_registry_state, normalize_network_backend,
+    normalize_optional_url, save_executor_registry_state,
 };
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
@@ -84,6 +85,14 @@ pub struct StartupConfig {
     pub bootstrap_contacts: Vec<String>,
     #[serde(default)]
     pub gateway_urls: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network_backend: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_server_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network_registration_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cs_auto_register: Option<bool>,
     #[serde(default)]
     pub core_agent: CoreAgentConfig,
 }
@@ -96,6 +105,10 @@ impl Default for StartupConfig {
             network_mode: NetworkMode::default(),
             bootstrap_contacts: Vec::new(),
             gateway_urls: Vec::new(),
+            network_backend: None,
+            client_server_url: None,
+            network_registration_url: None,
+            cs_auto_register: None,
             core_agent: CoreAgentConfig::default(),
         }
     }
@@ -115,9 +128,25 @@ impl StartupConfig {
         self.longitude = normalize_longitude(self.longitude);
         self.bootstrap_contacts = normalize_bootstrap_contacts(&self.bootstrap_contacts);
         self.gateway_urls = normalize_gateway_urls(&self.gateway_urls);
+        self.network_backend = self
+            .network_backend
+            .as_deref()
+            .and_then(normalize_network_backend);
+        self.client_server_url = self
+            .client_server_url
+            .as_deref()
+            .and_then(normalize_optional_url);
+        self.network_registration_url = self
+            .network_registration_url
+            .as_deref()
+            .and_then(normalize_optional_url);
         if matches!(self.network_mode, NetworkMode::Local) {
             self.bootstrap_contacts.clear();
             self.gateway_urls.clear();
+            self.network_backend = None;
+            self.client_server_url = None;
+            self.network_registration_url = None;
+            self.cs_auto_register = None;
         }
         self.core_agent.provider = self.core_agent.provider.trim().to_owned();
         self.core_agent.base_url = self
@@ -371,12 +400,16 @@ mod tests {
             network_mode: NetworkMode::Local,
             bootstrap_contacts: vec!["iroh-contact-a".to_owned()],
             gateway_urls: vec!["https://gw.example.com".to_owned()],
+            network_backend: Some("client_server".to_owned()),
+            client_server_url: Some("https://message-gateway.example.com".to_owned()),
             ..StartupConfig::default()
         }
         .normalized();
 
         assert!(config.bootstrap_contacts.is_empty());
         assert!(config.gateway_urls.is_empty());
+        assert!(config.network_backend.is_none());
+        assert!(config.client_server_url.is_none());
     }
 
     #[test]
@@ -400,6 +433,34 @@ mod tests {
                 "http://gateway.example.com:8080".to_owned(),
             ]
         );
+    }
+
+    #[test]
+    fn normalizes_network_transport_values_with_shared_rules() {
+        let config = StartupConfig {
+            network_mode: NetworkMode::Wan,
+            network_backend: Some(" CLIENT-SERVER ".to_owned()),
+            client_server_url: Some(" https://message-gateway.example.com/// ".to_owned()),
+            ..StartupConfig::default()
+        }
+        .normalized();
+
+        assert_eq!(config.network_backend.as_deref(), Some("client_server"));
+        assert_eq!(
+            config.client_server_url.as_deref(),
+            Some("https://message-gateway.example.com")
+        );
+
+        let invalid = StartupConfig {
+            network_mode: NetworkMode::Wan,
+            network_backend: Some("future_backend".to_owned()),
+            client_server_url: Some("///".to_owned()),
+            ..StartupConfig::default()
+        }
+        .normalized();
+
+        assert!(invalid.network_backend.is_none());
+        assert!(invalid.client_server_url.is_none());
     }
 
     #[test]

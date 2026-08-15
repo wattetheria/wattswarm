@@ -1704,6 +1704,11 @@ fn ui_exposes_network_join_manifest() {
         "WATTSWARM_PUBLIC_GATEWAY_URLS",
         "https://gateway.wattetheria.com",
     );
+    let _registration_guard = EnvVarGuard::set(
+        "WATTSWARM_NETWORK_REGISTRATION_URL",
+        "https://bootstrap.wattetheria.com",
+    );
+    let _auto_register_guard = EnvVarGuard::set("WATTSWARM_CS_AUTO_REGISTER", "true");
     let _discovery_guard = EnvVarGuard::set(
         "WATTSWARM_PUBLIC_DISCOVERY_URLS",
         "https://bootstrap.wattetheria.com/api/network/discovery",
@@ -1711,6 +1716,11 @@ fn ui_exposes_network_join_manifest() {
     let _relay_guard = EnvVarGuard::set(
         "WATTSWARM_IROH_RELAY_URLS",
         "https://relay.wattetheria.com,https://relay2.wattetheria.com",
+    );
+    let _backend_guard = EnvVarGuard::set("WATTSWARM_NETWORK_BACKEND", "client_server");
+    let _client_server_url_guard = EnvVarGuard::set(
+        "WATTSWARM_CLIENT_SERVER_URL",
+        "https://message-gateway.example.test",
     );
     let dir = tempdir().unwrap();
     let state_dir = dir.path().join("state");
@@ -1777,6 +1787,10 @@ fn ui_exposes_network_join_manifest() {
             Some("https://gateway.wattetheria.com")
         );
         assert_eq!(
+            json["registration_urls"][0].as_str(),
+            Some("https://bootstrap.wattetheria.com")
+        );
+        assert_eq!(
             json["discovery_urls"][0].as_str(),
             Some("https://bootstrap.wattetheria.com/api/network/discovery")
         );
@@ -1788,6 +1802,12 @@ fn ui_exposes_network_join_manifest() {
             json["relay_urls"][1].as_str(),
             Some("https://relay2.wattetheria.com")
         );
+        assert_eq!(json["network_backend"].as_str(), Some("client_server"));
+        assert_eq!(
+            json["client_server_url"].as_str(),
+            Some("https://message-gateway.example.test")
+        );
+        assert_eq!(json["cs_auto_register"].as_bool(), Some(true));
         assert!(json.get("servicenet_urls").is_none());
     });
 }

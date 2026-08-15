@@ -6708,6 +6708,7 @@ dependencies = [
  "wattswarm-artifact-store",
  "wattswarm-control-plane",
  "wattswarm-crypto",
+ "wattswarm-network-client-server",
  "wattswarm-network-discovery",
  "wattswarm-network-p2p",
  "wattswarm-network-transport-iroh",
@@ -6746,6 +6747,7 @@ dependencies = [
  "serde_jcs 0.2.0",
  "serde_json",
  "sha2 0.10.9",
+ "tempfile",
  "tokio",
  "uuid",
  "watt-did",
@@ -6774,6 +6776,7 @@ dependencies = [
  "hkdf",
  "rand 0.8.5",
  "serde",
+ "serde_jcs 0.2.0",
  "serde_json",
  "sha2 0.10.9",
  "wattswarm-protocol",
@@ -6788,9 +6791,12 @@ dependencies = [
  "base64",
  "reqwest 0.12.28",
  "serde",
+ "serde_jcs 0.2.0",
  "serde_json",
  "tempfile",
+ "uuid",
  "wattswarm-network-transport-core",
+ "wattswarm-protocol",
 ]
 
 [[package]]
@@ -6906,6 +6912,7 @@ name = "wattswarm-protocol"
 version = "0.1.0"
 dependencies = [
  "serde",
+ "serde_jcs 0.2.0",
  "serde_json",
  "thiserror 2.0.18",
 ]

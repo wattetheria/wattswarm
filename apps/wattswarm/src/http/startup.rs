@@ -20,6 +20,8 @@ pub(crate) struct StartupConfigSaveRequest {
     #[serde(default)]
     gateway_urls: Vec<String>,
     #[serde(default)]
+    network_registration_url: Option<String>,
+    #[serde(default)]
     core_agent: Option<crate::startup_config::CoreAgentConfig>,
 }
 pub(crate) async fn startup_config_get(
@@ -59,6 +61,12 @@ pub(crate) async fn startup_config_save(
         network_mode: req.network_mode,
         bootstrap_contacts,
         gateway_urls,
+        network_backend: existing.network_backend,
+        client_server_url: existing.client_server_url,
+        network_registration_url: req
+            .network_registration_url
+            .or(existing.network_registration_url),
+        cs_auto_register: existing.cs_auto_register,
         core_agent: req.core_agent.clone().unwrap_or(existing.core_agent),
     }
     .normalized();

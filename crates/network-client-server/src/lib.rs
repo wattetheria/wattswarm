@@ -11,8 +11,9 @@ pub use delivery_class_policy::{
     DeliveryClassInput, EventDeliveryUrgency, delivery_class_for_record,
 };
 pub use frame::{
-    ChallengeRequest, ChallengeResponse, CommitRequest, ControlAcceptance, ControlFrame,
-    ControlFrameKind, HistoryStatus, LogicalNodePrincipalClaim, LogicalNodePrincipalProof,
+    AutoRegistrationRequest, AutoRegistrationResponse, ChallengeRequest, ChallengeResponse,
+    CommitRequest, ControlAcceptance, ControlFrame, ControlFrameKind, GrantAdmissionRequest,
+    GrantAdmissionResponse, HistoryStatus, LogicalNodePrincipalClaim, LogicalNodePrincipalProof,
     PublishAcceptance, PublishFrame, PublishPayloadType, PublishRoute, SessionProofRequest,
     SessionResponse, control_frame_signing_message, session_proof_message,
 };

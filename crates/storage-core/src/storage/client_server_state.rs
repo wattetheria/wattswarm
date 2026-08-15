@@ -8,7 +8,6 @@ pub struct CsOutboundProgressRow {
     pub source_id: String,
     pub outbound_partition: String,
     pub scanned_sequence: u64,
-    pub cutover_sequence: u64,
     pub delivery_policy_version: u64,
     pub retry_attempts: u32,
     pub next_retry_at: Option<u64>,
@@ -106,13 +105,11 @@ impl PgStore {
         .map_err(Into::into)
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub fn initialize_cs_outbound_progress(
         &self,
         scope_id: &str,
         source_id: &str,
         outbound_partitions: &[&str],
-        cutover_sequence: u64,
         delivery_policy_version: u64,
         source_head: u64,
         now_ms: u64,
@@ -165,24 +162,22 @@ impl PgStore {
             }
             for partition in outbound_partitions {
                 let partition = *partition;
-                let cutover_sequence = cutover_sequence as i64;
                 let delivery_policy_version = delivery_policy_version as i64;
                 let now_ms = now_ms as i64;
-                let params: [&(dyn DbParam + Sync); 6] = [
+                let params: [&(dyn DbParam + Sync); 5] = [
                     &scope_id,
                     &source_id,
                     &partition,
-                    &cutover_sequence,
                     &delivery_policy_version,
                     &now_ms,
                 ];
                 tx.execute(
                     "INSERT INTO cs_outbound_progress_local(
                          scope_id, source_id, outbound_partition, scanned_sequence,
-                         cutover_sequence, delivery_policy_version, retry_attempts, updated_at
+                         delivery_policy_version, retry_attempts, updated_at
                      ) VALUES (
-                         $1, $2, $3, $4, $4, $5, 0,
-                         TIMESTAMPTZ 'epoch' + ($6::bigint * INTERVAL '1 millisecond')
+                         $1, $2, $3, 0, $4, 0,
+                         TIMESTAMPTZ 'epoch' + ($5::bigint * INTERVAL '1 millisecond')
                      ) ON CONFLICT(scope_id, source_id, outbound_partition) DO NOTHING",
                     &params,
                 )?;
@@ -204,7 +199,7 @@ impl PgStore {
             .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
         Ok(conn
             .query_row(
-                "SELECT source_id, outbound_partition, scanned_sequence, cutover_sequence,
+                "SELECT source_id, outbound_partition, scanned_sequence,
                         delivery_policy_version, retry_attempts,
                         (EXTRACT(EPOCH FROM next_retry_at) * 1000)::BIGINT,
                         last_error,
@@ -217,12 +212,11 @@ impl PgStore {
                         source_id: row.get(0)?,
                         outbound_partition: row.get(1)?,
                         scanned_sequence: row.get::<_, i64>(2)? as u64,
-                        cutover_sequence: row.get::<_, i64>(3)? as u64,
-                        delivery_policy_version: row.get::<_, i64>(4)? as u64,
-                        retry_attempts: row.get::<_, i64>(5)? as u32,
-                        next_retry_at: row.get::<_, Option<i64>>(6)?.map(|value| value as u64),
-                        last_error: row.get(7)?,
-                        updated_at: row.get::<_, i64>(8)? as u64,
+                        delivery_policy_version: row.get::<_, i64>(3)? as u64,
+                        retry_attempts: row.get::<_, i64>(4)? as u32,
+                        next_retry_at: row.get::<_, Option<i64>>(5)?.map(|value| value as u64),
+                        last_error: row.get(6)?,
+                        updated_at: row.get::<_, i64>(7)? as u64,
                     })
                 },
             )

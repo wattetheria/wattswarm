@@ -346,7 +346,7 @@ fn handle_node(cmd: NodeCommand, state_dir: &Path, db_path: &Path) -> Result<()>
             let mode = NodeMode::parse(&mode)?;
             let node = open_node_in_mode(state_dir, db_path, mode)?;
             write_node_state(state_dir, true, mode)?;
-            if crate::network_bridge::network_enabled_from_env() {
+            if crate::network_bridge::network_enabled_from_state_dir(state_dir) {
                 crate::udp_announce::announce_startup_with_contact(
                     "node-up",
                     None,

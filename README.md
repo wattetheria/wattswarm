@@ -178,7 +178,21 @@ WATTSWARM_NETWORK_BACKEND=p2p
 # ClientServer distribution
 WATTSWARM_NETWORK_BACKEND=client_server
 WATTSWARM_CLIENT_SERVER_URL=https://message-gateway.example.com
+# Genesis node: publish this base URL through the join manifest.
+WATTSWARM_NETWORK_REGISTRATION_URL=https://genesis.example.com
+# Genesis network policy. Omit it to keep the default auto behavior.
+WATTSWARM_CS_AUTO_REGISTER=true
+# Optional Genesis setting. 0 means grants do not expire.
+WATTSWARM_NETWORK_GRANT_TTL_SECONDS=0
 ```
+
+With `WATTSWARM_CS_AUTO_REGISTER=true` (the default), a new ClientServer node
+signs a registration request with its local node identity and sends it to the
+Genesis registration server. `WATTSWARM_NETWORK_REGISTRATION_URL` is the base
+URL; the node appends `/api/network/registration/auto`. Genesis signs a
+`NetworkMembershipGrant`, and the node stores it locally before presenting it
+to the Message Gateway at `/v1/admission/grant`. The Gateway verifies the
+Genesis signature and admits the node before the normal session challenge.
 
 Networked P2P and ClientServer nodes run one `NodeMaintenanceLoop` and one
 bounded Agent Inbox worker per canonical `state_dir`. A process-local registry

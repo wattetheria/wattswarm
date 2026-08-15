@@ -26,6 +26,7 @@ COPY crates/control-plane/Cargo.toml crates/control-plane/Cargo.toml
 COPY crates/run-queue/Cargo.toml crates/run-queue/Cargo.toml
 COPY crates/network-discovery/Cargo.toml crates/network-discovery/Cargo.toml
 COPY crates/network-transport-core/Cargo.toml crates/network-transport-core/Cargo.toml
+COPY crates/network-client-server/Cargo.toml crates/network-client-server/Cargo.toml
 COPY crates/network-transport-iroh/Cargo.toml crates/network-transport-iroh/Cargo.toml
 COPY apps/wattswarm/Cargo.toml apps/wattswarm/Cargo.toml
 COPY apps/wattswarm-runtime/Cargo.toml apps/wattswarm-runtime/Cargo.toml
@@ -50,6 +51,7 @@ RUN mkdir -p \
     crates/run-queue/src \
     crates/network-discovery/src \
     crates/network-transport-core/src \
+    crates/network-client-server/src \
     crates/network-transport-iroh/src \
     apps/wattswarm/src \
     apps/wattswarm-runtime/src \
@@ -66,6 +68,7 @@ RUN mkdir -p \
     && printf "pub fn _planner_stub() {}\n" > crates/run-queue/src/lib.rs \
     && printf "pub fn _planner_stub() {}\n" > crates/network-discovery/src/lib.rs \
     && printf "pub fn _planner_stub() {}\n" > crates/network-transport-core/src/lib.rs \
+    && printf "pub fn _planner_stub() {}\n" > crates/network-client-server/src/lib.rs \
     && printf "pub fn _planner_stub() {}\n" > crates/network-transport-iroh/src/lib.rs \
     && printf "pub fn _planner_stub() {}\n" > apps/wattswarm/src/lib.rs \
     && printf "fn main() {}\n" > apps/wattswarm/src/main.rs \

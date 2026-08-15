@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 use wattswarm_network_transport_core::{
     DeliveryClass, EventTransportRoute, OpaqueCommitToken, OpaqueSignedRecord,
 };
+use wattswarm_protocol::types::NetworkMembershipGrant;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -126,6 +127,52 @@ pub struct SessionProofRequest {
     pub principals: Vec<LogicalNodePrincipalClaim>,
     pub proofs: Vec<LogicalNodePrincipalProof>,
     pub delivery_policy_version: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AutoRegistrationRequest {
+    pub network_id: String,
+    pub principal_id: String,
+    pub public_key_hex: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tenant_instance_id: Option<String>,
+    pub nonce: String,
+    pub signature_hex: String,
+}
+
+impl AutoRegistrationRequest {
+    pub fn signing_message(&self) -> Result<Vec<u8>, serde_json::Error> {
+        let payload = serde_json::json!({
+            "domain": "wattswarm:network-registration-request:v1",
+            "network_id": self.network_id,
+            "principal_id": self.principal_id,
+            "public_key_hex": self.public_key_hex,
+            "tenant_instance_id": self.tenant_instance_id,
+            "nonce": self.nonce,
+        });
+        serde_jcs::to_vec(&payload)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AutoRegistrationResponse {
+    pub network_id: String,
+    pub principal_id: String,
+    pub grant: NetworkMembershipGrant,
+    pub status: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GrantAdmissionRequest {
+    pub grant: NetworkMembershipGrant,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GrantAdmissionResponse {
+    pub network_id: String,
+    pub principal_id: String,
+    pub membership_version: String,
+    pub status: String,
 }
 
 pub fn session_proof_message(
@@ -276,5 +323,28 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(response.history_status, HistoryStatus::CurrentMailboxOnly);
+    }
+
+    #[test]
+    fn auto_registration_request_round_trips_and_signing_excludes_signature() {
+        let request = AutoRegistrationRequest {
+            network_id: "network-a".to_owned(),
+            principal_id: "principal-a".to_owned(),
+            public_key_hex: "principal-a".to_owned(),
+            tenant_instance_id: Some("instance-a".to_owned()),
+            nonce: "nonce-a".to_owned(),
+            signature_hex: "signature-a".to_owned(),
+        };
+        let encoded = serde_json::to_string(&request).unwrap();
+        assert!(encoded.contains("signature-a"));
+        assert!(
+            !String::from_utf8(request.signing_message().unwrap())
+                .unwrap()
+                .contains("signature-a")
+        );
+        assert_eq!(
+            serde_json::from_str::<AutoRegistrationRequest>(&encoded).unwrap(),
+            request
+        );
     }
 }

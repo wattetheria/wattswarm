@@ -1,27 +1,25 @@
 use super::service_loop::{
     NetworkServiceStatus, network_service_statuses, set_network_service_status,
 };
-use crate::network_service::{
-    ContentFetcher, ENV_CLIENT_SERVER_URL, HttpObjectStoreContentFetcher, event_artifact_refs,
-};
+use crate::network_service::{ContentFetcher, HttpObjectStoreContentFetcher, event_artifact_refs};
 use anyhow::{Context, Result, bail};
-use std::env;
 use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use wattswarm_network_client_server::{
-    ChallengeRequest, ClientServerClient, ClientServerConfig, ClientServerTransport, CommitRequest,
-    ControlFrame, ControlFrameKind, DeliveryClassInput, DeliveryScheduler, EventDeliveryUrgency,
-    HistoryStatus, LogicalNodePrincipalClaim, LogicalNodePrincipalProof, PublishFrame,
-    PublishPayloadType, PublishRoute, SessionProofRequest, SessionResponse,
-    WeightedDeliveryScheduler, control_frame_signing_message, delivery_class_for_record,
-    session_proof_message,
+    AutoRegistrationRequest, ChallengeRequest, ClientServerClient, ClientServerConfig,
+    ClientServerTransport, CommitRequest, ControlFrame, ControlFrameKind, DeliveryClassInput,
+    DeliveryScheduler, EventDeliveryUrgency, GrantAdmissionRequest, HistoryStatus,
+    LogicalNodePrincipalClaim, LogicalNodePrincipalProof, PublishFrame, PublishPayloadType,
+    PublishRoute, SessionProofRequest, SessionResponse, WeightedDeliveryScheduler,
+    control_frame_signing_message, delivery_class_for_record, session_proof_message,
 };
 use wattswarm_network_transport_core::{
     CheckpointAnnouncement, DeliveryClass, DeliveryPage, EventTransportRoute,
     MailboxControlDelivery, OpaqueCommitToken, OpaqueSignedRecord, PropagationLane,
     SummaryAnnouncement, SwarmScope,
 };
+use wattswarm_protocol::types::NetworkMembershipGrant;
 use wattswarm_storage_core::storage::{
     CsMailboxDeliveryState, NetworkBackendStatusRow, PgStore, local_control_scope_id,
 };
@@ -29,7 +27,6 @@ use wattswarm_storage_core::storage::{
 const EVENT_SOURCE_ID: &str = "events";
 const CS_SCAN_LIMIT: usize = 128;
 const CS_IDLE_SLEEP: Duration = Duration::from_millis(100);
-const ENV_CS_CUTOVER_SEQUENCE: &str = "WATTSWARM_CS_CUTOVER_SEQUENCE";
 
 pub(super) fn build_client_server_contact_material(
     state_dir: &Path,
@@ -139,8 +136,8 @@ pub(super) fn maybe_start_client_server_network_service(
     state_dir: PathBuf,
     db_path: PathBuf,
 ) -> Result<bool> {
-    let gateway_url = env::var(ENV_CLIENT_SERVER_URL)
-        .context("WATTSWARM_CLIENT_SERVER_URL is required for client_server backend")?;
+    let gateway_url =
+        crate::network_service::client_server_url_from_env_or_startup_config(&state_dir)?;
     {
         let mut statuses = network_service_statuses()
             .lock()
@@ -190,6 +187,14 @@ fn run_client_server_network_service(
     )?;
     let mut observability = CsRuntimeObservability::default();
     let auth_started = Instant::now();
+    let _grant = load_or_register_grant(
+        &client,
+        state_dir,
+        &node.store,
+        &identity,
+        &network_id,
+        &tenant_instance_id,
+    )?;
     let mut session = authenticate(
         &client,
         &identity,
@@ -201,11 +206,6 @@ fn run_client_server_network_service(
     observability.session.observe(auth_started);
     let mut history_unavailable = session.history_status == HistoryStatus::HistoryUnavailable;
     content_fetcher.set_bearer_token(Some(session.session_token.clone()));
-    let configured_cutover = env::var(ENV_CS_CUTOVER_SEQUENCE)
-        .ok()
-        .map(|value| value.parse::<u64>())
-        .transpose()
-        .context("parse WATTSWARM_CS_CUTOVER_SEQUENCE")?;
     let partition_names = CsOutboundPartition::ALL.map(CsOutboundPartition::as_str);
     let source_head = node.head_seq()?;
     let existing_progress = CsOutboundPartition::ALL
@@ -216,40 +216,15 @@ fn run_client_server_network_service(
         })
         .collect::<Result<Vec<_>>>()?;
     let initialized = existing_progress.iter().flatten().count();
-    let cutover_sequence = match initialized {
-        0 => match configured_cutover {
-            Some(cutover) if cutover <= source_head => cutover,
-            Some(_) => bail!("ClientServer cutover sequence exceeds the Event source head"),
-            None if source_head == 0 => 0,
-            None => bail!(
-                "WATTSWARM_CS_CUTOVER_SEQUENCE is required when enabling ClientServer on an existing Event Store"
-            ),
-        },
-        count if count == CsOutboundPartition::ALL.len() => {
-            let cutovers = existing_progress
-                .iter()
-                .flatten()
-                .map(|progress| progress.cutover_sequence)
-                .collect::<std::collections::BTreeSet<_>>();
-            if cutovers.len() != 1 {
-                bail!("ClientServer outbound partitions have inconsistent cutover sequences");
-            }
-            let stored = *cutovers
-                .iter()
-                .next()
-                .context("missing stored CS cutover")?;
-            if configured_cutover.is_some_and(|configured| configured != stored) {
-                bail!("configured ClientServer cutover differs from persisted progress");
-            }
-            stored
-        }
-        _ => bail!("ClientServer outbound progress is only partially initialized"),
-    };
+    validate_client_server_outbound_progress_state(
+        initialized,
+        CsOutboundPartition::ALL.len(),
+        source_head,
+    )?;
     node.store.initialize_cs_outbound_progress(
         &scope_id,
         EVENT_SOURCE_ID,
         &partition_names,
-        cutover_sequence,
         delivery_policy_version,
         source_head,
         now_ms(),
@@ -487,6 +462,66 @@ fn run_client_server_network_service(
             thread::sleep(CS_IDLE_SLEEP);
         }
     }
+}
+
+fn validate_client_server_outbound_progress_state(
+    initialized: usize,
+    partition_count: usize,
+    source_head: u64,
+) -> Result<()> {
+    match initialized {
+        0 if source_head == 0 => Ok(()),
+        0 => bail!(
+            "ClientServer requires a fresh Event Store; redeploy the node before enabling ClientServer"
+        ),
+        count if count == partition_count => Ok(()),
+        _ => bail!("ClientServer outbound progress is only partially initialized"),
+    }
+}
+
+fn load_or_register_grant(
+    client: &ClientServerClient,
+    state_dir: &Path,
+    store: &PgStore,
+    identity: &crate::crypto::NodeIdentity,
+    network_id: &str,
+    tenant_instance_id: &str,
+) -> Result<NetworkMembershipGrant> {
+    let topology = store.load_network_topology_for_org(store.org_id())?;
+    let expected_genesis = topology.network.genesis_node_id;
+    let principal_id = identity.node_id();
+    if let Some(grant) = store.load_network_membership_grant(network_id, &principal_id)?
+        && crate::crypto::verify_network_membership_grant(&grant, &expected_genesis, now_ms())
+            .is_ok()
+    {
+        client.admit_grant(&GrantAdmissionRequest {
+            grant: grant.clone(),
+        })?;
+        return Ok(grant);
+    }
+    if !crate::network_service::client_server_auto_registration_enabled(state_dir)? {
+        bail!("ClientServer node membership grant is missing or invalid");
+    }
+    let registration_url =
+        crate::network_service::network_registration_url_from_env_or_startup_config(state_dir)?;
+    let mut request = AutoRegistrationRequest {
+        network_id: network_id.to_owned(),
+        principal_id: principal_id.clone(),
+        public_key_hex: principal_id,
+        tenant_instance_id: Some(tenant_instance_id.to_owned()),
+        nonce: uuid::Uuid::new_v4().to_string(),
+        signature_hex: String::new(),
+    };
+    request.signature_hex = identity.sign_bytes(&request.signing_message()?);
+    let response = client
+        .auto_register(&registration_url, &request)
+        .context("register ClientServer node automatically")?;
+    crate::crypto::verify_network_membership_grant(&response.grant, &expected_genesis, now_ms())?;
+    store.put_network_membership_grant(&response.grant, now_ms())?;
+    client.admit_grant(&GrantAdmissionRequest {
+        grant: response.grant.clone(),
+    })?;
+    Ok(response.grant)
 }
 
 fn authenticate(
@@ -1152,8 +1187,9 @@ fn apply_control_delivery(
                 contact_material: Some(build_client_server_contact_material(
                     state_dir,
                     identity,
-                    &env::var(ENV_CLIENT_SERVER_URL)
-                        .context("WATTSWARM_CLIENT_SERVER_URL is required")?,
+                    &crate::network_service::client_server_url_from_env_or_startup_config(
+                        state_dir,
+                    )?,
                 )?),
                 detail: None,
                 updated_at: now_ms(),
@@ -1410,7 +1446,6 @@ fn store_backend_status(
                         "scanned_sequence": progress.scanned_sequence,
                         "source_head": source_head,
                         "cursor_lag": source_head.saturating_sub(progress.scanned_sequence),
-                        "cutover_sequence": progress.cutover_sequence,
                         "delivery_policy_version": progress.delivery_policy_version,
                         "retry_attempts": progress.retry_attempts,
                         "consecutive_retries": progress.retry_attempts,
@@ -1531,7 +1566,6 @@ mod tests {
                 "scope-a",
                 EVENT_SOURCE_ID,
                 &partitions,
-                0,
                 wattswarm_network_client_server::DELIVERY_POLICY_VERSION,
                 0,
                 1,
@@ -1565,6 +1599,14 @@ mod tests {
         assert_eq!(details["publisher_confirm_latency"]["count"], 0);
         assert_eq!(details["delivery_page_latency"]["count"], 0);
         assert_eq!(details["cumulative_commit"]["pending_pages"], 0);
+    }
+
+    #[test]
+    fn client_server_requires_a_fresh_event_store_for_first_start() {
+        assert!(validate_client_server_outbound_progress_state(0, 4, 0).is_ok());
+        assert!(validate_client_server_outbound_progress_state(4, 4, 12).is_ok());
+        assert!(validate_client_server_outbound_progress_state(0, 4, 12).is_err());
+        assert!(validate_client_server_outbound_progress_state(2, 4, 0).is_err());
     }
 
     #[test]

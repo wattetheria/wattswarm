@@ -23,6 +23,28 @@ fn network_enabled_can_be_explicitly_disabled() {
 }
 
 #[test]
+fn persisted_client_server_backend_ignores_p2p_disable_flag() {
+    let _lock = lock_env_test_mutex();
+    let _backend = EnvVarGuard::set(crate::network_service::ENV_NETWORK_BACKEND, None);
+    let _service_enabled =
+        EnvVarGuard::set(crate::network_service::ENV_NETWORK_SERVICE_ENABLED, None);
+    let _p2p_enabled = EnvVarGuard::set(ENV_P2P_ENABLED, Some("false"));
+    let state_dir = temp_startup_dir("client-server-enabled");
+    std::fs::write(
+        state_dir.join("startup_config.json"),
+        serde_json::json!({
+            "network_backend": "client_server",
+            "client_server_url": "https://message-gateway.example.test"
+        })
+        .to_string(),
+    )
+    .expect("write persisted client-server config");
+
+    assert!(network_enabled_from_state_dir(&state_dir));
+    std::fs::remove_dir_all(state_dir).expect("remove client-server test state");
+}
+
+#[test]
 fn configured_network_scopes_include_global_by_default() {
     let _lock = lock_env_test_mutex();
     let _regions = EnvVarGuard::set(ENV_P2P_REGION_IDS, None);

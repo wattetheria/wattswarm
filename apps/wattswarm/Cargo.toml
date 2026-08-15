@@ -48,6 +48,7 @@ wattswarm-crypto = { workspace = true }
 wattswarm-artifact-store = { workspace = true }
 wattswarm-network-discovery = { workspace = true }
 wattswarm-network-p2p = { workspace = true }
+wattswarm-network-client-server = { workspace = true }
 wattswarm-network-transport-iroh = { workspace = true }
 wattswarm-policy-engine = { workspace = true }
 wattswarm-runtime-client = { workspace = true }

@@ -324,6 +324,10 @@ fn open_node_network_mode_auto_syncs_signed_bundle_from_join_manifest() {
         network_id: network_id.to_owned(),
         genesis_node_id: remote_node_id.clone(),
         params_hash: bundle.signed_params.params_hash.clone(),
+        network_backend: Some("client_server".to_owned()),
+        client_server_url: Some("https://message-gateway.example.test".to_owned()),
+        cs_auto_register: Some(true),
+        registration_urls: Vec::new(),
         bootstrap_urls: Vec::new(),
         bootstrap_contacts: vec!["iroh-bootstrap-contact-json".to_owned()],
         gateway_urls: vec!["https://gateway.wattetheria.com/".to_owned()],
@@ -402,6 +406,15 @@ fn open_node_network_mode_auto_syncs_signed_bundle_from_join_manifest() {
         Some("https://gateway.wattetheria.com")
     );
     assert_eq!(
+        startup_config["network_backend"].as_str(),
+        Some("client_server")
+    );
+    assert_eq!(
+        startup_config["client_server_url"].as_str(),
+        Some("https://message-gateway.example.test")
+    );
+    assert_eq!(startup_config["cs_auto_register"].as_bool(), Some(true));
+    assert_eq!(
         startup_config["relay_urls"],
         json!([
             "https://relay.wattetheria.com",
@@ -466,6 +479,10 @@ fn open_node_network_mode_rejects_join_manifest_params_hash_mismatch() {
         network_id: network_id.to_owned(),
         genesis_node_id: remote_node_id,
         params_hash: "wrong-params-hash".to_owned(),
+        network_backend: None,
+        client_server_url: None,
+        cs_auto_register: None,
+        registration_urls: Vec::new(),
         bootstrap_urls: Vec::new(),
         bootstrap_contacts: Vec::new(),
         gateway_urls: Vec::new(),
@@ -586,6 +603,8 @@ fn join_manifest_without_relay_urls_field_deserializes_to_empty() {
     )
     .expect("deserialize legacy manifest");
     assert!(manifest.relay_urls.is_empty());
+    assert!(manifest.network_backend.is_none());
+    assert!(manifest.client_server_url.is_none());
 }
 
 fn relay_refresh_manifest(relay_urls: Vec<String>) -> NetworkJoinManifest {
@@ -593,11 +612,32 @@ fn relay_refresh_manifest(relay_urls: Vec<String>) -> NetworkJoinManifest {
         network_id: "mainnet:wattetheria".to_owned(),
         genesis_node_id: "genesis-node".to_owned(),
         params_hash: "params-hash".to_owned(),
+        network_backend: None,
+        client_server_url: None,
+        cs_auto_register: None,
+        registration_urls: Vec::new(),
         bootstrap_urls: Vec::new(),
         bootstrap_contacts: Vec::new(),
         gateway_urls: Vec::new(),
         discovery_urls: Vec::new(),
         relay_urls,
+    }
+}
+
+fn network_config_refresh_manifest() -> NetworkJoinManifest {
+    NetworkJoinManifest {
+        network_id: "mainnet:wattetheria".to_owned(),
+        genesis_node_id: "genesis-node".to_owned(),
+        params_hash: "params-hash".to_owned(),
+        network_backend: Some("client_server".to_owned()),
+        client_server_url: Some("https://message-gateway.example.test/".to_owned()),
+        cs_auto_register: Some(false),
+        registration_urls: vec!["https://genesis.example.test/".to_owned()],
+        bootstrap_urls: Vec::new(),
+        bootstrap_contacts: Vec::new(),
+        gateway_urls: Vec::new(),
+        discovery_urls: Vec::new(),
+        relay_urls: Vec::new(),
     }
 }
 
@@ -676,6 +716,55 @@ fn refresh_relay_urls_overwrites_startup_config_from_join_manifest() {
         wattswarm_control_plane::refresh_startup_config_relay_urls_from_join_manifest(&state_dir)
             .expect("refresh relay urls again");
     assert!(!unchanged, "identical relay set must not rewrite the file");
+
+    cleanup_dir(&dir);
+}
+
+#[test]
+fn refresh_network_transport_config_overwrites_startup_config_from_join_manifest() {
+    let _guard = env_lock();
+    let stub = JoinManifestStub::start(network_config_refresh_manifest());
+    let _mode_guard = EnvVarGuard::remove("WATTSWARM_NODE_MODE");
+    let _manifest_guard =
+        EnvVarGuard::set("WATTSWARM_NETWORK_JOIN_MANIFEST_URLS", &stub.manifest_url());
+    let dir = temp_test_dir("refresh-network-transport-config");
+    let state_dir = dir.join("state");
+    fs::create_dir_all(&state_dir).expect("create state dir");
+    fs::write(
+        state_dir.join("startup_config.json"),
+        json!({
+            "network_mode": "wan",
+            "network_backend": "p2p",
+            "client_server_url": "https://old-message-gateway.example"
+        })
+        .to_string(),
+    )
+    .expect("write startup config");
+
+    let changed =
+        wattswarm_control_plane::refresh_startup_config_relay_urls_from_join_manifest(&state_dir)
+            .expect("refresh network transport config");
+    assert!(changed);
+    let startup_config: serde_json::Value =
+        serde_json::from_slice(&fs::read(state_dir.join("startup_config.json")).unwrap()).unwrap();
+    assert_eq!(
+        startup_config["network_backend"].as_str(),
+        Some("client_server")
+    );
+    assert_eq!(
+        startup_config["client_server_url"].as_str(),
+        Some("https://message-gateway.example.test")
+    );
+    assert_eq!(
+        startup_config["network_registration_url"].as_str(),
+        Some("https://genesis.example.test")
+    );
+    assert_eq!(startup_config["cs_auto_register"].as_bool(), Some(false));
+
+    let unchanged =
+        wattswarm_control_plane::refresh_startup_config_relay_urls_from_join_manifest(&state_dir)
+            .expect("refresh network transport config again");
+    assert!(!unchanged);
 
     cleanup_dir(&dir);
 }

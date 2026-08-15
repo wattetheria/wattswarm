@@ -73,8 +73,8 @@ pub use service_loop::{
     PostTickHook, configured_network_scopes_from_env, latest_connected_peer_ids,
     latest_network_observability_snapshot, maybe_start_background_network_service,
     maybe_start_background_network_service_with_hook, network_config_from_env,
-    network_config_from_state_dir, network_enabled_from_env, network_service_started,
-    network_service_status,
+    network_config_from_state_dir, network_enabled_from_env, network_enabled_from_state_dir,
+    network_service_started, network_service_status,
 };
 pub use summary::{
     apply_summary_announcement, build_knowledge_summary_for_task_type,

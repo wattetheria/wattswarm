@@ -20,7 +20,7 @@ pub fn run(state_dir: PathBuf, db_path: PathBuf, listen: String) -> Result<()> {
     fs::create_dir_all(&state_dir)?;
     crate::startup_config::ensure_default_wan_startup_config(&state_dir)?;
     let node_id = local_node_id(&state_dir).ok();
-    let network_enabled = crate::network_bridge::network_enabled_from_env();
+    let network_enabled = crate::network_bridge::network_enabled_from_state_dir(&state_dir);
     if network_enabled {
         if let Some(id) = &node_id {
             crate::udp_announce::maybe_start_listener(state_dir.clone(), id.clone());
@@ -162,6 +162,10 @@ pub fn build_app(state: UiServerState) -> Router {
         .route(
             "/api/network/bootstrap",
             get(crate::http::network_bootstrap::network_bootstrap),
+        )
+        .route(
+            "/api/network/registration/auto",
+            post(crate::http::network_bootstrap::network_auto_registration),
         )
         .route(
             "/.well-known/wattswarm/join.json",
