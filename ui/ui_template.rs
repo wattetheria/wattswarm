@@ -71,7 +71,7 @@ pub const INDEX_HTML: &str = r#"<!DOCTYPE html>
       gap: 0.55rem;
       padding: 0.4rem 0.6rem;
       border: 1px solid var(--line);
-      border-radius: 999px;
+      border-radius: 0;
       background: var(--surface);
     }
     .theme-picker-label {
@@ -280,7 +280,7 @@ pub const INDEX_HTML: &str = r#"<!DOCTYPE html>
       background: var(--surface);
       color: var(--muted);
       border: 1px solid var(--line-strong);
-      border-radius: 999px;
+      border-radius: 0;
       font-weight: 500;
     }
     .tab:hover { background: var(--surface-alt); color: var(--ink); filter: none; }
@@ -329,7 +329,7 @@ pub const INDEX_HTML: &str = r#"<!DOCTYPE html>
       display: inline-flex;
       align-items: center;
       border: 1px solid transparent;
-      border-radius: 999px;
+      border-radius: 0;
       background: var(--surface-alt);
       padding: 0.15rem 0.55rem;
       color: var(--muted);
@@ -355,7 +355,7 @@ pub const INDEX_HTML: &str = r#"<!DOCTYPE html>
       max-width: 100%;
       padding: 0.12rem 0.5rem;
       border: 1px solid var(--line);
-      border-radius: 999px;
+      border-radius: 0;
       background: var(--surface-alt);
       color: var(--muted);
       font-weight: 500;

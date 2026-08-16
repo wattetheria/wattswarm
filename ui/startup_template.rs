@@ -337,7 +337,7 @@ pub const STARTUP_HTML: &str = r#"<!DOCTYPE html>
       gap: 0.55rem;
       padding: 0.4rem 0.6rem;
       border: 1px solid var(--line);
-      border-radius: 999px;
+      border-radius: 0;
       background: var(--surface);
     }
     .theme-picker-label {
