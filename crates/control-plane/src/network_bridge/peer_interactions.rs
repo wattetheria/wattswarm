@@ -713,6 +713,12 @@ pub(super) fn verify_agent_envelope_signature_for_source(
     if let Some(card) = &envelope.source_agent_card {
         verify_source_agent_card(envelope, card, expected_source_node_id)?;
     }
+    if let Some(extensions_json) = envelope.extensions_json.as_deref()
+        && let Ok(extensions) = serde_json::from_str::<Value>(extensions_json)
+        && let Some(credential) = extensions.get("network_membership_credential")
+    {
+        validate_membership_credential_value(credential, envelope.source_agent_id.as_deref())?;
+    }
     let Some(signature) = envelope.signature.as_deref() else {
         return Ok(());
     };
@@ -807,6 +813,9 @@ fn verify_source_agent_card(
     if card.card_hash != card_hash {
         bail!("source_agent_card hash mismatch");
     }
+    if let Some(credential) = card.card.pointer("/metadata/network_membership_credential") {
+        validate_membership_credential_value(credential, Some(&card.agent_id))?;
+    }
 
     let Some(signature) = card.signature.as_deref() else {
         return Ok(());
@@ -823,6 +832,53 @@ fn verify_source_agent_card(
         signature,
     )
     .context("verify source_agent_card signature")
+}
+
+fn validate_membership_credential_value(
+    value: &Value,
+    expected_agent_did: Option<&str>,
+) -> Result<()> {
+    let version = value
+        .get("version")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| anyhow!("membership credential version is required"))?;
+    let credential_id = value
+        .get("credential_id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| anyhow!("membership credential credential_id is required"))?;
+    let request_id = value
+        .get("request_id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| anyhow!("membership credential request_id is required"))?;
+    let network_id = value
+        .get("network_id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| anyhow!("membership credential network_id is required"))?;
+    let agent_did = value
+        .get("agent_did")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| anyhow!("membership credential agent_did is required"))?;
+    if expected_agent_did.is_some_and(|expected| expected != agent_did) {
+        bail!("membership credential agent_did does not match source Agent");
+    }
+    let issued_at = value
+        .get("issued_at")
+        .or_else(|| value.get("issued_at_ms"))
+        .and_then(Value::as_u64)
+        .ok_or_else(|| anyhow!("membership credential issued_at is required"))?;
+    let expires_at = value
+        .get("expires_at")
+        .or_else(|| value.get("expires_at_ms"))
+        .and_then(Value::as_u64);
+    if expires_at.is_some_and(|expires_at| expires_at <= observed_at_ms()) {
+        bail!("membership credential has expired");
+    }
+    let _ = (version, credential_id, request_id, network_id, issued_at);
+    Ok(())
 }
 
 pub(super) fn attach_agent_envelope_to_relationship(

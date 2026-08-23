@@ -25,7 +25,8 @@ use wattswarm_protocol::types::SourceAgentCard;
 const DISCOVERY_RECORDS_FILE: &str = "discovery_records_v1.json";
 const DEFAULT_DISCOVERY_QUERY_LIMIT: usize = 50;
 const MAX_DISCOVERY_QUERY_LIMIT: usize = 200;
-const DISCOVERY_RECORDS_ROUTE: &str = "/api/network/discovery/records";
+const REGISTRY_NODES_ROUTE: &str = "/nodes";
+const REGISTRY_NODE_DISCOVERY_ROUTE: &str = "/nodes/discovery";
 const DEFAULT_DISCOVERY_RECORD_RADIUS_KM: f64 = 1000.0;
 const DISCOVERY_ANNOUNCE_TIMEOUT: Duration = Duration::from_secs(3);
 const DISCOVERY_RECORDS_PRUNE_INTERVAL: Duration = Duration::from_secs(30);
@@ -35,6 +36,7 @@ const DISCOVERY_AGENT_CARD_URL_ENV: &str = "WATTSWARM_DISCOVERY_AGENT_CARD_URL";
 const DISCOVERY_AGENT_CARD_TOKEN_ENV: &str = "WATTSWARM_DISCOVERY_AGENT_CARD_TOKEN";
 const DISCOVERY_AGENT_CARD_ROUTE: &str = "/v1/wattetheria/source-agent-card";
 const DEFAULT_DISCOVERY_AGENT_CARD_TOKEN_PATH: &str = "/var/lib/wattetheria/control.token";
+const REGISTRY_API_ROUTE: &str = "/v1";
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct NearbyDiscoveryQuery {
@@ -96,10 +98,34 @@ pub struct DiscoveryAnnounceReport {
     pub failed: usize,
 }
 
+fn registry_base_url(base_url: &str) -> Option<String> {
+    let base_url = base_url.trim().trim_end_matches('/');
+    if base_url.is_empty() || base_url.contains("/api/network/discovery") {
+        return None;
+    }
+    if let Some(base) = base_url.strip_suffix("/v1/nodes/discovery") {
+        return Some(base.to_owned() + REGISTRY_API_ROUTE);
+    }
+    if let Some(base) = base_url.strip_suffix("/v1/nodes") {
+        return Some(base.to_owned() + REGISTRY_API_ROUTE);
+    }
+    if base_url.ends_with(REGISTRY_API_ROUTE) {
+        return Some(base_url.to_owned());
+    }
+    Some(format!("{base_url}{REGISTRY_API_ROUTE}"))
+}
+
 pub fn maybe_announce_local_record_to_discovery_bootnodes(
     state_dir: &FsPath,
     db_path: &FsPath,
 ) -> Result<DiscoveryAnnounceReport> {
+    if !crate::network_bridge::network_permission_is_active(state_dir) {
+        return Ok(DiscoveryAnnounceReport {
+            attempted: 0,
+            succeeded: 0,
+            failed: 0,
+        });
+    }
     let discovery_urls = load_discovery_bootnode_urls_state(state_dir)?;
     if discovery_urls.is_empty() {
         return Ok(DiscoveryAnnounceReport {
@@ -119,7 +145,14 @@ pub fn maybe_announce_local_record_to_discovery_bootnodes(
         failed: 0,
     };
     for discovery_url in discovery_urls {
-        let endpoint = discovery_records_endpoint(&discovery_url);
+        let Some(registry_base_url) = registry_base_url(&discovery_url) else {
+            report.failed += 1;
+            eprintln!(
+                "wattswarm discovery announce skipped unsupported registry URL: {discovery_url}"
+            );
+            continue;
+        };
+        let endpoint = format!("{registry_base_url}{REGISTRY_NODE_DISCOVERY_ROUTE}");
         let response = client.post(&endpoint).json(&record).send();
         match response.and_then(reqwest::blocking::Response::error_for_status) {
             Ok(_) => report.succeeded += 1,
@@ -186,7 +219,7 @@ pub(crate) async fn discovery_find_node(
     let state_clone = state.clone();
     let response = run_blocking(move || -> Result<Value> {
         let now_ms = now_ms();
-        read_discovery_records(&state_clone, now_ms, |table| {
+        read_discovery_records(&state_clone, now_ms, None, |table| {
             Ok(json!({
                 "ok": true,
                 "record": table.find_node(&node_id, now_ms),
@@ -210,7 +243,7 @@ pub(crate) async fn discovery_find_nearby(
         };
         origin.validate()?;
         let now_ms = now_ms();
-        read_discovery_records(&state_clone, now_ms, |table| {
+        read_discovery_records(&state_clone, now_ms, Some(&query.network_id), |table| {
             let records = table.find_nearby(
                 &query.network_id,
                 &origin,
@@ -234,7 +267,7 @@ pub(crate) async fn discovery_find_capability(
     let state_clone = state.clone();
     let response = run_blocking(move || -> Result<Value> {
         let now_ms = now_ms();
-        read_discovery_records(&state_clone, now_ms, |table| {
+        read_discovery_records(&state_clone, now_ms, Some(&query.network_id), |table| {
             let records = table.find_capability(
                 &query.network_id,
                 &query.capability,
@@ -258,7 +291,7 @@ pub(crate) async fn discovery_find_topic_providers(
     let state_clone = state.clone();
     let response = run_blocking(move || -> Result<Value> {
         let now_ms = now_ms();
-        read_discovery_records(&state_clone, now_ms, |table| {
+        read_discovery_records(&state_clone, now_ms, Some(&query.network_id), |table| {
             let records = table.find_topic_providers(
                 &query.network_id,
                 &query.feed_key,
@@ -283,7 +316,7 @@ pub(crate) async fn discovery_find_topic_providers_batch(
     let state_clone = state.clone();
     let response = run_blocking(move || -> Result<Value> {
         let now_ms = now_ms();
-        read_discovery_records(&state_clone, now_ms, |table| {
+        read_discovery_records(&state_clone, now_ms, Some(&request.network_id), |table| {
             let limit = normalize_limit(request.limit);
             let mut records = Vec::new();
             let mut seen = std::collections::BTreeSet::new();
@@ -336,7 +369,7 @@ pub(crate) async fn discovery_find_agent(
             anyhow::bail!("public_id or display_name is required");
         }
         let now_ms = now_ms();
-        read_discovery_records(&state_clone, now_ms, |table| {
+        read_discovery_records(&state_clone, now_ms, Some(&query.network_id), |table| {
             let records = table
                 .active_records(now_ms, normalize_limit(query.limit))
                 .into_iter()
@@ -358,14 +391,87 @@ pub(crate) async fn discovery_find_agent(
 fn read_discovery_records<T>(
     state: &UiServerState,
     now_ms: u64,
+    network_id: Option<&str>,
     read: impl FnOnce(&DiscoveryRoutingTable) -> Result<T>,
 ) -> Result<T> {
+    if let Some(records) = load_registry_discovery_records(state, network_id, now_ms)? {
+        let mut table = DiscoveryRoutingTable::new();
+        for record in records {
+            let _ = table.announce_record(record, now_ms)?;
+        }
+        return read(&table);
+    }
     prune_discovery_records_if_due(state, now_ms)?;
     let table = state
         .discovery_records
         .read()
         .map_err(|_| anyhow::anyhow!("discovery records lock poisoned"))?;
     read(&table)
+}
+
+fn load_registry_discovery_records(
+    state: &UiServerState,
+    network_id: Option<&str>,
+    now_ms: u64,
+) -> Result<Option<Vec<SignedDiscoveryNodeRecord>>> {
+    let discovery_urls = load_discovery_bootnode_urls_state(&state.state_dir)?;
+    if discovery_urls.is_empty() {
+        return Ok(None);
+    }
+    let registry_urls = discovery_urls
+        .iter()
+        .filter_map(|url| registry_base_url(url))
+        .collect::<Vec<_>>();
+    if registry_urls.is_empty() {
+        return Ok(Some(Vec::new()));
+    }
+
+    let client = reqwest::blocking::Client::builder()
+        .timeout(DISCOVERY_ANNOUNCE_TIMEOUT)
+        .build()
+        .context("build registry discovery query HTTP client")?;
+    let mut last_error = None;
+    for registry_base_url in registry_urls {
+        let mut query = vec![("status", "active".to_owned()), ("limit", "500".to_owned())];
+        if let Some(network_id) = network_id {
+            query.push(("network_id", network_id.to_owned()));
+        }
+        let endpoint = format!("{registry_base_url}{REGISTRY_NODES_ROUTE}");
+        let response = client
+            .get(&endpoint)
+            .query(&query)
+            .send()
+            .and_then(reqwest::blocking::Response::error_for_status)
+            .with_context(|| format!("query registry discovery nodes from {endpoint}"));
+        let payload = match response.and_then(|response| {
+            response
+                .json::<Value>()
+                .context("decode registry discovery nodes response")
+        }) {
+            Ok(payload) => payload,
+            Err(error) => {
+                last_error = Some(error);
+                continue;
+            }
+        };
+        let records = payload
+            .get("records")
+            .and_then(Value::as_array)
+            .or_else(|| payload.as_array())
+            .ok_or_else(|| anyhow::anyhow!("registry discovery response missing records array"))?;
+        let mut verified_records = Vec::with_capacity(records.len());
+        for item in records {
+            let record_value = item.get("record").cloned().unwrap_or_else(|| item.clone());
+            let record: SignedDiscoveryNodeRecord = serde_json::from_value(record_value)
+                .context("decode registry discovery node record")?;
+            if record.verify_fresh_at(now_ms).is_ok() {
+                verified_records.push(record);
+            }
+        }
+        return Ok(Some(verified_records));
+    }
+
+    Err(last_error.unwrap_or_else(|| anyhow::anyhow!("registry discovery query failed")))
 }
 
 fn prune_discovery_records_if_due(state: &UiServerState, now_ms: u64) -> Result<()> {
@@ -703,7 +809,7 @@ fn validate_discovery_source_agent_card_node(
     Ok(())
 }
 
-fn discovery_agent_card_url() -> Option<String> {
+pub(crate) fn discovery_agent_card_url() -> Option<String> {
     std::env::var(DISCOVERY_AGENT_CARD_URL_ENV)
         .ok()
         .map(|value| value.trim().trim_end_matches('/').to_owned())
@@ -717,7 +823,7 @@ fn discovery_agent_card_url() -> Option<String> {
         })
 }
 
-fn discovery_agent_card_token() -> Result<Option<String>> {
+pub(crate) fn discovery_agent_card_token() -> Result<Option<String>> {
     if let Some(token) = std::env::var(DISCOVERY_AGENT_CARD_TOKEN_ENV)
         .ok()
         .map(|value| value.trim().to_owned())
@@ -818,17 +924,6 @@ fn local_discovery_geo(state_dir: &FsPath) -> Result<Option<DiscoveryGeo>> {
     };
     geo.validate()?;
     Ok(Some(geo))
-}
-
-fn discovery_records_endpoint(base_url: &str) -> String {
-    let base_url = base_url.trim().trim_end_matches('/');
-    if base_url.ends_with(DISCOVERY_RECORDS_ROUTE) {
-        base_url.to_owned()
-    } else if base_url.ends_with("/api/network/discovery") {
-        format!("{base_url}/records")
-    } else {
-        format!("{base_url}{DISCOVERY_RECORDS_ROUTE}")
-    }
 }
 
 fn normalize_limit(limit: Option<usize>) -> usize {

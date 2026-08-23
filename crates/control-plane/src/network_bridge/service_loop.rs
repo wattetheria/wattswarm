@@ -2,17 +2,53 @@ use super::*;
 
 static NETWORK_SERVICE_STATUSES: OnceLock<Mutex<HashMap<PathBuf, NetworkServiceStatus>>> =
     OnceLock::new();
+static NETWORK_PERMISSION_STATES: OnceLock<Mutex<HashMap<PathBuf, NetworkPermissionState>>> =
+    OnceLock::new();
 static LATEST_NETWORK_OBSERVABILITY_SNAPSHOTS: OnceLock<
     Mutex<HashMap<PathBuf, NetworkBridgeObservabilitySnapshot>>,
 > = OnceLock::new();
 
 const NETWORK_SERVICE_START_RETRY_DELAY: Duration = Duration::from_secs(5);
 const NETWORK_LOOP_DIAGNOSTIC_INTERVAL: Duration = Duration::from_secs(1);
+const WATTETHERIA_PERMISSION_QUERY_TIMEOUT: Duration = Duration::from_secs(3);
+const WATTETHERIA_CONTROL_PLANE_URL_ENV: &str = "WATTSWARM_DISCOVERY_AGENT_CARD_URL";
+const WATTETHERIA_CONTROL_PLANE_TOKEN_ENV: &str = "WATTSWARM_DISCOVERY_AGENT_CARD_TOKEN";
+const WATTETHERIA_SOURCE_AGENT_CARD_ROUTE: &str = "/v1/wattetheria/source-agent-card";
+const WATTETHERIA_NETWORK_PERMISSION_ROUTE: &str = "/v1/wattetheria/network-permission";
+const DEFAULT_WATTETHERIA_CONTROL_TOKEN_PATH: &str = "/var/lib/wattetheria/control.token";
 /// Cap retry attempts so a stuck dependency (e.g. an unreachable relay) doesn't
 /// keep the network bridge in `retrying` forever. After this many consecutive
 /// retryable failures the bridge thread exits with status=Failed; operators
 /// see a clear terminal state and the container can be restarted by docker.
 const MAX_NETWORK_SERVICE_START_RETRIES: u32 = 5;
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NetworkPermissionCheckpoint {
+    pub network_id: String,
+    pub node_id: String,
+    pub agent_did: String,
+    #[serde(alias = "admission_status")]
+    pub permission_status: String,
+    pub network_status: String,
+    pub revision: u64,
+    pub credential_id: Option<String>,
+    pub credential_hash: Option<String>,
+    #[serde(default)]
+    pub credential_expires_at_ms: Option<u64>,
+    pub last_error: Option<String>,
+    pub updated_at_ms: u64,
+}
+
+#[derive(Debug, Clone, Default)]
+struct NetworkPermissionState {
+    active: bool,
+    checkpoint: Option<NetworkPermissionCheckpoint>,
+}
+
+#[derive(Debug, Deserialize)]
+struct WattetheriaNetworkPermissionResponse {
+    active: bool,
+    checkpoint: Option<NetworkPermissionCheckpoint>,
+}
 
 #[derive(Debug, Default)]
 struct DurationStats {
@@ -305,6 +341,7 @@ fn format_duration_stats(stats: &HashMap<String, DurationStats>) -> String {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum NetworkServiceStatus {
+    PermissionPending,
     Starting,
     Running,
     Retrying,
@@ -315,6 +352,7 @@ enum NetworkServiceStatus {
 impl NetworkServiceStatus {
     fn as_str(self) -> &'static str {
         match self {
+            Self::PermissionPending => "permission_pending",
             Self::Starting => "starting",
             Self::Running => "running",
             Self::Retrying => "retrying",
@@ -330,6 +368,10 @@ impl NetworkServiceStatus {
 
 fn network_service_statuses() -> &'static Mutex<HashMap<PathBuf, NetworkServiceStatus>> {
     NETWORK_SERVICE_STATUSES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn network_permission_states() -> &'static Mutex<HashMap<PathBuf, NetworkPermissionState>> {
+    NETWORK_PERMISSION_STATES.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 fn set_network_service_status(state_dir: &Path, status: NetworkServiceStatus) {
@@ -460,6 +502,166 @@ pub fn network_service_status(state_dir: &Path) -> String {
         .to_owned()
 }
 
+pub fn load_network_permission_checkpoint(
+    state_dir: &Path,
+) -> Result<Option<NetworkPermissionCheckpoint>> {
+    Ok(network_permission_states()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(state_dir)
+        .and_then(|state| state.checkpoint.clone()))
+}
+
+pub fn update_network_permission_runtime_state(
+    state_dir: &Path,
+    checkpoint: &NetworkPermissionCheckpoint,
+) -> bool {
+    let active = checkpoint_allows_network(checkpoint);
+    replace_network_permission_runtime_state(state_dir, Some(checkpoint.clone()), active)
+}
+
+fn replace_network_permission_runtime_state(
+    state_dir: &Path,
+    checkpoint: Option<NetworkPermissionCheckpoint>,
+    mut active: bool,
+) -> bool {
+    let mut states = network_permission_states()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(checkpoint) = checkpoint.as_ref()
+        && states
+            .get(state_dir)
+            .and_then(|state| state.checkpoint.as_ref())
+            .is_some_and(|current| current.revision > checkpoint.revision)
+    {
+        return states
+            .get(state_dir)
+            .is_some_and(checkpoint_allows_network_state);
+    }
+    if let Some(checkpoint) = checkpoint.as_ref()
+        && let Some(current) = states.get(state_dir)
+        && current
+            .checkpoint
+            .as_ref()
+            .is_some_and(|value| value.revision == checkpoint.revision)
+    {
+        active &= current.active;
+    }
+    states.insert(
+        state_dir.to_path_buf(),
+        NetworkPermissionState { active, checkpoint },
+    );
+    active
+}
+
+pub fn refresh_network_permission_from_wattetheria(state_dir: &Path) -> Result<bool> {
+    let endpoint = wattetheria_network_permission_endpoint()
+        .context("Wattetheria control-plane URL is not configured")?;
+    let token = wattetheria_control_token()?
+        .with_context(|| format!("Wattetheria control token is required for {endpoint}"))?;
+    refresh_network_permission_from_endpoint(state_dir, &endpoint, &token)
+}
+
+fn refresh_network_permission_from_endpoint(
+    state_dir: &Path,
+    endpoint: &str,
+    token: &str,
+) -> Result<bool> {
+    let response = reqwest::blocking::Client::builder()
+        .timeout(WATTETHERIA_PERMISSION_QUERY_TIMEOUT)
+        .build()
+        .context("build Wattetheria network permission client")?
+        .get(endpoint)
+        .bearer_auth(token)
+        .send()
+        .with_context(|| format!("query Wattetheria network permission from {endpoint}"))?
+        .error_for_status()
+        .with_context(|| format!("query Wattetheria network permission from {endpoint}"))?
+        .json::<WattetheriaNetworkPermissionResponse>()
+        .with_context(|| format!("decode Wattetheria network permission from {endpoint}"))?;
+    let active = response.active
+        && response
+            .checkpoint
+            .as_ref()
+            .is_some_and(checkpoint_allows_network);
+    Ok(replace_network_permission_runtime_state(
+        state_dir,
+        response.checkpoint,
+        active,
+    ))
+}
+
+pub fn network_permission_is_active(state_dir: &Path) -> bool {
+    network_permission_states()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(state_dir)
+        .is_some_and(checkpoint_allows_network_state)
+}
+
+fn checkpoint_allows_network_state(state: &NetworkPermissionState) -> bool {
+    state.active
+        && state
+            .checkpoint
+            .as_ref()
+            .is_some_and(checkpoint_allows_network)
+}
+
+fn checkpoint_allows_network(checkpoint: &NetworkPermissionCheckpoint) -> bool {
+    checkpoint.permission_status == "active"
+        && checkpoint
+            .credential_id
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty())
+        && checkpoint
+            .credential_hash
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty())
+        && checkpoint
+            .credential_expires_at_ms
+            .is_none_or(|expires_at_ms| expires_at_ms > network_permission_now_ms())
+}
+
+fn wattetheria_network_permission_endpoint() -> Option<String> {
+    std::env::var(WATTETHERIA_CONTROL_PLANE_URL_ENV)
+        .ok()
+        .map(|value| value.trim().trim_end_matches('/').to_owned())
+        .filter(|value| !value.is_empty())
+        .map(|value| {
+            let base_url = value
+                .strip_suffix(WATTETHERIA_SOURCE_AGENT_CARD_ROUTE)
+                .or_else(|| value.strip_suffix(WATTETHERIA_NETWORK_PERMISSION_ROUTE))
+                .unwrap_or(&value);
+            format!("{base_url}{WATTETHERIA_NETWORK_PERMISSION_ROUTE}")
+        })
+}
+
+fn wattetheria_control_token() -> Result<Option<String>> {
+    if let Some(token) = std::env::var(WATTETHERIA_CONTROL_PLANE_TOKEN_ENV)
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+    {
+        return Ok(Some(token));
+    }
+    let path = Path::new(DEFAULT_WATTETHERIA_CONTROL_TOKEN_PATH);
+    if !path.exists() {
+        return Ok(None);
+    }
+    let token = fs::read_to_string(path)
+        .with_context(|| format!("read Wattetheria control token: {}", path.display()))?;
+    Ok(Some(token.trim().to_owned()).filter(|value| !value.is_empty()))
+}
+
+fn network_permission_now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX)
+}
+
 fn parse_bool_env_with_default(key: &str, default: bool) -> bool {
     env::var(key)
         .ok()
@@ -565,6 +767,11 @@ pub fn maybe_start_background_network_service_with_hook(
     post_tick_hook: Option<PostTickHook>,
 ) -> Result<bool> {
     if !network_enabled_from_env() {
+        return Ok(false);
+    }
+    if !network_permission_is_active(&state_dir) {
+        set_network_service_status(&state_dir, NetworkServiceStatus::PermissionPending);
+        eprintln!("wattswarm p2p network deferred (network permission checkpoint is not active)");
         return Ok(false);
     }
     let Some(mode) = crate::control::configured_node_mode(&state_dir)? else {
@@ -705,11 +912,20 @@ fn run_background_network_service_with_hook(
     configured_scopes: Vec<SwarmScope>,
     post_tick_hook: Option<&PostTickHook>,
 ) -> Result<()> {
+    if !network_permission_is_active(state_dir) {
+        set_network_service_status(state_dir, NetworkServiceStatus::PermissionPending);
+        return Ok(());
+    }
     record_startup_step(state_dir, "open_configured_node.begin");
     let mut node = crate::control::open_configured_node(state_dir, db_path)
         .context("network bridge startup open configured node")?;
     record_startup_step(state_dir, "open_configured_node.end");
     let node_id = node.node_id();
+    if !network_permission_is_active(state_dir) {
+        set_network_service_status(state_dir, NetworkServiceStatus::PermissionPending);
+        return Ok(());
+    }
+    crate::udp_announce::maybe_start_listener(state_dir.to_path_buf(), node_id.clone());
     let scopes = merge_scopes(configured_scopes);
     record_startup_step(state_dir, "dynamic_subscriptions.begin");
     let dynamic_subscriptions = dynamic_subscription_scope_kinds_for_node(&node, &node_id)
@@ -781,6 +997,20 @@ fn run_background_network_service_with_hook(
     let debug_diagnostics = diagnostics::debug_diagnostics_enabled();
 
     loop {
+        if !network_permission_is_active(state_dir) {
+            set_network_service_status(state_dir, NetworkServiceStatus::PermissionPending);
+            diagnostics::record_diagnostic(
+                Some(state_dir),
+                diagnostics::DiagnosticEvent::new(
+                    "warn",
+                    "transport",
+                    "permission.revoked",
+                    "blocked",
+                    "network permission is no longer active; stopping network bridge",
+                ),
+            );
+            return Ok(());
+        }
         let mut did_work = false;
         let try_tick_drain_started_at = Instant::now();
         loop {
@@ -1033,6 +1263,121 @@ mod tests {
         set_network_service_status(&state_dir, NetworkServiceStatus::Stopped);
         assert_eq!(network_service_status(&state_dir), "stopped");
         assert!(!network_service_started(&state_dir));
+    }
+
+    #[test]
+    fn network_permission_runtime_state_requires_credential_material_without_writing_a_file() {
+        let state_dir = unique_state_dir("network-permission-checkpoint");
+        let mut checkpoint = NetworkPermissionCheckpoint {
+            network_id: "network-1".to_owned(),
+            node_id: "node-1".to_owned(),
+            agent_did: "did:key:test".to_owned(),
+            permission_status: "active".to_owned(),
+            network_status: "starting".to_owned(),
+            revision: 1,
+            credential_id: None,
+            credential_hash: None,
+            credential_expires_at_ms: None,
+            last_error: None,
+            updated_at_ms: 1_700_000_000_000,
+        };
+
+        update_network_permission_runtime_state(&state_dir, &checkpoint);
+        assert_eq!(
+            load_network_permission_checkpoint(&state_dir).unwrap(),
+            Some(checkpoint.clone())
+        );
+        assert!(!network_permission_is_active(&state_dir));
+        assert!(
+            !state_dir
+                .join("network_permission_checkpoint_v1.json")
+                .exists()
+        );
+
+        checkpoint.credential_id = Some("credential-1".to_owned());
+        checkpoint.credential_hash = Some("sha256:abc".to_owned());
+        checkpoint.revision = 2;
+        update_network_permission_runtime_state(&state_dir, &checkpoint);
+        assert!(network_permission_is_active(&state_dir));
+
+        checkpoint.credential_expires_at_ms = Some(network_permission_now_ms().saturating_sub(1));
+        checkpoint.revision = 3;
+        update_network_permission_runtime_state(&state_dir, &checkpoint);
+        assert!(!network_permission_is_active(&state_dir));
+
+        checkpoint.credential_expires_at_ms = None;
+        checkpoint.permission_status = "pending".to_owned();
+        checkpoint.revision = 4;
+        update_network_permission_runtime_state(&state_dir, &checkpoint);
+        assert!(!network_permission_is_active(&state_dir));
+
+        checkpoint.permission_status = "active".to_owned();
+        checkpoint.revision = 3;
+        update_network_permission_runtime_state(&state_dir, &checkpoint);
+        assert!(!network_permission_is_active(&state_dir));
+
+        if state_dir.exists() {
+            fs::remove_dir_all(state_dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn network_permission_query_reads_wattetheria_without_persisting_state() {
+        use std::io::{Read, Write as _};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 4096];
+            let read = stream.read(&mut request).unwrap();
+            let request = String::from_utf8_lossy(&request[..read]);
+            assert!(request.starts_with("GET /v1/wattetheria/network-permission "));
+            assert!(
+                request
+                    .to_ascii_lowercase()
+                    .contains("authorization: bearer test-token")
+            );
+            let body = serde_json::json!({
+                "ok": true,
+                "active": true,
+                "checkpoint": {
+                    "network_id": "network-1",
+                    "node_id": "node-1",
+                    "agent_did": "did:key:test",
+                    "permission_status": "active",
+                    "network_status": "starting",
+                    "revision": 1,
+                    "credential_id": "credential-1",
+                    "credential_hash": "sha256:abc",
+                    "credential_expires_at_ms": null,
+                    "last_error": null,
+                    "updated_at_ms": 1700000000000_u64
+                }
+            })
+            .to_string();
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .unwrap();
+        });
+        let state_dir = unique_state_dir("network-permission-query");
+        let endpoint = format!("http://{address}/v1/wattetheria/network-permission");
+
+        assert!(
+            refresh_network_permission_from_endpoint(&state_dir, &endpoint, "test-token").unwrap()
+        );
+        assert!(network_permission_is_active(&state_dir));
+        assert!(
+            !state_dir
+                .join("network_permission_checkpoint_v1.json")
+                .exists()
+        );
+        server.join().unwrap();
     }
 
     #[test]

@@ -18,6 +18,7 @@ pub(crate) mod network_bootstrap;
 pub(crate) mod node;
 pub(crate) mod pages;
 pub(crate) mod peers;
+pub(crate) mod registration;
 pub(crate) mod runs;
 pub(crate) mod server;
 pub(crate) mod startup;

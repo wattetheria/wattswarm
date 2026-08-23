@@ -1,9 +1,8 @@
-use crate::control::local_node_id;
 use crate::http::UiServerState;
 use crate::http::background::mark_node_running_if_service_started;
 use crate::http::{
-    diagnostics, discovery, egress, executors, node, pages, peers, runs, startup, swarm, tasks,
-    topics,
+    diagnostics, discovery, egress, executors, node, pages, peers, registration, runs, startup,
+    swarm, tasks, topics,
 };
 use crate::wattetheria_sync;
 use anyhow::{Context, Result};
@@ -19,13 +18,7 @@ const DISCOVERY_BOOTNODE_ANNOUNCE_INTERVAL: Duration = Duration::from_secs(60);
 pub fn run(state_dir: PathBuf, db_path: PathBuf, listen: String) -> Result<()> {
     fs::create_dir_all(&state_dir)?;
     crate::startup_config::ensure_default_wan_startup_config(&state_dir)?;
-    let node_id = local_node_id(&state_dir).ok();
     let network_enabled = crate::network_bridge::network_enabled_from_env();
-    if network_enabled {
-        if let Some(id) = &node_id {
-            crate::udp_announce::maybe_start_listener(state_dir.clone(), id.clone());
-        }
-    }
     if network_enabled {
         // Refresh once per process start, before the network service builds the
         // iroh endpoint, so a restart picks up current relay and peer addresses.
@@ -33,6 +26,13 @@ pub fn run(state_dir: PathBuf, db_path: PathBuf, listen: String) -> Result<()> {
             Ok(true) => eprintln!("wattswarm network contacts refreshed from join manifest"),
             Ok(false) => {}
             Err(error) => eprintln!("wattswarm network contact refresh skipped: {error:#}"),
+        }
+        match crate::network_bridge::refresh_network_permission_from_wattetheria(&state_dir) {
+            Ok(true) => eprintln!("wattswarm network permission loaded from Wattetheria"),
+            Ok(false) => eprintln!("wattswarm network permission is not active"),
+            Err(error) => {
+                eprintln!("wattswarm network permission query deferred: {error:#}");
+            }
         }
     }
     let network_started = crate::network_bridge::maybe_start_background_network_service_with_hook(
@@ -44,18 +44,12 @@ pub fn run(state_dir: PathBuf, db_path: PathBuf, listen: String) -> Result<()> {
     )?;
     if network_started {
         mark_node_running_if_service_started(&state_dir, true)?;
-        spawn_periodic_discovery_bootnode_announce(state_dir.clone(), db_path.clone());
         eprintln!("wattswarm p2p network enabled");
     } else {
         eprintln!("wattswarm p2p network disabled");
     }
     if network_enabled {
-        crate::udp_announce::announce_startup_with_contact(
-            "ui-startup",
-            Some(&listen),
-            node_id.as_deref(),
-            &state_dir,
-        );
+        spawn_periodic_discovery_bootnode_announce(state_dir.clone(), db_path.clone());
     }
     let state = UiServerState::new(state_dir, db_path);
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -152,6 +146,10 @@ pub fn build_app(state: UiServerState) -> Router {
         .route("/api/node/up", post(node::node_up))
         .route("/api/node/down", post(node::node_down))
         .route("/api/node/status", get(node::node_status))
+        .route(
+            "/api/network/permission/checkpoint",
+            post(registration::network_permission_checkpoint),
+        )
         .route(
             "/api/node/iroh-probe",
             post(crate::http::network_bootstrap::network_iroh_probe),

@@ -14,12 +14,15 @@ services:
     environment:
       <<: *dev-cargo-environment
       WATTSWARM_NETWORK_DEBUG_DIAGNOSTICS: ${WATTSWARM_NETWORK_DEBUG_DIAGNOSTICS:-false}
+      WATTSWARM_DISCOVERY_AGENT_CARD_ENABLED: ${WATTSWARM_DISCOVERY_AGENT_CARD_ENABLED:-true}
+      WATTSWARM_DISCOVERY_AGENT_CARD_URL: ${WATTSWARM_DISCOVERY_AGENT_CARD_URL:-http://host.docker.internal:7777}
     volumes:
       - .:/app
       - ../watt-did:/watt-did:ro
       - wattswarm_cargo_target:/app/target
       - wattswarm_cargo_registry:/usr/local/cargo/registry
       - wattswarm_state_data:/var/lib/wattswarm
+      - wattetheria_wattetheria_state:/var/lib/wattetheria:ro
     entrypoint: ["/bin/sh", "-c"]
     command:
       - >
@@ -73,3 +76,6 @@ services:
 volumes:
   wattswarm_cargo_target:
   wattswarm_cargo_registry:
+  wattetheria_wattetheria_state:
+    external: true
+    name: wattetheria_wattetheria_state

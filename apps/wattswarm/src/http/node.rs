@@ -12,24 +12,29 @@ use std::fs;
 pub(crate) async fn node_up(State(state): State<UiServerState>) -> Result<Json<Value>, ApiError> {
     let state_clone = state.clone();
     run_blocking(move || -> Result<()> {
-        let node = open_configured_node(&state_clone.state_dir, &state_clone.db_path)?;
         let mode = require_configured_node_mode(&state_clone.state_dir)?;
-        write_node_state(&state_clone.state_dir, true, mode)?;
-        let _ = crate::network_bridge::maybe_start_background_network_service_with_hook(
-            state_clone.state_dir.clone(),
-            state_clone.db_path.clone(),
-            Some(Box::new(|node, sd| {
-                crate::network_hooks::run_background_post_tick(node, sd);
-            })),
-        )?;
-        if crate::network_bridge::network_enabled_from_env() {
-            crate::udp_announce::announce_startup_with_contact(
-                "node-up-api",
-                None,
-                Some(&node.node_id()),
-                &state_clone.state_dir,
-            );
+        let network_enabled = crate::network_bridge::network_enabled_from_env();
+        if network_enabled
+            && !matches!(mode, crate::control::NodeMode::Local)
+            && !crate::network_bridge::network_permission_is_active(&state_clone.state_dir)
+        {
+            write_node_state(&state_clone.state_dir, false, mode)?;
+            return Ok(());
         }
+        let _node = open_configured_node(&state_clone.state_dir, &state_clone.db_path)?;
+        let network_started =
+            crate::network_bridge::maybe_start_background_network_service_with_hook(
+                state_clone.state_dir.clone(),
+                state_clone.db_path.clone(),
+                Some(Box::new(|node, sd| {
+                    crate::network_hooks::run_background_post_tick(node, sd);
+                })),
+            )?;
+        write_node_state(
+            &state_clone.state_dir,
+            network_started || !network_enabled || matches!(mode, crate::control::NodeMode::Local),
+            mode,
+        )?;
         Ok(())
     })
     .await?;

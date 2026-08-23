@@ -250,6 +250,9 @@ pub(super) fn query_discovery_bootnodes_for_candidate_records(
         return Ok(records);
     }
     for discovery_url in &discovery_urls {
+        if registry_base_url(discovery_url).is_some() {
+            continue;
+        }
         let batch_endpoint =
             match discovery_bootnode_topic_provider_batch_endpoint(discovery_url, network_id) {
                 Ok(endpoint) => endpoint,
@@ -390,6 +393,18 @@ fn discovery_bootnode_query_endpoint(
     settings: &DiscoveryBootnodeSettings,
 ) -> Result<String> {
     let base_url = base_url.trim().trim_end_matches('/');
+    if let Some(registry_base_url) = registry_base_url(base_url) {
+        let mut url = reqwest::Url::parse(&format!("{registry_base_url}/nodes"))
+            .with_context(|| format!("parse registry node URL {base_url}"))?;
+        {
+            let mut pairs = url.query_pairs_mut();
+            pairs
+                .append_pair("network_id", network_id)
+                .append_pair("status", "active")
+                .append_pair("limit", &DISCOVERY_BOOTNODE_QUERY_LIMIT.to_string());
+        }
+        return Ok(url.to_string());
+    }
     let endpoint = if settings.has_local_geo() {
         if base_url.ends_with("/api/network/discovery/nearby") {
             base_url.to_owned()
@@ -421,6 +436,23 @@ fn discovery_bootnode_query_endpoint(
         pairs.append_pair("limit", &DISCOVERY_BOOTNODE_QUERY_LIMIT.to_string());
     }
     Ok(url.to_string())
+}
+
+fn registry_base_url(base_url: &str) -> Option<String> {
+    let base_url = base_url.trim().trim_end_matches('/');
+    if base_url.is_empty() || base_url.contains("/api/network/discovery") {
+        return None;
+    }
+    if let Some(base) = base_url.strip_suffix("/v1/nodes/discovery") {
+        return Some(base.to_owned() + "/v1");
+    }
+    if let Some(base) = base_url.strip_suffix("/v1/nodes") {
+        return Some(base.to_owned() + "/v1");
+    }
+    if base_url.ends_with("/v1") {
+        return Some(base_url.to_owned());
+    }
+    Some(format!("{base_url}/v1"))
 }
 
 fn discovery_bootnode_topic_provider_batch_endpoint(

@@ -484,6 +484,7 @@ fn ui_exposes_wattetheria_sync_http_boundaries() {
     let dir = tempdir().unwrap();
     let state_dir = dir.path().join("state");
     std::fs::create_dir_all(&state_dir).unwrap();
+    seed_active_network_permission_checkpoint(&state_dir);
     let db_path = state_dir.join("ui.state");
     init_test_run_queue(&state_dir);
     let app = build_app(UiServerState::new(state_dir.clone(), db_path.clone()));
@@ -974,6 +975,7 @@ fn ui_exposes_wattetheria_sync_grpc_streams() {
     let dir = tempdir().unwrap();
     let state_dir = dir.path().join("state");
     std::fs::create_dir_all(&state_dir).unwrap();
+    seed_active_network_permission_checkpoint(&state_dir);
     let db_path = state_dir.join("ui.state");
     init_test_run_queue(&state_dir);
     let app = build_app(UiServerState::new(state_dir.clone(), db_path.clone()));

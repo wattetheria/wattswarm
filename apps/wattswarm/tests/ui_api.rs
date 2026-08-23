@@ -478,7 +478,9 @@ fn handle_discovery_stub_conn(
     }
     let req = String::from_utf8_lossy(&req_bytes);
     let line = req.lines().next().unwrap_or_default();
-    if line.starts_with("POST /api/network/discovery/records ") {
+    if line.starts_with("POST /v1/nodes/discovery ")
+        || line.starts_with("POST /api/network/discovery/records ")
+    {
         if let Some(raw_body) = req.split("\r\n\r\n").nth(1)
             && let Ok(mut requests) = requests.lock()
         {
@@ -630,6 +632,68 @@ async fn json_from(res: axum::response::Response) -> Value {
     serde_json::from_slice(&bytes).unwrap()
 }
 
+fn seed_active_network_permission_checkpoint(state_dir: &Path) {
+    wattswarm::network_bridge::update_network_permission_runtime_state(
+        state_dir,
+        &wattswarm::network_bridge::NetworkPermissionCheckpoint {
+            network_id: "test-network".to_owned(),
+            node_id: "test-node".to_owned(),
+            agent_did: "did:key:test".to_owned(),
+            permission_status: "active".to_owned(),
+            network_status: "starting".to_owned(),
+            revision: 1,
+            credential_id: Some("test-credential".to_owned()),
+            credential_hash: Some("sha256:test".to_owned()),
+            credential_expires_at_ms: None,
+            last_error: None,
+            updated_at_ms: chrono::Utc::now().timestamp_millis().max(0) as u64,
+        },
+    );
+}
+
+#[tokio::test]
+async fn network_permission_push_updates_runtime_state_without_writing_a_checkpoint_file() {
+    let _guard = env_lock();
+    let _network_enabled_guard = EnvVarGuard::set("WATTSWARM_NETWORK_ENABLED", "false");
+    let dir = tempdir().expect("tempdir");
+    let state_dir = dir.path().join("state");
+    fs::create_dir_all(&state_dir).expect("create state dir");
+    let state = UiServerState::new(state_dir.clone(), dir.path().join("wattswarm.db"));
+    let checkpoint = json!({
+        "network_id": "test-network",
+        "node_id": "test-node",
+        "agent_did": "did:key:test",
+        "permission_status": "active",
+        "network_status": "starting",
+        "revision": 1,
+        "credential_id": "test-credential",
+        "credential_hash": "sha256:test",
+        "credential_expires_at_ms": null,
+        "last_error": null,
+        "updated_at_ms": 1_700_000_000_000_u64
+    });
+
+    let response = build_app(state)
+        .oneshot(
+            Request::post("/api/network/permission/checkpoint")
+                .header("content-type", "application/json")
+                .body(Body::from(checkpoint.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(wattswarm::network_bridge::network_permission_is_active(
+        &state_dir
+    ));
+    assert!(
+        !state_dir
+            .join("network_permission_checkpoint_v1.json")
+            .exists()
+    );
+}
+
 #[test]
 fn network_discovery_auto_announces_local_record_to_bootnode() {
     let _guard = env_lock();
@@ -694,6 +758,7 @@ fn network_discovery_auto_announces_local_record_to_bootnode() {
     let stub = DiscoveryRecordStubServer::start();
     wattswarm::control::save_discovery_bootnode_urls_state(&state_dir, &[stub.base_url()])
         .expect("save discovery bootnode urls");
+    seed_active_network_permission_checkpoint(&state_dir);
     let db_path = state_dir.join("local.state");
     let node = open_node(&state_dir, &db_path).expect("open node");
     let subscriber_node_id = node.node_id();
@@ -807,7 +872,7 @@ fn network_discovery_auto_announces_local_record_to_bootnode() {
 }
 
 #[test]
-fn network_discovery_auto_announces_local_record_to_discovery_api_base_url() {
+fn network_discovery_auto_announces_local_record_to_registry_base_url() {
     let _guard = env_lock();
     let _db_lock = DbTestLock::acquire();
     let schema = reset_test_schema("ui_discovery_auto_announce_base_url");
@@ -827,11 +892,9 @@ fn network_discovery_auto_announces_local_record_to_discovery_api_base_url() {
     )
     .expect("save startup config");
     let stub = DiscoveryRecordStubServer::start();
-    wattswarm::control::save_discovery_bootnode_urls_state(
-        &state_dir,
-        &[format!("{}/api/network/discovery", stub.base_url())],
-    )
-    .expect("save discovery bootnode urls");
+    wattswarm::control::save_discovery_bootnode_urls_state(&state_dir, &[stub.base_url()])
+        .expect("save discovery bootnode urls");
+    seed_active_network_permission_checkpoint(&state_dir);
 
     let report = wattswarm::ui::maybe_announce_local_record_to_discovery_bootnodes(
         &state_dir,
@@ -869,6 +932,7 @@ fn network_discovery_bootnode_announce_does_not_block_startup_path() {
     let stub = DiscoveryRecordStubServer::start_with_delay(Duration::from_millis(250));
     wattswarm::control::save_discovery_bootnode_urls_state(&state_dir, &[stub.base_url()])
         .expect("save discovery bootnode urls");
+    seed_active_network_permission_checkpoint(&state_dir);
 
     let started = Instant::now();
     let handle = wattswarm::ui::spawn_discovery_bootnode_announce(
@@ -912,6 +976,7 @@ fn network_discovery_periodic_announce_refreshes_bootnode_records() {
     let stub = DiscoveryRecordStubServer::start();
     wattswarm::control::save_discovery_bootnode_urls_state(&state_dir, &[stub.base_url()])
         .expect("save discovery bootnode urls");
+    seed_active_network_permission_checkpoint(&state_dir);
 
     let handle = wattswarm::ui::spawn_discovery_bootnode_announce_loop(
         state_dir.clone(),
