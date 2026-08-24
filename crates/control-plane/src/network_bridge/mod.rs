@@ -65,13 +65,13 @@ pub use peer_interactions::{
 };
 pub use publish::{publish_pending_global_events, publish_pending_scoped_updates};
 pub use service_loop::{
-    NetworkPermissionCheckpoint, PostTickHook, configured_network_scopes_from_env,
-    latest_connected_peer_ids, latest_network_observability_snapshot,
-    load_network_permission_checkpoint, maybe_start_background_network_service,
-    maybe_start_background_network_service_with_hook, network_config_from_env,
-    network_config_from_state_dir, network_enabled_from_env, network_permission_is_active,
-    network_service_started, network_service_status, refresh_network_permission_from_wattetheria,
-    update_network_permission_runtime_state,
+    NetworkCredentialTrustAnchor, NetworkPermissionCheckpoint, PostTickHook,
+    configured_network_scopes_from_env, latest_connected_peer_ids,
+    latest_network_observability_snapshot, load_network_permission_checkpoint,
+    maybe_start_background_network_service, maybe_start_background_network_service_with_hook,
+    network_config_from_env, network_config_from_state_dir, network_enabled_from_env,
+    network_permission_is_active, network_service_started, network_service_status,
+    refresh_network_permission_from_wattetheria, update_network_permission_runtime_state,
 };
 pub use summary::{
     apply_summary_announcement, build_knowledge_summary_for_task_type,

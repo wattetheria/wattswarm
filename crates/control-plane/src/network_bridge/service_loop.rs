@@ -34,8 +34,19 @@ pub struct NetworkPermissionCheckpoint {
     pub credential_hash: Option<String>,
     #[serde(default)]
     pub credential_expires_at_ms: Option<u64>,
+    #[serde(default)]
+    pub credential_trust_anchor: Option<NetworkCredentialTrustAnchor>,
     pub last_error: Option<String>,
     pub updated_at_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NetworkCredentialTrustAnchor {
+    pub network_id: String,
+    pub trust_anchor_id: String,
+    pub signature_algorithm: String,
+    pub public_key_encoding: String,
+    pub public_key: String,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -618,6 +629,14 @@ fn checkpoint_allows_network(checkpoint: &NetworkPermissionCheckpoint) -> bool {
             .as_deref()
             .is_some_and(|value| !value.trim().is_empty())
         && checkpoint
+            .credential_trust_anchor
+            .as_ref()
+            .is_some_and(|anchor| {
+                anchor.network_id == checkpoint.network_id
+                    && !anchor.trust_anchor_id.trim().is_empty()
+                    && !anchor.public_key.trim().is_empty()
+            })
+        && checkpoint
             .credential_expires_at_ms
             .is_none_or(|expires_at_ms| expires_at_ms > network_permission_now_ms())
 }
@@ -925,7 +944,6 @@ fn run_background_network_service_with_hook(
         set_network_service_status(state_dir, NetworkServiceStatus::PermissionPending);
         return Ok(());
     }
-    crate::udp_announce::maybe_start_listener(state_dir.to_path_buf(), node_id.clone());
     let scopes = merge_scopes(configured_scopes);
     record_startup_step(state_dir, "dynamic_subscriptions.begin");
     let dynamic_subscriptions = dynamic_subscription_scope_kinds_for_node(&node, &node_id)
@@ -936,6 +954,11 @@ fn run_background_network_service_with_hook(
         .store
         .load_verified_network_protocol_params()
         .context("network bridge startup load verified protocol params")?;
+    verify_network_permission_trust_anchor(
+        state_dir,
+        &verified_protocol_params.network_id,
+        &verified_protocol_params.genesis_node_id,
+    )?;
     record_startup_step(state_dir, "protocol_params.end");
     let protocol_params = verified_protocol_params.params().clone();
     let mut config = config.apply_protocol_params(&protocol_params);
@@ -952,6 +975,7 @@ fn run_background_network_service_with_hook(
     config
         .validate()
         .context("network bridge startup validate p2p config")?;
+    crate::udp_announce::maybe_start_listener(state_dir.to_path_buf(), node_id.clone());
     record_startup_step(state_dir, "create_p2p_node.begin");
     let network_node = network_node_from_state_dir(state_dir, config)
         .context("network bridge startup create network p2p node")?;
@@ -1231,6 +1255,28 @@ fn run_background_network_service_with_hook(
     }
 }
 
+fn verify_network_permission_trust_anchor(
+    state_dir: &Path,
+    network_id: &str,
+    genesis_node_id: &str,
+) -> Result<()> {
+    let checkpoint = load_network_permission_checkpoint(state_dir)?
+        .context("network permission checkpoint disappeared during network startup")?;
+    let trust_anchor = checkpoint
+        .credential_trust_anchor
+        .context("network permission has no Credential trust anchor")?;
+    if checkpoint.network_id != network_id
+        || trust_anchor.network_id != network_id
+        || trust_anchor.trust_anchor_id != genesis_node_id
+        || trust_anchor.public_key != genesis_node_id
+    {
+        bail!(
+            "network membership Credential trust anchor does not match verified Genesis parameters"
+        );
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1273,11 +1319,12 @@ mod tests {
             node_id: "node-1".to_owned(),
             agent_did: "did:key:test".to_owned(),
             permission_status: "active".to_owned(),
-            network_status: "starting".to_owned(),
+            network_status: "running".to_owned(),
             revision: 1,
             credential_id: None,
             credential_hash: None,
             credential_expires_at_ms: None,
+            credential_trust_anchor: None,
             last_error: None,
             updated_at_ms: 1_700_000_000_000,
         };
@@ -1298,21 +1345,37 @@ mod tests {
         checkpoint.credential_hash = Some("sha256:abc".to_owned());
         checkpoint.revision = 2;
         update_network_permission_runtime_state(&state_dir, &checkpoint);
+        assert!(!network_permission_is_active(&state_dir));
+
+        checkpoint.credential_trust_anchor = Some(NetworkCredentialTrustAnchor {
+            network_id: "network-1".to_owned(),
+            trust_anchor_id: "genesis-1".to_owned(),
+            signature_algorithm: "ed25519".to_owned(),
+            public_key_encoding: "hex".to_owned(),
+            public_key: "genesis-1".to_owned(),
+        });
+        checkpoint.revision = 3;
+        update_network_permission_runtime_state(&state_dir, &checkpoint);
         assert!(network_permission_is_active(&state_dir));
+        verify_network_permission_trust_anchor(&state_dir, "network-1", "genesis-1").unwrap();
+        assert!(
+            verify_network_permission_trust_anchor(&state_dir, "network-1", "forged-genesis")
+                .is_err()
+        );
 
         checkpoint.credential_expires_at_ms = Some(network_permission_now_ms().saturating_sub(1));
-        checkpoint.revision = 3;
+        checkpoint.revision = 4;
         update_network_permission_runtime_state(&state_dir, &checkpoint);
         assert!(!network_permission_is_active(&state_dir));
 
         checkpoint.credential_expires_at_ms = None;
         checkpoint.permission_status = "pending".to_owned();
-        checkpoint.revision = 4;
+        checkpoint.revision = 5;
         update_network_permission_runtime_state(&state_dir, &checkpoint);
         assert!(!network_permission_is_active(&state_dir));
 
         checkpoint.permission_status = "active".to_owned();
-        checkpoint.revision = 3;
+        checkpoint.revision = 4;
         update_network_permission_runtime_state(&state_dir, &checkpoint);
         assert!(!network_permission_is_active(&state_dir));
 
@@ -1347,11 +1410,18 @@ mod tests {
                     "node_id": "node-1",
                     "agent_did": "did:key:test",
                     "permission_status": "active",
-                    "network_status": "starting",
+                    "network_status": "running",
                     "revision": 1,
                     "credential_id": "credential-1",
                     "credential_hash": "sha256:abc",
                     "credential_expires_at_ms": null,
+                    "credential_trust_anchor": {
+                        "network_id": "network-1",
+                        "trust_anchor_id": "genesis-1",
+                        "signature_algorithm": "ed25519",
+                        "public_key_encoding": "hex",
+                        "public_key": "genesis-1"
+                    },
                     "last_error": null,
                     "updated_at_ms": 1700000000000_u64
                 }

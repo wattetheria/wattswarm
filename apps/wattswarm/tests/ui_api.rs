@@ -640,11 +640,20 @@ fn seed_active_network_permission_checkpoint(state_dir: &Path) {
             node_id: "test-node".to_owned(),
             agent_did: "did:key:test".to_owned(),
             permission_status: "active".to_owned(),
-            network_status: "starting".to_owned(),
+            network_status: "running".to_owned(),
             revision: 1,
             credential_id: Some("test-credential".to_owned()),
             credential_hash: Some("sha256:test".to_owned()),
             credential_expires_at_ms: None,
+            credential_trust_anchor: Some(
+                wattswarm::network_bridge::NetworkCredentialTrustAnchor {
+                    network_id: "test-network".to_owned(),
+                    trust_anchor_id: "test-genesis".to_owned(),
+                    signature_algorithm: "ed25519".to_owned(),
+                    public_key_encoding: "hex".to_owned(),
+                    public_key: "test-genesis".to_owned(),
+                },
+            ),
             last_error: None,
             updated_at_ms: chrono::Utc::now().timestamp_millis().max(0) as u64,
         },
@@ -664,11 +673,18 @@ async fn network_permission_push_updates_runtime_state_without_writing_a_checkpo
         "node_id": "test-node",
         "agent_did": "did:key:test",
         "permission_status": "active",
-        "network_status": "starting",
+        "network_status": "running",
         "revision": 1,
         "credential_id": "test-credential",
         "credential_hash": "sha256:test",
         "credential_expires_at_ms": null,
+        "credential_trust_anchor": {
+            "network_id": "test-network",
+            "trust_anchor_id": "test-genesis",
+            "signature_algorithm": "ed25519",
+            "public_key_encoding": "hex",
+            "public_key": "test-genesis"
+        },
         "last_error": null,
         "updated_at_ms": 1_700_000_000_000_u64
     });

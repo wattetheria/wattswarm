@@ -48,6 +48,8 @@ pub struct NetworkProjectionSnapshot {
     pub node_id: String,
     pub org_id: String,
     pub network_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_trust_anchor: Option<NetworkCredentialTrustAnchorSnapshot>,
     pub running: bool,
     pub mode: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -56,6 +58,15 @@ pub struct NetworkProjectionSnapshot {
     pub longitude: Option<f64>,
     pub peer_protocol_distribution: BTreeMap<String, u64>,
     pub peers: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NetworkCredentialTrustAnchorSnapshot {
+    pub network_id: String,
+    pub trust_anchor_id: String,
+    pub signature_algorithm: String,
+    pub public_key_encoding: String,
+    pub public_key: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -495,6 +506,7 @@ pub fn build_network_projection_snapshot(
     ensure_sync_node_mode_configured(state_dir)?;
     let startup = load_startup_config(&startup_config_path(state_dir))?;
     let node = open_node(state_dir, db_path)?;
+    let verified_network = node.store.load_verified_network_protocol_params().ok();
     let (running, mode) = read_node_running(state_dir)?;
     let distribution = node
         .store
@@ -507,7 +519,19 @@ pub fn build_network_projection_snapshot(
         generated_at: now_ms(),
         node_id: node.node_id(),
         org_id: node.store.org_id().to_owned(),
-        network_id: resolve_network_id(&node),
+        network_id: verified_network.as_ref().map_or_else(
+            || resolve_network_id(&node),
+            |verified| verified.network_id.clone(),
+        ),
+        credential_trust_anchor: verified_network.map(|verified| {
+            NetworkCredentialTrustAnchorSnapshot {
+                network_id: verified.network_id,
+                trust_anchor_id: verified.genesis_node_id.clone(),
+                signature_algorithm: "ed25519".to_owned(),
+                public_key_encoding: "hex".to_owned(),
+                public_key: verified.genesis_node_id,
+            }
+        }),
         running,
         mode,
         latitude: startup.latitude,
