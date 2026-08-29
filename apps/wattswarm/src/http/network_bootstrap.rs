@@ -5,6 +5,7 @@ use axum::Json;
 use axum::extract::State;
 use serde::Deserialize;
 use serde_json::{Value, json};
+use std::collections::HashSet;
 use std::fs::{self, OpenOptions};
 use std::io::Write as _;
 use std::path::Path;
@@ -88,20 +89,94 @@ pub(crate) async fn network_local(
     State(state): State<UiServerState>,
 ) -> Result<Json<Value>, ApiError> {
     let state_clone = state.clone();
-    let (peer_id, listen_addrs) = run_blocking(move || -> Result<(String, Vec<String>)> {
-        let peer_id = local_peer_id(&state_clone.state_dir)?;
-        let listen_addrs =
-            crate::network_bridge::network_config_from_state_dir(&state_clone.state_dir)
-                .listen_addrs;
-        Ok((peer_id, listen_addrs))
-    })
-    .await?;
+    let (peer_id, listen_addrs, public_bootstrap) =
+        run_blocking(move || -> Result<(String, Vec<String>, bool)> {
+            let peer_id = local_peer_id(&state_clone.state_dir)?;
+            let listen_addrs =
+                crate::network_bridge::network_config_from_state_dir(&state_clone.state_dir)
+                    .listen_addrs;
+            let public_bootstrap =
+                is_public_bootstrap_node(&state_clone.state_dir, &state_clone.db_path, &peer_id);
+            Ok((peer_id, listen_addrs, public_bootstrap))
+        })
+        .await?;
     Ok(Json(json!({
         "ok": true,
         "network_enabled": crate::network_bridge::network_enabled_from_env(),
         "local_peer_id": peer_id,
-        "listen_addrs": listen_addrs
+        "listen_addrs": listen_addrs,
+        "public_bootstrap": public_bootstrap,
     })))
+}
+
+fn is_public_bootstrap_node(state_dir: &Path, db_path: &Path, peer_id: &str) -> bool {
+    if public_bootstrap_contact_node_ids().contains(peer_id) {
+        return true;
+    }
+    let Ok(node) = open_configured_node(state_dir, db_path) else {
+        return false;
+    };
+    let Ok(bundle) = node.store.load_network_bootstrap_bundle() else {
+        return false;
+    };
+    bundle.topology.network.genesis_node_id == peer_id
+}
+
+fn public_bootstrap_contact_node_ids() -> HashSet<String> {
+    let Some(raw) = std::env::var(ENV_PUBLIC_BOOTSTRAP_CONTACTS).ok() else {
+        return HashSet::new();
+    };
+    parse_public_bootstrap_contact_node_ids(&raw)
+}
+
+fn parse_public_bootstrap_contact_node_ids(raw: &str) -> HashSet<String> {
+    let mut node_ids = HashSet::new();
+    for line in raw.lines().map(str::trim).filter(|line| !line.is_empty()) {
+        if let Ok(value) = serde_json::from_str::<Value>(line) {
+            collect_bootstrap_contact_node_ids(&value, &mut node_ids);
+        } else {
+            for value in line
+                .split(',')
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                insert_bootstrap_contact_node_id(value, &mut node_ids);
+            }
+        }
+    }
+    node_ids
+}
+
+fn collect_bootstrap_contact_node_ids(value: &Value, node_ids: &mut HashSet<String>) {
+    match value {
+        Value::Array(values) => {
+            for value in values {
+                collect_bootstrap_contact_node_ids(value, node_ids);
+            }
+        }
+        Value::Object(object) => {
+            for key in ["node_id", "peer_id"] {
+                if let Some(value) = object.get(key).and_then(Value::as_str) {
+                    insert_bootstrap_contact_node_id(value, node_ids);
+                }
+            }
+        }
+        Value::String(value) => {
+            if let Ok(nested) = serde_json::from_str::<Value>(value) {
+                collect_bootstrap_contact_node_ids(&nested, node_ids);
+            } else {
+                insert_bootstrap_contact_node_id(value, node_ids);
+            }
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) => {}
+    }
+}
+
+fn insert_bootstrap_contact_node_id(value: &str, node_ids: &mut HashSet<String>) {
+    let candidate = value.split('@').next().map(str::trim).unwrap_or_default();
+    if let Ok(node_id) = NetworkNodeId::new(candidate) {
+        node_ids.insert(node_id.to_string());
+    }
 }
 
 pub(crate) async fn network_iroh_probe(
@@ -312,6 +387,11 @@ fn relay_only_bootstrap_contact_json_for_peer_id(
 mod tests {
     use super::*;
 
+    const BOOTSTRAP_NODE_ID: &str =
+        "83393ad000151bc41e686a1fc892e07a440a2a53110bbaeae3d13e5978599956";
+    const SECOND_BOOTSTRAP_NODE_ID: &str =
+        "9b196ed13c0ec849dd7b8bf5add0b07ad2c88c1bf5d79e8591f6681ab1803258";
+
     #[test]
     fn record_iroh_probe_route_diagnostic_writes_selected_route() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -337,5 +417,22 @@ mod tests {
         assert_eq!(saved["details"]["selected_route"], "relay");
         assert_eq!(saved["details"]["stage"], "probe");
         assert_eq!(saved["details"]["direct_capable"], false);
+    }
+
+    #[test]
+    fn public_bootstrap_contact_node_ids_accept_ids_and_contact_json() {
+        let raw = format!(
+            "{BOOTSTRAP_NODE_ID}, {SECOND_BOOTSTRAP_NODE_ID}@127.0.0.1:4010\n{}",
+            json!({
+                "node_id": BOOTSTRAP_NODE_ID,
+                "peer_id": BOOTSTRAP_NODE_ID,
+                "transports": []
+            })
+        );
+
+        let node_ids = parse_public_bootstrap_contact_node_ids(&raw);
+
+        assert!(node_ids.contains(BOOTSTRAP_NODE_ID));
+        assert!(node_ids.contains(SECOND_BOOTSTRAP_NODE_ID));
     }
 }

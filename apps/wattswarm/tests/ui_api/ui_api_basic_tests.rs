@@ -1138,6 +1138,7 @@ fn ui_exposes_local_network_peer_identity_and_listen_addrs() {
         let json = json_from(res).await;
         assert_eq!(json["ok"].as_bool(), Some(true));
         assert_eq!(json["network_enabled"].as_bool(), Some(true));
+        assert_eq!(json["public_bootstrap"].as_bool(), Some(false));
         assert!(
             json["local_peer_id"]
                 .as_str()

@@ -1326,6 +1326,93 @@ fn topic_message_requires_reply_excludes_consensus_kinds() {
 }
 
 #[test]
+fn board_topic_messages_do_not_create_agent_events() {
+    let local = NodeIdentity::random();
+    let remote = NodeIdentity::random();
+    let local_node_id = local.node_id();
+    let remote_node_id = remote.node_id();
+    let membership = membership_with_roles(&[local_node_id.clone(), remote_node_id.clone()]);
+    let mut node =
+        Node::new(local, PgStore::open_in_memory().expect("store"), membership).expect("node");
+    let cases = [
+        (
+            "wattetheria.board",
+            "group:board-general",
+            "board.message.publish",
+        ),
+        (
+            "wattetheria.board.general",
+            "group:board-general",
+            "board.message.publish",
+        ),
+        (
+            "wattetheria.board.services",
+            "group:board-services",
+            "board.service_agent.message.publish",
+        ),
+    ];
+
+    for (index, (feed_key, scope_hint, capability)) in cases.into_iter().enumerate() {
+        let agent_envelope = wattswarm_protocol::types::AgentEnvelope {
+            source_agent_id: Some("did:key:remote".to_owned()),
+            source_node_id: Some(remote_node_id.clone()),
+            capability: Some(capability.to_owned()),
+            message_json: json!({"action": "message.post"}).to_string(),
+            signature: Some("sig".to_owned()),
+            ..wattswarm_protocol::types::AgentEnvelope::default()
+        };
+        let remote_event = build_event_for_external(
+            &remote,
+            1,
+            10 + index as u64,
+            crate::types::EventPayload::TopicMessagePosted(
+                crate::types::TopicMessagePostedPayload {
+                    network_id: "default".to_owned(),
+                    feed_key: feed_key.to_owned(),
+                    scope_hint: scope_hint.to_owned(),
+                    content_ref: sample_topic_content_ref(
+                        &format!("sha256:board-message-{index}"),
+                        &remote_node_id,
+                    ),
+                    local_content_cache: Some(json!({
+                        "category": "general",
+                        "message": "board message",
+                        "reply_to_message_id": null
+                    })),
+                    reply_to_message_id: None,
+                    agent_envelope: Some(agent_envelope),
+                },
+            ),
+        )
+        .expect("board topic event");
+        let ingested = ingest_event_envelope(
+            &mut node,
+            &EventEnvelope {
+                scope: SwarmScope::Group(
+                    scope_hint
+                        .strip_prefix("group:")
+                        .expect("group scope")
+                        .to_owned(),
+                ),
+                event: remote_event,
+                content_source_node_id: None,
+            },
+        )
+        .expect("ingest board event");
+        let crate::types::EventPayload::TopicMessagePosted(payload) = &ingested.payload else {
+            panic!("expected topic message");
+        };
+
+        let agent_event =
+            topic_message_agent_event(&node, &ingested, payload).expect("board agent event result");
+        assert!(
+            agent_event.is_none(),
+            "Board message created an agent event"
+        );
+    }
+}
+
+#[test]
 fn private_dm_topic_agent_event_exposes_direct_message_content() {
     let local = NodeIdentity::random();
     let remote = NodeIdentity::random();

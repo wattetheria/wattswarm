@@ -1,8 +1,8 @@
 use crate::http::UiServerState;
 use crate::http::background::mark_node_running_if_service_started;
 use crate::http::{
-    diagnostics, discovery, egress, executors, node, pages, peers, registration, runs, startup,
-    swarm, tasks, topics,
+    diagnostics, discovery, egress, executors, global, node, pages, peers, registration, runs,
+    startup, swarm, tasks, topics,
 };
 use crate::wattetheria_sync;
 use anyhow::{Context, Result};
@@ -283,6 +283,7 @@ pub fn build_app(state: UiServerState) -> Router {
         .route("/api/knowledge/export", post(runs::knowledge_export))
         .route("/api/topic/messages", get(topics::topic_messages))
         .route("/api/topic/messages", post(topics::topic_message_post))
+        .route("/api/global/messages", get(global::global_messages))
         .route("/api/topic/cursor", get(topics::topic_cursor))
         .route(
             "/api/topic/subscriptions",

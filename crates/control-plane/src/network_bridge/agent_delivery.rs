@@ -449,6 +449,15 @@ fn topic_message_agent_envelope(
     embedded_topic_agent_envelope(content)
 }
 
+fn is_board_message_agent_envelope(
+    envelope: Option<&wattswarm_protocol::types::AgentEnvelope>,
+) -> bool {
+    matches!(
+        envelope.and_then(|envelope| envelope.capability.as_deref()),
+        Some("board.message.publish" | "board.service_agent.message.publish")
+    )
+}
+
 fn verified_context_for_event_envelope(
     envelope: Option<&wattswarm_protocol::types::AgentEnvelope>,
     author_node_id: &str,
@@ -852,14 +861,17 @@ pub(super) fn topic_message_agent_event(
     let Some(topic_message) = node.store.get_topic_message(&event.event_id)? else {
         return Ok(None);
     };
-    if !topic_message_requires_reply(&topic_message.content) {
-        return Ok(None);
-    }
     let agent_envelope = topic_message_agent_envelope(
         payload,
         &topic_message.content,
         topic_message.agent_envelope.as_ref(),
     )?;
+    if is_board_message_agent_envelope(agent_envelope.as_ref()) {
+        return Ok(None);
+    }
+    if !topic_message_requires_reply(&topic_message.content) {
+        return Ok(None);
+    }
     Ok(Some(build_agent_event_with_agent_envelope(
         wattswarm_protocol::types::AgentEventType::TopicMessageRequiresReply,
         wattswarm_protocol::types::AgentEventSourceKind::TopicMessage,

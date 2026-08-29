@@ -13,6 +13,7 @@ pub(crate) mod diagnostics;
 pub(crate) mod discovery;
 pub(crate) mod egress;
 pub(crate) mod executors;
+pub(crate) mod global;
 pub(crate) mod helpers;
 pub(crate) mod network_bootstrap;
 pub(crate) mod node;
