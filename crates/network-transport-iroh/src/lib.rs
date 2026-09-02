@@ -27,6 +27,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::runtime::{Builder as RuntimeBuilder, Runtime, RuntimeFlavor};
+use tokio::sync::Semaphore;
 use wattswarm_artifact_store::{ArtifactKind, ArtifactStore};
 use wattswarm_network_transport_core::{
     DirectDataFetchRequest, DirectDataFetchResponse, DirectDataTransportAdapter,
@@ -53,6 +54,8 @@ const DEFAULT_GOSSIP_PASSIVE_VIEW_CAPACITY: usize = 12;
 const DEFAULT_GOSSIP_SHUFFLE_ACTIVE_VIEW_COUNT: usize = 4;
 const DEFAULT_GOSSIP_MAINTENANCE_INTERVAL_MS: u64 = 1_000;
 const DEFAULT_IROH_DATA_PLANE_START_TIMEOUT_MS: u64 = 120_000;
+const DEFAULT_IROH_DIRECT_DATA_FETCH_TIMEOUT_MS: u64 = 30_000;
+const DEFAULT_IROH_DIRECT_DATA_FETCH_CONCURRENCY: usize = 4;
 const DEFAULT_IROH_CONTROL_STREAM_TIMEOUT_MS: u64 = 30_000;
 const IROH_ONLINE_WAIT_TIMEOUT_MS: u64 = 10_000;
 const CONTROL_STREAM_RECOVERY_TIMEOUT_THRESHOLD: u32 = 3;
@@ -466,7 +469,7 @@ struct IrohDataPlaneService {
     adapter: IrohTransportAdapter,
     endpoint_options: IrohEndpointOptions,
     control_handlers: ControlStreamHandlers,
-    fetch_lock: Mutex<()>,
+    fetch_permits: Arc<Semaphore>,
     endpoint_online_awaited: AtomicBool,
     control_stream_recovery: Mutex<ControlStreamRecoveryState>,
     public_ip_cache: Mutex<Option<PublicIpCacheEntry>>,
@@ -998,6 +1001,18 @@ fn serve_fetch_request(
     }
 }
 
+async fn with_direct_data_fetch_timeout<F>(
+    timeout: Duration,
+    future: F,
+) -> Result<DirectDataFetchResponse>
+where
+    F: Future<Output = Result<DirectDataFetchResponse>>,
+{
+    tokio::time::timeout(timeout, future)
+        .await
+        .map_err(|_| anyhow!("iroh direct data fetch timed out after {timeout:?}"))?
+}
+
 impl IrohDataPlaneService {
     fn new(
         state_dir: &Path,
@@ -1077,7 +1092,7 @@ impl IrohDataPlaneService {
             adapter,
             endpoint_options,
             control_handlers,
-            fetch_lock: Mutex::new(()),
+            fetch_permits: Arc::new(Semaphore::new(DEFAULT_IROH_DIRECT_DATA_FETCH_CONCURRENCY)),
             endpoint_online_awaited: AtomicBool::new(false),
             control_stream_recovery: Mutex::new(ControlStreamRecoveryState::default()),
             public_ip_cache: Mutex::new(None),
@@ -1300,10 +1315,36 @@ impl IrohDataPlaneService {
         remote: &TransportContactMaterial,
         request: &DirectDataFetchRequest,
     ) -> Result<DirectDataFetchResponse> {
-        let _guard = self
-            .fetch_lock
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.fetch_with_timeout(
+            remote,
+            request,
+            Duration::from_millis(DEFAULT_IROH_DIRECT_DATA_FETCH_TIMEOUT_MS),
+        )
+    }
+
+    fn fetch_with_timeout(
+        &self,
+        remote: &TransportContactMaterial,
+        request: &DirectDataFetchRequest,
+        timeout: Duration,
+    ) -> Result<DirectDataFetchResponse> {
+        let started = Instant::now();
+        let remaining = timeout.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
+            return Err(anyhow!(
+                "iroh direct data fetch timed out waiting for a fetch permit after {timeout:?}"
+            ));
+        }
+        let _permit = self
+            .block_on(async {
+                tokio::time::timeout(remaining, self.fetch_permits.clone().acquire_owned()).await
+            })
+            .map_err(|_| {
+                anyhow!(
+                    "iroh direct data fetch timed out waiting for a fetch permit after {timeout:?}"
+                )
+            })?
+            .map_err(|error| anyhow!("iroh direct data fetch permit unavailable: {error}"))?;
         let endpoint_addr = endpoint_addr_from_contact_material(remote)?;
         let alpn = remote
             .metadata
@@ -1311,7 +1352,13 @@ impl IrohDataPlaneService {
             .clone()
             .unwrap_or_else(|| self.adapter.config.alpn.clone());
         let request_bytes = serde_json::to_vec(request)?;
-        self.block_on(async {
+        let remaining = timeout.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
+            return Err(anyhow!(
+                "iroh direct data fetch timed out before opening the connection after {timeout:?}"
+            ));
+        }
+        self.block_on(with_direct_data_fetch_timeout(remaining, async {
             let connection = self
                 .endpoint
                 .connect(endpoint_addr, alpn.as_bytes())
@@ -1337,7 +1384,7 @@ impl IrohDataPlaneService {
                 );
             }
             Ok(response)
-        })
+        }))
     }
 
     fn send_control_stream_request(
@@ -1800,6 +1847,17 @@ pub fn fetch_direct_data_for_network_peer_id(
 ) -> Result<DirectDataFetchResponse> {
     ensure_local_iroh_data_plane_for_network_peer_id(state_dir, network_peer_id)?
         .fetch(remote_contact, request)
+}
+
+pub fn fetch_direct_data_for_network_peer_id_with_timeout(
+    state_dir: &Path,
+    network_peer_id: &str,
+    remote_contact: &TransportContactMaterial,
+    request: &DirectDataFetchRequest,
+    timeout: Duration,
+) -> Result<DirectDataFetchResponse> {
+    ensure_local_iroh_data_plane_for_network_peer_id(state_dir, network_peer_id)?
+        .fetch_with_timeout(remote_contact, request, timeout)
 }
 
 pub fn send_control_stream_request_for_network_peer_id(
@@ -3198,5 +3256,23 @@ mod tests {
 
         shutdown_local_iroh_data_plane(local_dir.path());
         shutdown_local_iroh_data_plane(remote_dir.path());
+    }
+
+    #[test]
+    fn direct_data_fetch_timeout_returns_without_waiting_for_future() {
+        let runtime = RuntimeBuilder::new_current_thread()
+            .enable_time()
+            .build()
+            .expect("runtime");
+        let started = Instant::now();
+        let error = runtime
+            .block_on(with_direct_data_fetch_timeout(
+                Duration::from_millis(10),
+                std::future::pending::<Result<DirectDataFetchResponse>>(),
+            ))
+            .expect_err("pending fetch must time out");
+
+        assert!(error.to_string().contains("timed out"));
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
 }
