@@ -1289,9 +1289,24 @@ fn network_discovery_bootnode_accepts_signed_records_and_filters_queries() {
         std::fs::create_dir_all(&state_dir).unwrap();
         let db_path = state_dir.join("ui.state");
         let app = build_app(UiServerState::new(state_dir.clone(), db_path));
-        let identity = NodeIdentity::from_seed([91; 32]);
+        let identity_a = NodeIdentity::from_seed([91; 32]);
+        let identity_b = NodeIdentity::from_seed([92; 32]);
+        let (identity, filler_identity) = if identity_a.node_id() > identity_b.node_id() {
+            (identity_a, identity_b)
+        } else {
+            (identity_b, identity_a)
+        };
         let now_ms = chrono::Utc::now().timestamp_millis().max(0) as u64;
         let node_id = identity.node_id();
+        let filler_node_id = filler_identity.node_id();
+        let filler_body = DiscoveryNodeRecordBody::new(
+            "mainnet:test",
+            filler_node_id.clone(),
+            filler_node_id,
+            1,
+            now_ms,
+        );
+        let filler_record = SignedDiscoveryNodeRecord::sign(filler_body, &filler_identity).unwrap();
         let mut body = DiscoveryNodeRecordBody::new(
             "mainnet:test",
             node_id.clone(),
@@ -1351,6 +1366,20 @@ fn network_discovery_bootnode_accepts_signed_records_and_filters_queries() {
         assert_eq!(announce_json["ok"].as_bool(), Some(true));
         assert_eq!(announce_json["status"].as_str(), Some("inserted"));
         assert_eq!(announce_json["node_id"].as_str(), Some(node_id.as_str()));
+
+        let filler_announce_res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/network/discovery/records")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&filler_record).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(filler_announce_res.status(), StatusCode::OK);
         std::fs::write(state_dir.join("discovery_records_v1.json"), "{not-json")
             .expect("corrupt persisted discovery records after announce");
 
@@ -1442,7 +1471,7 @@ fn network_discovery_bootnode_accepts_signed_records_and_filters_queries() {
             .oneshot(
                 Request::builder()
                     .method("GET")
-                    .uri("/api/network/discovery/agent?network_id=mainnet:test&public_id=%40agent-alpha")
+                    .uri("/api/network/discovery/agent?network_id=mainnet:test&public_id=%40agent-alpha&limit=1")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -1466,7 +1495,7 @@ fn network_discovery_bootnode_accepts_signed_records_and_filters_queries() {
             .oneshot(
                 Request::builder()
                     .method("GET")
-                    .uri("/api/network/discovery/agent?network_id=mainnet:test&display_name=%40Agent%20Alpha")
+                    .uri("/api/network/discovery/agent?network_id=mainnet:test&display_name=%40Agent%20Alpha&limit=1")
                     .body(Body::empty())
                     .unwrap(),
             )

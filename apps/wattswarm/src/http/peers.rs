@@ -6,12 +6,13 @@ use crate::control::{
     load_peer_relationship_request_records_state, open_configured_node, open_node,
     private_dm_scope_hint, private_dm_thread_id,
 };
+use crate::http::discovery::find_discovery_record;
 use crate::http::helpers::resolve_network_id;
 use crate::http::{ApiError, UiServerState, run_blocking};
 use crate::network_bridge::{
     PrivateDmCryptoDiagnostic, default_agent_envelope, enqueue_agent_payment_command,
     enqueue_peer_relationship_action_command, network_service_started,
-    record_private_dm_crypto_diagnostic,
+    persist_discovery_record_contact_material, record_private_dm_crypto_diagnostic,
 };
 use crate::network_p2p::{RawAgentEnvelope, RawContactMaterial};
 use anyhow::{Result, anyhow, bail};
@@ -128,6 +129,7 @@ pub(crate) async fn peer_relationships_update(
             let agent_envelope = req.agent_envelope.ok_or_else(|| {
                 anyhow!("agent_envelope is required for network peer relationship actions")
             })?;
+            ensure_peer_contact_material_from_discovery(&state_clone, &req.remote_node_id)?;
             enqueue_peer_relationship_action_command(
                 &state_clone.state_dir,
                 &req.remote_node_id,
@@ -151,6 +153,26 @@ pub(crate) async fn peer_relationships_update(
     })
     .await?;
     Ok(Json(payload))
+}
+
+/// Relationship actions need the peer's contact material. Peers skipped by the nearby
+/// discovery loop (distance or peer limit) are resolved from the discovery records instead.
+fn ensure_peer_contact_material_from_discovery(
+    state: &UiServerState,
+    remote_node_id: &str,
+) -> Result<()> {
+    let remote_node_id = remote_node_id.trim();
+    let has_contact_material = load_peer_metadata_records_state(&state.state_dir)?
+        .iter()
+        .any(|record| {
+            record.node_id == remote_node_id && !record.transport_contact_materials().is_empty()
+        });
+    if has_contact_material {
+        return Ok(());
+    }
+    let record = find_discovery_record(state, remote_node_id)?
+        .ok_or_else(|| anyhow!("no discovery contact material for peer {remote_node_id}"))?;
+    persist_discovery_record_contact_material(&state.state_dir, &record)
 }
 
 pub(crate) async fn peer_dm_threads_list(
@@ -641,13 +663,77 @@ fn update_peer_relationship_payload(
 mod tests {
     use super::{
         NEARBY_PEER_RETENTION_MS, build_peer_relationships_payload, build_peers_list_payload,
-        nearby_peer_is_fresh, update_peer_relationship_payload,
+        ensure_peer_contact_material_from_discovery, nearby_peer_is_fresh,
+        update_peer_relationship_payload,
     };
     use crate::control::{NodeState, node_state_path};
     use crate::http::background::mark_node_running_if_service_started;
     use crate::startup_config::{
         CoreAgentConfig, NetworkMode, StartupConfig, save_startup_config, startup_config_path,
     };
+
+    #[test]
+    fn relationship_contact_material_is_resolved_from_discovery_records() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state_dir = dir.path().join("state");
+        let remote_dir = dir.path().join("remote");
+        std::fs::create_dir_all(&state_dir).expect("create state dir");
+        std::fs::create_dir_all(&remote_dir).expect("create remote dir");
+        let remote_seed = [151u8; 32];
+        std::fs::write(remote_dir.join("node_seed.hex"), hex::encode(remote_seed))
+            .expect("write remote seed");
+        std::fs::write(
+            remote_dir.join("startup_config.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "relay_urls": ["https://relay.example.invalid/"]
+            }))
+            .expect("startup config json"),
+        )
+        .expect("write remote startup config");
+        let identity = wattswarm_crypto::NodeIdentity::from_seed(remote_seed);
+        let now_ms = chrono::Utc::now().timestamp_millis().max(0) as u64;
+        let peer_id =
+            wattswarm_network_transport_iroh::local_endpoint_id_from_state_dir(&remote_dir)
+                .expect("endpoint id")
+                .to_string();
+        let contact =
+            wattswarm_network_transport_iroh::export_local_contact_material_for_network_peer_id(
+                &remote_dir,
+                &peer_id,
+                now_ms,
+            )
+            .expect("contact");
+        let mut body = wattswarm_network_discovery::DiscoveryNodeRecordBody::new(
+            "mainnet:watt-galaxy",
+            identity.node_id(),
+            identity.node_id(),
+            now_ms,
+            now_ms,
+        );
+        body.transport_contact = Some(contact);
+        let record = wattswarm_network_discovery::SignedDiscoveryNodeRecord::sign(body, &identity)
+            .expect("sign discovery record");
+        let state = crate::http::UiServerState::new(state_dir.clone(), state_dir.join("ui.state"));
+        state
+            .discovery_records
+            .write()
+            .expect("discovery records lock")
+            .announce_record(record, now_ms)
+            .expect("announce discovery record");
+
+        ensure_peer_contact_material_from_discovery(&state, &identity.node_id())
+            .expect("resolve contact from discovery");
+
+        let metadata =
+            crate::control::load_peer_metadata_records_state(&state_dir).expect("peer metadata");
+        assert!(metadata.iter().any(|record| {
+            record.node_id == identity.node_id() && !record.transport_contact_materials().is_empty()
+        }));
+        let error = ensure_peer_contact_material_from_discovery(&state, "unknown-node")
+            .expect_err("unknown peer cannot be queued without contact material");
+        assert!(error.to_string().contains("no discovery contact material"));
+        wattswarm_network_transport_iroh::shutdown_local_iroh_data_plane(&remote_dir);
+    }
 
     #[test]
     fn marks_running_true_when_background_service_starts() {

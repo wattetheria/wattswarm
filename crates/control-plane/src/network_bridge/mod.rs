@@ -195,9 +195,10 @@ pub use bootstrap_contact::{
     export_local_bootstrap_contact, export_local_bootstrap_contact_json,
     export_local_contact_material, upsert_contact_material_for_peer, validate_bootstrap_contact,
 };
+pub use discovery_bootnode::persist_discovery_record_contact_material;
 use discovery_bootnode::{
     apply_discovery_bootnode_record, discovery_bootnode_settings_from_state_dir,
-    query_discovery_bootnodes_for_candidate_records,
+    query_discovery_bootnodes_for_candidate_records, sort_discovery_records_by_distance,
 };
 #[cfg(test)]
 use discovery_bootnode::{
@@ -274,9 +275,11 @@ const ENV_P2P_PORT: &str = "WATTSWARM_P2P_PORT";
 const ENV_P2P_LISTEN_ADDRS: &str = "WATTSWARM_P2P_LISTEN_ADDRS";
 const STARTUP_CONFIG_FILE: &str = "startup_config.json";
 const DEFAULT_P2P_PORT: u16 = 4001;
-const DEFAULT_DISCOVERY_GEO_RADIUS_KM: f64 = 1000.0;
+const DEFAULT_DISCOVERY_GEO_RADIUS_KM: f64 = 5000.0;
 const DEFAULT_DISCOVERY_BOOTNODE_QUERY_INTERVAL: Duration = Duration::from_secs(30);
-const DISCOVERY_BOOTNODE_QUERY_LIMIT: usize = 50;
+// Records beyond the geo radius are still accepted until the node knows this many peers.
+const DISCOVERY_NEARBY_PEER_LIMIT: usize = 200;
+const DISCOVERY_BOOTNODE_QUERY_LIMIT: usize = DISCOVERY_NEARBY_PEER_LIMIT;
 const DISCOVERY_BOOTNODE_QUERY_TIMEOUT: Duration = Duration::from_secs(10);
 const DISCOVERY_BOOTNODE_FAILURE_LOG_EVERY: u64 = 10;
 const DISCOVERY_NODE_CAPABILITY: &str = "wattswarm.node";

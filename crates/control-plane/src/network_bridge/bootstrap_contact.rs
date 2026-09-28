@@ -342,7 +342,27 @@ impl NetworkBridgeService {
     }
 
     pub(super) fn load_iroh_contact_material(&mut self, state_dir: &Path) -> Result<()> {
-        for record in crate::control::load_peer_metadata_records_state(state_dir)? {
+        self.load_persisted_iroh_contact_material(state_dir, None)
+    }
+
+    /// Registers contact material persisted after startup (e.g. via the contact-material API).
+    pub(super) fn load_iroh_contact_material_for_peer(
+        &mut self,
+        state_dir: &Path,
+        remote_node_id: &str,
+    ) -> Result<()> {
+        self.load_persisted_iroh_contact_material(state_dir, Some(remote_node_id))
+    }
+
+    fn load_persisted_iroh_contact_material(
+        &mut self,
+        state_dir: &Path,
+        remote_node_id: Option<&str>,
+    ) -> Result<()> {
+        for record in crate::control::load_peer_metadata_records_state(state_dir)?
+            .into_iter()
+            .filter(|record| remote_node_id.is_none_or(|node_id| record.node_id == node_id))
+        {
             for contact in record.transport_contact_materials() {
                 if contact.transport == DataTransportRoute::IrohDirect.as_str() {
                     let remote_network_peer_id = match iroh_contact_network_peer_id(&contact) {

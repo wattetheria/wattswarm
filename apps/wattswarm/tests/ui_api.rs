@@ -837,7 +837,7 @@ fn network_discovery_auto_announces_local_record_to_bootnode() {
     );
     assert_eq!(
         record.body.geo.as_ref().map(|geo| geo.radius_km),
-        Some(1000.0)
+        Some(5000.0)
     );
     assert_eq!(record.body.ttl_ms, DEFAULT_RECORD_TTL_MS);
     assert!(record.body.capabilities.contains("wattswarm.node"));

@@ -1169,7 +1169,8 @@ fn run_background_network_service_with_hook(
                         &settings,
                         observed_at_ms(),
                     ) {
-                        Ok(records) => {
+                        Ok(mut records) => {
+                            sort_discovery_records_by_distance(&settings, &mut records);
                             for record in records {
                                 let local_peer_id = service.local_peer_id().to_string();
                                 match apply_discovery_bootnode_record(

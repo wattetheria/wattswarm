@@ -529,6 +529,7 @@ impl NetworkBridgeService {
             .map_err(|err| anyhow!("parse remote_node_id as iroh node id: {err}"))?;
 
         if !self.runtime.allows_outbound_backfill_to(&peer) {
+            self.load_iroh_contact_material_for_peer(state_dir, remote_node_id)?;
             self.ensure_peer_connected(state_dir, &peer, remote_node_id)?;
         }
         if !self.runtime.allows_outbound_backfill_to(&peer) {
@@ -536,15 +537,6 @@ impl NetworkBridgeService {
             bail!("peer relationship actions require peer contact material");
         }
 
-        let now = Instant::now();
-        if !self.connected_peers.contains(&peer) && !self.peer_recently_seen_at(&peer, now) {
-            self.ensure_peer_connected(state_dir, &peer, remote_node_id)?;
-        }
-        let now = Instant::now();
-        if !self.connected_peers.contains(&peer) && !self.peer_recently_seen_at(&peer, now) {
-            self.schedule_peer_reconnect(peer.clone());
-            bail!("peer relationship actions require a connected or recently seen peer");
-        }
         if !self.connected_peers.contains(&peer) {
             self.schedule_peer_reconnect(peer.clone());
         }

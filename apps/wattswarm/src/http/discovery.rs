@@ -5,7 +5,7 @@ use crate::http::{ApiError, UiServerState, run_blocking};
 use crate::startup_config::{load_startup_config, startup_config_path};
 use crate::storage::PgStore;
 use crate::types::TopicProviderCapabilities;
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use axum::Json;
 use axum::extract::{Path, Query, State};
 use serde::{Deserialize, Serialize};
@@ -27,7 +27,7 @@ const DEFAULT_DISCOVERY_QUERY_LIMIT: usize = 50;
 const MAX_DISCOVERY_QUERY_LIMIT: usize = 200;
 const REGISTRY_NODES_ROUTE: &str = "/nodes";
 const REGISTRY_NODE_DISCOVERY_ROUTE: &str = "/nodes/discovery";
-const DEFAULT_DISCOVERY_RECORD_RADIUS_KM: f64 = 1000.0;
+const DEFAULT_DISCOVERY_RECORD_RADIUS_KM: f64 = 5000.0;
 const DISCOVERY_ANNOUNCE_TIMEOUT: Duration = Duration::from_secs(3);
 const DISCOVERY_RECORDS_PRUNE_INTERVAL: Duration = Duration::from_secs(30);
 const DISCOVERY_RECORDS_SNAPSHOT_INTERVAL: Duration = Duration::from_secs(30);
@@ -369,14 +369,16 @@ pub(crate) async fn discovery_find_agent(
             anyhow::bail!("public_id or display_name is required");
         }
         let now_ms = now_ms();
+        let limit = normalize_limit(query.limit);
         read_discovery_records(&state_clone, now_ms, Some(&query.network_id), |table| {
             let records = table
-                .active_records(now_ms, normalize_limit(query.limit))
+                .active_records(now_ms, table.len())
                 .into_iter()
                 .filter(|record| record.body.network_id == query.network_id)
                 .filter(|record| {
                     discovery_record_matches_agent_query(record, public_id, display_name)
                 })
+                .take(limit)
                 .collect::<Vec<_>>();
             Ok(json!({
                 "ok": true,
@@ -386,6 +388,119 @@ pub(crate) async fn discovery_find_agent(
     })
     .await?;
     Ok(Json(response))
+}
+
+pub(crate) fn find_discovery_record(
+    state: &UiServerState,
+    node_id: &str,
+) -> Result<Option<SignedDiscoveryNodeRecord>> {
+    let now_ms = now_ms();
+    let node_id = node_id.trim();
+    let discovery_urls = load_discovery_bootnode_urls_state(&state.state_dir)?;
+    let registry_urls = discovery_urls
+        .iter()
+        .filter_map(|url| registry_base_url(url))
+        .collect::<Vec<_>>();
+    if !registry_urls.is_empty() {
+        let network_id = load_current_network_id(&state.state_dir, &state.db_path)?;
+        return find_registry_discovery_record(&registry_urls, &network_id, node_id, now_ms);
+    }
+
+    prune_discovery_records_if_due(state, now_ms)?;
+    let table = state
+        .discovery_records
+        .read()
+        .map_err(|_| anyhow!("discovery records lock poisoned"))?;
+    Ok(table.find_node(node_id, now_ms))
+}
+
+fn find_registry_discovery_record(
+    registry_urls: &[String],
+    network_id: &str,
+    node_id: &str,
+    now_ms: u64,
+) -> Result<Option<SignedDiscoveryNodeRecord>> {
+    let client = reqwest::blocking::Client::builder()
+        .timeout(DISCOVERY_ANNOUNCE_TIMEOUT)
+        .build()
+        .context("build registry node lookup HTTP client")?;
+    let mut last_error = None;
+
+    for registry_url in registry_urls {
+        let endpoint = match registry_node_lookup_url(registry_url, network_id, node_id) {
+            Ok(endpoint) => endpoint,
+            Err(error) => {
+                last_error = Some(error);
+                continue;
+            }
+        };
+        let response = match client.get(endpoint.clone()).send() {
+            Ok(response) if response.status() == reqwest::StatusCode::NOT_FOUND => continue,
+            Ok(response) => response,
+            Err(error) => {
+                last_error = Some(error.into());
+                continue;
+            }
+        };
+        let response = match response
+            .error_for_status()
+            .with_context(|| format!("query registry node record from {endpoint}"))
+        {
+            Ok(response) => response,
+            Err(error) => {
+                last_error = Some(error);
+                continue;
+            }
+        };
+        let payload = match response.json::<Value>() {
+            Ok(payload) => payload,
+            Err(error) => {
+                last_error = Some(error.into());
+                continue;
+            }
+        };
+        let record_value = payload.get("record").cloned().unwrap_or(payload);
+        let record: SignedDiscoveryNodeRecord = match serde_json::from_value(record_value) {
+            Ok(record) => record,
+            Err(error) => {
+                last_error = Some(error.into());
+                continue;
+            }
+        };
+        if record.body.network_id != network_id || record.body.node_id != node_id {
+            last_error = Some(anyhow!(
+                "registry returned a discovery record for a different node or network"
+            ));
+            continue;
+        }
+        if let Err(error) = record.verify_fresh_at(now_ms) {
+            last_error = Some(error);
+            continue;
+        }
+        return Ok(Some(record));
+    }
+
+    match last_error {
+        Some(error) => Err(error).context("query registry discovery record by node id"),
+        None => Ok(None),
+    }
+}
+
+fn registry_node_lookup_url(
+    registry_url: &str,
+    network_id: &str,
+    node_id: &str,
+) -> Result<reqwest::Url> {
+    let mut endpoint = reqwest::Url::parse(&format!("{registry_url}{REGISTRY_NODES_ROUTE}"))
+        .context("parse registry node lookup URL")?;
+    endpoint
+        .path_segments_mut()
+        .map_err(|_| anyhow!("registry node lookup URL cannot accept a path segment"))?
+        .push(node_id);
+    endpoint
+        .query_pairs_mut()
+        .append_pair("network_id", network_id);
+    Ok(endpoint)
 }
 
 fn read_discovery_records<T>(
@@ -942,4 +1057,110 @@ fn upsert_status(status: DiscoveryRecordUpsert) -> &'static str {
 
 fn now_ms() -> u64 {
     chrono::Utc::now().timestamp_millis().max(0) as u64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::registry_node_lookup_url;
+    use super::{find_registry_discovery_record, now_ms};
+    use axum::extract::{Path, Query};
+    use axum::routing::get;
+    use axum::{Json, Router};
+    use serde_json::json;
+    use std::collections::HashMap;
+    use std::sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    };
+    use wattswarm_crypto::NodeIdentity;
+    use wattswarm_network_discovery::{DiscoveryNodeRecordBody, SignedDiscoveryNodeRecord};
+
+    #[tokio::test]
+    async fn registry_record_lookup_queries_node_id_directly() {
+        let now_ms = now_ms();
+        let identity = NodeIdentity::from_seed([151; 32]);
+        let network_id = "mainnet:watt-galaxy".to_owned();
+        let node_id = identity.node_id();
+        let record = SignedDiscoveryNodeRecord::sign(
+            DiscoveryNodeRecordBody::new(
+                &network_id,
+                node_id.clone(),
+                node_id.clone(),
+                now_ms,
+                now_ms,
+            ),
+            &identity,
+        )
+        .expect("sign discovery record");
+
+        let requested_node = Arc::new(Mutex::new(None));
+        let list_requests = Arc::new(AtomicUsize::new(0));
+        let app = Router::new()
+            .route(
+                "/v1/nodes/:node_id",
+                get({
+                    let requested_node = Arc::clone(&requested_node);
+                    let record = record.clone();
+                    move |Path(requested_id): Path<String>,
+                          Query(query): Query<HashMap<String, String>>| {
+                        let requested_node = Arc::clone(&requested_node);
+                        let record = record.clone();
+                        async move {
+                            *requested_node.lock().expect("request log") =
+                                Some((requested_id, query.get("network_id").cloned()));
+                            Json(json!({"record": record}))
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/v1/nodes",
+                get({
+                    let list_requests = Arc::clone(&list_requests);
+                    move || {
+                        let list_requests = Arc::clone(&list_requests);
+                        async move {
+                            list_requests.fetch_add(1, Ordering::Relaxed);
+                            Json(json!({"records": []}))
+                        }
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener");
+        let base_url = format!("http://{}", listener.local_addr().expect("address"));
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let urls = vec![format!("{base_url}/v1")];
+        assert_eq!(
+            registry_node_lookup_url(&urls[0], &network_id, &node_id)
+                .expect("lookup URL")
+                .path(),
+            format!("/v1/nodes/{node_id}")
+        );
+        let lookup_network_id = network_id.clone();
+        let lookup_node_id = node_id.clone();
+        let actual = tokio::task::spawn_blocking(move || {
+            find_registry_discovery_record(&urls, &lookup_network_id, &lookup_node_id, now_ms)
+        })
+        .await
+        .expect("lookup task")
+        .expect("registry lookup")
+        .unwrap_or_else(|| {
+            panic!(
+                "registry record missing; request={:?}",
+                *requested_node.lock().expect("request log")
+            )
+        });
+
+        assert_eq!(actual.body.network_id, network_id);
+        assert_eq!(actual.body.node_id, node_id);
+        assert_eq!(
+            *requested_node.lock().expect("request log"),
+            Some((node_id, Some(network_id)))
+        );
+        assert_eq!(list_requests.load(Ordering::Relaxed), 0);
+        server.abort();
+    }
 }

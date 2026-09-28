@@ -366,7 +366,7 @@ fn discovery_bootnode_record_accepts_candidate_without_local_geo() {
 }
 
 #[test]
-fn discovery_bootnode_record_rejects_self_stale_and_out_of_radius_records() {
+fn discovery_bootnode_record_rejects_self_stale_and_out_of_radius_records_at_peer_limit() {
     let _lock = lock_env_test_mutex();
     let _debug_diagnostics =
         EnvVarGuard::set(diagnostics::ENV_NETWORK_DEBUG_DIAGNOSTICS, Some("true"));
@@ -404,6 +404,7 @@ fn discovery_bootnode_record_rejects_self_stale_and_out_of_radius_records() {
     .expect("service");
     service.set_state_dir(local_dir.clone(), local_dir.join("ui.state"));
     let local_peer_id = service.local_peer_id().to_string();
+    fill_node_peers_to_discovery_limit(&mut node);
 
     let out_of_radius = signed_discovery_record_for_test(
         &remote_dir,
@@ -486,6 +487,238 @@ fn discovery_bootnode_record_rejects_self_stale_and_out_of_radius_records() {
         .expect("reject self")
     );
     assert_eq!(service.known_remote_contact_count(), 0);
+
+    wattswarm_network_transport_iroh::shutdown_local_iroh_data_plane(&local_dir);
+    wattswarm_network_transport_iroh::shutdown_local_iroh_data_plane(&remote_dir);
+    fs::remove_dir_all(local_dir).expect("cleanup local");
+    fs::remove_dir_all(remote_dir).expect("cleanup remote");
+}
+
+fn fill_node_peers_to_discovery_limit(node: &mut Node) {
+    for index in node.peers().len()..DISCOVERY_NEARBY_PEER_LIMIT {
+        node.discover_peer(format!("peer-limit-filler-{index}"));
+    }
+}
+
+#[test]
+fn discovery_bootnode_record_accepts_out_of_radius_record_below_peer_limit() {
+    let _lock = lock_env_test_mutex();
+    let local_dir = temp_startup_dir("discovery-v1-beyond-radius-local");
+    let remote_dir = temp_startup_dir("discovery-v1-beyond-radius-remote");
+    let local_seed = [121u8; 32];
+    let remote_seed = [122u8; 32];
+    fs::write(local_dir.join("node_seed.hex"), hex::encode(local_seed)).expect("write local seed");
+    fs::write(remote_dir.join("node_seed.hex"), hex::encode(remote_seed))
+        .expect("write remote seed");
+    fs::write(
+        local_dir.join("startup_config.json"),
+        serde_json::to_vec(&json!({
+            "network_mode": "wan",
+            "relay_urls": ["https://relay.example.invalid/"],
+            "latitude": 0.0,
+            "longitude": 0.0,
+            "nearby_radius_km": 5.0
+        }))
+        .expect("startup config json"),
+    )
+    .expect("write startup config");
+    let settings = discovery_bootnode_settings_from_state_dir(&local_dir).expect("settings");
+    let mut node = Node::open_in_memory_with_roles(&[Role::Proposer]).expect("node");
+    let mut service = NetworkBridgeService::new(
+        NetworkP2pNode::from_iroh_state_dir(
+            NetworkP2pConfig::default(),
+            local_dir.clone(),
+            local_seed,
+        )
+        .expect("iroh node"),
+        &[SwarmScope::Global],
+        &NetworkProtocolParams::default(),
+    )
+    .expect("service");
+    service.set_state_dir(local_dir.clone(), local_dir.join("ui.state"));
+    let local_peer_id = service.local_peer_id().to_string();
+
+    // ~157 km away with a 5 km radius: outside the radius but below the peer limit.
+    let out_of_radius = signed_discovery_record_for_test(
+        &remote_dir,
+        remote_seed,
+        DEFAULT_NETWORK_CONTEXT_ID,
+        1.0,
+        1.0,
+        5.0,
+    );
+    let remote_node_id = out_of_radius.body.node_id.clone();
+    assert!(
+        apply_discovery_bootnode_record(
+            &mut service,
+            &mut node,
+            &local_dir,
+            &local_peer_id,
+            DEFAULT_NETWORK_CONTEXT_ID,
+            &settings,
+            out_of_radius.clone(),
+            observed_at_ms(),
+        )
+        .expect("accept out of radius below peer limit")
+    );
+    assert!(node.peers().contains(&remote_node_id));
+    let metadata =
+        crate::control::load_peer_metadata_records_state(&local_dir).expect("peer metadata");
+    assert!(
+        metadata
+            .iter()
+            .any(|record| record.node_id == remote_node_id && record.contact_material.is_some())
+    );
+
+    // Once the limit is reached, an already known far peer still accepts contact updates.
+    fill_node_peers_to_discovery_limit(&mut node);
+    let mut updated_body = out_of_radius.body;
+    updated_body.seq = updated_body.seq.saturating_add(1);
+    updated_body.updated_at_ms = updated_body.updated_at_ms.saturating_add(1);
+    updated_body
+        .transport_contact
+        .as_mut()
+        .expect("transport contact")
+        .metadata
+        .generated_at = updated_body.updated_at_ms;
+    let updated_record =
+        SignedDiscoveryNodeRecord::sign(updated_body, &NodeIdentity::from_seed(remote_seed))
+            .expect("sign updated discovery record");
+    assert!(
+        apply_discovery_bootnode_record(
+            &mut service,
+            &mut node,
+            &local_dir,
+            &local_peer_id,
+            DEFAULT_NETWORK_CONTEXT_ID,
+            &settings,
+            updated_record,
+            observed_at_ms(),
+        )
+        .expect("refresh known far peer at peer limit")
+    );
+
+    wattswarm_network_transport_iroh::shutdown_local_iroh_data_plane(&local_dir);
+    wattswarm_network_transport_iroh::shutdown_local_iroh_data_plane(&remote_dir);
+    fs::remove_dir_all(local_dir).expect("cleanup local");
+    fs::remove_dir_all(remote_dir).expect("cleanup remote");
+}
+
+#[test]
+fn discovery_records_sort_nearest_first_with_missing_geo_last() {
+    let local_dir = temp_startup_dir("discovery-v1-sort-local");
+    fs::write(
+        local_dir.join("startup_config.json"),
+        serde_json::to_vec(&json!({
+            "network_mode": "wan",
+            "latitude": 0.0,
+            "longitude": 0.0,
+            "nearby_radius_km": 5.0
+        }))
+        .expect("startup config json"),
+    )
+    .expect("write startup config");
+    let settings = discovery_bootnode_settings_from_state_dir(&local_dir).expect("settings");
+    let mut remote_dirs = Vec::new();
+    let mut remote_record = |seed: [u8; 32], latitude: f64, longitude: f64| {
+        let remote_dir = temp_startup_dir("discovery-v1-sort-remote");
+        fs::write(remote_dir.join("node_seed.hex"), hex::encode(seed)).expect("write seed");
+        let record = signed_discovery_record_for_test(
+            &remote_dir,
+            seed,
+            DEFAULT_NETWORK_CONTEXT_ID,
+            latitude,
+            longitude,
+            5.0,
+        );
+        remote_dirs.push(remote_dir);
+        record
+    };
+    let far = remote_record([131u8; 32], 10.0, 10.0);
+    let near = remote_record([132u8; 32], 0.1, 0.1);
+    let mut without_geo = remote_record([133u8; 32], 0.0, 0.0);
+    without_geo.body.geo = None;
+    let expected = vec![
+        near.body.node_id.clone(),
+        far.body.node_id.clone(),
+        without_geo.body.node_id.clone(),
+    ];
+    let mut records = vec![without_geo, far, near];
+
+    sort_discovery_records_by_distance(&settings, &mut records);
+
+    assert_eq!(
+        records
+            .iter()
+            .map(|record| record.body.node_id.clone())
+            .collect::<Vec<_>>(),
+        expected
+    );
+    for remote_dir in remote_dirs {
+        wattswarm_network_transport_iroh::shutdown_local_iroh_data_plane(&remote_dir);
+        fs::remove_dir_all(remote_dir).expect("cleanup remote");
+    }
+    fs::remove_dir_all(local_dir).expect("cleanup local");
+}
+
+#[test]
+fn persisted_discovery_contact_is_loaded_into_runtime_for_one_peer() {
+    let _lock = lock_env_test_mutex();
+    let local_dir = temp_startup_dir("discovery-v1-persist-contact-local");
+    let remote_dir = temp_startup_dir("discovery-v1-persist-contact-remote");
+    let local_seed = [141u8; 32];
+    let remote_seed = [142u8; 32];
+    fs::write(local_dir.join("node_seed.hex"), hex::encode(local_seed)).expect("write local seed");
+    fs::write(remote_dir.join("node_seed.hex"), hex::encode(remote_seed))
+        .expect("write remote seed");
+    fs::write(
+        local_dir.join("startup_config.json"),
+        serde_json::to_vec(&json!({
+            "network_mode": "wan",
+            "relay_urls": ["https://relay.example.invalid/"]
+        }))
+        .expect("startup config json"),
+    )
+    .expect("write startup config");
+    let mut service = NetworkBridgeService::new(
+        NetworkP2pNode::from_iroh_state_dir(
+            NetworkP2pConfig::default(),
+            local_dir.clone(),
+            local_seed,
+        )
+        .expect("iroh node"),
+        &[SwarmScope::Global],
+        &NetworkProtocolParams::default(),
+    )
+    .expect("service");
+    service.set_state_dir(local_dir.clone(), local_dir.join("ui.state"));
+    let record = signed_discovery_record_for_test(
+        &remote_dir,
+        remote_seed,
+        DEFAULT_NETWORK_CONTEXT_ID,
+        60.0,
+        60.0,
+        5.0,
+    );
+    let remote_node_id = record.body.node_id.clone();
+
+    let mut tampered = record.clone();
+    tampered.body.seq = tampered.body.seq.saturating_add(1);
+    assert!(persist_discovery_record_contact_material(&local_dir, &tampered).is_err());
+
+    persist_discovery_record_contact_material(&local_dir, &record)
+        .expect("persist discovery contact");
+    assert_eq!(service.known_remote_contact_count(), 0);
+
+    service
+        .load_iroh_contact_material_for_peer(&local_dir, "unrelated-node")
+        .expect("load unrelated peer");
+    assert_eq!(service.known_remote_contact_count(), 0);
+
+    service
+        .load_iroh_contact_material_for_peer(&local_dir, &remote_node_id)
+        .expect("load persisted peer contact");
+    assert_eq!(service.known_remote_contact_count(), 1);
 
     wattswarm_network_transport_iroh::shutdown_local_iroh_data_plane(&local_dir);
     wattswarm_network_transport_iroh::shutdown_local_iroh_data_plane(&remote_dir);

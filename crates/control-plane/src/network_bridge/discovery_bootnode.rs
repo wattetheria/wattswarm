@@ -580,34 +580,21 @@ pub(super) fn apply_discovery_bootnode_record(
     if record.body.node_id == local_peer_id {
         return Ok(false);
     }
-    let distance_km = if settings.has_local_geo() {
-        let Some(remote_geo) = &record.body.geo else {
-            return Ok(false);
-        };
-        let Some(distance_km) = discovery_record_distance_km(settings, remote_geo) else {
-            return Ok(false);
-        };
-        if distance_km > settings.radius_km.min(remote_geo.radius_km) {
-            return Ok(false);
-        }
-        Some(distance_km)
-    } else {
-        None
-    };
-    let Some(contact) = record.body.transport_contact.clone() else {
-        return Ok(false);
-    };
-    if contact.transport != DataTransportRoute::IrohDirect.as_str() {
+    let distance_km = record
+        .body
+        .geo
+        .as_ref()
+        .and_then(|remote_geo| discovery_record_distance_km(settings, remote_geo));
+    if settings.has_local_geo()
+        && !distance_km.is_some_and(|distance_km| distance_km <= settings.radius_km)
+        && !beyond_radius_slot_available(node, &record.body.node_id)
+    {
         return Ok(false);
     }
-    let remote_network_peer_id = iroh_contact_network_peer_id(&contact)?;
-    if remote_network_peer_id != record.body.node_id {
-        bail!(
-            "discovery record node_id {} does not match Iroh contact peer {}",
-            record.body.node_id,
-            remote_network_peer_id
-        );
-    }
+    let Some(contact) = discovery_record_iroh_contact(&record)?.cloned() else {
+        return Ok(false);
+    };
+    let remote_network_peer_id = record.body.node_id.clone();
     let remote_peer = NetworkNodeId::new(remote_network_peer_id.clone())?;
     let registered =
         service.upsert_remote_contact_material(remote_network_peer_id.clone(), contact)?;
@@ -642,6 +629,35 @@ pub(super) fn apply_discovery_bootnode_record(
     Ok(registered)
 }
 
+fn beyond_radius_slot_available(node: &Node, remote_node_id: &str) -> bool {
+    let peers = node.peers();
+    peers.len() < DISCOVERY_NEARBY_PEER_LIMIT || peers.iter().any(|peer| peer == remote_node_id)
+}
+
+/// Orders records nearest first so beyond-radius slots go to the closest candidates;
+/// records without a comparable geo go last.
+pub(super) fn sort_discovery_records_by_distance(
+    settings: &DiscoveryBootnodeSettings,
+    records: &mut [SignedDiscoveryNodeRecord],
+) {
+    if !settings.has_local_geo() {
+        return;
+    }
+    let distance_km = |record: &SignedDiscoveryNodeRecord| {
+        record
+            .body
+            .geo
+            .as_ref()
+            .and_then(|remote_geo| discovery_record_distance_km(settings, remote_geo))
+            .unwrap_or(f64::INFINITY)
+    };
+    records.sort_by(|left, right| {
+        distance_km(left)
+            .total_cmp(&distance_km(right))
+            .then_with(|| left.body.node_id.cmp(&right.body.node_id))
+    });
+}
+
 fn discovery_record_distance_km(
     settings: &DiscoveryBootnodeSettings,
     remote_geo: &DiscoveryGeo,
@@ -657,6 +673,45 @@ fn discovery_record_distance_km(
         remote_geo.latitude,
         remote_geo.longitude,
     ))
+}
+
+/// Returns the record's Iroh direct contact, or `None` when it has no usable contact.
+/// Errors when the contact belongs to a different peer than the record.
+fn discovery_record_iroh_contact(
+    record: &SignedDiscoveryNodeRecord,
+) -> Result<Option<&TransportContactMaterial>> {
+    let Some(contact) = record.body.transport_contact.as_ref() else {
+        return Ok(None);
+    };
+    if contact.transport != DataTransportRoute::IrohDirect.as_str() {
+        return Ok(None);
+    }
+    let remote_network_peer_id = iroh_contact_network_peer_id(contact)?;
+    if remote_network_peer_id != record.body.node_id {
+        bail!(
+            "discovery record node_id {} does not match Iroh contact peer {}",
+            record.body.node_id,
+            remote_network_peer_id
+        );
+    }
+    Ok(Some(contact))
+}
+
+/// Persists a discovery record's Iroh contact so explicit peer actions (e.g. friend requests)
+/// can reach peers the discovery loop skipped because of distance or the peer limit.
+pub fn persist_discovery_record_contact_material(
+    state_dir: &Path,
+    record: &SignedDiscoveryNodeRecord,
+) -> Result<()> {
+    record.verify()?;
+    if discovery_record_iroh_contact(record)?.is_none() {
+        bail!("discovery record has no Iroh direct transport contact");
+    }
+    upsert_contact_material_for_peer(
+        state_dir,
+        &record.body.node_id,
+        &raw_contact_material_from_discovery_record(record)?,
+    )
 }
 
 fn raw_contact_material_from_discovery_record(

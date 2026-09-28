@@ -613,7 +613,8 @@ fn peer_relationship_action_records_outbound_contact_material_diagnostic() {
         .runtime
         .upsert_remote_contact_material(peer.to_string(), remote_contact)
         .expect("upsert contact");
-    service.record_peer_liveness(peer);
+    assert!(!service.connected_peers.contains(&peer));
+    assert!(!service.peer_recently_seen_at(&peer, Instant::now()));
 
     service
         .send_peer_relationship_action(
@@ -637,6 +638,89 @@ fn peer_relationship_action_records_outbound_contact_material_diagnostic() {
     wattswarm_network_transport_iroh::shutdown_local_iroh_data_plane(&remote_dir);
     let _ = std::fs::remove_dir_all(local_dir);
     let _ = std::fs::remove_dir_all(remote_dir);
+}
+
+#[test]
+fn peer_relationship_action_loads_persisted_contact_for_never_seen_peer() {
+    let local_dir = temp_startup_dir("relationship-first-contact-local");
+    let remote_dir = temp_startup_dir("relationship-first-contact-remote");
+    let local_seed = [115u8; 32];
+    std::fs::write(local_dir.join("node_seed.hex"), hex::encode(local_seed))
+        .expect("write local seed");
+    std::fs::write(remote_dir.join("node_seed.hex"), hex::encode([116u8; 32]))
+        .expect("write remote seed");
+    ensure_test_relay_urls(&local_dir);
+    ensure_test_relay_urls(&remote_dir);
+    let remote_endpoint =
+        wattswarm_network_transport_iroh::local_endpoint_id_from_state_dir(&remote_dir)
+            .expect("remote endpoint")
+            .to_string();
+    let peer = NetworkNodeId::new(remote_endpoint.clone()).expect("remote peer id");
+    let mut service = NetworkBridgeService::new(
+        NetworkP2pNode::from_iroh_state_dir(
+            NetworkP2pConfig::default(),
+            local_dir.clone(),
+            local_seed,
+        )
+        .expect("local node"),
+        &[SwarmScope::Global],
+        &NetworkProtocolParams::default(),
+    )
+    .expect("service");
+    service.set_state_dir(local_dir.clone(), local_dir.join("ui.state"));
+    let contact = build_contact_material(&remote_dir, &remote_endpoint).expect("remote contact");
+    upsert_contact_material_for_peer(&local_dir, &remote_endpoint, &contact)
+        .expect("persist contact after startup");
+    assert!(!service.runtime.allows_outbound_backfill_to(&peer));
+    assert!(!service.connected_peers.contains(&peer));
+    assert!(!service.peer_recently_seen_at(&peer, Instant::now()));
+
+    let request_id = service
+        .send_peer_relationship_action(
+            &remote_endpoint,
+            crate::control::PeerRelationshipAction::Request,
+            None,
+        )
+        .expect("first relationship request uses persisted contact");
+    assert!(service.runtime.allows_outbound_backfill_to(&peer));
+    assert!(
+        service
+            .pending_relationship_requests
+            .contains_key(&request_id)
+    );
+    assert!(service.reconnect_attempts_for_peer(&peer).is_some());
+
+    wattswarm_network_transport_iroh::shutdown_local_iroh_data_plane(&local_dir);
+    wattswarm_network_transport_iroh::shutdown_local_iroh_data_plane(&remote_dir);
+    let _ = std::fs::remove_dir_all(local_dir);
+    let _ = std::fs::remove_dir_all(remote_dir);
+}
+
+#[test]
+fn peer_relationship_action_still_requires_contact_material() {
+    let dir = temp_startup_dir("relationship-missing-contact");
+    let mut service = NetworkBridgeService::new(
+        test_network_node(NetworkP2pConfig::default()).expect("node"),
+        &[SwarmScope::Global],
+        &NetworkProtocolParams::default(),
+    )
+    .expect("service");
+    service.set_state_dir(dir.clone(), dir.join("ui.state"));
+    let peer = random_network_node_id();
+    let error = service
+        .send_peer_relationship_action(
+            peer.as_str(),
+            crate::control::PeerRelationshipAction::Request,
+            None,
+        )
+        .expect_err("missing contact must still be rejected");
+    assert_eq!(
+        error.to_string(),
+        "peer relationship actions require peer contact material"
+    );
+    assert!(service.pending_relationship_requests.is_empty());
+
+    let _ = std::fs::remove_dir_all(dir);
 }
 
 #[test]

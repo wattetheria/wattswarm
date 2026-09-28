@@ -377,6 +377,8 @@ impl DiscoveryRoutingTable {
             .collect()
     }
 
+    /// Returns the `limit` nearest records. Records inside `origin.radius_km` always sort first;
+    /// remaining slots are filled with farther records, then records without geo.
     pub fn find_nearby(
         &self,
         network_id: &str,
@@ -387,26 +389,23 @@ impl DiscoveryRoutingTable {
         let mut candidates = self
             .records
             .values()
-            .filter_map(|record| {
-                if record.body.network_id != network_id || record.body.is_expired_at(now_ms) {
-                    return None;
-                }
-                let remote_geo = record.body.geo.as_ref()?;
-                let distance_km = origin.distance_km_to(remote_geo);
-                let allowed_radius_km = origin.radius_km.min(remote_geo.radius_km);
-                if distance_km > allowed_radius_km {
-                    return None;
-                }
-                Some(DiscoveryCandidate {
-                    record: record.clone(),
-                    distance_km: Some(distance_km),
-                })
+            .filter(|record| {
+                record.body.network_id == network_id && !record.body.is_expired_at(now_ms)
+            })
+            .map(|record| DiscoveryCandidate {
+                record: record.clone(),
+                distance_km: record
+                    .body
+                    .geo
+                    .as_ref()
+                    .map(|remote_geo| origin.distance_km_to(remote_geo)),
             })
             .collect::<Vec<_>>();
         candidates.sort_by(|left, right| {
-            left.distance_km
-                .partial_cmp(&right.distance_km)
-                .unwrap_or(std::cmp::Ordering::Equal)
+            let left_distance = left.distance_km.unwrap_or(f64::INFINITY);
+            let right_distance = right.distance_km.unwrap_or(f64::INFINITY);
+            left_distance
+                .total_cmp(&right_distance)
                 .then_with(|| left.record.body.node_id.cmp(&right.record.body.node_id))
         });
         candidates.truncate(limit);
@@ -730,7 +729,7 @@ mod tests {
     }
 
     #[test]
-    fn nearby_query_filters_network_ttl_and_radius() {
+    fn nearby_query_filters_network_and_ttl_and_fills_beyond_radius_by_distance() {
         let near_identity = NodeIdentity::from_seed([1; 32]);
         let far_identity = NodeIdentity::from_seed([2; 32]);
         let other_network_identity = NodeIdentity::from_seed([3; 32]);
@@ -787,8 +786,18 @@ mod tests {
             radius_km: 50.0,
         };
         let nearby = table.find_nearby("net", &origin, 2_000, 10);
-        assert_eq!(nearby.len(), 1);
-        assert_eq!(nearby[0].record.body.node_id, near_identity.node_id());
+        assert_eq!(
+            nearby
+                .iter()
+                .map(|candidate| candidate.record.body.node_id.clone())
+                .collect::<Vec<_>>(),
+            vec![near_identity.node_id(), far_identity.node_id()]
+        );
+        assert!(nearby[1].distance_km.expect("far distance") > origin.radius_km);
+
+        let nearest = table.find_nearby("net", &origin, 2_000, 1);
+        assert_eq!(nearest.len(), 1);
+        assert_eq!(nearest[0].record.body.node_id, near_identity.node_id());
 
         assert!(table.find_nearby("net", &origin, 1_000_000, 10).is_empty());
     }

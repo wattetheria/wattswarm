@@ -5,6 +5,7 @@ use iroh::{
     address_lookup::memory::MemoryLookup,
     endpoint::{Connection, presets},
     protocol::{AcceptError, ProtocolHandler, Router},
+    tls::CaRootsConfig,
 };
 use iroh_blobs::{
     BlobFormat, BlobsProtocol, Hash as IrohBlobHash, HashAndFormat, store::fs::FsStore,
@@ -14,6 +15,7 @@ use iroh_gossip::{
     Gossip,
     proto::{HyparviewConfig, PlumtreeConfig},
 };
+use rustls_pki_types::{CertificateDer, pem::PemObject};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::HashMap;
@@ -28,6 +30,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::runtime::{Builder as RuntimeBuilder, Runtime, RuntimeFlavor};
 use tokio::sync::Semaphore;
+use url::{Host, Url};
 use wattswarm_artifact_store::{ArtifactKind, ArtifactStore};
 use wattswarm_network_transport_core::{
     DirectDataFetchRequest, DirectDataFetchResponse, DirectDataTransportAdapter,
@@ -43,7 +46,13 @@ pub const ENV_IROH_RELAY_URLS: &str = "WATTSWARM_IROH_RELAY_URLS";
 pub const ENV_IROH_BIND_ADDR: &str = "WATTSWARM_IROH_BIND_ADDR";
 pub const ENV_IROH_PUBLISH_DIRECT_ADDRS: &str = "WATTSWARM_IROH_PUBLISH_DIRECT_ADDRS";
 pub const ENV_IROH_DATA_PLANE_START_TIMEOUT_MS: &str = "WATTSWARM_IROH_DATA_PLANE_START_TIMEOUT_MS";
+pub const ENV_IROH_EXTRA_CA_FILE: &str = "WATTSWARM_IROH_EXTRA_CA_FILE";
 const ENV_NETWORK_DEBUG_DIAGNOSTICS: &str = "WATTSWARM_NETWORK_DEBUG_DIAGNOSTICS";
+/// Standard proxy variables, HTTPS first because relays are always https.
+/// `ALL_PROXY` is left out: it is usually SOCKS, which iroh cannot dial.
+const ENV_PROXY_KEYS: &[&str] = &["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"];
+const ENV_NO_PROXY_KEYS: &[&str] = &["NO_PROXY", "no_proxy"];
+const ENV_EXTRA_CA_FILE_KEYS: &[&str] = &[ENV_IROH_EXTRA_CA_FILE, "SSL_CERT_FILE"];
 const MAX_FETCH_REQUEST_BYTES: usize = 64 * 1024;
 const MAX_FETCH_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_CONTROL_REQUEST_BYTES: usize = 1024 * 1024;
@@ -487,6 +496,179 @@ struct IrohEndpointOptions {
     bind_addr: Option<SocketAddr>,
     publish_observed_direct_addrs: bool,
     published_direct_addrs: Vec<String>,
+    egress: IrohEgressOptions,
+}
+
+/// Egress settings for iroh's own HTTPS traffic (relays, pkarr).
+///
+/// Sandboxed hosts often force all egress through a TLS-intercepting proxy
+/// and expose it only via the standard proxy / CA-bundle env vars. iroh
+/// ignores both by default, so the relay handshake fails there. Hosts
+/// without these vars keep iroh's defaults.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct IrohEgressOptions {
+    proxy_url: Option<Url>,
+    extra_ca_roots: Vec<CertificateDer<'static>>,
+    extra_ca_file: Option<PathBuf>,
+    warnings: Vec<String>,
+}
+
+impl IrohEgressOptions {
+    fn from_env_lookup(relay_urls: &[RelayUrl], lookup: impl Fn(&str) -> Option<String>) -> Self {
+        let first_non_empty = |keys: &[&'static str]| {
+            keys.iter().find_map(|key| {
+                lookup(key)
+                    .map(|value| value.trim().to_owned())
+                    .filter(|value| !value.is_empty())
+                    .map(|value| (*key, value))
+            })
+        };
+        let mut options = Self::default();
+
+        if let Some((key, raw)) = first_non_empty(ENV_PROXY_KEYS) {
+            let no_proxy = first_non_empty(ENV_NO_PROXY_KEYS)
+                .map(|(_, value)| value)
+                .unwrap_or_default();
+            match parse_http_proxy_url(&raw) {
+                Ok(_) if relays_bypass_proxy(relay_urls, &no_proxy) => {}
+                Ok(url) => options.proxy_url = Some(url),
+                Err(error) => options.warnings.push(format!("ignoring {key}: {error:#}")),
+            }
+        }
+
+        if let Some((key, raw)) = first_non_empty(ENV_EXTRA_CA_FILE_KEYS) {
+            let path = PathBuf::from(raw);
+            match load_pem_certificates(&path) {
+                Ok(certs) if certs.is_empty() => options.warnings.push(format!(
+                    "{key}={} contains no PEM certificates",
+                    path.display()
+                )),
+                Ok(certs) => {
+                    options.extra_ca_roots = certs;
+                    options.extra_ca_file = Some(path);
+                }
+                Err(error) => options
+                    .warnings
+                    .push(format!("ignoring {key}={}: {error:#}", path.display())),
+            }
+        }
+        options
+    }
+
+    fn apply(&self, mut builder: iroh::endpoint::Builder) -> iroh::endpoint::Builder {
+        if let Some(proxy_url) = &self.proxy_url {
+            builder = builder.proxy_url(proxy_url.clone());
+        }
+        if !self.extra_ca_roots.is_empty() {
+            builder = builder.ca_roots_config(
+                CaRootsConfig::embedded().with_extra_roots(self.extra_ca_roots.clone()),
+            );
+        }
+        builder
+    }
+
+    /// Proxy location without credentials, safe for logs and diagnostics.
+    fn redacted_proxy(&self) -> Option<String> {
+        self.proxy_url.as_ref().map(|url| {
+            let host = url.host_str().unwrap_or_default();
+            match url.port() {
+                Some(port) => format!("{}://{host}:{port}", url.scheme()),
+                None => format!("{}://{host}", url.scheme()),
+            }
+        })
+    }
+
+    fn summary(&self) -> String {
+        format!(
+            "proxy={} extra_ca_roots={} extra_ca_file={}",
+            self.redacted_proxy().as_deref().unwrap_or("none"),
+            self.extra_ca_roots.len(),
+            self.extra_ca_file
+                .as_deref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| "none".to_owned()),
+        )
+    }
+}
+
+/// iroh tunnels relay traffic with HTTP CONNECT only, so accept `http(s)`
+/// proxies and default a missing scheme to `http://` like curl does.
+fn parse_http_proxy_url(raw: &str) -> Result<Url> {
+    let with_scheme = if raw.contains("://") {
+        raw.to_owned()
+    } else {
+        format!("http://{raw}")
+    };
+    let url = Url::parse(&with_scheme).context("invalid proxy url")?;
+    if !matches!(url.scheme(), "http" | "https") {
+        bail!("unsupported proxy scheme {}", url.scheme());
+    }
+    if url.host_str().is_none_or(str::is_empty) {
+        bail!("proxy url has no host");
+    }
+    Ok(url)
+}
+
+fn load_pem_certificates(path: &Path) -> Result<Vec<CertificateDer<'static>>> {
+    let bytes = fs::read(path).context("read CA file")?;
+    CertificateDer::pem_slice_iter(&bytes)
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|error| anyhow!("parse PEM certificates: {error:?}"))
+}
+
+/// Skips the proxy only when every configured relay is local or covered by
+/// `NO_PROXY`: iroh applies a single proxy to all of its HTTPS traffic, and
+/// the default (empty) relay list means public n0 relays.
+fn relays_bypass_proxy(relay_urls: &[RelayUrl], no_proxy: &str) -> bool {
+    !relay_urls.is_empty()
+        && relay_urls
+            .iter()
+            .all(|relay| host_is_local(relay) || host_matches_no_proxy(relay, no_proxy))
+}
+
+fn host_is_local(url: &Url) -> bool {
+    match url.host() {
+        Some(Host::Domain(domain)) => {
+            let domain = domain.to_ascii_lowercase();
+            domain == "localhost" || domain.ends_with(".localhost")
+        }
+        Some(Host::Ipv4(ip)) => ip.is_loopback() || ip.is_private() || ip.is_link_local(),
+        Some(Host::Ipv6(ip)) => {
+            ip.is_loopback() || ip.is_unique_local() || ip.is_unicast_link_local()
+        }
+        None => false,
+    }
+}
+
+fn host_matches_no_proxy(url: &Url, no_proxy: &str) -> bool {
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    let host = host
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .to_ascii_lowercase();
+    no_proxy
+        .split(',')
+        .map(|entry| entry.trim().to_ascii_lowercase())
+        .filter(|entry| !entry.is_empty())
+        .any(|entry| {
+            if entry == "*" {
+                return true;
+            }
+            let entry = entry.trim_start_matches("*.").trim_start_matches('.');
+            // Drop an optional `:port` suffix, but not from bare IPv6 entries.
+            let entry = match entry.rsplit_once(':') {
+                Some((name, port))
+                    if !name.contains(':') && port.chars().all(|c| c.is_ascii_digit()) =>
+                {
+                    name
+                }
+                _ => entry,
+            };
+            let entry = entry.trim_start_matches('[').trim_end_matches(']');
+            host == entry || host.ends_with(&format!(".{entry}"))
+        })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -564,11 +746,20 @@ impl IrohEndpointOptions {
     fn resolve(state_dir: &Path) -> Result<Self> {
         let relay_urls_raw = startup_config_relay_urls(state_dir)
             .or_else(|| std::env::var(ENV_IROH_RELAY_URLS).ok());
-        Self::from_raw_env(
+        let mut options = Self::from_raw_env(
             relay_urls_raw.as_deref(),
             std::env::var(ENV_IROH_BIND_ADDR).ok().as_deref(),
             std::env::var(ENV_IROH_PUBLISH_DIRECT_ADDRS).ok().as_deref(),
-        )
+        )?;
+        options.egress =
+            IrohEgressOptions::from_env_lookup(&options.relay_urls, |key| std::env::var(key).ok());
+        for warning in &options.egress.warnings {
+            eprintln!("wattswarm iroh egress warning: {warning}");
+        }
+        if options.egress != IrohEgressOptions::default() {
+            eprintln!("wattswarm iroh egress: {}", options.egress.summary());
+        }
+        Ok(options)
     }
 
     fn from_raw_env(
@@ -591,6 +782,7 @@ impl IrohEndpointOptions {
             bind_addr: parse_optional_socket_addr_env(ENV_IROH_BIND_ADDR, bind_addr)?,
             publish_observed_direct_addrs,
             published_direct_addrs: parse_direct_addr_publish_env(publish_direct_addrs)?,
+            egress: IrohEgressOptions::default(),
         })
     }
 
@@ -1037,7 +1229,9 @@ impl IrohDataPlaneService {
             .enable_all()
             .build()?;
         let endpoint_future = || async {
-            let mut builder = Endpoint::builder(presets::N0).secret_key(secret_key);
+            let mut builder = endpoint_options
+                .egress
+                .apply(Endpoint::builder(presets::N0).secret_key(secret_key));
             if let Some(bind_addr) = endpoint_options.bind_addr {
                 builder = builder.clear_ip_transports().bind_addr(bind_addr)?;
             }
@@ -1215,6 +1409,8 @@ impl IrohDataPlaneService {
         let details = json!({
             "publish_observed_direct_addrs": self.endpoint_options.publish_observed_direct_addrs,
             "bind_addr": self.endpoint_options.bind_addr.map(|addr| addr.to_string()),
+            "egress_proxy": self.endpoint_options.egress.redacted_proxy(),
+            "extra_ca_roots": self.endpoint_options.egress.extra_ca_roots.len(),
             "online_wait_status": online_wait_status,
             "raw_ip_addrs": raw_ip_addrs,
             "published_direct_addrs": published_direct_addrs,
@@ -2448,6 +2644,182 @@ mod tests {
 
         std::fs::write(&path, "not-json").expect("write config");
         assert_eq!(startup_config_relay_urls(dir.path()), None);
+    }
+
+    fn egress_from(relays: &str, env: &[(&str, &str)]) -> IrohEgressOptions {
+        let relay_urls = parse_relay_urls(relays).expect("relay urls");
+        let env: HashMap<String, String> = env
+            .iter()
+            .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
+            .collect();
+        IrohEgressOptions::from_env_lookup(&relay_urls, |key| env.get(key).cloned())
+    }
+
+    const TEST_PEM_BUNDLE: &str = "-----BEGIN CERTIFICATE-----\nAQID\n-----END CERTIFICATE-----\n\
+         -----BEGIN CERTIFICATE-----\nBAUG\n-----END CERTIFICATE-----\n";
+
+    #[test]
+    fn iroh_egress_defaults_without_proxy_or_ca_env() {
+        let egress = egress_from("https://relay.wattetheria.com", &[]);
+        assert_eq!(egress, IrohEgressOptions::default());
+        assert_eq!(
+            egress.summary(),
+            "proxy=none extra_ca_roots=0 extra_ca_file=none"
+        );
+    }
+
+    #[test]
+    fn iroh_egress_prefers_https_proxy_and_redacts_credentials() {
+        let egress = egress_from(
+            "https://relay.wattetheria.com",
+            &[
+                ("http_proxy", "http://plain-proxy:3128"),
+                ("https_proxy", "http://user:secret@egress-proxy:8080"),
+            ],
+        );
+        assert_eq!(
+            egress.proxy_url.as_ref().map(Url::as_str),
+            Some("http://user:secret@egress-proxy:8080/")
+        );
+        assert_eq!(
+            egress.redacted_proxy().as_deref(),
+            Some("http://egress-proxy:8080")
+        );
+        assert!(!egress.summary().contains("secret"));
+    }
+
+    #[test]
+    fn iroh_egress_uses_proxy_for_default_n0_relays() {
+        let egress = egress_from("", &[("HTTPS_PROXY", "http://egress-proxy:8080")]);
+        assert!(egress.proxy_url.is_some());
+    }
+
+    #[test]
+    fn iroh_egress_skips_proxy_when_all_relays_are_local_or_no_proxy() {
+        let proxy = ("HTTPS_PROXY", "http://egress-proxy:8080");
+        for relays in [
+            "http://localhost:3340",
+            "http://127.0.0.1:3340,http://relay.localhost",
+            "http://[::1]:3340",
+            "http://10.0.0.5:3340",
+        ] {
+            assert!(
+                egress_from(relays, &[proxy]).proxy_url.is_none(),
+                "{relays} must bypass the proxy"
+            );
+        }
+        for no_proxy in [
+            "*",
+            "wattetheria.com",
+            ".wattetheria.com",
+            "*.wattetheria.com",
+            "relay.wattetheria.com:443, other.example",
+        ] {
+            assert!(
+                egress_from(
+                    "https://relay.wattetheria.com",
+                    &[proxy, ("NO_PROXY", no_proxy)]
+                )
+                .proxy_url
+                .is_none(),
+                "NO_PROXY={no_proxy} must bypass the proxy"
+            );
+        }
+    }
+
+    #[test]
+    fn iroh_egress_keeps_proxy_when_any_relay_needs_it() {
+        let egress = egress_from(
+            "http://127.0.0.1:3340,https://relay.wattetheria.com",
+            &[
+                ("HTTPS_PROXY", "http://egress-proxy:8080"),
+                ("no_proxy", "example.com,notwattetheria.com"),
+            ],
+        );
+        assert!(egress.proxy_url.is_some());
+    }
+
+    #[test]
+    fn iroh_egress_warns_and_ignores_unusable_proxy() {
+        for raw in ["http://", "socks5://egress-proxy:1080", "http://[bad"] {
+            let egress = egress_from("https://relay.wattetheria.com", &[("HTTPS_PROXY", raw)]);
+            assert!(egress.proxy_url.is_none(), "{raw}");
+            assert_eq!(egress.warnings.len(), 1, "{raw}");
+            assert!(egress.warnings[0].contains("HTTPS_PROXY"), "{raw}");
+        }
+    }
+
+    #[test]
+    fn iroh_egress_defaults_scheme_less_proxy_to_http() {
+        let egress = egress_from(
+            "https://relay.wattetheria.com",
+            &[("HTTPS_PROXY", "egress-proxy:8080")],
+        );
+        assert_eq!(
+            egress.redacted_proxy().as_deref(),
+            Some("http://egress-proxy:8080")
+        );
+        assert!(egress.warnings.is_empty());
+    }
+
+    #[test]
+    fn iroh_egress_loads_extra_ca_roots_with_override_precedence() {
+        let dir = tempdir().expect("tempdir");
+        let bundle = dir.path().join("bundle.pem");
+        std::fs::write(&bundle, TEST_PEM_BUNDLE).expect("write bundle");
+        let bundle_str = bundle.to_str().expect("utf8 path");
+
+        let egress = egress_from(
+            "https://relay.wattetheria.com",
+            &[
+                ("SSL_CERT_FILE", "/nonexistent/ignored.pem"),
+                (ENV_IROH_EXTRA_CA_FILE, bundle_str),
+            ],
+        );
+        assert!(egress.warnings.is_empty());
+        assert_eq!(egress.extra_ca_roots.len(), 2);
+        assert_eq!(egress.extra_ca_file.as_deref(), Some(bundle.as_path()));
+
+        let egress = egress_from(
+            "https://relay.wattetheria.com",
+            &[("SSL_CERT_FILE", bundle_str)],
+        );
+        assert_eq!(egress.extra_ca_roots.len(), 2);
+    }
+
+    #[test]
+    fn iroh_egress_warns_on_missing_empty_or_corrupt_ca_file() {
+        let dir = tempdir().expect("tempdir");
+        let empty = dir.path().join("empty.pem");
+        std::fs::write(&empty, "no certificates here\n").expect("write empty");
+        let corrupt = dir.path().join("corrupt.pem");
+        std::fs::write(
+            &corrupt,
+            "-----BEGIN CERTIFICATE-----\n!!!\n-----END CERTIFICATE-----\n",
+        )
+        .expect("write corrupt");
+
+        for path in [
+            dir.path().join("missing.pem"),
+            empty.clone(),
+            corrupt.clone(),
+        ] {
+            let egress = egress_from(
+                "https://relay.wattetheria.com",
+                &[("SSL_CERT_FILE", path.to_str().expect("utf8 path"))],
+            );
+            assert!(egress.extra_ca_roots.is_empty(), "{}", path.display());
+            assert!(egress.extra_ca_file.is_none(), "{}", path.display());
+            assert_eq!(egress.warnings.len(), 1, "{}", path.display());
+            assert!(egress.warnings[0].contains("SSL_CERT_FILE"));
+        }
+    }
+
+    #[test]
+    fn iroh_endpoint_options_from_raw_env_leaves_egress_default() {
+        let options =
+            IrohEndpointOptions::from_raw_env(None, None, None).expect("endpoint options");
+        assert_eq!(options.egress, IrohEgressOptions::default());
     }
 
     #[test]
