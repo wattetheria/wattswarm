@@ -60,6 +60,8 @@ pub(crate) async fn startup_config_save(
         bootstrap_contacts,
         gateway_urls,
         core_agent: req.core_agent.clone().unwrap_or(existing.core_agent),
+        relay_urls: existing.relay_urls,
+        extra: existing.extra,
     }
     .normalized();
     payload.validate()?;

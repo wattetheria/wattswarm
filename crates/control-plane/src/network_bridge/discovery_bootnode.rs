@@ -208,7 +208,7 @@ pub(super) fn query_discovery_bootnodes_for_candidate_records(
     if discovery_urls.is_empty() {
         return Ok(Vec::new());
     }
-    let client = reqwest::blocking::Client::builder()
+    let client = wattswarm_network_transport_iroh::egress_http_client_builder()
         .timeout(DISCOVERY_BOOTNODE_QUERY_TIMEOUT)
         .build()
         .context("build discovery bootnode query HTTP client")?;

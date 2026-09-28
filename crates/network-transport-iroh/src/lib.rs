@@ -1,7 +1,7 @@
 use anyhow::{Context, Result, anyhow, bail};
 use hex::decode;
 use iroh::{
-    Endpoint, EndpointAddr, EndpointId, RelayMode, RelayUrl, SecretKey, TransportAddr,
+    Endpoint, EndpointAddr, EndpointId, RelayMap, RelayMode, RelayUrl, SecretKey, TransportAddr,
     address_lookup::memory::MemoryLookup,
     endpoint::{Connection, presets},
     protocol::{AcceptError, ProtocolHandler, Router},
@@ -513,20 +513,60 @@ struct IrohEgressOptions {
     warnings: Vec<String>,
 }
 
+fn first_non_empty_env(
+    lookup: &impl Fn(&str) -> Option<String>,
+    keys: &[&'static str],
+) -> Option<(&'static str, String)> {
+    keys.iter().find_map(|key| {
+        lookup(key)
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty())
+            .map(|value| (*key, value))
+    })
+}
+
+/// Extra trust roots from `WATTSWARM_IROH_EXTRA_CA_FILE` / `SSL_CERT_FILE`, shared by
+/// iroh's relay egress and wattswarm's own HTTPS clients.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct ExtraCaRoots {
+    certs: Vec<CertificateDer<'static>>,
+    file: Option<PathBuf>,
+    warning: Option<String>,
+}
+
+impl ExtraCaRoots {
+    fn from_env_lookup(lookup: &impl Fn(&str) -> Option<String>) -> Self {
+        let Some((key, raw)) = first_non_empty_env(lookup, ENV_EXTRA_CA_FILE_KEYS) else {
+            return Self::default();
+        };
+        let path = PathBuf::from(raw);
+        match load_pem_certificates(&path) {
+            Ok(certs) if certs.is_empty() => Self {
+                warning: Some(format!(
+                    "{key}={} contains no PEM certificates",
+                    path.display()
+                )),
+                ..Self::default()
+            },
+            Ok(certs) => Self {
+                certs,
+                file: Some(path),
+                warning: None,
+            },
+            Err(error) => Self {
+                warning: Some(format!("ignoring {key}={}: {error:#}", path.display())),
+                ..Self::default()
+            },
+        }
+    }
+}
+
 impl IrohEgressOptions {
     fn from_env_lookup(relay_urls: &[RelayUrl], lookup: impl Fn(&str) -> Option<String>) -> Self {
-        let first_non_empty = |keys: &[&'static str]| {
-            keys.iter().find_map(|key| {
-                lookup(key)
-                    .map(|value| value.trim().to_owned())
-                    .filter(|value| !value.is_empty())
-                    .map(|value| (*key, value))
-            })
-        };
         let mut options = Self::default();
 
-        if let Some((key, raw)) = first_non_empty(ENV_PROXY_KEYS) {
-            let no_proxy = first_non_empty(ENV_NO_PROXY_KEYS)
+        if let Some((key, raw)) = first_non_empty_env(&lookup, ENV_PROXY_KEYS) {
+            let no_proxy = first_non_empty_env(&lookup, ENV_NO_PROXY_KEYS)
                 .map(|(_, value)| value)
                 .unwrap_or_default();
             match parse_http_proxy_url(&raw) {
@@ -536,22 +576,10 @@ impl IrohEgressOptions {
             }
         }
 
-        if let Some((key, raw)) = first_non_empty(ENV_EXTRA_CA_FILE_KEYS) {
-            let path = PathBuf::from(raw);
-            match load_pem_certificates(&path) {
-                Ok(certs) if certs.is_empty() => options.warnings.push(format!(
-                    "{key}={} contains no PEM certificates",
-                    path.display()
-                )),
-                Ok(certs) => {
-                    options.extra_ca_roots = certs;
-                    options.extra_ca_file = Some(path);
-                }
-                Err(error) => options
-                    .warnings
-                    .push(format!("ignoring {key}={}: {error:#}", path.display())),
-            }
-        }
+        let extra_ca = ExtraCaRoots::from_env_lookup(&lookup);
+        options.extra_ca_roots = extra_ca.certs;
+        options.extra_ca_file = extra_ca.file;
+        options.warnings.extend(extra_ca.warning);
         options
     }
 
@@ -589,6 +617,38 @@ impl IrohEgressOptions {
                 .unwrap_or_else(|| "none".to_owned()),
         )
     }
+}
+
+/// Blocking HTTP client builder for wattswarm's own HTTPS calls (join manifest,
+/// registry, discovery). Trusts the same extra CA bundle as iroh's relay egress so
+/// TLS-intercepting egress proxies work; proxies themselves come from the standard
+/// env vars, which reqwest already honors. Without an extra CA bundle this is a plain
+/// `reqwest` builder.
+pub fn egress_http_client_builder() -> reqwest::blocking::ClientBuilder {
+    static EXTRA_ROOTS: OnceLock<Vec<reqwest::Certificate>> = OnceLock::new();
+    EXTRA_ROOTS
+        .get_or_init(|| {
+            let extra_ca = ExtraCaRoots::from_env_lookup(&|key| std::env::var(key).ok());
+            if let Some(warning) = &extra_ca.warning {
+                eprintln!("wattswarm http egress warning: {warning}");
+            }
+            http_trust_roots(&extra_ca.certs)
+        })
+        .iter()
+        .cloned()
+        .fold(reqwest::blocking::Client::builder(), |builder, cert| {
+            builder.add_root_certificate(cert)
+        })
+}
+
+/// reqwest fails the whole client build on a root rustls rejects, so keep only the
+/// certificates rustls accepts as trust anchors.
+fn http_trust_roots(certs: &[CertificateDer<'static>]) -> Vec<reqwest::Certificate> {
+    certs
+        .iter()
+        .filter(|cert| rustls::RootCertStore::empty().add((*cert).clone()).is_ok())
+        .filter_map(|cert| reqwest::Certificate::from_der(cert.as_ref()).ok())
+        .collect()
 }
 
 /// iroh tunnels relay traffic with HTTP CONNECT only, so accept `http(s)`
@@ -742,10 +802,84 @@ fn startup_config_relay_urls(state_dir: &Path) -> Option<String> {
     }
 }
 
+/// Valid relays advertised by the persisted bootstrap contacts (e.g. the genesis
+/// contact from the join manifest). Malformed entries are skipped so a bad contact
+/// can never stop the iroh endpoint from starting.
+fn startup_config_bootstrap_relay_urls(state_dir: &Path) -> Option<String> {
+    #[derive(Deserialize)]
+    struct StartupConfigBootstrapContacts {
+        #[serde(default)]
+        bootstrap_contacts: Vec<String>,
+    }
+    #[derive(Deserialize)]
+    struct BootstrapContact {
+        #[serde(default)]
+        transports: Vec<TransportContactMaterial>,
+    }
+    let bytes = fs::read(state_dir.join("startup_config.json")).ok()?;
+    let config: StartupConfigBootstrapContacts = serde_json::from_slice(&bytes).ok()?;
+    let mut urls: Vec<String> = Vec::new();
+    for transport in config
+        .bootstrap_contacts
+        .iter()
+        .filter_map(|raw| serde_json::from_str::<BootstrapContact>(raw).ok())
+        .flat_map(|contact| contact.transports)
+    {
+        let Ok(material) = serde_json::from_value::<IrohTransportMaterial>(transport.extra) else {
+            continue;
+        };
+        for url in material.relay_urls {
+            let Ok(url) = RelayUrl::from_str(url.trim()) else {
+                continue;
+            };
+            let url = normalize_public_relay_url(&url);
+            if !urls.contains(&url) {
+                urls.push(url);
+            }
+        }
+    }
+    (!urls.is_empty()).then(|| urls.join(","))
+}
+
+/// Last-resort relays when neither the startup config nor `WATTSWARM_IROH_RELAY_URLS`
+/// provides any: the bootstrap contact relays plus the relays iroh would use by
+/// default (`default_relays`, which honors `IROH_FORCE_STAGING_RELAYS`). Contacts can
+/// be stale, so the defaults stay available and iroh keeps whichever relay it reaches
+/// (a sandbox that blocks the defaults still lands on the contact relays).
+fn bootstrap_fallback_relay_urls(state_dir: &Path, default_relays: &RelayMap) -> Option<String> {
+    let contact_relays = startup_config_bootstrap_relay_urls(state_dir)?;
+    let mut urls = contact_relays
+        .split(',')
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    for url in default_relays.urls::<Vec<RelayUrl>>() {
+        let url = normalize_public_relay_url(&url);
+        if !urls.contains(&url) {
+            urls.push(url);
+        }
+    }
+    Some(urls.join(","))
+}
+
+/// Relay source order: startup config, then `WATTSWARM_IROH_RELAY_URLS`, then the
+/// bootstrap contacts alongside iroh's defaults. `None` leaves iroh on its defaults.
+fn resolve_relay_urls_raw(
+    state_dir: &Path,
+    env_relay_urls: Option<String>,
+    default_relays: &RelayMap,
+) -> Option<String> {
+    startup_config_relay_urls(state_dir)
+        .or_else(|| env_relay_urls.filter(|value| !value.trim().is_empty()))
+        .or_else(|| bootstrap_fallback_relay_urls(state_dir, default_relays))
+}
+
 impl IrohEndpointOptions {
     fn resolve(state_dir: &Path) -> Result<Self> {
-        let relay_urls_raw = startup_config_relay_urls(state_dir)
-            .or_else(|| std::env::var(ENV_IROH_RELAY_URLS).ok());
+        let relay_urls_raw = resolve_relay_urls_raw(
+            state_dir,
+            std::env::var(ENV_IROH_RELAY_URLS).ok(),
+            &iroh::endpoint::default_relay_mode().relay_map(),
+        );
         let mut options = Self::from_raw_env(
             relay_urls_raw.as_deref(),
             std::env::var(ENV_IROH_BIND_ADDR).ok().as_deref(),
@@ -2646,6 +2780,179 @@ mod tests {
         assert_eq!(startup_config_relay_urls(dir.path()), None);
     }
 
+    fn bootstrap_contact_json(relay_urls: &[&str]) -> String {
+        json!({
+            "node_id": "genesis",
+            "peer_id": "genesis",
+            "transports": [{
+                "transport": "iroh_direct",
+                "peer_id": "genesis",
+                "metadata": {
+                    "alpn": "/wattswarm/iroh/1",
+                    "endpoint_id": "genesis",
+                    "generated_at": 1,
+                    "listen_addrs": [],
+                    "route": "iroh_direct",
+                    "capabilities": {
+                        "max_recommended_inline_bytes": 16384,
+                        "preferred_data_route": "iroh_direct",
+                        "supports_iroh_direct": true,
+                        "supports_streaming": true
+                    }
+                },
+                "extra": {
+                    "alpn": "/wattswarm/iroh/1",
+                    "endpoint_id": "genesis",
+                    "direct_addrs": [],
+                    "relay_urls": relay_urls
+                }
+            }]
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn startup_config_bootstrap_relay_urls_reads_contact_relays() {
+        let dir = tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("startup_config.json"),
+            json!({
+                "network_mode": "wan",
+                "bootstrap_contacts": [
+                    bootstrap_contact_json(&["https://relay.wattetheria.com/", "https://relay2.wattetheria.com"]),
+                    bootstrap_contact_json(&["https://relay.wattetheria.com", "not a url", ""]),
+                    "not-a-contact"
+                ]
+            })
+            .to_string(),
+        )
+        .expect("write startup config");
+
+        assert_eq!(
+            startup_config_bootstrap_relay_urls(dir.path()),
+            Some("https://relay.wattetheria.com,https://relay2.wattetheria.com".to_owned())
+        );
+
+        std::fs::write(
+            dir.path().join("startup_config.json"),
+            r#"{"network_mode":"wan","bootstrap_contacts":[]}"#,
+        )
+        .expect("write startup config");
+        assert_eq!(startup_config_bootstrap_relay_urls(dir.path()), None);
+    }
+
+    #[test]
+    fn relay_url_resolution_falls_back_config_then_env_then_bootstrap_contacts() {
+        let prod = RelayMode::Default.relay_map();
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("startup_config.json");
+        let env = || Some("https://env-relay.example.com".to_owned());
+        let contact = bootstrap_contact_json(&["https://relay.wattetheria.com"]);
+
+        std::fs::write(
+            &path,
+            json!({"relay_urls": ["https://config-relay.example.com"], "bootstrap_contacts": [contact]})
+                .to_string(),
+        )
+        .expect("write config");
+        assert_eq!(
+            resolve_relay_urls_raw(dir.path(), env(), &prod),
+            Some("https://config-relay.example.com".to_owned())
+        );
+
+        std::fs::write(&path, json!({"bootstrap_contacts": [contact]}).to_string())
+            .expect("write config");
+        assert_eq!(
+            resolve_relay_urls_raw(dir.path(), env(), &prod),
+            Some("https://env-relay.example.com".to_owned())
+        );
+        let fallback = resolve_relay_urls_raw(dir.path(), None, &prod).expect("bootstrap fallback");
+        assert_eq!(
+            Some(fallback.clone()),
+            resolve_relay_urls_raw(dir.path(), Some("  ".to_owned()), &prod)
+        );
+        let fallback = fallback.split(',').collect::<Vec<_>>();
+        assert_eq!(fallback[0], "https://relay.wattetheria.com");
+        let default_relays = prod.urls::<Vec<RelayUrl>>();
+        assert!(!default_relays.is_empty());
+        for url in &default_relays {
+            assert!(fallback.contains(&normalize_public_relay_url(url).as_str()));
+        }
+
+        std::fs::write(&path, r#"{"network_mode":"wan"}"#).expect("write config");
+        assert_eq!(resolve_relay_urls_raw(dir.path(), None, &prod), None);
+    }
+
+    #[test]
+    fn bootstrap_fallback_keeps_staging_default_relays_without_production() {
+        let dir = tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("startup_config.json"),
+            json!({"bootstrap_contacts": [bootstrap_contact_json(&["https://relay.wattetheria.com"])]})
+                .to_string(),
+        )
+        .expect("write startup config");
+        let staging = RelayMode::Staging.relay_map();
+        let production = RelayMode::Default.relay_map();
+
+        let fallback = resolve_relay_urls_raw(dir.path(), None, &staging).expect("fallback");
+        let fallback = fallback.split(',').collect::<Vec<_>>();
+
+        assert_eq!(fallback[0], "https://relay.wattetheria.com");
+        let staging_urls = staging.urls::<Vec<RelayUrl>>();
+        assert!(!staging_urls.is_empty());
+        for url in &staging_urls {
+            assert!(fallback.contains(&normalize_public_relay_url(url).as_str()));
+        }
+        for url in production.urls::<Vec<RelayUrl>>() {
+            if !staging_urls.contains(&url) {
+                assert!(!fallback.contains(&normalize_public_relay_url(&url).as_str()));
+            }
+        }
+    }
+
+    #[test]
+    fn malformed_bootstrap_contact_relays_do_not_break_endpoint_options() {
+        let prod = RelayMode::Default.relay_map();
+        let dir = tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("startup_config.json"),
+            json!({"bootstrap_contacts": [bootstrap_contact_json(&["not a url", "ftp://"])]})
+                .to_string(),
+        )
+        .expect("write startup config");
+
+        assert_eq!(startup_config_bootstrap_relay_urls(dir.path()), None);
+        assert_eq!(resolve_relay_urls_raw(dir.path(), None, &prod), None);
+        let relay_urls_raw = resolve_relay_urls_raw(dir.path(), None, &prod);
+        IrohEndpointOptions::from_raw_env(relay_urls_raw.as_deref(), None, None)
+            .expect("endpoint options without usable relays");
+    }
+
+    #[test]
+    fn iroh_endpoint_options_prefer_configured_relays_over_bootstrap_contacts() {
+        let dir = tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("startup_config.json"),
+            json!({
+                "relay_urls": ["https://relay2.wattetheria.com"],
+                "bootstrap_contacts": [bootstrap_contact_json(&["https://relay.wattetheria.com"])]
+            })
+            .to_string(),
+        )
+        .expect("write startup config");
+
+        let options = IrohEndpointOptions::resolve(dir.path()).expect("resolve options");
+        assert_eq!(
+            options
+                .relay_urls
+                .iter()
+                .map(normalize_public_relay_url)
+                .collect::<Vec<_>>(),
+            vec!["https://relay2.wattetheria.com".to_owned()]
+        );
+    }
+
     fn egress_from(relays: &str, env: &[(&str, &str)]) -> IrohEgressOptions {
         let relay_urls = parse_relay_urls(relays).expect("relay urls");
         let env: HashMap<String, String> = env
@@ -2653,6 +2960,59 @@ mod tests {
             .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
             .collect();
         IrohEgressOptions::from_env_lookup(&relay_urls, |key| env.get(key).cloned())
+    }
+
+    /// Real self-signed CA (EC P-256, CA:TRUE) that rustls accepts as a trust anchor.
+    const TEST_VALID_CA_PEM: &str = "-----BEGIN CERTIFICATE-----\n\
+MIIBrDCCAVOgAwIBAgIUEgJw5KbFO4bXOdykeMfGYW74gbUwCgYIKoZIzj0EAwIw\n\
+IzEhMB8GA1UEAwwYd2F0dHN3YXJtLXRlc3QtZWdyZXNzLWNhMCAXDTI2MDkyODEy\n\
+MDcwOVoYDzIxMjYwOTA0MTIwNzA5WjAjMSEwHwYDVQQDDBh3YXR0c3dhcm0tdGVz\n\
+dC1lZ3Jlc3MtY2EwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAATK+ibnzxn9PUzK\n\
+aYhBIO4PjTW1o6Z06YGnBp7enrzoadSSGYQDK4xY51vrUMKb8f7JLHERKk5YF3qm\n\
+hpm75XHso2MwYTAdBgNVHQ4EFgQUNAbOoQmuxkW2dIuq5Aif445YopMwHwYDVR0j\n\
+BBgwFoAUNAbOoQmuxkW2dIuq5Aif445YopMwDwYDVR0TAQH/BAUwAwEB/zAOBgNV\n\
+HQ8BAf8EBAMCAgQwCgYIKoZIzj0EAwIDRwAwRAIgJaIBMUbmB/K94jo3VekABwjF\n\
+GsmUIhIoQCUNhf052/0CIF1BBXj/Fv+KaOTT57eFuzSuu/fiepb2kKgmiiS3LP7o\n\
+-----END CERTIFICATE-----\n";
+
+    #[test]
+    fn http_trust_roots_keep_valid_cas_and_drop_rejected_certificates() {
+        let dir = tempdir().expect("tempdir");
+        let bundle = dir.path().join("bundle.pem");
+        std::fs::write(&bundle, format!("{TEST_VALID_CA_PEM}{TEST_PEM_BUNDLE}"))
+            .expect("write bundle");
+        let bundle_path = bundle.to_str().expect("utf8 path").to_owned();
+        let extra_ca = ExtraCaRoots::from_env_lookup(&|key| {
+            (key == "SSL_CERT_FILE").then(|| bundle_path.clone())
+        });
+        assert_eq!(extra_ca.certs.len(), 3);
+        assert_eq!(extra_ca.file.as_deref(), Some(bundle.as_path()));
+
+        let roots = http_trust_roots(&extra_ca.certs);
+        assert_eq!(roots.len(), 1);
+        let client = roots
+            .into_iter()
+            .fold(reqwest::blocking::Client::builder(), |builder, cert| {
+                builder.add_root_certificate(cert)
+            })
+            .build();
+        assert!(client.is_ok(), "{:?}", client.err());
+
+        let unfiltered = reqwest::blocking::Client::builder()
+            .add_root_certificate(
+                reqwest::Certificate::from_der(extra_ca.certs[1].as_ref()).expect("der cert"),
+            )
+            .build();
+        assert!(unfiltered.is_err(), "rejected roots must be filtered out");
+    }
+
+    #[test]
+    fn extra_ca_roots_are_empty_without_ca_env() {
+        assert_eq!(
+            ExtraCaRoots::from_env_lookup(&|_| None),
+            ExtraCaRoots::default()
+        );
+        assert!(http_trust_roots(&[]).is_empty());
     }
 
     const TEST_PEM_BUNDLE: &str = "-----BEGIN CERTIFICATE-----\nAQID\n-----END CERTIFICATE-----\n\

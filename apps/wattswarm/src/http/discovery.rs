@@ -135,7 +135,7 @@ pub fn maybe_announce_local_record_to_discovery_bootnodes(
         });
     }
     let record = build_local_discovery_record(state_dir, db_path)?;
-    let client = reqwest::blocking::Client::builder()
+    let client = wattswarm_network_transport_iroh::egress_http_client_builder()
         .timeout(DISCOVERY_ANNOUNCE_TIMEOUT)
         .build()
         .context("build discovery announce HTTP client")?;
@@ -420,7 +420,7 @@ fn find_registry_discovery_record(
     node_id: &str,
     now_ms: u64,
 ) -> Result<Option<SignedDiscoveryNodeRecord>> {
-    let client = reqwest::blocking::Client::builder()
+    let client = wattswarm_network_transport_iroh::egress_http_client_builder()
         .timeout(DISCOVERY_ANNOUNCE_TIMEOUT)
         .build()
         .context("build registry node lookup HTTP client")?;
@@ -541,7 +541,7 @@ fn load_registry_discovery_records(
         return Ok(Some(Vec::new()));
     }
 
-    let client = reqwest::blocking::Client::builder()
+    let client = wattswarm_network_transport_iroh::egress_http_client_builder()
         .timeout(DISCOVERY_ANNOUNCE_TIMEOUT)
         .build()
         .context("build registry discovery query HTTP client")?;
@@ -892,7 +892,7 @@ fn fetch_discovery_source_agent_card(
 ) -> Result<SourceAgentCard> {
     let token = discovery_agent_card_token()?
         .with_context(|| format!("discovery source agent card token is required for {endpoint}"))?;
-    let card = reqwest::blocking::Client::builder()
+    let card = wattswarm_network_transport_iroh::egress_http_client_builder()
         .timeout(DISCOVERY_ANNOUNCE_TIMEOUT)
         .build()
         .context("build discovery source agent card HTTP client")?

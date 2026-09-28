@@ -882,6 +882,8 @@ mod tests {
                 bootstrap_contacts: vec!["iroh-bootstrap-contact".to_owned()],
                 gateway_urls: Vec::new(),
                 core_agent: CoreAgentConfig::default(),
+                relay_urls: Vec::new(),
+                extra: Default::default(),
             },
         )
         .expect("save startup config");

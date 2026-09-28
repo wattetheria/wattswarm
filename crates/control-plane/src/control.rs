@@ -304,7 +304,7 @@ fn bootstrap_bundle_endpoints_from_manifest(
 }
 
 fn fetch_network_bootstrap_bundle(endpoint: &str) -> Result<NetworkBootstrapBundle> {
-    let client = reqwest::blocking::Client::builder()
+    let client = wattswarm_network_transport_iroh::egress_http_client_builder()
         .timeout(Duration::from_secs(3))
         .build()
         .context("build bootstrap bundle HTTP client")?;
@@ -324,7 +324,7 @@ fn fetch_network_bootstrap_bundle(endpoint: &str) -> Result<NetworkBootstrapBund
 }
 
 fn fetch_network_join_manifest(endpoint: &str) -> Result<NetworkJoinManifest> {
-    let client = reqwest::blocking::Client::builder()
+    let client = wattswarm_network_transport_iroh::egress_http_client_builder()
         .timeout(Duration::from_secs(3))
         .build()
         .context("build join manifest HTTP client")?;

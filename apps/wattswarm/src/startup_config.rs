@@ -86,6 +86,12 @@ pub struct StartupConfig {
     pub gateway_urls: Vec<String>,
     #[serde(default)]
     pub core_agent: CoreAgentConfig,
+    /// Iroh relays refreshed from the join manifest; read directly by the iroh endpoint.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub relay_urls: Vec<String>,
+    /// Keys this struct does not model, preserved so read-modify-write saves never drop them.
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
 impl Default for StartupConfig {
@@ -97,6 +103,8 @@ impl Default for StartupConfig {
             bootstrap_contacts: Vec::new(),
             gateway_urls: Vec::new(),
             core_agent: CoreAgentConfig::default(),
+            relay_urls: Vec::new(),
+            extra: serde_json::Map::new(),
         }
     }
 }
@@ -115,6 +123,7 @@ impl StartupConfig {
         self.longitude = normalize_longitude(self.longitude);
         self.bootstrap_contacts = normalize_bootstrap_contacts(&self.bootstrap_contacts);
         self.gateway_urls = normalize_gateway_urls(&self.gateway_urls);
+        self.relay_urls = normalize_url_values(&self.relay_urls);
         if matches!(self.network_mode, NetworkMode::Local) {
             self.bootstrap_contacts.clear();
             self.gateway_urls.clear();
@@ -457,6 +466,46 @@ mod tests {
         assert_eq!(config.network_mode, NetworkMode::Lan);
         assert_eq!(config.bootstrap_contacts, vec!["iroh-contact-a"]);
         assert_eq!(config.gateway_urls, vec!["https://gw.example.com"]);
+    }
+
+    #[test]
+    fn update_startup_config_geo_preserves_relay_urls_and_unknown_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = startup_config_path(dir.path());
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&serde_json::json!({
+                "network_mode": "wan",
+                "latitude": 1.0,
+                "longitude": 2.0,
+                "relay_urls": ["https://relay.example.com/", "https://relay2.example.com"],
+                "future_field": {"enabled": true}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        assert!(update_startup_config_geo(&path, -33.8399, 151.0583).unwrap());
+
+        let saved: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(
+            saved["relay_urls"],
+            serde_json::json!(["https://relay.example.com", "https://relay2.example.com"])
+        );
+        assert_eq!(saved["future_field"], serde_json::json!({"enabled": true}));
+        assert_eq!(saved["latitude"], serde_json::json!(-33.8399));
+    }
+
+    #[test]
+    fn save_startup_config_omits_empty_relay_urls() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = startup_config_path(dir.path());
+        save_startup_config(&path, &StartupConfig::default()).unwrap();
+
+        let saved: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert!(saved.get("relay_urls").is_none());
     }
 
     #[test]

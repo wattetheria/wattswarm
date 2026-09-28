@@ -6836,6 +6836,7 @@ dependencies = [
  "iroh-gossip",
  "n0-future",
  "reqwest 0.12.28",
+ "rustls",
  "rustls-pki-types",
  "serde",
  "serde_json",

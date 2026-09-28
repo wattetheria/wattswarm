@@ -11,6 +11,7 @@ iroh = "0.97"
 iroh-blobs = { workspace = true }
 iroh-gossip = { workspace = true }
 reqwest = { workspace = true }
+rustls = { version = "0.23", default-features = false, features = ["std"] }
 rustls-pki-types = "1"
 serde = { workspace = true }
 serde_json = { workspace = true }

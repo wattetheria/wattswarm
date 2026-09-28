@@ -442,3 +442,53 @@ fn ui_startup_config_still_accepts_legacy_core_agent_binding_payload() {
         assert_eq!(save_json["executor_registered"].as_bool(), Some(true));
     });
 }
+
+#[test]
+fn ui_startup_config_save_preserves_relay_urls_and_unknown_keys() {
+    let _guard = env_lock();
+    let _db_lock = DbTestLock::acquire();
+    let schema = reset_test_schema("test");
+    let _schema_guard = EnvVarGuard::set("WATTSWARM_PG_SCHEMA", &schema);
+    let _p2p_guard = EnvVarGuard::set("WATTSWARM_P2P_ENABLED", "0");
+    let dir = tempdir().unwrap();
+    let state_dir = dir.path().join("state");
+    std::fs::create_dir_all(&state_dir).unwrap();
+    let db_path = state_dir.join("ui.state");
+    let config_path = state_dir.join("startup_config.json");
+    std::fs::write(
+        &config_path,
+        serde_json::to_vec(&json!({
+            "network_mode": "wan",
+            "relay_urls": ["https://relay.example.com"],
+            "future_field": "kept"
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let app = build_app(UiServerState::new(state_dir.clone(), db_path.clone()));
+        let save_res = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/startup-config")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({"network_mode": "wan"})).unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(save_res.status(), StatusCode::OK);
+    });
+
+    let saved: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&config_path).unwrap()).unwrap();
+    assert_eq!(saved["relay_urls"], json!(["https://relay.example.com"]));
+    assert_eq!(saved["future_field"], json!("kept"));
+}
