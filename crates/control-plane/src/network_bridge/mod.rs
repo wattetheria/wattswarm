@@ -60,8 +60,9 @@ pub use diagnostics::{
     DiagnosticEntry, DiagnosticFilter, list_diagnostics as list_network_diagnostics,
 };
 pub use peer_interactions::{
-    default_agent_envelope, enqueue_agent_payment_command,
-    enqueue_peer_relationship_action_command, verified_agent_context_for_source,
+    cancel_queued_local_peer_relationship_removes, default_agent_envelope,
+    enqueue_agent_payment_command, enqueue_peer_relationship_action_command,
+    verified_agent_context_for_source,
 };
 pub use publish::{publish_pending_global_events, publish_pending_scoped_updates};
 pub use service_loop::{

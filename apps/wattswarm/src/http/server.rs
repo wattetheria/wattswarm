@@ -7,7 +7,7 @@ use crate::http::{
 use crate::wattetheria_sync;
 use anyhow::{Context, Result};
 use axum::Router;
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use std::fs;
 use std::path::PathBuf;
 use std::thread;
@@ -212,6 +212,10 @@ pub fn build_app(state: UiServerState) -> Router {
         .route(
             "/api/peers/relationships",
             post(peers::peer_relationships_update),
+        )
+        .route(
+            "/api/peers/relationships",
+            delete(peers::peer_relationships_local_remove),
         )
         .route("/api/peers/dm/threads", get(peers::peer_dm_threads_list))
         .route("/api/peers/dm/messages", get(peers::peer_dm_messages_list))

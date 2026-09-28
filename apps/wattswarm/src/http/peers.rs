@@ -4,13 +4,14 @@ use crate::control::{
     load_peer_dm_message_records_state, load_peer_dm_thread_records_state,
     load_peer_metadata_records_state, load_peer_relationship_records_state,
     load_peer_relationship_request_records_state, open_configured_node, open_node,
-    private_dm_scope_hint, private_dm_thread_id,
+    private_dm_scope_hint, private_dm_thread_id, remove_peer_relationship_locally_state,
 };
 use crate::http::discovery::find_discovery_record;
 use crate::http::helpers::resolve_network_id;
 use crate::http::{ApiError, UiServerState, run_blocking};
 use crate::network_bridge::{
-    PrivateDmCryptoDiagnostic, default_agent_envelope, enqueue_agent_payment_command,
+    PrivateDmCryptoDiagnostic, cancel_queued_local_peer_relationship_removes,
+    default_agent_envelope, enqueue_agent_payment_command,
     enqueue_peer_relationship_action_command, network_service_started,
     persist_discovery_record_contact_material, record_private_dm_crypto_diagnostic,
 };
@@ -33,6 +34,17 @@ pub(crate) struct PeerRelationshipActionRequest {
     initiated_by: Option<PeerRelationshipInitiator>,
     #[serde(default)]
     agent_envelope: Option<RawAgentEnvelope>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct PeerRelationshipLocalRemoveRequest {
+    remote_node_id: String,
+    #[serde(default)]
+    request_id: Option<String>,
+    #[serde(default)]
+    local_public_id: Option<String>,
+    #[serde(default)]
+    counterpart_public_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -150,6 +162,44 @@ pub(crate) async fn peer_relationships_update(
                 req.initiated_by.unwrap_or(PeerRelationshipInitiator::Local),
             )
         }
+    })
+    .await?;
+    Ok(Json(payload))
+}
+
+pub(crate) async fn peer_relationships_local_remove(
+    State(state): State<UiServerState>,
+    Json(req): Json<PeerRelationshipLocalRemoveRequest>,
+) -> Result<Json<Value>, ApiError> {
+    let payload = run_blocking(move || {
+        let cancelled = match (
+            req.local_public_id.as_deref(),
+            req.counterpart_public_id.as_deref(),
+        ) {
+            (Some(local_public_id), Some(counterpart_public_id)) => {
+                cancel_queued_local_peer_relationship_removes(
+                    &state.state_dir,
+                    &req.remote_node_id,
+                    local_public_id,
+                    counterpart_public_id,
+                )?
+            }
+            (None, None) => 0,
+            _ => bail!("both public IDs are required to cancel queued removes"),
+        };
+        remove_peer_relationship_locally_state(
+            &state.state_dir,
+            &req.remote_node_id,
+            req.request_id.as_deref(),
+        )?;
+        Ok(json!({
+            "ok": true,
+            "queued": false,
+            "local_only": true,
+            "cancelled_queued_removes": cancelled,
+            "remote_node_id": req.remote_node_id,
+            "action": PeerRelationshipAction::Remove,
+        }))
     })
     .await?;
     Ok(Json(payload))
@@ -671,6 +721,89 @@ mod tests {
     use crate::startup_config::{
         CoreAgentConfig, NetworkMode, StartupConfig, save_startup_config, startup_config_path,
     };
+    use axum::body::{Body, to_bytes};
+    use axum::http::{Method, Request, StatusCode};
+    use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn delete_relationship_route_updates_local_state_without_queuing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state_dir = dir.path().join("state");
+        std::fs::create_dir_all(&state_dir).expect("create state dir");
+        let setup_dir = state_dir.clone();
+        let app = tokio::task::spawn_blocking(move || {
+            crate::control::apply_peer_relationship_action_state(
+                &setup_dir,
+                "remote-node",
+                crate::control::PeerRelationshipAction::Request,
+                crate::control::PeerRelationshipInitiator::Remote,
+            )
+            .expect("seed request");
+            crate::control::apply_peer_relationship_action_state(
+                &setup_dir,
+                "remote-node",
+                crate::control::PeerRelationshipAction::Accept,
+                crate::control::PeerRelationshipInitiator::Local,
+            )
+            .expect("seed accepted relationship");
+            crate::network_bridge::enqueue_peer_relationship_action_command(
+                &setup_dir,
+                "remote-node",
+                crate::control::PeerRelationshipAction::Remove,
+                crate::network_bridge::default_agent_envelope(
+                    "local-node",
+                    "remote-node",
+                    "social.friend.remove",
+                    serde_json::json!({
+                        "source_public_id": "local-agent",
+                        "target_public_id": "remote-agent",
+                        "request_id": "old-generated-id",
+                    }),
+                ),
+            )
+            .expect("seed old queued remove");
+            crate::http::server::build_app(crate::http::UiServerState::new(
+                setup_dir.clone(),
+                setup_dir.join("ui.state"),
+            ))
+        })
+        .await
+        .expect("setup task");
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::DELETE)
+                    .uri("/api/peers/relationships")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"remote_node_id":"remote-node","local_public_id":"local-agent","counterpart_public_id":"remote-agent"}"#))
+                    .expect("request"),
+            )
+            .await
+            .expect("route response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("response body");
+        let payload: serde_json::Value = serde_json::from_slice(&body).expect("response json");
+        assert_eq!(payload["queued"], false);
+        assert_eq!(payload["local_only"], true);
+        assert_eq!(payload["cancelled_queued_removes"], 1);
+        let record = tokio::task::spawn_blocking(move || {
+            crate::control::load_peer_relationship_records_state(&state_dir)
+                .expect("relationship")
+                .remove(0)
+        })
+        .await
+        .expect("load task");
+        assert_eq!(
+            record.relationship_state,
+            crate::control::PeerRelationshipState::None
+        );
+        assert_eq!(
+            record.last_action,
+            crate::control::PeerRelationshipAction::Remove
+        );
+    }
 
     #[test]
     fn relationship_contact_material_is_resolved_from_discovery_records() {

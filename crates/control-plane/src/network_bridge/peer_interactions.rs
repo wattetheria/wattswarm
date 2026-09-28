@@ -274,6 +274,46 @@ fn load_pending_network_commands(state_dir: &Path) -> Result<Vec<PendingNetworkC
         .collect())
 }
 
+pub fn cancel_queued_local_peer_relationship_removes(
+    state_dir: &Path,
+    remote_node_id: &str,
+    local_public_id: &str,
+    counterpart_public_id: &str,
+) -> Result<usize> {
+    if remote_node_id.trim().is_empty()
+        || local_public_id.trim().is_empty()
+        || counterpart_public_id.trim().is_empty()
+    {
+        bail!("remote_node_id and both public IDs are required to cancel queued removes");
+    }
+    let mut commands = load_pending_network_commands(state_dir)?;
+    let before = commands.len();
+    commands.retain(|command| {
+        let PendingNetworkCommand::PeerRelationship {
+            remote_node_id: queued_node,
+            action: crate::control::PeerRelationshipAction::Remove,
+            agent_envelope,
+            ..
+        } = command
+        else {
+            return true;
+        };
+        let Ok(message) = serde_json::from_str::<Value>(&agent_envelope.message_json) else {
+            return true;
+        };
+        !(queued_node == remote_node_id
+            && message.get("source_public_id").and_then(Value::as_str) == Some(local_public_id)
+            && (message.get("target_public_id").and_then(Value::as_str)
+                == Some(counterpart_public_id)
+                || agent_envelope.target_agent_id.as_deref() == Some(counterpart_public_id)))
+    });
+    let cancelled = before - commands.len();
+    if cancelled > 0 {
+        write_pending_network_commands(state_dir, &commands)?;
+    }
+    Ok(cancelled)
+}
+
 fn upsert_peer_relationship_action_command(
     state_dir: &Path,
     mut command: PendingNetworkCommand,
@@ -2299,6 +2339,69 @@ mod tests {
             }
             PendingNetworkCommand::AgentPayment { .. } => panic!("expected peer relationship"),
         }
+        let _ = std::fs::remove_dir_all(state_dir);
+    }
+
+    #[test]
+    fn local_remove_cancels_only_matching_legacy_remove_commands() {
+        let state_dir = std::env::temp_dir().join(format!(
+            "wattswarm-peer-remove-cancel-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&state_dir).expect("create state dir");
+        for (source, target, action) in [
+            (
+                "local-agent",
+                "target-agent",
+                crate::control::PeerRelationshipAction::Remove,
+            ),
+            (
+                "local-agent",
+                "other-agent",
+                crate::control::PeerRelationshipAction::Remove,
+            ),
+            (
+                "other-local",
+                "target-agent",
+                crate::control::PeerRelationshipAction::Remove,
+            ),
+            (
+                "local-agent",
+                "target-agent",
+                crate::control::PeerRelationshipAction::Request,
+            ),
+        ] {
+            let envelope = default_agent_envelope(
+                "local-node",
+                "remote-node",
+                "social.friend.remove",
+                json!({
+                    "source_public_id": source,
+                    "target_public_id": target,
+                    "request_id": uuid::Uuid::new_v4().to_string(),
+                }),
+            );
+            enqueue_peer_relationship_action_command(&state_dir, "remote-node", action, envelope)
+                .expect("enqueue relationship command");
+        }
+
+        let cancelled = cancel_queued_local_peer_relationship_removes(
+            &state_dir,
+            "remote-node",
+            "local-agent",
+            "target-agent",
+        )
+        .expect("cancel targeted remove");
+        assert_eq!(cancelled, 1);
+        let commands = load_pending_network_commands(&state_dir).expect("pending commands");
+        assert_eq!(commands.len(), 3);
+        assert!(commands.iter().any(|command| matches!(
+            command,
+            PendingNetworkCommand::PeerRelationship {
+                action: crate::control::PeerRelationshipAction::Request,
+                ..
+            }
+        )));
         let _ = std::fs::remove_dir_all(state_dir);
     }
 

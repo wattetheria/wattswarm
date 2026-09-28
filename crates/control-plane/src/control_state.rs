@@ -2020,6 +2020,132 @@ pub fn apply_peer_relationship_action_state(
     Ok(record)
 }
 
+fn sync_node_relationship_after_local_remove(
+    state_dir: &Path,
+    remote_node_id: &str,
+    remaining: Option<&PeerRelationshipRequestRecord>,
+    now: u64,
+) -> Result<()> {
+    let existing = load_peer_relationship_records_state(state_dir)?
+        .into_iter()
+        .find(|record| record.remote_node_id == remote_node_id);
+    if existing
+        .as_ref()
+        .is_some_and(|record| record.relationship_state == PeerRelationshipState::Blocked)
+    {
+        return Ok(());
+    }
+    let mut next = if let Some(remaining) = remaining {
+        PeerRelationshipRecord::from(remaining.clone())
+    } else {
+        let mut record = existing.clone().unwrap_or(PeerRelationshipRecord {
+            remote_node_id: remote_node_id.to_owned(),
+            relationship_state: PeerRelationshipState::None,
+            last_action: PeerRelationshipAction::Remove,
+            initiated_by: PeerRelationshipInitiator::Local,
+            agent_envelope: None,
+            requested_at: None,
+            responded_at: None,
+            blocked_at: None,
+            cleared_at: None,
+            updated_at: now,
+        });
+        record.relationship_state = PeerRelationshipState::None;
+        record.last_action = PeerRelationshipAction::Remove;
+        record.initiated_by = PeerRelationshipInitiator::Local;
+        record.blocked_at = None;
+        record.cleared_at = record.cleared_at.or(Some(now));
+        record
+    };
+    next.updated_at = now;
+    let already_current = existing.as_ref().is_some_and(|record| {
+        let mut expected = next.clone();
+        expected.updated_at = record.updated_at;
+        record == &expected
+    });
+    if !already_current {
+        save_peer_relationship_record_state(state_dir, &next)?;
+    }
+    Ok(())
+}
+
+pub fn remove_peer_relationship_locally_state(
+    state_dir: &Path,
+    remote_node_id: &str,
+    request_id: Option<&str>,
+) -> Result<()> {
+    let remote_node_id = remote_node_id.trim();
+    if remote_node_id.is_empty() {
+        return Err(anyhow!("remote_node_id is required"));
+    }
+    let request_id = request_id.map(str::trim).filter(|value| !value.is_empty());
+    let mut requests = load_peer_relationship_request_records_state(state_dir)?;
+    let matching_request = if let Some(request_id) = request_id {
+        requests.iter().position(|record| {
+            record.remote_node_id == remote_node_id && record.request_id == request_id
+        })
+    } else {
+        let mut accepted = requests.iter().enumerate().filter(|(_, record)| {
+            record.remote_node_id == remote_node_id
+                && record.relationship_state == PeerRelationshipState::Accepted
+        });
+        let first = accepted.next().map(|(index, _)| index);
+        if accepted.next().is_some() {
+            return Err(anyhow!(
+                "multiple peer relationships exist for remote_node_id={remote_node_id}; request_id is required"
+            ));
+        }
+        first
+    };
+    if matching_request.is_none()
+        && requests.iter().any(|record| {
+            record.remote_node_id == remote_node_id
+                && matches!(
+                    record.relationship_state,
+                    PeerRelationshipState::Accepted | PeerRelationshipState::Requested
+                )
+        })
+    {
+        return Err(anyhow!(
+            "matching peer relationship request was not found for remote_node_id={remote_node_id}"
+        ));
+    }
+    let remaining = requests
+        .iter()
+        .enumerate()
+        .filter(|(index, record)| {
+            record.remote_node_id == remote_node_id
+                && Some(*index) != matching_request
+                && matches!(
+                    record.relationship_state,
+                    PeerRelationshipState::Accepted | PeerRelationshipState::Requested
+                )
+        })
+        .map(|(_, record)| record)
+        .max_by_key(|record| {
+            (
+                record.relationship_state == PeerRelationshipState::Accepted,
+                record.updated_at,
+            )
+        });
+    let now = chrono::Utc::now().timestamp_millis().max(0) as u64;
+    sync_node_relationship_after_local_remove(state_dir, remote_node_id, remaining, now)?;
+    if let Some(index) = matching_request {
+        let record = &mut requests[index];
+        if record.relationship_state != PeerRelationshipState::None
+            || record.last_action != PeerRelationshipAction::Remove
+        {
+            record.relationship_state = PeerRelationshipState::None;
+            record.last_action = PeerRelationshipAction::Remove;
+            record.initiated_by = PeerRelationshipInitiator::Local;
+            record.responded_at = Some(now);
+            record.updated_at = now;
+            save_peer_relationship_request_record_state(state_dir, record)?;
+        }
+    }
+    Ok(())
+}
+
 pub fn add_discovered_peer(state_dir: &Path, peer_node_id: &str) -> Result<bool> {
     add_discovered_peer_endpoint_with_source(state_dir, peer_node_id, None, "unknown")
 }
@@ -2288,6 +2414,184 @@ mod tests {
 
         assert_eq!(replayed, accepted);
         assert_eq!(stored, accepted);
+        fs::remove_dir_all(&state_dir).expect("remove state dir");
+    }
+
+    #[test]
+    fn local_remove_updates_node_and_target_request_without_network_state() {
+        let state_dir = std::env::temp_dir().join(format!(
+            "wattswarm-local-remove-test-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        fs::create_dir_all(&state_dir).expect("create state dir");
+        let state_dir = state_dir.as_path();
+        apply_peer_relationship_action_state(
+            state_dir,
+            "remote-node",
+            PeerRelationshipAction::Request,
+            PeerRelationshipInitiator::Remote,
+        )
+        .expect("seed node request");
+        apply_peer_relationship_action_state(
+            state_dir,
+            "remote-node",
+            PeerRelationshipAction::Accept,
+            PeerRelationshipInitiator::Local,
+        )
+        .expect("seed accepted node");
+        let envelope = AgentInteractionEnvelope::default();
+        apply_peer_relationship_request_action_state(
+            state_dir,
+            "remote-node",
+            "request-1",
+            PeerRelationshipAction::Request,
+            PeerRelationshipInitiator::Remote,
+            envelope.clone(),
+        )
+        .expect("seed request");
+        apply_peer_relationship_request_action_state(
+            state_dir,
+            "remote-node",
+            "request-1",
+            PeerRelationshipAction::Accept,
+            PeerRelationshipInitiator::Local,
+            envelope,
+        )
+        .expect("seed accepted request");
+
+        remove_peer_relationship_locally_state(state_dir, "remote-node", Some("request-1"))
+            .expect("remove locally");
+        let node = load_peer_relationship_records_state(state_dir)
+            .unwrap()
+            .remove(0);
+        let request = load_peer_relationship_request_records_state(state_dir)
+            .unwrap()
+            .remove(0);
+        assert_eq!(node.relationship_state, PeerRelationshipState::None);
+        assert_eq!(node.last_action, PeerRelationshipAction::Remove);
+        assert_eq!(request.relationship_state, PeerRelationshipState::None);
+        assert_eq!(request.last_action, PeerRelationshipAction::Remove);
+        assert_eq!(request.request_id, "request-1");
+
+        remove_peer_relationship_locally_state(state_dir, "remote-node", Some("request-1"))
+            .expect("retry is idempotent");
+        assert_eq!(
+            node,
+            load_peer_relationship_records_state(state_dir).unwrap()[0]
+        );
+        assert_eq!(
+            request,
+            load_peer_relationship_request_records_state(state_dir).unwrap()[0]
+        );
+        fs::remove_dir_all(state_dir).expect("remove state dir");
+    }
+
+    #[test]
+    fn local_remove_preserves_other_accepted_request_for_same_node() {
+        let state_dir = std::env::temp_dir().join(format!(
+            "wattswarm-local-remove-multi-test-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        fs::create_dir_all(&state_dir).expect("create state dir");
+        let state_dir = state_dir.as_path();
+        for request_id in ["request-1", "request-2"] {
+            apply_peer_relationship_request_action_state(
+                state_dir,
+                "remote-node",
+                request_id,
+                PeerRelationshipAction::Request,
+                PeerRelationshipInitiator::Remote,
+                AgentInteractionEnvelope::default(),
+            )
+            .expect("seed request");
+            apply_peer_relationship_request_action_state(
+                state_dir,
+                "remote-node",
+                request_id,
+                PeerRelationshipAction::Accept,
+                PeerRelationshipInitiator::Local,
+                AgentInteractionEnvelope::default(),
+            )
+            .expect("seed accepted request");
+        }
+        apply_peer_relationship_request_action_state(
+            state_dir,
+            "remote-node",
+            "request-3",
+            PeerRelationshipAction::Request,
+            PeerRelationshipInitiator::Remote,
+            AgentInteractionEnvelope::default(),
+        )
+        .expect("seed another pending request");
+        assert!(remove_peer_relationship_locally_state(state_dir, "remote-node", None).is_err());
+        remove_peer_relationship_locally_state(state_dir, "remote-node", Some("request-1"))
+            .expect("remove target request");
+        let requests = load_peer_relationship_request_records_state(state_dir).unwrap();
+        let state_for = |request_id: &str| {
+            requests
+                .iter()
+                .find(|record| record.request_id == request_id)
+                .expect("request record")
+                .relationship_state
+        };
+        assert_eq!(state_for("request-1"), PeerRelationshipState::None);
+        assert_eq!(state_for("request-2"), PeerRelationshipState::Accepted);
+        assert_eq!(state_for("request-3"), PeerRelationshipState::Requested);
+        assert_eq!(
+            load_peer_relationship_records_state(state_dir).unwrap()[0].relationship_state,
+            PeerRelationshipState::Accepted
+        );
+        remove_peer_relationship_locally_state(state_dir, "remote-node", Some("request-2"))
+            .expect("remove second accepted request");
+        let node = load_peer_relationship_records_state(state_dir)
+            .unwrap()
+            .remove(0);
+        assert_eq!(node.relationship_state, PeerRelationshipState::Requested);
+        assert_eq!(node.last_action, PeerRelationshipAction::Request);
+        assert!(
+            load_peer_relationship_request_records_state(state_dir)
+                .unwrap()
+                .iter()
+                .any(|record| record.request_id == "request-3"
+                    && record.relationship_state == PeerRelationshipState::Requested)
+        );
+        fs::remove_dir_all(state_dir).expect("remove state dir");
+    }
+
+    #[test]
+    fn local_remove_handles_legacy_node_without_request_projection() {
+        let state_dir = std::env::temp_dir().join(format!(
+            "wattswarm-local-remove-legacy-test-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        fs::create_dir_all(&state_dir).expect("create state dir");
+        apply_peer_relationship_action_state(
+            &state_dir,
+            "remote-node",
+            PeerRelationshipAction::Request,
+            PeerRelationshipInitiator::Remote,
+        )
+        .expect("seed request");
+        apply_peer_relationship_action_state(
+            &state_dir,
+            "remote-node",
+            PeerRelationshipAction::Accept,
+            PeerRelationshipInitiator::Local,
+        )
+        .expect("seed accepted relationship");
+
+        remove_peer_relationship_locally_state(&state_dir, "remote-node", Some("legacy-request"))
+            .expect("remove legacy relationship");
+        let node = load_peer_relationship_records_state(&state_dir)
+            .unwrap()
+            .remove(0);
+        assert_eq!(node.relationship_state, PeerRelationshipState::None);
+        assert!(node.cleared_at.is_some());
+        assert!(
+            load_peer_relationship_request_records_state(&state_dir)
+                .unwrap()
+                .is_empty()
+        );
         fs::remove_dir_all(&state_dir).expect("remove state dir");
     }
 }
