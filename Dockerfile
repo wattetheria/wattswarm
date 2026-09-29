@@ -29,6 +29,7 @@ COPY crates/network-transport-core/Cargo.toml crates/network-transport-core/Carg
 COPY crates/network-transport-iroh/Cargo.toml crates/network-transport-iroh/Cargo.toml
 COPY apps/wattswarm/Cargo.toml apps/wattswarm/Cargo.toml
 COPY apps/wattswarm-runtime/Cargo.toml apps/wattswarm-runtime/Cargo.toml
+COPY third_party third_party
 
 # Release Docker builds do not have the sibling checkout mounted at
 # ../watt-did, so use the published git source inside the image build.
@@ -76,6 +77,9 @@ RUN cargo chef prepare --recipe-path recipe.json
 FROM chef AS cacher
 
 COPY --from=planner /app/recipe.json /app/recipe.json
+# The vendored [patch.crates-io] crate is outside the workspace, so cargo-chef's
+# recipe does not recreate it; cook needs the real source.
+COPY third_party third_party
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
     --mount=type=secret,id=github_token \

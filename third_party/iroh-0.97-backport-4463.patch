@@ -1,0 +1,40 @@
+--- a/iroh-0.97.0/src/net_report/reportgen.rs
++++ b/iroh-0.97.0/src/net_report/reportgen.rs
+@@ -589,7 +589,11 @@
+     let mut builder =
+         reqwest_client_builder(Some(tls_config)).redirect(reqwest::redirect::Policy::none());
+ 
+-    if let Some(Host::Domain(domain)) = url.host() {
++    // Backport of n0-computer/iroh#4463: `resolve_to_addrs` makes reqwest connect to
++    // the resolved address directly, bypassing an (env) HTTP proxy's CONNECT tunnel.
++    if !env_proxy_configured()
++        && let Some(Host::Domain(domain)) = url.host()
++    {
+         // Use our own resolver rather than getaddrinfo
+         //
+         // Be careful, a non-zero port will override the port in the URI.
+@@ -829,7 +833,9 @@
+     }
+ 
+     #[cfg(not(wasm_browser))]
+-    if let Some(Host::Domain(domain)) = url.host() {
++    if !env_proxy_configured()
++        && let Some(Host::Domain(domain)) = url.host()
++    {
+         // Use our own resolver rather than getaddrinfo
+         //
+         // Be careful, a non-zero port will override the port in the URI.
+@@ -934,3 +940,13 @@
+         Ok(())
+     }
+ }
++
++
++/// reqwest routes requests through these env proxies; the probes must not override
++/// name resolution when one is set (see n0-computer/iroh#4463).
++#[cfg(not(wasm_browser))]
++fn env_proxy_configured() -> bool {
++    ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"]
++        .iter()
++        .any(|key| std::env::var(key).is_ok_and(|value| !value.trim().is_empty()))
++}

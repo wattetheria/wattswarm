@@ -18,6 +18,7 @@ members = [
   "apps/wattswarm",
   "apps/wattswarm-runtime",
 ]
+exclude = ["third_party"]
 
 [workspace.dependencies]
 anyhow = "1.0"
@@ -66,3 +67,10 @@ wattswarm-node-core = { path = "crates/node-core" }
 wattswarm-control-plane = { path = "crates/control-plane" }
 wattswarm-run-queue = { path = "crates/run-queue" }
 watt-did = { path = "../watt-did" }
+
+# iroh 0.97 with n0-computer/iroh#4463 backported: net_report's HTTPS probe honours an
+# HTTP(S) proxy instead of resolving relay hosts locally, so a home relay is selected on
+# hosts whose only egress is a proxy. Drop once iroh is upgraded to >= 1.1.
+# See third_party/README.md.
+[patch.crates-io]
+iroh = { path = "third_party/iroh-0.97.0" }
