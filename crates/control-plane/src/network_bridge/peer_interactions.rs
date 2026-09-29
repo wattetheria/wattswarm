@@ -2082,6 +2082,113 @@ mod tests {
     }
 
     #[test]
+    fn accepted_duplicates_stay_removed_until_a_new_request_is_accepted() {
+        use crate::control::{
+            PeerRelationshipAction as Action, PeerRelationshipInitiator as Initiator,
+            PeerRelationshipState as State,
+        };
+        let state_dir = std::env::temp_dir().join(format!(
+            "wattswarm-local-remove-replay-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        fs::create_dir_all(&state_dir).unwrap();
+        let envelope = |request_id: &str| {
+            default_agent_envelope(
+                "remote-node",
+                "local-node",
+                "social.friend.request",
+                json!({"request_id": request_id}),
+            )
+        };
+        for (node, id) in [
+            ("remote-node", "a"),
+            ("remote-node", "b"),
+            ("other-node", "c"),
+        ] {
+            apply_peer_relationship_action_projection(
+                &state_dir,
+                node,
+                Action::Request,
+                Initiator::Remote,
+                &envelope(id),
+            )
+            .unwrap();
+        }
+        apply_peer_relationship_action_projection(
+            &state_dir,
+            "remote-node",
+            Action::Accept,
+            Initiator::Local,
+            &envelope("a"),
+        )
+        .unwrap();
+        let history =
+            crate::control::load_peer_relationship_request_records_state(&state_dir).unwrap();
+        assert!(
+            history
+                .iter()
+                .filter(|r| r.remote_node_id == "remote-node")
+                .all(|r| r.relationship_state == State::Accepted)
+        );
+        assert_eq!(
+            history
+                .iter()
+                .find(|r| r.remote_node_id == "other-node")
+                .unwrap()
+                .relationship_state,
+            State::Requested
+        );
+
+        for _ in 0..2 {
+            crate::control::remove_peer_relationship_locally_state(&state_dir, "remote-node")
+                .unwrap();
+        }
+        assert_eq!(
+            history,
+            crate::control::load_peer_relationship_request_records_state(&state_dir).unwrap()
+        );
+        for id in ["a", "b"] {
+            let (_, replayed) = apply_peer_relationship_action_projection(
+                &state_dir,
+                "remote-node",
+                Action::Accept,
+                Initiator::Remote,
+                &envelope(id),
+            )
+            .unwrap();
+            assert!(replayed);
+        }
+        let node_state = || {
+            crate::control::load_peer_relationship_records_state(&state_dir)
+                .unwrap()
+                .into_iter()
+                .find(|r| r.remote_node_id == "remote-node")
+                .unwrap()
+                .relationship_state
+        };
+        assert_eq!(node_state(), State::None);
+        apply_peer_relationship_action_projection(
+            &state_dir,
+            "remote-node",
+            Action::Request,
+            Initiator::Remote,
+            &envelope("new"),
+        )
+        .unwrap();
+        assert_eq!(node_state(), State::Requested);
+        apply_peer_relationship_action_projection(
+            &state_dir,
+            "remote-node",
+            Action::Accept,
+            Initiator::Local,
+            &envelope("new"),
+        )
+        .unwrap();
+        assert_eq!(node_state(), State::Accepted);
+        fs::remove_dir_all(state_dir).unwrap();
+    }
+
+    #[test]
     fn legacy_accepted_relationship_replay_seeds_request_ledger_without_new_event() {
         let state_dir = std::env::temp_dir().join(format!(
             "wattswarm-peer-legacy-request-{}",

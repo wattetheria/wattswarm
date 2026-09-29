@@ -40,8 +40,6 @@ pub(crate) struct PeerRelationshipActionRequest {
 pub(crate) struct PeerRelationshipLocalRemoveRequest {
     remote_node_id: String,
     #[serde(default)]
-    request_id: Option<String>,
-    #[serde(default)]
     local_public_id: Option<String>,
     #[serde(default)]
     counterpart_public_id: Option<String>,
@@ -187,11 +185,7 @@ pub(crate) async fn peer_relationships_local_remove(
             (None, None) => 0,
             _ => bail!("both public IDs are required to cancel queued removes"),
         };
-        remove_peer_relationship_locally_state(
-            &state.state_dir,
-            &req.remote_node_id,
-            req.request_id.as_deref(),
-        )?;
+        remove_peer_relationship_locally_state(&state.state_dir, &req.remote_node_id)?;
         Ok(json!({
             "ok": true,
             "queued": false,
@@ -666,30 +660,41 @@ fn nearby_peer_is_fresh(
 }
 
 fn build_peer_relationships_payload(state_dir: &std::path::Path) -> Result<Value> {
-    let node_relationships = load_peer_relationship_records_state(state_dir)?;
-    let blocked_nodes = node_relationships
-        .iter()
-        .filter(|record| {
-            record.relationship_state == crate::control::PeerRelationshipState::Blocked
-        })
-        .map(|record| record.remote_node_id.clone())
-        .collect::<BTreeSet<_>>();
-    let request_relationships = load_peer_relationship_request_records_state(state_dir)?
+    let mut relationships = load_peer_relationship_records_state(state_dir)?
         .into_iter()
-        .filter(|record| !blocked_nodes.contains(&record.remote_node_id))
-        .collect::<Vec<_>>();
-    let request_nodes = request_relationships
-        .iter()
-        .map(|record| record.remote_node_id.clone())
-        .collect::<BTreeSet<_>>();
-    let mut relationships = node_relationships
-        .into_iter()
-        .filter(|record| {
-            blocked_nodes.contains(&record.remote_node_id)
-                || !request_nodes.contains(&record.remote_node_id)
-        })
-        .chain(request_relationships.into_iter().map(Into::into))
-        .collect::<Vec<crate::control::PeerRelationshipRecord>>();
+        .map(|record| (record.remote_node_id.clone(), record))
+        .collect::<BTreeMap<_, _>>();
+    let mut requests = load_peer_relationship_request_records_state(state_dir)?;
+    requests.sort_by(|left, right| {
+        right
+            .updated_at
+            .cmp(&left.updated_at)
+            .then_with(|| right.request_id.cmp(&left.request_id))
+    });
+    let mut projected_nodes = BTreeSet::new();
+    for request in requests {
+        if projected_nodes.contains(&request.remote_node_id) {
+            continue;
+        }
+        if let Some(node) = relationships.get_mut(&request.remote_node_id) {
+            // Request envelopes supply identity metadata, never current relationship state.
+            if matches!(
+                node.relationship_state,
+                crate::control::PeerRelationshipState::None
+                    | crate::control::PeerRelationshipState::Blocked
+            ) || node.relationship_state != request.relationship_state
+            {
+                continue;
+            }
+            node.agent_envelope = Some(request.agent_envelope);
+            node.initiated_by = request.initiated_by;
+        } else {
+            // Preserve visibility for legacy data without a node projection.
+            relationships.insert(request.remote_node_id.clone(), request.clone().into());
+        }
+        projected_nodes.insert(request.remote_node_id);
+    }
+    let mut relationships = relationships.into_values().collect::<Vec<_>>();
     relationships.sort_by(|left, right| {
         left.remote_node_id
             .cmp(&right.remote_node_id)
@@ -775,7 +780,7 @@ mod tests {
                     .method(Method::DELETE)
                     .uri("/api/peers/relationships")
                     .header("content-type", "application/json")
-                    .body(Body::from(r#"{"remote_node_id":"remote-node","local_public_id":"local-agent","counterpart_public_id":"remote-agent"}"#))
+                    .body(Body::from(r#"{"remote_node_id":"remote-node","request_id":"ignored-legacy-id","local_public_id":"local-agent","counterpart_public_id":"remote-agent"}"#))
                     .expect("request"),
             )
             .await
@@ -1019,7 +1024,7 @@ mod tests {
     }
 
     #[test]
-    fn relationship_payload_lists_identity_requests_for_accepted_node() {
+    fn relationship_payload_respects_current_node_state_over_request_history() {
         let dir = tempfile::tempdir().expect("tempdir");
         let state_dir = dir.path().join("state");
         std::fs::create_dir_all(&state_dir).expect("create state dir");
@@ -1080,15 +1085,31 @@ mod tests {
             .as_array()
             .expect("relationship projections");
 
-        assert_eq!(relationships.len(), 2);
+        assert_eq!(relationships.len(), 1);
         assert!(relationships.iter().any(|record| {
             record["relationship_state"] == "accepted"
                 && record["agent_envelope"]["message"]["request_id"] == "identity-request-accepted"
         }));
-        assert!(relationships.iter().any(|record| {
-            record["relationship_state"] == "requested"
-                && record["agent_envelope"]["message"]["request_id"] == "identity-request-pending"
-        }));
+        crate::control::remove_peer_relationship_locally_state(&state_dir, "peer-multi-identity")
+            .expect("remove node");
+        let removed = build_peer_relationships_payload(&state_dir).unwrap();
+        let records = removed["relationships"].as_array().unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0]["relationship_state"], "none");
+        assert_eq!(records[0]["last_action"], "remove");
+        assert!(records[0]["cleared_at"].is_number());
+
+        crate::control::apply_peer_relationship_action_state(
+            &state_dir,
+            "peer-multi-identity",
+            crate::control::PeerRelationshipAction::Request,
+            crate::control::PeerRelationshipInitiator::Remote,
+        )
+        .expect("new pending relationship");
+        let requested = build_peer_relationships_payload(&state_dir).unwrap();
+        let records = requested["relationships"].as_array().unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0]["relationship_state"], "requested");
     }
 
     #[test]
