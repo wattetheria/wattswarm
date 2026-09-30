@@ -1252,6 +1252,11 @@ impl NetworkBridgeService {
     }
 
     pub(crate) fn expire_stale_backfill_requests(&mut self, now: Instant) -> usize {
+        if self.monitoring_enabled {
+            self.diagnostic_backfill_timeouts.retain(|_, expired_at| {
+                now.saturating_duration_since(*expired_at) < Duration::from_secs(300)
+            });
+        }
         let debug_diagnostics = diagnostics::debug_diagnostics_enabled();
         let mut expired = Vec::new();
         for (peer, state) in &self.peer_sync_state {
@@ -1272,6 +1277,9 @@ impl NetworkBridgeService {
         }
         let mut peer_cooldowns = HashMap::new();
         for (peer, request_id, scope, feed_key, timeout) in &expired {
+            if self.monitoring_enabled && self.diagnostic_backfill_timeouts.len() < 4096 {
+                self.diagnostic_backfill_timeouts.insert(*request_id, now);
+            }
             let mut cooldown_event = None;
             if let Some(state) = self.peer_sync_state.get_mut(peer)
                 && let Some(event) = state.record_backfill_request_failed_at(*request_id, now)
@@ -1328,6 +1336,33 @@ impl NetworkBridgeService {
                     json!(self.runtime.allows_outbound_backfill_to(peer)),
                 );
             }
+            diagnostics::record_anomaly(self.state_dir.as_deref(), self.monitoring_enabled, || {
+                let mut details = details.clone();
+                details["kind"] = json!("backfill.v1");
+                details["peer_id"] = json!(peer.to_string());
+                details["limit"] = json!(BACKFILL_BATCH_EVENTS);
+                details["smoothed_latency_ms"] = json!(
+                    self.peer_sync_state
+                        .get(peer)
+                        .and_then(|state| state.smoothed_backfill_latency_ms)
+                );
+                details["attempt"] = json!(
+                    self.peer_sync_state
+                        .get(peer)
+                        .map_or(1, |state| state.backfill_failures)
+                );
+                diagnostics::DiagnosticEvent::new(
+                    "warn",
+                    "backfill",
+                    "backfill.timeout",
+                    "timeout",
+                    "backfill request timed out",
+                )
+                .object("backfill", Some(request_id.to_string()))
+                .source_node_id(Some(peer.to_string()))
+                .scope(scope)
+                .details(details)
+            });
             diagnostics::record_diagnostic(
                 self.state_dir.as_deref(),
                 diagnostics::DiagnosticEvent::new(
@@ -1348,6 +1383,9 @@ impl NetworkBridgeService {
     }
 
     pub fn try_tick(&mut self, node: &mut Node) -> Result<Option<NetworkBridgeTick>> {
+        if self.monitoring_enabled {
+            self.drain_runtime_diagnostics();
+        }
         let event = self.runtime.try_next_event()?;
         let Some(event) = event else {
             return Ok(None);

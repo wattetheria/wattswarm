@@ -1424,6 +1424,10 @@ pub struct NetworkBridgeService {
         HashMap<ContactMaterialRequestId, PendingContactMaterialRequest>,
     pending_relationship_requests:
         HashMap<PeerRelationshipRequestId, PendingPeerRelationshipRequest>,
+    diagnostic_backfill_timeouts: HashMap<BackfillRequestId, Instant>,
+    monitoring_enabled: bool,
+    runtime_diagnostics: Option<std::sync::mpsc::Receiver<crate::network_p2p::RuntimeDiagnostic>>,
+    dropped_runtime_diagnostics: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// Optional state_dir for run-queue bridge hooks.
     state_dir: Option<PathBuf>,
     db_path: Option<PathBuf>,
@@ -1481,6 +1485,10 @@ impl NetworkBridgeService {
             scope_traffic: HashMap::new(),
             pending_contact_material_requests: HashMap::new(),
             pending_relationship_requests: HashMap::new(),
+            diagnostic_backfill_timeouts: HashMap::new(),
+            monitoring_enabled: diagnostics::debug_diagnostics_enabled(),
+            runtime_diagnostics: None,
+            dropped_runtime_diagnostics: Default::default(),
             state_dir: None,
             db_path: None,
         })
@@ -1488,6 +1496,20 @@ impl NetworkBridgeService {
 
     /// Set the local persistence paths for run-queue and agent-event hooks.
     pub fn set_state_dir(&mut self, state_dir: PathBuf, db_path: PathBuf) {
+        if self.monitoring_enabled {
+            let (tx, rx) =
+                std::sync::mpsc::sync_channel(diagnostics::RUNTIME_DIAGNOSTIC_QUEUE_CAPACITY);
+            self.runtime_diagnostics = Some(rx);
+            let dropped = self.dropped_runtime_diagnostics.clone();
+            self.runtime.set_diagnostic_handler(
+                self.monitoring_enabled,
+                std::sync::Arc::new(move |event| {
+                    if tx.try_send(event).is_err() {
+                        dropped.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                }),
+            );
+        }
         if let Err(err) = self.load_peer_sync_state(&state_dir) {
             eprintln!(
                 "peer sync state load failed for {}: {err}",
@@ -1508,6 +1530,20 @@ impl NetworkBridgeService {
         }
         self.state_dir = Some(state_dir);
         self.db_path = Some(db_path);
+    }
+
+    fn drain_runtime_diagnostics(&self) {
+        if let Some(state_dir) = self.state_dir.as_deref()
+            && let Some(receiver) = &self.runtime_diagnostics
+        {
+            // Keep JSONL writes on the bridge thread, outside control handlers.
+            for event in receiver
+                .try_iter()
+                .take(diagnostics::RUNTIME_DIAGNOSTIC_QUEUE_CAPACITY)
+            {
+                diagnostics::record_runtime_diagnostic(state_dir, self.monitoring_enabled, event);
+            }
+        }
     }
 
     fn load_peer_sync_state(&mut self, state_dir: &Path) -> Result<()> {

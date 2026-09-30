@@ -1,6 +1,105 @@
 use super::*;
+use std::hash::{Hash, Hasher};
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Instant;
 use tokio::sync::Semaphore;
+
+/// Metadata-only observations; the host owns level gating and persistence.
+pub struct RuntimeDiagnostic {
+    pub phase: &'static str,
+    pub status: &'static str,
+    pub anomaly: bool,
+    pub peer: Option<String>,
+    pub details: serde_json::Value,
+}
+
+pub type RuntimeDiagnosticHandler = Arc<dyn Fn(RuntimeDiagnostic) + Send + Sync>;
+#[derive(Default)]
+struct RuntimeDiagnostics {
+    enabled: std::sync::atomic::AtomicBool,
+    handler: Mutex<Option<RuntimeDiagnosticHandler>>,
+}
+type DiagnosticHandlerSlot = Arc<RuntimeDiagnostics>;
+
+fn runtime_diagnostics_enabled(slot: &DiagnosticHandlerSlot) -> bool {
+    slot.enabled.load(Ordering::Relaxed)
+}
+
+fn emit_runtime_diagnostic(
+    slot: &DiagnosticHandlerSlot,
+    build_event: impl FnOnce() -> RuntimeDiagnostic,
+) {
+    if !runtime_diagnostics_enabled(slot) {
+        return;
+    }
+    let handler = slot.handler.lock().ok().and_then(|handler| handler.clone());
+    if let Some(handler) = handler {
+        handler(build_event());
+    }
+}
+
+pub fn diagnostic_error_is_timeout(error: &str) -> bool {
+    error.contains("timeout") || error.contains("timed out")
+}
+
+fn control_correlation(payload: &[u8]) -> serde_json::Value {
+    #[cfg(test)]
+    CORRELATION_CALLS.with(|calls| calls.set(calls.get() + 1));
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    payload.hash(&mut hasher);
+    let mut details = serde_json::json!({"wire_fingerprint": format!("{:016x}", hasher.finish())});
+    if let Ok(value) = serde_json::from_slice::<serde_json::Value>(payload) {
+        for source in [&value, &value["payload"]] {
+            for key in [
+                "event_id",
+                "request_id",
+                "message_id",
+                "feed_key",
+                "limit",
+                "from_event_seq",
+            ] {
+                if let Some(value) = source
+                    .get(key)
+                    .filter(|value| value.is_string() || value.is_number())
+                {
+                    details[key] = value.clone();
+                }
+            }
+        }
+        if let Some(scope) = value
+            .get("scope")
+            .and_then(|value| serde_json::from_value::<SwarmScope>(value.clone()).ok())
+        {
+            details["scope"] = serde_json::json!(scope);
+        }
+        if let Some(event) = value.get("event") {
+            for key in ["event_id", "event_kind", "task_id"] {
+                if let Some(value) = event.get(key).filter(|value| value.is_string()) {
+                    details[key] = value.clone();
+                }
+            }
+        }
+        for pointer in [
+            "/agent_envelope/message_json",
+            "/event/payload/payload/agent_envelope/message_json",
+            "/payload/agent_envelope/message_json",
+            "/payload/content/agent_envelope/message_json",
+            "/event/payload/payload/local_content_cache/agent_envelope/message_json",
+        ] {
+            if let Some(message) = value.pointer(pointer).and_then(serde_json::Value::as_str)
+                && let Ok(message) = serde_json::from_str::<serde_json::Value>(message)
+            {
+                for key in ["request_id", "message_id"] {
+                    if let Some(value) = message.get(key).filter(|value| value.is_string()) {
+                        details[key] = value.clone();
+                    }
+                }
+            }
+        }
+    }
+    details
+}
 
 const MAX_CONCURRENT_BACKFILL_REQUESTS: usize = 16;
 const MAX_CONCURRENT_INTERACTIVE_CONTROL_REQUESTS: usize = 4;
@@ -181,6 +280,7 @@ enum IrohGossipInbound {
         peer: String,
     },
     NeighborDown {
+        subscription: Option<IrohGossipSubscription>,
         peer: String,
     },
     Malformed {
@@ -214,6 +314,9 @@ pub struct SubstrateRuntime {
     established_per_peer: HashMap<NetworkNodeId, u32>,
     counters: IrohRuntimeCounters,
     next_request_id: u64,
+    diagnostic_handler: DiagnosticHandlerSlot,
+    topic_neighbors: HashMap<IrohGossipSubscription, HashSet<String>>,
+    last_control_success: Arc<Mutex<HashMap<String, u64>>>,
 }
 
 impl SubstrateRuntime {
@@ -258,6 +361,9 @@ impl SubstrateRuntime {
             established_per_peer: HashMap::new(),
             counters: IrohRuntimeCounters::default(),
             next_request_id: 1,
+            diagnostic_handler: Arc::new(RuntimeDiagnostics::default()),
+            topic_neighbors: HashMap::new(),
+            last_control_success: Arc::new(Mutex::new(HashMap::new())),
         };
         this.install_control_handlers()?;
         for (peer, address) in this.config.parse_bootstrap_peers()? {
@@ -269,6 +375,89 @@ impl SubstrateRuntime {
 
     pub fn local_peer_id(&self) -> NetworkNodeId {
         self.local_peer_id.clone()
+    }
+
+    pub fn set_diagnostic_handler(&mut self, enabled: bool, handler: RuntimeDiagnosticHandler) {
+        if let Ok(mut slot) = self.diagnostic_handler.handler.lock() {
+            *slot = enabled.then_some(handler);
+            self.diagnostic_handler
+                .enabled
+                .store(enabled, Ordering::Relaxed);
+        }
+    }
+
+    pub fn diagnostic_snapshot(&self) -> serde_json::Value {
+        serde_json::json!({
+            "topics": self.subscriptions.iter().map(|topic| serde_json::json!({
+                "topic": topic.topic_id_hex,
+                "scope": topic.scope,
+                "kind": topic.kind.as_str(),
+                "neighbor_count": self.topic_neighbors.get(topic).map_or(0, HashSet::len),
+            })).collect::<Vec<_>>(),
+            "last_success_ms": self.last_control_success.lock().ok().map(|peers| peers.clone()),
+            "known_peers": self.remote_contacts.keys().collect::<Vec<_>>(),
+            "home_relay_urls": local_iroh_home_relay_urls(&self.state_dir),
+        })
+    }
+
+    fn observe_gossip(
+        &self,
+        phase: &'static str,
+        status: &'static str,
+        anomaly: bool,
+        subscription: &IrohGossipSubscription,
+        peer: Option<&str>,
+        payload: Option<&[u8]>,
+    ) {
+        if !runtime_diagnostics_enabled(&self.diagnostic_handler) {
+            return;
+        }
+        let mut details = payload
+            .map(control_correlation)
+            .unwrap_or_else(|| serde_json::json!({}));
+        details["topic"] = serde_json::json!(subscription.topic_id_hex);
+        details["scope"] = serde_json::json!(subscription.scope);
+        details["kind"] = serde_json::json!(subscription.kind.as_str());
+        details["neighbor_count"] = serde_json::json!(
+            self.topic_neighbors
+                .get(subscription)
+                .map_or(0, HashSet::len)
+        );
+        emit_runtime_diagnostic(&self.diagnostic_handler, || RuntimeDiagnostic {
+            phase,
+            status,
+            anomaly,
+            peer: peer.map(str::to_owned),
+            details,
+        });
+    }
+
+    fn observe_control_preflight(
+        &self,
+        peer: &NetworkNodeId,
+        kind: &'static str,
+        timeout: Duration,
+        status: &'static str,
+        payload: Option<&[u8]>,
+    ) {
+        if !runtime_diagnostics_enabled(&self.diagnostic_handler) {
+            return;
+        }
+        let mut details = payload
+            .map(control_correlation)
+            .unwrap_or_else(|| serde_json::json!({}));
+        details["kind"] = serde_json::json!(kind);
+        details["local_request_id"] =
+            serde_json::json!(self.next_request_id.saturating_sub(1).to_string());
+        details["timeout_ms"] = serde_json::json!(timeout.as_millis());
+        details["elapsed_ms"] = serde_json::json!(0);
+        emit_runtime_diagnostic(&self.diagnostic_handler, || RuntimeDiagnostic {
+            phase: "control.outbound",
+            status,
+            anomaly: true,
+            peer: Some(peer.to_string()),
+            details,
+        });
     }
 
     pub fn listen_addrs(&self) -> &[NetworkAddress] {
@@ -441,6 +630,7 @@ impl SubstrateRuntime {
         for kind in kinds {
             let subscription = self.subscription_for(scope, *kind)?;
             self.subscriptions.remove(&subscription);
+            self.topic_neighbors.remove(&subscription);
             if let Some(handle) = self.gossip_topics.remove(&subscription) {
                 handle.task.abort();
             }
@@ -456,6 +646,31 @@ impl SubstrateRuntime {
         };
         let bytes = message.encode_json()?;
         if bytes.len() > self.config.gossip_mesh_max_transmit_size {
+            if runtime_diagnostics_enabled(&self.diagnostic_handler) {
+                let mut details = control_correlation(payload);
+                let subscription = self.subscription_for(scope, kind).ok();
+                details["scope"] = serde_json::json!(scope);
+                details["kind"] = serde_json::json!(kind.as_str());
+                details["bytes"] = serde_json::json!(bytes.len());
+                details["topic"] = serde_json::json!(
+                    subscription
+                        .as_ref()
+                        .map(|subscription| &subscription.topic_id_hex)
+                );
+                details["neighbor_count"] = serde_json::json!(
+                    subscription
+                        .as_ref()
+                        .and_then(|subscription| self.topic_neighbors.get(subscription))
+                        .map_or(0, HashSet::len)
+                );
+                emit_runtime_diagnostic(&self.diagnostic_handler, || RuntimeDiagnostic {
+                    phase: "gossip.publish",
+                    status: "oversized_skipped",
+                    anomaly: true,
+                    peer: None,
+                    details,
+                });
+            }
             bail!(
                 "gossip message size {} exceeds configured max {}",
                 bytes.len(),
@@ -463,13 +678,45 @@ impl SubstrateRuntime {
             );
         }
         let subscription = self.subscription_for(scope, kind)?;
-        self.ensure_gossip_topic(subscription.clone())?;
+        self.ensure_gossip_topic(subscription.clone())
+            .inspect_err(|_| {
+                self.observe_gossip(
+                    "gossip.publish",
+                    "subscribe_failed",
+                    true,
+                    &subscription,
+                    None,
+                    Some(payload),
+                );
+            })?;
         let topic = self
             .gossip_topics
             .get(&subscription)
             .ok_or_else(|| anyhow!("missing iroh gossip topic {}", subscription.topic_id_hex))?;
-        self.block_on(topic.sender.broadcast(bytes.into()))
-            .map_err(|err| anyhow!("publish iroh gossip notification: {err}"))?;
+        let result = self
+            .block_on(topic.sender.broadcast(bytes.into()))
+            .map_err(|err| anyhow!("publish iroh gossip notification: {err}"));
+        if runtime_diagnostics_enabled(&self.diagnostic_handler) {
+            let zero_neighbors = self
+                .topic_neighbors
+                .get(&subscription)
+                .is_none_or(HashSet::is_empty);
+            self.observe_gossip(
+                "gossip.publish",
+                if result.is_err() {
+                    "err"
+                } else if zero_neighbors {
+                    "zero_neighbors"
+                } else {
+                    "ok"
+                },
+                result.is_err() || zero_neighbors,
+                &subscription,
+                None,
+                Some(payload),
+            );
+        }
+        result?;
         Ok(())
     }
 
@@ -573,6 +820,13 @@ impl SubstrateRuntime {
             }) {
             Ok(encoded) => encoded,
             Err(err) => {
+                self.observe_control_preflight(
+                    peer,
+                    IROH_CONTROL_KIND_BACKFILL,
+                    timeout,
+                    "invalid_request",
+                    None,
+                );
                 self.pending_events
                     .push_back(SubstrateRuntimeEvent::BackfillOutboundFailure {
                         peer: peer.clone(),
@@ -583,6 +837,13 @@ impl SubstrateRuntime {
             }
         };
         let Some(remote_contact) = self.remote_contacts.get(peer.as_str()).cloned() else {
+            self.observe_control_preflight(
+                peer,
+                IROH_CONTROL_KIND_BACKFILL,
+                timeout,
+                "missing_contact",
+                Some(&payload),
+            );
             self.pending_events
                 .push_back(SubstrateRuntimeEvent::BackfillOutboundFailure {
                     peer: peer.clone(),
@@ -647,6 +908,13 @@ impl SubstrateRuntime {
             match encode_raw_control_request(RawControlRequest::ContactMaterial(request)) {
                 Ok(encoded) => encoded,
                 Err(err) => {
+                    self.observe_control_preflight(
+                        peer,
+                        IROH_CONTROL_KIND_CONTACT_MATERIAL,
+                        Duration::from_millis(self.config.control_request_timeout_ms),
+                        "invalid_request",
+                        None,
+                    );
                     self.pending_events.push_back(
                         SubstrateRuntimeEvent::ContactMaterialOutboundFailure {
                             peer: peer.clone(),
@@ -658,6 +926,13 @@ impl SubstrateRuntime {
                 }
             };
         let Some(remote_contact) = self.remote_contacts.get(peer.as_str()).cloned() else {
+            self.observe_control_preflight(
+                peer,
+                IROH_CONTROL_KIND_CONTACT_MATERIAL,
+                Duration::from_millis(self.config.control_request_timeout_ms),
+                "missing_contact",
+                Some(&payload),
+            );
             self.pending_events
                 .push_back(SubstrateRuntimeEvent::ContactMaterialOutboundFailure {
                     peer: peer.clone(),
@@ -725,6 +1000,13 @@ impl SubstrateRuntime {
             match encode_raw_control_request(RawControlRequest::PeerRelationship(request)) {
                 Ok(encoded) => encoded,
                 Err(err) => {
+                    self.observe_control_preflight(
+                        peer,
+                        IROH_CONTROL_KIND_PEER_RELATIONSHIP,
+                        Duration::from_millis(self.config.control_request_timeout_ms),
+                        "invalid_request",
+                        None,
+                    );
                     self.pending_events.push_back(
                         SubstrateRuntimeEvent::PeerRelationshipOutboundFailure {
                             peer: peer.clone(),
@@ -736,6 +1018,13 @@ impl SubstrateRuntime {
                 }
             };
         let Some(remote_contact) = self.remote_contacts.get(peer.as_str()).cloned() else {
+            self.observe_control_preflight(
+                peer,
+                IROH_CONTROL_KIND_PEER_RELATIONSHIP,
+                Duration::from_millis(self.config.control_request_timeout_ms),
+                "missing_contact",
+                Some(&payload),
+            );
             self.pending_events
                 .push_back(SubstrateRuntimeEvent::PeerRelationshipOutboundFailure {
                     peer: peer.clone(),
@@ -807,18 +1096,49 @@ impl SubstrateRuntime {
         + Send
         + 'static,
     ) -> bool {
+        let local_request_id = self.next_request_id.saturating_sub(1);
         let slots = match class {
             ControlRequestClass::Backfill => self.backfill_request_slots.clone(),
             ControlRequestClass::Interactive => self.interactive_control_request_slots.clone(),
         };
         let Ok(permit) = slots.try_acquire_owned() else {
+            emit_runtime_diagnostic(&self.diagnostic_handler, || RuntimeDiagnostic {
+                phase: "control.outbound",
+                status: "capacity_skipped",
+                anomaly: true,
+                peer: Some(peer.to_string()),
+                details: {
+                    let mut details = control_correlation(&request.payload);
+                    details["local_request_id"] = serde_json::json!(local_request_id.to_string());
+                    details["kind"] = serde_json::json!(request.kind);
+                    details["timeout_ms"] = serde_json::json!(timeout.as_millis());
+                    details
+                },
+            });
             return false;
         };
         let state_dir = self.state_dir.clone();
         let local_peer_id = self.local_peer_id.clone();
         let peer = peer.clone();
         let control_tx = self.control_tx.clone();
+        let diagnostic_handler = self.diagnostic_handler.clone();
+        let last_success = self.last_control_success.clone();
         self.runtime().spawn(async move {
+            let started = runtime_diagnostics_enabled(&diagnostic_handler).then(Instant::now);
+            let mut details = started.map(|_| {
+                let mut details = control_correlation(&request.payload);
+                details["local_request_id"] = serde_json::json!(local_request_id.to_string());
+                details["kind"] = serde_json::json!(request.kind);
+                details["timeout_ms"] = serde_json::json!(timeout.as_millis());
+                details
+            });
+            emit_runtime_diagnostic(&diagnostic_handler, || RuntimeDiagnostic {
+                phase: "control.outbound.started",
+                status: "started",
+                anomaly: false,
+                peer: Some(peer.to_string()),
+                details: details.clone().unwrap_or_default(),
+            });
             let response = tokio::task::spawn_blocking(move || {
                 let _permit = permit;
                 let kind = request.kind.clone();
@@ -833,6 +1153,28 @@ impl SubstrateRuntime {
             })
             .await
             .unwrap_or_else(|err| Err(anyhow!("join control request task: {err}")));
+            if let Some(started) = started {
+                let status = match &response {
+                    Ok(_) if started.elapsed() >= timeout => "late_response",
+                    Ok(_) => "ok",
+                    Err(error) if diagnostic_error_is_timeout(&error.to_string()) => "timeout",
+                    Err(_) => "err",
+                };
+                if response.is_ok()
+                    && let Ok(mut peers) = last_success.lock()
+                {
+                    peers.insert(peer.to_string(), unix_timestamp_millis());
+                }
+                let mut details = details.take().unwrap_or_default();
+                details["elapsed_ms"] = serde_json::json!(started.elapsed().as_millis());
+                emit_runtime_diagnostic(&diagnostic_handler, || RuntimeDiagnostic {
+                    phase: "control.outbound",
+                    status,
+                    anomaly: status != "ok",
+                    peer: Some(peer.to_string()),
+                    details,
+                });
+            }
             let _ = control_tx.send(build_event(peer, response));
         });
         true
@@ -865,17 +1207,55 @@ impl SubstrateRuntime {
                     bytes,
                 } => {
                     if bytes.len() > self.config.gossip_mesh_max_transmit_size {
+                        self.observe_gossip(
+                            "gossip.receive",
+                            "oversized_skipped",
+                            true,
+                            &subscription,
+                            Some(delivered_from.as_str()),
+                            None,
+                        );
                         self.counters.malformed_gossip_notifications = self
                             .counters
                             .malformed_gossip_notifications
                             .saturating_add(1);
                         continue;
                     }
-                    let message = RawGossipMessage::decode_json(&bytes)?;
+                    let message = RawGossipMessage::decode_json(&bytes).inspect_err(|_| {
+                        self.observe_gossip(
+                            "gossip.receive",
+                            "decode_failed",
+                            true,
+                            &subscription,
+                            Some(delivered_from.as_str()),
+                            None,
+                        );
+                    })?;
+                    self.observe_gossip(
+                        "gossip.receive",
+                        "received",
+                        false,
+                        &subscription,
+                        Some(delivered_from.as_str()),
+                        Some(&message.payload),
+                    );
                     if message.scope != subscription.scope || message.kind != subscription.kind {
+                        self.observe_gossip(
+                            "gossip.receive",
+                            "scope_kind_skipped",
+                            true,
+                            &subscription,
+                            Some(delivered_from.as_str()),
+                            Some(&message.payload),
+                        );
                         self.counters.scope_kind_mismatch_drops =
                             self.counters.scope_kind_mismatch_drops.saturating_add(1);
                         continue;
+                    }
+                    if runtime_diagnostics_enabled(&self.diagnostic_handler)
+                        && let Ok(mut peers) = self.last_control_success.lock()
+                    {
+                        peers.insert(delivered_from.clone(), unix_timestamp_millis());
                     }
                     self.pending_events
                         .push_back(SubstrateRuntimeEvent::Gossip {
@@ -884,6 +1264,20 @@ impl SubstrateRuntime {
                         });
                 }
                 IrohGossipInbound::NeighborUp { subscription, peer } => {
+                    if runtime_diagnostics_enabled(&self.diagnostic_handler) {
+                        self.topic_neighbors
+                            .entry(subscription.clone())
+                            .or_default()
+                            .insert(peer.clone());
+                    }
+                    self.observe_gossip(
+                        "gossip.neighbor_up",
+                        "ok",
+                        false,
+                        &subscription,
+                        Some(peer.as_str()),
+                        None,
+                    );
                     let peer = NetworkNodeId::new(peer)?;
                     self.pending_events
                         .push_back(SubstrateRuntimeEvent::GossipNeighborUp {
@@ -912,7 +1306,22 @@ impl SubstrateRuntime {
                         );
                     }
                 }
-                IrohGossipInbound::NeighborDown { peer, .. } => {
+                IrohGossipInbound::NeighborDown { subscription, peer } => {
+                    if runtime_diagnostics_enabled(&self.diagnostic_handler)
+                        && let Some(subscription) = subscription
+                    {
+                        if let Some(neighbors) = self.topic_neighbors.get_mut(&subscription) {
+                            neighbors.remove(&peer);
+                        }
+                        self.observe_gossip(
+                            "gossip.neighbor_down",
+                            "ok",
+                            false,
+                            &subscription,
+                            Some(peer.as_str()),
+                            None,
+                        );
+                    }
                     let peer = NetworkNodeId::new(peer)?;
                     let remaining_established = match self.established_per_peer.get_mut(&peer) {
                         Some(established) => {
@@ -948,6 +1357,13 @@ impl SubstrateRuntime {
                         });
                 }
                 IrohGossipInbound::Lagged => {
+                    emit_runtime_diagnostic(&self.diagnostic_handler, || RuntimeDiagnostic {
+                        phase: "gossip.receive",
+                        status: "lagged",
+                        anomaly: true,
+                        peer: None,
+                        details: serde_json::json!({}),
+                    });
                     self.counters.malformed_gossip_notifications = self
                         .counters
                         .malformed_gossip_notifications
@@ -1010,95 +1426,152 @@ impl SubstrateRuntime {
         let local_peer_id = self.local_peer_id.clone();
         let timeout = Duration::from_millis(self.config.control_request_timeout_ms);
         let admission = max_inflight.map(|limit| Arc::new(InboundRequestAdmission::new(limit)));
+        let diagnostic_handler = self.diagnostic_handler.clone();
+        let last_success = self.last_control_success.clone();
         set_local_control_stream_handler_for_network_peer_id(
             &self.state_dir,
             self.local_peer_id.as_str(),
             kind,
             Some(
                 move |remote_peer_id: String, request: IrohControlStreamRequest| {
-                    let _admission_permit = match admission.as_ref() {
-                        Some(admission) => match admission.try_acquire() {
-                            Some(permit) => Some(permit),
-                            None => {
+                    let started =
+                        runtime_diagnostics_enabled(&diagnostic_handler).then(Instant::now);
+                    let diagnostic_peer = started.map(|_| remote_peer_id.clone());
+                    let details = started.map(|_| {
+                        let mut details = control_correlation(&request.payload);
+                        details["kind"] = serde_json::json!(request.kind);
+                        details["timeout_ms"] = serde_json::json!(timeout.as_millis());
+                        details
+                    });
+                    emit_runtime_diagnostic(&diagnostic_handler, || RuntimeDiagnostic {
+                        phase: "control.inbound.received",
+                        status: "received",
+                        anomaly: false,
+                        peer: diagnostic_peer.clone(),
+                        details: details.clone().unwrap_or_default(),
+                    });
+                    // Preserve the original permit lifetime while observing returns.
+                    let mut _admission_permit = None;
+                    let mut response_receiver = None;
+                    let response = (|| {
+                        _admission_permit = match admission.as_ref() {
+                            Some(admission) => match admission.try_acquire() {
+                                Some(permit) => Some(permit),
+                                None => {
+                                    return IrohControlStreamResponse {
+                                        ok: false,
+                                        error: Some(format!(
+                                            "{CONTROL_BUSY_ERROR_PREFIX} retry_after_ms=1000"
+                                        )),
+                                        payload: Vec::new(),
+                                    };
+                                }
+                            },
+                            None => None,
+                        };
+                        if request.kind != kind {
+                            return IrohControlStreamResponse {
+                                ok: false,
+                                error: Some(format!(
+                                    "unexpected iroh control request kind {}",
+                                    request.kind
+                                )),
+                                payload: Vec::new(),
+                            };
+                        }
+                        let decoded = match serde_json::from_slice::<Req>(&request.payload) {
+                            Ok(decoded) => decoded,
+                            Err(err) => {
                                 return IrohControlStreamResponse {
                                     ok: false,
-                                    error: Some(format!(
-                                        "{CONTROL_BUSY_ERROR_PREFIX} retry_after_ms=1000"
-                                    )),
+                                    error: Some(format!("decode iroh control request: {err}")),
                                     payload: Vec::new(),
                                 };
                             }
-                        },
-                        None => None,
-                    };
-                    if request.kind != kind {
-                        return IrohControlStreamResponse {
-                            ok: false,
-                            error: Some(format!(
-                                "unexpected iroh control request kind {}",
-                                request.kind
-                            )),
-                            payload: Vec::new(),
                         };
-                    }
-                    let decoded = match serde_json::from_slice::<Req>(&request.payload) {
-                        Ok(decoded) => decoded,
-                        Err(err) => {
-                            return IrohControlStreamResponse {
-                                ok: false,
-                                error: Some(format!("decode iroh control request: {err}")),
-                                payload: Vec::new(),
-                            };
-                        }
-                    };
-                    let remote_peer = match NetworkNodeId::new(remote_peer_id) {
-                        Ok(peer) => peer,
-                        Err(err) => {
-                            return IrohControlStreamResponse {
-                                ok: false,
-                                error: Some(format!("resolve iroh remote peer: {err}")),
-                                payload: Vec::new(),
-                            };
-                        }
-                    };
-                    let peer = match decoded.inbound_peer(&remote_peer, &local_peer_id) {
-                        Ok(peer) => peer,
-                        Err(err) => {
-                            return IrohControlStreamResponse {
-                                ok: false,
-                                error: Some(format!("resolve iroh control peer: {err}")),
-                                payload: Vec::new(),
-                            };
-                        }
-                    };
-                    let (response_tx, response_rx) = mpsc::channel::<Resp>();
-                    let event = build_event(peer, decoded, response_tx);
-                    if pending_tx.send(event).is_err() {
-                        return IrohControlStreamResponse {
-                            ok: false,
-                            error: Some("control dispatch channel unavailable".to_owned()),
-                            payload: Vec::new(),
+                        let remote_peer = match NetworkNodeId::new(remote_peer_id) {
+                            Ok(peer) => peer,
+                            Err(err) => {
+                                return IrohControlStreamResponse {
+                                    ok: false,
+                                    error: Some(format!("resolve iroh remote peer: {err}")),
+                                    payload: Vec::new(),
+                                };
+                            }
                         };
-                    }
-                    match response_rx.recv_timeout(timeout) {
-                        Ok(response) => match serde_json::to_vec(&response) {
-                            Ok(payload) => IrohControlStreamResponse {
-                                ok: true,
-                                error: None,
-                                payload,
+                        let peer = match decoded.inbound_peer(&remote_peer, &local_peer_id) {
+                            Ok(peer) => peer,
+                            Err(err) => {
+                                return IrohControlStreamResponse {
+                                    ok: false,
+                                    error: Some(format!("resolve iroh control peer: {err}")),
+                                    payload: Vec::new(),
+                                };
+                            }
+                        };
+                        let (response_tx, response_rx) = mpsc::channel::<Resp>();
+                        let response_rx = response_receiver.insert(response_rx);
+                        let event = build_event(peer, decoded, response_tx);
+                        if pending_tx.send(event).is_err() {
+                            return IrohControlStreamResponse {
+                                ok: false,
+                                error: Some("control dispatch channel unavailable".to_owned()),
+                                payload: Vec::new(),
+                            };
+                        }
+                        match response_rx.recv_timeout(timeout) {
+                            Ok(response) => match serde_json::to_vec(&response) {
+                                Ok(payload) => IrohControlStreamResponse {
+                                    ok: true,
+                                    error: None,
+                                    payload,
+                                },
+                                Err(err) => IrohControlStreamResponse {
+                                    ok: false,
+                                    error: Some(format!("encode iroh control response: {err}")),
+                                    payload: Vec::new(),
+                                },
                             },
                             Err(err) => IrohControlStreamResponse {
                                 ok: false,
-                                error: Some(format!("encode iroh control response: {err}")),
+                                error: Some(format!("wait for iroh control response: {err}")),
                                 payload: Vec::new(),
                             },
-                        },
-                        Err(err) => IrohControlStreamResponse {
-                            ok: false,
-                            error: Some(format!("wait for iroh control response: {err}")),
-                            payload: Vec::new(),
-                        },
+                        }
+                    })();
+                    if let Some(started) = started {
+                        let status = if response.ok && started.elapsed() >= timeout {
+                            "late_response"
+                        } else if response.ok {
+                            "ok"
+                        } else if response
+                            .error
+                            .as_deref()
+                            .is_some_and(diagnostic_error_is_timeout)
+                        {
+                            "timeout"
+                        } else {
+                            "err"
+                        };
+                        if response.ok
+                            && let Ok(mut peers) = last_success.lock()
+                            && let Some(peer) = &diagnostic_peer
+                        {
+                            peers.insert(peer.clone(), unix_timestamp_millis());
+                        }
+                        let mut details = details.unwrap_or_default();
+                        details["handled_within_timeout"] =
+                            serde_json::json!(started.elapsed() < timeout);
+                        details["elapsed_ms"] = serde_json::json!(started.elapsed().as_millis());
+                        emit_runtime_diagnostic(&diagnostic_handler, || RuntimeDiagnostic {
+                            phase: "control.inbound",
+                            status,
+                            anomaly: status != "ok",
+                            peer: diagnostic_peer,
+                            details,
+                        });
                     }
+                    response
                 },
             ),
         )
@@ -1144,6 +1617,7 @@ impl SubstrateRuntime {
         let (sender, mut receiver) = topic.split();
         let inbound_tx = self.gossip_tx.clone();
         let task_subscription = subscription.clone();
+        let diagnostic_handler = self.diagnostic_handler.clone();
         let task = self.runtime().spawn(async move {
             while let Some(event) = receiver.next().await {
                 match event {
@@ -1179,6 +1653,8 @@ impl SubstrateRuntime {
                     Ok(IrohGossipEvent::NeighborDown(peer)) => {
                         if inbound_tx
                             .send(IrohGossipInbound::NeighborDown {
+                                subscription: runtime_diagnostics_enabled(&diagnostic_handler)
+                                    .then(|| task_subscription.clone()),
                                 peer: peer.to_string(),
                             })
                             .is_err()
@@ -1267,8 +1743,185 @@ impl Drop for SubstrateRuntime {
 }
 
 #[cfg(test)]
+thread_local! {
+    static CORRELATION_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn monitoring_disabled_skips_builders_correlation_and_neighbor_tracking() {
+        let mut runtime = runtime_for_test(SubstrateConfig::default());
+        runtime.set_diagnostic_handler(false, Arc::new(|_| panic!("disabled callback invoked")));
+        emit_runtime_diagnostic(&runtime.diagnostic_handler, || {
+            panic!("disabled metadata built")
+        });
+        let topic = runtime
+            .subscription_for(&SwarmScope::Global, GossipKind::Events)
+            .unwrap();
+        let peer = NetworkNodeId::random();
+        CORRELATION_CALLS.with(|calls| calls.set(0));
+        runtime.observe_gossip(
+            "gossip.receive",
+            "received",
+            false,
+            &topic,
+            Some(peer.as_str()),
+            Some(br#"{"message_id":"message-1"}"#),
+        );
+        runtime.observe_control_preflight(
+            &peer,
+            "test.v1",
+            Duration::from_secs(1),
+            "failed",
+            Some(br#"{"request_id":"request-1"}"#),
+        );
+        runtime
+            .gossip_tx
+            .send(IrohGossipInbound::NeighborUp {
+                subscription: topic.clone(),
+                peer: peer.to_string(),
+            })
+            .unwrap();
+        while runtime.try_next_event().unwrap().is_some() {}
+        assert!(runtime.topic_neighbors.is_empty());
+        assert!(runtime.last_control_success.lock().unwrap().is_empty());
+        CORRELATION_CALLS.with(|calls| assert_eq!(calls.get(), 0));
+    }
+
+    #[test]
+    fn diagnostic_timeout_classifier_covers_existing_error_texts() {
+        for error in [
+            "control timeout",
+            "control timed out",
+            "wait for iroh control response: timed out waiting on channel",
+        ] {
+            assert!(diagnostic_error_is_timeout(error));
+        }
+        assert!(!diagnostic_error_is_timeout("response channel closed"));
+    }
+
+    #[test]
+    fn control_correlation_is_metadata_only_for_requests_events_and_summaries() {
+        let message = serde_json::json!({"request_id": "request-7", "message_id": "message-8", "text": "private text"}).to_string();
+        let request = serde_json::json!({"agent_envelope": {"message_json": message, "signature": "secret"}, "scope": "global", "limit": 64});
+        let event = serde_json::json!({"event": {"event_id": "event-9", "event_kind": "TopicMessagePosted", "task_id": "task-4", "payload": {"payload": {"agent_envelope": {"message_json": message}, "content": "private text"}}}});
+        let summary = serde_json::json!({"payload": {"message_id": "message-8", "agent_envelope": {"message_json": message}, "content": "private text"}});
+        for value in [request, event, summary] {
+            let bytes = serde_json::to_vec(&value).unwrap();
+            let correlation = control_correlation(&bytes);
+            assert_eq!(correlation["request_id"], "request-7");
+            assert_eq!(correlation["message_id"], "message-8");
+            assert_eq!(
+                correlation["wire_fingerprint"],
+                control_correlation(&bytes)["wire_fingerprint"]
+            );
+            let raw = correlation.to_string();
+            assert!(!raw.contains("private text"));
+            assert!(!raw.contains("secret"));
+            assert!(!raw.contains("message_json"));
+            if value.get("event").is_some() {
+                assert_eq!(correlation["event_id"], "event-9");
+                assert_eq!(correlation["task_id"], "task-4");
+            }
+        }
+    }
+
+    #[test]
+    fn missing_control_contact_records_kind_peer_request_and_timeout() {
+        let mut runtime = runtime_for_test(SubstrateConfig::default());
+        let (tx, rx) = mpsc::channel();
+        runtime.set_diagnostic_handler(
+            true,
+            Arc::new(move |observation| {
+                tx.send(observation).unwrap();
+            }),
+        );
+        let peer = NetworkNodeId::random();
+        let request_id = runtime
+            .send_backfill_request(
+                &peer,
+                RawBackfillRequest {
+                    scope: SwarmScope::Global,
+                    from_event_seq: 0,
+                    limit: 64,
+                    head_only: false,
+                    feed_key: None,
+                    exclude_topic_events: false,
+                    known_event_ids: Vec::new(),
+                },
+                Duration::from_secs(7),
+            )
+            .unwrap()
+            .unwrap();
+        let observation = rx.recv().unwrap();
+        assert!(observation.anomaly);
+        assert_eq!(observation.status, "missing_contact");
+        assert_eq!(observation.peer.as_deref(), Some(peer.as_str()));
+        assert_eq!(observation.details["kind"], "backfill.v1");
+        assert_eq!(
+            observation.details["local_request_id"],
+            request_id.to_string()
+        );
+        assert_eq!(observation.details["timeout_ms"], 7000);
+        assert_eq!(observation.details["limit"], 64);
+        assert!(matches!(
+            runtime.try_next_event().unwrap(),
+            Some(SubstrateRuntimeEvent::BackfillOutboundFailure { .. })
+        ));
+    }
+
+    #[test]
+    fn gossip_neighbor_counts_are_per_topic_and_include_peer_correlation() {
+        let mut runtime = runtime_for_test(SubstrateConfig::default());
+        let (tx, rx) = mpsc::channel();
+        runtime.set_diagnostic_handler(
+            true,
+            Arc::new(move |observation| {
+                tx.send(observation).unwrap();
+            }),
+        );
+        let first = runtime
+            .subscription_for(&SwarmScope::Global, GossipKind::Events)
+            .unwrap();
+        let second = runtime
+            .subscription_for(&SwarmScope::Group("test".to_owned()), GossipKind::Events)
+            .unwrap();
+        runtime
+            .subscriptions
+            .extend([first.clone(), second.clone()]);
+        let peer = NetworkNodeId::random();
+        for topic in [&first, &second] {
+            runtime
+                .gossip_tx
+                .send(IrohGossipInbound::NeighborUp {
+                    subscription: topic.clone(),
+                    peer: peer.to_string(),
+                })
+                .unwrap();
+            while runtime.try_next_event().unwrap().is_some() {}
+            let observation = rx.recv().unwrap();
+            assert!(!observation.anomaly);
+            assert_eq!(observation.peer.as_deref(), Some(peer.as_str()));
+            assert_eq!(observation.details["topic"], topic.topic_id_hex);
+            assert_eq!(observation.details["neighbor_count"], 1);
+        }
+        runtime
+            .gossip_tx
+            .send(IrohGossipInbound::NeighborDown {
+                subscription: Some(first.clone()),
+                peer: peer.to_string(),
+            })
+            .unwrap();
+        while runtime.try_next_event().unwrap().is_some() {}
+        assert_eq!(rx.recv().unwrap().details["neighbor_count"], 0);
+        assert!(runtime.topic_neighbors[&first].is_empty());
+        assert_eq!(runtime.topic_neighbors[&second].len(), 1);
+        let snapshot = runtime.diagnostic_snapshot();
+        assert_eq!(snapshot["topics"].as_array().unwrap().len(), 2);
+    }
 
     static TEST_STATE_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
@@ -1297,6 +1950,9 @@ mod tests {
             local_endpoint_id: local_peer_id.to_string(),
             local_peer_id,
             local_listen_addrs: Vec::new(),
+            diagnostic_handler: Arc::new(RuntimeDiagnostics::default()),
+            topic_neighbors: HashMap::new(),
+            last_control_success: Arc::new(Mutex::new(HashMap::new())),
             subscriptions: HashSet::new(),
             gossip_topics: HashMap::new(),
             gossip_tx,
@@ -1579,6 +2235,7 @@ mod tests {
         runtime
             .gossip_tx
             .send(IrohGossipInbound::NeighborDown {
+                subscription: None,
                 peer: peer.to_string(),
             })
             .unwrap();
@@ -1587,6 +2244,7 @@ mod tests {
         runtime
             .gossip_tx
             .send(IrohGossipInbound::NeighborDown {
+                subscription: None,
                 peer: peer.to_string(),
             })
             .unwrap();

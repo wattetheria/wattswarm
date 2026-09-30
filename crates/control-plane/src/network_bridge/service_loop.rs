@@ -1016,9 +1016,20 @@ fn run_background_network_service_with_hook(
     let mut announced_listen = false;
     let mut announced_peers: HashMap<String, Instant> = HashMap::new();
     let mut last_published_seq = node.head_seq()?;
+    let mut publish_cursor_marker = record_startup_publish_cursor(
+        service.monitoring_enabled,
+        state_dir,
+        &node,
+        &node_id,
+        last_published_seq,
+    );
     let mut next_discovery_bootnode_query_at = Instant::now();
+    let mut next_health_at = service
+        .monitoring_enabled
+        .then(|| Instant::now() + Duration::from_secs(60));
+    let mut health_phase_max_ms: HashMap<String, u128> = HashMap::new();
     let mut loop_diagnostics = NetworkLoopDiagnostics::new();
-    let debug_diagnostics = diagnostics::debug_diagnostics_enabled();
+    let debug_diagnostics = service.monitoring_enabled;
 
     loop {
         if !network_permission_is_active(state_dir) {
@@ -1071,6 +1082,20 @@ fn run_background_network_service_with_hook(
                 Ok(None) => break,
                 Err(err) => {
                     eprintln!("network bridge tick failed: {err}");
+                    diagnostics::record_anomaly(
+                        Some(state_dir),
+                        service.monitoring_enabled,
+                        || {
+                            diagnostics::DiagnosticEvent::new(
+                                "warn",
+                                "transport",
+                                "loop.tick",
+                                "failed",
+                                "network bridge tick failed",
+                            )
+                            .details(json!({"reason": "runtime_tick_error"}))
+                        },
+                    );
                     thread::sleep(Duration::from_millis(250));
                     break;
                 }
@@ -1139,6 +1164,9 @@ fn run_background_network_service_with_hook(
             Ok(new_last_published_seq) if new_last_published_seq != last_published_seq => {
                 did_work = true;
                 last_published_seq = new_last_published_seq;
+                if let Some(marker) = &mut publish_cursor_marker {
+                    marker.advance(last_published_seq, Instant::now());
+                }
             }
             Ok(_) => {}
             Err(err) => {
@@ -1248,11 +1276,128 @@ fn run_background_network_service_with_hook(
             loop_diagnostics.record_idle_sleep();
             thread::sleep(IDLE_NETWORK_SLEEP);
         }
+        if service.monitoring_enabled {
+            for (phase, stats) in &loop_diagnostics.phase_duration_stats {
+                health_phase_max_ms
+                    .entry(phase.clone())
+                    .and_modify(|max| *max = (*max).max(stats.max_ms))
+                    .or_insert(stats.max_ms);
+            }
+            if next_health_at.is_some_and(|next| Instant::now() >= next)
+                && loop_diagnostics.window_started_at.elapsed() >= NETWORK_LOOP_DIAGNOSTIC_INTERVAL
+            {
+                service.record_diagnostic_health(state_dir, &health_phase_max_ms);
+                health_phase_max_ms.clear();
+                next_health_at = Some(Instant::now() + Duration::from_secs(60));
+            }
+        }
         if let Some(line) = loop_diagnostics.maybe_emit(Instant::now())
             && debug_diagnostics
         {
             eprintln!("{line}");
         }
+    }
+}
+
+pub(super) fn record_startup_publish_cursor(
+    enabled: bool,
+    state_dir: &Path,
+    node: &Node,
+    node_id: &str,
+    head_seq: u64,
+) -> Option<diagnostics::PublishCursorMarker> {
+    if !enabled {
+        let path = state_dir.join("diagnostics/publish_cursor.json");
+        if path.exists()
+            && let Err(error) = std::fs::remove_file(path)
+        {
+            eprintln!("remove disabled diagnostic publish cursor failed: {error:#}");
+        }
+        return None;
+    }
+    let marker = diagnostics::PublishCursorMarker::new(state_dir, head_seq);
+    let skipped = marker.marker_seq.map(|seq| {
+        node.store
+            .count_local_events_through(node_id, seq, head_seq)
+    });
+    let (status, count) = match skipped {
+        Some(Ok(count)) => (if count > 0 { "skipped" } else { "ok" }, Some(count)),
+        Some(Err(_)) => ("count_failed", None),
+        None => ("history_unknown", None),
+    };
+    let event = || {
+        let mut details = json!({"head_seq": head_seq, "marker_seq": marker.marker_seq,
+            "marker_updated_at_ms": marker.marker_updated_at_ms,
+            "previous_clean_shutdown": marker.previous_clean_shutdown,
+            "publication_history_known": marker.marker_seq.is_some()});
+        if let Some(count) = count {
+            details["skipped_unpublished_local_events"] = json!(count);
+        }
+        diagnostics::DiagnosticEvent::new(
+            if count.is_some_and(|count| count > 0) {
+                "warn"
+            } else {
+                "debug"
+            },
+            "gossip",
+            "startup.publish_cursor",
+            status,
+            "publisher starts at head; diagnostic cursor history",
+        )
+        .source_node_id(Some(node_id.to_owned()))
+        .details(details)
+    };
+    if count.is_some_and(|count| count > 0) {
+        diagnostics::record_anomaly(Some(state_dir), true, event);
+    } else {
+        diagnostics::record_debug(Some(state_dir), true, event);
+    }
+    Some(marker)
+}
+
+impl NetworkBridgeService {
+    pub(super) fn record_diagnostic_health(
+        &self,
+        state_dir: &Path,
+        phase_max_ms: &HashMap<String, u128>,
+    ) {
+        if !self.monitoring_enabled {
+            return;
+        }
+        let runtime = self.runtime.diagnostic_snapshot();
+        let mut peers: HashSet<NetworkNodeId> = self.peer_sync_state.keys().cloned().collect();
+        peers.extend(self.known_peer_addrs.keys().cloned());
+        peers.extend(self.global_backfill_providers.iter().cloned());
+        peers.extend(self.connected_peers.iter().cloned());
+        if let Some(known) = runtime["known_peers"].as_array() {
+            peers.extend(known.iter().filter_map(|peer| peer.as_str()?.parse().ok()));
+        }
+        if let Some(successes) = runtime["last_success_ms"].as_object() {
+            peers.extend(successes.keys().filter_map(|peer| peer.parse().ok()));
+        }
+        let peer_snapshots = peers.iter().map(|peer| {
+            let state = self.peer_sync_state.get(peer);
+            json!({"peer_id": peer.to_string(), "connected": self.connected_peers.contains(peer),
+                "last_success_ms": runtime["last_success_ms"].get(peer.as_str()),
+                "smoothed_backfill_latency_ms": state.and_then(|state| state.smoothed_backfill_latency_ms),
+                "backfill_timeout_ms": state.map_or(BACKFILL_TIMEOUT_FALLBACK, PeerSyncState::backfill_request_timeout).as_millis(),
+            })
+        }).collect::<Vec<_>>();
+        diagnostics::record_anomaly(Some(state_dir), self.monitoring_enabled, || {
+            diagnostics::DiagnosticEvent::new(
+                "info",
+                "transport",
+                "health.snapshot",
+                "ok",
+                "periodic network health",
+            )
+            .details(json!({"peers": peer_snapshots, "topics": runtime["topics"],
+                "home_relay_urls": runtime["home_relay_urls"],
+                "pending_commands": super::peer_interactions::pending_command_count(state_dir),
+                "phase_max_ms": phase_max_ms, "interval_secs": 60,
+                "runtime_observations_dropped": self.dropped_runtime_diagnostics.load(std::sync::atomic::Ordering::Relaxed),
+            }))
+        });
     }
 }
 

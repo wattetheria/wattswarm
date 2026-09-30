@@ -1,6 +1,391 @@
 use super::*;
 
 #[test]
+fn monitoring_publish_filters_are_debug_only_and_off_skips_all_records() {
+    let _env_lock = lock_env_test_mutex();
+    let _debug = EnvVarGuard::set(diagnostics::ENV_NETWORK_DEBUG_DIAGNOSTICS, None);
+    let state_dir = temp_startup_dir("monitoring-publish-filters");
+    let mut service = NetworkBridgeService::new(
+        test_network_node(NetworkP2pConfig::default()).unwrap(),
+        &[SwarmScope::Global],
+        &NetworkProtocolParams::default(),
+    )
+    .unwrap();
+    service.state_dir = Some(state_dir.clone());
+    let event = diagnostic_event_from_payload(crate::types::EventPayload::TaskExpired(
+        crate::types::TaskExpiredPayload {
+            task_id: "publish-task".to_owned(),
+        },
+    ));
+    let reasons = [
+        "remote_author",
+        "not_syncable",
+        "not_public_global_control",
+        "no_subscription_scope",
+        "no_transport_route",
+    ];
+    for reason in reasons {
+        super::super::publish::record_publish_outcome(&service, &event, 1, None, "skipped", reason);
+    }
+    assert!(!state_dir.join("diagnostics/wattswarm_node.jsonl").exists());
+    service.monitoring_enabled = true;
+    for reason in reasons {
+        super::super::publish::record_publish_outcome(&service, &event, 1, None, "skipped", reason);
+    }
+    let entries = diagnostics::list_diagnostics(&state_dir, &DiagnosticFilter::default()).unwrap();
+    assert_eq!(entries.len(), 5);
+    for entry in entries {
+        assert_eq!(
+            entry.level,
+            if entry.details["reason"] == "no_transport_route" {
+                "warn"
+            } else {
+                "debug"
+            }
+        );
+    }
+    fs::remove_dir_all(state_dir).unwrap();
+}
+
+#[test]
+fn monitoring_startup_cursor_counts_only_local_events_after_saved_marker() {
+    let state_dir = temp_startup_dir("monitoring-startup-cursor");
+    let node = Node::open_in_memory_with_roles(&[Role::Proposer]).unwrap();
+    let mut event = diagnostic_event_from_payload(crate::types::EventPayload::TaskExpired(
+        crate::types::TaskExpiredPayload {
+            task_id: "cursor-task".to_owned(),
+        },
+    ));
+    event.author_node_id = "local".to_owned();
+    let first_seq = node.store.append_event(&event).unwrap();
+    let marker = super::super::service_loop::record_startup_publish_cursor(
+        true, &state_dir, &node, "local", first_seq,
+    )
+    .unwrap();
+    let entries = diagnostics::list_diagnostics(&state_dir, &DiagnosticFilter::default()).unwrap();
+    assert_eq!(entries[0].details["publication_history_known"], false);
+    assert!(
+        entries[0]
+            .details
+            .get("skipped_unpublished_local_events")
+            .is_none()
+    );
+    drop(marker);
+    event.event_id = "cursor-remote".to_owned();
+    event.author_node_id = "remote".to_owned();
+    node.store.append_event(&event).unwrap();
+    event.event_id = "cursor-local-new".to_owned();
+    event.author_node_id = "local".to_owned();
+    let head = node.store.append_event(&event).unwrap();
+    let marker = super::super::service_loop::record_startup_publish_cursor(
+        true, &state_dir, &node, "local", head,
+    )
+    .unwrap();
+    let entries = diagnostics::list_diagnostics(&state_dir, &DiagnosticFilter::default()).unwrap();
+    assert_eq!(entries[0].level, "warn");
+    assert_eq!(entries[0].details["marker_seq"], first_seq);
+    assert_eq!(entries[0].details["head_seq"], head);
+    assert_eq!(entries[0].details["skipped_unpublished_local_events"], 1);
+    drop(marker);
+    let marker = super::super::service_loop::record_startup_publish_cursor(
+        true, &state_dir, &node, "local", head,
+    )
+    .unwrap();
+    let entries = diagnostics::list_diagnostics(&state_dir, &DiagnosticFilter::default()).unwrap();
+    assert_eq!(entries[0].level, "debug");
+    assert_eq!(entries[0].details["skipped_unpublished_local_events"], 0);
+    drop(marker);
+    fs::remove_dir_all(state_dir).unwrap();
+}
+
+#[test]
+fn monitoring_cursor_on_off_on_restart_discards_stale_history() {
+    let state_dir = temp_startup_dir("monitoring-cursor-on-off-on");
+    let node = Node::open_in_memory_with_roles(&[Role::Proposer]).unwrap();
+    let mut event = diagnostic_event_from_payload(crate::types::EventPayload::TaskExpired(
+        crate::types::TaskExpiredPayload {
+            task_id: "cursor-restart-task".to_owned(),
+        },
+    ));
+    event.author_node_id = "local".to_owned();
+    let first_seq = node.store.append_event(&event).unwrap();
+    let mut marker = super::super::service_loop::record_startup_publish_cursor(
+        true, &state_dir, &node, "local", first_seq,
+    )
+    .unwrap();
+    event.event_id = "cursor-run-a".to_owned();
+    let published_seq = node.store.append_event(&event).unwrap();
+    marker.advance(published_seq, Instant::now());
+    drop(marker);
+    let marker_path = state_dir.join("diagnostics/publish_cursor.json");
+    assert!(marker_path.exists());
+    let log_path = state_dir.join("diagnostics/wattswarm_node.jsonl");
+    let previous_log = fs::read(&log_path).unwrap();
+
+    assert!(
+        super::super::service_loop::record_startup_publish_cursor(
+            false,
+            &state_dir,
+            &node,
+            "local",
+            published_seq,
+        )
+        .is_none()
+    );
+    assert!(!marker_path.exists());
+    let mut head = published_seq;
+    for seq in 0..4 {
+        event.event_id = format!("cursor-run-b-{seq}");
+        head = node.store.append_event(&event).unwrap();
+    }
+    assert_eq!(fs::read(&log_path).unwrap(), previous_log);
+    assert!(!marker_path.exists());
+
+    let marker = super::super::service_loop::record_startup_publish_cursor(
+        true, &state_dir, &node, "local", head,
+    )
+    .unwrap();
+    let entries = diagnostics::list_diagnostics(&state_dir, &DiagnosticFilter::default()).unwrap();
+    assert_eq!(entries.len(), 2);
+    assert_eq!(entries[0].level, "debug");
+    assert_eq!(entries[0].status, "history_unknown");
+    assert_eq!(entries[0].details["publication_history_known"], false);
+    assert!(entries[0].details["marker_seq"].is_null());
+    assert!(entries[0].details["marker_updated_at_ms"].is_null());
+    assert!(entries[0].details["previous_clean_shutdown"].is_null());
+    assert!(
+        entries[0]
+            .details
+            .get("skipped_unpublished_local_events")
+            .is_none()
+    );
+    drop(marker);
+    fs::remove_dir_all(state_dir).unwrap();
+}
+
+#[test]
+fn monitoring_cursor_crash_reports_unclean_throttled_marker_metadata() {
+    let state_dir = temp_startup_dir("monitoring-cursor-crash");
+    let node = Node::open_in_memory_with_roles(&[Role::Proposer]).unwrap();
+    let mut event = diagnostic_event_from_payload(crate::types::EventPayload::TaskExpired(
+        crate::types::TaskExpiredPayload {
+            task_id: "cursor-crash-task".to_owned(),
+        },
+    ));
+    event.author_node_id = "local".to_owned();
+    let first_seq = node.store.append_event(&event).unwrap();
+    let mut marker = super::super::service_loop::record_startup_publish_cursor(
+        true, &state_dir, &node, "local", first_seq,
+    )
+    .unwrap();
+    let now = Instant::now();
+    event.event_id = "cursor-before-crash".to_owned();
+    let saved_seq = node.store.append_event(&event).unwrap();
+    marker.advance(saved_seq, now);
+    event.event_id = "cursor-throttled-at-crash".to_owned();
+    let head = node.store.append_event(&event).unwrap();
+    marker.advance(head, now + Duration::from_secs(1));
+    let path = state_dir.join("diagnostics/publish_cursor.json");
+    let crash_marker = fs::read(&path).unwrap();
+    let crash_record: serde_json::Value = serde_json::from_slice(&crash_marker).unwrap();
+    assert_eq!(crash_record["last_published_seq"], saved_seq);
+    assert_eq!(crash_record["clean_shutdown"], false);
+    drop(marker);
+    // Restore the on-disk snapshot that a crash before Drop would leave behind.
+    fs::write(&path, crash_marker).unwrap();
+    let marker = super::super::service_loop::record_startup_publish_cursor(
+        true, &state_dir, &node, "local", head,
+    )
+    .unwrap();
+    let entries = diagnostics::list_diagnostics(&state_dir, &DiagnosticFilter::default()).unwrap();
+    assert_eq!(entries[0].details["marker_seq"], saved_seq);
+    assert_eq!(entries[0].details["skipped_unpublished_local_events"], 1);
+    assert_eq!(entries[0].details["previous_clean_shutdown"], false);
+    assert_eq!(
+        entries[0].details["marker_updated_at_ms"],
+        crash_record["updated_at_ms"]
+    );
+    drop(marker);
+    let marker = super::super::service_loop::record_startup_publish_cursor(
+        true, &state_dir, &node, "local", head,
+    )
+    .unwrap();
+    let entries = diagnostics::list_diagnostics(&state_dir, &DiagnosticFilter::default()).unwrap();
+    assert_eq!(entries[0].details["previous_clean_shutdown"], true);
+    assert_eq!(entries[0].details["skipped_unpublished_local_events"], 0);
+    drop(marker);
+    fs::remove_dir_all(state_dir).unwrap();
+}
+
+#[test]
+fn monitoring_switch_off_has_no_new_records_runtime_queue_or_cursor_marker() {
+    let _env_lock = lock_env_test_mutex();
+    let _debug = EnvVarGuard::set(diagnostics::ENV_NETWORK_DEBUG_DIAGNOSTICS, None);
+    let state_dir = temp_startup_dir("monitoring-off");
+    let mut node = Node::open_in_memory_with_roles(&[Role::Proposer]).unwrap();
+    let mut service = NetworkBridgeService::new(
+        test_network_node(NetworkP2pConfig::default()).unwrap(),
+        &[SwarmScope::Global],
+        &NetworkProtocolParams::default(),
+    )
+    .unwrap();
+    assert!(!service.monitoring_enabled);
+    service.set_state_dir(state_dir.clone(), state_dir.join("control.sqlite"));
+    assert!(service.runtime_diagnostics.is_none());
+    assert!(
+        super::super::service_loop::record_startup_publish_cursor(
+            false, &state_dir, &node, "local", 99
+        )
+        .is_none()
+    );
+    service.record_diagnostic_health(&state_dir, &HashMap::new());
+    let peer = random_network_node_id();
+    service
+        .runtime
+        .send_backfill_request(
+            &peer,
+            BackfillRequest {
+                scope: SwarmScope::Global,
+                from_event_seq: 0,
+                limit: 1,
+                head_only: false,
+                feed_key: None,
+                exclude_topic_events: false,
+                known_event_ids: Vec::new(),
+            },
+            Duration::from_secs(7),
+        )
+        .unwrap();
+    service.try_tick(&mut node).unwrap();
+    assert!(
+        diagnostics::list_diagnostics(&state_dir, &DiagnosticFilter::default())
+            .unwrap()
+            .is_empty()
+    );
+    assert!(!state_dir.join("diagnostics/publish_cursor.json").exists());
+    assert!(service.diagnostic_backfill_timeouts.is_empty());
+    fs::remove_dir_all(state_dir).unwrap();
+}
+
+#[test]
+fn monitoring_runtime_handoff_is_bounded_and_written_by_bridge_tick() {
+    let _env_lock = lock_env_test_mutex();
+    let _debug = EnvVarGuard::set(diagnostics::ENV_NETWORK_DEBUG_DIAGNOSTICS, Some("1"));
+    let state_dir = temp_startup_dir("monitoring-runtime-handoff");
+    let mut node = Node::open_in_memory_with_roles(&[Role::Proposer]).unwrap();
+    let mut service = NetworkBridgeService::new(
+        test_network_node(NetworkP2pConfig::default()).unwrap(),
+        &[SwarmScope::Global],
+        &NetworkProtocolParams::default(),
+    )
+    .unwrap();
+    service.set_state_dir(state_dir.clone(), state_dir.join("control.sqlite"));
+    let peer = random_network_node_id();
+    for _ in 0..=diagnostics::RUNTIME_DIAGNOSTIC_QUEUE_CAPACITY {
+        service
+            .runtime
+            .send_backfill_request(
+                &peer,
+                BackfillRequest {
+                    scope: SwarmScope::Global,
+                    from_event_seq: 0,
+                    limit: 1,
+                    head_only: false,
+                    feed_key: None,
+                    exclude_topic_events: false,
+                    known_event_ids: Vec::new(),
+                },
+                Duration::from_secs(7),
+            )
+            .unwrap();
+    }
+    assert!(!state_dir.join("diagnostics/wattswarm_node.jsonl").exists());
+    assert_eq!(
+        service
+            .dropped_runtime_diagnostics
+            .load(std::sync::atomic::Ordering::Relaxed),
+        1
+    );
+    service.try_tick(&mut node).unwrap();
+    let entries = diagnostics::list_diagnostics(&state_dir, &DiagnosticFilter::default()).unwrap();
+    let observation = entries
+        .iter()
+        .find(|entry| entry.phase == "control.outbound")
+        .unwrap();
+    assert_eq!(observation.status, "missing_contact");
+    assert_eq!(observation.source_node_id.as_deref(), Some(peer.as_str()));
+    assert_eq!(observation.details["timeout_ms"], 7000);
+    assert_eq!(
+        entries
+            .iter()
+            .filter(|entry| entry.phase == "control.outbound")
+            .count(),
+        1
+    );
+    service.record_diagnostic_health(&state_dir, &HashMap::new());
+    let entries = diagnostics::list_diagnostics(&state_dir, &DiagnosticFilter::default()).unwrap();
+    assert_eq!(
+        entries
+            .iter()
+            .find(|entry| entry.phase == "health.snapshot")
+            .unwrap()
+            .details["runtime_observations_dropped"],
+        1
+    );
+    fs::remove_dir_all(state_dir).unwrap();
+}
+
+#[test]
+fn monitoring_health_snapshot_includes_known_peers_topics_queue_and_phase_maxima() {
+    let _env_lock = lock_env_test_mutex();
+    let _debug = EnvVarGuard::set(diagnostics::ENV_NETWORK_DEBUG_DIAGNOSTICS, Some("1"));
+    let state_dir = temp_startup_dir("monitoring-health");
+    let mut service = NetworkBridgeService::new(
+        test_network_node(NetworkP2pConfig::default()).unwrap(),
+        &[SwarmScope::Global],
+        &NetworkProtocolParams::default(),
+    )
+    .unwrap();
+    let peer = random_network_node_id();
+    let mut state = PeerSyncState::new(Instant::now());
+    state.smoothed_backfill_latency_ms = Some(125);
+    let timeout_ms = state.backfill_request_timeout().as_millis();
+    service.peer_sync_state.insert(peer.clone(), state);
+    service.connected_peers.insert(peer.clone());
+    fs::write(state_dir.join("pending_network_commands.jsonl"), "{}\n{}\n").unwrap();
+    service.record_diagnostic_health(
+        &state_dir,
+        &HashMap::from([("try_tick_drain".to_owned(), 123)]),
+    );
+    let entries = diagnostics::list_diagnostics(&state_dir, &DiagnosticFilter::default()).unwrap();
+    assert_eq!(entries.len(), 1);
+    let entry = &entries[0];
+    assert_eq!(entry.phase, "health.snapshot");
+    assert_eq!(entry.level, "info");
+    assert_eq!(entry.details["pending_commands"], 2);
+    assert_eq!(entry.details["phase_max_ms"]["try_tick_drain"], 123);
+    assert_eq!(
+        entry.details["topics"].as_array().unwrap().len(),
+        GossipKind::ALL.len()
+    );
+    let peer = entry.details["peers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["peer_id"] == peer.to_string())
+        .unwrap();
+    assert_eq!(peer["connected"], true);
+    assert!(peer.get("route").is_none());
+    assert!(entry.details["home_relay_urls"].is_array());
+    assert_eq!(peer["smoothed_backfill_latency_ms"], 125);
+    assert_eq!(
+        peer["backfill_timeout_ms"].as_u64().unwrap() as u128,
+        timeout_ms
+    );
+    fs::remove_dir_all(state_dir).unwrap();
+}
+
+#[test]
 fn summary_publish_is_suppressed_when_backlog_is_high() {
     assert!(should_publish_summaries(
         SUMMARY_BACKPRESSURE_HIGH_WATERMARK,

@@ -16,8 +16,8 @@ pub use substrate::{
     NetworkNodeId, NetworkRuntimeObservabilitySnapshot, PeerDiscoverySourceKind,
     PeerHandshakeMetadata, PeerMetadata, PeerRelationshipResponseChannel, RawAgentEnvelope,
     RawContactMaterial, RawContactMaterialRequest, RawContactMaterialResponse,
-    RawPeerRelationshipAction, RawSourceAgentCard, SwarmScope, TopicCatalog, TopicNamespace,
-    TrafficGuardPeerHealth, sanitize_segment,
+    RawPeerRelationshipAction, RawSourceAgentCard, RuntimeDiagnostic, SwarmScope, TopicCatalog,
+    TopicNamespace, TrafficGuardPeerHealth, diagnostic_error_is_timeout, sanitize_segment,
 };
 
 pub type BackfillRequest = substrate::RawBackfillRequest;
@@ -447,6 +447,18 @@ pub struct NetworkRuntime {
 }
 
 impl NetworkRuntime {
+    pub fn set_diagnostic_handler(
+        &mut self,
+        enabled: bool,
+        handler: substrate::RuntimeDiagnosticHandler,
+    ) {
+        self.inner.set_diagnostic_handler(enabled, handler);
+    }
+
+    pub fn diagnostic_snapshot(&self) -> serde_json::Value {
+        self.inner.diagnostic_snapshot()
+    }
+
     pub fn new(node: NetworkP2pNode) -> Result<Self> {
         let config = node.config.clone();
         let local_peer_id = node.local_peer_id();

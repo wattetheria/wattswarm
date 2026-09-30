@@ -18,6 +18,82 @@ fn open_test_store() -> PgStore {
         .for_org("local:test-storage:bootstrap")
 }
 
+fn verify_startup_cursor_skip_count(store: PgStore) {
+    let store = store.for_org("local:cursor-count");
+    assert_eq!(store.count_local_events_through("local", 0, 0).unwrap(), 0);
+    let payload = EventPayload::TaskExpired(TaskExpiredPayload {
+        task_id: "task-1".to_owned(),
+    });
+    let first = sample_event("cursor-local-1", "1", "local", 0, 100, payload.clone());
+    let first_seq = store.append_event(&first).unwrap();
+    let remote = sample_event("cursor-remote", "1", "remote", 0, 101, payload.clone());
+    store.append_event(&remote).unwrap();
+    let head = store.head_seq().unwrap();
+    assert_eq!(
+        store.count_local_events_through("local", 0, head).unwrap(),
+        1
+    );
+    assert_eq!(
+        store
+            .count_local_events_through("local", first_seq, head)
+            .unwrap(),
+        0
+    );
+    let later = sample_event("cursor-local-2", "1", "local", 0, 102, payload.clone());
+    let later_seq = store.append_event(&later).unwrap();
+    assert_eq!(
+        store
+            .count_local_events_through("local", first_seq, later_seq)
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        store
+            .count_local_events_through("local", later_seq, later_seq)
+            .unwrap(),
+        0
+    );
+    store
+        .clone()
+        .for_org("local:other")
+        .append_event(&sample_event(
+            "cursor-other-org",
+            "1",
+            "local",
+            0,
+            103,
+            payload,
+        ))
+        .unwrap();
+    assert_eq!(store.count_local_events_through("local", 0, 0).unwrap(), 0);
+    assert_eq!(
+        store
+            .count_local_events_through("local", 0, first_seq)
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        store.count_local_events_through("local", 0, head).unwrap(),
+        1
+    );
+    assert_eq!(
+        store
+            .count_local_events_through("local", 0, store.head_seq().unwrap())
+            .unwrap(),
+        2
+    );
+}
+
+#[test]
+fn startup_cursor_skip_count_configured_backend() {
+    verify_startup_cursor_skip_count(PgStore::open_in_memory().unwrap());
+}
+
+#[test]
+fn startup_cursor_skip_count_sqlite() {
+    verify_startup_cursor_skip_count(PgStore::open_in_memory_sqlite().unwrap());
+}
+
 #[test]
 fn node_penalty_tracks_summary_block_and_network_ban_independently() {
     let store = open_test_store();

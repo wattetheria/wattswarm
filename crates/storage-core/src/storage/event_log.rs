@@ -1,6 +1,25 @@
 use super::*;
 
 impl PgStore {
+    /// Local events after the diagnostic marker through the publisher's startup head.
+    pub fn count_local_events_through(
+        &self,
+        local_node_id: &str,
+        from_seq: u64,
+        through_seq: u64,
+    ) -> Result<u64> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
+        let count = conn.query_row(
+            "SELECT COUNT(*) FROM events WHERE org_id = $1 AND author_node_id = $2 AND seq > $3 AND seq <= $4",
+            params![self.org_id(), local_node_id, from_seq as i64, through_seq as i64],
+            |row| row.get::<_, i64>(0),
+        )?;
+        Ok(count as u64)
+    }
+
     pub fn append_event(&self, event: &Event) -> Result<u64> {
         self.append_event_if_new(event)?.ok_or_else(|| {
             SwarmError::Storage(format!("event already exists: {}", event.event_id)).into()

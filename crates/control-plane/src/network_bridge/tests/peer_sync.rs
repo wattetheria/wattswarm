@@ -1,5 +1,70 @@
 use super::*;
 
+#[test]
+fn monitoring_backfill_timeout_and_late_response_are_visible_with_debug() {
+    let _env_lock = lock_env_test_mutex();
+    let _debug = EnvVarGuard::set(diagnostics::ENV_NETWORK_DEBUG_DIAGNOSTICS, Some("1"));
+    let state_dir = temp_startup_dir("monitoring-backfill");
+    let mut node = Node::open_in_memory_with_roles(&[Role::Proposer]).unwrap();
+    let mut service = NetworkBridgeService::new(
+        test_network_node(NetworkP2pConfig::default()).unwrap(),
+        &[SwarmScope::Global],
+        &NetworkProtocolParams::default(),
+    )
+    .unwrap();
+    service.set_state_dir(state_dir.clone(), state_dir.join("control.sqlite"));
+    let peer = random_network_node_id();
+    let request_id = BackfillRequestId::new(771);
+    let mut state = PeerSyncState::new(Instant::now());
+    state.smoothed_backfill_latency_ms = Some(125);
+    state.record_pending_backfill_with_timeout(
+        request_id,
+        SwarmScope::Global,
+        None,
+        Instant::now() - Duration::from_secs(60),
+        Duration::from_secs(7),
+    );
+    service.peer_sync_state.insert(peer.clone(), state);
+    assert_eq!(service.expire_stale_backfill_requests(Instant::now()), 1);
+    let entries = diagnostics::list_diagnostics(&state_dir, &DiagnosticFilter::default()).unwrap();
+    let timeout = entries
+        .iter()
+        .find(|entry| entry.phase == "backfill.timeout")
+        .unwrap();
+    assert_eq!(timeout.source_node_id.as_deref(), Some(peer.as_str()));
+    assert_eq!(timeout.object_id.as_deref(), Some("771"));
+    assert_eq!(timeout.details["smoothed_latency_ms"], 125);
+    assert_eq!(timeout.details["timeout_ms"], 7000);
+    assert_eq!(timeout.details["limit"], BACKFILL_BATCH_EVENTS);
+    assert_eq!(timeout.details["attempt"], 1);
+    service
+        .process_runtime_event(
+            &mut node,
+            NetworkRuntimeEvent::BackfillResponse {
+                peer: peer.clone(),
+                request_id,
+                response: BackfillResponse {
+                    scope: SwarmScope::Global,
+                    next_from_event_seq: 0,
+                    head_only: true,
+                    feed_key: None,
+                    head_event_ids: Vec::new(),
+                    events: Vec::new(),
+                },
+            },
+        )
+        .unwrap();
+    assert_eq!(service.peer_sync_state[&peer].inflight_backfills(), 0);
+    let entries = diagnostics::list_diagnostics(&state_dir, &DiagnosticFilter::default()).unwrap();
+    let late = entries
+        .iter()
+        .find(|entry| entry.phase == "backfill.response" && entry.status == "late_response")
+        .unwrap();
+    assert_eq!(late.source_node_id.as_deref(), Some(peer.as_str()));
+    assert_eq!(late.details["request_id"], "771");
+    fs::remove_dir_all(state_dir).unwrap();
+}
+
 fn register_contacted_peer(
     service: &mut NetworkBridgeService,
     label: &str,
@@ -574,6 +639,8 @@ fn peer_relationship_action_allows_recently_seen_peer_without_live_connection() 
 
 #[test]
 fn peer_relationship_action_records_outbound_contact_material_diagnostic() {
+    let _env_lock = lock_env_test_mutex();
+    let _debug = EnvVarGuard::set(diagnostics::ENV_NETWORK_DEBUG_DIAGNOSTICS, None);
     let local_dir = temp_startup_dir("relationship-action-diagnostic-local");
     let remote_dir = temp_startup_dir("relationship-action-diagnostic-remote");
     let local_seed = [117u8; 32];
@@ -795,6 +862,8 @@ fn contact_material_failures_record_peer_diagnostics() {
 
 #[test]
 fn contact_material_inbound_request_records_handler_diagnostics() {
+    let _env_lock = lock_env_test_mutex();
+    let _debug = EnvVarGuard::set(diagnostics::ENV_NETWORK_DEBUG_DIAGNOSTICS, None);
     let dir = temp_startup_dir("contact-material-inbound-diagnostic");
     let local_seed = [119u8; 32];
     std::fs::write(dir.join("node_seed.hex"), hex::encode(local_seed)).expect("write local seed");
@@ -2158,6 +2227,8 @@ fn bounded_backfill_scheduler_rotates_across_lanes() {
 
 #[test]
 fn connection_established_diagnostics_skip_duplicate_peer_events() {
+    let _env_lock = lock_env_test_mutex();
+    let _debug = EnvVarGuard::set(diagnostics::ENV_NETWORK_DEBUG_DIAGNOSTICS, None);
     let dir = temp_startup_dir("connection-established-diagnostics-dedupe");
     let peer = random_network_node_id();
     let address = "203.0.113.10:4001".parse::<NetworkAddress>().expect("addr");
@@ -2320,6 +2391,8 @@ fn gossip_from_peer_persists_relay_contact_material_from_configured_relay() {
 
 #[test]
 fn connection_closed_diagnostics_skip_duplicate_peer_events() {
+    let _env_lock = lock_env_test_mutex();
+    let _debug = EnvVarGuard::set(diagnostics::ENV_NETWORK_DEBUG_DIAGNOSTICS, None);
     let dir = temp_startup_dir("connection-closed-diagnostics-dedupe");
     let peer = random_network_node_id();
     let mut node = Node::open_in_memory_with_roles(&[Role::Proposer]).expect("node");

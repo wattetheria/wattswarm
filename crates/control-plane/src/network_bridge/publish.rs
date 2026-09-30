@@ -2,6 +2,82 @@ use super::*;
 
 const AUTO_PUBLISH_BATCH_LIMIT: usize = 64;
 
+pub(super) fn record_publish_outcome(
+    service: &NetworkBridgeService,
+    event: &crate::types::Event,
+    seq: u64,
+    scope: Option<&SwarmScope>,
+    status: &'static str,
+    reason: &'static str,
+) {
+    if !service.monitoring_enabled {
+        return;
+    }
+    let normal_filter = matches!(
+        reason,
+        "remote_author"
+            | "not_syncable"
+            | "not_public_global_control"
+            | "no_subscription_scope"
+            | "subscription_no_peers"
+    );
+    let debug = status == "published" || normal_filter;
+    let mut details = json!({"seq": seq, "kind": format!("{:?}", event.event_kind),
+        "task_id": event.task_id, "reason": reason});
+    if let Some(envelope) = event_payload_agent_envelope(&event.payload)
+        && let Some(message) = envelope.get("message_json").and_then(Value::as_str)
+        && let Ok(message) = serde_json::from_str::<Value>(message)
+    {
+        for key in ["message_id", "request_id"] {
+            if let Some(value) = message.get(key).filter(|value| value.is_string()) {
+                details[key] = value.clone();
+            }
+        }
+    }
+    if let crate::types::EventPayload::TopicMessagePosted(payload) = &event.payload {
+        details["feed_key"] = json!(payload.feed_key);
+    }
+    let mut observation = diagnostics::DiagnosticEvent::new(
+        if debug { "debug" } else { "warn" },
+        "gossip",
+        "publish.pipeline",
+        status,
+        "local event publication outcome",
+    )
+    .event_id(event.event_id.clone())
+    .source_node_id(Some(event.author_node_id.clone()))
+    .details(details);
+    if let Some(scope) = scope {
+        observation = observation.scope(scope);
+    }
+    if debug {
+        diagnostics::record_debug(
+            service.state_dir.as_deref(),
+            service.monitoring_enabled,
+            || observation,
+        );
+    } else {
+        diagnostics::record_anomaly(
+            service.state_dir.as_deref(),
+            service.monitoring_enabled,
+            || observation,
+        );
+    }
+}
+
+fn observe_auxiliary_publish(
+    service: &NetworkBridgeService,
+    event: &crate::types::Event,
+    seq: u64,
+    scope: &SwarmScope,
+    reason: &'static str,
+    result: Result<()>,
+) {
+    if result.is_err() {
+        record_publish_outcome(service, event, seq, Some(scope), "failed", reason);
+    }
+}
+
 fn is_high_frequency_global_event(payload: &crate::types::EventPayload) -> bool {
     payload.dissemination_layer() == crate::types::TaskDisseminationLayer::Process
 }
@@ -44,6 +120,21 @@ pub fn publish_pending_scoped_updates(
     from_event_seq: u64,
 ) -> Result<u64> {
     if node.store.is_node_network_banned(local_node_id)? {
+        diagnostics::record_anomaly(
+            service.state_dir.as_deref(),
+            service.monitoring_enabled,
+            || {
+                diagnostics::DiagnosticEvent::new(
+                    "warn",
+                    "gossip",
+                    "publish.pipeline",
+                    "deferred",
+                    "local node network banned",
+                )
+                .source_node_id(Some(local_node_id.to_owned()))
+                .details(json!({"reason": "network_banned", "cursor": from_event_seq}))
+            },
+        );
         return Ok(from_event_seq);
     }
     let rows = node
@@ -54,19 +145,30 @@ pub fn publish_pending_scoped_updates(
     let publish_summaries = super::should_publish_summaries(node.head_seq()?, from_event_seq);
     for (seq, event) in rows {
         if event.author_node_id != local_node_id {
+            record_publish_outcome(service, &event, seq, None, "skipped", "remote_author");
             last_published_seq = seq;
             continue;
         }
         if !super::should_sync_event(node, &event)? {
+            record_publish_outcome(service, &event, seq, None, "skipped", "not_syncable");
             last_published_seq = seq;
             continue;
         }
         let Some(route) = super::event_transport_route(node, &event)? else {
+            record_publish_outcome(service, &event, seq, None, "skipped", "no_transport_route");
             last_published_seq = seq;
             continue;
         };
         let scope = route.scope.clone();
         if scope == SwarmScope::Global && !route.public_global_control {
+            record_publish_outcome(
+                service,
+                &event,
+                seq,
+                Some(&scope),
+                "skipped",
+                "not_public_global_control",
+            );
             last_published_seq = seq;
             continue;
         }
@@ -74,6 +176,14 @@ pub fn publish_pending_scoped_updates(
             && payload.subscriber_node_id == local_node_id
         {
             let Some(subscription_scope) = super::feed_subscription_target_scope(payload) else {
+                record_publish_outcome(
+                    service,
+                    &event,
+                    seq,
+                    Some(&scope),
+                    "skipped",
+                    "no_subscription_scope",
+                );
                 last_published_seq = seq;
                 continue;
             };
@@ -131,6 +241,7 @@ pub fn publish_pending_scoped_updates(
                     .scope(&scope)
                     .details(Value::Object(details)),
                 );
+                record_publish_outcome(service, &event, seq, Some(&scope), "published", "ok");
                 service.record_scope_event_published(&scope);
                 last_published_seq = seq;
             }
@@ -157,6 +268,14 @@ pub fn publish_pending_scoped_updates(
                         "error": err.to_string(),
                     })),
                 );
+                record_publish_outcome(
+                    service,
+                    &event,
+                    seq,
+                    Some(&scope),
+                    "skipped",
+                    "subscription_no_peers",
+                );
                 last_published_seq = seq;
                 continue;
             }
@@ -180,6 +299,7 @@ pub fn publish_pending_scoped_updates(
                         "error": err.to_string(),
                     })),
                 );
+                record_publish_outcome(service, &event, seq, Some(&scope), "deferred", "no_peers");
                 break;
             }
             Err(err) if err.to_string().contains("GlobalTopicRateLimited") => {
@@ -201,6 +321,14 @@ pub fn publish_pending_scoped_updates(
                         "event_kind": format!("{:?}", event.event_kind),
                         "error": err.to_string(),
                     })),
+                );
+                record_publish_outcome(
+                    service,
+                    &event,
+                    seq,
+                    Some(&scope),
+                    "deferred",
+                    "global_rate_limited",
                 );
                 break;
             }
@@ -224,20 +352,69 @@ pub fn publish_pending_scoped_updates(
                         "error": err.to_string(),
                     })),
                 );
+                record_publish_outcome(
+                    service,
+                    &event,
+                    seq,
+                    Some(&scope),
+                    "deferred",
+                    "local_rate_limited",
+                );
                 break;
             }
-            Err(err) => return Err(err),
+            Err(err) => {
+                record_publish_outcome(
+                    service,
+                    &event,
+                    seq,
+                    Some(&scope),
+                    "failed",
+                    "publish_error",
+                );
+                return Err(err);
+            }
         }
-        let _ = super::mirror_summary_controls_to_parent_network(node, &event);
+        observe_auxiliary_publish(
+            service,
+            &event,
+            seq,
+            &scope,
+            "mirror_controls_failed",
+            super::mirror_summary_controls_to_parent_network(node, &event).map(|_| ()),
+        );
         if let Some(checkpoint) =
             super::announcements::checkpoint_announcement_for_event(node, &event, &scope)?
         {
-            let _ = super::announcements::apply_checkpoint_announcement_to_store(
+            let checkpoint_result = super::announcements::apply_checkpoint_announcement_to_store(
                 &node.store,
                 &checkpoint,
             );
-            let _ = service.publish_checkpoint(checkpoint.clone());
-            let _ = super::announcements::mirror_checkpoint_to_parent_network(node, &checkpoint);
+            observe_auxiliary_publish(
+                service,
+                &event,
+                seq,
+                &scope,
+                "checkpoint_apply_failed",
+                checkpoint_result.map(|_| ()),
+            );
+            let result = service.publish_checkpoint(checkpoint.clone());
+            observe_auxiliary_publish(
+                service,
+                &event,
+                seq,
+                &scope,
+                "checkpoint_publish_failed",
+                result,
+            );
+            observe_auxiliary_publish(
+                service,
+                &event,
+                seq,
+                &scope,
+                "checkpoint_mirror_failed",
+                super::announcements::mirror_checkpoint_to_parent_network(node, &checkpoint)
+                    .map(|_| ()),
+            );
         }
         if publish_summaries
             && !local_node_penalized
@@ -248,22 +425,67 @@ pub fn publish_pending_scoped_updates(
                 service.summary_decision_memory_limit,
             )?
         {
-            let _ = service.publish_summary(summary.clone());
-            let _ = super::mirror_summary_to_parent_network(node, &summary);
+            let result = service.publish_summary(summary.clone());
+            observe_auxiliary_publish(
+                service,
+                &event,
+                seq,
+                &scope,
+                "knowledge_publish_failed",
+                result,
+            );
+            observe_auxiliary_publish(
+                service,
+                &event,
+                seq,
+                &scope,
+                "knowledge_mirror_failed",
+                super::mirror_summary_to_parent_network(node, &summary).map(|_| ()),
+            );
         }
         if publish_summaries
             && !local_node_penalized
             && let Some(summary) = super::task_outcome_summary_for_event(node, &event, &scope)?
         {
-            let _ = service.publish_summary(summary.clone());
-            let _ = super::mirror_summary_to_parent_network(node, &summary);
+            let result = service.publish_summary(summary.clone());
+            observe_auxiliary_publish(
+                service,
+                &event,
+                seq,
+                &scope,
+                "outcome_publish_failed",
+                result,
+            );
+            observe_auxiliary_publish(
+                service,
+                &event,
+                seq,
+                &scope,
+                "outcome_mirror_failed",
+                super::mirror_summary_to_parent_network(node, &summary).map(|_| ()),
+            );
         }
         if publish_summaries
             && !local_node_penalized
             && let Some(summary) = super::reputation_summary_for_event(node, &event)?
         {
-            let _ = service.publish_summary(summary.clone());
-            let _ = super::mirror_summary_to_parent_network(node, &summary);
+            let result = service.publish_summary(summary.clone());
+            observe_auxiliary_publish(
+                service,
+                &event,
+                seq,
+                &scope,
+                "reputation_publish_failed",
+                result,
+            );
+            observe_auxiliary_publish(
+                service,
+                &event,
+                seq,
+                &scope,
+                "reputation_mirror_failed",
+                super::mirror_summary_to_parent_network(node, &summary).map(|_| ()),
+            );
         }
     }
     Ok(last_published_seq)

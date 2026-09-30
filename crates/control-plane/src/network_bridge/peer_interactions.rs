@@ -372,6 +372,7 @@ pub(super) fn remove_peer_relationship_action_command(
 
 pub(super) fn record_peer_relationship_action_command_failure(
     state_dir: &Path,
+    monitoring_enabled: bool,
     remote_node_id: &str,
     action: crate::control::PeerRelationshipAction,
     agent_envelope: RawAgentEnvelope,
@@ -383,6 +384,13 @@ pub(super) fn record_peer_relationship_action_command_failure(
         peer_relationship_command_matches(command, remote_node_id, action, &agent_envelope)
     }) {
         command.record_failure(error, now_ms);
+        record_command_failure_observation(
+            state_dir,
+            monitoring_enabled,
+            command,
+            error,
+            "runtime_failed",
+        );
     } else {
         let mut command = PendingNetworkCommand::PeerRelationship {
             remote_node_id: remote_node_id.trim().to_owned(),
@@ -393,6 +401,13 @@ pub(super) fn record_peer_relationship_action_command_failure(
             last_error: None,
         };
         command.record_failure(error, now_ms);
+        record_command_failure_observation(
+            state_dir,
+            monitoring_enabled,
+            &command,
+            error,
+            "runtime_failed",
+        );
         commands.push(command);
     }
     write_pending_network_commands(state_dir, &commands)
@@ -1487,7 +1502,19 @@ pub(super) fn process_pending_network_commands(
         }
         let mut command: PendingNetworkCommand = match serde_json::from_str(line) {
             Ok(value) => value,
-            Err(_) => continue,
+            Err(_) => {
+                diagnostics::record_anomaly(Some(state_dir), service.monitoring_enabled, || {
+                    diagnostics::DiagnosticEvent::new(
+                        "warn",
+                        "retry",
+                        "retry.command",
+                        "skipped",
+                        "invalid queued network command",
+                    )
+                    .details(json!({"reason": "invalid_command"}))
+                });
+                continue;
+            }
         };
         if !command.is_due(now_ms) {
             retry.push(line.to_owned());
@@ -1501,6 +1528,14 @@ pub(super) fn process_pending_network_commands(
                 ..
             } => {
                 if command.should_abandon() {
+                    record_command_observation(
+                        state_dir,
+                        service.monitoring_enabled,
+                        &command,
+                        "abandoned",
+                        command.attempts(),
+                        "attempt_limit",
+                    );
                     eprintln!(
                         "network_bridge: abandoning queued peer relationship command after {} attempts for {}",
                         command.attempts(),
@@ -1516,6 +1551,14 @@ pub(super) fn process_pending_network_commands(
                 ) {
                     let error = "peer relationship request timed out without runtime result";
                     command.record_in_flight_timeout(error, now_ms);
+                    record_command_observation(
+                        state_dir,
+                        service.monitoring_enabled,
+                        &command,
+                        "timeout",
+                        command.attempts(),
+                        "without_runtime_result",
+                    );
                     retry.push(serde_json::to_string(&command)?);
                     continue;
                 }
@@ -1528,6 +1571,14 @@ pub(super) fn process_pending_network_commands(
                     retry.push(serde_json::to_string(&command)?);
                     continue;
                 }
+                record_command_observation(
+                    state_dir,
+                    service.monitoring_enabled,
+                    &command,
+                    "attempt",
+                    command.attempts().saturating_add(1),
+                    "dispatch",
+                );
                 match service.send_peer_relationship_action(
                     &remote_node_id,
                     action,
@@ -1553,6 +1604,14 @@ pub(super) fn process_pending_network_commands(
                 agent_envelope,
                 ..
             } => {
+                record_command_observation(
+                    state_dir,
+                    service.monitoring_enabled,
+                    &command,
+                    "attempt",
+                    command.attempts().saturating_add(1),
+                    "dispatch",
+                );
                 let protocol_envelope = raw_agent_envelope_to_protocol(&agent_envelope);
                 node.emit_at(
                     0,
@@ -1566,7 +1625,17 @@ pub(super) fn process_pending_network_commands(
                         },
                     ),
                     observed_at_ms(),
-                )?;
+                )
+                .inspect_err(|_| {
+                    record_command_observation(
+                        state_dir,
+                        service.monitoring_enabled,
+                        &command,
+                        "failed",
+                        command.attempts().saturating_add(1),
+                        "event_emit_failed",
+                    )
+                })?;
                 let mut summary = build_agent_payment_summary(
                     &remote_node_id,
                     &message_kind,
@@ -1574,7 +1643,16 @@ pub(super) fn process_pending_network_commands(
                     agent_envelope,
                 );
                 summary.source_node_id = service.local_peer_id().to_string();
-                let _ = service.publish_summary(summary);
+                if service.publish_summary(summary).is_err() {
+                    record_command_observation(
+                        state_dir,
+                        service.monitoring_enabled,
+                        &command,
+                        "failed",
+                        command.attempts().saturating_add(1),
+                        "summary_publish_failed",
+                    );
+                }
                 Ok(())
             }
         };
@@ -1583,7 +1661,22 @@ pub(super) fn process_pending_network_commands(
             Err(err) => {
                 let error = format!("{err:#}");
                 command.record_failure(&error, now_ms);
+                record_command_failure_observation(
+                    state_dir,
+                    service.monitoring_enabled,
+                    &command,
+                    &error,
+                    "dispatch_failed",
+                );
                 if command.should_abandon() {
+                    record_command_observation(
+                        state_dir,
+                        service.monitoring_enabled,
+                        &command,
+                        "abandoned",
+                        command.attempts(),
+                        "attempt_limit",
+                    );
                     eprintln!(
                         "network_bridge: abandoning queued network command after {} attempts for {}: {error}",
                         command.attempts(),
@@ -1612,12 +1705,177 @@ pub(super) fn process_pending_network_commands(
     Ok(processed)
 }
 
+fn record_command_observation(
+    state_dir: &Path,
+    monitoring_enabled: bool,
+    command: &PendingNetworkCommand,
+    status: &'static str,
+    attempt: u32,
+    reason: &'static str,
+) {
+    if !monitoring_enabled {
+        return;
+    }
+    let (kind, envelope) = match command {
+        PendingNetworkCommand::PeerRelationship { agent_envelope, .. } => {
+            ("peer_relationship.v1", agent_envelope)
+        }
+        PendingNetworkCommand::AgentPayment { agent_envelope, .. } => {
+            ("agent_payment", agent_envelope)
+        }
+    };
+    let mut details = json!({"kind": kind, "attempt": attempt, "reason": reason});
+    if let Ok(message) = serde_json::from_str::<Value>(&envelope.message_json) {
+        for key in ["message_id", "request_id", "event_id"] {
+            if let Some(value) = message.get(key).filter(|value| value.is_string()) {
+                details[key] = value.clone();
+            }
+        }
+    }
+    let event = diagnostics::DiagnosticEvent::new(
+        if status == "attempt" { "debug" } else { "warn" },
+        "retry",
+        "retry.command",
+        status,
+        "queued network command observation",
+    )
+    .source_node_id(Some(command.remote_node_id().to_owned()))
+    .details(details);
+    if status == "attempt" {
+        diagnostics::record_debug(Some(state_dir), monitoring_enabled, || event);
+    } else {
+        diagnostics::record_anomaly(Some(state_dir), monitoring_enabled, || event);
+    }
+}
+
+fn record_command_failure_observation(
+    state_dir: &Path,
+    monitoring_enabled: bool,
+    command: &PendingNetworkCommand,
+    error: &str,
+    reason: &'static str,
+) {
+    if !monitoring_enabled {
+        return;
+    }
+    record_command_observation(
+        state_dir,
+        monitoring_enabled,
+        command,
+        if diagnostics::diagnostic_error_is_timeout(error) {
+            "timeout"
+        } else {
+            "failed"
+        },
+        command.attempts(),
+        reason,
+    );
+}
+
+pub(super) fn pending_command_count(state_dir: &Path) -> Option<usize> {
+    match fs::read_to_string(pending_network_commands_path(state_dir)) {
+        Ok(content) => Some(
+            content
+                .lines()
+                .filter(|line| !line.trim().is_empty())
+                .count(),
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Some(0),
+        Err(_) => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use ed25519_dalek::{Signer, SigningKey};
     use serde::Serialize;
     use serde_json::json;
+
+    #[test]
+    fn monitoring_retry_attempt_timeout_and_abandonment_preserve_ids_not_plaintext() {
+        let state_dir =
+            std::env::temp_dir().join(format!("wattswarm-retry-monitoring-{}", Uuid::new_v4()));
+        let mut command = PendingNetworkCommand::PeerRelationship {
+            remote_node_id: "remote-node".to_owned(),
+            action: crate::control::PeerRelationshipAction::Request,
+            agent_envelope: default_agent_envelope(
+                "local-node",
+                "remote-node",
+                "social.friend.request",
+                json!({"request_id": "request-7", "message_id": "message-8", "text": "private text"}),
+            ),
+            attempts: PENDING_NETWORK_COMMAND_MAX_ATTEMPTS - 1,
+            next_retry_at: None,
+            last_error: None,
+        };
+        record_command_observation(
+            &state_dir,
+            true,
+            &command,
+            "attempt",
+            command.attempts() + 1,
+            "dispatch",
+        );
+        command.record_in_flight_timeout("timed out without runtime result", 100);
+        record_command_observation(
+            &state_dir,
+            true,
+            &command,
+            "timeout",
+            command.attempts(),
+            "without_runtime_result",
+        );
+        record_peer_relationship_action_command_failure(
+            &state_dir,
+            true,
+            "remote-node",
+            crate::control::PeerRelationshipAction::Request,
+            match command.clone() {
+                PendingNetworkCommand::PeerRelationship { agent_envelope, .. } => agent_envelope,
+                _ => unreachable!(),
+            },
+            "control stream timed out private text",
+        )
+        .unwrap();
+        // Exercise final-abandonment telemetry without changing command state.
+        command.record_failure("control stream timed out", 101);
+        let before = serde_json::to_string(&command).unwrap();
+        record_command_failure_observation(
+            &state_dir,
+            true,
+            &command,
+            "control stream timed out",
+            "dispatch_failed",
+        );
+        record_command_observation(
+            &state_dir,
+            true,
+            &command,
+            "abandoned",
+            command.attempts(),
+            "attempt_limit",
+        );
+        assert_eq!(serde_json::to_string(&command).unwrap(), before);
+        let entries =
+            diagnostics::list_diagnostics(&state_dir, &DiagnosticFilter::default()).unwrap();
+        for status in ["attempt", "timeout", "abandoned"] {
+            assert!(entries.iter().any(|entry| entry.status == status));
+        }
+        for entry in entries {
+            assert_eq!(entry.source_node_id.as_deref(), Some("remote-node"));
+            assert_eq!(entry.details["request_id"], "request-7");
+            assert_eq!(entry.details["message_id"], "message-8");
+            assert_eq!(entry.details["kind"], "peer_relationship.v1");
+            assert!(entry.details["attempt"].as_u64().is_some());
+            assert!(
+                !serde_json::to_string(&entry)
+                    .unwrap()
+                    .contains("private text")
+            );
+        }
+        std::fs::remove_dir_all(state_dir).unwrap();
+    }
 
     fn did_key_for_identity(identity: &crate::crypto::NodeIdentity) -> String {
         let mut encoded = vec![0xed, 0x01];
@@ -2429,6 +2687,7 @@ mod tests {
 
         record_peer_relationship_action_command_failure(
             &state_dir,
+            false,
             "remote-node",
             crate::control::PeerRelationshipAction::Request,
             envelope,

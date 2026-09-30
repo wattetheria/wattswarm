@@ -49,7 +49,8 @@ mod types;
 mod wire;
 
 pub use runtime::{
-    IrohGossipSubscription, IrohRuntimeCounters, SubstrateRuntime, SubstrateRuntimeEvent,
+    IrohGossipSubscription, IrohRuntimeCounters, RuntimeDiagnostic, RuntimeDiagnosticHandler,
+    SubstrateRuntime, SubstrateRuntimeEvent, diagnostic_error_is_timeout,
 };
 pub use types::{
     BackfillRequestId, BackfillResponseChannel, ContactMaterialRequestId,

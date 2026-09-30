@@ -894,6 +894,16 @@ impl NetworkBridgeService {
                 match message {
                     GossipMessage::Event(envelope) => {
                         if !event_matches_signed_scope(&envelope.event, &envelope.scope) {
+                            diagnostics::record_anomaly(
+                                self.state_dir.as_deref(),
+                                self.monitoring_enabled,
+                                || {
+                                    diagnostics::DiagnosticEvent::new(
+                                "warn", "gossip", "gossip.ingest", "skipped", "gossip event signed scope mismatch",
+                            ).event_id(envelope.event.event_id.clone()).source_node_id(Some(propagation_source.to_string()))
+                                .scope(&envelope.scope).details(json!({"kind": format!("{:?}", envelope.event.event_kind), "reason": "signed_scope_mismatch"}))
+                                },
+                            );
                             return Ok(NetworkBridgeTick::TransportNotice {
                                 detail: format!(
                                     "gossip_event_dropped peer={propagation_source} reason=signed_scope_mismatch event={}",
@@ -1216,6 +1226,22 @@ impl NetworkBridgeService {
                 request_id,
                 response,
             } => {
+                if self.monitoring_enabled
+                    && let Some(expired_at) = self.diagnostic_backfill_timeouts.remove(&request_id)
+                {
+                    diagnostics::record_anomaly(
+                        self.state_dir.as_deref(),
+                        self.monitoring_enabled,
+                        || {
+                            diagnostics::DiagnosticEvent::new(
+                        "warn", "backfill", "backfill.response", "late_response", "backfill response arrived after expiry",
+                    ).source_node_id(Some(peer.to_string())).scope(&response.scope).details(json!({
+                        "request_id": request_id.to_string(), "kind": "backfill.v1", "feed_key": response.feed_key,
+                        "after_timeout_ms": expired_at.elapsed().as_millis(),
+                    }))
+                        },
+                    );
+                }
                 if response.head_only {
                     let local_cursor = self.peer_sync_state.get(&peer).map_or(0, |state| {
                         state.backfill_cursor(&response.scope, response.feed_key.as_deref())
@@ -1389,6 +1415,27 @@ impl NetworkBridgeService {
                 request_id,
                 error,
             } => {
+                if self.monitoring_enabled {
+                    let state = self.peer_sync_state.get(&peer);
+                    let pending =
+                        state.and_then(|state| state.inflight_backfill_requests.get(&request_id));
+                    diagnostics::record_anomaly(
+                        self.state_dir.as_deref(),
+                        self.monitoring_enabled,
+                        || {
+                            diagnostics::DiagnosticEvent::new(
+                    "warn", "backfill", "backfill.outbound", if diagnostics::diagnostic_error_is_timeout(&error) { "timeout" } else { "failed" },
+                    "backfill outbound request failed",
+                ).source_node_id(Some(peer.to_string())).details(json!({
+                    "request_id": request_id.to_string(), "kind": "backfill.v1", "limit": BACKFILL_BATCH_EVENTS,
+                    "timeout_ms": pending.map(|pending| pending.timeout.as_millis()),
+                    "scope": pending.map(|pending| &pending.scope), "feed_key": pending.and_then(|pending| pending.feed_key.as_deref()),
+                    "smoothed_latency_ms": state.and_then(|state| state.smoothed_backfill_latency_ms),
+                    "attempt": state.map_or(1, |state| state.backfill_failures.saturating_add(1)),
+                }))
+                        },
+                    );
+                }
                 if error.starts_with(CONTROL_BUSY_ERROR_PREFIX) {
                     self.defer_backfill_request(peer.clone(), request_id);
                     return Ok(NetworkBridgeTick::TransportNotice {
@@ -2007,6 +2054,20 @@ impl NetworkBridgeService {
                         },
                     )
                 };
+                if !response.applied {
+                    diagnostics::record_anomaly(
+                        self.state_dir.as_deref(),
+                        self.monitoring_enabled,
+                        || {
+                            diagnostics::DiagnosticEvent::new(
+                        "warn", "transport", "peer_relationship.inbound", "rejected", "peer relationship request not applied",
+                    ).source_node_id(Some(peer.to_string())).details(json!({
+                        "local_request_id": request_id.to_string(), "kind": "peer_relationship.v1",
+                        "agent_envelope": request.agent_envelope,
+                    }))
+                        },
+                    );
+                }
                 match self
                     .runtime
                     .send_peer_relationship_response(request_id, response)
@@ -2017,6 +2078,15 @@ impl NetworkBridgeService {
                             .to_string()
                             .contains("peer relationship response channel closed") =>
                     {
+                        diagnostics::record_anomaly(
+                            self.state_dir.as_deref(),
+                            self.monitoring_enabled,
+                            || {
+                                diagnostics::DiagnosticEvent::new(
+                            "warn", "transport", "peer_relationship.inbound", "late_response", "peer relationship response channel closed",
+                        ).source_node_id(Some(peer.to_string())).details(json!({"local_request_id": request_id.to_string(), "kind": "peer_relationship.v1"}))
+                            },
+                        );
                         Ok(NetworkBridgeTick::TransportNotice {
                             detail: format!(
                                 "peer_relationship_response_dropped peer={peer} reason={error}"
@@ -2186,6 +2256,7 @@ impl NetworkBridgeService {
                 if let (Some(state_dir), Some(pending)) = (self.state_dir.as_deref(), pending) {
                     record_peer_relationship_action_command_failure(
                         state_dir,
+                        self.monitoring_enabled,
                         &pending.remote_node_id,
                         pending.action,
                         pending.agent_envelope,
