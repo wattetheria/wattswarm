@@ -185,7 +185,38 @@ pub(crate) async fn peer_relationships_local_remove(
             (None, None) => 0,
             _ => bail!("both public IDs are required to cancel queued removes"),
         };
+        let mut node = open_node(&state.state_dir, &state.db_path)?;
+        let local_node_id = node.node_id();
+        let network_id = resolve_network_id(&node);
+        let scope_hint = private_dm_scope_hint(&local_node_id, &req.remote_node_id);
         remove_peer_relationship_locally_state(&state.state_dir, &req.remote_node_id)?;
+        if node
+            .store
+            .get_feed_subscription(
+                &network_id,
+                &local_node_id,
+                PRIVATE_DM_FEED_KEY,
+                &scope_hint,
+            )?
+            .is_none_or(|subscription| subscription.active)
+        {
+            node.emit_at(
+                1,
+                crate::types::EventPayload::FeedSubscriptionUpdated(
+                    crate::types::FeedSubscriptionUpdatedPayload {
+                        network_id,
+                        subscriber_node_id: local_node_id,
+                        feed_key: PRIVATE_DM_FEED_KEY.to_owned(),
+                        scope_hint,
+                        gossip_kinds: vec!["messages".to_owned()],
+                        provider_capabilities: None,
+                        agent_envelope: None,
+                        active: false,
+                    },
+                ),
+                chrono::Utc::now().timestamp_millis().max(0) as u64,
+            )?;
+        }
         Ok(json!({
             "ok": true,
             "queued": false,
@@ -737,6 +768,40 @@ mod tests {
         std::fs::create_dir_all(&state_dir).expect("create state dir");
         let setup_dir = state_dir.clone();
         let app = tokio::task::spawn_blocking(move || {
+            let node = crate::control::open_node(&setup_dir, &setup_dir.join("ui.state"))
+                .expect("open node");
+            let local_node_id = node.node_id();
+            let network_id = crate::http::helpers::resolve_network_id(&node);
+            for remote in ["remote-node", "other-node"] {
+                node.store
+                    .upsert_feed_subscription(
+                        &network_id,
+                        &local_node_id,
+                        crate::control::PRIVATE_DM_FEED_KEY,
+                        &crate::control::private_dm_scope_hint(&local_node_id, remote),
+                        &["messages".to_owned()],
+                        true,
+                        1,
+                    )
+                    .expect("seed DM subscription");
+            }
+            crate::control::save_peer_dm_message_record_state(
+                &setup_dir,
+                &crate::control::PeerDmMessageRecord {
+                    thread_id: crate::control::private_dm_thread_id(&local_node_id, "remote-node"),
+                    message_id: "retained-dm".to_owned(),
+                    remote_node_id: "remote-node".to_owned(),
+                    message_kind: crate::control::PeerDmMessageKind::Message,
+                    direction: crate::control::PeerDmDirection::Inbound,
+                    delivery_state: crate::control::PeerDmDeliveryState::Delivered,
+                    a2a_protocol: "google_a2a".to_owned(),
+                    content: serde_json::json!({"text": "history"}),
+                    agent_envelope: None,
+                    created_at: 1,
+                    acknowledged_at: Some(1),
+                },
+            )
+            .expect("seed DM history");
             crate::control::apply_peer_relationship_action_state(
                 &setup_dir,
                 "remote-node",
@@ -774,7 +839,7 @@ mod tests {
         })
         .await
         .expect("setup task");
-        let response = app
+        let response = app.clone()
             .oneshot(
                 Request::builder()
                     .method(Method::DELETE)
@@ -793,7 +858,40 @@ mod tests {
         assert_eq!(payload["queued"], false);
         assert_eq!(payload["local_only"], true);
         assert_eq!(payload["cancelled_queued_removes"], 1);
+        let repeated = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::DELETE)
+                    .uri("/api/peers/relationships")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"remote_node_id":"remote-node"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(repeated.status(), StatusCode::OK);
         let record = tokio::task::spawn_blocking(move || {
+            let node = crate::control::open_node(&state_dir, &state_dir.join("ui.state"))
+                .expect("reopen node");
+            let local_node_id = node.node_id();
+            let network_id = crate::http::helpers::resolve_network_id(&node);
+            for (remote, active) in [("remote-node", false), ("other-node", true)] {
+                assert_eq!(node.store.get_feed_subscription(
+                    &network_id,
+                    &local_node_id,
+                    crate::control::PRIVATE_DM_FEED_KEY,
+                    &crate::control::private_dm_scope_hint(&local_node_id, remote),
+                ).unwrap().unwrap().active, active);
+            }
+            assert_eq!(node.store.load_all_events().unwrap().iter().filter(|(_, event)| {
+                matches!(&event.payload, crate::types::EventPayload::FeedSubscriptionUpdated(payload)
+                    if !payload.active && payload.feed_key == crate::control::PRIVATE_DM_FEED_KEY)
+            }).count(), 1);
+            let messages = crate::control::load_peer_dm_message_records_state(
+                &state_dir, &crate::control::private_dm_thread_id(&local_node_id, "remote-node"),
+            ).unwrap();
+            assert_eq!(messages.len(), 1);
+            assert_eq!(messages[0].message_id, "retained-dm");
             crate::control::load_peer_relationship_records_state(&state_dir)
                 .expect("relationship")
                 .remove(0)

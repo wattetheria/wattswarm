@@ -344,6 +344,10 @@ fn unified_sqlite_database_migrates_main_and_local_control_data_once() {
         legacy_main
             .put_membership(r#"{"members":{"node-a":["proposer"]}}"#)
             .expect("write legacy main data");
+        let conn = Connection::open_sqlite(state_dir.join(LEGACY_MAIN_SQLITE_FILE)).unwrap();
+        conn.execute("INSERT INTO feed_subscriptions(org_id, network_id, subscriber_node_id, feed_key, scope_hint, active, updated_at)
+            VALUES ($1, 'default', 'node-a', 'wattswarm.dm', ' local:thread-1 ', FALSE, NOW())",
+            wattswarm_storage_core::params![org_id]).unwrap();
     }
     {
         let legacy_local = PgStore::open_sqlite(state_dir.join(LEGACY_LOCAL_CONTROL_SQLITE_FILE))
@@ -375,6 +379,12 @@ fn unified_sqlite_database_migrates_main_and_local_control_data_once() {
         unified.load_membership().expect("read migrated membership"),
         Some(r#"{"members":{"node-a":["proposer"]}}"#.to_owned())
     );
+    let subscription = unified
+        .get_feed_subscription("default", "node-a", "wattswarm.dm", "node:thread-1")
+        .unwrap()
+        .unwrap();
+    assert_eq!(subscription.scope_hint, "node:thread-1");
+    assert!(!subscription.active);
     let executors = unified
         .list_local_executors(&scope_id)
         .expect("read migrated executors");

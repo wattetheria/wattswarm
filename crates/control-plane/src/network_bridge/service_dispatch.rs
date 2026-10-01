@@ -371,6 +371,15 @@ impl NetworkBridgeService {
         a2a_protocol: &str,
         established_at: u64,
     ) -> Result<()> {
+        if !crate::control::load_peer_relationship_records_state(state_dir)?
+            .into_iter()
+            .any(|record| {
+                record.remote_node_id == remote_node_id
+                    && record.relationship_state == crate::control::PeerRelationshipState::Accepted
+            })
+        {
+            return Ok(());
+        }
         let local_node_id = self.local_peer_id().to_string();
         let thread_id = peer_dm_thread_id(&local_node_id, remote_node_id);
         self.ensure_private_dm_group_subscription(

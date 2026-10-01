@@ -148,7 +148,13 @@ fn topic_message_is_relevant(
         return false;
     }
     local_has_active_topic_subscription(node, local_node_id, payload)
-        || local_has_ready_dm_thread(state_dir, &event.author_node_id, payload)
+        || local_has_ready_dm_thread(
+            node,
+            state_dir,
+            local_node_id,
+            &event.author_node_id,
+            payload,
+        )
 }
 
 fn topic_message_content_is_agent_deliverable(
@@ -175,7 +181,12 @@ fn local_has_active_topic_subscription(
 ) -> bool {
     let Some(subscription) = node
         .store
-        .get_feed_subscription(&payload.network_id, local_node_id, &payload.feed_key)
+        .get_feed_subscription(
+            &payload.network_id,
+            local_node_id,
+            &payload.feed_key,
+            &payload.scope_hint,
+        )
         .ok()
         .flatten()
     else {
@@ -193,11 +204,25 @@ fn canonical_scope_hint(raw: &str) -> String {
 }
 
 fn local_has_ready_dm_thread(
+    node: &Node,
     state_dir: &Path,
+    local_node_id: &str,
     remote_node_id: &str,
     payload: &crate::types::TopicMessagePostedPayload,
 ) -> bool {
     if payload.feed_key != crate::control::PRIVATE_DM_FEED_KEY {
+        return false;
+    }
+    // An explicit unsubscribe takes precedence over a retained DM thread.
+    if !matches!(
+        node.store.get_feed_subscription(
+            &payload.network_id,
+            local_node_id,
+            &payload.feed_key,
+            &payload.scope_hint,
+        ),
+        Ok(None)
+    ) {
         return false;
     }
     crate::control::load_peer_dm_thread_record_for_remote_state(state_dir, remote_node_id)

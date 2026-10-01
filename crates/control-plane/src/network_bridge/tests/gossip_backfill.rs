@@ -555,7 +555,7 @@ fn ingest_backfill_response_skips_feed_subscription_wrong_lane() {
     assert_eq!(applied, 0);
     assert!(
         node.store
-            .get_feed_subscription("default", &remote.node_id(), "market.relay")
+            .get_feed_subscription("default", &remote.node_id(), "market.relay", "group:crew-7")
             .expect("load subscription")
             .is_none()
     );

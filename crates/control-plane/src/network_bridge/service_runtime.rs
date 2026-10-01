@@ -1928,7 +1928,6 @@ impl NetworkBridgeService {
                                     vec![
                                         "accept".to_owned(),
                                         "reject".to_owned(),
-                                        "block".to_owned(),
                                     ],
                                     Some(request.source_node_id.clone()),
                                     Some(friend_request_event_dedupe_key(

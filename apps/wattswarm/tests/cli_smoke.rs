@@ -950,6 +950,128 @@ fn cli_governance_commands_require_mainnet_genesis_and_emit_events() {
 }
 
 #[test]
+fn cli_old_subscription_schema_recovers_dm_scopes_on_restart() {
+    let dir = tempdir().unwrap();
+    let state_dir = dir.path().join("state");
+    let identity = NodeIdentity::random();
+    write_identity_seed(&state_dir, &identity);
+    wattswarm::control::write_node_state(&state_dir, true, NodeMode::Local).unwrap();
+    let schema = CliSchemaGuard::new();
+    let db_path = state_dir.join("test.state");
+    let node_id = identity.node_id();
+    let network_id = wattswarm::storage::local_network_id(&node_id);
+    let org_id = wattswarm::storage::bootstrap_org_id(&network_id);
+    with_pg_schema(schema.as_str(), || {
+        let store = PgStore::open(&db_path).unwrap().for_org(&org_id);
+        for (scope, time) in [("group:dm-a", 100), ("group:dm-b", 110)] {
+            let event = wattswarm::node::build_event_for_external(
+                &identity,
+                1,
+                time,
+                wattswarm::types::EventPayload::FeedSubscriptionUpdated(
+                    wattswarm::types::FeedSubscriptionUpdatedPayload {
+                        network_id: network_id.clone(),
+                        subscriber_node_id: node_id.clone(),
+                        feed_key: "wattswarm.dm".to_owned(),
+                        scope_hint: scope.to_owned(),
+                        gossip_kinds: vec!["messages".to_owned()],
+                        provider_capabilities: None,
+                        agent_envelope: None,
+                        active: true,
+                    },
+                ),
+            )
+            .unwrap();
+            store.append_event(&event).unwrap();
+        }
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "DROP TABLE feed_subscriptions;
+            CREATE TABLE feed_subscriptions (
+                org_id TEXT NOT NULL DEFAULT '__unset_org__',
+                network_id TEXT NOT NULL DEFAULT '',
+                subscriber_node_id TEXT NOT NULL,
+                feed_key TEXT NOT NULL,
+                scope_hint TEXT NOT NULL,
+                gossip_kinds_json TEXT NOT NULL DEFAULT '[]',
+                provider_capabilities_json TEXT,
+                active BOOLEAN NOT NULL DEFAULT TRUE,
+                updated_at TIMESTAMPTZ NOT NULL,
+                PRIMARY KEY(org_id, network_id, subscriber_node_id, feed_key)
+            );",
+        )
+        .unwrap();
+        conn.execute("INSERT INTO feed_subscriptions(org_id, network_id, subscriber_node_id, feed_key, scope_hint, gossip_kinds_json, updated_at)
+            VALUES ($1, $2, $3, 'wattswarm.dm', 'group:dm-b', '[\"messages\"]', NOW())",
+            wattswarm_storage_core::params![org_id, network_id, node_id]).unwrap();
+    });
+    // A fresh process exercises migration rather than the in-process schema cache.
+    cmd(schema.as_str())
+        .args([
+            "--state-dir",
+            state_dir.to_str().unwrap(),
+            "--store",
+            "test.state",
+            "log",
+            "head",
+        ])
+        .assert()
+        .success();
+    with_pg_schema(schema.as_str(), || {
+        let store = PgStore::open(&db_path).unwrap().for_org(&org_id);
+        for scope in ["group:dm-a", "group:dm-b"] {
+            assert!(
+                store
+                    .get_feed_subscription(&network_id, &node_id, "wattswarm.dm", scope)
+                    .unwrap()
+                    .unwrap()
+                    .active
+            );
+        }
+        assert!(store.feed_subscription_scope_recovery_completed().unwrap());
+        store
+            .upsert_feed_subscription(
+                &network_id,
+                &node_id,
+                "wattswarm.dm",
+                "group:dm-a",
+                &["messages".to_owned()],
+                false,
+                120,
+            )
+            .unwrap();
+    });
+    cmd(schema.as_str())
+        .args([
+            "--state-dir",
+            state_dir.to_str().unwrap(),
+            "--store",
+            "test.state",
+            "log",
+            "head",
+        ])
+        .assert()
+        .success();
+    with_pg_schema(schema.as_str(), || {
+        let store = PgStore::open(&db_path).unwrap().for_org(&org_id);
+        assert!(
+            !store
+                .get_feed_subscription(&network_id, &node_id, "wattswarm.dm", "group:dm-a")
+                .unwrap()
+                .unwrap()
+                .active
+        );
+        assert!(
+            store
+                .get_feed_subscription(&network_id, &node_id, "wattswarm.dm", "group:dm-b")
+                .unwrap()
+                .unwrap()
+                .active
+        );
+    });
+}
+
+#[test]
 fn cli_run_queue_lifecycle_smoke() {
     let dir = tempdir().unwrap();
     let state_dir = dir.path().join("state");

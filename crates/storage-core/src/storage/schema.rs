@@ -170,9 +170,16 @@ const SQLITE_REQUIRED_PRIMARY_KEYS: &[(&str, &[&str])] = &[
     ("checkpoints", &["org_id", "checkpoint_id"]),
     (
         "feed_subscriptions",
-        &["org_id", "network_id", "subscriber_node_id", "feed_key"],
+        &[
+            "org_id",
+            "network_id",
+            "subscriber_node_id",
+            "feed_key",
+            "scope_hint",
+        ],
     ),
     ("task_announcements", &["org_id", "announcement_id"]),
+    ("feed_subscription_scope_recovery", &["org_id"]),
     ("topic_messages", &["org_id", "message_id"]),
     (
         "topic_cursors",
@@ -570,7 +577,33 @@ fn migrate_feed_subscription_network_id_schema(conn: &Connection) -> Result<()> 
             "ALTER TABLE feed_subscriptions ADD COLUMN network_id TEXT NOT NULL DEFAULT ''",
         )?;
     }
+    canonicalize_feed_subscription_scopes(conn)?;
     if conn.backend_kind() == pg::BackendKind::Sqlite {
+        if sqlite_primary_key_columns(conn, "feed_subscriptions")?
+            != ["org_id", "network_id", "subscriber_node_id", "feed_key"]
+        {
+            return Ok(());
+        }
+        conn.execute_batch(
+            "CREATE TABLE feed_subscriptions_scope_migration (
+                org_id TEXT NOT NULL DEFAULT '__unset_org__',
+                network_id TEXT NOT NULL DEFAULT '',
+                subscriber_node_id TEXT NOT NULL,
+                feed_key TEXT NOT NULL,
+                scope_hint TEXT NOT NULL,
+                gossip_kinds_json TEXT NOT NULL DEFAULT '[]',
+                provider_capabilities_json TEXT,
+                active BOOLEAN NOT NULL DEFAULT TRUE,
+                updated_at TIMESTAMPTZ NOT NULL,
+                PRIMARY KEY(org_id, network_id, subscriber_node_id, feed_key, scope_hint)
+            );
+            INSERT INTO feed_subscriptions_scope_migration
+                SELECT org_id, network_id, subscriber_node_id, feed_key, scope_hint,
+                       gossip_kinds_json, provider_capabilities_json, active, updated_at
+                FROM feed_subscriptions;
+            DROP TABLE feed_subscriptions;
+            ALTER TABLE feed_subscriptions_scope_migration RENAME TO feed_subscriptions;",
+        )?;
         return Ok(());
     }
     conn.execute_batch(
@@ -579,9 +612,37 @@ fn migrate_feed_subscription_network_id_schema(conn: &Connection) -> Result<()> 
         DROP CONSTRAINT IF EXISTS feed_subscriptions_pkey;
         ALTER TABLE feed_subscriptions
         ADD CONSTRAINT feed_subscriptions_pkey
-        PRIMARY KEY (org_id, network_id, subscriber_node_id, feed_key);
+        PRIMARY KEY (org_id, network_id, subscriber_node_id, feed_key, scope_hint);
         ",
     )?;
+    Ok(())
+}
+
+fn canonicalize_feed_subscription_scopes(conn: &Connection) -> Result<()> {
+    let mut stmt = conn.prepare(
+        "SELECT org_id, network_id, subscriber_node_id, feed_key, scope_hint FROM feed_subscriptions"
+    )?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+            ))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    for (org, network, subscriber, feed, scope) in rows {
+        let canonical = wattswarm_protocol::types::normalized_scope_hint(&scope);
+        if canonical != scope {
+            conn.execute(
+                "UPDATE feed_subscriptions SET scope_hint = $1 WHERE org_id = $2 AND network_id = $3
+                 AND subscriber_node_id = $4 AND feed_key = $5 AND scope_hint = $6",
+                params![canonical, org, network, subscriber, feed, scope],
+            )?;
+        }
+    }
     Ok(())
 }
 
@@ -1564,7 +1625,11 @@ impl PgStore {
                 provider_capabilities_json TEXT,
                 active BOOLEAN NOT NULL DEFAULT TRUE,
                 updated_at TIMESTAMPTZ NOT NULL,
-                PRIMARY KEY(org_id, network_id, subscriber_node_id, feed_key)
+                PRIMARY KEY(org_id, network_id, subscriber_node_id, feed_key, scope_hint)
+            );
+
+            CREATE TABLE IF NOT EXISTS feed_subscription_scope_recovery (
+                org_id TEXT NOT NULL PRIMARY KEY
             );
 
             CREATE TABLE IF NOT EXISTS task_announcements (
@@ -2478,6 +2543,77 @@ impl PgStore {
 #[cfg(test)]
 mod swarm_scope_migration_tests {
     use super::*;
+
+    fn verify_subscription_scope_upgrade(conn: Connection) {
+        conn.execute_batch(
+            "CREATE TABLE feed_subscriptions (
+                org_id TEXT NOT NULL DEFAULT '__unset_org__',
+                network_id TEXT NOT NULL DEFAULT '',
+                subscriber_node_id TEXT NOT NULL,
+                feed_key TEXT NOT NULL,
+                scope_hint TEXT NOT NULL,
+                gossip_kinds_json TEXT NOT NULL DEFAULT '[]',
+                provider_capabilities_json TEXT,
+                active BOOLEAN NOT NULL DEFAULT TRUE,
+                updated_at TIMESTAMPTZ NOT NULL,
+                PRIMARY KEY(org_id, network_id, subscriber_node_id, feed_key)
+            );
+            INSERT INTO feed_subscriptions(org_id, network_id, subscriber_node_id, feed_key, scope_hint,
+                gossip_kinds_json, provider_capabilities_json, active, updated_at)
+                VALUES ('org', 'default', 'node', 'wattswarm.dm', ' group:dm-b ',
+                    '[\"messages\"]', '{\"local_store\":true}', FALSE, NOW());"
+        ).unwrap();
+        let store = PgStore::initialize(conn).unwrap().for_org("org");
+        let copied = store
+            .get_feed_subscription("default", "node", "wattswarm.dm", "group:dm-b")
+            .unwrap()
+            .unwrap();
+        assert_eq!(copied.scope_hint, "group:dm-b");
+        assert!(!copied.active);
+        assert_eq!(copied.gossip_kinds, vec!["messages"]);
+        assert!(copied.provider_capabilities.unwrap().local_store);
+        store
+            .upsert_feed_subscription(
+                "default",
+                "node",
+                "wattswarm.dm",
+                "group:dm-a",
+                &["messages".to_owned()],
+                true,
+                100,
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .list_feed_subscriptions_for_network("default")
+                .unwrap()
+                .len(),
+            2
+        );
+        let conn = store.conn.lock().unwrap();
+        migrate_feed_subscription_network_id_schema(&conn).unwrap();
+        conn.execute_batch("INSERT INTO feed_subscriptions(org_id, network_id, subscriber_node_id, feed_key, scope_hint, updated_at)
+            VALUES ('org', 'default', 'node', 'wattswarm.dm', 'group:dm-c', NOW());").unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT gossip_kinds_json FROM feed_subscriptions WHERE scope_hint = 'group:dm-c'",
+                [],
+                |row| row.get::<_, String>(0)
+            )
+            .unwrap(),
+            "[]"
+        );
+    }
+
+    #[test]
+    fn subscription_scope_upgrade_configured_backend() {
+        verify_subscription_scope_upgrade(Connection::open_in_memory().unwrap());
+    }
+
+    #[test]
+    fn subscription_scope_upgrade_sqlite() {
+        verify_subscription_scope_upgrade(Connection::open_in_memory_sqlite().unwrap());
+    }
 
     #[test]
     fn backfill_events_swarm_scope_populates_existing_null_rows() {

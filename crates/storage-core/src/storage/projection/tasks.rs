@@ -1,6 +1,36 @@
 use super::*;
 
 impl PgStore {
+    pub fn feed_subscription_scope_recovery_completed(&self) -> Result<bool> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
+        let count = conn.query_row(
+            "SELECT COUNT(*) FROM feed_subscription_scope_recovery WHERE org_id = $1",
+            params![self.org_id()],
+            |row| row.get::<_, i64>(0),
+        )?;
+        Ok(count != 0)
+    }
+
+    /// Called inside the recovery transaction; the marker commits with the restored rows.
+    pub fn claim_feed_subscription_scope_recovery(&self) -> Result<bool> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
+        let inserted = conn.execute(
+            "INSERT INTO feed_subscription_scope_recovery(org_id) VALUES ($1)
+             ON CONFLICT(org_id) DO NOTHING",
+            params![self.org_id()],
+        )? != 0;
+        if inserted && conn.backend_kind() == pg::BackendKind::Postgres {
+            conn.execute_batch("LOCK TABLE feed_subscriptions IN SHARE ROW EXCLUSIVE MODE")?;
+        }
+        Ok(inserted)
+    }
+
     pub fn upsert_task_contract(&self, contract: &TaskContract, epoch: u64) -> Result<()> {
         let contract_json = serde_json::to_string(contract)?;
         let conn = self
@@ -195,6 +225,7 @@ impl PgStore {
         &self,
         upsert: FeedSubscriptionUpsert<'_>,
     ) -> Result<()> {
+        let scope_hint = Self::canonical_scope_hint_or_original(upsert.scope_hint.to_owned());
         let gossip_kinds_json = serde_json::to_string(upsert.gossip_kinds)?;
         let provider_capabilities_json = upsert
             .provider_capabilities
@@ -207,8 +238,7 @@ impl PgStore {
         conn.execute(
             "INSERT INTO feed_subscriptions(org_id, network_id, subscriber_node_id, feed_key, scope_hint, gossip_kinds_json, provider_capabilities_json, active, updated_at)
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, TIMESTAMPTZ 'epoch' + ($9::bigint * INTERVAL '1 millisecond'))
-             ON CONFLICT(org_id, network_id, subscriber_node_id, feed_key) DO UPDATE SET
-               scope_hint = excluded.scope_hint,
+             ON CONFLICT(org_id, network_id, subscriber_node_id, feed_key, scope_hint) DO UPDATE SET
                gossip_kinds_json = excluded.gossip_kinds_json,
                provider_capabilities_json = excluded.provider_capabilities_json,
                active = excluded.active,
@@ -218,7 +248,7 @@ impl PgStore {
                 upsert.network_id,
                 upsert.subscriber_node_id,
                 upsert.feed_key,
-                upsert.scope_hint,
+                scope_hint,
                 gossip_kinds_json,
                 provider_capabilities_json,
                 upsert.active,
@@ -280,7 +310,9 @@ impl PgStore {
         network_id: &str,
         subscriber_node_id: &str,
         feed_key: &str,
+        scope_hint: &str,
     ) -> Result<Option<FeedSubscriptionRow>> {
+        let scope_hint = Self::canonical_scope_hint_or_original(scope_hint.to_owned());
         let conn = self
             .conn
             .lock()
@@ -288,8 +320,8 @@ impl PgStore {
         conn.query_row(
             "SELECT scope_hint, gossip_kinds_json, provider_capabilities_json, active, CAST(EXTRACT(EPOCH FROM updated_at) * 1000 AS BIGINT)
              FROM feed_subscriptions
-             WHERE org_id = $1 AND network_id = $2 AND subscriber_node_id = $3 AND feed_key = $4",
-            params![self.org_id(), network_id, subscriber_node_id, feed_key],
+             WHERE org_id = $1 AND network_id = $2 AND subscriber_node_id = $3 AND feed_key = $4 AND scope_hint = $5",
+            params![self.org_id(), network_id, subscriber_node_id, feed_key, scope_hint],
             |r| {
                 let updated_at_ms: i64 = r.get(4)?;
                 Ok(FeedSubscriptionRow {

@@ -148,6 +148,43 @@ impl PgStore {
         self.load_events_from(0)
     }
 
+    pub fn load_events_by_kinds(
+        &self,
+        kinds: &[crate::types::EventKind],
+    ) -> Result<Vec<(u64, Event)>> {
+        if kinds.is_empty() {
+            return Ok(Vec::new());
+        }
+        let placeholders = (2..kinds.len() + 2)
+            .map(|index| format!("${index}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let mut values = params![self.org_id()];
+        values.extend(
+            kinds
+                .iter()
+                .map(|kind| pg::ParamValue::Text(format!("{kind:?}"))),
+        );
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
+        let mut stmt = conn.prepare(&format!(
+            "SELECT seq, event_json FROM events WHERE org_id = $1
+             AND event_kind IN ({placeholders}) ORDER BY seq ASC"
+        ))?;
+        let rows = stmt.query_map(values, |row| {
+            let seq: i64 = row.get(0)?;
+            let json: String = row.get(1)?;
+            let event: Event = serde_json::from_str(&json).map_err(|e| {
+                pg::Error::FromSqlConversionFailure(1, pg::types::Type::Text, Box::new(e))
+            })?;
+            Ok((seq as u64, event))
+        })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
     /// Load events for a single swarm scope, newest first, older than
     /// `before_exclusive` (unbounded when `None`).
     ///

@@ -397,10 +397,11 @@ pub(crate) async fn task_claim(
             let gossip_kinds = vec!["events".to_owned()];
             let already_subscribed = node
                 .store
-                .get_feed_subscription(&network_id, &subscriber_node_id, &feed_key)?
+                .get_feed_subscription(&network_id, &subscriber_node_id, &feed_key, &scope_hint)?
                 .is_some_and(|subscription| {
                     subscription.active
-                        && subscription.scope_hint == scope_hint
+                        && subscription.scope_hint
+                            == crate::types::normalized_scope_hint(&scope_hint)
                         && subscription.gossip_kinds == gossip_kinds
                 });
             if !already_subscribed {

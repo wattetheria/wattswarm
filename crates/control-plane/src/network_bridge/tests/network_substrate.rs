@@ -125,7 +125,12 @@ fn network_substrate_projection_canonicalizes_scope_hints() {
 
     let row = node
         .store
-        .get_feed_subscription("default", &subscriber_node_id, "market.canonical")
+        .get_feed_subscription(
+            "default",
+            &subscriber_node_id,
+            "market.canonical",
+            "node:lab-9",
+        )
         .expect("load subscription")
         .expect("subscription exists");
     assert_eq!(row.scope_hint, "node:lab-9");

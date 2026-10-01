@@ -1,5 +1,5 @@
 use super::*;
-use crate::types::AgentEnvelope;
+use crate::types::{AgentEnvelope, EventKind};
 
 #[derive(Debug, Clone, Copy)]
 struct NetworkBanInterval {
@@ -40,7 +40,92 @@ impl Node {
             this.store
                 .put_membership(&serde_json::to_string(&genesis_membership)?)?;
         }
+        this.recover_feed_subscription_scopes()?;
         Ok(this)
+    }
+
+    fn recover_feed_subscription_scopes(&self) -> Result<()> {
+        if self.store.feed_subscription_scope_recovery_completed()? {
+            return Ok(());
+        }
+        self.store.begin_tx()?;
+        let result = (|| -> Result<()> {
+            if !self.store.claim_feed_subscription_scope_recovery()? {
+                return Ok(());
+            }
+            let events = self.store.load_events_by_kinds(&[
+                EventKind::FeedSubscriptionUpdated,
+                EventKind::EventRevoked,
+                EventKind::NodePenalized,
+            ])?;
+            let revoked_event_ids = collect_revoked_event_ids(&events);
+            let mut network_ban_intervals: HashMap<String, Vec<NetworkBanInterval>> =
+                HashMap::new();
+            let mut latest = HashMap::new();
+            for (_, event) in &events {
+                if !should_apply_event_during_replay(
+                    event,
+                    &revoked_event_ids,
+                    &network_ban_intervals,
+                ) {
+                    continue;
+                }
+                match &event.payload {
+                    EventPayload::FeedSubscriptionUpdated(payload) => {
+                        let scope_hint = crate::types::normalized_scope_hint(&payload.scope_hint);
+                        latest.insert(
+                            (
+                                payload.network_id.clone(),
+                                payload.subscriber_node_id.clone(),
+                                payload.feed_key.clone(),
+                                scope_hint,
+                            ),
+                            (payload, event.created_at),
+                        );
+                    }
+                    EventPayload::NodePenalized(payload) if payload.network_ban => {
+                        network_ban_intervals
+                            .entry(payload.penalized_node_id.clone())
+                            .or_default()
+                            .push(NetworkBanInterval {
+                                starts_at: event.created_at,
+                                until: payload.network_ban_until,
+                            });
+                    }
+                    _ => {}
+                }
+            }
+            for ((network, subscriber, feed, scope), (payload, updated_at)) in latest {
+                // Keep copied rows, including direct run-queue writes, authoritative.
+                if self
+                    .store
+                    .get_feed_subscription(&network, &subscriber, &feed, &scope)?
+                    .is_some()
+                {
+                    continue;
+                }
+                self.store
+                    .upsert_feed_subscription_with_provider_capabilities(
+                        crate::storage::FeedSubscriptionUpsert {
+                            network_id: &network,
+                            subscriber_node_id: &subscriber,
+                            feed_key: &feed,
+                            scope_hint: &scope,
+                            gossip_kinds: &payload.gossip_kinds,
+                            provider_capabilities: payload.provider_capabilities.as_ref(),
+                            active: payload.active,
+                            updated_at,
+                        },
+                    )?;
+            }
+            Ok(())
+        })();
+        if result.is_ok() {
+            self.store.commit_tx()?;
+        } else {
+            self.store.rollback_tx()?;
+        }
+        result
     }
 
     pub fn open_in_memory_with_roles(roles: &[Role]) -> Result<Self> {
@@ -1435,5 +1520,155 @@ fn should_apply_event_during_replay(
                         })
                     })
         }
+    }
+}
+
+#[cfg(test)]
+mod subscription_scope_recovery_tests {
+    use super::*;
+    use crate::types::{
+        EventRevokedPayload, FeedSubscriptionUpdatedPayload, NodePenalizedPayload,
+        TopicProviderCapabilities,
+    };
+
+    fn subscription(identity: &NodeIdentity, scope: &str, active: bool, time: u64) -> Event {
+        build_event_for_external(
+            identity,
+            1,
+            time,
+            EventPayload::FeedSubscriptionUpdated(FeedSubscriptionUpdatedPayload {
+                network_id: "default".to_owned(),
+                subscriber_node_id: identity.node_id(),
+                feed_key: "wattswarm.dm".to_owned(),
+                scope_hint: scope.to_owned(),
+                gossip_kinds: vec!["messages".to_owned()],
+                provider_capabilities: Some(TopicProviderCapabilities::local_history_provider()),
+                agent_envelope: None,
+                active,
+            }),
+        )
+        .unwrap()
+    }
+
+    fn verify_scope_recovery(store: PgStore) {
+        let store = store.for_org("local:recovery-test");
+        let identity = NodeIdentity::random();
+        let subscriber = identity.node_id();
+        // The old projection retained only dm-b, while the event log retained every scope.
+        for (scope, active, time) in [
+            (" group:dm-a ", true, 300),
+            ("group:dm-b", true, 100),
+            ("group:inactive", true, 400),
+            ("group:inactive", false, 200),
+            ("group:direct", true, 100),
+        ] {
+            store
+                .append_event(&subscription(&identity, scope, active, time))
+                .unwrap();
+        }
+        for scope in ["group:dm-b", "group:direct"] {
+            store
+                .upsert_feed_subscription(
+                    "default",
+                    &subscriber,
+                    "wattswarm.dm",
+                    scope,
+                    &["events".to_owned()],
+                    scope == "group:dm-b",
+                    500,
+                )
+                .unwrap();
+        }
+        let revoked = subscription(&identity, "group:revoked", true, 100);
+        store.append_event(&revoked).unwrap();
+        store
+            .append_event(
+                &build_event_for_external(
+                    &identity,
+                    1,
+                    500,
+                    EventPayload::EventRevoked(EventRevokedPayload {
+                        target_event_id: revoked.event_id,
+                        reason: "test".to_owned(),
+                    }),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        store
+            .append_event(
+                &build_event_for_external(
+                    &identity,
+                    1,
+                    600,
+                    EventPayload::NodePenalized(NodePenalizedPayload {
+                        penalized_node_id: subscriber.clone(),
+                        reason: "test".to_owned(),
+                        revoked_event_ids: vec![],
+                        revoked_summary_ids: vec![],
+                        block_summaries: false,
+                        network_ban: true,
+                        network_ban_until: Some(700),
+                    }),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        store
+            .append_event(&subscription(&identity, "group:banned", true, 650))
+            .unwrap();
+        store
+            .append_event(&subscription(&identity, "group:after-ban", true, 750))
+            .unwrap();
+        let node = Node::new(identity, store.clone(), Membership::new()).unwrap();
+        let get = |scope| {
+            store
+                .get_feed_subscription("default", &subscriber, "wattswarm.dm", scope)
+                .unwrap()
+        };
+        assert!(get("group:dm-a").unwrap().active);
+        assert!(
+            get("group:dm-a")
+                .unwrap()
+                .provider_capabilities
+                .unwrap()
+                .history_backfill
+        );
+        assert!(get("group:dm-b").unwrap().active);
+        assert!(
+            !get("group:inactive").unwrap().active,
+            "seq order, not timestamps, determines the final state"
+        );
+        let direct = get("group:direct").unwrap();
+        assert!(!direct.active);
+        assert_eq!(direct.gossip_kinds, vec!["events"]);
+        assert!(direct.provider_capabilities.is_none());
+        assert!(get("group:revoked").is_none());
+        assert!(get("group:banned").is_none());
+        assert!(get("group:after-ban").unwrap().active);
+        assert!(store.feed_subscription_scope_recovery_completed().unwrap());
+        // Once marked complete, opening the node must not replay newly appended events.
+        store
+            .append_event(&subscription(&node.identity, "group:later", true, 800))
+            .unwrap();
+        Node::new(node.identity.clone(), store.clone(), Membership::new()).unwrap();
+        assert!(get("group:later").is_none());
+        assert!(
+            !store
+                .clone()
+                .for_org("local:other-org")
+                .feed_subscription_scope_recovery_completed()
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn scope_recovery_configured_backend() {
+        verify_scope_recovery(PgStore::open_in_memory().unwrap());
+    }
+
+    #[test]
+    fn scope_recovery_sqlite() {
+        verify_scope_recovery(PgStore::open_in_memory_sqlite().unwrap());
     }
 }

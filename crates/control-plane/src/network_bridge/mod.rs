@@ -465,9 +465,12 @@ fn maybe_record_topic_cursor(
     updated_at: u64,
 ) -> Result<()> {
     let network_id = current_network_context_id(node);
-    let Some(subscription) =
-        node.store
-            .get_feed_subscription(&network_id, subscriber_node_id, feed_key)?
+    let Some(subscription) = node.store.get_feed_subscription(
+        &network_id,
+        subscriber_node_id,
+        feed_key,
+        &scope_hint_label(scope),
+    )?
     else {
         return Ok(());
     };

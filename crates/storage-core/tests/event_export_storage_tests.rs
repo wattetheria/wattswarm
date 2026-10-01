@@ -18,6 +18,152 @@ fn open_test_store() -> PgStore {
         .for_org("local:test-storage:bootstrap")
 }
 
+fn verify_feed_subscription_scopes_are_independent(store: PgStore) {
+    let store = store.for_org("local:scope-isolation");
+    store.begin_tx().unwrap();
+    assert!(store.claim_feed_subscription_scope_recovery().unwrap());
+    store.rollback_tx().unwrap();
+    assert!(!store.feed_subscription_scope_recovery_completed().unwrap());
+    store.begin_tx().unwrap();
+    assert!(store.claim_feed_subscription_scope_recovery().unwrap());
+    store.commit_tx().unwrap();
+    store.begin_tx().unwrap();
+    assert!(!store.claim_feed_subscription_scope_recovery().unwrap());
+    store.commit_tx().unwrap();
+    for scope in [" group:dm-a ", "group:dm-b"] {
+        store
+            .upsert_feed_subscription(
+                "default",
+                "node-a",
+                "wattswarm.dm",
+                scope,
+                &["messages".to_owned()],
+                true,
+                100,
+            )
+            .unwrap();
+    }
+    assert_eq!(
+        store
+            .list_active_feed_subscriptions("default", "node-a")
+            .unwrap()
+            .len(),
+        2
+    );
+    store
+        .upsert_feed_subscription(
+            "default",
+            "node-a",
+            "wattswarm.dm",
+            "group:dm-a",
+            &["messages".to_owned()],
+            false,
+            200,
+        )
+        .unwrap();
+    assert!(
+        !store
+            .get_feed_subscription("default", "node-a", "wattswarm.dm", " group:dm-a ")
+            .unwrap()
+            .unwrap()
+            .active
+    );
+    assert!(
+        store
+            .get_feed_subscription("default", "node-a", "wattswarm.dm", "group:dm-b")
+            .unwrap()
+            .unwrap()
+            .active
+    );
+    assert!(
+        store
+            .get_feed_subscription("default", "node-a", "wattswarm.dm", "group:missing")
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
+fn feed_subscription_scopes_are_independent_configured_backend() {
+    verify_feed_subscription_scopes_are_independent(PgStore::open_in_memory().unwrap());
+}
+
+#[test]
+fn feed_subscription_scopes_are_independent_sqlite() {
+    verify_feed_subscription_scopes_are_independent(PgStore::open_in_memory_sqlite().unwrap());
+}
+
+fn verify_event_kind_reads(store: PgStore) {
+    use wattswarm_storage_core::types::{EventKind, EventRevokedPayload};
+    let store = store.for_org("local:event-kind-read");
+    let expired = EventPayload::TaskExpired(TaskExpiredPayload {
+        task_id: "task".to_owned(),
+    });
+    let first = store
+        .append_event(&sample_event(
+            "kind-1",
+            "1",
+            "author",
+            1,
+            300,
+            expired.clone(),
+        ))
+        .unwrap();
+    store
+        .append_event(&sample_event(
+            "kind-2",
+            "1",
+            "author",
+            1,
+            200,
+            EventPayload::EventRevoked(EventRevokedPayload {
+                target_event_id: "target".to_owned(),
+                reason: "test".to_owned(),
+            }),
+        ))
+        .unwrap();
+    let last = store
+        .append_event(&sample_event(
+            "kind-3",
+            "1",
+            "author",
+            1,
+            100,
+            expired.clone(),
+        ))
+        .unwrap();
+    store
+        .clone()
+        .for_org("local:other")
+        .append_event(&sample_event("kind-other", "1", "author", 1, 100, expired))
+        .unwrap();
+    let rows = store
+        .load_events_by_kinds(&[EventKind::TaskExpired])
+        .unwrap();
+    assert_eq!(
+        rows.iter().map(|(seq, _)| *seq).collect::<Vec<_>>(),
+        vec![first, last]
+    );
+    assert_eq!(
+        store
+            .load_events_by_kinds(&[EventKind::TaskExpired, EventKind::EventRevoked])
+            .unwrap()
+            .len(),
+        3
+    );
+    assert!(store.load_events_by_kinds(&[]).unwrap().is_empty());
+}
+
+#[test]
+fn event_kind_reads_configured_backend() {
+    verify_event_kind_reads(PgStore::open_in_memory().unwrap());
+}
+
+#[test]
+fn event_kind_reads_sqlite() {
+    verify_event_kind_reads(PgStore::open_in_memory_sqlite().unwrap());
+}
+
 fn verify_startup_cursor_skip_count(store: PgStore) {
     let store = store.for_org("local:cursor-count");
     assert_eq!(store.count_local_events_through("local", 0, 0).unwrap(), 0);
@@ -225,7 +371,7 @@ fn network_substrate_reads_canonicalize_scope_hints() {
         .expect("upsert subscription");
 
     let subscription = store
-        .get_feed_subscription("default", "node-a", "feed-1")
+        .get_feed_subscription("default", "node-a", "feed-1", "node:lab-9")
         .expect("load subscription")
         .expect("subscription exists");
     assert_eq!(subscription.scope_hint, "node:lab-9");
@@ -257,7 +403,7 @@ fn network_substrate_reads_canonicalize_scope_hints() {
         )
         .expect("upsert group subscription");
     let group_subscription = store
-        .get_feed_subscription("default", "node-a", "feed-group")
+        .get_feed_subscription("default", "node-a", "feed-group", "group:crew-7")
         .expect("load group subscription")
         .expect("group subscription exists");
     assert_eq!(group_subscription.scope_hint, "group:crew-7");
@@ -294,13 +440,13 @@ fn feed_subscriptions_are_partitioned_by_network_id() {
         .expect("upsert subnet subscription");
 
     let mainnet = store
-        .get_feed_subscription("mainnet", "node-a", "crew.chat")
+        .get_feed_subscription("mainnet", "node-a", "crew.chat", "group:main")
         .expect("load mainnet subscription")
         .expect("mainnet subscription exists");
     assert_eq!(mainnet.scope_hint, "group:main");
 
     let subnet = store
-        .get_feed_subscription("subnet:alpha", "node-a", "crew.chat")
+        .get_feed_subscription("subnet:alpha", "node-a", "crew.chat", "group:subnet")
         .expect("load subnet subscription")
         .expect("subnet subscription exists");
     assert_eq!(subnet.scope_hint, "group:subnet");
@@ -324,7 +470,7 @@ fn feed_subscription_provider_capabilities_are_persisted() {
         .expect("upsert subscription");
 
     let subscription = store
-        .get_feed_subscription("mainnet", "node-a", "hive.chat")
+        .get_feed_subscription("mainnet", "node-a", "hive.chat", "group:sydney-weather")
         .expect("load subscription")
         .expect("subscription exists");
 
