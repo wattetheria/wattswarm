@@ -207,20 +207,21 @@ use discovery_bootnode::{
     reset_discovery_bootnode_failure_log_state,
 };
 use event_relevance::EventRelevanceFilter;
-#[cfg(test)]
-use peer_interactions::payment_allowed_actions;
 use peer_interactions::{
     PendingContactMaterialRequest, PendingPeerRelationshipRequest,
     apply_peer_relationship_action_projection, attach_agent_envelope_to_relationship,
-    control_peer_relationship_action, optional_verified_agent_context_for_protocol_source,
+    control_peer_relationship_action, is_signed_relationship_envelope,
+    local_signed_accept_for_remote, optional_verified_agent_context_for_protocol_source,
     payload_with_verified_agent_context, peer_dm_thread_id, process_pending_network_commands,
     raw_agent_envelope_to_protocol, raw_relationship_request_id,
-    record_peer_relationship_action_command_failure, remove_peer_relationship_action_command,
-    save_agent_payment_event, save_agent_payment_summary, save_dm_message,
-    save_inbound_private_dm_topic_message, upsert_dm_thread,
+    record_peer_relationship_action_command_failure, release_parked_peer_relationship_commands,
+    remove_peer_relationship_action_command, save_agent_payment_event, save_agent_payment_summary,
+    save_dm_message, save_inbound_private_dm_topic_message, upsert_dm_thread,
     verify_agent_envelope_signature_for_source, verify_protocol_agent_envelope_for_source,
     wire_peer_relationship_action,
 };
+#[cfg(test)]
+use peer_interactions::{payment_allowed_actions, signed_test_agent_envelope};
 use publish::GlobalPublishRateGuard;
 use scope::{
     dynamic_subscription_scope_kinds_for_node, event_matches_signed_scope, event_transport_route,

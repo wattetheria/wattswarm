@@ -1068,6 +1068,25 @@ fn run_background_network_service_with_hook(
                         }
                         NetworkBridgeTick::Connected { peer } => {
                             let peer_str = peer.to_string();
+                            if let Err(error) =
+                                release_parked_peer_relationship_commands(state_dir, &peer_str)
+                            {
+                                diagnostics::record_anomaly(
+                                    Some(state_dir),
+                                    service.monitoring_enabled,
+                                    || {
+                                        diagnostics::DiagnosticEvent::new(
+                                            "warn",
+                                            "retry",
+                                            "retry.command",
+                                            "release_failed",
+                                            "parked network command release failed",
+                                        )
+                                        .source_node_id(Some(peer_str.clone()))
+                                        .details(json!({"error": format!("{error:#}")}))
+                                    },
+                                );
+                            }
                             if record_peer_announcement(
                                 &mut announced_peers,
                                 &peer_str,

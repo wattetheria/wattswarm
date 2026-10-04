@@ -1965,16 +1965,32 @@ impl NetworkBridgeService {
                                     target_node_id: request.source_node_id.clone(),
                                     action: request.action,
                                     applied: true,
-                                    agent_envelope: Some(default_agent_envelope(
-                                        &local_node_id,
-                                        &request.source_node_id,
-                                        "peer.relationship.response",
-                                        json!({
-                                            "action": request.action,
-                                            "applied": true,
-                                            "relationship_state": record.relationship_state.as_str(),
-                                        }),
-                                    )),
+                                    agent_envelope: Some(
+                                        (action == crate::control::PeerRelationshipAction::Request)
+                                            .then(|| {
+                                                local_signed_accept_for_remote(
+                                                    &state_dir,
+                                                    &local_node_id,
+                                                    &request.source_node_id,
+                                                    request.agent_envelope.as_ref()
+                                                        .and_then(raw_relationship_request_id)
+                                                        .as_deref(),
+                                                )
+                                            })
+                                            .flatten()
+                                            .unwrap_or_else(|| {
+                                                default_agent_envelope(
+                                                    &local_node_id,
+                                                    &request.source_node_id,
+                                                    "peer.relationship.response",
+                                                    json!({
+                                                        "action": request.action,
+                                                        "applied": true,
+                                                        "relationship_state": record.relationship_state.as_str(),
+                                                    }),
+                                                )
+                                            }),
+                                    ),
                                     contact_material: local_contact_material.clone(),
                                     relationship_state: Some(
                                         record.relationship_state.as_str().to_owned(),
@@ -2198,6 +2214,16 @@ impl NetworkBridgeService {
                                 .to_owned(),
                     });
                 };
+                if action == crate::control::PeerRelationshipAction::Request
+                    && let Some(envelope) = response.agent_envelope.as_ref()
+                {
+                    self.adopt_accept_from_relationship_response(
+                        &state_dir,
+                        &peer,
+                        &pending.remote_node_id,
+                        envelope,
+                    );
+                }
                 let local_state = crate::control::load_peer_relationship_records_state(&state_dir)?
                     .into_iter()
                     .find(|record| record.remote_node_id == pending.remote_node_id)
@@ -2286,6 +2312,77 @@ impl NetworkBridgeService {
                     Err(error)
                 }
             }),
+        }
+    }
+
+    /// Applies a signed accept the remote returned with the response to our
+    /// relationship request exactly as if its accept push had arrived. This
+    /// covers peers that can reach us but cannot be dialed back. Failures only
+    /// leave diagnostics so the response keeps its existing handling.
+    fn adopt_accept_from_relationship_response(
+        &mut self,
+        state_dir: &Path,
+        peer: &NetworkNodeId,
+        remote_node_id: &str,
+        envelope: &RawAgentEnvelope,
+    ) {
+        let local_node_id = self.local_peer_id().to_string();
+        if !is_signed_relationship_envelope(envelope, remote_node_id, &local_node_id) {
+            return;
+        }
+        let verification =
+            verify_agent_envelope_signature_for_source(envelope, Some(remote_node_id));
+        record_agent_signature_verification_diagnostic(
+            Some(state_dir),
+            peer,
+            envelope,
+            "peer_relationship.response",
+            &verification,
+        );
+        if verification.is_err() {
+            return;
+        }
+        let adopted = apply_peer_relationship_action_projection(
+            state_dir,
+            remote_node_id,
+            crate::control::PeerRelationshipAction::Accept,
+            crate::control::PeerRelationshipInitiator::Remote,
+            envelope,
+        )
+        .and_then(|(record, replayed)| {
+            // Do not reactivate an already-ready DM that was explicitly unsubscribed.
+            if replayed
+                && crate::control::load_peer_dm_thread_record_for_remote_state(
+                    state_dir,
+                    remote_node_id,
+                )?
+                .is_some_and(|thread| {
+                    thread.session_state == crate::control::PeerDmSessionState::Ready
+                })
+            {
+                return Ok(());
+            }
+            self.finalize_dm_session_from_relationship(
+                state_dir,
+                remote_node_id,
+                crate::control::PeerDmDirection::Inbound,
+                &envelope.protocol,
+                record.updated_at,
+            )
+        });
+        if let Err(error) = adopted {
+            diagnostics::record_diagnostic(
+                Some(state_dir),
+                diagnostics::DiagnosticEvent::new(
+                    "warn",
+                    "transport",
+                    "peer_relationship.response",
+                    "adopt_failed",
+                    "peer relationship response accept could not be applied",
+                )
+                .source_node_id(Some(peer.to_string()))
+                .details(json!({ "error": format!("{error:#}") })),
+            );
         }
     }
 }

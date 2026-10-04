@@ -1108,6 +1108,82 @@ fn queued_peer_relationship_command_retries_synchronous_dispatch_failure() {
 }
 
 #[test]
+fn exhausted_queued_accept_is_parked_while_other_actions_are_dropped() {
+    let local_dir = temp_startup_dir("relationship-command-park");
+    let local_seed = [118u8; 32];
+    std::fs::write(local_dir.join("node_seed.hex"), hex::encode(local_seed))
+        .expect("write local seed");
+    ensure_test_relay_urls(&local_dir);
+    let local_endpoint =
+        wattswarm_network_transport_iroh::local_endpoint_id_from_state_dir(&local_dir)
+            .expect("local endpoint")
+            .to_string();
+    let local = NodeIdentity::random();
+    let membership = membership_with_roles(&[local.node_id()]);
+    let mut node =
+        Node::new(local, PgStore::open_in_memory().expect("store"), membership).expect("node");
+    let mut service = NetworkBridgeService::new(
+        NetworkP2pNode::from_iroh_state_dir(
+            NetworkP2pConfig::default(),
+            local_dir.clone(),
+            local_seed,
+        )
+        .expect("local node"),
+        &[SwarmScope::Global],
+        &NetworkProtocolParams::default(),
+    )
+    .expect("service");
+    service.set_state_dir(local_dir.clone(), local_dir.join("ui.state"));
+    let exhausted_line = |action: &str| {
+        let envelope = default_agent_envelope(
+            &local_endpoint,
+            "missing-peer",
+            &format!("social.friend.{action}"),
+            json!({"action": action, "request_id": format!("request-{action}")}),
+        );
+        json!({
+            "kind": "peer_relationship",
+            "remote_node_id": "missing-peer",
+            "action": action,
+            "agent_envelope": envelope,
+            "attempts": 10,
+        })
+        .to_string()
+    };
+    std::fs::write(
+        local_dir.join("pending_network_commands.jsonl"),
+        format!(
+            "{}\n{}\n",
+            exhausted_line("accept"),
+            exhausted_line("request")
+        ),
+    )
+    .expect("write pending commands");
+
+    process_pending_network_commands(&mut node, &mut service, &local_dir)
+        .expect("process pending commands");
+
+    let pending = std::fs::read_to_string(local_dir.join("pending_network_commands.jsonl"))
+        .expect("read pending commands");
+    let commands = pending
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("command json"))
+        .collect::<Vec<_>>();
+    assert_eq!(commands.len(), 1, "{pending}");
+    assert_eq!(commands[0]["action"], json!("accept"));
+    let parked_at = commands[0]["parked_at"].as_i64().expect("parked_at");
+    assert!(
+        commands[0]["next_retry_at"]
+            .as_i64()
+            .expect("next_retry_at")
+            > parked_at
+    );
+
+    wattswarm_network_transport_iroh::shutdown_local_iroh_data_plane(&local_dir);
+    let _ = std::fs::remove_dir_all(local_dir);
+}
+
+#[test]
 fn gossip_source_does_not_mark_peer_connected_for_backfill() {
     let dir = temp_startup_dir("gossip-source-not-connected");
     std::fs::write(dir.join("node_seed.hex"), hex::encode([43_u8; 32])).expect("write seed");
@@ -2780,6 +2856,496 @@ fn peer_relationship_response_persists_private_message_contact_material() {
     wattswarm_network_transport_iroh::shutdown_local_iroh_data_plane(&remote_dir);
     std::fs::remove_dir_all(local_dir).expect("cleanup local");
     std::fs::remove_dir_all(remote_dir).expect("cleanup remote");
+}
+
+struct RelationshipResponseFixture {
+    local_dir: PathBuf,
+    remote_dir: PathBuf,
+    local_endpoint: String,
+    remote_endpoint: String,
+    service: NetworkBridgeService,
+    request_id: PeerRelationshipRequestId,
+}
+
+impl RelationshipResponseFixture {
+    /// A local node with an outbound request `request-1` pending to a remote
+    /// node that has already accepted it on its side.
+    fn new(label: &str, seeds: (u8, u8)) -> Self {
+        let local_dir = temp_startup_dir(&format!("{label}-local"));
+        let remote_dir = temp_startup_dir(&format!("{label}-remote"));
+        std::fs::write(local_dir.join("node_seed.hex"), hex::encode([seeds.0; 32]))
+            .expect("write local seed");
+        std::fs::write(remote_dir.join("node_seed.hex"), hex::encode([seeds.1; 32]))
+            .expect("write remote seed");
+        ensure_test_relay_urls(&local_dir);
+        ensure_test_relay_urls(&remote_dir);
+        let local_endpoint =
+            wattswarm_network_transport_iroh::local_endpoint_id_from_state_dir(&local_dir)
+                .expect("local endpoint")
+                .to_string();
+        let remote_endpoint =
+            wattswarm_network_transport_iroh::local_endpoint_id_from_state_dir(&remote_dir)
+                .expect("remote endpoint")
+                .to_string();
+        let request_envelope = default_agent_envelope(
+            &local_endpoint,
+            &remote_endpoint,
+            "social.friend.request",
+            json!({"action": "request", "request_id": "request-1"}),
+        );
+        apply_peer_relationship_action_projection(
+            &local_dir,
+            &remote_endpoint,
+            crate::control::PeerRelationshipAction::Request,
+            crate::control::PeerRelationshipInitiator::Local,
+            &request_envelope,
+        )
+        .expect("local outbound request");
+
+        let mut service = NetworkBridgeService::new(
+            NetworkP2pNode::from_iroh_state_dir(
+                NetworkP2pConfig::default(),
+                local_dir.clone(),
+                [seeds.0; 32],
+            )
+            .expect("node"),
+            &[SwarmScope::Global],
+            &NetworkProtocolParams::default(),
+        )
+        .expect("service");
+        service.set_state_dir(local_dir.clone(), local_dir.join("ui.state"));
+        let request_id = PeerRelationshipRequestId::new(9);
+        service.pending_relationship_requests.insert(
+            request_id,
+            PendingPeerRelationshipRequest {
+                peer: NetworkNodeId::new(remote_endpoint.clone()).expect("remote peer"),
+                remote_node_id: remote_endpoint.clone(),
+                action: crate::control::PeerRelationshipAction::Request,
+                agent_envelope: request_envelope,
+                started_at_ms: observed_at_ms() as i64,
+            },
+        );
+        Self {
+            local_dir,
+            remote_dir,
+            local_endpoint,
+            remote_endpoint,
+            service,
+            request_id,
+        }
+    }
+
+    /// The accept the remote stored when it accepted `request-1`, as its
+    /// responder would return it.
+    fn remote_stored_accept(&self, tamper: bool) -> RawAgentEnvelope {
+        let mut accept = signed_test_agent_envelope(
+            &self.remote_endpoint,
+            &self.local_endpoint,
+            "social.friend.accept",
+            &json!({"action": "accept", "request_id": "request-1"}),
+        );
+        let request = default_agent_envelope(
+            &self.local_endpoint,
+            &self.remote_endpoint,
+            "social.friend.request",
+            json!({"action": "request", "request_id": "request-1"}),
+        );
+        apply_peer_relationship_action_projection(
+            &self.remote_dir,
+            &self.local_endpoint,
+            crate::control::PeerRelationshipAction::Request,
+            crate::control::PeerRelationshipInitiator::Remote,
+            &request,
+        )
+        .expect("remote inbound request");
+        apply_peer_relationship_action_projection(
+            &self.remote_dir,
+            &self.local_endpoint,
+            crate::control::PeerRelationshipAction::Accept,
+            crate::control::PeerRelationshipInitiator::Local,
+            &accept,
+        )
+        .expect("remote accept");
+        if tamper {
+            accept.message_json =
+                json!({"action": "accept", "request_id": "request-2"}).to_string();
+            return accept;
+        }
+        local_signed_accept_for_remote(
+            &self.remote_dir,
+            &self.remote_endpoint,
+            &self.local_endpoint,
+            Some("request-1"),
+        )
+        .expect("responder returns its stored accept")
+    }
+
+    fn respond(&mut self, agent_envelope: RawAgentEnvelope) -> NetworkBridgeTick {
+        let remote_contact = build_contact_material(&self.remote_dir, &self.remote_endpoint)
+            .expect("remote contact material");
+        self.service
+            .process_runtime_event(
+                &mut crate::control::open_node(&self.local_dir, &self.local_dir.join("ui.state"))
+                    .expect("open node"),
+                NetworkRuntimeEvent::PeerRelationshipResponse {
+                    peer: NetworkNodeId::new(self.remote_endpoint.clone()).expect("remote peer"),
+                    request_id: self.request_id,
+                    response: PeerRelationshipResponse {
+                        source_node_id: self.remote_endpoint.clone(),
+                        target_node_id: self.local_endpoint.clone(),
+                        action: RawPeerRelationshipAction::Request,
+                        applied: true,
+                        agent_envelope: Some(agent_envelope),
+                        contact_material: Some(remote_contact),
+                        relationship_state: Some("accepted".to_owned()),
+                        detail: None,
+                        updated_at: observed_at_ms(),
+                    },
+                },
+            )
+            .expect("process response")
+    }
+
+    fn local_relationship_state(&self) -> crate::control::PeerRelationshipState {
+        crate::control::load_peer_relationship_records_state(&self.local_dir)
+            .expect("local relationships")
+            .into_iter()
+            .find(|record| record.remote_node_id == self.remote_endpoint)
+            .expect("local relationship record")
+            .relationship_state
+    }
+
+    fn cleanup(self) {
+        wattswarm_network_transport_iroh::shutdown_local_iroh_data_plane(&self.local_dir);
+        wattswarm_network_transport_iroh::shutdown_local_iroh_data_plane(&self.remote_dir);
+        std::fs::remove_dir_all(&self.local_dir).expect("cleanup local");
+        std::fs::remove_dir_all(&self.remote_dir).expect("cleanup remote");
+    }
+}
+
+#[test]
+fn peer_relationship_response_adopts_remote_signed_accept() {
+    let mut fixture = RelationshipResponseFixture::new("relationship-adopt-accept", (121, 122));
+    let accept = fixture.remote_stored_accept(false);
+
+    let tick = fixture.respond(accept);
+
+    assert!(matches!(
+        tick,
+        NetworkBridgeTick::PeerRelationshipUpdated {
+            relationship_state: crate::control::PeerRelationshipState::Accepted,
+            ..
+        }
+    ));
+    assert_eq!(
+        fixture.local_relationship_state(),
+        crate::control::PeerRelationshipState::Accepted
+    );
+    let thread = crate::control::load_peer_dm_thread_record_for_remote_state(
+        &fixture.local_dir,
+        &fixture.remote_endpoint,
+    )
+    .expect("dm threads")
+    .expect("dm thread established");
+    assert_eq!(
+        thread.session_state,
+        crate::control::PeerDmSessionState::Ready
+    );
+    fixture.cleanup();
+}
+
+#[test]
+fn peer_relationship_response_ignores_unverifiable_or_synthesized_accept() {
+    let mut fixture = RelationshipResponseFixture::new("relationship-reject-accept", (123, 124));
+    let tampered = fixture.remote_stored_accept(true);
+    fixture.respond(tampered);
+    assert_eq!(
+        fixture.local_relationship_state(),
+        crate::control::PeerRelationshipState::Requested
+    );
+
+    let mut fixture_legacy =
+        RelationshipResponseFixture::new("relationship-legacy-response", (125, 126));
+    let synthesized = default_agent_envelope(
+        &fixture_legacy.remote_endpoint,
+        &fixture_legacy.local_endpoint,
+        "peer.relationship.response",
+        json!({"action": "request", "applied": true, "relationship_state": "accepted"}),
+    );
+    fixture_legacy.respond(synthesized);
+    assert_eq!(
+        fixture_legacy.local_relationship_state(),
+        crate::control::PeerRelationshipState::Requested
+    );
+    fixture.cleanup();
+    fixture_legacy.cleanup();
+}
+
+#[test]
+fn peer_relationship_response_ignores_signed_non_accept_actions() {
+    for (i, (capability, action)) in [
+        ("social.friend.request", "request"),
+        ("social.friend.reject", "reject"),
+        ("social.friend.cancel", "cancel"),
+        ("social.friend.remove", "remove"),
+        ("social.friend.block", "block"),
+        ("social.friend.unblock", "unblock"),
+        ("social.friend.accept", "reject"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut fixture = RelationshipResponseFixture::new(
+            "relationship-non-accept",
+            (130 + i as u8 * 2, 131 + i as u8 * 2),
+        );
+        let envelope = signed_test_agent_envelope(
+            &fixture.remote_endpoint,
+            &fixture.local_endpoint,
+            capability,
+            &json!({"action": action, "request_id": "request-1"}),
+        );
+        fixture.respond(envelope);
+        assert_eq!(
+            fixture.local_relationship_state(),
+            crate::control::PeerRelationshipState::Requested
+        );
+        assert!(
+            crate::control::load_peer_dm_thread_record_for_remote_state(
+                &fixture.local_dir,
+                &fixture.remote_endpoint
+            )
+            .unwrap()
+            .is_none()
+        );
+        fixture.cleanup();
+    }
+}
+
+#[test]
+fn peer_relationship_response_accept_action_is_capability_independent() {
+    for (i, capability) in [
+        "social.friend.accept",
+        "peer.relationship.accept",
+        "custom.accept",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut fixture = RelationshipResponseFixture::new(
+            "relationship-capability-independent",
+            (160 + i as u8 * 2, 161 + i as u8 * 2),
+        );
+        let accept = signed_test_agent_envelope(
+            &fixture.remote_endpoint,
+            &fixture.local_endpoint,
+            capability,
+            &json!({"action": "accept", "request_id": "request-1"}),
+        );
+        fixture.respond(accept);
+        assert_eq!(
+            fixture.local_relationship_state(),
+            crate::control::PeerRelationshipState::Accepted
+        );
+        fixture.cleanup();
+    }
+}
+
+#[test]
+fn peer_relationship_response_recovers_older_request_with_multiple_accepts() {
+    let mut fixture =
+        RelationshipResponseFixture::new("relationship-older-identity-request", (170, 171));
+    let older = fixture.remote_stored_accept(false);
+    let newer_request = default_agent_envelope(
+        &fixture.local_endpoint,
+        &fixture.remote_endpoint,
+        "peer.relationship.request",
+        json!({"action": "request", "request_id": "request-2"}),
+    );
+    let newer_accept = signed_test_agent_envelope(
+        &fixture.remote_endpoint,
+        &fixture.local_endpoint,
+        "custom.accept",
+        &json!({"action": "accept", "request_id": "request-2"}),
+    );
+    assert_ne!(older.source_agent_id, newer_accept.source_agent_id);
+    apply_peer_relationship_action_projection(
+        &fixture.remote_dir,
+        &fixture.local_endpoint,
+        crate::control::PeerRelationshipAction::Request,
+        crate::control::PeerRelationshipInitiator::Remote,
+        &newer_request,
+    )
+    .unwrap();
+    apply_peer_relationship_action_projection(
+        &fixture.remote_dir,
+        &fixture.local_endpoint,
+        crate::control::PeerRelationshipAction::Accept,
+        crate::control::PeerRelationshipInitiator::Local,
+        &newer_accept,
+    )
+    .unwrap();
+    let mut records =
+        crate::control::load_peer_relationship_request_records_state(&fixture.remote_dir).unwrap();
+    let older_at = records
+        .iter()
+        .find(|record| record.request_id == "request-1")
+        .unwrap()
+        .updated_at;
+    let newest = records
+        .iter_mut()
+        .find(|record| record.request_id == "request-2")
+        .unwrap();
+    newest.updated_at = newest.updated_at.max(older_at + 1);
+    crate::control::save_peer_relationship_request_record_state(&fixture.remote_dir, newest)
+        .unwrap();
+    let accept = local_signed_accept_for_remote(
+        &fixture.remote_dir,
+        &fixture.remote_endpoint,
+        &fixture.local_endpoint,
+        Some("request-1"),
+    )
+    .unwrap();
+    assert_eq!(accept.signature, older.signature);
+    fixture.respond(accept);
+    let request = crate::control::load_peer_relationship_request_records_state(&fixture.local_dir)
+        .unwrap()
+        .into_iter()
+        .find(|record| record.request_id == "request-1")
+        .unwrap();
+    assert_eq!(
+        request.relationship_state,
+        crate::control::PeerRelationshipState::Accepted
+    );
+    fixture.cleanup();
+}
+
+#[test]
+fn peer_relationship_response_replay_completes_unfinished_dm() {
+    for (i, session_state) in [
+        None,
+        Some(crate::control::PeerDmSessionState::SessionPending),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut fixture = RelationshipResponseFixture::new(
+            "relationship-partial-dm",
+            (150 + i as u8 * 2, 151 + i as u8 * 2),
+        );
+        let accept = fixture.remote_stored_accept(false);
+        let (_, replayed) = apply_peer_relationship_action_projection(
+            &fixture.local_dir,
+            &fixture.remote_endpoint,
+            crate::control::PeerRelationshipAction::Accept,
+            crate::control::PeerRelationshipInitiator::Remote,
+            &accept,
+        )
+        .unwrap();
+        assert!(!replayed);
+        // Persisted relationship with DM initialization not yet completed.
+        if let Some(session_state) = session_state {
+            upsert_dm_thread(
+                &fixture.local_dir,
+                &fixture.remote_endpoint,
+                &peer_dm_thread_id(&fixture.local_endpoint, &fixture.remote_endpoint),
+                session_state,
+                None,
+                None,
+            )
+            .unwrap();
+        }
+        fixture.respond(accept);
+        let thread = crate::control::load_peer_dm_thread_record_for_remote_state(
+            &fixture.local_dir,
+            &fixture.remote_endpoint,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            thread.session_state,
+            crate::control::PeerDmSessionState::Ready
+        );
+        let scope = SwarmScope::Group(crate::control::private_dm_group_id(
+            &fixture.local_endpoint,
+            &fixture.remote_endpoint,
+        ));
+        assert!(fixture.service.backfill_scopes().contains(&scope));
+        fixture.cleanup();
+    }
+}
+
+#[test]
+fn peer_relationship_response_replay_preserves_explicit_dm_unsubscribe() {
+    let mut fixture = RelationshipResponseFixture::new("relationship-unsubscribed-dm", (155, 156));
+    let accept = fixture.remote_stored_accept(false);
+    fixture.respond(accept.clone());
+    let db_path = fixture.local_dir.join("ui.state");
+    let mut node = crate::control::open_node(&fixture.local_dir, &db_path).unwrap();
+    let scope_hint =
+        crate::control::private_dm_scope_hint(&fixture.local_endpoint, &fixture.remote_endpoint);
+    let scope = SwarmScope::Group(crate::control::private_dm_group_id(
+        &fixture.local_endpoint,
+        &fixture.remote_endpoint,
+    ));
+    let network = current_network_context_id(&node);
+    let before = node.store.head_seq().unwrap();
+    node.emit_at(
+        1,
+        crate::types::EventPayload::FeedSubscriptionUpdated(
+            crate::types::FeedSubscriptionUpdatedPayload {
+                network_id: network.clone(),
+                subscriber_node_id: fixture.local_endpoint.clone(),
+                feed_key: crate::control::PRIVATE_DM_FEED_KEY.to_owned(),
+                scope_hint: scope_hint.clone(),
+                gossip_kinds: vec!["messages".to_owned()],
+                provider_capabilities: None,
+                agent_envelope: None,
+                active: false,
+            },
+        ),
+        observed_at_ms(),
+    )
+    .unwrap();
+    publish_pending_scoped_updates(&mut fixture.service, &node, &fixture.local_endpoint, before)
+        .unwrap();
+    assert!(!fixture.service.backfill_scopes().contains(&scope));
+    fixture.service.pending_relationship_requests.insert(
+        fixture.request_id,
+        PendingPeerRelationshipRequest {
+            peer: NetworkNodeId::new(fixture.remote_endpoint.clone()).unwrap(),
+            remote_node_id: fixture.remote_endpoint.clone(),
+            action: crate::control::PeerRelationshipAction::Request,
+            agent_envelope: default_agent_envelope(
+                &fixture.local_endpoint,
+                &fixture.remote_endpoint,
+                "social.friend.request",
+                json!({"action": "request", "request_id": "request-1"}),
+            ),
+            started_at_ms: observed_at_ms() as i64,
+        },
+    );
+    fixture.respond(accept);
+    assert!(!fixture.service.backfill_scopes().contains(&scope));
+    assert!(
+        !node
+            .store
+            .get_feed_subscription(
+                &network,
+                &fixture.local_endpoint,
+                crate::control::PRIVATE_DM_FEED_KEY,
+                &scope_hint
+            )
+            .unwrap()
+            .unwrap()
+            .active
+    );
+    assert_eq!(
+        fixture.local_relationship_state(),
+        crate::control::PeerRelationshipState::Accepted
+    );
+    drop(node);
+    fixture.cleanup();
 }
 
 #[test]

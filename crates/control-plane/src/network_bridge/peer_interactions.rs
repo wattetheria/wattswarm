@@ -5,6 +5,7 @@ use watt_did::{Did, DidKey, DidKeyPublicKey, VerifiedAgentContext};
 const PENDING_NETWORK_COMMAND_INITIAL_RETRY_MS: i64 = 5_000;
 const PENDING_NETWORK_COMMAND_MAX_RETRY_MS: i64 = 60_000;
 const PENDING_NETWORK_COMMAND_MAX_ATTEMPTS: u32 = 10;
+const PARKED_PEER_RELATIONSHIP_TTL_MS: i64 = 7 * 24 * 60 * 60 * 1000;
 
 fn is_zero(value: &u32) -> bool {
     *value == 0
@@ -67,6 +68,8 @@ enum PendingNetworkCommand {
         next_retry_at: Option<i64>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         last_error: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parked_at: Option<i64>,
     },
     AgentPayment {
         remote_node_id: String,
@@ -196,6 +199,53 @@ impl PendingNetworkCommand {
 
     fn should_abandon(&self) -> bool {
         self.attempts() >= PENDING_NETWORK_COMMAND_MAX_ATTEMPTS
+    }
+
+    /// Keeps an accept that exhausted its attempts parked until its TTL, so a
+    /// peer that cannot be dialed now still receives it once it reconnects.
+    /// Returns false for every other command, which is dropped as before.
+    fn park_after_attempt_limit(&mut self, now_ms: i64) -> bool {
+        let Self::PeerRelationship {
+            action: crate::control::PeerRelationshipAction::Accept,
+            next_retry_at,
+            parked_at,
+            ..
+        } = self
+        else {
+            return false;
+        };
+        let parked_since = *parked_at.get_or_insert(now_ms);
+        let expires_at = parked_since.saturating_add(PARKED_PEER_RELATIONSHIP_TTL_MS);
+        if now_ms >= expires_at {
+            return false;
+        }
+        *next_retry_at = Some(expires_at);
+        true
+    }
+
+    fn is_parked_for(&self, peer_node_id: &str) -> bool {
+        matches!(
+            self,
+            Self::PeerRelationship {
+                remote_node_id,
+                parked_at: Some(_),
+                ..
+            } if remote_node_id == peer_node_id
+        )
+    }
+
+    /// Makes a parked command due for exactly one more dispatch; a failure
+    /// parks it again under its original TTL.
+    fn release_for_single_attempt(&mut self) {
+        if let Self::PeerRelationship {
+            attempts,
+            next_retry_at,
+            ..
+        } = self
+        {
+            *attempts = PENDING_NETWORK_COMMAND_MAX_ATTEMPTS - 1;
+            *next_retry_at = None;
+        }
     }
 }
 
@@ -335,6 +385,7 @@ fn upsert_peer_relationship_action_command(
             attempts,
             next_retry_at,
             last_error,
+            parked_at,
             ..
         } = &mut command
         {
@@ -342,12 +393,14 @@ fn upsert_peer_relationship_action_command(
                 attempts: existing_attempts,
                 next_retry_at: existing_next_retry_at,
                 last_error: existing_last_error,
+                parked_at: existing_parked_at,
                 ..
             } = &*existing
             {
                 *attempts = *existing_attempts;
                 *next_retry_at = *existing_next_retry_at;
                 *last_error = existing_last_error.clone();
+                *parked_at = *existing_parked_at;
             }
         }
         *existing = command;
@@ -368,6 +421,41 @@ pub(super) fn remove_peer_relationship_action_command(
         !peer_relationship_command_matches(command, remote_node_id, action, agent_envelope)
     });
     write_pending_network_commands(state_dir, &commands)
+}
+
+/// Gives every parked command for a reconnected peer one more dispatch. A
+/// parked accept only stays meaningful while this node still holds the
+/// relationship as accepted; otherwise a later local decision superseded it.
+pub(super) fn release_parked_peer_relationship_commands(
+    state_dir: &Path,
+    peer_node_id: &str,
+) -> Result<usize> {
+    let mut commands = load_pending_network_commands(state_dir)?;
+    if !commands
+        .iter()
+        .any(|command| command.is_parked_for(peer_node_id))
+    {
+        return Ok(0);
+    }
+    let still_accepted = crate::control::load_peer_relationship_records_state(state_dir)?
+        .iter()
+        .any(|record| {
+            record.remote_node_id == peer_node_id
+                && record.relationship_state == crate::control::PeerRelationshipState::Accepted
+        });
+    let mut released = 0;
+    commands.retain_mut(|command| {
+        if !command.is_parked_for(peer_node_id) {
+            return true;
+        }
+        if still_accepted {
+            command.release_for_single_attempt();
+            released += 1;
+        }
+        still_accepted
+    });
+    write_pending_network_commands(state_dir, &commands)?;
+    Ok(released)
 }
 
 pub(super) fn record_peer_relationship_action_command_failure(
@@ -399,6 +487,7 @@ pub(super) fn record_peer_relationship_action_command_failure(
             attempts: 0,
             next_retry_at: None,
             last_error: None,
+            parked_at: None,
         };
         command.record_failure(error, now_ms);
         record_command_failure_observation(
@@ -428,6 +517,7 @@ pub fn enqueue_peer_relationship_action_command(
             attempts: 0,
             next_retry_at: None,
             last_error: None,
+            parked_at: None,
         },
     )
 }
@@ -453,7 +543,7 @@ pub fn enqueue_agent_payment_command(
     )
 }
 
-fn raw_agent_envelope_to_control_record(
+pub(super) fn raw_agent_envelope_to_control_record(
     envelope: &RawAgentEnvelope,
 ) -> crate::control::AgentInteractionEnvelope {
     crate::control::AgentInteractionEnvelope {
@@ -475,6 +565,91 @@ fn raw_agent_envelope_to_control_record(
             .and_then(|value| serde_json::from_str(value).ok()),
         signature: envelope.signature.clone(),
     }
+}
+
+/// Inverse of `raw_agent_envelope_to_control_record`. Messages are signed over
+/// their canonical serde_json form, so a stored envelope re-serialises to the
+/// signed bytes; callers still verify before trusting the result.
+fn control_record_to_raw_agent_envelope(
+    envelope: &crate::control::AgentInteractionEnvelope,
+) -> Option<RawAgentEnvelope> {
+    let source_agent_card = match &envelope.source_agent_card {
+        Some(card) => Some(serde_json::from_value::<RawSourceAgentCard>(card.clone()).ok()?),
+        None => None,
+    };
+    Some(RawAgentEnvelope {
+        protocol: envelope.protocol.clone(),
+        transport_profile: envelope.transport_profile.clone(),
+        source_agent_id: envelope.source_agent_id.clone(),
+        target_agent_id: envelope.target_agent_id.clone(),
+        source_node_id: envelope.source_node_id.clone(),
+        target_node_id: envelope.target_node_id.clone(),
+        capability: envelope.capability.clone(),
+        source_agent_card,
+        message_json: serde_json::to_string(&envelope.message).ok()?,
+        extensions_json: match &envelope.extensions {
+            Some(extensions) => Some(serde_json::to_string(extensions).ok()?),
+            None => None,
+        },
+        signature: envelope.signature.clone(),
+    })
+}
+
+/// A signed relationship accept sent by `source_node_id` to
+/// `target_node_id` for a specific request. Signature validity is checked
+/// separately so callers can record the verification outcome.
+pub(super) fn is_signed_relationship_envelope(
+    envelope: &RawAgentEnvelope,
+    source_node_id: &str,
+    target_node_id: &str,
+) -> bool {
+    envelope
+        .signature
+        .as_deref()
+        .is_some_and(|signature| !signature.trim().is_empty())
+        && envelope.source_node_id.as_deref() == Some(source_node_id)
+        && envelope.target_node_id.as_deref() == Some(target_node_id)
+        && raw_relationship_request_id(envelope).is_some()
+        && serde_json::from_str::<Value>(&envelope.message_json)
+            .ok()
+            .is_some_and(|message| message.get("action").and_then(Value::as_str) == Some("accept"))
+}
+
+/// The verified accept this node signed when it accepted `remote_node_id`.
+/// Returned with the response to the remote's relationship request so a
+/// requester that never received the accept push can still apply it.
+pub(super) fn local_signed_accept_for_remote(
+    state_dir: &Path,
+    local_node_id: &str,
+    remote_node_id: &str,
+    request_id: Option<&str>,
+) -> Option<RawAgentEnvelope> {
+    let record = crate::control::load_peer_relationship_records_state(state_dir)
+        .ok()?
+        .into_iter()
+        .find(|record| record.remote_node_id == remote_node_id)?;
+    if record.relationship_state != crate::control::PeerRelationshipState::Accepted {
+        return None;
+    }
+    let mut requests =
+        crate::control::load_peer_relationship_request_records_state(state_dir).ok()?;
+    // Stable sorting keeps the newest-first storage order for the fallback.
+    requests.sort_by_key(|request| Some(request.request_id.as_str()) != request_id);
+    requests
+        .into_iter()
+        .filter(|request| {
+            request.remote_node_id == remote_node_id
+                && request.relationship_state == crate::control::PeerRelationshipState::Accepted
+                && request.last_action == crate::control::PeerRelationshipAction::Accept
+                && request.initiated_by == crate::control::PeerRelationshipInitiator::Local
+        })
+        .find_map(|request| {
+            let envelope = control_record_to_raw_agent_envelope(&request.agent_envelope)?;
+            (is_signed_relationship_envelope(&envelope, local_node_id, remote_node_id)
+                && verify_agent_envelope_signature_for_source(&envelope, Some(local_node_id))
+                    .is_ok())
+            .then_some(envelope)
+        })
 }
 
 pub(super) fn raw_relationship_request_id(envelope: &RawAgentEnvelope) -> Option<String> {
@@ -1528,6 +1703,18 @@ pub(super) fn process_pending_network_commands(
                 ..
             } => {
                 if command.should_abandon() {
+                    if command.park_after_attempt_limit(now_ms) {
+                        record_command_observation(
+                            state_dir,
+                            service.monitoring_enabled,
+                            &command,
+                            "parked",
+                            command.attempts(),
+                            "attempt_limit",
+                        );
+                        retry.push(serde_json::to_string(&command)?);
+                        continue;
+                    }
                     record_command_observation(
                         state_dir,
                         service.monitoring_enabled,
@@ -1668,7 +1855,17 @@ pub(super) fn process_pending_network_commands(
                     &error,
                     "dispatch_failed",
                 );
-                if command.should_abandon() {
+                if command.should_abandon() && command.park_after_attempt_limit(now_ms) {
+                    record_command_observation(
+                        state_dir,
+                        service.monitoring_enabled,
+                        &command,
+                        "parked",
+                        command.attempts(),
+                        "attempt_limit",
+                    );
+                    retry.push(serde_json::to_string(&command)?);
+                } else if command.should_abandon() {
                     record_command_observation(
                         state_dir,
                         service.monitoring_enabled,
@@ -1786,10 +1983,111 @@ pub(super) fn pending_command_count(state_dir: &Path) -> Option<usize> {
 }
 
 #[cfg(test)]
+fn test_did_key_for_identity(identity: &crate::crypto::NodeIdentity) -> String {
+    let mut encoded = vec![0xed, 0x01];
+    encoded.extend_from_slice(identity.verifying_key().as_bytes());
+    format!("did:key:z{}", bs58::encode(encoded).into_string())
+}
+
+#[cfg(test)]
+fn test_sign_json<T: serde::Serialize>(
+    identity: &crate::crypto::NodeIdentity,
+    payload: &T,
+) -> String {
+    let bytes = serde_jcs::to_string(payload)
+        .expect("canonical payload")
+        .into_bytes();
+    let signing_key = ed25519_dalek::SigningKey::from_bytes(&identity.secret_bytes());
+    base64::engine::general_purpose::STANDARD
+        .encode(ed25519_dalek::Signer::sign(&signing_key, &bytes).to_bytes())
+}
+
+/// Envelope signed by a fresh agent identity whose card binds it to
+/// `source_node`, for tests that need real signature verification.
+#[cfg(test)]
+pub(super) fn signed_test_agent_envelope(
+    source_node: &str,
+    target_node: &str,
+    capability: &str,
+    message: &Value,
+) -> RawAgentEnvelope {
+    let identity = crate::crypto::NodeIdentity::random();
+    let agent_id = test_did_key_for_identity(&identity);
+    let card = json!({
+        "protocolVersion": "1.0",
+        "name": "Test Agent",
+        "skills": [{"id": "task", "name": "Task", "tags": ["task"]}],
+        "metadata": {
+            "agent_id": agent_id,
+            "node_id": source_node,
+            "transport_profile": "wattswarm_mesh"
+        }
+    });
+    let card_hash = format!(
+        "sha256:{}",
+        crate::crypto::sha256_hex(
+            serde_jcs::to_string(&card)
+                .expect("canonical card")
+                .as_bytes()
+        )
+    );
+    let source_node_id = source_node.to_owned();
+    let source_agent_card = RawSourceAgentCard {
+        agent_id: agent_id.clone(),
+        node_id: Some(source_node_id.clone()),
+        card_hash: card_hash.clone(),
+        issued_at: 42,
+        card,
+        signature: Some(test_sign_json(
+            &identity,
+            &UnsignedSourceAgentCard {
+                agent_id: &agent_id,
+                node_id: Some(&source_node_id),
+                card_hash: &card_hash,
+                issued_at: 42,
+            },
+        )),
+    };
+    let message_json = message.to_string();
+    let protocol = "google_a2a".to_owned();
+    let transport_profile = Some("wattswarm_mesh".to_owned());
+    let capability = Some(capability.to_owned());
+    let source_agent_id = Some(agent_id.clone());
+    let target_agent_id = Some("did:key:ztarget".to_owned());
+    let source_node_id = Some(source_node_id);
+    let target_node_id = Some(target_node.to_owned());
+    let unsigned = UnsignedAgentEnvelope {
+        protocol: &protocol,
+        transport_profile: transport_profile.as_ref(),
+        source_agent_id: source_agent_id.as_ref(),
+        target_agent_id: target_agent_id.as_ref(),
+        source_node_id: source_node_id.as_ref(),
+        target_node_id: target_node_id.as_ref(),
+        capability: capability.as_ref(),
+        source_agent_card_hash: Some(&card_hash),
+        message_json: &message_json,
+        extensions_json: None,
+    };
+    let signature = test_sign_json(&identity, &unsigned);
+    RawAgentEnvelope {
+        protocol,
+        transport_profile,
+        source_agent_id,
+        target_agent_id,
+        source_node_id,
+        target_node_id,
+        capability,
+        source_agent_card: Some(source_agent_card),
+        message_json,
+        extensions_json: None,
+        signature: Some(signature),
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use ed25519_dalek::{Signer, SigningKey};
-    use serde::Serialize;
     use serde_json::json;
 
     #[test]
@@ -1808,6 +2106,7 @@ mod tests {
             attempts: PENDING_NETWORK_COMMAND_MAX_ATTEMPTS - 1,
             next_retry_at: None,
             last_error: None,
+            parked_at: None,
         };
         record_command_observation(
             &state_dir,
@@ -1877,96 +2176,13 @@ mod tests {
         std::fs::remove_dir_all(state_dir).unwrap();
     }
 
-    fn did_key_for_identity(identity: &crate::crypto::NodeIdentity) -> String {
-        let mut encoded = vec![0xed, 0x01];
-        encoded.extend_from_slice(identity.verifying_key().as_bytes());
-        format!("did:key:z{}", bs58::encode(encoded).into_string())
-    }
-
-    fn sign_json<T: Serialize>(identity: &crate::crypto::NodeIdentity, payload: &T) -> String {
-        let bytes = serde_jcs::to_string(payload)
-            .expect("canonical payload")
-            .into_bytes();
-        let signing_key = SigningKey::from_bytes(&identity.secret_bytes());
-        base64::engine::general_purpose::STANDARD.encode(signing_key.sign(&bytes).to_bytes())
-    }
-
     fn signed_envelope_with_card(source_node: &str, target_node: &str) -> RawAgentEnvelope {
-        let identity = crate::crypto::NodeIdentity::random();
-        let agent_id = did_key_for_identity(&identity);
-        let card = json!({
-            "protocolVersion": "1.0",
-            "name": "Test Agent",
-            "skills": [{"id": "task", "name": "Task", "tags": ["task"]}],
-            "metadata": {
-                "agent_id": agent_id,
-                "node_id": source_node,
-                "transport_profile": "wattswarm_mesh"
-            }
-        });
-        let card_hash = format!(
-            "sha256:{}",
-            crate::crypto::sha256_hex(
-                serde_jcs::to_string(&card)
-                    .expect("canonical card")
-                    .as_bytes()
-            )
-        );
-        let source_node_id = source_node.to_owned();
-        let source_agent_card = RawSourceAgentCard {
-            agent_id: agent_id.clone(),
-            node_id: Some(source_node_id.clone()),
-            card_hash: card_hash.clone(),
-            issued_at: 42,
-            card,
-            signature: Some(sign_json(
-                &identity,
-                &UnsignedSourceAgentCard {
-                    agent_id: &agent_id,
-                    node_id: Some(&source_node_id),
-                    card_hash: &card_hash,
-                    issued_at: 42,
-                },
-            )),
-        };
-        let message_json = json!({
-            "task_id": "task-1",
-            "action": "claim"
-        })
-        .to_string();
-        let protocol = "google_a2a".to_owned();
-        let transport_profile = Some("wattswarm_mesh".to_owned());
-        let capability = Some("task.claim".to_owned());
-        let source_agent_id = Some(agent_id.clone());
-        let target_agent_id = Some("did:key:ztarget".to_owned());
-        let source_node_id = Some(source_node_id);
-        let target_node_id = Some(target_node.to_owned());
-        let unsigned = UnsignedAgentEnvelope {
-            protocol: &protocol,
-            transport_profile: transport_profile.as_ref(),
-            source_agent_id: source_agent_id.as_ref(),
-            target_agent_id: target_agent_id.as_ref(),
-            source_node_id: source_node_id.as_ref(),
-            target_node_id: target_node_id.as_ref(),
-            capability: capability.as_ref(),
-            source_agent_card_hash: Some(&card_hash),
-            message_json: &message_json,
-            extensions_json: None,
-        };
-        let signature = sign_json(&identity, &unsigned);
-        RawAgentEnvelope {
-            protocol,
-            transport_profile,
-            source_agent_id,
-            target_agent_id,
-            source_node_id,
-            target_node_id,
-            capability,
-            source_agent_card: Some(source_agent_card),
-            message_json,
-            extensions_json: None,
-            signature: Some(signature),
-        }
+        signed_test_agent_envelope(
+            source_node,
+            target_node,
+            "task.claim",
+            &json!({"task_id": "task-1", "action": "claim"}),
+        )
     }
 
     #[test]
@@ -2807,5 +3023,395 @@ mod tests {
         let commands = load_pending_network_commands(&state_dir).expect("load commands");
         assert!(commands.is_empty());
         let _ = std::fs::remove_dir_all(state_dir);
+    }
+
+    fn temp_relationship_state_dir(label: &str) -> PathBuf {
+        let state_dir = std::env::temp_dir().join(format!(
+            "wattswarm-{label}-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&state_dir).expect("create temp state dir");
+        state_dir
+    }
+
+    fn signed_accept(source_node: &str, target_node: &str) -> RawAgentEnvelope {
+        signed_test_agent_envelope(
+            source_node,
+            target_node,
+            "social.friend.accept",
+            &json!({"action": "accept", "request_id": "request-1"}),
+        )
+    }
+
+    fn parked_accept_command(remote_node_id: &str, parked_at: i64) -> PendingNetworkCommand {
+        PendingNetworkCommand::PeerRelationship {
+            remote_node_id: remote_node_id.to_owned(),
+            action: crate::control::PeerRelationshipAction::Accept,
+            agent_envelope: signed_accept("local-node", remote_node_id),
+            attempts: PENDING_NETWORK_COMMAND_MAX_ATTEMPTS,
+            next_retry_at: Some(parked_at + PARKED_PEER_RELATIONSHIP_TTL_MS),
+            last_error: Some("control stream timed out".to_owned()),
+            parked_at: Some(parked_at),
+        }
+    }
+
+    fn store_local_accept(state_dir: &Path, remote_node_id: &str, envelope: &RawAgentEnvelope) {
+        let request = signed_test_agent_envelope(
+            remote_node_id,
+            envelope.source_node_id.as_deref().expect("local node"),
+            "social.friend.request",
+            &json!({"action": "request", "request_id": raw_relationship_request_id(envelope).unwrap()}),
+        );
+        apply_peer_relationship_action_projection(
+            state_dir,
+            remote_node_id,
+            crate::control::PeerRelationshipAction::Request,
+            crate::control::PeerRelationshipInitiator::Remote,
+            &request,
+        )
+        .expect("remote request");
+        apply_peer_relationship_action_projection(
+            state_dir,
+            remote_node_id,
+            crate::control::PeerRelationshipAction::Accept,
+            crate::control::PeerRelationshipInitiator::Local,
+            envelope,
+        )
+        .expect("accept relationship");
+    }
+
+    #[test]
+    fn exhausted_accept_parks_until_ttl_then_abandons() {
+        let mut command = parked_accept_command("remote-node", 0);
+        if let PendingNetworkCommand::PeerRelationship {
+            parked_at,
+            next_retry_at,
+            ..
+        } = &mut command
+        {
+            *parked_at = None;
+            *next_retry_at = None;
+        }
+        assert!(command.park_after_attempt_limit(1_000));
+        assert!(command.is_parked_for("remote-node"));
+        assert!(!command.is_due(1_001));
+        assert!(command.is_due(1_000 + PARKED_PEER_RELATIONSHIP_TTL_MS));
+        // Re-parking keeps the original TTL anchor.
+        assert!(command.park_after_attempt_limit(5_000));
+        assert_eq!(
+            command.next_retry_at(),
+            Some(1_000 + PARKED_PEER_RELATIONSHIP_TTL_MS)
+        );
+        assert!(!command.park_after_attempt_limit(1_000 + PARKED_PEER_RELATIONSHIP_TTL_MS));
+    }
+
+    #[test]
+    fn only_accept_commands_are_parked() {
+        let envelope = default_agent_envelope("local-node", "remote-node", "x", json!({}));
+        for action in [
+            crate::control::PeerRelationshipAction::Request,
+            crate::control::PeerRelationshipAction::Reject,
+            crate::control::PeerRelationshipAction::Cancel,
+            crate::control::PeerRelationshipAction::Remove,
+            crate::control::PeerRelationshipAction::Block,
+        ] {
+            let mut command = PendingNetworkCommand::PeerRelationship {
+                remote_node_id: "remote-node".to_owned(),
+                action,
+                agent_envelope: envelope.clone(),
+                attempts: PENDING_NETWORK_COMMAND_MAX_ATTEMPTS,
+                next_retry_at: None,
+                last_error: None,
+                parked_at: None,
+            };
+            assert!(!command.park_after_attempt_limit(1_000), "{action:?}");
+        }
+        let mut payment = PendingNetworkCommand::AgentPayment {
+            remote_node_id: "remote-node".to_owned(),
+            message_kind: "payment_request".to_owned(),
+            payment: json!({}),
+            agent_envelope: envelope,
+            attempts: PENDING_NETWORK_COMMAND_MAX_ATTEMPTS,
+            next_retry_at: None,
+            last_error: None,
+        };
+        assert!(!payment.park_after_attempt_limit(1_000));
+    }
+
+    #[test]
+    fn reconnect_releases_parked_accept_for_one_attempt_while_still_accepted() {
+        let state_dir = temp_relationship_state_dir("parked-accept-release");
+        store_local_accept(
+            &state_dir,
+            "remote-node",
+            &signed_accept("local-node", "remote-node"),
+        );
+        let unrelated = PendingNetworkCommand::PeerRelationship {
+            remote_node_id: "other-node".to_owned(),
+            action: crate::control::PeerRelationshipAction::Request,
+            agent_envelope: default_agent_envelope("local-node", "other-node", "x", json!({})),
+            attempts: 1,
+            next_retry_at: Some(42),
+            last_error: None,
+            parked_at: None,
+        };
+        write_pending_network_commands(
+            &state_dir,
+            &[parked_accept_command("remote-node", 7), unrelated],
+        )
+        .expect("write commands");
+
+        assert_eq!(
+            release_parked_peer_relationship_commands(&state_dir, "other-node").expect("noop"),
+            0
+        );
+        assert_eq!(
+            release_parked_peer_relationship_commands(&state_dir, "remote-node").expect("release"),
+            1
+        );
+        let commands = load_pending_network_commands(&state_dir).expect("load commands");
+        assert_eq!(commands.len(), 2);
+        let released = &commands[0];
+        assert_eq!(
+            released.attempts(),
+            PENDING_NETWORK_COMMAND_MAX_ATTEMPTS - 1
+        );
+        assert!(released.is_due(0));
+        assert!(!released.should_abandon());
+        assert!(matches!(
+            released,
+            PendingNetworkCommand::PeerRelationship {
+                parked_at: Some(7),
+                ..
+            }
+        ));
+        assert_eq!(commands[1].next_retry_at(), Some(42));
+        let _ = std::fs::remove_dir_all(state_dir);
+    }
+
+    #[test]
+    fn reconnect_drops_parked_accept_once_relationship_is_no_longer_accepted() {
+        let state_dir = temp_relationship_state_dir("parked-accept-superseded");
+        store_local_accept(
+            &state_dir,
+            "remote-node",
+            &signed_accept("local-node", "remote-node"),
+        );
+        crate::control::apply_peer_relationship_action_state(
+            &state_dir,
+            "remote-node",
+            crate::control::PeerRelationshipAction::Remove,
+            crate::control::PeerRelationshipInitiator::Local,
+        )
+        .expect("remove relationship");
+        write_pending_network_commands(&state_dir, &[parked_accept_command("remote-node", 7)])
+            .expect("write commands");
+
+        assert_eq!(
+            release_parked_peer_relationship_commands(&state_dir, "remote-node").expect("release"),
+            0
+        );
+        assert!(
+            load_pending_network_commands(&state_dir)
+                .expect("load commands")
+                .is_empty()
+        );
+        let _ = std::fs::remove_dir_all(state_dir);
+    }
+
+    #[test]
+    fn local_signed_accept_round_trips_through_stored_relationship() {
+        let state_dir = temp_relationship_state_dir("stored-signed-accept");
+        let accept = signed_accept("local-node", "remote-node");
+        store_local_accept(&state_dir, "remote-node", &accept);
+        let record = crate::control::load_peer_relationship_records_state(&state_dir)
+            .expect("node relationships")
+            .remove(0);
+        let remote_envelope = record.agent_envelope.unwrap();
+        assert_eq!(
+            remote_envelope.source_node_id.as_deref(),
+            Some("remote-node")
+        );
+        assert!(remote_envelope.source_agent_card.is_some());
+
+        let returned =
+            local_signed_accept_for_remote(&state_dir, "local-node", "remote-node", None)
+                .expect("stored accept is returned");
+        assert_eq!(returned.message_json, accept.message_json);
+        assert_eq!(returned.signature, accept.signature);
+        verify_agent_envelope_signature_for_source(&returned, Some("local-node"))
+            .expect("returned accept still verifies");
+        assert!(
+            local_signed_accept_for_remote(&state_dir, "local-node", "other-node", None).is_none()
+        );
+        let _ = std::fs::remove_dir_all(state_dir);
+    }
+
+    #[test]
+    fn local_signed_accept_requires_a_verifiable_local_accept() {
+        let state_dir = temp_relationship_state_dir("stored-accept-guards");
+        let mut tampered = signed_accept("local-node", "remote-node");
+        tampered.message_json = json!({"action": "accept", "request_id": "request-2"}).to_string();
+        store_local_accept(&state_dir, "remote-node", &tampered);
+        assert!(
+            local_signed_accept_for_remote(&state_dir, "local-node", "remote-node", None).is_none()
+        );
+
+        // An accept this node received (remote initiated) is never echoed back.
+        let mut record = crate::control::load_peer_relationship_request_records_state(&state_dir)
+            .expect("records")
+            .remove(0);
+        record.agent_envelope =
+            raw_agent_envelope_to_control_record(&signed_accept("local-node", "remote-node"));
+        record.initiated_by = crate::control::PeerRelationshipInitiator::Remote;
+        crate::control::save_peer_relationship_request_record_state(&state_dir, &record)
+            .expect("save");
+        assert!(
+            local_signed_accept_for_remote(&state_dir, "local-node", "remote-node", None).is_none()
+        );
+        let _ = std::fs::remove_dir_all(state_dir);
+    }
+
+    #[test]
+    fn signed_relationship_envelope_rejects_synthesized_or_misaddressed_envelopes() {
+        let accept = signed_accept("remote-node", "local-node");
+        assert!(is_signed_relationship_envelope(
+            &accept,
+            "remote-node",
+            "local-node"
+        ));
+        assert!(!is_signed_relationship_envelope(
+            &accept,
+            "other-node",
+            "local-node"
+        ));
+        assert!(!is_signed_relationship_envelope(
+            &accept,
+            "remote-node",
+            "other-node"
+        ));
+        let synthesized = default_agent_envelope(
+            "remote-node",
+            "local-node",
+            "peer.relationship.response",
+            json!({"action": "request", "applied": true, "relationship_state": "accepted"}),
+        );
+        assert!(!is_signed_relationship_envelope(
+            &synthesized,
+            "remote-node",
+            "local-node"
+        ));
+        let without_request = signed_test_agent_envelope(
+            "remote-node",
+            "local-node",
+            "social.friend.accept",
+            &json!({"action": "accept"}),
+        );
+        assert!(!is_signed_relationship_envelope(
+            &without_request,
+            "remote-node",
+            "local-node"
+        ));
+        for (capability, action) in [
+            ("social.friend.request", "request"),
+            ("social.friend.reject", "reject"),
+            ("social.friend.accept", "reject"),
+        ] {
+            let envelope = signed_test_agent_envelope(
+                "remote-node",
+                "local-node",
+                capability,
+                &json!({"action": action, "request_id": "request-1"}),
+            );
+            assert!(!is_signed_relationship_envelope(
+                &envelope,
+                "remote-node",
+                "local-node"
+            ));
+        }
+        let peer_accept = signed_test_agent_envelope(
+            "remote-node",
+            "local-node",
+            "peer.relationship.accept",
+            &json!({"action": "accept", "request_id": "request-1"}),
+        );
+        assert!(is_signed_relationship_envelope(
+            &peer_accept,
+            "remote-node",
+            "local-node"
+        ));
+    }
+
+    #[test]
+    fn local_signed_accept_matches_request_before_latest_identity_accept() {
+        let state_dir = temp_relationship_state_dir("stored-accept-identities");
+        let older = signed_accept("local-node", "remote-node");
+        let newer = signed_test_agent_envelope(
+            "local-node",
+            "remote-node",
+            "custom.accept",
+            &json!({"action": "accept", "request_id": "request-2"}),
+        );
+        assert_ne!(older.source_agent_id, newer.source_agent_id);
+        store_local_accept(&state_dir, "remote-node", &older);
+        store_local_accept(&state_dir, "remote-node", &newer);
+        let mut records =
+            crate::control::load_peer_relationship_request_records_state(&state_dir).unwrap();
+        let older_at = records
+            .iter()
+            .find(|record| record.request_id == "request-1")
+            .unwrap()
+            .updated_at;
+        let newest = records
+            .iter_mut()
+            .find(|record| record.request_id == "request-2")
+            .unwrap();
+        newest.updated_at = newest.updated_at.max(older_at + 1);
+        crate::control::save_peer_relationship_request_record_state(&state_dir, newest).unwrap();
+
+        for (request_id, expected) in [
+            (Some("request-1"), &older),
+            (Some("request-2"), &newer),
+            (Some("missing-request"), &newer),
+            (None, &newer),
+        ] {
+            let returned =
+                local_signed_accept_for_remote(&state_dir, "local-node", "remote-node", request_id)
+                    .unwrap();
+            assert_eq!(returned.signature, expected.signature);
+            assert_eq!(returned.source_agent_id, expected.source_agent_id);
+            assert_eq!(
+                raw_relationship_request_id(&returned),
+                raw_relationship_request_id(expected)
+            );
+        }
+        fs::remove_dir_all(state_dir).unwrap();
+    }
+
+    #[test]
+    fn local_signed_accept_is_not_returned_after_remove_or_block() {
+        for action in [
+            crate::control::PeerRelationshipAction::Remove,
+            crate::control::PeerRelationshipAction::Block,
+        ] {
+            let state_dir = temp_relationship_state_dir("stored-accept-cleared");
+            store_local_accept(
+                &state_dir,
+                "remote-node",
+                &signed_accept("local-node", "remote-node"),
+            );
+            crate::control::apply_peer_relationship_action_state(
+                &state_dir,
+                "remote-node",
+                action,
+                crate::control::PeerRelationshipInitiator::Local,
+            )
+            .expect("clear node relationship");
+            assert!(
+                local_signed_accept_for_remote(&state_dir, "local-node", "remote-node", None)
+                    .is_none()
+            );
+            fs::remove_dir_all(state_dir).unwrap();
+        }
     }
 }
