@@ -1,3 +1,4 @@
+use super::peer_interactions::verified_agent_context_for_protocol_source;
 use super::*;
 
 const ENV_AGENT_EVENT_CALLBACK_TIMEOUT_MS: &str = "WATTSWARM_AGENT_EVENT_CALLBACK_TIMEOUT_MS";
@@ -347,6 +348,15 @@ fn route_agent_decision_to_wattswarm(
     decision: &wattswarm_protocol::types::AgentDecision,
 ) -> Result<(i64, String)> {
     match event.event_type {
+        wattswarm_protocol::types::AgentEventType::GlobalAnnouncementReceived => {
+            if decision.action != "ignore" {
+                bail!("global announcement only allows ignore");
+            }
+            Ok((
+                200,
+                json!({"ok":true, "status":"ignored", "event_id":event.event_id}).to_string(),
+            ))
+        }
         wattswarm_protocol::types::AgentEventType::TopicMessageRequiresReply => {
             let db_path = db_path.ok_or_else(|| {
                 anyhow!("wattswarm_direct topic routing requires a configured db_path")
@@ -853,10 +863,46 @@ pub(super) fn task_settled_agent_event(
     ))
 }
 
+pub(super) fn global_announcement_agent_event(
+    event: &crate::types::Event,
+    announcement: &crate::types::EventAnnouncementPayload,
+) -> Result<wattswarm_protocol::types::AgentEvent> {
+    let mut payload = serde_json::to_value(announcement)?;
+    payload["event_id"] = json!(event.event_id);
+    Ok(build_agent_event_with_agent_envelope(
+        wattswarm_protocol::types::AgentEventType::GlobalAnnouncementReceived,
+        wattswarm_protocol::types::AgentEventSourceKind::GlobalAnnouncement,
+        Some(event.author_node_id.clone()),
+        None,
+        None,
+        payload,
+        false,
+        vec!["ignore".to_owned()],
+        Some(announcement.announcement_id.clone()),
+        Some(format!(
+            "global_announcement:{}:{}",
+            announcement.network_id, announcement.announcement_id
+        )),
+    ))
+}
+
+pub fn deliver_global_announcement_to_local_executor(
+    state_dir: &Path,
+    db_path: Option<&Path>,
+    event: &crate::types::Event,
+) -> Result<()> {
+    let crate::types::EventPayload::EventAnnouncement(announcement) = &event.payload else {
+        return Ok(());
+    };
+    let agent_event = global_announcement_agent_event(event, announcement)?;
+    deliver_agent_event_to_local_executor(state_dir, db_path, &agent_event)
+}
+
 pub(super) fn topic_message_agent_event(
     node: &Node,
     event: &crate::types::Event,
     payload: &crate::types::TopicMessagePostedPayload,
+    local_agent_id: Option<&str>,
 ) -> Result<Option<wattswarm_protocol::types::AgentEvent>> {
     let Some(topic_message) = node.store.get_topic_message(&event.event_id)? else {
         return Ok(None);
@@ -866,29 +912,61 @@ pub(super) fn topic_message_agent_event(
         &topic_message.content,
         topic_message.agent_envelope.as_ref(),
     )?;
-    if is_board_message_agent_envelope(agent_envelope.as_ref()) {
-        return Ok(None);
+    let is_board_message = is_board_message_agent_envelope(agent_envelope.as_ref());
+    if is_board_message {
+        let target_agent_id = agent_envelope
+            .as_ref()
+            .and_then(|envelope| envelope.target_agent_id.as_deref());
+        if target_agent_id.is_none() || target_agent_id != local_agent_id {
+            return Ok(None);
+        }
+        verified_agent_context_for_protocol_source(
+            agent_envelope.as_ref().expect("addressed Board envelope"),
+            &event.author_node_id,
+        )?;
     }
     if !topic_message_requires_reply(&topic_message.content) {
         return Ok(None);
     }
+    let replied_to_content = payload
+        .reply_to_message_id
+        .as_deref()
+        .map(|message_id| node.store.get_topic_message(message_id))
+        .transpose()?
+        .flatten()
+        .filter(|message| {
+            message.network_id == payload.network_id
+                && message.feed_key == payload.feed_key
+                && message.scope_hint == payload.scope_hint
+        })
+        .map(|message| topic_message_agent_content(&payload.feed_key, &message.content));
+    let target_agent_id = is_board_message
+        .then(|| {
+            agent_envelope
+                .as_ref()
+                .and_then(|envelope| envelope.target_agent_id.clone())
+        })
+        .flatten();
+    let agent_event_payload = json!({
+        "message_id": &event.event_id,
+        "network_id": &payload.network_id,
+        "feed_key": &payload.feed_key,
+        "scope_hint": &payload.scope_hint,
+        "author_node_id": &event.author_node_id,
+        "content": topic_message_agent_content(&payload.feed_key, &topic_message.content),
+        "topic_content": topic_message.content,
+        "agent_envelope": &agent_envelope,
+        "reply_to_message_id": &payload.reply_to_message_id,
+        "replied_to_content": replied_to_content,
+        "created_at": event.created_at,
+    });
     Ok(Some(build_agent_event_with_agent_envelope(
         wattswarm_protocol::types::AgentEventType::TopicMessageRequiresReply,
         wattswarm_protocol::types::AgentEventSourceKind::TopicMessage,
         Some(event.author_node_id.clone()),
-        None,
+        target_agent_id,
         agent_envelope,
-        json!({
-            "message_id": &event.event_id,
-            "network_id": &payload.network_id,
-            "feed_key": &payload.feed_key,
-            "scope_hint": &payload.scope_hint,
-            "author_node_id": &event.author_node_id,
-            "content": topic_message_agent_content(&payload.feed_key, &topic_message.content),
-            "topic_content": topic_message.content,
-            "reply_to_message_id": &payload.reply_to_message_id,
-            "created_at": event.created_at,
-        }),
+        agent_event_payload,
         false,
         vec!["reply".to_owned(), "ignore".to_owned()],
         Some(payload.feed_key.clone()),
@@ -1403,4 +1481,44 @@ pub(super) fn deliver_agent_event_to_local_executor(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod global_announcement_tests {
+    use super::*;
+
+    #[test]
+    fn global_announcement_direct_decision_accepts_only_ignore() {
+        let event = build_agent_event(
+            crate::types::AgentEventType::GlobalAnnouncementReceived,
+            crate::types::AgentEventSourceKind::GlobalAnnouncement,
+            None,
+            None,
+            json!({"announcement_id":"a"}),
+            false,
+            vec!["ignore".to_owned()],
+            None,
+            None,
+        );
+        let mut decision = crate::types::AgentDecision {
+            decision_id: "ignore-a".to_owned(),
+            action: "ignore".to_owned(),
+            route: crate::types::AgentDecisionRoute::WattswarmDirect,
+            reason: None,
+            payload: Value::Null,
+        };
+        let (status, body) =
+            route_agent_decision_to_wattswarm(Path::new("unused"), None, &event, &decision)
+                .expect("ignore");
+        assert_eq!(status, 200);
+        assert_eq!(
+            serde_json::from_str::<Value>(&body).expect("response")["status"],
+            "ignored"
+        );
+        decision.action = "reply".to_owned();
+        assert!(
+            route_agent_decision_to_wattswarm(Path::new("unused"), None, &event, &decision)
+                .is_err()
+        );
+    }
 }

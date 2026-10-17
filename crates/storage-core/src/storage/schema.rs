@@ -664,6 +664,32 @@ fn migrate_events_swarm_scope_schema(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+fn migrate_events_global_announcement_schema(conn: &Connection) -> Result<()> {
+    if !column_exists(conn, "events", "announcement_network_id") {
+        conn.execute_batch("ALTER TABLE events ADD COLUMN announcement_network_id TEXT")?;
+    }
+    if !column_exists(conn, "events", "global_announcement_id") {
+        conn.execute_batch("ALTER TABLE events ADD COLUMN global_announcement_id TEXT")?;
+    }
+    let mut statement = conn.prepare(
+        "SELECT seq, event_json FROM events WHERE event_kind = 'EventAnnouncement'
+         AND (announcement_network_id IS NULL OR global_announcement_id IS NULL)",
+    )?;
+    let existing = statement
+        .query_map(params![], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    for (seq, json) in existing {
+        let event: Event = serde_json::from_str(&json)?;
+        if let crate::types::EventPayload::EventAnnouncement(payload) = event.payload {
+            conn.execute("UPDATE events SET announcement_network_id = $1, global_announcement_id = $2 WHERE seq = $3", params![payload.network_id, payload.announcement_id, seq])?;
+        }
+    }
+    conn.execute_batch("CREATE UNIQUE INDEX IF NOT EXISTS idx_events_global_announcement ON events(org_id, announcement_network_id, global_announcement_id) WHERE global_announcement_id IS NOT NULL")?;
+    Ok(())
+}
+
 /// One-time backfill of `events.swarm_scope` for rows written before the column
 /// existed. Reuses [`canonical_swarm_scope`] so the stored value matches the
 /// backfill-lane filter exactly. Unparseable scopes stay NULL and are excluded
@@ -2495,6 +2521,7 @@ impl PgStore {
             migrate_network_peer_sync_state_last_observed_schema(&conn)?;
             migrate_feed_subscription_network_id_schema(&conn)?;
             migrate_events_swarm_scope_schema(&conn)?;
+            migrate_events_global_announcement_schema(&conn)?;
             migrate_topic_cursor_network_id_schema(&conn)?;
             migrate_peer_relationships_local_trim_signature_column(&conn)?;
             migrate_peer_dm_messages_local_trim_product_columns(&conn)?;
@@ -2543,6 +2570,70 @@ impl PgStore {
 #[cfg(test)]
 mod swarm_scope_migration_tests {
     use super::*;
+
+    #[test]
+    fn global_announcement_upgrade_preserves_old_events_and_is_idempotent() {
+        let conn = Connection::open_in_memory().expect("configured backend");
+        conn.execute_batch("CREATE TABLE events (seq BIGSERIAL PRIMARY KEY, org_id TEXT NOT NULL, event_id TEXT NOT NULL UNIQUE, event_kind TEXT NOT NULL, event_json TEXT NOT NULL)").expect("old event table");
+        conn.execute(
+            "INSERT INTO events (org_id,event_id,event_kind,event_json) VALUES ($1,$2,$3,$4)",
+            params!["org", "old-event", "CheckpointCreated", "original old JSON"],
+        )
+        .expect("existing event");
+        let announcement = crate::types::EventAnnouncementPayload {
+            announcement_id: "existing-announcement".to_owned(),
+            network_id: "network".to_owned(),
+            authority_node_id: "authority".to_owned(),
+            issued_at: 100,
+            content: serde_json::json!({"opaque":null}),
+            authority_signature: "signature".to_owned(),
+        };
+        let event = crate::types::Event {
+            event_id: "existing-announcement-event".to_owned(),
+            protocol_version: "0.1.0".to_owned(),
+            event_kind: crate::types::EventKind::EventAnnouncement,
+            task_id: None,
+            swarm_scope: "global".to_owned(),
+            epoch: 1,
+            author_node_id: "relay".to_owned(),
+            created_at: 101,
+            payload: crate::types::EventPayload::EventAnnouncement(announcement),
+            signature_hex: "outer signature".to_owned(),
+        };
+        let event_json = serde_json::to_string(&event).expect("event JSON");
+        conn.execute(
+            "INSERT INTO events (org_id,event_id,event_kind,event_json) VALUES ($1,$2,$3,$4)",
+            params!["org", event.event_id, "EventAnnouncement", event_json],
+        )
+        .expect("pre-column announcement");
+        migrate_events_global_announcement_schema(&conn).expect("upgrade");
+        migrate_events_global_announcement_schema(&conn).expect("repeat upgrade");
+        assert_eq!(
+            conn.query_row(
+                "SELECT event_json FROM events WHERE event_id = 'old-event'",
+                params![],
+                |row| row.get::<_, String>(0)
+            )
+            .expect("old data"),
+            "original old JSON"
+        );
+        let stored:(String,String,String) = conn.query_row("SELECT announcement_network_id,global_announcement_id,event_json FROM events WHERE event_id = $1", params![event.event_id], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?))).expect("backfilled announcement");
+        assert_eq!(
+            stored,
+            (
+                "network".to_owned(),
+                "existing-announcement".to_owned(),
+                event_json
+            )
+        );
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM events", params![], |row| row
+                .get::<_, i64>(0))
+                .expect("event count"),
+            2
+        );
+        assert!(conn.execute("INSERT INTO events (org_id,event_id,event_kind,event_json,announcement_network_id,global_announcement_id) VALUES ($1,$2,$3,$4,$5,$6)", params!["org","duplicate","EventAnnouncement","{}","network","existing-announcement"]).is_err());
+    }
 
     fn verify_subscription_scope_upgrade(conn: Connection) {
         conn.execute_batch(

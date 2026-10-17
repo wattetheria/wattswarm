@@ -251,6 +251,13 @@ struct GovernanceCommand {
 
 #[derive(Subcommand, Debug)]
 enum GovernanceAction {
+    GlobalAnnouncement {
+        file: PathBuf,
+        #[arg(long = "announcement-id")]
+        announcement_id: String,
+        #[arg(long, default_value_t = 1)]
+        epoch: u64,
+    },
     MembershipUpdate {
         file: PathBuf,
         #[arg(long, default_value_t = 1)]
@@ -907,6 +914,21 @@ fn handle_governance(cmd: GovernanceCommand, state_dir: &Path, db_path: &Path) -
     ensure_mainnet_genesis_node(&node)?;
     let now = chrono::Utc::now().timestamp_millis().max(0) as u64;
     let (action, event) = match cmd.action {
+        GovernanceAction::GlobalAnnouncement {
+            file,
+            announcement_id,
+            epoch,
+        } => {
+            let content: serde_json::Value = serde_json::from_slice(&fs::read(&file)?)
+                .with_context(|| format!("parse announcement content from {}", file.display()))?;
+            let event = node.publish_global_announcement(announcement_id, content, epoch, now)?;
+            crate::network_bridge::deliver_global_announcement_to_local_executor(
+                state_dir,
+                Some(db_path),
+                &event,
+            )?;
+            ("global_announcement", event)
+        }
         GovernanceAction::MembershipUpdate {
             file,
             epoch,

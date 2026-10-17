@@ -526,7 +526,16 @@ impl NetworkBridgeService {
         if !EventRelevanceFilter::should_deliver(node, state_dir, &local_node_id, event) {
             return;
         }
-        if let Ok(Some(agent_event)) = topic_message_agent_event(node, event, payload) {
+        let checkpoint = load_network_permission_checkpoint(state_dir).ok().flatten();
+        let local_agent_id = checkpoint
+            .as_ref()
+            .filter(|checkpoint| {
+                checkpoint.node_id == local_node_id && checkpoint.network_id == payload.network_id
+            })
+            .map(|checkpoint| checkpoint.agent_did.as_str());
+        if let Ok(Some(agent_event)) =
+            topic_message_agent_event(node, event, payload, local_agent_id)
+        {
             let _ = deliver_agent_event_to_local_executor(
                 state_dir,
                 self.db_path.as_deref(),
@@ -935,6 +944,13 @@ impl NetworkBridgeService {
                             .scope(&envelope.scope)
                             .details(Value::Object(event_diagnostic_details(&ingested_event))),
                         );
+                        if let Some(state_dir) = &self.state_dir {
+                            let _ = deliver_global_announcement_to_local_executor(
+                                state_dir,
+                                self.db_path.as_deref(),
+                                &ingested_event,
+                            );
+                        }
                         if let Err(err) = self.maybe_sync_candidate_output(node, &ingested_event) {
                             eprintln!(
                                 "candidate output sync failed for {}: {err}",
@@ -1362,6 +1378,13 @@ impl NetworkBridgeService {
                         );
                     }
                     self.deliver_task_lifecycle_agent_event(node, &envelope.event);
+                    if let Some(state_dir) = &self.state_dir {
+                        let _ = deliver_global_announcement_to_local_executor(
+                            state_dir,
+                            self.db_path.as_deref(),
+                            &envelope.event,
+                        );
+                    }
                     self.save_agent_payment_event_if_applicable(node, &envelope.event);
                     if let Err(err) = self.maybe_sync_topic_message_content(
                         node,

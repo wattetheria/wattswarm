@@ -805,6 +805,554 @@ fn cli_node_update_authority_set_requires_genesis_and_updates_signed_envelope() 
 }
 
 #[test]
+fn cli_global_announcement_uses_genesis_and_existing_global_pipeline() {
+    use serde_json::{Value, json};
+    use std::path::Path;
+    use std::time::Instant;
+    use wattswarm::startup_config::{
+        NetworkMode, StartupConfig, save_startup_config, startup_config_path,
+    };
+    use wattswarm::types::{EventKind, EventPayload, NetworkProtocolParams};
+
+    fn wait_for(mut condition: impl FnMut() -> bool, message: &str) {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while Instant::now() < deadline {
+            if condition() {
+                return;
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+        panic!("{message}");
+    }
+
+    fn diagnostic_contains(state_dir: &Path, phase: &str, event_id: Option<&str>) -> bool {
+        std::fs::read_to_string(state_dir.join("diagnostics/wattswarm_node.jsonl"))
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .any(|row| row["phase"] == phase && event_id.is_none_or(|id| row["event_id"] == id))
+    }
+
+    fn start_ui(schema: &str, state_dir: &Path, listen: &str, iroh_bind: &str) -> ChildGuard {
+        ChildGuard(
+            cmd(schema)
+                .env("WATTSWARM_P2P_ENABLED", "true")
+                .env("WATTSWARM_P2P_MDNS", "false")
+                .env("WATTSWARM_P2P_LISTEN_ADDRS", "127.0.0.1:0")
+                .env("WATTSWARM_IROH_BIND_ADDR", iroh_bind)
+                .env("WATTSWARM_IROH_PUBLISH_DIRECT_ADDRS", iroh_bind)
+                .env("WATTSWARM_NETWORK_DEBUG_DIAGNOSTICS", "true")
+                .env("WATTSWARM_NETWORK_JOIN_MANIFEST_URLS", "http://127.0.0.1:9")
+                .env(
+                    "WATTSWARM_NETWORK_BOOTSTRAP_HTTP_URLS",
+                    "http://127.0.0.1:9",
+                )
+                .envs([
+                    ("WATTSWARM_PUBLIC_GATEWAY_URLS", "http://127.0.0.1:9"),
+                    ("WATTSWARM_PUBLIC_DISCOVERY_URLS", "http://127.0.0.1:9"),
+                    ("WATTSWARM_PUBLIC_BOOTSTRAP_URLS", "http://127.0.0.1:9"),
+                    ("WATTSWARM_IROH_RELAY_URLS", "http://127.0.0.1:9"),
+                    ("HTTP_PROXY", "http://127.0.0.1:9"),
+                    ("HTTPS_PROXY", "http://127.0.0.1:9"),
+                    ("ALL_PROXY", "http://127.0.0.1:9"),
+                    ("http_proxy", "http://127.0.0.1:9"),
+                    ("https_proxy", "http://127.0.0.1:9"),
+                    ("all_proxy", "http://127.0.0.1:9"),
+                    ("NO_PROXY", "127.0.0.1,localhost,::1"),
+                    ("no_proxy", "127.0.0.1,localhost,::1"),
+                ])
+                .env_remove("WATTSWARM_WATTETHERIA_SYNC_GRPC_LISTEN")
+                .args([
+                    "--state-dir",
+                    state_dir.to_str().unwrap(),
+                    "--store",
+                    "test.state",
+                    "ui",
+                    "--listen",
+                    listen,
+                ])
+                .stdout(Stdio::null())
+                .stderr(std::fs::File::create(state_dir.join("ui-stderr.log")).unwrap())
+                .spawn()
+                .unwrap(),
+        )
+    }
+
+    let dir = tempdir().unwrap();
+    let genesis_dir = dir.path().join("genesis");
+    let receiver_dir = dir.path().join("receiver");
+    let genesis_schema = CliSchemaGuard::new();
+    let receiver_schema = CliSchemaGuard::new();
+    let genesis = NodeIdentity::random();
+    let receiver = NodeIdentity::random();
+    let receipts = std::sync::Arc::new(Mutex::new(
+        Vec::<(String, wattswarm::types::AgentEvent)>::new(),
+    ));
+    let callback_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let callback_url = format!("http://{}", callback_listener.local_addr().unwrap());
+    callback_listener.set_nonblocking(true).unwrap();
+    let callback_runtime = tokio::runtime::Runtime::new().unwrap();
+    let callback_router = axum::Router::new().route(
+        "/:node/agent-events",
+        axum::routing::post({
+            let receipts = receipts.clone();
+            move |axum::extract::Path(node): axum::extract::Path<String>,
+                      axum::Json(request): axum::Json<
+                    wattswarm::types::AgentEventCallbackRequest,
+                >| {
+                    let receipts = receipts.clone();
+                    async move {
+                        receipts.lock().unwrap().push((node, request.event));
+                        axum::Json(json!({"ok":true}))
+                    }
+                }
+        }),
+    );
+    let callback_listener = {
+        let _entered = callback_runtime.enter();
+        tokio::net::TcpListener::from_std(callback_listener).unwrap()
+    };
+    callback_runtime.spawn(async move {
+        axum::serve(callback_listener, callback_router)
+            .await
+            .unwrap()
+    });
+    let network_id = format!("mainnet-announcement-{}", Uuid::new_v4().simple());
+    let params = NetworkProtocolParams {
+        anti_entropy_interval_secs: 1,
+        backfill_retry_after_secs: 1,
+        ..NetworkProtocolParams::default()
+    };
+    let mut config = StartupConfig {
+        network_mode: NetworkMode::Wan,
+        relay_urls: vec!["http://127.0.0.1:9/".to_owned()],
+        ..StartupConfig::default()
+    };
+    for (state_dir, schema, identity) in [
+        (&genesis_dir, genesis_schema.as_str(), &genesis),
+        (&receiver_dir, receiver_schema.as_str(), &receiver),
+    ] {
+        setup_mainnet_cli_state(
+            state_dir,
+            "test.state",
+            schema,
+            identity,
+            &genesis.node_id(),
+            &network_id,
+        );
+        with_pg_schema(schema, || {
+            PgStore::open(state_dir.join("test.state"))
+                .unwrap()
+                .put_network_protocol_params(&network_id, &genesis, &params)
+                .unwrap();
+        });
+        save_startup_config(&startup_config_path(state_dir), &config).unwrap();
+        with_pg_schema(schema, || {
+            wattswarm::control::save_executor_registry_state(
+                state_dir,
+                &wattswarm::control::ExecutorRegistry {
+                    entries: vec![wattswarm::control::ExecutorRegistryEntry {
+                        name: "core-agent".to_owned(),
+                        base_url: format!(
+                            "{callback_url}/{}",
+                            state_dir.file_name().unwrap().to_str().unwrap()
+                        ),
+                        agent_event_callback_base_url: None,
+                        kind: Default::default(),
+                        target_node_id: None,
+                        scope_hint: None,
+                        commit_plane_endpoint: None,
+                        commit_plane_token_file: None,
+                    }],
+                },
+            )
+            .unwrap();
+        });
+    }
+
+    let content = json!({"opaque": {"title":"network announcement"}, "optional":null});
+    let content_file = dir.path().join("content.json");
+    std::fs::write(&content_file, serde_json::to_vec(&content).unwrap()).unwrap();
+    let publish = |state_dir: &Path, schema: &str, file: &Path, id: &str| {
+        cmd(schema)
+            .env("WATTSWARM_NETWORK_JOIN_MANIFEST_URLS", "http://127.0.0.1:9")
+            .env(
+                "WATTSWARM_NETWORK_BOOTSTRAP_HTTP_URLS",
+                "http://127.0.0.1:9",
+            )
+            .envs([
+                ("HTTP_PROXY", "http://127.0.0.1:9"),
+                ("HTTPS_PROXY", "http://127.0.0.1:9"),
+                ("ALL_PROXY", "http://127.0.0.1:9"),
+                ("http_proxy", "http://127.0.0.1:9"),
+                ("https_proxy", "http://127.0.0.1:9"),
+                ("all_proxy", "http://127.0.0.1:9"),
+                ("NO_PROXY", "127.0.0.1,localhost,::1"),
+                ("no_proxy", "127.0.0.1,localhost,::1"),
+            ])
+            .args([
+                "--state-dir",
+                state_dir.to_str().unwrap(),
+                "--store",
+                "test.state",
+                "governance",
+                "global-announcement",
+                file.to_str().unwrap(),
+                "--announcement-id",
+                id,
+            ])
+            .output()
+            .unwrap()
+    };
+    let rejected = publish(
+        &receiver_dir,
+        receiver_schema.as_str(),
+        &content_file,
+        "unauthorized",
+    );
+    assert!(!rejected.status.success());
+    assert!(
+        String::from_utf8(rejected.stderr)
+            .unwrap()
+            .contains("requires mainnet genesis node")
+    );
+
+    let free_listen = || {
+        std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .to_string()
+    };
+    let genesis_listen = free_listen();
+    let receiver_listen = free_listen();
+    let free_iroh_bind = || {
+        std::net::UdpSocket::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .to_string()
+    };
+    let genesis_iroh_bind = free_iroh_bind();
+    let receiver_iroh_bind = free_iroh_bind();
+    let genesis_url = format!("http://{genesis_listen}");
+    let receiver_url = format!("http://{receiver_listen}");
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(3))
+        .build()
+        .unwrap();
+    let activate = |url: &str, node_id: &str| {
+        wait_for(
+            || {
+                client
+                    .get(format!("{url}/api/node/status"))
+                    .send()
+                    .is_ok_and(|r| r.status().is_success())
+            },
+            "UI must be reachable",
+        );
+        let response = client.post(format!("{url}/api/network/permission/checkpoint")).json(&json!({
+            "network_id": network_id, "node_id":node_id, "agent_did":"did:key:test-agent",
+            "permission_status":"active", "network_status":"running", "revision":1,
+            "credential_id":"test-credential", "credential_hash":"sha256:test-credential",
+            "credential_trust_anchor": {
+                "network_id":network_id, "trust_anchor_id":genesis.node_id(),
+                "signature_algorithm":"ed25519", "public_key_encoding":"hex", "public_key":genesis.node_id()
+            },
+            "last_error":null, "updated_at_ms":100,
+        })).send().unwrap().error_for_status().unwrap().json::<Value>().unwrap();
+        assert_eq!(response["network_start_requested"], true);
+    };
+    let contact = |url: &str| {
+        let mut material = None;
+        wait_for(
+            || {
+                material = client
+                    .get(format!("{url}/api/network/contact-material/local"))
+                    .send()
+                    .ok()
+                    .and_then(|r| r.error_for_status().ok())
+                    .and_then(|r| r.json::<Value>().ok())
+                    .and_then(|v| {
+                        v["contact_material"]["material_json"]
+                            .as_str()
+                            .map(str::to_owned)
+                    });
+                material.is_some()
+            },
+            "running node must export actual contact material",
+        );
+        material.unwrap()
+    };
+
+    let genesis_ui = start_ui(
+        genesis_schema.as_str(),
+        &genesis_dir,
+        &genesis_listen,
+        &genesis_iroh_bind,
+    );
+    activate(&genesis_url, &genesis.node_id());
+    config.bootstrap_contacts = vec![contact(&genesis_url)];
+    save_startup_config(&startup_config_path(&receiver_dir), &config).unwrap();
+    let _receiver_ui = start_ui(
+        receiver_schema.as_str(),
+        &receiver_dir,
+        &receiver_listen,
+        &receiver_iroh_bind,
+    );
+    activate(&receiver_url, &receiver.node_id());
+    wait_for(
+        || diagnostic_contains(&genesis_dir, "connection.established", None),
+        "genesis must connect before CLI publication",
+    );
+    thread::sleep(Duration::from_millis(500));
+
+    let published = publish(
+        &genesis_dir,
+        genesis_schema.as_str(),
+        &content_file,
+        "live-announcement",
+    );
+    assert!(
+        published.status.success(),
+        "{}",
+        String::from_utf8_lossy(&published.stderr)
+    );
+    let output: Value = serde_json::from_slice(&published.stdout).unwrap();
+    assert_eq!(output["action"], "global_announcement");
+    assert_eq!(output["author_node_id"], genesis.node_id());
+    let event_id = output["event_id"].as_str().unwrap();
+    wait_for(
+        || diagnostic_contains(&receiver_dir, "event.ingest.live", Some(event_id)),
+        "real Global gossip must deliver the CLI event",
+    );
+    let load = |state_dir: &Path, schema: &str, id: &str| {
+        with_pg_schema(schema, || {
+            PgStore::open(state_dir.join("test.state"))
+                .unwrap()
+                .for_org(wattswarm::storage::bootstrap_org_id(&network_id))
+                .get_global_announcement(&network_id, id)
+                .unwrap()
+                .unwrap()
+        })
+    };
+    let live = load(&genesis_dir, genesis_schema.as_str(), "live-announcement");
+    assert_eq!(
+        load(&receiver_dir, receiver_schema.as_str(), "live-announcement"),
+        live
+    );
+    wattswarm::crypto::verify_event_signature(&live).unwrap();
+    let EventPayload::EventAnnouncement(payload) = &live.payload else {
+        panic!("announcement payload")
+    };
+    assert_eq!(payload.authority_node_id, genesis.node_id());
+    assert_eq!(payload.network_id, network_id);
+    assert_eq!(payload.content, content);
+    wattswarm::crypto::verify_signature(
+        &genesis.node_id(),
+        &serde_jcs::to_vec(&payload.unsigned_payload()).unwrap(),
+        &payload.authority_signature,
+    )
+    .unwrap();
+    let page = client
+        .get(format!("{receiver_url}/api/global/messages"))
+        .send()
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json::<Value>()
+        .unwrap();
+    assert!(
+        page["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|message| message["message_id"] == event_id
+                && message["content"]["payload"] == serde_json::to_value(payload).unwrap())
+    );
+    assert_eq!(
+        client
+            .post(format!("{genesis_url}/api/global/announcements"))
+            .json(payload)
+            .send()
+            .unwrap()
+            .status()
+            .as_u16(),
+        404
+    );
+
+    for _ in 0..3 {
+        let repeated = publish(
+            &genesis_dir,
+            genesis_schema.as_str(),
+            &content_file,
+            "live-announcement",
+        );
+        assert!(repeated.status.success());
+        assert_eq!(
+            serde_json::from_slice::<Value>(&repeated.stdout).unwrap()["event_id"],
+            output["event_id"]
+        );
+        assert_eq!(
+            load(&genesis_dir, genesis_schema.as_str(), "live-announcement"),
+            live
+        );
+        with_pg_schema(genesis_schema.as_str(), || {
+            assert_eq!(
+                wattswarm::control::load_agent_event_records_state(&genesis_dir)
+                    .unwrap()
+                    .len(),
+                1
+            );
+        });
+        assert_eq!(
+            receipts
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(node, _)| node == "genesis")
+                .count(),
+            1
+        );
+    }
+    let conflicting_file = dir.path().join("conflict.json");
+    std::fs::write(&conflicting_file, b"{\"opaque\":\"different\"}").unwrap();
+    let conflicting = publish(
+        &genesis_dir,
+        genesis_schema.as_str(),
+        &conflicting_file,
+        "live-announcement",
+    );
+    assert!(!conflicting.status.success());
+    assert!(
+        String::from_utf8(conflicting.stderr)
+            .unwrap()
+            .contains("already published with different content")
+    );
+
+    config.bootstrap_contacts = vec![contact(&receiver_url)];
+    save_startup_config(&startup_config_path(&genesis_dir), &config).unwrap();
+    drop(genesis_ui);
+    let missed = publish(
+        &genesis_dir,
+        genesis_schema.as_str(),
+        &content_file,
+        "missed-announcement",
+    );
+    assert!(missed.status.success());
+    let missed_output: Value = serde_json::from_slice(&missed.stdout).unwrap();
+    let _restarted_genesis_ui = start_ui(
+        genesis_schema.as_str(),
+        &genesis_dir,
+        &genesis_listen,
+        &genesis_iroh_bind,
+    );
+    activate(&genesis_url, &genesis.node_id());
+    let recovered = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        wait_for(
+            || {
+                diagnostic_contains(
+                    &receiver_dir,
+                    "event.ingest.backfill",
+                    missed_output["event_id"].as_str(),
+                )
+            },
+            "offline CLI event must recover through existing Global backfill",
+        );
+    }));
+    if let Err(error) = recovered {
+        for state_dir in [&genesis_dir, &receiver_dir] {
+            eprintln!(
+                "{}\n{}",
+                state_dir.display(),
+                std::fs::read_to_string(state_dir.join("ui-stderr.log")).unwrap()
+            );
+            for line in std::fs::read_to_string(state_dir.join("diagnostics/wattswarm_node.jsonl"))
+                .unwrap()
+                .lines()
+            {
+                if line.contains(missed_output["event_id"].as_str().unwrap()) {
+                    eprintln!("{line}");
+                }
+            }
+        }
+        std::panic::resume_unwind(error);
+    }
+    assert_eq!(
+        load(
+            &receiver_dir,
+            receiver_schema.as_str(),
+            "missed-announcement"
+        ),
+        load(&genesis_dir, genesis_schema.as_str(), "missed-announcement")
+    );
+    for (state_dir, schema) in [
+        (&genesis_dir, genesis_schema.as_str()),
+        (&receiver_dir, receiver_schema.as_str()),
+    ] {
+        with_pg_schema(schema, || {
+            let mut node =
+                wattswarm::control::open_node(state_dir, &state_dir.join("test.state")).unwrap();
+            assert_eq!(
+                node.store
+                    .load_events_by_kinds(&[EventKind::EventAnnouncement])
+                    .unwrap()
+                    .len(),
+                2
+            );
+            node.replay_rebuild_projection().unwrap();
+            assert_eq!(
+                node.store
+                    .load_events_by_kinds(&[EventKind::EventAnnouncement])
+                    .unwrap()
+                    .len(),
+                2
+            );
+            let notifications =
+                wattswarm::control::load_agent_event_records_state(state_dir).unwrap();
+            assert_eq!(notifications.len(), 2);
+            assert!(notifications.iter().all(|event| event.event_type
+                == wattswarm::types::AgentEventType::GlobalAnnouncementReceived
+                && event.allowed_actions == ["ignore"]));
+        });
+    }
+    let receipts = receipts.lock().unwrap();
+    for node in ["genesis", "receiver"] {
+        let delivered = receipts
+            .iter()
+            .filter(|(target, _)| target == node)
+            .collect::<Vec<_>>();
+        assert_eq!(delivered.len(), 2);
+        assert!(delivered.iter().all(|(_, event)| event.event_type
+            == wattswarm::types::AgentEventType::GlobalAnnouncementReceived));
+    }
+    println!(
+        "GLOBAL_CLI_PUBLIC_EVIDENCE={}",
+        serde_json::to_string(&serde_json::json!({
+            "backend": std::env::var("WATTSWARM_STORAGE_BACKEND").unwrap_or_else(|_| "sqlite".into()),
+            "genesis_public_key": genesis.node_id(),
+            "receiver_public_key": receiver.node_id(),
+            "cli_output": output,
+            "signed_live_event": live,
+            "global_get": page,
+            "signed_backfilled_event": load(&receiver_dir, receiver_schema.as_str(), "missed-announcement"),
+            "same_id_repeats": 3,
+            "stored_events_per_node": 2,
+            "stored_notifications_per_node": 2,
+            "actual_http_callback_counts": {
+                "genesis": receipts.iter().filter(|(node, _)| node == "genesis").count(),
+                "receiver": receipts.iter().filter(|(node, _)| node == "receiver").count()
+            },
+            "non_genesis_rejected": true,
+            "conflicting_content_rejected": true,
+            "deleted_post_status": 404,
+            "live_gossip_and_restart_backfill_verified": true
+        }))
+        .unwrap()
+    );
+}
+
+#[test]
 fn cli_governance_commands_require_mainnet_genesis_and_emit_events() {
     let dir = tempdir().unwrap();
     let state_dir = dir.path().join("genesis-state");

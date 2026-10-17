@@ -1,6 +1,139 @@
 use super::*;
 
 #[test]
+fn global_announcement_authority_global_backfill_dedupe_and_replay() {
+    let authority = NodeIdentity::random();
+    let relay = NodeIdentity::random();
+    let network_id = "mainnet-auth-test";
+    let mut source = mainnet_node_with_genesis(relay.clone(), &authority.node_id());
+    let mut receiver = mainnet_node_with_genesis(NodeIdentity::random(), &authority.node_id());
+    for node in [&source, &receiver] {
+        node.store
+            .ensure_bootstrap_signed_network_protocol_params(network_id, &authority)
+            .expect("verified network authority pin");
+    }
+    let mut announcement = crate::types::EventAnnouncementPayload {
+        announcement_id: "announcement-1".to_owned(),
+        network_id: network_id.to_owned(),
+        authority_node_id: authority.node_id(),
+        issued_at: 200,
+        content: json!({"opaque": {"title":"public announcement"}, "optional": null}),
+        authority_signature: String::new(),
+    };
+    announcement.authority_signature = authority
+        .sign_bytes(&serde_jcs::to_vec(&announcement.unsigned_payload()).expect("JCS payload"));
+    let event = source
+        .emit_at(
+            1,
+            crate::types::EventPayload::EventAnnouncement(announcement.clone()),
+            201,
+        )
+        .expect("relay publishes authority-signed announcement");
+    assert_ne!(event.author_node_id, announcement.authority_node_id);
+    let route = event_transport_route(&source, &event)
+        .expect("transport route")
+        .expect("Global route");
+    assert_eq!(route.scope, SwarmScope::Global);
+    assert!(route.public_global_control);
+    let response = backfill_response_for_request(
+        &source,
+        "receiver",
+        &BackfillRequest {
+            scope: SwarmScope::Global,
+            from_event_seq: 0,
+            limit: 8,
+            head_only: false,
+            feed_key: None,
+            exclude_topic_events: true,
+            known_event_ids: Vec::new(),
+        },
+        32,
+        64,
+    )
+    .expect("Global backfill");
+    assert_eq!(response.events.len(), 1);
+    assert_eq!(response.events[0].event, event);
+    assert_eq!(
+        ingest_backfill_response(&mut receiver, &response).expect("backfill"),
+        1
+    );
+    assert_eq!(
+        ingest_backfill_response(&mut receiver, &response).expect("duplicate backfill"),
+        0
+    );
+    let relayed_again = build_event_for_external(
+        &NodeIdentity::random(),
+        1,
+        300,
+        crate::types::EventPayload::EventAnnouncement(announcement.clone()),
+    )
+    .expect("another outer signer");
+    assert!(
+        !receiver
+            .ingest_remote_if_new(relayed_again)
+            .expect("inner announcement dedupe")
+    );
+    let head = receiver.head_seq().expect("head");
+    receiver.replay_rebuild_projection().expect("replay");
+    assert_eq!(receiver.head_seq().expect("replayed head"), head);
+    let stored = receiver
+        .store
+        .get_global_announcement(network_id, "announcement-1")
+        .expect("stored announcement")
+        .expect("exists");
+    assert_eq!(stored.payload, event.payload);
+    let notification =
+        super::super::agent_delivery::global_announcement_agent_event(&stored, &announcement)
+            .expect("generic notification");
+    assert_eq!(
+        notification.event_type,
+        crate::types::AgentEventType::GlobalAnnouncementReceived
+    );
+    assert_eq!(notification.allowed_actions, vec!["ignore"]);
+    assert!(!notification.requires_commit);
+    assert_eq!(
+        notification.payload["authority_signature"],
+        announcement.authority_signature
+    );
+    assert_eq!(notification.payload["content"], announcement.content);
+    assert_eq!(
+        notification.dedupe_key.as_deref(),
+        Some("global_announcement:mainnet-auth-test:announcement-1")
+    );
+
+    let mut forged = announcement.clone();
+    forged.content = json!({"opaque":"tampered"});
+    assert!(receiver.validate_global_announcement(&forged).is_err());
+    let attacker = NodeIdentity::random();
+    forged.authority_node_id = attacker.node_id();
+    forged.authority_signature =
+        attacker.sign_bytes(&serde_jcs::to_vec(&forged.unsigned_payload()).expect("JCS"));
+    assert!(receiver.validate_global_announcement(&forged).is_err());
+    forged = announcement.clone();
+    forged.network_id = "another-network".to_owned();
+    forged.authority_signature =
+        authority.sign_bytes(&serde_jcs::to_vec(&forged.unsigned_payload()).expect("JCS"));
+    assert!(receiver.validate_global_announcement(&forged).is_err());
+    forged = announcement;
+    forged.content = json!({"opaque":"conflicting signed content"});
+    forged.authority_signature =
+        authority.sign_bytes(&serde_jcs::to_vec(&forged.unsigned_payload()).expect("JCS"));
+    assert!(
+        receiver
+            .emit_at(
+                1,
+                crate::types::EventPayload::EventAnnouncement(forged),
+                400
+            )
+            .is_err()
+    );
+    assert_eq!(
+        receiver.head_seq().expect("rejected events preserve head"),
+        head
+    );
+}
+
+#[test]
 fn task_announcement_event_persists_summary_and_detail_reference() {
     let mut node = Node::open_in_memory_with_roles(&[Role::Proposer]).expect("node");
     let policy_hash = node

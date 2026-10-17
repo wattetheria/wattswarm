@@ -44,6 +44,7 @@ pub struct Node {
 }
 
 mod core;
+mod global_announcements;
 mod knowledge;
 mod projection;
 mod validation_core;

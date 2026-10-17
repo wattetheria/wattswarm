@@ -218,6 +218,7 @@ fn is_public_global_control_event(payload: &crate::types::EventPayload) -> bool 
             | crate::types::EventPayload::EventRevoked(_)
             | crate::types::EventPayload::SummaryRevoked(_)
             | crate::types::EventPayload::NodePenalized(_)
+            | crate::types::EventPayload::EventAnnouncement(_)
     )
 }
 

@@ -177,6 +177,7 @@ pub fn record_private_hive_crypto_diagnostic(
     );
 }
 
+pub use agent_delivery::deliver_global_announcement_to_local_executor;
 #[cfg(test)]
 use agent_delivery::{build_agent_event, topic_message_requires_reply};
 use agent_delivery::{

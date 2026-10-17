@@ -1,13 +1,14 @@
 use wattswarm_protocol::types::{
     AgentEnvelope, AgentPaymentPostedPayload, ArtifactRef, BudgetMode, CheckpointCreatedPayload,
     DEFAULT_CONTROL_BACKFILL_RETRY_SECS, DEFAULT_CONTROL_MAX_DRIFT_BEFORE_SNAPSHOT,
-    DEFAULT_CONTROL_RANGE_LIMIT, DEFAULT_CONTROL_STATUS_INTERVAL_SECS, EventKind, EventPayload,
-    EventRevokedPayload, ExecutionIntentDeclaredPayload, ExecutionSetConfirmedPayload,
-    FeedSubscriptionUpdatedPayload, Membership, NetworkControlSyncParams, NetworkDescriptor,
-    NetworkKind, NetworkTopology, NodePenalizedPayload, OrgDescriptor, PolicyBinding, Role,
-    ScopeHint, SummaryRevokedPayload, TaskAnnouncedPayload, TaskContract, TaskDisseminationLayer,
-    TaskExpiredPayload, TaskMode, TopicMessagePostedPayload, TopicProviderCapabilities,
-    TransportRoute, UnsignedEvent, canonical_scope_hint, normalized_scope_hint,
+    DEFAULT_CONTROL_RANGE_LIMIT, DEFAULT_CONTROL_STATUS_INTERVAL_SECS, EventAnnouncementPayload,
+    EventKind, EventPayload, EventRevokedPayload, ExecutionIntentDeclaredPayload,
+    ExecutionSetConfirmedPayload, FeedSubscriptionUpdatedPayload, Membership,
+    NetworkControlSyncParams, NetworkDescriptor, NetworkKind, NetworkTopology,
+    NodePenalizedPayload, OrgDescriptor, PolicyBinding, Role, ScopeHint, SummaryRevokedPayload,
+    TaskAnnouncedPayload, TaskContract, TaskDisseminationLayer, TaskExpiredPayload, TaskMode,
+    TopicMessagePostedPayload, TopicProviderCapabilities, TransportRoute, UnsignedEvent,
+    canonical_scope_hint, normalized_scope_hint,
 };
 
 fn sample_topic_content_ref() -> ArtifactRef {
@@ -680,5 +681,27 @@ fn topic_message_payload_roundtrip_preserves_inline_content_cache() {
     assert_eq!(
         public_decoded.local_content_cache,
         Some(serde_json::json!({"text": "public chat"}))
+    );
+}
+
+#[test]
+fn event_announcement_uses_the_new_protocol_names() {
+    let payload = EventPayload::EventAnnouncement(EventAnnouncementPayload {
+        announcement_id: "announcement-1".to_owned(),
+        network_id: "network-1".to_owned(),
+        authority_node_id: "authority-1".to_owned(),
+        issued_at: 1,
+        content: serde_json::json!({"title": "town event"}),
+        authority_signature: "signature".to_owned(),
+    });
+
+    assert_eq!(payload.kind(), EventKind::EventAnnouncement);
+    assert_eq!(
+        serde_json::to_value(EventKind::EventAnnouncement).expect("encode event kind"),
+        serde_json::json!("EVENT_ANNOUNCEMENT")
+    );
+    assert_eq!(
+        serde_json::to_value(payload).expect("encode event payload")["type"],
+        "EventAnnouncement"
     );
 }

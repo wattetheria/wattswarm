@@ -16,6 +16,7 @@ pub(crate) struct TopicMessagesQuery {
     network_id: Option<String>,
     feed_key: String,
     scope_hint: String,
+    message_id: Option<String>,
     limit: Option<usize>,
     before_created_at: Option<u64>,
     before_message_id: Option<String>,
@@ -187,6 +188,18 @@ pub(crate) async fn topic_messages(
     if scope_hint.is_empty() {
         return Err(anyhow!("scope_hint is required").into());
     }
+    let message_id = query.message_id.map(|value| value.trim().to_owned());
+    if let Some(message_id) = &message_id {
+        if message_id.is_empty() {
+            return Err(anyhow!("message_id cannot be empty").into());
+        }
+        if query.limit.is_some()
+            || query.before_created_at.is_some()
+            || query.before_message_id.is_some()
+        {
+            return Err(anyhow!("message_id cannot be combined with pagination").into());
+        }
+    }
     let before_created_at = query.before_created_at;
     let before_message_id = query
         .before_message_id
@@ -197,25 +210,40 @@ pub(crate) async fn topic_messages(
     let payload = run_blocking(move || -> Result<Value> {
         let node = open_node(&state_clone.state_dir, &state_clone.db_path)?;
         let network_id = network_id.unwrap_or_else(|| resolve_network_id(&node));
-        let mut messages = node.store.list_topic_messages_page(
-            &network_id,
-            &feed_key,
-            &scope_hint,
-            before_created_at,
-            before_message_id.as_deref(),
-            limit,
-        )?;
+        let mut messages = if let Some(message_id) = &message_id {
+            node.store
+                .get_topic_message(message_id)?
+                .filter(|message| {
+                    message.network_id == network_id
+                        && message.feed_key == feed_key
+                        && message.scope_hint == scope_hint
+                })
+                .into_iter()
+                .collect()
+        } else {
+            node.store.list_topic_messages_page(
+                &network_id,
+                &feed_key,
+                &scope_hint,
+                before_created_at,
+                before_message_id.as_deref(),
+                limit,
+            )?
+        };
         maybe_decrypt_private_hive_topic_messages_for_response(
             &state_clone.state_dir,
             &node,
             &mut messages,
         );
-        let next_anchor = messages.last().map(|message| {
-            json!({
-                "before_created_at": message.created_at,
-                "before_message_id": message.message_id,
-            })
-        });
+        let next_anchor = messages
+            .last()
+            .filter(|_| message_id.is_none())
+            .map(|message| {
+                json!({
+                    "before_created_at": message.created_at,
+                    "before_message_id": message.message_id,
+                })
+            });
         Ok(json!({
             "ok": true,
             "network_id": network_id,

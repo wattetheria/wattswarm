@@ -217,6 +217,7 @@ pub enum AgentEventType {
     TaskCompletionDecisionReceived,
     TaskSettledReceived,
     TopicMessageRequiresReply,
+    GlobalAnnouncementReceived,
     ThirdPartyResult,
 }
 
@@ -239,6 +240,7 @@ pub enum AgentEventSourceKind {
     PaymentSummary,
     TaskLifecycle,
     TopicMessage,
+    GlobalAnnouncement,
     ServiceNetResult,
 }
 
@@ -1305,6 +1307,28 @@ pub struct SeedBundle {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EventAnnouncementPayload {
+    pub announcement_id: String,
+    pub network_id: String,
+    pub authority_node_id: String,
+    pub issued_at: u64,
+    pub content: Value,
+    pub authority_signature: String,
+}
+
+impl EventAnnouncementPayload {
+    pub fn unsigned_payload(&self) -> Value {
+        serde_json::json!({
+            "announcement_id": self.announcement_id,
+            "network_id": self.network_id,
+            "authority_node_id": self.authority_node_id,
+            "issued_at": self.issued_at,
+            "content": self.content,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", content = "payload")]
 #[allow(clippy::large_enum_variant)]
 pub enum EventPayload {
@@ -1337,6 +1361,7 @@ pub enum EventPayload {
     ExecutionIntentDeclared(ExecutionIntentDeclaredPayload),
     ExecutionSetConfirmed(ExecutionSetConfirmedPayload),
     TopicMessagePosted(TopicMessagePostedPayload),
+    EventAnnouncement(EventAnnouncementPayload),
     AgentPaymentPosted(AgentPaymentPostedPayload),
     MembershipUpdated(MembershipUpdatedPayload),
     PolicyTuned(PolicyTunedPayload),
@@ -1383,6 +1408,7 @@ pub enum EventKind {
     ExecutionIntentDeclared,
     ExecutionSetConfirmed,
     TopicMessagePosted,
+    EventAnnouncement,
     AgentPaymentPosted,
     MembershipUpdated,
     PolicyTuned,
@@ -1440,6 +1466,7 @@ impl EventPayload {
             Self::ExecutionIntentDeclared(_) => EventKind::ExecutionIntentDeclared,
             Self::ExecutionSetConfirmed(_) => EventKind::ExecutionSetConfirmed,
             Self::TopicMessagePosted(_) => EventKind::TopicMessagePosted,
+            Self::EventAnnouncement(_) => EventKind::EventAnnouncement,
             Self::AgentPaymentPosted(_) => EventKind::AgentPaymentPosted,
             Self::MembershipUpdated(_) => EventKind::MembershipUpdated,
             Self::PolicyTuned(_) => EventKind::PolicyTuned,
@@ -1486,6 +1513,7 @@ impl EventPayload {
             Self::ExecutionIntentDeclared(p) => Some(&p.task_id),
             Self::ExecutionSetConfirmed(p) => Some(&p.task_id),
             Self::TopicMessagePosted(_) => None,
+            Self::EventAnnouncement(_) => None,
             Self::AgentPaymentPosted(_) => None,
             Self::MembershipUpdated(_) => None,
             Self::PolicyTuned(_) => None,
@@ -1504,9 +1532,9 @@ impl EventPayload {
     pub fn dissemination_layer(&self) -> TaskDisseminationLayer {
         match self {
             Self::TaskCreated(_) => TaskDisseminationLayer::TaskDetail,
-            Self::FeedSubscriptionUpdated(_) | Self::TaskAnnounced(_) => {
-                TaskDisseminationLayer::Announcement
-            }
+            Self::FeedSubscriptionUpdated(_)
+            | Self::TaskAnnounced(_)
+            | Self::EventAnnouncement(_) => TaskDisseminationLayer::Announcement,
             Self::ExecutionIntentDeclared(_) | Self::ExecutionSetConfirmed(_) => {
                 TaskDisseminationLayer::ExecutionCoordination
             }
@@ -1898,6 +1926,7 @@ pub fn static_event_payload_scope_hint(payload: &EventPayload) -> Option<ScopeHi
         | EventPayload::EventRevoked(_)
         | EventPayload::SummaryRevoked(_)
         | EventPayload::NodePenalized(_) => Some(ScopeHint::Global),
+        EventPayload::EventAnnouncement(_) => Some(ScopeHint::Global),
         EventPayload::TaskClaimed(_)
         | EventPayload::TaskClaimRenewed(_)
         | EventPayload::TaskClaimReleased(_)

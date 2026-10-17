@@ -158,6 +158,7 @@ impl Node {
             EventPayload::TopicMessagePosted(payload) => {
                 self.validate_topic_message_posted(payload)
             }
+            EventPayload::EventAnnouncement(payload) => self.validate_global_announcement(payload),
             EventPayload::AgentPaymentPosted(payload) => {
                 self.validate_agent_payment_posted(event, payload)
             }
@@ -183,6 +184,34 @@ impl Node {
             EventPayload::SummaryRevoked(payload) => self.validate_summary_revoked(payload),
             EventPayload::NodePenalized(payload) => self.validate_node_penalized(event, payload),
         }
+    }
+
+    pub fn validate_global_announcement(
+        &self,
+        payload: &crate::types::EventAnnouncementPayload,
+    ) -> Result<()> {
+        let trusted = self.store.load_verified_network_protocol_params()?;
+        if payload.network_id != trusted.network_id {
+            return Err(
+                SwarmError::InvalidEvent("global announcement network_id mismatch".into()).into(),
+            );
+        }
+        if payload.authority_node_id != trusted.genesis_node_id {
+            return Err(SwarmError::Unauthorized(
+                "global announcement signer is not the trusted Network Authority".into(),
+            )
+            .into());
+        }
+        if payload.announcement_id.trim().is_empty() {
+            return Err(SwarmError::InvalidEvent("global announcement_id required".into()).into());
+        }
+        let bytes = serde_jcs::to_vec(&payload.unsigned_payload())?;
+        verify_signature(
+            &payload.authority_node_id,
+            &bytes,
+            &payload.authority_signature,
+        )
+        .context("global announcement authority signature verify")
     }
 
     fn validate_signed_swarm_scope(&self, event: &Event) -> Result<()> {
@@ -232,6 +261,7 @@ impl Node {
             EventPayload::ExecutionIntentDeclared(p) => (None, Some(&p.participant_node_id)),
             EventPayload::ExecutionSetConfirmed(p) => (None, Some(&p.confirmed_by_node_id)),
             EventPayload::TopicMessagePosted(_) => (None, None),
+            EventPayload::EventAnnouncement(_) => (None, None),
             EventPayload::AgentPaymentPosted(_) => (None, None),
             EventPayload::MembershipUpdated(_) => (Some(Role::Finalizer), None),
             EventPayload::PolicyTuned(_) => (Some(Role::Finalizer), None),

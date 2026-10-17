@@ -1403,13 +1403,130 @@ fn board_topic_messages_do_not_create_agent_events() {
             panic!("expected topic message");
         };
 
-        let agent_event =
-            topic_message_agent_event(&node, &ingested, payload).expect("board agent event result");
+        let agent_event = topic_message_agent_event(&node, &ingested, payload, None)
+            .expect("board agent event result");
         assert!(
             agent_event.is_none(),
             "Board message created an agent event"
         );
     }
+}
+
+#[test]
+fn directed_board_message_wakes_only_target_and_preserves_reply_context() {
+    let local = NodeIdentity::random();
+    let remote = NodeIdentity::random();
+    let local_node_id = local.node_id();
+    let remote_node_id = remote.node_id();
+    let node = Node::new(
+        local,
+        PgStore::open_in_memory().expect("store"),
+        membership_with_roles(&[local_node_id.clone(), remote_node_id.clone()]),
+    )
+    .expect("node");
+    let content = json!({"category":"general", "message":"answer"});
+    let envelope = raw_agent_envelope_to_protocol(&signed_test_agent_envelope(
+        &remote_node_id,
+        &local_node_id,
+        "board.message.publish",
+        &content,
+    ));
+    let original_content = json!({"category":"general", "message":"question"});
+    let content_ref = sample_topic_content_ref("sha256:board-original", &remote_node_id);
+    node.store
+        .put_topic_message(
+            "board-original",
+            "default",
+            "public.general",
+            "group:board-general",
+            &remote_node_id,
+            None,
+            &content_ref,
+            Some(&original_content),
+            None,
+            9,
+        )
+        .expect("store original");
+    let event = build_event_for_external(
+        &remote,
+        1,
+        10,
+        crate::types::EventPayload::TopicMessagePosted(crate::types::TopicMessagePostedPayload {
+            network_id: "default".to_owned(),
+            feed_key: "public.general".to_owned(),
+            scope_hint: "group:board-general".to_owned(),
+            content_ref: content_ref.clone(),
+            local_content_cache: Some(content.clone()),
+            reply_to_message_id: Some("board-original".to_owned()),
+            agent_envelope: Some(envelope.clone()),
+        }),
+    )
+    .expect("signed topic event");
+    let crate::types::EventPayload::TopicMessagePosted(payload) = &event.payload else {
+        panic!("topic payload");
+    };
+    node.store
+        .put_topic_message(
+            &event.event_id,
+            &payload.network_id,
+            &payload.feed_key,
+            &payload.scope_hint,
+            &remote_node_id,
+            Some(&envelope),
+            &content_ref,
+            Some(&content),
+            payload.reply_to_message_id.as_deref(),
+            event.created_at,
+        )
+        .expect("store reply");
+    assert!(
+        topic_message_agent_event(&node, &event, payload, Some("did:key:other"))
+            .expect("non-target result")
+            .is_none()
+    );
+    assert!(
+        topic_message_agent_event(&node, &event, payload, None)
+            .expect("no local identity")
+            .is_none()
+    );
+    let delivered = topic_message_agent_event(&node, &event, payload, Some("did:key:ztarget"))
+        .expect("target result")
+        .expect("directed Board event");
+    assert_eq!(
+        delivered.event_type,
+        wattswarm_protocol::types::AgentEventType::TopicMessageRequiresReply
+    );
+    assert_eq!(
+        delivered.target_agent_id.as_deref(),
+        Some("did:key:ztarget")
+    );
+    assert_eq!(delivered.agent_envelope, Some(envelope.clone()));
+    assert_eq!(
+        delivered.payload["agent_envelope"],
+        serde_json::to_value(envelope).expect("envelope value")
+    );
+    assert_eq!(delivered.payload["message_id"], event.event_id);
+    assert_eq!(delivered.payload["network_id"], "default");
+    assert_eq!(delivered.payload["feed_key"], "public.general");
+    assert_eq!(delivered.payload["scope_hint"], "group:board-general");
+    assert_eq!(delivered.payload["content"], content);
+    assert_eq!(delivered.payload["reply_to_message_id"], "board-original");
+    assert_eq!(delivered.payload["replied_to_content"], original_content);
+    assert_eq!(delivered.allowed_actions, vec!["reply", "ignore"]);
+    let mut tampered = payload.clone();
+    tampered
+        .agent_envelope
+        .as_mut()
+        .expect("envelope")
+        .message_json = "{}".to_owned();
+    assert!(topic_message_agent_event(&node, &event, &tampered, Some("did:key:ztarget")).is_err());
+    let mut unsigned = payload.clone();
+    unsigned
+        .agent_envelope
+        .as_mut()
+        .expect("envelope")
+        .signature = None;
+    assert!(topic_message_agent_event(&node, &event, &unsigned, Some("did:key:ztarget")).is_err());
 }
 
 #[test]
@@ -1465,7 +1582,7 @@ fn private_dm_topic_agent_event_exposes_direct_message_content() {
     let crate::types::EventPayload::TopicMessagePosted(payload) = &ingested.payload else {
         panic!("expected topic message");
     };
-    let agent_event = topic_message_agent_event(&node, &ingested, payload)
+    let agent_event = topic_message_agent_event(&node, &ingested, payload, None)
         .expect("agent event result")
         .expect("agent event");
 
@@ -1568,7 +1685,7 @@ fn private_hive_topic_agent_event_uses_decrypted_stored_agent_envelope() {
         )
         .expect("store decrypted private hive message");
 
-    let agent_event = topic_message_agent_event(&node, &remote_event, payload)
+    let agent_event = topic_message_agent_event(&node, &remote_event, payload, None)
         .expect("agent event result")
         .expect("agent event");
 

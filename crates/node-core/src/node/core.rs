@@ -206,6 +206,7 @@ impl Node {
             | EventPayload::EventRevoked(_)
             | EventPayload::SummaryRevoked(_)
             | EventPayload::NodePenalized(_) => Ok(ScopeHint::Global),
+            EventPayload::EventAnnouncement(_) => Ok(ScopeHint::Global),
             _ => {
                 let Some(task_id) = payload.task_id() else {
                     return Err(SwarmError::InvalidEvent("event scope unavailable".into()).into());
@@ -230,6 +231,17 @@ impl Node {
             .context("append event")?
             .is_none()
         {
+            if let EventPayload::EventAnnouncement(payload) = &event.payload
+                && self
+                    .store
+                    .get_global_announcement(&payload.network_id, &payload.announcement_id)?
+                    .is_some_and(|existing| existing.payload != event.payload)
+            {
+                return Err(SwarmError::InvalidEvent(
+                    "announcement_id already published with different content".into(),
+                )
+                .into());
+            }
             return Ok(false);
         }
         if event_requires_projection_rebuild(&event.payload) {

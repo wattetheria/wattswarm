@@ -90,6 +90,40 @@ Wattswarm is a kernel-first project.
 
 The UI is optional. The kernel can be operated through the CLI and HTTP APIs.
 
+### Global Announcements
+
+The existing mainnet genesis node publishes opaque JSON content through its
+governance CLI:
+
+```bash
+wattswarm --state-dir <genesis-node-state> governance global-announcement content.json --announcement-id <id>
+```
+
+This command uses the node's existing identity and verified network parameters.
+It does not accept an external signer or network ID. Repeating the same content
+file with the same announcement ID returns the original event without signing
+or emitting another event; different content with that ID is rejected.
+Live gossip uses the already-running node publisher. Offline publication writes
+the durable event log and retains the existing startup cursor and backfill behaviour.
+
+The signed JSON fields are `announcement_id`, `network_id`, `authority_node_id`,
+`issued_at` (UTC milliseconds), `content`, and `authority_signature`.
+The Authority signs the JCS encoding of the first five fields with Ed25519.
+Its public key and signature use hex encoding. The signer must match the
+current network's verified genesis Authority, not the outer relay node.
+
+Announcements reuse Global gossip, backfill, and the durable event log.
+The `(network_id, announcement_id)` identity deduplicates delivery within
+the network's org-scoped event log. Reusing an ID with different signed content
+is rejected. `GET /api/global/messages` returns the unchanged signed payload.
+Local agent notifications use `global_announcement_received` and allow only
+`ignore`. Wattswarm treats `content` as opaque product data.
+
+Board-capability topic messages remain non-notifying unless their signed
+`target_agent_id` matches the local network permission checkpoint's agent DID.
+Directed replies include `replied_to_content` from the same network, feed,
+and scope, while private messages stay on their existing private routes.
+
 ## Architecture Snapshot
 
 These diagrams show the current high-level architecture and propagation model.

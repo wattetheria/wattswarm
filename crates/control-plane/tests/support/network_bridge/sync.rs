@@ -1,5 +1,153 @@
 use super::*;
 
+pub fn two_nodes_global_announcement_gossip_and_missed_backfill_over_iroh() {
+    let authority = NodeIdentity::random();
+    let network_id = "default";
+    let make_authorized_node = |identity: NodeIdentity| {
+        let store = PgStore::open_in_memory().expect("store");
+        let topology = store
+            .ensure_mainnet_bootstrap_network_topology(
+                network_id,
+                "Announcement Test",
+                &authority.node_id(),
+                &authority.node_id(),
+                100,
+            )
+            .expect("network topology");
+        store
+            .ensure_bootstrap_signed_network_protocol_params(network_id, &authority)
+            .expect("signed network params");
+        Node::new(
+            identity,
+            store.for_org(topology.org.org_id),
+            Membership::new(),
+        )
+        .expect("authorized node")
+    };
+    let mut node_a = make_authorized_node(NodeIdentity::random());
+    let mut node_b = make_authorized_node(NodeIdentity::random());
+    let mut service_a = make_fast_service();
+    let bootstrap_peer = bootstrap_peer_addr(&mut service_a, &mut node_a);
+    let mut service_b = make_bootstrap_service_with_params(
+        &[SwarmScope::Global],
+        &test_protocol_params(),
+        &[bootstrap_peer],
+    );
+    connect_services(&mut service_b, &mut node_b, &mut service_a, &mut node_a);
+    pump_services_for(
+        &mut service_a,
+        &mut node_a,
+        &mut service_b,
+        &mut node_b,
+        scaled_timeout(Duration::from_secs(1)),
+    );
+    let signed_announcement = |id: &str| {
+        let mut payload = wattswarm_protocol::types::EventAnnouncementPayload {
+            announcement_id: id.to_owned(),
+            network_id: network_id.to_owned(),
+            authority_node_id: authority.node_id(),
+            issued_at: 200,
+            content: json!({"opaque":"network announcement"}),
+            authority_signature: String::new(),
+        };
+        payload.authority_signature =
+            authority.sign_bytes(&serde_jcs::to_vec(&payload.unsigned_payload()).expect("JCS"));
+        payload
+    };
+    let live_payload = signed_announcement("live-announcement");
+    let live = node_a
+        .emit_at(
+            1,
+            EventPayload::EventAnnouncement(live_payload.clone()),
+            201,
+        )
+        .expect("publish live");
+    assert!(
+        publish_pending_global_events(&mut service_a, &node_a, &node_a.node_id(), 0)
+            .expect("Global publish")
+            > 0
+    );
+    let mut received_live_gossip = false;
+    let synced = wait_until(scaled_timeout(Duration::from_secs(10)), || {
+        let _ = pump_once(&mut service_a, &mut node_a);
+        if let Some(NetworkBridgeTick::EventIngested { event_id, .. }) =
+            pump_once(&mut service_b, &mut node_b)
+        {
+            received_live_gossip |= event_id == live.event_id;
+        }
+        received_live_gossip
+    });
+    assert!(
+        synced,
+        "announcement must arrive through real Global gossip"
+    );
+    assert_eq!(
+        node_b
+            .store
+            .get_global_announcement(network_id, "live-announcement")
+            .expect("stored")
+            .expect("received")
+            .payload,
+        live.payload
+    );
+    let missed = node_a
+        .emit_at(
+            1,
+            EventPayload::EventAnnouncement(signed_announcement("missed-announcement")),
+            202,
+        )
+        .expect("missed event");
+    assert!(
+        node_b
+            .store
+            .get_global_announcement(network_id, "missed-announcement")
+            .expect("before backfill")
+            .is_none()
+    );
+    let recovered = drive_anti_entropy_until(
+        &mut service_a,
+        &mut node_a,
+        &mut service_b,
+        &mut node_b,
+        scaled_timeout(Duration::from_secs(30)),
+        |node| {
+            node.store
+                .get_global_announcement(network_id, "missed-announcement")
+                .expect("recovery lookup")
+                .is_some()
+        },
+    );
+    assert!(
+        recovered,
+        "unpublished announcement must recover through real Global backfill"
+    );
+    assert_eq!(
+        node_b
+            .store
+            .get_global_announcement(network_id, "missed-announcement")
+            .expect("stored")
+            .expect("recovered")
+            .event_id,
+        missed.event_id
+    );
+    let before = node_b.head_seq().expect("head");
+    assert!(
+        !node_b
+            .ingest_remote_if_new(live)
+            .expect("duplicate delivery")
+    );
+    node_b.replay_rebuild_projection().expect("replay");
+    assert_eq!(node_b.head_seq().expect("head after replay"), before);
+    assert_eq!(
+        node_b
+            .store
+            .load_events_by_kinds(&[wattswarm_protocol::types::EventKind::EventAnnouncement])
+            .expect("announcements")
+            .len(),
+        2
+    );
+}
+
 pub fn two_nodes_sync_global_control_event_over_iroh() {
     let identity_a = NodeIdentity::random();
     let identity_b = NodeIdentity::random();

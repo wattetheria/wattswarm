@@ -1,6 +1,20 @@
 use super::*;
 
 impl PgStore {
+    pub fn get_global_announcement(
+        &self,
+        network_id: &str,
+        announcement_id: &str,
+    ) -> Result<Option<Event>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
+        let json = conn.query_row("SELECT event_json FROM events WHERE org_id = $1 AND announcement_network_id = $2 AND global_announcement_id = $3", params![self.org_id(), network_id, announcement_id], |row| row.get::<_, String>(0)).optional()?;
+        json.map(|json| serde_json::from_str(&json).map_err(Into::into))
+            .transpose()
+    }
+
     /// Local events after the diagnostic marker through the publisher's startup head.
     pub fn count_local_events_through(
         &self,
@@ -28,6 +42,13 @@ impl PgStore {
 
     pub fn append_event_if_new(&self, event: &Event) -> Result<Option<u64>> {
         let event_json = serde_json::to_string(event)?;
+        let (announcement_network_id, global_announcement_id) = match &event.payload {
+            crate::types::EventPayload::EventAnnouncement(payload) => (
+                Some(payload.network_id.as_str()),
+                Some(payload.announcement_id.as_str()),
+            ),
+            _ => (None, None),
+        };
         let swarm_scope = canonical_swarm_scope(&event.swarm_scope);
         let conn = self
             .conn
@@ -35,10 +56,10 @@ impl PgStore {
             .map_err(|_| SwarmError::Storage("mutex poisoned".into()))?;
         let seq: Option<i64> = conn
             .query_row(
-                "INSERT INTO events(org_id, event_id, protocol_version, task_id, epoch, event_kind, author_node_id, created_at, event_json, swarm_scope)
-                 SELECT $1, $2, $3, $4, $5, $6, $7, TIMESTAMPTZ 'epoch' + ($8::bigint * INTERVAL '1 millisecond'), $9, $10
+                "INSERT INTO events(org_id, event_id, protocol_version, task_id, epoch, event_kind, author_node_id, created_at, event_json, swarm_scope, announcement_network_id, global_announcement_id)
+                 SELECT $1, $2, $3, $4, $5, $6, $7, TIMESTAMPTZ 'epoch' + ($8::bigint * INTERVAL '1 millisecond'), $9, $10, $11, $12
                  WHERE NOT EXISTS (SELECT 1 FROM events WHERE event_id = $2)
-                 ON CONFLICT (event_id) DO NOTHING
+                 ON CONFLICT DO NOTHING
                  RETURNING seq",
                 params![
                     self.org_id(),
@@ -51,6 +72,8 @@ impl PgStore {
                     event.created_at as i64,
                     event_json,
                     swarm_scope,
+                    announcement_network_id,
+                    global_announcement_id,
                 ],
                 |r| r.get(0),
             )

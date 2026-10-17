@@ -11,6 +11,12 @@ fn network_bridge_local_test_guard() -> MutexGuard<'static, ()> {
 }
 
 #[test]
+fn two_nodes_global_announcement_gossip_and_missed_backfill_over_iroh() {
+    let _guard = network_bridge_local_test_guard();
+    support::network_bridge::two_nodes_global_announcement_gossip_and_missed_backfill_over_iroh();
+}
+
+#[test]
 fn two_nodes_sync_global_control_event_over_iroh() {
     let _guard = network_bridge_local_test_guard();
     support::network_bridge::two_nodes_sync_global_control_event_over_iroh();

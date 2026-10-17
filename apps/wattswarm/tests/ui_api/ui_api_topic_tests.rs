@@ -1,6 +1,362 @@
 use super::*;
 
 #[test]
+fn topic_and_global_indexed_reads_use_real_http_and_forward_cursors() {
+    let _guard = env_lock();
+    let _db_lock = DbTestLock::acquire();
+    let schema = reset_test_schema("indexed_reads");
+    let _schema_guard = EnvVarGuard::set("WATTSWARM_PG_SCHEMA", &schema);
+    let _mode_guard = EnvVarGuard::set("WATTSWARM_NODE_MODE", "local");
+    let dir = tempdir().unwrap();
+    let state_dir = dir.path().join("state");
+    fs::create_dir_all(&state_dir).unwrap();
+    let db_path = state_dir.join("ui.state");
+    let mut node = open_node(&state_dir, &db_path).unwrap();
+    let network_id = format!("local:{}", node.node_id());
+    node.store
+        .put_network_protocol_params(
+            &network_id,
+            &node.identity,
+            &NetworkProtocolParams::default(),
+        )
+        .unwrap();
+    for index in 0..1000 {
+        let id = format!("topic-{index:04}");
+        node.store
+            .put_topic_message(
+                &id,
+                &network_id,
+                "board.general",
+                "group:board-general",
+                &node.node_id(),
+                None,
+                &topic_content_ref(&id, &node.node_id(), index),
+                Some(&json!({"index":index})),
+                None,
+                index,
+            )
+            .unwrap();
+    }
+    let initial_sequence = node.store.head_seq().unwrap();
+    let mut filtered_sequences = Vec::new();
+    for index in 0..5 {
+        let event = build_event_for_external(
+            &node.identity,
+            1,
+            10_000 + index,
+            EventPayload::TaskCreated(sample_contract(&format!("hidden-{index}"), "policy".into())),
+        )
+        .unwrap();
+        assert_eq!(event.swarm_scope, "global");
+        filtered_sequences.push(node.store.append_event(&event).unwrap());
+    }
+    let mut expected_announcements = Vec::new();
+    for index in 0..221 {
+        let event = node
+            .publish_global_announcement(
+                format!("announcement-{index:04}"),
+                json!({"opaque":index,"nested":{"ends_at":"not-interpreted"}}),
+                1,
+                20_000 + index,
+            )
+            .unwrap();
+        let EventPayload::EventAnnouncement(payload) = event.payload else {
+            panic!("expected original signed announcement");
+        };
+        expected_announcements.push(payload);
+    }
+    let final_sequence = node.store.head_seq().unwrap();
+    drop(node);
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let app = build_app(UiServerState::new(state_dir.clone(), db_path.clone()));
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(async {
+                    let _ = shutdown_rx.await;
+                })
+                .await
+                .unwrap();
+        });
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let topic_url = format!("{base_url}/api/topic/messages");
+        let topic_query = [
+            ("network_id", network_id.as_str()),
+            ("feed_key", "board.general"),
+            ("scope_hint", "group:board-general"),
+        ];
+        let latest: Value = client
+            .get(&topic_url)
+            .query(&topic_query)
+            .query(&[("limit", "200")])
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(latest["messages"].as_array().unwrap().len(), 200);
+        assert_eq!(latest["messages"][0]["message_id"], "topic-0999");
+        assert!(
+            !latest["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|message| message["message_id"] == "topic-0000")
+        );
+        let oldest: Value = client
+            .get(&topic_url)
+            .query(&topic_query)
+            .query(&[("message_id", "topic-0000")])
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(oldest["messages"].as_array().unwrap().len(), 1);
+        assert_eq!(oldest["messages"][0]["content"], json!({"index":0}));
+        assert!(oldest["next_anchor"].is_null());
+        for query in [
+            [
+                ("network_id", "different-network"),
+                ("feed_key", "board.general"),
+                ("scope_hint", "group:board-general"),
+            ],
+            [
+                ("network_id", network_id.as_str()),
+                ("feed_key", "board.trade"),
+                ("scope_hint", "group:board-general"),
+            ],
+            [
+                ("network_id", network_id.as_str()),
+                ("feed_key", "board.general"),
+                ("scope_hint", "group:board-trade"),
+            ],
+        ] {
+            let result: Value = client
+                .get(&topic_url)
+                .query(&query)
+                .query(&[("message_id", "topic-0000")])
+                .send()
+                .await
+                .unwrap()
+                .error_for_status()
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            assert!(result["messages"].as_array().unwrap().is_empty());
+        }
+        for extra in [
+            "limit=1",
+            "before_created_at=999",
+            "before_message_id=topic-0999",
+        ] {
+            assert_eq!(
+                client
+                    .get(format!("{topic_url}?message_id=topic-0000&{extra}"))
+                    .query(&topic_query)
+                    .send()
+                    .await
+                    .unwrap()
+                    .status(),
+                StatusCode::BAD_REQUEST
+            );
+        }
+
+        let global_url = format!("{base_url}/api/global/messages");
+        let lookup_query = [
+            ("network_id", network_id.as_str()),
+            ("announcement_id", "announcement-0000"),
+        ];
+        let original: Value = client
+            .get(&global_url)
+            .query(&lookup_query)
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(
+            original["announcement"],
+            serde_json::to_value(&expected_announcements[0]).unwrap()
+        );
+        let wrong_network: Value = client
+            .get(&global_url)
+            .query(&[
+                ("network_id", "different-network"),
+                ("announcement_id", "announcement-0000"),
+            ])
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert!(wrong_network["announcement"].is_null());
+        let missing: Value = client
+            .get(&global_url)
+            .query(&[
+                ("network_id", network_id.as_str()),
+                ("announcement_id", "missing"),
+            ])
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert!(missing["announcement"].is_null());
+        for query in [
+            "before_sequence=1&after_sequence=0",
+            "announcement_id=announcement-0000",
+            "network_id=x",
+            "network_id=x&announcement_id=y&limit=1",
+            "network_id=x&announcement_id=y&after_sequence=0",
+        ] {
+            assert_eq!(
+                client
+                    .get(format!("{global_url}?{query}"))
+                    .send()
+                    .await
+                    .unwrap()
+                    .status(),
+                StatusCode::BAD_REQUEST
+            );
+        }
+        let latest: Value = client
+            .get(&global_url)
+            .query(&[("limit", "200")])
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(latest["messages"].as_array().unwrap().len(), 200);
+        assert_eq!(
+            latest["messages"][0]["content"]["payload"],
+            serde_json::to_value(expected_announcements.last().unwrap()).unwrap()
+        );
+        let older: Value = client
+            .get(&global_url)
+            .query(&[
+                ("limit", "200".to_owned()),
+                (
+                    "before_sequence",
+                    latest["next_before_sequence"].to_string(),
+                ),
+            ])
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(older["messages"].as_array().unwrap().len(), 21);
+
+        let mut cursor = initial_sequence;
+        let mut actual_announcements = Vec::new();
+        let mut first_pages = Vec::new();
+        for page_index in 0..200 {
+            let page: Value = client
+                .get(&global_url)
+                .query(&[
+                    ("limit", "2".to_owned()),
+                    ("after_sequence", cursor.to_string()),
+                ])
+                .send()
+                .await
+                .unwrap()
+                .error_for_status()
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            if page_index < 2 {
+                assert!(page["messages"].as_array().unwrap().is_empty());
+                assert_eq!(
+                    page["next_after_sequence"],
+                    filtered_sequences[page_index * 2 + 1]
+                );
+            }
+            if page_index < 3 {
+                first_pages.push(page.clone());
+            }
+            for message in page["messages"].as_array().unwrap() {
+                assert!(message["sequence"].as_u64().unwrap() > cursor);
+                actual_announcements.push(message["content"]["payload"].clone());
+            }
+            let Some(next) = page["next_after_sequence"].as_u64() else {
+                break;
+            };
+            assert!(next > cursor);
+            cursor = next;
+        }
+        assert_eq!(cursor, final_sequence);
+        assert_eq!(
+            actual_announcements,
+            expected_announcements
+                .iter()
+                .map(|payload| serde_json::to_value(payload).unwrap())
+                .collect::<Vec<_>>()
+        );
+        println!("INDEXED_READ_PUBLIC_EVIDENCE {}", json!({
+            "backend":format!("{:?}", configured_backend_kind().unwrap()),
+            "network_id":network_id,
+            "topic_history_count":1000,
+            "oldest_topic_response":oldest,
+            "oldest_global_lookup_response":original,
+            "wrong_network_global_response":wrong_network,
+            "first_forward_pages":first_pages,
+            "forward_returned_announcement_count":actual_announcements.len(),
+            "final_after_sequence":cursor,
+            "original_signed_payload_unchanged":actual_announcements[0] == original["announcement"],
+        }));
+        shutdown_tx.send(()).unwrap();
+        server.await.unwrap();
+    });
+    let reloaded = open_node(&state_dir, &db_path).unwrap();
+    let stored = reloaded
+        .store
+        .get_global_announcement(&network_id, "announcement-0000")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        serde_json::to_value(&stored.payload).unwrap()["payload"],
+        serde_json::to_value(&expected_announcements[0]).unwrap()
+    );
+    assert_eq!(reloaded.store.head_seq().unwrap(), final_sequence);
+    println!(
+        "INDEXED_READ_ORIGINAL_SIGNED_EVENT {}",
+        serde_json::to_string(&stored).unwrap()
+    );
+}
+
+#[test]
 fn ui_exposes_topic_message_history_and_cursor_queries() {
     let _guard = env_lock();
     let _db_lock = DbTestLock::acquire();
@@ -691,20 +1047,37 @@ fn ui_topic_messages_decrypts_private_hive_rows_on_read() {
         .build()
         .unwrap();
     runtime.block_on(async {
-        let messages_res = app
-            .oneshot(
-                Request::builder()
-                    .method("GET")
-                    .uri(format!(
-                        "/api/topic/messages?network_id={network_id}&feed_key=private.hive&scope_hint=group:dm-private-hive-read&limit=5"
-                    ))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(async {
+                    let _ = shutdown_rx.await;
+                })
+                .await
+                .unwrap();
+        });
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let url = format!("{base_url}/api/topic/messages");
+        let route = [
+            ("network_id", network_id.as_str()),
+            ("feed_key", "private.hive"),
+            ("scope_hint", "group:dm-private-hive-read"),
+        ];
+        let messages_json: Value = client
+            .get(&url)
+            .query(&route)
+            .query(&[("message_id", message_id.as_str())])
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
             .await
             .unwrap();
-        assert_eq!(messages_res.status(), StatusCode::OK);
-        let messages_json = json_from(messages_res).await;
+        assert_eq!(messages_json["messages"].as_array().unwrap().len(), 1);
         assert_eq!(
             messages_json["messages"][0]["content"]["text"].as_str(),
             Some("remote private hive plaintext")
@@ -713,6 +1086,21 @@ fn ui_topic_messages_decrypts_private_hive_rows_on_read() {
             messages_json["messages"][0]["agent_envelope"]["capability"].as_str(),
             Some("hive.message.post")
         );
+        let paged: Value = client
+            .get(&url)
+            .query(&route)
+            .query(&[("limit", "5")])
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(paged["messages"], messages_json["messages"]);
+        shutdown_tx.send(()).unwrap();
+        server.await.unwrap();
     });
 
     let node = open_node(&state_dir, &db_path).expect("reopen node");
