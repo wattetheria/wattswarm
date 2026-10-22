@@ -183,8 +183,14 @@ impl NetworkBridgeService {
     }
 
     pub fn tick(&mut self, node: &mut Node) -> Result<NetworkBridgeTick> {
-        let event = self.tokio_runtime.block_on(self.runtime.next_event());
-        self.handle_runtime_event(node, event)
+        loop {
+            if let Some(tick) = self.try_tick(node)? {
+                return Ok(tick);
+            }
+            self.tokio_runtime.block_on(async {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            });
+        }
     }
 
     pub(crate) fn request_backfill_for_peer_now(
@@ -852,7 +858,7 @@ impl NetworkBridgeService {
             .iter()
             .filter_map(|(request_id, pending)| {
                 let age = now.saturating_duration_since(pending.started_at);
-                (age >= PENDING_CONTACT_MATERIAL_REQUEST_TTL).then(|| {
+                (!pending.received_busy && age >= PENDING_CONTACT_MATERIAL_REQUEST_TTL).then(|| {
                     (
                         *request_id,
                         pending.peer.clone(),
@@ -1383,6 +1389,7 @@ impl NetworkBridgeService {
     }
 
     pub fn try_tick(&mut self, node: &mut Node) -> Result<Option<NetworkBridgeTick>> {
+        self.retry_busy_control_requests()?;
         if self.monitoring_enabled {
             self.drain_runtime_diagnostics();
         }
@@ -1390,7 +1397,7 @@ impl NetworkBridgeService {
         let Some(event) = event else {
             return Ok(None);
         };
-        Ok(Some(self.process_runtime_event(node, event)?))
+        Ok(Some(self.handle_runtime_event(node, Ok(event))?))
     }
 
     pub(crate) fn handle_runtime_event(

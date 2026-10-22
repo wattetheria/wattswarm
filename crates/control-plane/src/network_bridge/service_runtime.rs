@@ -1723,6 +1723,19 @@ impl NetworkBridgeService {
                 request_id,
                 error,
             } => {
+                if error.starts_with(CONTROL_BUSY_ERROR_PREFIX)
+                    && let Some(pending) =
+                        self.pending_contact_material_requests.get_mut(&request_id)
+                    && pending.peer == peer
+                {
+                    pending.retry_at = Some(Instant::now() + CONTROL_BUSY_RETRY_AFTER);
+                    pending.received_busy = true;
+                    return Ok(NetworkBridgeTick::TransportNotice {
+                        detail: format!(
+                            "contact_material_deferred_remote_busy peer={peer} request_id={request_id:?}"
+                        ),
+                    });
+                }
                 self.pending_contact_material_requests.remove(&request_id);
                 self.mark_peer_control_stream_failed(peer.clone());
                 let details =
@@ -2289,6 +2302,18 @@ impl NetworkBridgeService {
                 request_id,
                 error,
             } => {
+                if error.starts_with(CONTROL_BUSY_ERROR_PREFIX)
+                    && let Some(pending) = self.pending_relationship_requests.get_mut(&request_id)
+                    && pending.peer == peer
+                {
+                    pending.retry_at = Some(Instant::now() + CONTROL_BUSY_RETRY_AFTER);
+                    pending.received_busy = true;
+                    return Ok(NetworkBridgeTick::TransportNotice {
+                        detail: format!(
+                            "peer_relationship_deferred_remote_busy peer={peer} request_id={request_id:?}"
+                        ),
+                    });
+                }
                 let pending = self.pending_relationship_requests.remove(&request_id);
                 let action = pending
                     .as_ref()

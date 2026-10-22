@@ -33,9 +33,9 @@ use tokio::sync::Semaphore;
 use url::{Host, Url};
 use wattswarm_artifact_store::{ArtifactKind, ArtifactStore};
 use wattswarm_network_transport_core::{
-    DirectDataFetchRequest, DirectDataFetchResponse, DirectDataTransportAdapter,
-    PeerTransportCapabilities, TransportContactMaterial, TransportError, TransportMetadata,
-    TransportRoute,
+    CONTROL_BUSY_ERROR_PREFIX, CONTROL_BUSY_RETRY_AFTER, DirectDataFetchRequest,
+    DirectDataFetchResponse, DirectDataTransportAdapter, PeerTransportCapabilities,
+    TransportContactMaterial, TransportError, TransportMetadata, TransportRoute,
 };
 
 pub const DEFAULT_IROH_ALPN: &str = "/wattswarm/iroh/1";
@@ -66,6 +66,7 @@ const DEFAULT_IROH_DATA_PLANE_START_TIMEOUT_MS: u64 = 120_000;
 const DEFAULT_IROH_DIRECT_DATA_FETCH_TIMEOUT_MS: u64 = 30_000;
 const DEFAULT_IROH_DIRECT_DATA_FETCH_CONCURRENCY: usize = 4;
 const DEFAULT_IROH_CONTROL_STREAM_TIMEOUT_MS: u64 = 30_000;
+const DEFAULT_IROH_INBOUND_CONTROL_CONCURRENCY: usize = 4;
 const IROH_ONLINE_WAIT_TIMEOUT_MS: u64 = 10_000;
 const CONTROL_STREAM_RECOVERY_TIMEOUT_THRESHOLD: u32 = 3;
 const CONTROL_STREAM_RECOVERY_COOLDOWN: Duration = Duration::from_secs(60);
@@ -361,7 +362,16 @@ pub struct IrohControlStreamResponse {
 
 type ControlStreamHandler =
     Arc<dyn Fn(String, IrohControlStreamRequest) -> IrohControlStreamResponse + Send + Sync>;
-type ControlStreamHandlers = Arc<Mutex<HashMap<String, ControlStreamHandler>>>;
+pub type ControlStreamBusyHandler = Arc<dyn Fn(&str, &IrohControlStreamRequest) + Send + Sync>;
+
+#[derive(Clone)]
+struct RegisteredControlStreamHandler {
+    callback: ControlStreamHandler,
+    admission: Arc<Semaphore>,
+    on_busy: Option<ControlStreamBusyHandler>,
+}
+
+type ControlStreamHandlers = Arc<Mutex<HashMap<String, RegisteredControlStreamHandler>>>;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IrohTransportConfig {
@@ -1212,13 +1222,37 @@ async fn serve_incoming_control_stream_request(
         let request_bytes = recv.read_to_end(MAX_CONTROL_REQUEST_BYTES).await?;
         let request: IrohControlStreamRequest = serde_json::from_slice(&request_bytes)?;
         let request_kind = request.kind.clone();
-        let response = match handlers
+        let handler = handlers
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .get(&request_kind)
-            .cloned()
-        {
-            Some(handler) => handler(remote_peer_id, request),
+            .cloned();
+        let response = match handler {
+            Some(RegisteredControlStreamHandler {
+                callback,
+                admission,
+                on_busy,
+            }) => match admission.try_acquire_owned() {
+                Ok(permit) => tokio::task::spawn_blocking(move || {
+                    let _permit = permit;
+                    callback(remote_peer_id, request)
+                })
+                .await
+                .context("join iroh inbound control handler")?,
+                Err(_) => {
+                    if let Some(on_busy) = on_busy {
+                        on_busy(&remote_peer_id, &request);
+                    }
+                    IrohControlStreamResponse {
+                        ok: false,
+                        error: Some(format!(
+                            "{CONTROL_BUSY_ERROR_PREFIX} retry_after_ms={}",
+                            CONTROL_BUSY_RETRY_AFTER.as_millis()
+                        )),
+                        payload: Vec::new(),
+                    }
+                }
+            },
             None => IrohControlStreamResponse {
                 ok: false,
                 error: Some(format!(
@@ -1851,14 +1885,27 @@ impl IrohDataPlaneService {
         ))
     }
 
-    fn set_control_stream_handler(&self, kind: &str, handler: Option<ControlStreamHandler>) {
+    fn set_control_stream_handler(
+        &self,
+        kind: &str,
+        max_inflight: usize,
+        on_busy: Option<ControlStreamBusyHandler>,
+        handler: Option<ControlStreamHandler>,
+    ) {
         let mut handlers = self
             .control_handlers
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         match handler {
             Some(handler) => {
-                handlers.insert(kind.to_owned(), handler);
+                handlers.insert(
+                    kind.to_owned(),
+                    RegisteredControlStreamHandler {
+                        callback: handler,
+                        admission: Arc::new(Semaphore::new(max_inflight)),
+                        on_busy,
+                    },
+                );
             }
             None => {
                 handlers.remove(kind);
@@ -2296,6 +2343,8 @@ pub fn set_local_control_stream_handler_for_network_peer_id<H>(
     state_dir: &Path,
     network_peer_id: &str,
     kind: &str,
+    max_inflight: usize,
+    on_busy: Option<ControlStreamBusyHandler>,
     handler: Option<H>,
 ) -> Result<()>
 where
@@ -2303,7 +2352,7 @@ where
 {
     let handler = handler.map(|handler| Arc::new(handler) as ControlStreamHandler);
     ensure_local_iroh_data_plane_for_network_peer_id(state_dir, network_peer_id)?
-        .set_control_stream_handler(kind, handler);
+        .set_control_stream_handler(kind, max_inflight, on_busy, handler);
     Ok(())
 }
 
@@ -2317,6 +2366,8 @@ pub fn install_local_contact_material_control_handler_for_network_peer_id(
         &state_dir.clone(),
         &network_peer_id.clone(),
         IROH_CONTROL_KIND_CONTACT_MATERIAL,
+        DEFAULT_IROH_INBOUND_CONTROL_CONCURRENCY,
+        None,
         Some(
             move |_remote_peer_id: String, request: IrohControlStreamRequest| match request
                 .kind
@@ -2524,6 +2575,23 @@ mod tests {
             .get("direct_addrs")
             .and_then(serde_json::Value::as_array)
             .is_some_and(|items| !items.is_empty())
+    }
+
+    fn loopback_contact(state_dir: &Path, peer_id: &str) -> TransportContactMaterial {
+        let service = ensure_local_iroh_data_plane_for_network_peer_id(state_dir, peer_id)
+            .expect("local data plane");
+        let bound = service
+            .endpoint
+            .bound_sockets()
+            .into_iter()
+            .find(SocketAddr::is_ipv4)
+            .expect("IPv4 test socket");
+        let address = SocketAddr::new("127.0.0.1".parse().unwrap(), bound.port()).to_string();
+        let mut contact = service.export_contact_material(1).expect("local contact");
+        contact.metadata.listen_addrs = vec![address.clone()];
+        contact.extra["direct_addrs"] = json!([address]);
+        contact.extra["relay_urls"] = json!([]);
+        contact
     }
 
     #[test]
@@ -3751,6 +3819,8 @@ GsmUIhIoQCUNhf052/0CIF1BBXj/Fv+KaOTT57eFuzSuu/fiepb2kKgmiiS3LP7o\n\
             dir_b.path(),
             &peer_b,
             "echo.v1",
+            4,
+            None,
             Some(
                 |_remote_peer_id: String, request: IrohControlStreamRequest| {
                     IrohControlStreamResponse {
@@ -3799,18 +3869,14 @@ GsmUIhIoQCUNhf052/0CIF1BBXj/Fv+KaOTT57eFuzSuu/fiepb2kKgmiiS3LP7o\n\
         let peer_b = endpoint_b.to_string();
         export_local_contact_material_for_network_peer_id(dir_a.path(), &peer_a, 1)
             .expect("contact a");
-        let contact_b = export_local_contact_material_for_network_peer_id(dir_b.path(), &peer_b, 1)
-            .expect("contact b");
-        if !contact_has_direct_addr(&contact_b) {
-            shutdown_local_iroh_data_plane(dir_a.path());
-            shutdown_local_iroh_data_plane(dir_b.path());
-            return;
-        }
+        let contact_b = loopback_contact(dir_b.path(), &peer_b);
         let (slow_entered_tx, slow_entered_rx) = std::sync::mpsc::channel();
         set_local_control_stream_handler_for_network_peer_id(
             dir_b.path(),
             &peer_b,
             "parallel.v1",
+            2,
+            None,
             Some(
                 move |_remote_peer_id: String, request: IrohControlStreamRequest| {
                     if request.payload == b"slow" {
@@ -3881,6 +3947,220 @@ GsmUIhIoQCUNhf052/0CIF1BBXj/Fv+KaOTT57eFuzSuu/fiepb2kKgmiiS3LP7o\n\
             b"slow"
         );
 
+        shutdown_local_iroh_data_plane(dir_a.path());
+        shutdown_local_iroh_data_plane(dir_b.path());
+    }
+
+    #[test]
+    fn waiting_inbound_handlers_leave_gossip_and_outbound_control_running() {
+        let dir_a = tempdir().expect("node a tempdir");
+        let dir_b = tempdir().expect("node b tempdir");
+        seed_state_dir(dir_a.path(), [35u8; 32]);
+        seed_state_dir(dir_b.path(), [36u8; 32]);
+        write_test_relay_urls(dir_a.path());
+        write_test_relay_urls(dir_b.path());
+        let peer_a = local_endpoint_id_from_state_dir(dir_a.path())
+            .unwrap()
+            .to_string();
+        let peer_b = local_endpoint_id_from_state_dir(dir_b.path())
+            .unwrap()
+            .to_string();
+        let contact_a = loopback_contact(dir_a.path(), &peer_a);
+        let contact_b = loopback_contact(dir_b.path(), &peer_b);
+        register_remote_contact_material_for_network_peer_id(dir_a.path(), &peer_a, &contact_b)
+            .unwrap();
+        register_remote_contact_material_for_network_peer_id(dir_b.path(), &peer_b, &contact_a)
+            .unwrap();
+
+        let gossip_a = local_gossip_for_network_peer_id(dir_a.path(), &peer_a).unwrap();
+        let gossip_b = local_gossip_for_network_peer_id(dir_b.path(), &peer_b).unwrap();
+        let topic_id = derive_gossip_topic_id("mainnet", "inbound-regression", "events");
+        let runtime = Runtime::new().unwrap();
+        let (mut topic_a, mut topic_b) = runtime.block_on(async {
+            let mut a = gossip_a.subscribe(topic_id, Vec::new()).await.unwrap();
+            let mut b = gossip_b
+                .subscribe(topic_id, vec![peer_a.parse().unwrap()])
+                .await
+                .unwrap();
+            timeout(Duration::from_secs(5), a.joined())
+                .await
+                .unwrap()
+                .unwrap();
+            timeout(Duration::from_secs(5), b.joined())
+                .await
+                .unwrap()
+                .unwrap();
+            (a, b)
+        });
+
+        let (pending_tx, pending_rx) = std::sync::mpsc::channel();
+        set_local_control_stream_handler_for_network_peer_id(
+            dir_b.path(),
+            &peer_b,
+            "waiting.v1",
+            2,
+            None,
+            Some(move |_peer: String, request: IrohControlStreamRequest| {
+                let (reply_tx, reply_rx) = std::sync::mpsc::channel();
+                pending_tx.send((request.payload, reply_tx)).unwrap();
+                IrohControlStreamResponse {
+                    ok: true,
+                    error: None,
+                    payload: reply_rx
+                        .recv_timeout(Duration::from_secs(10))
+                        .expect("bridge loop reply"),
+                }
+            }),
+        )
+        .unwrap();
+        for (directory, peer) in [(&dir_a, &peer_a), (&dir_b, &peer_b)] {
+            set_local_control_stream_handler_for_network_peer_id(
+                directory.path(),
+                peer,
+                "echo.v1",
+                4,
+                None,
+                Some(|_peer: String, request: IrohControlStreamRequest| {
+                    IrohControlStreamResponse {
+                        ok: true,
+                        error: None,
+                        payload: request.payload,
+                    }
+                }),
+            )
+            .unwrap();
+        }
+
+        let mut requests = Vec::new();
+        for payload in [b"first".to_vec(), b"second".to_vec()] {
+            let state_dir = dir_a.path().to_path_buf();
+            let peer = peer_a.clone();
+            let contact = contact_b.clone();
+            requests.push(std::thread::spawn(move || {
+                send_control_stream_request_for_network_peer_id_with_timeout(
+                    &state_dir,
+                    &peer,
+                    &contact,
+                    &IrohControlStreamRequest {
+                        kind: "waiting.v1".into(),
+                        payload,
+                    },
+                    Duration::from_secs(10),
+                )
+            }));
+        }
+        let first = pending_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("first inbound request");
+        let second = pending_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("both inbound handlers must run without occupying the network workers");
+
+        let independent = send_control_stream_request_for_network_peer_id_with_timeout(
+            dir_a.path(),
+            &peer_a,
+            &contact_b,
+            &IrohControlStreamRequest {
+                kind: "echo.v1".into(),
+                payload: b"independent-kind".to_vec(),
+            },
+            Duration::from_secs(2),
+        )
+        .expect("a saturated request kind must not consume another kind's capacity");
+        assert!(independent.ok);
+        assert_eq!(independent.payload, b"independent-kind");
+
+        let pressure_dir = dir_a.path().to_path_buf();
+        let pressure_peer = peer_a.clone();
+        let pressure_contact = contact_b.clone();
+        let pressure = std::thread::spawn(move || {
+            for _ in 0..16 {
+                let response = send_control_stream_request_for_network_peer_id_with_timeout(
+                    &pressure_dir,
+                    &pressure_peer,
+                    &pressure_contact,
+                    &IrohControlStreamRequest {
+                        kind: "waiting.v1".into(),
+                        payload: b"excess".to_vec(),
+                    },
+                    Duration::from_secs(2),
+                )
+                .expect("excess requests must get a response without waiting for a handler slot");
+                assert!(!response.ok);
+                assert_eq!(
+                    response.error.as_deref(),
+                    Some("control_busy retry_after_ms=1000")
+                );
+            }
+        });
+
+        let response = send_control_stream_request_for_network_peer_id_with_timeout(
+            dir_b.path(),
+            &peer_b,
+            &contact_a,
+            &IrohControlStreamRequest {
+                kind: "echo.v1".into(),
+                payload: b"outbound".to_vec(),
+            },
+            Duration::from_secs(2),
+        )
+        .expect("outbound control must progress while inbound handlers wait");
+        assert!(response.ok);
+        assert_eq!(response.payload, b"outbound");
+        runtime.block_on(async {
+            timeout(
+                Duration::from_secs(2),
+                topic_b.broadcast(b"gossip-progress".to_vec().into()),
+            )
+            .await
+            .expect("gossip publication must progress")
+            .unwrap();
+            let received = timeout(Duration::from_secs(2), async {
+                loop {
+                    if let Event::Received(message) = topic_a.next().await.unwrap().unwrap() {
+                        break message.content;
+                    }
+                }
+            })
+            .await
+            .expect("gossip must arrive while inbound handlers wait");
+            assert_eq!(received.as_ref(), b"gossip-progress");
+        });
+        pressure.join().unwrap();
+        assert!(
+            pending_rx.try_recv().is_err(),
+            "rejected requests must not reach the bridge loop"
+        );
+        first.1.send(first.0).unwrap();
+        second.1.send(second.0).unwrap();
+        for request in requests {
+            let response = request.join().unwrap().unwrap();
+            assert!(response.ok);
+            assert!(response.payload == b"first" || response.payload == b"second");
+        }
+        let retry_dir = dir_a.path().to_path_buf();
+        let retry_peer = peer_a.clone();
+        let retry_contact = contact_b.clone();
+        let retry = std::thread::spawn(move || {
+            send_control_stream_request_for_network_peer_id_with_timeout(
+                &retry_dir,
+                &retry_peer,
+                &retry_contact,
+                &IrohControlStreamRequest {
+                    kind: "waiting.v1".into(),
+                    payload: b"capacity-restored".to_vec(),
+                },
+                Duration::from_secs(2),
+            )
+        });
+        let (payload, reply) = pending_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("handler capacity must be released after previous replies");
+        assert_eq!(payload, b"capacity-restored");
+        reply.send(payload).unwrap();
+        let response = retry.join().unwrap().unwrap();
+        assert!(response.ok);
+        assert_eq!(response.payload, b"capacity-restored");
         shutdown_local_iroh_data_plane(dir_a.path());
         shutdown_local_iroh_data_plane(dir_b.path());
     }

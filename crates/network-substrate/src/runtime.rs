@@ -1,7 +1,7 @@
 use super::*;
 use std::hash::{Hash, Hasher};
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::Ordering;
 use std::time::Instant;
 use tokio::sync::Semaphore;
 
@@ -104,48 +104,12 @@ fn control_correlation(payload: &[u8]) -> serde_json::Value {
 const MAX_CONCURRENT_BACKFILL_REQUESTS: usize = 16;
 const MAX_CONCURRENT_INTERACTIVE_CONTROL_REQUESTS: usize = 4;
 const MAX_CONCURRENT_INBOUND_BACKFILLS: usize = 16;
-const CONTROL_BUSY_ERROR_PREFIX: &str = "control_busy";
+const GOSSIP_PUBLISH_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ControlRequestClass {
     Backfill,
     Interactive,
-}
-
-#[derive(Debug)]
-struct InboundRequestAdmission {
-    active: AtomicUsize,
-    max_active: usize,
-}
-
-impl InboundRequestAdmission {
-    fn new(max_active: usize) -> Self {
-        Self {
-            active: AtomicUsize::new(0),
-            max_active,
-        }
-    }
-
-    fn try_acquire(self: &Arc<Self>) -> Option<InboundRequestPermit> {
-        self.active
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
-                (active < self.max_active).then_some(active + 1)
-            })
-            .ok()?;
-        Some(InboundRequestPermit {
-            admission: self.clone(),
-        })
-    }
-}
-
-struct InboundRequestPermit {
-    admission: Arc<InboundRequestAdmission>,
-}
-
-impl Drop for InboundRequestPermit {
-    fn drop(&mut self) {
-        self.admission.active.fetch_sub(1, Ordering::AcqRel);
-    }
 }
 
 #[derive(Debug)]
@@ -693,9 +657,12 @@ impl SubstrateRuntime {
             .gossip_topics
             .get(&subscription)
             .ok_or_else(|| anyhow!("missing iroh gossip topic {}", subscription.topic_id_hex))?;
-        let result = self
-            .block_on(topic.sender.broadcast(bytes.into()))
-            .map_err(|err| anyhow!("publish iroh gossip notification: {err}"));
+        let result = self.block_on(async {
+            tokio::time::timeout(GOSSIP_PUBLISH_TIMEOUT, topic.sender.broadcast(bytes.into()))
+                .await
+                .context("publish iroh gossip notification timed out after 5000ms")?
+                .map_err(|err| anyhow!("publish iroh gossip notification: {err}"))
+        });
         if runtime_diagnostics_enabled(&self.diagnostic_handler) {
             let zero_neighbors = self
                 .topic_neighbors
@@ -1072,6 +1039,10 @@ impl SubstrateRuntime {
         Ok(request_id)
     }
 
+    pub fn has_interactive_control_capacity(&self) -> bool {
+        self.interactive_control_request_slots.available_permits() > 0
+    }
+
     pub fn send_peer_relationship_response(
         &mut self,
         channel: PeerRelationshipResponseChannel,
@@ -1380,7 +1351,7 @@ impl SubstrateRuntime {
     fn install_control_handlers(&mut self) -> Result<()> {
         self.install_typed_control_handler::<RawBackfillRequest, RawBackfillResponse>(
             IROH_CONTROL_KIND_BACKFILL,
-            Some(MAX_CONCURRENT_INBOUND_BACKFILLS),
+            MAX_CONCURRENT_INBOUND_BACKFILLS,
             |peer, request, channel| SubstrateRuntimeEvent::BackfillRequest {
                 peer,
                 request,
@@ -1389,7 +1360,7 @@ impl SubstrateRuntime {
         )?;
         self.install_typed_control_handler::<RawContactMaterialRequest, RawContactMaterialResponse>(
             IROH_CONTROL_KIND_CONTACT_MATERIAL,
-            None,
+            MAX_CONCURRENT_INTERACTIVE_CONTROL_REQUESTS,
             |peer, request, channel| SubstrateRuntimeEvent::ContactMaterialRequest {
                 peer,
                 request,
@@ -1398,7 +1369,7 @@ impl SubstrateRuntime {
         )?;
         self.install_typed_control_handler::<RawPeerRelationshipRequest, RawPeerRelationshipResponse>(
             IROH_CONTROL_KIND_PEER_RELATIONSHIP,
-            None,
+            MAX_CONCURRENT_INTERACTIVE_CONTROL_REQUESTS,
             |peer, request, channel| SubstrateRuntimeEvent::PeerRelationshipRequest {
                 peer,
                 request,
@@ -1411,7 +1382,7 @@ impl SubstrateRuntime {
     fn install_typed_control_handler<Req, Resp>(
         &self,
         kind: &'static str,
-        max_inflight: Option<usize>,
+        max_inflight: usize,
         build_event: impl Fn(NetworkNodeId, Req, Sender<Resp>) -> SubstrateRuntimeEvent
         + Send
         + Sync
@@ -1425,13 +1396,37 @@ impl SubstrateRuntime {
         let pending_tx = self.control_tx.clone();
         let local_peer_id = self.local_peer_id.clone();
         let timeout = Duration::from_millis(self.config.control_request_timeout_ms);
-        let admission = max_inflight.map(|limit| Arc::new(InboundRequestAdmission::new(limit)));
         let diagnostic_handler = self.diagnostic_handler.clone();
         let last_success = self.last_control_success.clone();
+        let busy_diagnostic_handler = diagnostic_handler.clone();
         set_local_control_stream_handler_for_network_peer_id(
             &self.state_dir,
             self.local_peer_id.as_str(),
             kind,
+            max_inflight,
+            Some(Arc::new(move |peer, request| {
+                if !runtime_diagnostics_enabled(&busy_diagnostic_handler) {
+                    return;
+                }
+                let mut details = control_correlation(&request.payload);
+                details["kind"] = serde_json::json!(request.kind);
+                details["timeout_ms"] = serde_json::json!(timeout.as_millis());
+                details["retry_after_ms"] = serde_json::json!(CONTROL_BUSY_RETRY_AFTER.as_millis());
+                emit_runtime_diagnostic(&busy_diagnostic_handler, || RuntimeDiagnostic {
+                    phase: "control.inbound.received",
+                    status: "received",
+                    anomaly: false,
+                    peer: Some(peer.to_owned()),
+                    details: details.clone(),
+                });
+                emit_runtime_diagnostic(&busy_diagnostic_handler, || RuntimeDiagnostic {
+                    phase: "control.inbound",
+                    status: "busy",
+                    anomaly: true,
+                    peer: Some(peer.to_owned()),
+                    details,
+                });
+            })),
             Some(
                 move |remote_peer_id: String, request: IrohControlStreamRequest| {
                     let started =
@@ -1450,25 +1445,8 @@ impl SubstrateRuntime {
                         peer: diagnostic_peer.clone(),
                         details: details.clone().unwrap_or_default(),
                     });
-                    // Preserve the original permit lifetime while observing returns.
-                    let mut _admission_permit = None;
                     let mut response_receiver = None;
                     let response = (|| {
-                        _admission_permit = match admission.as_ref() {
-                            Some(admission) => match admission.try_acquire() {
-                                Some(permit) => Some(permit),
-                                None => {
-                                    return IrohControlStreamResponse {
-                                        ok: false,
-                                        error: Some(format!(
-                                            "{CONTROL_BUSY_ERROR_PREFIX} retry_after_ms=1000"
-                                        )),
-                                        payload: Vec::new(),
-                                    };
-                                }
-                            },
-                            None => None,
-                        };
                         if request.kind != kind {
                             return IrohControlStreamResponse {
                                 ok: false,
@@ -1972,15 +1950,81 @@ mod tests {
     }
 
     #[test]
-    fn inbound_backfill_admission_enforces_limit_and_releases_capacity() {
-        let admission = Arc::new(InboundRequestAdmission::new(2));
-        let first = admission.try_acquire().expect("first permit");
-        let second = admission.try_acquire().expect("second permit");
+    fn gossip_publish_times_out_under_backpressure_and_can_retry() {
+        let mut runtime = runtime_for_test(SubstrateConfig::default());
+        let subscription = runtime
+            .subscription_for(&SwarmScope::Global, GossipKind::Events)
+            .unwrap();
+        let topic_id = iroh_gossip::TopicId::from_bytes(
+            hex::decode(&subscription.topic_id_hex)
+                .unwrap()
+                .try_into()
+                .unwrap(),
+        );
+        let actor_runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (endpoint, gossip, topic) = actor_runtime.block_on(async {
+            let endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0)
+                .relay_mode(iroh::RelayMode::Disabled)
+                .clear_ip_transports()
+                .bind_addr("127.0.0.1:0")
+                .unwrap()
+                .bind()
+                .await
+                .unwrap();
+            let gossip = iroh_gossip::net::Gossip::builder().spawn(endpoint.clone());
+            let topic = gossip.subscribe(topic_id, Vec::new()).await.unwrap();
+            (endpoint, gossip, topic)
+        });
+        let (sender, mut receiver) = topic.split();
+        let task = runtime
+            .runtime()
+            .spawn(async move { while receiver.next().await.is_some() {} });
+        runtime
+            .gossip_topics
+            .insert(subscription, IrohGossipTopicHandle { sender, task });
 
-        assert!(admission.try_acquire().is_none());
-        drop(first);
-        assert!(admission.try_acquire().is_some());
-        drop(second);
+        // Stop polling the real gossip actor so its bounded command queue fills.
+        let (done_tx, done_rx) = mpsc::channel();
+        let publisher = std::thread::spawn(move || {
+            let mut outcome = None;
+            for _ in 0..256 {
+                if let Err(error) =
+                    runtime.publish(&SwarmScope::Global, GossipKind::Events, b"retry-me")
+                {
+                    outcome = Some(error.to_string());
+                    break;
+                }
+            }
+            done_tx.send(outcome).unwrap();
+            runtime
+        });
+        let outcome = done_rx.recv_timeout(Duration::from_secs(7));
+        actor_runtime.block_on(async {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while !publisher.is_finished() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("publisher must unblock when the gossip actor resumes");
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        });
+        let mut runtime = publisher.join().unwrap();
+        let error = outcome
+            .expect("gossip publication must have a deadline")
+            .expect("the full gossip queue must report a publication failure");
+        assert!(error.contains("timed out"), "{error}");
+        runtime
+            .publish(&SwarmScope::Global, GossipKind::Events, b"retry-me")
+            .expect("the same publication can retry after the queue drains");
+        drop(runtime);
+        actor_runtime.block_on(async {
+            gossip.shutdown().await.unwrap();
+            endpoint.close().await;
+        });
     }
 
     #[test]

@@ -1,6 +1,649 @@
 use super::*;
 
 #[test]
+fn busy_contact_material_retries_without_disconnecting_peer() {
+    exercise_busy_control_retry(false, false);
+}
+
+#[test]
+fn busy_peer_relationship_retries_without_consuming_command_attempts() {
+    exercise_busy_control_retry(true, false);
+}
+
+#[test]
+fn busy_contact_material_expires_without_disconnecting_peer() {
+    exercise_busy_control_retry(false, true);
+}
+
+#[test]
+fn busy_peer_relationship_expires_without_disconnecting_peer() {
+    exercise_busy_control_retry(true, true);
+}
+
+fn exercise_busy_control_retry(relationship: bool, expire: bool) {
+    use wattswarm_network_transport_iroh::{
+        IrohControlStreamRequest, send_control_stream_request_for_network_peer_id_with_timeout,
+        shutdown_local_iroh_data_plane,
+    };
+
+    let _env_lock = lock_env_test_mutex();
+    let _debug = EnvVarGuard::set(diagnostics::ENV_NETWORK_DEBUG_DIAGNOSTICS, Some("true"));
+    let local_dir = temp_startup_dir("busy-control-local");
+    let remote_dir = temp_startup_dir("busy-control-remote");
+    let seeds = [[201_u8; 32], [202_u8; 32]];
+    for (dir, seed) in [(&local_dir, seeds[0]), (&remote_dir, seeds[1])] {
+        fs::write(dir.join("node_seed.hex"), hex::encode(seed)).unwrap();
+        ensure_test_relay_urls(dir);
+    }
+    let make_service = |dir: &Path, seed| {
+        let _bind = EnvVarGuard::set("WATTSWARM_IROH_BIND_ADDR", Some("127.0.0.1:0"));
+        let _direct = EnvVarGuard::set("WATTSWARM_IROH_PUBLISH_DIRECT_ADDRS", Some("true"));
+        let mut service = NetworkBridgeService::new(
+            NetworkP2pNode::from_iroh_state_dir(
+                NetworkP2pConfig {
+                    enable_local_discovery: false,
+                    ..NetworkP2pConfig::default()
+                },
+                dir.to_path_buf(),
+                seed,
+            )
+            .unwrap(),
+            &[SwarmScope::Global],
+            &NetworkProtocolParams::default(),
+        )
+        .unwrap();
+        service.set_state_dir(dir.to_path_buf(), dir.join("ui.state"));
+        service
+    };
+    let mut local = make_service(&local_dir, seeds[0]);
+    let mut remote = make_service(&remote_dir, seeds[1]);
+    let mut local_node =
+        crate::control::open_node(&local_dir, &local_dir.join("ui.state")).unwrap();
+    let mut remote_node =
+        crate::control::open_node(&remote_dir, &remote_dir.join("ui.state")).unwrap();
+    let local_peer = local.local_peer_id().clone();
+    let remote_peer = remote.local_peer_id().clone();
+    let contact = export_local_contact_material_for_network_peer_id(
+        &remote_dir,
+        remote_peer.as_str(),
+        observed_at_ms(),
+    )
+    .unwrap();
+    assert!(
+        contact.metadata.listen_addrs.iter().any(|address| {
+            address
+                .parse::<std::net::SocketAddr>()
+                .is_ok_and(|address| address.ip().is_loopback() && address.port() != 0)
+        }),
+        "the exported contact must contain the actual ephemeral loopback port"
+    );
+    local
+        .runtime
+        .upsert_remote_contact_material(remote_peer.to_string(), contact.clone())
+        .unwrap();
+    remote
+        .runtime
+        .upsert_remote_contact_material(
+            local_peer.to_string(),
+            export_local_contact_material_for_network_peer_id(
+                &local_dir,
+                local_peer.as_str(),
+                observed_at_ms(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !(local.connected_peers.contains(&remote_peer)
+        && remote.connected_peers.contains(&local_peer))
+        && Instant::now() < deadline
+    {
+        local.try_tick(&mut local_node).unwrap();
+        remote.try_tick(&mut remote_node).unwrap();
+        thread::sleep(Duration::from_millis(5));
+    }
+    assert!(
+        local.connected_peers.contains(&remote_peer),
+        "the sender must be connected before testing busy"
+    );
+    assert!(
+        remote.connected_peers.contains(&local_peer),
+        "the receiver must be connected before testing busy"
+    );
+    let quiet_until = Instant::now() + Duration::from_secs(1);
+    while Instant::now() < quiet_until {
+        local.try_tick(&mut local_node).unwrap();
+        remote.try_tick(&mut remote_node).unwrap();
+        thread::sleep(Duration::from_millis(5));
+    }
+    remote.drain_runtime_diagnostics();
+    let before_received = diagnostics::list_diagnostics(
+        &remote_dir,
+        &DiagnosticFilter {
+            limit: Some(1000),
+            ..DiagnosticFilter::default()
+        },
+    )
+    .unwrap()
+    .iter()
+    .filter(|row| {
+        row.phase == "control.inbound.received"
+            && row.details["kind"]
+                == if relationship {
+                    "peer_relationship.v1"
+                } else {
+                    "contact_material.v1"
+                }
+    })
+    .count();
+    let kind = if relationship {
+        "peer_relationship.v1"
+    } else {
+        "contact_material.v1"
+    };
+    let mut pressure = Vec::new();
+    for index in 0..4 {
+        let payload = if relationship {
+            serde_json::to_vec(&PeerRelationshipRequest {
+                source_node_id: local_peer.to_string(),
+                target_node_id: remote_peer.to_string(),
+                action: wire_peer_relationship_action(
+                    crate::control::PeerRelationshipAction::Request,
+                ),
+                agent_envelope: Some(default_agent_envelope(
+                    local_peer.as_str(),
+                    remote_peer.as_str(),
+                    "social.friend.request",
+                    json!({"action": "request", "request_id": format!("pressure-{index}")}),
+                )),
+                contact_material: Some(
+                    build_contact_material(&local_dir, local_peer.as_str()).unwrap(),
+                ),
+            })
+            .unwrap()
+        } else {
+            serde_json::to_vec(&RawContactMaterialRequest {
+                source_node_id: local_peer.to_string(),
+                target_node_id: remote_peer.to_string(),
+            })
+            .unwrap()
+        };
+        let dir = local_dir.clone();
+        let peer = local_peer.clone();
+        let contact = contact.clone();
+        pressure.push(thread::spawn(move || {
+            send_control_stream_request_for_network_peer_id_with_timeout(
+                &dir,
+                peer.as_str(),
+                &contact,
+                &IrohControlStreamRequest {
+                    kind: kind.to_owned(),
+                    payload,
+                },
+                Duration::from_secs(15),
+            )
+        }));
+    }
+    // Hold real inbound requests without servicing the remote bridge loop.
+    let mut held = Vec::new();
+    let mut entered = 0;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while entered < 4 && Instant::now() < deadline {
+        if let Some(event) = remote.runtime.try_next_event().unwrap() {
+            if matches!(&event, NetworkRuntimeEvent::ContactMaterialRequest { .. }) && !relationship
+                || matches!(&event, NetworkRuntimeEvent::PeerRelationshipRequest { .. })
+                    && relationship
+            {
+                entered += 1;
+                held.push(event);
+            } else {
+                remote
+                    .process_runtime_event(&mut remote_node, event)
+                    .unwrap();
+            }
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(
+        entered, 4,
+        "the real inbound admission slots must be occupied"
+    );
+    let envelope = default_agent_envelope(
+        local_peer.as_str(),
+        remote_peer.as_str(),
+        "social.friend.request",
+        json!({"action": "request", "request_id": "busy-business-request", "correlation_id": "busy-correlation"}),
+    );
+    if relationship {
+        enqueue_peer_relationship_action_command(
+            &local_dir,
+            remote_peer.as_str(),
+            crate::control::PeerRelationshipAction::Request,
+            envelope.clone(),
+        )
+        .unwrap();
+        assert_eq!(
+            process_pending_network_commands(&mut local_node, &mut local, &local_dir).unwrap(),
+            1
+        );
+    } else {
+        local
+            .request_peer_contact_material(remote_peer.as_str())
+            .unwrap();
+    }
+    let first_contact_started_at = local
+        .pending_contact_material_requests
+        .values()
+        .next()
+        .map(|pending| pending.started_at);
+    let first_relationship_started_at = local
+        .pending_relationship_requests
+        .values()
+        .next()
+        .map(|pending| pending.started_at_ms);
+    let required_busy_count = if relationship && !expire { 6 } else { 2 };
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut busy_count = 0;
+    let mut busy_received_at = None;
+    let mut connected_after_busy = true;
+    let mut reconnect_after_busy = false;
+    while busy_count < required_busy_count && Instant::now() < deadline {
+        let busy_seen = match local.try_tick(&mut local_node).unwrap() {
+            Some(NetworkBridgeTick::TransportNotice { detail }) => detail.contains("busy"),
+            Some(NetworkBridgeTick::PeerRelationshipFailed { error, .. }) => {
+                error.starts_with("control_busy")
+            }
+            _ => false,
+        };
+        if busy_seen {
+            if let Some(previous) = busy_received_at {
+                assert!(
+                    Instant::now().duration_since(previous) >= Duration::from_millis(950),
+                    "each busy retry must wait one second"
+                );
+            }
+            busy_count += 1;
+            busy_received_at = Some(Instant::now());
+            connected_after_busy &= local.connected_peers.contains(&remote_peer);
+            reconnect_after_busy |= local.peer_reconnect_state.contains_key(&remote_peer);
+        }
+        if relationship {
+            assert_eq!(
+                process_pending_network_commands(&mut local_node, &mut local, &local_dir).unwrap(),
+                0
+            );
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+    // Keep the sender's real interactive slots occupied when the busy retry becomes due.
+    for index in 0..4 {
+        if relationship {
+            local
+                .runtime
+                .send_contact_material_request(
+                    &remote_peer,
+                    RawContactMaterialRequest {
+                        source_node_id: local_peer.to_string(),
+                        target_node_id: remote_peer.to_string(),
+                    },
+                )
+                .unwrap();
+        } else {
+            local
+                .runtime
+                .send_peer_relationship_request(
+                    &remote_peer,
+                    PeerRelationshipRequest {
+                        source_node_id: local_peer.to_string(),
+                        target_node_id: remote_peer.to_string(),
+                        action: wire_peer_relationship_action(
+                            crate::control::PeerRelationshipAction::Request,
+                        ),
+                        agent_envelope: Some(default_agent_envelope(
+                            local_peer.as_str(),
+                            remote_peer.as_str(),
+                            "social.friend.request",
+                            json!({"action": "request", "request_id": format!("occupier-{index}")}),
+                        )),
+                        contact_material: Some(
+                            build_contact_material(&local_dir, local_peer.as_str()).unwrap(),
+                        ),
+                    },
+                )
+                .unwrap();
+        }
+    }
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let mut occupying = 0;
+    while occupying < 4 && Instant::now() < deadline {
+        if let Some(event) = remote.runtime.try_next_event().unwrap() {
+            if matches!(&event, NetworkRuntimeEvent::ContactMaterialRequest { .. }) && relationship
+                || matches!(&event, NetworkRuntimeEvent::PeerRelationshipRequest { .. })
+                    && !relationship
+            {
+                occupying += 1;
+            }
+            held.push(event);
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(
+        occupying, 4,
+        "real outbound interactive slots must be occupied"
+    );
+    let hold_until = Instant::now() + Duration::from_millis(1200);
+    while Instant::now() < hold_until {
+        local.try_tick(&mut local_node).unwrap();
+        thread::sleep(Duration::from_millis(5));
+    }
+    let retained_while_local_slots_full = if relationship {
+        local.pending_relationship_requests.len() == 1
+    } else {
+        local.pending_contact_material_requests.len() == 1
+    } && local.connected_peers.contains(&remote_peer);
+    let original_start_preserved = if relationship {
+        local
+            .pending_relationship_requests
+            .values()
+            .next()
+            .map(|pending| pending.started_at_ms)
+            == first_relationship_started_at
+    } else {
+        local
+            .pending_contact_material_requests
+            .values()
+            .next()
+            .map(|pending| pending.started_at)
+            == first_contact_started_at
+    };
+    if expire {
+        if relationship {
+            for pending in local.pending_relationship_requests.values_mut() {
+                pending.started_at_ms = (observed_at_ms() as i64) - 40_000;
+                pending.retry_at = Some(Instant::now() + Duration::from_secs(1));
+            }
+        } else {
+            for pending in local.pending_contact_material_requests.values_mut() {
+                pending.started_at = Instant::now() - PENDING_CONTACT_MATERIAL_REQUEST_TTL;
+                pending.retry_at = Some(Instant::now() + Duration::from_secs(1));
+            }
+        }
+        local.try_tick(&mut local_node).unwrap();
+    }
+    for event in held {
+        remote
+            .process_runtime_event(&mut remote_node, event)
+            .unwrap();
+    }
+    for request in pressure {
+        let response = request.join().unwrap().unwrap();
+        assert!(response.ok, "pressure response: {response:?}");
+    }
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        assert_eq!(
+            busy_count, required_busy_count,
+            "the fifth real request must retry while admission remains busy"
+        );
+        assert!(
+            connected_after_busy,
+            "busy must not disconnect a healthy peer"
+        );
+        assert!(
+            !reconnect_after_busy,
+            "busy must not schedule peer reconnection"
+        );
+        assert!(
+            retained_while_local_slots_full,
+            "a busy retry must wait for local capacity without losing the original operation"
+        );
+        assert!(
+            original_start_preserved,
+            "busy retries must preserve the first send time"
+        );
+        if !expire && relationship {
+            assert!(
+                !local.release_stale_peer_relationship_action(
+                    remote_peer.as_str(),
+                    crate::control::PeerRelationshipAction::Request,
+                    &envelope,
+                    (observed_at_ms() as i64) + 60_000
+                ),
+                "deferred busy work is not an in-flight timeout"
+            );
+        } else if !expire {
+            assert_eq!(
+                local.expire_stale_contact_material_requests(
+                    Instant::now() + PENDING_CONTACT_MATERIAL_REQUEST_TTL + Duration::from_secs(1)
+                ),
+                0,
+                "deferred busy work is not an in-flight timeout"
+            );
+        }
+        remote.drain_runtime_diagnostics();
+        let observations = diagnostics::list_diagnostics(
+            &remote_dir,
+            &DiagnosticFilter {
+                limit: Some(1000),
+                ..DiagnosticFilter::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(observations.iter().filter(|row| row.phase == "control.inbound.received" && row.details["kind"] == kind).count(), before_received + 4 + required_busy_count);
+        // Anomalies keep their existing throttle; received observations retain every rejection.
+        assert_eq!(
+            observations
+                .iter()
+                .filter(|row| row.phase == "control.inbound"
+                    && row.status == "busy"
+                    && row.details["kind"] == kind)
+                .count(),
+            1
+        );
+        let busy = observations
+            .iter()
+            .find(|row| {
+                row.phase == "control.inbound"
+                    && row.status == "busy"
+                    && row.details["kind"] == kind
+            })
+            .expect("rejected traffic must have a receiver diagnostic");
+        assert_eq!(busy.source_node_id.as_deref(), Some(local_peer.as_str()));
+        assert_eq!(busy.details["retry_after_ms"], 1000);
+        if expire {
+            assert!(local.connected_peers.contains(&remote_peer));
+            assert!(!local.peer_reconnect_state.contains_key(&remote_peer));
+            if relationship {
+                assert!(
+                    local.pending_relationship_requests.is_empty(),
+                    "an expired busy relationship must stop even while local capacity is full"
+                );
+                let commands =
+                    fs::read_to_string(local_dir.join("pending_network_commands.jsonl")).unwrap();
+                let commands = commands
+                    .lines()
+                    .map(|line| serde_json::from_str::<Value>(line).unwrap())
+                    .collect::<Vec<_>>();
+                assert_eq!(commands.len(), 1);
+                let command = &commands[0];
+                assert!(command["next_retry_at"].as_i64().unwrap() > observed_at_ms() as i64);
+                assert_eq!(
+                    command["last_error"],
+                    "peer relationship request timed out while remote busy"
+                );
+                assert_eq!(
+                    command["agent_envelope"]["message_json"],
+                    envelope.message_json
+                );
+            } else {
+                assert!(
+                    local.pending_contact_material_requests.is_empty(),
+                    "an expired busy contact request must stop even while local capacity is full"
+                );
+                let expired = diagnostics::list_diagnostics(
+                    &local_dir,
+                    &DiagnosticFilter {
+                        limit: Some(1000),
+                        ..DiagnosticFilter::default()
+                    },
+                )
+                .unwrap();
+                assert!(
+                    expired
+                        .iter()
+                        .any(|row| row.phase == "contact_material.pending.expired"
+                            && row.details["reason"] == "remote_busy")
+                );
+            }
+            return;
+        }
+        if relationship {
+            let commands =
+                fs::read_to_string(local_dir.join("pending_network_commands.jsonl")).unwrap();
+            let command: Value = serde_json::from_str(
+                commands
+                    .lines()
+                    .next()
+                    .expect("command must remain queued while busy"),
+            )
+            .unwrap();
+            assert_eq!(
+                command["attempts"], 1,
+                "busy must not consume queued command attempts"
+            );
+            assert!(command.get("last_error").is_none());
+        }
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let in_flight_retry = loop {
+            local.try_tick(&mut local_node).unwrap();
+            if let Some(event) = remote.runtime.try_next_event().unwrap() {
+                if matches!(&event, NetworkRuntimeEvent::PeerRelationshipRequest { .. })
+                    && relationship
+                    || matches!(&event, NetworkRuntimeEvent::ContactMaterialRequest { .. })
+                        && !relationship
+                {
+                    break event;
+                }
+                remote
+                    .process_runtime_event(&mut remote_node, event)
+                    .unwrap();
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the real retry must be in flight"
+            );
+            thread::sleep(Duration::from_millis(5));
+        };
+        if relationship {
+            let pending = local
+                .pending_relationship_requests
+                .values_mut()
+                .next()
+                .unwrap();
+            assert!(pending.retry_at.is_none());
+            pending.started_at_ms = (observed_at_ms() as i64) - 40_000;
+        } else {
+            let pending = local
+                .pending_contact_material_requests
+                .values_mut()
+                .next()
+                .unwrap();
+            assert!(pending.retry_at.is_none());
+            pending.started_at = Instant::now() - PENDING_CONTACT_MATERIAL_REQUEST_TTL;
+        }
+        local.try_tick(&mut local_node).unwrap();
+        assert_eq!(
+            if relationship {
+                local.pending_relationship_requests.len()
+            } else {
+                local.pending_contact_material_requests.len()
+            },
+            1,
+            "an already in-flight retry must retain its real transport result rather than create an orphaned late failure"
+        );
+        remote
+            .process_runtime_event(&mut remote_node, in_flight_retry)
+            .unwrap();
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        thread::scope(|scope| {
+            let remote_worker = scope.spawn(|| {
+                while !stop.load(std::sync::atomic::Ordering::Acquire) {
+                    remote.try_tick(&mut remote_node).unwrap();
+                    thread::sleep(Duration::from_millis(5));
+                }
+            });
+            let completion = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let deadline = Instant::now() + Duration::from_secs(5);
+                loop {
+                    if relationship {
+                        local.try_tick(&mut local_node).unwrap();
+                    } else {
+                        local.tick(&mut local_node).unwrap();
+                    }
+                    let pending = if relationship {
+                        local.pending_relationship_requests.len()
+                    } else {
+                        local.pending_contact_material_requests.len()
+                    };
+                    if pending == 0 {
+                        break;
+                    }
+                    assert!(
+                        Instant::now() < deadline,
+                        "the original request must retry and complete after capacity is released"
+                    );
+                    thread::sleep(Duration::from_millis(5));
+                }
+            }));
+            stop.store(true, std::sync::atomic::Ordering::Release);
+            remote_worker.join().unwrap();
+            if let Err(panic) = completion {
+                std::panic::resume_unwind(panic);
+            }
+        });
+        assert!(local.connected_peers.contains(&remote_peer));
+        if relationship {
+            let commands =
+                fs::read_to_string(local_dir.join("pending_network_commands.jsonl")).unwrap();
+            assert!(
+                commands.trim().is_empty(),
+                "only a successful response may remove the queued command"
+            );
+            let records =
+                crate::control::load_peer_relationship_request_records_state(&remote_dir).unwrap();
+            let matching = records
+                .iter()
+                .filter(|row| row.request_id == "busy-business-request")
+                .collect::<Vec<_>>();
+            assert_eq!(matching.len(), 1);
+            assert_eq!(
+                matching[0].agent_envelope.message,
+                serde_json::from_str::<Value>(&envelope.message_json).unwrap()
+            );
+            assert_eq!(
+                process_pending_network_commands(&mut local_node, &mut local, &local_dir).unwrap(),
+                0
+            );
+        } else {
+            assert!(local.runtime.allows_outbound_backfill_to(&remote_peer));
+            let metadata = crate::control::load_peer_metadata_records_state(&local_dir).unwrap();
+            let peer = metadata
+                .iter()
+                .find(|peer| peer.node_id == remote_peer.as_str())
+                .expect("retried contact material must be persisted");
+            assert!(peer.contact_material_signature.is_some());
+            assert!(peer.contact_material.as_ref().unwrap()["encryption"]["private_message"]["public_key_b64"].as_str().is_some_and(|key| !key.is_empty()));
+        }
+    }));
+    shutdown_local_iroh_data_plane(&local_dir);
+    shutdown_local_iroh_data_plane(&remote_dir);
+    fs::remove_dir_all(local_dir).unwrap();
+    fs::remove_dir_all(remote_dir).unwrap();
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+#[test]
 fn monitoring_backfill_timeout_and_late_response_are_visible_with_debug() {
     let _env_lock = lock_env_test_mutex();
     let _debug = EnvVarGuard::set(diagnostics::ENV_NETWORK_DEBUG_DIAGNOSTICS, Some("1"));
@@ -2814,8 +3457,19 @@ fn peer_relationship_response_persists_private_message_contact_material() {
             peer: remote_peer.clone(),
             remote_node_id: remote_endpoint.clone(),
             action: crate::control::PeerRelationshipAction::Request,
+            request: PeerRelationshipRequest {
+                source_node_id: local_endpoint.clone(),
+                target_node_id: remote_endpoint.clone(),
+                action: wire_peer_relationship_action(
+                    crate::control::PeerRelationshipAction::Request,
+                ),
+                agent_envelope: Some(agent_envelope.clone()),
+                contact_material: None,
+            },
             agent_envelope,
             started_at_ms: observed_at_ms() as i64,
+            retry_at: None,
+            received_busy: false,
         },
     );
 
@@ -2921,8 +3575,19 @@ impl RelationshipResponseFixture {
                 peer: NetworkNodeId::new(remote_endpoint.clone()).expect("remote peer"),
                 remote_node_id: remote_endpoint.clone(),
                 action: crate::control::PeerRelationshipAction::Request,
+                request: PeerRelationshipRequest {
+                    source_node_id: local_endpoint.clone(),
+                    target_node_id: remote_endpoint.clone(),
+                    action: wire_peer_relationship_action(
+                        crate::control::PeerRelationshipAction::Request,
+                    ),
+                    agent_envelope: Some(request_envelope.clone()),
+                    contact_material: None,
+                },
                 agent_envelope: request_envelope,
                 started_at_ms: observed_at_ms() as i64,
+                retry_at: None,
+                received_busy: false,
             },
         );
         Self {
@@ -3310,19 +3975,31 @@ fn peer_relationship_response_replay_preserves_explicit_dm_unsubscribe() {
     publish_pending_scoped_updates(&mut fixture.service, &node, &fixture.local_endpoint, before)
         .unwrap();
     assert!(!fixture.service.backfill_scopes().contains(&scope));
+    let retry_envelope = default_agent_envelope(
+        &fixture.local_endpoint,
+        &fixture.remote_endpoint,
+        "social.friend.request",
+        json!({"action": "request", "request_id": "request-1"}),
+    );
     fixture.service.pending_relationship_requests.insert(
         fixture.request_id,
         PendingPeerRelationshipRequest {
             peer: NetworkNodeId::new(fixture.remote_endpoint.clone()).unwrap(),
             remote_node_id: fixture.remote_endpoint.clone(),
             action: crate::control::PeerRelationshipAction::Request,
-            agent_envelope: default_agent_envelope(
-                &fixture.local_endpoint,
-                &fixture.remote_endpoint,
-                "social.friend.request",
-                json!({"action": "request", "request_id": "request-1"}),
-            ),
+            request: PeerRelationshipRequest {
+                source_node_id: fixture.local_endpoint.clone(),
+                target_node_id: fixture.remote_endpoint.clone(),
+                action: wire_peer_relationship_action(
+                    crate::control::PeerRelationshipAction::Request,
+                ),
+                agent_envelope: Some(retry_envelope.clone()),
+                contact_material: None,
+            },
+            agent_envelope: retry_envelope,
             started_at_ms: observed_at_ms() as i64,
+            retry_at: None,
+            received_busy: false,
         },
     );
     fixture.respond(accept);
@@ -3418,6 +4095,7 @@ fn discovery_contact_material_preserves_private_message_key() {
 
 #[test]
 fn set_state_dir_loads_persisted_iroh_contact_material_into_runtime() {
+    let _env_lock = lock_env_test_mutex();
     let local_dir = temp_startup_dir("iroh-contact-load-local");
     let remote_dir = temp_startup_dir("iroh-contact-load-remote");
     let local_seed = [81u8; 32];

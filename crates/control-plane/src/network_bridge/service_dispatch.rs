@@ -60,16 +60,16 @@ impl NetworkBridgeService {
             raw_contact_material_private_message_key_len(Some(&contact_material));
         let pending_agent_envelope = envelope.clone();
         let request_action = wire_peer_relationship_action(action);
-        let request_id = self.runtime.send_peer_relationship_request(
-            &peer,
-            PeerRelationshipRequest {
-                source_node_id: local_node_id.clone(),
-                target_node_id: remote_node_id.clone(),
-                action: request_action.clone(),
-                agent_envelope: Some(envelope),
-                contact_material: Some(contact_material),
-            },
-        )?;
+        let request = PeerRelationshipRequest {
+            source_node_id: local_node_id.clone(),
+            target_node_id: remote_node_id.clone(),
+            action: request_action,
+            agent_envelope: Some(envelope),
+            contact_material: Some(contact_material),
+        };
+        let request_id = self
+            .runtime
+            .send_peer_relationship_request(&peer, request.clone())?;
         diagnostics::record_diagnostic(
             Some(&state_dir),
             diagnostics::DiagnosticEvent::new(
@@ -100,6 +100,9 @@ impl NetworkBridgeService {
                 action,
                 agent_envelope: pending_agent_envelope,
                 started_at_ms: observed_at_ms() as i64,
+                retry_at: None,
+                received_busy: false,
+                request,
             },
         );
         Ok(request_id)
@@ -121,6 +124,7 @@ impl NetworkBridgeService {
                     if pending.remote_node_id == remote_node_id
                         && pending.action == action
                         && pending.agent_envelope.message_json == agent_envelope.message_json
+                        && !pending.received_busy
                         && now_ms.saturating_sub(pending.started_at_ms) >= timeout_ms
                     {
                         Some(*request_id)
@@ -205,9 +209,105 @@ impl NetworkBridgeService {
                 peer,
                 remote_node_id,
                 started_at: Instant::now(),
+                retry_at: None,
+                received_busy: false,
             },
         );
         Ok(request_id)
+    }
+
+    pub(super) fn retry_busy_control_requests(&mut self) -> Result<()> {
+        let now = Instant::now();
+        let contacts = self
+            .pending_contact_material_requests
+            .iter()
+            // In-flight retries retain their bounded transport result; only deferred work expires here.
+            .filter(|(_, pending)| pending.retry_at.is_some())
+            .map(|(id, pending)| (*id, pending.clone()))
+            .collect::<Vec<_>>();
+        for (id, mut pending) in contacts {
+            let age = now.saturating_duration_since(pending.started_at);
+            if age >= PENDING_CONTACT_MATERIAL_REQUEST_TTL {
+                self.pending_contact_material_requests.remove(&id);
+                diagnostics::record_diagnostic(
+                    self.state_dir.as_deref(),
+                    diagnostics::DiagnosticEvent::new(
+                        "warn",
+                        "transport",
+                        "contact_material.pending.expired",
+                        "expired",
+                        "contact material request timed out while remote busy",
+                    )
+                    .object("peer", Some(pending.peer.to_string()))
+                    .source_node_id(Some(pending.peer.to_string()))
+                    .details(json!({
+                        "request_id": format!("{id:?}"),
+                        "remote_node_id": pending.remote_node_id,
+                        "age_ms": age.as_millis(),
+                        "ttl_ms": PENDING_CONTACT_MATERIAL_REQUEST_TTL.as_millis(),
+                        "reason": "remote_busy",
+                    })),
+                );
+                continue;
+            }
+            if !pending.retry_at.is_some_and(|retry_at| retry_at <= now) {
+                continue;
+            }
+            if !self.runtime.has_interactive_control_capacity() {
+                continue;
+            }
+            let request_id = self.runtime.send_contact_material_request(
+                &pending.peer,
+                RawContactMaterialRequest {
+                    source_node_id: self.local_peer_id().to_string(),
+                    target_node_id: pending.remote_node_id.clone(),
+                },
+            )?;
+            pending.retry_at = None;
+            self.pending_contact_material_requests.remove(&id);
+            self.pending_contact_material_requests
+                .insert(request_id, pending);
+        }
+        let relationships = self
+            .pending_relationship_requests
+            .iter()
+            .filter(|(_, pending)| pending.retry_at.is_some())
+            .map(|(id, pending)| (*id, pending.clone()))
+            .collect::<Vec<_>>();
+        for (id, mut pending) in relationships {
+            let age_ms = (observed_at_ms() as i64).saturating_sub(pending.started_at_ms);
+            if age_ms
+                >= PEER_RELATIONSHIP_CONTROL_REQUEST_TIMEOUT_MS
+                    .saturating_add(PEER_RELATIONSHIP_IN_FLIGHT_TIMEOUT_GRACE_MS)
+            {
+                self.pending_relationship_requests.remove(&id);
+                if let Some(state_dir) = self.state_dir.as_deref() {
+                    record_peer_relationship_action_command_failure(
+                        state_dir,
+                        self.monitoring_enabled,
+                        &pending.remote_node_id,
+                        pending.action,
+                        pending.agent_envelope,
+                        "peer relationship request timed out while remote busy",
+                    )?;
+                }
+                continue;
+            }
+            if !pending.retry_at.is_some_and(|retry_at| retry_at <= now) {
+                continue;
+            }
+            if !self.runtime.has_interactive_control_capacity() {
+                continue;
+            }
+            let request_id = self
+                .runtime
+                .send_peer_relationship_request(&pending.peer, pending.request.clone())?;
+            pending.retry_at = None;
+            self.pending_relationship_requests.remove(&id);
+            self.pending_relationship_requests
+                .insert(request_id, pending);
+        }
+        Ok(())
     }
 
     pub(crate) fn maybe_sync_topic_message_content(

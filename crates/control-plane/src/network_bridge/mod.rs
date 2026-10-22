@@ -44,8 +44,9 @@ use tokio::runtime::Runtime;
 use uuid::Uuid;
 use wattswarm_network_discovery::{DiscoveryGeo, SignedDiscoveryNodeRecord};
 use wattswarm_network_transport_core::{
-    PeerTransportCapabilities, TransferIntent, TransferKind, TransportContactMaterial,
-    TransportMetadata, TransportRoute as DataTransportRoute, TransportRouter,
+    CONTROL_BUSY_ERROR_PREFIX, CONTROL_BUSY_RETRY_AFTER, PeerTransportCapabilities, TransferIntent,
+    TransferKind, TransportContactMaterial, TransportMetadata,
+    TransportRoute as DataTransportRoute, TransportRouter,
 };
 use wattswarm_network_transport_iroh::{
     export_local_contact_material_for_network_peer_id, local_endpoint_id_from_state_dir,
@@ -247,7 +248,6 @@ const AGENT_PAYMENT_SUMMARY_KIND: &str = "agent_payment_session_v1";
 const CORE_AGENT_EXECUTOR_NAME: &str = "core-agent";
 const MAX_INFLIGHT_BACKFILLS_PER_PEER: usize = 2;
 const BACKFILL_RETRY_JITTER_MAX: Duration = Duration::from_secs(5);
-const CONTROL_BUSY_ERROR_PREFIX: &str = "control_busy";
 // Adaptive per-peer backfill request timeout, using the same broad shape as
 // DM attempt timeout but with batch-backfill-specific bounds. The timeout
 // is computed once per request and passed to the underlying control request so

@@ -46,6 +46,9 @@ pub(super) struct PendingPeerRelationshipRequest {
     pub(super) action: crate::control::PeerRelationshipAction,
     pub(super) agent_envelope: RawAgentEnvelope,
     pub(super) started_at_ms: i64,
+    pub(super) retry_at: Option<Instant>,
+    pub(super) received_busy: bool,
+    pub(super) request: PeerRelationshipRequest,
 }
 
 #[derive(Debug, Clone)]
@@ -53,6 +56,8 @@ pub(super) struct PendingContactMaterialRequest {
     pub(super) peer: NetworkNodeId,
     pub(super) remote_node_id: String,
     pub(super) started_at: Instant,
+    pub(super) retry_at: Option<Instant>,
+    pub(super) received_busy: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

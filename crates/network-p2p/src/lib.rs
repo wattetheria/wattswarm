@@ -459,6 +459,10 @@ impl NetworkRuntime {
         self.inner.diagnostic_snapshot()
     }
 
+    pub fn has_interactive_control_capacity(&self) -> bool {
+        self.inner.has_interactive_control_capacity()
+    }
+
     pub fn new(node: NetworkP2pNode) -> Result<Self> {
         let config = node.config.clone();
         let local_peer_id = node.local_peer_id();
