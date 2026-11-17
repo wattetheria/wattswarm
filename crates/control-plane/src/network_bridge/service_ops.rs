@@ -1021,6 +1021,11 @@ impl NetworkBridgeService {
                     .is_none_or(|state| state.next_attempt_at <= now)
             })
             .filter(|peer| {
+                // Bootstrap peers are the only Global backfill providers, so
+                // losing one for good cuts the node off from Global events.
+                if self.is_global_backfill_provider(peer) {
+                    return true;
+                }
                 if self.abandoned_reconnect_peers.contains(peer) {
                     return self.abandoned_recovery_probe_is_due(peer, now);
                 }
@@ -1109,10 +1114,11 @@ impl NetworkBridgeService {
                     );
                 }
             }
-            if self
-                .peer_reconnect_state
-                .get(&peer)
-                .is_some_and(PeerReconnectState::should_abandon)
+            if !self.is_global_backfill_provider(&peer)
+                && self
+                    .peer_reconnect_state
+                    .get(&peer)
+                    .is_some_and(PeerReconnectState::should_abandon)
             {
                 self.abandon_peer_reconnect(
                     peer,

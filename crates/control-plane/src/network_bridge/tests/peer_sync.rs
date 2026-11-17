@@ -4828,6 +4828,76 @@ fn reconnect_supervision_abandons_stale_peer_until_rediscovered() {
 }
 
 #[test]
+fn reconnect_supervision_never_abandons_bootstrap_peers() {
+    let local_dir = temp_startup_dir("reconnect-bootstrap-local");
+    let local_seed = [113u8; 32];
+    std::fs::write(local_dir.join("node_seed.hex"), hex::encode(local_seed))
+        .expect("write local seed");
+    ensure_test_relay_urls(&local_dir);
+    let mut service = NetworkBridgeService::new(
+        NetworkP2pNode::from_iroh_state_dir(
+            NetworkP2pConfig::default(),
+            local_dir.clone(),
+            local_seed,
+        )
+        .expect("iroh node"),
+        &[SwarmScope::Global],
+        &NetworkProtocolParams::default(),
+    )
+    .expect("service");
+
+    let remotes = [114u8, 115u8].map(|seed| {
+        let remote_dir = temp_startup_dir(&format!("reconnect-bootstrap-remote-{seed}"));
+        std::fs::write(remote_dir.join("node_seed.hex"), hex::encode([seed; 32]))
+            .expect("write remote seed");
+        ensure_test_relay_urls(&remote_dir);
+        let remote_endpoint =
+            wattswarm_network_transport_iroh::local_endpoint_id_from_state_dir(&remote_dir)
+                .expect("remote endpoint")
+                .to_string();
+        let peer = NetworkNodeId::new(remote_endpoint.clone()).expect("remote peer id");
+        let remote_contact = export_local_contact_material_for_network_peer_id(
+            &remote_dir,
+            &remote_endpoint,
+            observed_at_ms(),
+        )
+        .expect("remote contact");
+        service
+            .upsert_remote_contact_material(peer.to_string(), remote_contact)
+            .expect("upsert remote contact");
+        service.remember_global_backfill_provider(peer.clone());
+        (peer, remote_dir)
+    });
+
+    for _ in 0..(PEER_RECONNECT_MAX_ATTEMPTS + 2) * 2 {
+        for (peer, _) in &remotes {
+            service.force_pending_contact_material_request_stale_for_peer(peer);
+            service.force_reconnect_due_for_peer(peer);
+        }
+        service
+            .run_reconnect_supervision()
+            .expect("run reconnect supervision");
+    }
+
+    for (peer, _) in &remotes {
+        assert!(!service.reconnect_abandoned_for_peer(peer));
+        assert!(
+            service
+                .reconnect_attempts_for_peer(peer)
+                .is_some_and(|attempts| attempts > PEER_RECONNECT_MAX_ATTEMPTS),
+            "bootstrap peer keeps being retried past the attempt limit"
+        );
+    }
+
+    wattswarm_network_transport_iroh::shutdown_local_iroh_data_plane(&local_dir);
+    std::fs::remove_dir_all(local_dir).expect("cleanup local");
+    for (_, remote_dir) in remotes {
+        wattswarm_network_transport_iroh::shutdown_local_iroh_data_plane(&remote_dir);
+        std::fs::remove_dir_all(remote_dir).expect("cleanup remote");
+    }
+}
+
+#[test]
 fn repeated_contact_generation_does_not_reactivate_abandoned_peer() {
     let local_dir = temp_startup_dir("reconnect-generation-local");
     let remote_dir = temp_startup_dir("reconnect-generation-remote");
