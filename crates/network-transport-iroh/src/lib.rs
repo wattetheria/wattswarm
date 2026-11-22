@@ -481,6 +481,10 @@ struct IrohDataPlaneService {
     state_dir: PathBuf,
     runtime: Runtime,
     endpoint: Endpoint,
+    // The one address lookup holding every remote contact for this endpoint.
+    // iroh never drops a lookup once it is added, so contacts are merged
+    // into this instance instead of adding a lookup per registration.
+    remote_contacts: MemoryLookup,
     router: Router,
     gossip: Gossip,
     gossip_config: IrohGossipRuntimeConfig,
@@ -1414,6 +1418,11 @@ impl IrohDataPlaneService {
             "initialize iroh endpoint",
             endpoint_future(),
         )?;
+        let remote_contacts = MemoryLookup::new();
+        endpoint
+            .address_lookup()
+            .context("load local iroh address lookup")?
+            .add(remote_contacts.clone());
         let control_handlers = Arc::new(Mutex::new(HashMap::new()));
         let router_future = || async {
             let blob_store = FsStore::load(iroh_blob_store_path(state_dir)).await?;
@@ -1447,6 +1456,7 @@ impl IrohDataPlaneService {
             state_dir: state_dir.to_path_buf(),
             runtime,
             endpoint,
+            remote_contacts,
             router,
             gossip,
             gossip_config,
@@ -1941,12 +1951,8 @@ impl IrohDataPlaneService {
         reference: &IrohBlobReference,
     ) -> Result<Vec<u8>> {
         let endpoint_addr = endpoint_addr_from_contact_material(remote)?;
-        let lookup = MemoryLookup::new();
-        lookup.add_endpoint_info(endpoint_addr.clone());
-        self.endpoint
-            .address_lookup()
-            .context("load local iroh address lookup")?
-            .add(lookup);
+        self.remote_contacts
+            .add_endpoint_info(endpoint_addr.clone());
         let hash = parse_iroh_blob_hash(&reference.hash)?;
         let format = parse_iroh_blob_format(&reference.format)?;
         let request = HashAndFormat::new(hash, format);
@@ -2442,13 +2448,9 @@ pub fn register_remote_contact_material_for_network_peer_id(
     remote_contact: &TransportContactMaterial,
 ) -> Result<()> {
     let endpoint_addr = endpoint_addr_from_contact_material(remote_contact)?;
-    let lookup = MemoryLookup::new();
-    lookup.add_endpoint_info(endpoint_addr);
     ensure_local_iroh_data_plane_for_network_peer_id(state_dir, network_peer_id)?
-        .endpoint
-        .address_lookup()
-        .context("load local iroh address lookup")?
-        .add(lookup);
+        .remote_contacts
+        .add_endpoint_info(endpoint_addr);
     Ok(())
 }
 
@@ -3722,6 +3724,44 @@ GsmUIhIoQCUNhf052/0CIF1BBXj/Fv+KaOTT57eFuzSuu/fiepb2kKgmiiS3LP7o\n\
         )
         .expect("fetch remote blob");
         assert_eq!(bytes, b"remote blob");
+
+        shutdown_local_iroh_data_plane(dir_a.path());
+        shutdown_local_iroh_data_plane(dir_b.path());
+    }
+
+    #[test]
+    fn repeated_remote_contact_registration_reuses_one_address_lookup() {
+        let dir_a = tempdir().expect("node a tempdir");
+        let dir_b = tempdir().expect("node b tempdir");
+        seed_state_dir(dir_a.path(), [61u8; 32]);
+        seed_state_dir(dir_b.path(), [62u8; 32]);
+        write_test_relay_urls(dir_a.path());
+        write_test_relay_urls(dir_b.path());
+        let peer_a = local_endpoint_id_from_state_dir(dir_a.path())
+            .expect("endpoint a")
+            .to_string();
+        let peer_b = local_endpoint_id_from_state_dir(dir_b.path())
+            .expect("endpoint b")
+            .to_string();
+        let contact_b = export_local_contact_material_for_network_peer_id(dir_b.path(), &peer_b, 1)
+            .expect("contact b");
+        let address_lookup_count = || {
+            ensure_local_iroh_data_plane_for_network_peer_id(dir_a.path(), &peer_a)
+                .expect("data plane a")
+                .endpoint
+                .address_lookup()
+                .expect("address lookup a")
+                .len()
+        };
+
+        register_remote_contact_material_for_network_peer_id(dir_a.path(), &peer_a, &contact_b)
+            .expect("node a learns node b");
+        let after_first_registration = address_lookup_count();
+        for _ in 0..16 {
+            register_remote_contact_material_for_network_peer_id(dir_a.path(), &peer_a, &contact_b)
+                .expect("node a relearns node b");
+        }
+        assert_eq!(address_lookup_count(), after_first_registration);
 
         shutdown_local_iroh_data_plane(dir_a.path());
         shutdown_local_iroh_data_plane(dir_b.path());
