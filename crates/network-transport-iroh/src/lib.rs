@@ -3768,6 +3768,124 @@ GsmUIhIoQCUNhf052/0CIF1BBXj/Fv+KaOTT57eFuzSuu/fiepb2kKgmiiS3LP7o\n\
     }
 
     #[test]
+    fn gossip_closes_unused_connections() {
+        const NODES: usize = 6;
+        // A small active view makes every join evict a neighbor, and no shuffle runs
+        // during the test, so only connections to neighbors may stay open at the end.
+        let gossip_config = IrohGossipRuntimeConfig {
+            active_view_capacity: 2,
+            passive_view_capacity: 4,
+            shuffle_active_view_count: 1,
+            maintenance_interval: Duration::from_secs(600),
+            ..IrohGossipRuntimeConfig::default()
+        };
+        let dirs = (0..NODES)
+            .map(|_| tempdir().expect("node tempdir"))
+            .collect::<Vec<_>>();
+        let mut endpoints = Vec::new();
+        for (index, dir) in dirs.iter().enumerate() {
+            seed_state_dir(dir.path(), [80 + index as u8; 32]);
+            write_test_relay_urls(dir.path());
+            let endpoint = local_endpoint_id_from_state_dir(dir.path()).expect("endpoint id");
+            ensure_local_iroh_data_plane_for_network_peer_id_with_gossip_config(
+                dir.path(),
+                &endpoint.to_string(),
+                gossip_config.clone(),
+                true,
+            )
+            .expect("local data plane");
+            endpoints.push(endpoint);
+        }
+        let contacts = dirs
+            .iter()
+            .zip(&endpoints)
+            .map(|(dir, endpoint)| loopback_contact(dir.path(), &endpoint.to_string()))
+            .collect::<Vec<_>>();
+        for (index, dir) in dirs.iter().enumerate() {
+            for contact in contacts
+                .iter()
+                .enumerate()
+                .filter_map(|(other, contact)| (other != index).then_some(contact))
+            {
+                register_remote_contact_material_for_network_peer_id(
+                    dir.path(),
+                    &endpoints[index].to_string(),
+                    contact,
+                )
+                .expect("learn remote contact");
+            }
+        }
+        let connection_counts = || {
+            dirs.iter()
+                .zip(&endpoints)
+                .map(|(dir, endpoint)| {
+                    let service = ensure_local_iroh_data_plane_for_network_peer_id(
+                        dir.path(),
+                        &endpoint.to_string(),
+                    )
+                    .expect("local data plane");
+                    let metrics = &service.endpoint.metrics().socket;
+                    let opened = metrics.num_conns_opened.get();
+                    (opened, opened - metrics.num_conns_closed.get())
+                })
+                .collect::<Vec<_>>()
+        };
+        let topics = [
+            derive_gossip_topic_id("mainnet", "group.alpha", "messages"),
+            derive_gossip_topic_id("mainnet", "group.beta", "messages"),
+        ];
+        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
+
+        let counts = runtime
+            .block_on(async {
+                let mut senders = Vec::new();
+                for (dir, endpoint) in dirs.iter().zip(&endpoints) {
+                    let gossip =
+                        local_gossip_for_network_peer_id(dir.path(), &endpoint.to_string())?;
+                    let others = endpoints
+                        .iter()
+                        .copied()
+                        .filter(|other| other != endpoint)
+                        .collect::<Vec<_>>();
+                    for topic in topics {
+                        let (sender, mut receiver) =
+                            gossip.subscribe(topic, others.clone()).await?.split();
+                        tokio::spawn(async move { while receiver.next().await.is_some() {} });
+                        senders.push((sender, others.clone()));
+                    }
+                }
+                // Every node keeps re-joining every known peer on every topic.
+                for _ in 0..10 {
+                    for (sender, others) in &senders {
+                        let _ = timeout(Duration::from_secs(1), sender.join_peers(others.clone()))
+                            .await;
+                    }
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                }
+                // Unused connections are closed after a short grace period.
+                tokio::time::sleep(Duration::from_secs(15)).await;
+                Result::<_>::Ok(connection_counts())
+            })
+            .expect("run gossip swarm");
+
+        // Two peers that dial each other at the same time each keep the connection the
+        // other one sends on.
+        let limit = 2 * (NODES as u64 - 1);
+        assert!(
+            counts.iter().all(|(opened, _)| *opened > limit),
+            "the swarm did not open enough connections to test closing: {counts:?}"
+        );
+        assert!(
+            counts.iter().all(|(_, open)| *open <= limit),
+            "unused gossip connections were not closed: {counts:?} (limit {limit})"
+        );
+
+        for dir in &dirs {
+            shutdown_local_iroh_data_plane(dir.path());
+        }
+    }
+
+    #[test]
     fn two_nodes_exchange_iroh_gossip_notification_on_shared_topic() {
         let dir_a = tempdir().expect("node a tempdir");
         let dir_b = tempdir().expect("node b tempdir");

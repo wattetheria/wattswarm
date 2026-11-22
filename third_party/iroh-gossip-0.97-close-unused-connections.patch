@@ -1,0 +1,349 @@
+--- a/iroh-gossip-0.97.0/src/net/util.rs
++++ b/iroh-gossip-0.97.0/src/net/util.rs
+@@ -22,6 +22,7 @@
+     sync::mpsc,
+     task::JoinSet,
+ };
++use tokio_util::sync::CancellationToken;
+ use tracing::{debug, trace, Instrument};
+ 
+ use super::{InEvent, ProtoMessage};
+@@ -88,6 +89,9 @@
+     }
+ }
+ 
++/// How long a connection or peer may stay unused before it is closed or dropped.
++pub(crate) const UNUSED_GRACE: Duration = Duration::from_secs(5);
++
+ pub(crate) struct RecvLoop {
+     remote_endpoint_id: EndpointId,
+     conn: Connection,
+@@ -110,16 +114,32 @@
+         }
+     }
+ 
+-    pub(crate) async fn run(&mut self) -> Result<(), ReadError> {
++    /// Runs the receive loop until the connection is closed.
++    ///
++    /// `send_done` is cancelled once our side stopped sending on this connection. From
++    /// then on the connection is closed as soon as the remote sent nothing for
++    /// [`UNUSED_GRACE`]: neither side uses it any more, and nothing else closes it.
++    pub(crate) async fn run(&mut self, send_done: CancellationToken) -> Result<(), ReadError> {
+         let mut read_futures = FuturesUnordered::new();
+         let mut conn_is_closed = false;
+         let closed = self.conn.closed();
+         tokio::pin!(closed);
++        let mut send_is_done = false;
++        let mut last_activity = Instant::now();
+         while !conn_is_closed || !read_futures.is_empty() {
+             tokio::select! {
+                 _ = &mut closed, if !conn_is_closed => {
+                     conn_is_closed = true;
+                 }
++                _ = send_done.cancelled(), if !send_is_done => {
++                    send_is_done = true;
++                    last_activity = Instant::now();
++                }
++                _ = sleep_until(last_activity + UNUSED_GRACE), if send_is_done && !conn_is_closed => {
++                    debug!("close unused connection");
++                    self.conn.close(0u32.into(), b"unused");
++                    conn_is_closed = true;
++                }
+                 stream = self.conn.accept_uni(), if !conn_is_closed => {
+                     let stream = match stream {
+                         Ok(stream) => stream,
+@@ -128,6 +148,7 @@
+                             continue;
+                         }
+                     };
++                    last_activity = Instant::now();
+                     let state = RecvStreamState::new(stream, self.max_message_size).await?;
+                     debug!(topic=%state.header.topic_id.fmt_short(), "stream opened");
+                     read_futures.push(state.next());
+@@ -143,6 +164,7 @@
+                     match msg {
+                         None => debug!(topic=%state.header.topic_id.fmt_short(), "stream closed"),
+                         Some(msg) => {
++                            last_activity = Instant::now();
+                             if self.in_event_tx.send(InEvent::RecvMessage(self.remote_endpoint_id, msg)).await.is_err() {
+                                 debug!("stop recv loop: actor closed");
+                                 break;
+@@ -231,9 +253,14 @@
+             tokio::select! {
+                 biased;
+                 _ = &mut closed => break,
+-                Some(msg) = self.send_rx.recv() => self.write_message(&msg).await?,
++                msg = self.send_rx.recv() => match msg {
++                    Some(msg) => self.write_message(&msg).await?,
++                    // The sender was dropped: we stop sending on this connection. A
++                    // `Some(msg)` pattern would only disable this branch, and the loop
++                    // would then wait for the connection to close.
++                    None => break,
++                },
+                 _ = self.finishing.join_next(), if !self.finishing.is_empty() => {}
+-                else => break,
+             }
+         }
+ 
+--- a/iroh-gossip-0.97.0/src/net.rs
++++ b/iroh-gossip-0.97.0/src/net.rs
+@@ -31,7 +31,7 @@
+ 
+ use self::{
+     address_lookup::GossipAddressLookup,
+-    util::{RecvLoop, SendLoop, Timers},
++    util::{RecvLoop, SendLoop, Timers, UNUSED_GRACE},
+ };
+ use crate::{
+     api::{self, Command, Event, GossipApi, RpcMessage},
+@@ -294,6 +294,8 @@
+     topics: HashMap<TopicId, TopicState>,
+     /// Map of peers to their state.
+     peers: HashMap<EndpointId, PeerState>,
++    /// When to look for unused peers the next time.
++    next_unused_peers_check: Instant,
+     /// Stream of commands from topic handles.
+     command_rx: stream_group::Keyed<TopicCommandStream>,
+     /// Internal queue of topic to close because all handles were dropped.
+@@ -343,6 +345,7 @@
+             topics: Default::default(),
+             quit_queue: Default::default(),
+             connection_tasks: Default::default(),
++            next_unused_peers_check: Instant::now() + UNUSED_GRACE,
+             metrics,
+             local_rx,
+             topic_event_forwarders: Default::default(),
+@@ -479,9 +482,29 @@
+             }
+         }
+ 
++        self.drop_unused_peers(Instant::now());
+         true
+     }
+ 
++    /// Drops peers that no topic uses and that we did not send to for [`UNUSED_GRACE`].
++    ///
++    /// The protocol state only asks to disconnect peers it received a message from, so
++    /// a peer we only sent to (a join, a shuffle reply) would keep its connection forever.
++    /// Dropping the peer ends our sends, and the connection loop then closes the connection.
++    fn drop_unused_peers(&mut self, now: Instant) {
++        if now < self.next_unused_peers_check {
++            return;
++        }
++        self.next_unused_peers_check = now + UNUSED_GRACE;
++        let state = &self.state;
++        self.peers.retain(|peer_id, peer_state| match peer_state {
++            PeerState::Pending { .. } => true,
++            PeerState::Active { last_used, .. } => {
++                state.uses_peer(peer_id) || now.duration_since(*last_used) < UNUSED_GRACE
++            }
++        });
++    }
++
+     async fn handle_addr_update(&mut self, endpoint_addr: EndpointAddr) {
+         // let peer_data = our_peer_data(&self.endpoint, current_addresses);
+         let peer_data = encode_peer_data(&endpoint_addr.into());
+@@ -534,6 +557,7 @@
+                     active_send_tx: send_tx,
+                     active_conn_id: conn_id,
+                     other_conns: Vec::new(),
++                    last_used: Instant::now(),
+                 });
+                 Vec::new()
+             }
+@@ -584,6 +608,16 @@
+                 debug!("active send connection closed, mark peer as disconnected");
+                 self.handle_in_event(InEvent::PeerDisconnected(peer_id), Instant::now())
+                     .await;
++                // The protocol state only drops peers that were neighbors. Drop any other
++                // peer here, otherwise later messages go to the closed connection instead
++                // of dialing again.
++                let is_closed_conn = matches!(
++                    self.peers.get(&peer_id),
++                    Some(PeerState::Active { active_conn_id, .. }) if *active_conn_id == conn.stable_id()
++                );
++                if is_closed_conn {
++                    self.peers.remove(&peer_id);
++                }
+             } else {
+                 other_conns.retain(|x| *x != conn.stable_id());
+                 debug!("remaining {} other connections", other_conns.len() + 1);
+@@ -680,7 +714,12 @@
+                 OutEvent::SendMessage(peer_id, message) => {
+                     let state = self.peers.entry(peer_id).or_default();
+                     match state {
+-                        PeerState::Active { active_send_tx, .. } => {
++                        PeerState::Active {
++                            active_send_tx,
++                            last_used,
++                            ..
++                        } => {
++                            *last_used = now;
+                             if let Err(_err) = active_send_tx.send(message).await {
+                                 // Removing the peer is handled by the in_event PeerDisconnected sent
+                                 // in [`Self::handle_connection_task_finished`].
+@@ -763,6 +802,8 @@
+         active_send_tx: mpsc::Sender<ProtoMessage>,
+         active_conn_id: ConnId,
+         other_conns: Vec<ConnId>,
++        /// When we last sent to the peer or got a connection to it.
++        last_used: Instant,
+     },
+ }
+ 
+@@ -779,6 +820,7 @@
+                     active_send_tx: send_tx,
+                     active_conn_id: conn_id,
+                     other_conns: Vec::new(),
++                    last_used: Instant::now(),
+                 };
+                 queue
+             }
+@@ -786,6 +828,7 @@
+                 active_send_tx,
+                 active_conn_id,
+                 other_conns,
++                last_used,
+             } => {
+                 // We already have an active connection. We keep the old connection intact,
+                 // but only use the new connection for sending from now on.
+@@ -795,6 +838,7 @@
+                 other_conns.push(*active_conn_id);
+                 *active_send_tx = send_tx;
+                 *active_conn_id = conn_id;
++                *last_used = Instant::now();
+                 Vec::new()
+             }
+         }
+@@ -889,8 +933,16 @@
+     let mut send_loop = SendLoop::new(conn.clone(), send_rx, max_message_size);
+     let mut recv_loop = RecvLoop::new(from, conn, in_event_tx, max_message_size);
+ 
+-    let send_fut = send_loop.run(queue).instrument(error_span!("send"));
+-    let recv_fut = recv_loop.run().instrument(error_span!("recv"));
++    let send_done = CancellationToken::new();
++    let send_fut = async {
++        let res = send_loop.run(queue).await;
++        send_done.cancel();
++        res
++    }
++    .instrument(error_span!("send"));
++    let recv_fut = recv_loop
++        .run(send_done.clone())
++        .instrument(error_span!("recv"));
+ 
+     let (send_res, recv_res) = tokio::join!(send_fut, recv_fut);
+     send_res?;
+@@ -1968,6 +2020,83 @@
+         drop(rx2);
+         router1.shutdown().await.std_context("shutdown router1")?;
+         router2.shutdown().await.std_context("shutdown router2")?;
++        Ok(())
++    }
++
++    /// Connections that neither side uses any more must be closed.
++    ///
++    /// A small swarm keeps re-joining all known peers, so neighbors are evicted and
++    /// short-lived dials happen constantly. Once the joins stop, only connections
++    /// to neighbors may stay open.
++    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
++    async fn unused_connections_are_closed() -> n0_error::Result<()> {
++        const NODES: usize = 8;
++        let mut membership = HyparviewConfig::default();
++        membership.active_view_capacity = 3;
++        membership.passive_view_capacity = 8;
++        membership.shuffle_active_view_count = 2;
++
++        let lookup = MemoryLookup::new();
++        let mut routers = Vec::new();
++        let mut gossips = Vec::new();
++        for _ in 0..NODES {
++            let ep = Endpoint::empty_builder().bind().await?;
++            ep.address_lookup()?.add(lookup.clone());
++            let gossip = Gossip::builder()
++                .membership_config(membership.clone())
++                .spawn(ep.clone());
++            let router = Router::builder(ep)
++                .accept(crate::ALPN, gossip.clone())
++                .spawn();
++            lookup.add_endpoint_info(router.endpoint().addr());
++            routers.push(router);
++            gossips.push(gossip);
++        }
++        let ids: Vec<EndpointId> = routers.iter().map(|r| r.endpoint().id()).collect();
++        let topics = [TopicId::from([1u8; 32]), TopicId::from([2u8; 32])];
++
++        let mut senders = Vec::new();
++        for (index, gossip) in gossips.iter().enumerate() {
++            let others: Vec<EndpointId> =
++                ids.iter().copied().filter(|id| *id != ids[index]).collect();
++            for topic in topics {
++                let (sender, mut receiver) = gossip.subscribe(topic, others.clone()).await?.split();
++                spawn(async move { while receiver.next().await.is_some() {} });
++                senders.push((sender, others.clone()));
++            }
++        }
++
++        let open_connections = |routers: &[Router]| -> Vec<u64> {
++            routers
++                .iter()
++                .map(|router| {
++                    let metrics = &router.endpoint().metrics().socket;
++                    metrics.num_conns_opened.get() - metrics.num_conns_closed.get()
++                })
++                .collect()
++        };
++
++        // Churn: every node keeps re-joining every other node on every topic.
++        for _ in 0..30 {
++            for (sender, others) in &senders {
++                let _ = timeout(Duration::from_secs(1), sender.join_peers(others.clone())).await;
++            }
++            tokio::time::sleep(Duration::from_millis(500)).await;
++        }
++
++        // Let the swarm settle; unused connections must be closed after a short grace period.
++        tokio::time::sleep(Duration::from_secs(15)).await;
++        let open = open_connections(&routers);
++        // Two peers that dial each other at the same time each keep the connection the other uses.
++        let limit = 2 * (NODES as u64 - 1);
++        assert!(
++            open.iter().all(|count| *count <= limit),
++            "unused gossip connections were not closed: {open:?} (limit {limit})"
++        );
++
++        for router in routers {
++            router.shutdown().await.std_context("shutdown router")?;
++        }
+         Ok(())
+     }
+ }
+--- a/iroh-gossip-0.97.0/src/proto/hyparview.rs
++++ b/iroh-gossip-0.97.0/src/proto/hyparview.rs
+@@ -343,6 +343,12 @@
+     }
+ 
+     /// A connection was closed by the peer.
++    /// Whether the connection to `peer` is in use: the peer is a neighbor, or we wait
++    /// for its reply to a neighbor request.
++    pub(crate) fn uses_peer(&self, peer: &PI) -> bool {
++        self.active_view.contains(peer) || self.pending_neighbor_requests.contains(peer)
++    }
++
+     fn handle_connection_closed(&mut self, peer: PI, io: &mut impl IO<PI>) {
+         self.pending_neighbor_requests.remove(&peer);
+         if self.active_view.contains(&peer) {
+--- a/iroh-gossip-0.97.0/src/proto/state.rs
++++ b/iroh-gossip-0.97.0/src/proto/state.rs
+@@ -222,6 +222,11 @@
+             .unwrap_or(false)
+     }
+ 
++    /// Whether any topic uses the connection to `peer`.
++    pub(crate) fn uses_peer(&self, peer: &PI) -> bool {
++        self.states.values().any(|state| state.swarm.uses_peer(peer))
++    }
++
+     /// Returns the maximum message size configured in the gossip protocol.
+     pub fn max_message_size(&self) -> usize {
+         self.config.max_message_size
