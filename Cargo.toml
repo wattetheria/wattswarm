@@ -76,6 +76,7 @@ watt-did = { path = "../watt-did" }
 # iroh-gossip 0.97 patched to close connections that neither side uses any more. Without
 # it every gossip connection ever opened stays open and memory grows until the process is
 # killed. Fixed upstream in iroh-gossip 0.102, which needs iroh 1.x.
+# It also drops the messages queued for a peer whose dial failed, which otherwise pile up.
 # See third_party/README.md.
 [patch.crates-io]
 iroh = { path = "third_party/iroh-0.97.0" }

@@ -3886,6 +3886,40 @@ GsmUIhIoQCUNhf052/0CIF1BBXj/Fv+KaOTT57eFuzSuu/fiepb2kKgmiiS3LP7o\n\
     }
 
     #[test]
+    fn gossip_dials_again_after_failed_dial() {
+        let dir = tempdir().expect("node tempdir");
+        seed_state_dir(dir.path(), [90u8; 32]);
+        write_test_relay_urls(dir.path());
+        let endpoint = local_endpoint_id_from_state_dir(dir.path()).expect("endpoint id");
+        ensure_local_iroh_data_plane_for_network_peer_id(dir.path(), &endpoint.to_string())
+            .expect("local data plane");
+        // No contact material is known for this peer, so every dial fails (after 30 s).
+        let unreachable = SecretKey::from_bytes(&[91u8; 32]).public();
+        let topic = derive_gossip_topic_id("mainnet", "group.alpha", "messages");
+        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
+
+        runtime
+            .block_on(async {
+                let gossip = local_gossip_for_network_peer_id(dir.path(), &endpoint.to_string())?;
+                let (sender, _receiver) = gossip.subscribe(topic, Vec::new()).await?.split();
+                for attempt in 1..=2 {
+                    sender.join_peers(vec![unreachable]).await?;
+                    timeout(Duration::from_secs(45), async {
+                        while gossip.metrics().actor_tick_dialer_failure.get() < attempt {
+                            tokio::time::sleep(Duration::from_millis(50)).await;
+                        }
+                    })
+                    .await
+                    .with_context(|| format!("join {attempt} did not dial the peer"))?;
+                }
+                Result::<_>::Ok(())
+            })
+            .expect("a join after a failed dial dials the peer again");
+
+        shutdown_local_iroh_data_plane(dir.path());
+    }
+
+    #[test]
     fn two_nodes_exchange_iroh_gossip_notification_on_shared_topic() {
         let dir_a = tempdir().expect("node a tempdir");
         let dir_b = tempdir().expect("node b tempdir");

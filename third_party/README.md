@@ -23,11 +23,11 @@ or later.
 
 ## iroh-gossip-0.97.0
 
-`iroh-gossip` 0.97.0 from crates.io plus one fix, wired in through `[patch.crates-io]`
+`iroh-gossip` 0.97.0 from crates.io plus two fixes, wired in through `[patch.crates-io]`
 in the workspace `Cargo.toml`. The crate's own CI and tooling files (`.github`, `.cargo`,
 `.config`, `.gitignore`, `Cargo.lock`) are left out.
 
-**Fix:** `iroh-gossip-0.97-close-unused-connections.patch`, applied to `src/net.rs`,
+**Fix 1:** `iroh-gossip-0.97-close-unused-connections.patch`, applied to `src/net.rs`,
 `src/net/util.rs`, `src/proto/hyparview.rs` and `src/proto/state.rs`.
 
 **Why:** iroh-gossip 0.97 never closes a gossip connection. Every neighbor that is
@@ -54,5 +54,22 @@ The patch does four things:
 `gossip_closes_unused_connections` in `crates/network-transport-iroh` covers it from the
 workspace.
 
+**Fix 2:** `iroh-gossip-0.97-drop-queue-after-failed-dial.patch`, applied on top of fix 1
+to `src/net.rs`.
+
+**Why:** messages to a peer that is not connected yet wait in a per-peer queue while the
+peer is dialed. When the dial failed, the queue stayed: the protocol state only asks to
+disconnect peers it received a message from. A non-empty queue starts no new dial, so
+every later message to that peer was added to it and never sent. `wattswarm-kernel` kept
+about 930,000 queued join messages (104 MB) after two hours with an estimated 44 unreachable
+contacts, and it never dialed those contacts again.
+
+The patch drops the peer, and with it the queue, when its dial fails. The next message to
+the peer dials again.
+
+`net::test::failed_dial_is_retried_by_the_next_message` in the patched crate reproduces
+it, and `gossip_dials_again_after_failed_dial` in `crates/network-transport-iroh` covers
+it from the workspace.
+
 **Remove** this directory and the `[patch.crates-io]` entry when upgrading iroh-gossip to
-0.102 or later.
+0.102 or later. Check first that the release has fix 2: it is not known to be upstream.

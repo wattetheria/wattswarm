@@ -1,0 +1,51 @@
+--- a/iroh-gossip-0.97.0/src/net.rs
++++ b/iroh-gossip-0.97.0/src/net.rs
+@@ -442,6 +442,10 @@
+                         let peer_state = self.peers.get(&peer_id);
+                         let is_active = matches!(peer_state, Some(PeerState::Active { .. }));
+                         if !is_active {
++                            // Drop the messages queued for this dial. The protocol state only
++                            // asks to disconnect peers it received a message from, so a queue
++                            // left here would grow with every message and never dial again.
++                            self.peers.remove(&peer_id);
+                             self.handle_in_event(InEvent::PeerDisconnected(peer_id), Instant::now())
+                                 .await;
+                         }
+@@ -2099,4 +2103,37 @@
+         }
+         Ok(())
+     }
++
++    /// A failed dial must not leave the messages queued for the peer behind.
++    ///
++    /// Every join to a peer that cannot be dialed must dial again. A queue that
++    /// survives the failed dial would take all later messages without dialing.
++    #[tokio::test]
++    async fn failed_dial_is_retried_by_the_next_message() -> n0_error::Result<()> {
++        let rng = &mut rand_chacha::ChaCha12Rng::seed_from_u64(1);
++        let ep = Endpoint::empty_builder().bind().await?;
++        let gossip = Gossip::builder().spawn(ep.clone());
++        let router = Router::builder(ep)
++            .accept(crate::ALPN, gossip.clone())
++            .spawn();
++        let unreachable = SecretKey::generate(rng).public();
++        let (sender, _receiver) = gossip
++            .subscribe(TopicId::from([3u8; 32]), vec![])
++            .await?
++            .split();
++
++        for attempt in 1..=3 {
++            sender.join_peers(vec![unreachable]).await?;
++            timeout(Duration::from_secs(10), async {
++                while gossip.metrics().actor_tick_dialer_failure.get() < attempt {
++                    tokio::time::sleep(Duration::from_millis(20)).await;
++                }
++            })
++            .await
++            .std_context("join did not dial the unreachable peer again")?;
++        }
++
++        router.shutdown().await.std_context("shutdown router")?;
++        Ok(())
++    }
+ }

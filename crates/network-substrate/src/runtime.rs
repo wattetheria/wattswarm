@@ -1,4 +1,5 @@
 use super::*;
+use std::collections::BTreeSet;
 use std::hash::{Hash, Hasher};
 use std::sync::Mutex;
 use std::sync::atomic::Ordering;
@@ -225,6 +226,9 @@ pub struct IrohRuntimeCounters {
     pub stream_request_failures: u64,
     pub retry_suppressed_connects: u64,
     pub request_limit_drops: u64,
+    /// Gossip joins requested, counted per topic and peer.
+    #[serde(default)]
+    pub gossip_join_requests: u64,
 }
 
 struct IrohGossipTopicHandle {
@@ -527,6 +531,7 @@ impl SubstrateRuntime {
             );
         }
         contact.metadata.endpoint_id = Some(contact_endpoint.clone());
+        let mut dial_addrs_changed = true;
         if let Some(existing) = self.remote_contacts.get(&remote_network_peer_id) {
             if existing.metadata.generated_at > contact.metadata.generated_at {
                 self.counters.stale_contact_material_drops =
@@ -536,14 +541,19 @@ impl SubstrateRuntime {
             if existing.metadata.generated_at == contact.metadata.generated_at {
                 return Ok(false);
             }
+            dial_addrs_changed = contact_dial_addrs(existing) != contact_dial_addrs(&contact);
         }
         register_remote_contact_material_for_network_peer_id(
             &self.state_dir,
             self.local_peer_id.as_str(),
             &contact,
         )?;
-        self.remote_contacts.insert(remote_network_peer_id, contact);
-        self.schedule_gossip_bootstrap_join()?;
+        self.remote_contacts
+            .insert(remote_network_peer_id.clone(), contact);
+        // Refreshed material with the same addresses reaches the peer no better than before.
+        if dial_addrs_changed {
+            self.join_gossip_topics_with_contact(&remote_network_peer_id)?;
+        }
         Ok(true)
     }
 
@@ -562,7 +572,7 @@ impl SubstrateRuntime {
         if !self.remote_contacts.contains_key(peer.as_str()) {
             return Ok(false);
         }
-        self.schedule_gossip_bootstrap_join()?;
+        self.join_gossip_topics_with_contact(peer.as_str())?;
         Ok(true)
     }
 
@@ -714,7 +724,7 @@ impl SubstrateRuntime {
                 self.local_peer_id.as_str(),
                 &merged,
             )?;
-            self.schedule_gossip_bootstrap_join()?;
+            self.join_gossip_topics_with_contact(peer.as_str())?;
         } else {
             let contact = TransportContactMaterial {
                 transport: TransportRoute::IrohDirect.as_str().to_owned(),
@@ -747,27 +757,56 @@ impl SubstrateRuntime {
         Ok(())
     }
 
-    fn schedule_gossip_bootstrap_join(&self) -> Result<()> {
-        if self.gossip_topics.is_empty() {
+    /// Asks one contact to join every subscribed gossip topic.
+    fn join_gossip_topics_with_contact(&mut self, remote_network_peer_id: &str) -> Result<()> {
+        let Some(contact) = self.remote_contacts.get(remote_network_peer_id) else {
             return Ok(());
-        }
-        let bootstrap = self
+        };
+        let peers = vec![contact_endpoint_id(contact)?];
+        let senders = self
+            .gossip_topics
+            .values()
+            .map(|topic| topic.sender.clone())
+            .collect();
+        self.spawn_gossip_joins(senders, peers);
+        Ok(())
+    }
+
+    /// Asks every contact to join one gossip topic.
+    fn join_gossip_topic_with_contacts(
+        &mut self,
+        subscription: &IrohGossipSubscription,
+    ) -> Result<()> {
+        let Some(topic) = self.gossip_topics.get(subscription) else {
+            return Ok(());
+        };
+        let senders = vec![topic.sender.clone()];
+        let peers = self
             .remote_contacts
             .values()
             .map(contact_endpoint_id)
             .collect::<Result<Vec<_>>>()?;
-        if bootstrap.is_empty() {
-            return Ok(());
+        self.spawn_gossip_joins(senders, peers);
+        Ok(())
+    }
+
+    /// A join makes the remote peer replace one of its neighbors and tell the others, so
+    /// it is only sent to the peers and topics that changed.
+    fn spawn_gossip_joins(&mut self, senders: Vec<GossipSender>, peers: Vec<EndpointId>) {
+        if peers.is_empty() {
+            return;
         }
         let timeout = Duration::from_millis(DEFAULT_GOSSIP_BOOTSTRAP_TIMEOUT_MS);
-        for topic in self.gossip_topics.values() {
-            let sender = topic.sender.clone();
-            let peers = bootstrap.clone();
+        for sender in senders {
+            self.counters.gossip_join_requests = self
+                .counters
+                .gossip_join_requests
+                .saturating_add(peers.len() as u64);
+            let peers = peers.clone();
             self.runtime().spawn(async move {
                 let _ = tokio::time::timeout(timeout, sender.join_peers(peers)).await;
             });
         }
-        Ok(())
     }
 
     pub fn send_backfill_request(
@@ -1651,8 +1690,8 @@ impl SubstrateRuntime {
             }
         });
         self.gossip_topics
-            .insert(subscription, IrohGossipTopicHandle { sender, task });
-        self.schedule_gossip_bootstrap_join()?;
+            .insert(subscription.clone(), IrohGossipTopicHandle { sender, task });
+        self.join_gossip_topic_with_contacts(&subscription)?;
         Ok(())
     }
 
@@ -1661,6 +1700,16 @@ impl SubstrateRuntime {
         self.next_request_id = self.next_request_id.saturating_add(1).max(1);
         request_id
     }
+}
+
+/// The addresses iroh dials `contact` on: its direct addresses and relay URLs.
+fn contact_dial_addrs(contact: &TransportContactMaterial) -> BTreeSet<&str> {
+    ["direct_addrs", "relay_urls"]
+        .into_iter()
+        .filter_map(|key| contact.extra.get(key)?.as_array())
+        .flatten()
+        .filter_map(serde_json::Value::as_str)
+        .collect()
 }
 
 /// Copy of `contact` with `dial_addrs` appended to its direct address
@@ -1908,7 +1957,8 @@ mod tests {
         let (control_tx, control_rx) = mpsc::channel();
         let counter = TEST_STATE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let state_dir = std::env::temp_dir().join(format!(
-            "wattswarm-substrate-runtime-test-{}-{}",
+            "wattswarm-substrate-runtime-test-{}-{}-{}",
+            std::process::id(),
             unix_timestamp_millis(),
             counter
         ));
@@ -2173,6 +2223,163 @@ mod tests {
             }
             other => panic!("expected peer discovered event, got {other:?}"),
         }
+    }
+
+    fn relay_contact_for_test(
+        peer: &NetworkNodeId,
+        generated_at: u64,
+        direct_addrs: &[&str],
+    ) -> TransportContactMaterial {
+        TransportContactMaterial {
+            transport: TransportRoute::IrohDirect.as_str().to_owned(),
+            peer_id: peer.to_string(),
+            metadata: TransportMetadata {
+                route: TransportRoute::IrohDirect,
+                generated_at,
+                endpoint_id: Some(peer.to_string()),
+                alpn: Some(DEFAULT_IROH_CONTROL_ALPN.to_owned()),
+                listen_addrs: Vec::new(),
+                capabilities: PeerTransportCapabilities::iroh_direct_default(),
+            },
+            extra: serde_json::json!({
+                "endpoint_id": peer.to_string(),
+                "alpn": DEFAULT_IROH_CONTROL_ALPN,
+                "direct_addrs": direct_addrs,
+                "relay_urls": ["https://relay.example.com"],
+            }),
+        }
+    }
+
+    const TWO_GOSSIP_KINDS: [GossipKind; 2] = [GossipKind::Events, GossipKind::Messages];
+
+    #[test]
+    fn new_contact_is_asked_to_join_every_topic_without_rejoining_known_contacts() {
+        let mut runtime = runtime_for_test(SubstrateConfig::default());
+        runtime
+            .subscribe_scope_kinds(&SwarmScope::Global, &TWO_GOSSIP_KINDS)
+            .expect("subscribe topics");
+        assert_eq!(runtime.counters.gossip_join_requests, 0);
+
+        for known_contacts in 1..=3 {
+            let peer = NetworkNodeId::random();
+            runtime
+                .upsert_remote_contact_material(
+                    peer.to_string(),
+                    relay_contact_for_test(&peer, 1_000, &[]),
+                )
+                .expect("learn contact");
+            assert_eq!(
+                runtime.counters.gossip_join_requests,
+                known_contacts * TWO_GOSSIP_KINDS.len() as u64,
+                "only the new contact joins, once per topic"
+            );
+        }
+    }
+
+    #[test]
+    fn refreshed_contact_is_only_rejoined_when_its_addresses_change() {
+        let peer = NetworkNodeId::random();
+        let mut runtime = runtime_for_test(SubstrateConfig::default());
+        runtime
+            .subscribe_scope_kinds(&SwarmScope::Global, &TWO_GOSSIP_KINDS)
+            .expect("subscribe topics");
+        let joins_per_contact = TWO_GOSSIP_KINDS.len() as u64;
+        let mut upsert = |generated_at, direct_addrs: &[&str]| {
+            assert!(
+                runtime
+                    .upsert_remote_contact_material(
+                        peer.to_string(),
+                        relay_contact_for_test(&peer, generated_at, direct_addrs),
+                    )
+                    .expect("upsert contact")
+            );
+            runtime.counters.gossip_join_requests
+        };
+
+        assert_eq!(upsert(1_000, &["10.0.0.7:4002"]), joins_per_contact);
+        assert_eq!(
+            upsert(2_000, &["10.0.0.7:4002"]),
+            joins_per_contact,
+            "newer material with the same addresses must not join again"
+        );
+        assert_eq!(
+            upsert(3_000, &["10.0.0.8:4002"]),
+            2 * joins_per_contact,
+            "a changed address joins again"
+        );
+    }
+
+    #[test]
+    fn new_topic_is_joined_with_every_contact_without_rejoining_other_topics() {
+        let mut runtime = runtime_for_test(SubstrateConfig::default());
+        for _ in 0..3 {
+            let peer = NetworkNodeId::random();
+            runtime
+                .upsert_remote_contact_material(
+                    peer.to_string(),
+                    relay_contact_for_test(&peer, 1_000, &[]),
+                )
+                .expect("learn contact");
+        }
+        assert_eq!(runtime.counters.gossip_join_requests, 0);
+
+        for (subscribed_topics, kind) in TWO_GOSSIP_KINDS.into_iter().enumerate() {
+            runtime
+                .subscribe_scope_kinds(&SwarmScope::Global, &[kind])
+                .expect("subscribe topic");
+            assert_eq!(
+                runtime.counters.gossip_join_requests,
+                3 * (subscribed_topics as u64 + 1),
+                "only the new topic is joined, once per contact"
+            );
+        }
+    }
+
+    #[test]
+    fn rejoin_and_dial_ask_only_the_named_contact_to_join() {
+        let mut runtime = runtime_for_test(SubstrateConfig::default());
+        let peers = [NetworkNodeId::random(), NetworkNodeId::random()];
+        for peer in &peers {
+            runtime
+                .upsert_remote_contact_material(
+                    peer.to_string(),
+                    relay_contact_for_test(peer, 1_000, &[]),
+                )
+                .expect("learn contact");
+        }
+        runtime
+            .subscribe_scope_kinds(&SwarmScope::Global, &TWO_GOSSIP_KINDS)
+            .expect("subscribe topics");
+        let joins_per_contact = TWO_GOSSIP_KINDS.len() as u64;
+        let after_subscribe = runtime.counters.gossip_join_requests;
+
+        assert!(
+            runtime
+                .rejoin_gossip_with_remote_contact(&peers[0])
+                .expect("rejoin known contact")
+        );
+        assert_eq!(
+            runtime.counters.gossip_join_requests,
+            after_subscribe + joins_per_contact
+        );
+
+        runtime
+            .dial(NetworkAddress::new(format!("{}@127.0.0.1:4003", peers[1])).expect("dial target"))
+            .expect("dial known contact");
+        assert_eq!(
+            runtime.counters.gossip_join_requests,
+            after_subscribe + 2 * joins_per_contact
+        );
+
+        assert!(
+            !runtime
+                .rejoin_gossip_with_remote_contact(&NetworkNodeId::random())
+                .expect("rejoin unknown contact")
+        );
+        assert_eq!(
+            runtime.counters.gossip_join_requests,
+            after_subscribe + 2 * joins_per_contact
+        );
     }
 
     #[test]
