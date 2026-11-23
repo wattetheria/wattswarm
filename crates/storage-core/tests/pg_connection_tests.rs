@@ -4,7 +4,7 @@ use std::sync::{Mutex, OnceLock};
 use wattswarm_crypto::NodeIdentity;
 use wattswarm_storage_core::storage::pg::ErrorCode;
 use wattswarm_storage_core::storage::pg::{
-    Connection, Error, OptionalExtension, ParamValue, types::ValueRef,
+    Connection, DatabaseClient, Error, OptionalExtension, ParamValue, types::ValueRef,
 };
 use wattswarm_storage_core::storage::{PgStore, local_control_scope_id};
 
@@ -142,6 +142,112 @@ fn with_test_schema<T>(f: impl FnOnce() -> T) -> T {
 
 fn open_test_connection() -> Connection {
     Connection::open("pg-connection-tests.state").expect("open pg-backed test schema")
+}
+
+fn test_pg_url() -> String {
+    std::env::var("WATTSWARM_CORE_PG_URL")
+        .or_else(|_| std::env::var("WATTSWARM_PG_URL"))
+        .unwrap_or_else(|_| "postgres://postgres:postgres@127.0.0.1:55432/wattswarm".to_owned())
+}
+
+fn backend_pid(conn: &Connection) -> i32 {
+    conn.query_row(
+        "SELECT pg_backend_pid()",
+        wattswarm_storage_core::params![],
+        |row| row.get::<_, i32>(0),
+    )
+    .expect("read backend pid")
+}
+
+#[test]
+fn postgres_session_is_reused_by_the_next_open() {
+    with_test_schema(|| {
+        let first = open_test_connection();
+        let first_pid = backend_pid(&first);
+        drop(first);
+
+        let second = open_test_connection();
+        assert_eq!(backend_pid(&second), first_pid);
+        let other = open_test_connection();
+        assert_ne!(backend_pid(&other), first_pid);
+    });
+}
+
+#[test]
+fn postgres_session_with_open_transaction_is_closed_and_rolled_back() {
+    with_test_schema(|| {
+        let setup = open_test_connection();
+        setup
+            .execute_batch("CREATE TABLE pg_session_tx_probe (id BIGINT PRIMARY KEY)")
+            .expect("create probe table");
+        let setup_pid = backend_pid(&setup);
+        drop(setup);
+
+        let abandoned = open_test_connection();
+        assert_eq!(backend_pid(&abandoned), setup_pid);
+        abandoned
+            .execute_batch("BEGIN; INSERT INTO pg_session_tx_probe(id) VALUES (1)")
+            .expect("write inside open transaction");
+        drop(abandoned);
+
+        let writer = open_test_connection();
+        assert_ne!(backend_pid(&writer), setup_pid);
+        writer
+            .execute_batch("INSERT INTO pg_session_tx_probe(id) VALUES (2)")
+            .expect("write on next session");
+        drop(writer);
+
+        let ids = open_test_connection()
+            .prepare("SELECT id FROM pg_session_tx_probe ORDER BY id")
+            .expect("prepare probe query")
+            .query_map(wattswarm_storage_core::params![], |row| {
+                row.get::<_, i64>(0)
+            })
+            .expect("query probe rows")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("read probe rows");
+        assert_eq!(ids, vec![2]);
+    });
+}
+
+#[test]
+fn reused_postgres_session_holds_no_advisory_lock_and_default_search_path() {
+    const LOCK_KEY: i64 = 1_987_654_322;
+    with_test_schema(|| {
+        let holder = open_test_connection();
+        let holder_pid = backend_pid(&holder);
+        holder
+            .query_row(
+                "SELECT pg_advisory_lock($1)",
+                wattswarm_storage_core::params![LOCK_KEY],
+                |_| Ok(()),
+            )
+            .expect("take advisory lock");
+        drop(holder);
+
+        let mut reused =
+            DatabaseClient::connect_postgres(&test_pg_url()).expect("reuse idle session");
+        let reused_pid: i32 = reused
+            .query_one("SELECT pg_backend_pid()", &[])
+            .expect("read reused backend pid")
+            .get(0);
+        assert_eq!(reused_pid, holder_pid);
+        let search_path: String = reused
+            .query_one("SELECT current_setting('search_path')", &[])
+            .expect("read search path")
+            .get(0);
+        assert_eq!(search_path, "\"$user\", public");
+
+        let other = open_test_connection();
+        let locked = other
+            .query_row(
+                "SELECT pg_try_advisory_lock($1)",
+                wattswarm_storage_core::params![LOCK_KEY],
+                |row| row.get::<_, bool>(0),
+            )
+            .expect("try advisory lock from another session");
+        assert!(locked);
+    });
 }
 
 #[test]

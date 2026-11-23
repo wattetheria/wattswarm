@@ -1,12 +1,14 @@
 use super::sqlite_layout::sqlite_database_path;
 use postgres::types::{ToSql, Type as PgType};
-use postgres::{Client, NoTls, Row as PgRow};
+use postgres::{Client, NoTls, Row as PgRow, SimpleQueryMessage};
 use rusqlite::types::ValueRef as SqliteValueRef;
 use rusqlite::{Connection as SqliteConnection, OpenFlags};
+use std::collections::HashMap;
 use std::error::Error as StdError;
 use std::fmt::{Display, Formatter};
+use std::ops::{Deref, DerefMut};
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 pub mod types {
@@ -105,6 +107,7 @@ fn default_pg_url() -> String {
 }
 
 const PRIMARY_SCHEMA: &str = "public";
+const MAX_IDLE_PG_SESSIONS: usize = 8;
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const SQLITE_CONFIG_RETRY_DELAY: Duration = Duration::from_millis(50);
 const SQLITE_CONFIG_RETRY_ATTEMPTS: usize = 100;
@@ -160,6 +163,97 @@ pub fn configured_backend_kind() -> Result<BackendKind> {
     }
 }
 
+/// PostgreSQL sessions kept after use, by database URL.
+fn idle_pg_sessions() -> &'static Mutex<HashMap<String, Vec<Client>>> {
+    static IDLE: OnceLock<Mutex<HashMap<String, Vec<Client>>>> = OnceLock::new();
+    IDLE.get_or_init(Mutex::default)
+}
+
+fn take_idle_pg_session(database_url: &str) -> Option<Client> {
+    loop {
+        let mut client = idle_pg_sessions()
+            .lock()
+            .ok()?
+            .get_mut(database_url)?
+            .pop()?;
+        // The server may have closed the session while it was idle.
+        if client.batch_execute("").is_ok() {
+            return Some(client);
+        }
+    }
+}
+
+/// Leaves the session as a new one would be: no advisory locks and default settings.
+/// Returns false for a session inside a transaction: closing it rolls the transaction
+/// back, as it did before sessions were kept.
+fn reset_pg_session(client: &mut Client) -> bool {
+    // The two timestamps are equal only in the first statement of a transaction.
+    let Ok(messages) = client.simple_query(
+        "SELECT transaction_timestamp() = statement_timestamp();
+         SELECT pg_advisory_unlock_all();
+         RESET ALL",
+    ) else {
+        return false;
+    };
+    messages.iter().find_map(|message| match message {
+        SimpleQueryMessage::Row(row) => Some(row.get(0) == Some("t")),
+        _ => None,
+    }) == Some(true)
+}
+
+/// A PostgreSQL session that is kept for the next open when it is dropped. Storage is
+/// opened per request, and every new session costs a login on both sides.
+pub struct PgSession {
+    client: Option<Client>,
+    database_url: String,
+}
+
+impl PgSession {
+    fn connect(database_url: &str) -> Result<Self> {
+        let client = match take_idle_pg_session(database_url) {
+            Some(client) => client,
+            None => Client::connect(database_url, NoTls).map_err(map_db_err)?,
+        };
+        Ok(Self {
+            client: Some(client),
+            database_url: database_url.to_owned(),
+        })
+    }
+}
+
+impl Deref for PgSession {
+    type Target = Client;
+
+    fn deref(&self) -> &Client {
+        self.client.as_ref().expect("session is held until drop")
+    }
+}
+
+impl DerefMut for PgSession {
+    fn deref_mut(&mut self) -> &mut Client {
+        self.client.as_mut().expect("session is held until drop")
+    }
+}
+
+impl Drop for PgSession {
+    fn drop(&mut self) {
+        let Some(mut client) = self.client.take() else {
+            return;
+        };
+        if !reset_pg_session(&mut client) {
+            return;
+        }
+        if let Ok(mut idle) = idle_pg_sessions().lock() {
+            let sessions = idle
+                .entry(std::mem::take(&mut self.database_url))
+                .or_default();
+            if sessions.len() < MAX_IDLE_PG_SESSIONS {
+                sessions.push(client);
+            }
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct Connection {
     inner: Arc<Inner>,
@@ -175,7 +269,7 @@ enum Backend {
 }
 
 struct PostgresBackend {
-    client: Mutex<Client>,
+    client: Mutex<PgSession>,
     schema: String,
     database_url: String,
     cleanup_on_drop: bool,
@@ -265,7 +359,7 @@ impl Connection {
         cleanup_on_drop: bool,
     ) -> Result<Self> {
         let url = default_pg_url();
-        let mut client = Client::connect(&url, NoTls).map_err(map_db_err)?;
+        let mut client = PgSession::connect(&url)?;
         if create_schema {
             let ddl = format!(
                 "CREATE SCHEMA IF NOT EXISTS {schema};
@@ -1300,16 +1394,15 @@ where
 }
 
 pub enum DatabaseClient {
-    Postgres(Box<Client>),
+    Postgres(Box<PgSession>),
     Sqlite(SqliteConnection),
 }
 
 impl DatabaseClient {
     pub fn connect_postgres(database_url: &str) -> Result<Self> {
-        Client::connect(database_url, NoTls)
+        PgSession::connect(database_url)
             .map(Box::new)
             .map(Self::Postgres)
-            .map_err(map_db_err)
     }
 
     pub fn open_sqlite(path: impl AsRef<Path>) -> Result<Self> {
