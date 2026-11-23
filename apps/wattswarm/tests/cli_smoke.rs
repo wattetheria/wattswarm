@@ -1102,7 +1102,7 @@ fn cli_global_announcement_uses_genesis_and_existing_global_pipeline() {
     );
     activate(&receiver_url, &receiver.node_id());
     wait_for(
-        || diagnostic_contains(&genesis_dir, "connection.established", None),
+        || diagnostic_contains(&genesis_dir, "gossip.neighbor_up", None),
         "genesis must connect before CLI publication",
     );
     thread::sleep(Duration::from_millis(500));

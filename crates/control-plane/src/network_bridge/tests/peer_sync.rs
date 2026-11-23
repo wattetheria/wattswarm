@@ -20,6 +20,29 @@ fn busy_peer_relationship_expires_without_disconnecting_peer() {
     exercise_busy_control_retry(true, true);
 }
 
+/// A bridge service that listens on loopback and publishes that address in its contact
+/// material. The caller holds the env test mutex.
+fn loopback_bridge_service(dir: &Path, seed: [u8; 32]) -> NetworkBridgeService {
+    let _bind = EnvVarGuard::set("WATTSWARM_IROH_BIND_ADDR", Some("127.0.0.1:0"));
+    let _direct = EnvVarGuard::set("WATTSWARM_IROH_PUBLISH_DIRECT_ADDRS", Some("true"));
+    let mut service = NetworkBridgeService::new(
+        NetworkP2pNode::from_iroh_state_dir(
+            NetworkP2pConfig {
+                enable_local_discovery: false,
+                ..NetworkP2pConfig::default()
+            },
+            dir.to_path_buf(),
+            seed,
+        )
+        .unwrap(),
+        &[SwarmScope::Global],
+        &NetworkProtocolParams::default(),
+    )
+    .unwrap();
+    service.set_state_dir(dir.to_path_buf(), dir.join("ui.state"));
+    service
+}
+
 fn exercise_busy_control_retry(relationship: bool, expire: bool) {
     use wattswarm_network_transport_iroh::{
         IrohControlStreamRequest, send_control_stream_request_for_network_peer_id_with_timeout,
@@ -35,28 +58,8 @@ fn exercise_busy_control_retry(relationship: bool, expire: bool) {
         fs::write(dir.join("node_seed.hex"), hex::encode(seed)).unwrap();
         ensure_test_relay_urls(dir);
     }
-    let make_service = |dir: &Path, seed| {
-        let _bind = EnvVarGuard::set("WATTSWARM_IROH_BIND_ADDR", Some("127.0.0.1:0"));
-        let _direct = EnvVarGuard::set("WATTSWARM_IROH_PUBLISH_DIRECT_ADDRS", Some("true"));
-        let mut service = NetworkBridgeService::new(
-            NetworkP2pNode::from_iroh_state_dir(
-                NetworkP2pConfig {
-                    enable_local_discovery: false,
-                    ..NetworkP2pConfig::default()
-                },
-                dir.to_path_buf(),
-                seed,
-            )
-            .unwrap(),
-            &[SwarmScope::Global],
-            &NetworkProtocolParams::default(),
-        )
-        .unwrap();
-        service.set_state_dir(dir.to_path_buf(), dir.join("ui.state"));
-        service
-    };
-    let mut local = make_service(&local_dir, seeds[0]);
-    let mut remote = make_service(&remote_dir, seeds[1]);
+    let mut local = loopback_bridge_service(&local_dir, seeds[0]);
+    let mut remote = loopback_bridge_service(&remote_dir, seeds[1]);
     let mut local_node =
         crate::control::open_node(&local_dir, &local_dir.join("ui.state")).unwrap();
     let mut remote_node =
@@ -864,6 +867,80 @@ fn successful_contact_probe_emits_connected_only_on_first_liveness_transition() 
     wattswarm_network_transport_iroh::shutdown_local_iroh_data_plane(&remote_dir);
     std::fs::remove_dir_all(local_dir).expect("cleanup local");
     std::fs::remove_dir_all(remote_dir).expect("cleanup remote");
+}
+
+#[test]
+fn inbound_contact_request_that_connects_a_peer_requests_backfill() {
+    use wattswarm_network_transport_iroh::shutdown_local_iroh_data_plane;
+
+    let _env_lock = lock_env_test_mutex();
+    let local_dir = temp_startup_dir("contact-request-backfill-local");
+    let remote_dir = temp_startup_dir("contact-request-backfill-remote");
+    let seeds = [[211_u8; 32], [212_u8; 32]];
+    for (dir, seed) in [(&local_dir, seeds[0]), (&remote_dir, seeds[1])] {
+        fs::write(dir.join("node_seed.hex"), hex::encode(seed)).unwrap();
+        ensure_test_relay_urls(dir);
+    }
+    let mut local = loopback_bridge_service(&local_dir, seeds[0]);
+    let mut remote = loopback_bridge_service(&remote_dir, seeds[1]);
+    let mut remote_node =
+        crate::control::open_node(&remote_dir, &remote_dir.join("ui.state")).unwrap();
+    let local_peer = local.local_peer_id().clone();
+    let remote_peer = remote.local_peer_id().clone();
+    for (service, peer, dir) in [
+        (&mut local, &remote_peer, &remote_dir),
+        (&mut remote, &local_peer, &local_dir),
+    ] {
+        let contact =
+            export_local_contact_material_for_network_peer_id(dir, peer.as_str(), observed_at_ms())
+                .unwrap();
+        service
+            .runtime
+            .upsert_remote_contact_material(peer.to_string(), contact)
+            .unwrap();
+    }
+    remote.remember_global_backfill_provider(local_peer.clone());
+
+    local
+        .probe_peer_contact_material(&remote_peer)
+        .expect("send contact request")
+        .expect("contact request id");
+    // The request must reach the bridge before any connection event of the same peer.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let request = loop {
+        assert!(
+            Instant::now() < deadline,
+            "the contact request did not arrive"
+        );
+        match remote.runtime.try_next_event().unwrap() {
+            Some(event @ NetworkRuntimeEvent::ContactMaterialRequest { .. }) => break event,
+            _ => thread::sleep(Duration::from_millis(5)),
+        }
+    };
+    assert!(!remote.connected_peers.contains(&local_peer));
+
+    let tick = remote
+        .process_runtime_event(&mut remote_node, request)
+        .expect("serve contact request");
+
+    assert!(matches!(
+        tick,
+        NetworkBridgeTick::Connected { peer } if peer == local_peer
+    ));
+    assert_eq!(
+        remote
+            .peer_sync_state
+            .get(&local_peer)
+            .expect("peer sync state")
+            .inflight_backfills(),
+        1,
+        "the peer connected through its contact request, so backfill starts here"
+    );
+
+    shutdown_local_iroh_data_plane(&local_dir);
+    shutdown_local_iroh_data_plane(&remote_dir);
+    let _ = fs::remove_dir_all(local_dir);
+    let _ = fs::remove_dir_all(remote_dir);
 }
 
 #[test]

@@ -1635,6 +1635,9 @@ impl NetworkBridgeService {
                     let newly_connected =
                         self.mark_peer_connected_from(peer.clone(), "contact_material_request");
                     if newly_connected {
+                        // The connection event that follows finds the peer connected and
+                        // skips its backfill, so it is requested here.
+                        let _ = self.request_backfill_for_peer_now(&peer, node)?;
                         return Ok(NetworkBridgeTick::Connected { peer });
                     }
                 }
