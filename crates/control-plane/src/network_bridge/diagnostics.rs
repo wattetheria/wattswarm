@@ -2,11 +2,11 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::hash_map::Entry;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::env;
 use std::fs::{self, OpenOptions};
 use std::hash::{Hash as _, Hasher as _};
-use std::io::Write as _;
+use std::io::{BufRead as _, BufReader, Write as _};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use uuid::Uuid;
@@ -311,7 +311,7 @@ mod monitoring_tests {
     }
 
     #[test]
-    fn monitoring_log_rotates_to_one_backup_and_lists_current_file() {
+    fn monitoring_log_rotates_to_numbered_backups_and_lists_what_is_left() {
         assert_eq!(MAX_DIAGNOSTIC_LOG_BYTES, 5 * 1024 * 1024);
         let dir = state_dir();
         fs::create_dir_all(dir.join("diagnostics")).unwrap();
@@ -332,7 +332,8 @@ mod monitoring_tests {
                 1
             );
         }
-        assert_eq!(fs::read_dir(dir.join("diagnostics")).unwrap().count(), 2);
+        assert!(diagnostic_log_backup_path(&dir, 2).exists());
+        assert_eq!(fs::read_dir(dir.join("diagnostics")).unwrap().count(), 3);
         fs::remove_dir_all(dir).unwrap();
     }
 
@@ -349,6 +350,10 @@ mod monitoring_tests {
         file.set_len(MAX_DIAGNOSTIC_LOG_BYTES + 1).unwrap();
     }
 
+    fn numbered(number: usize) -> DiagnosticEvent {
+        observation("info").event_id(format!("numbered-{number}"))
+    }
+
     #[test]
     fn deduped_append_rotates_an_oversized_log_and_still_skips_what_the_backup_holds() {
         let dir = state_dir();
@@ -356,55 +361,76 @@ mod monitoring_tests {
         grow_log_past_limit(&dir);
         append_diagnostic(&dir, observation("info")).unwrap();
         assert_eq!(
-            fs::metadata(dir.join(DIAGNOSTIC_LOG_BACKUP_RELATIVE_PATH))
+            fs::metadata(diagnostic_log_backup_path(&dir, 1))
                 .unwrap()
                 .len(),
             MAX_DIAGNOSTIC_LOG_BYTES + 1
         );
         assert_eq!(log_lines(&dir), 0);
-        append_diagnostic(&dir, observation("info").event_id("event-2")).unwrap();
-        assert_eq!(log_lines(&dir), 1);
-
-        // After the next rotation the first entry is in neither file.
-        grow_log_past_limit(&dir);
-        append_diagnostic(&dir, observation("info").event_id("event-2")).unwrap();
-        assert_eq!(log_lines(&dir), 0);
-        append_diagnostic(&dir, observation("info")).unwrap();
+        append_diagnostic(&dir, numbered(1)).unwrap();
         assert_eq!(log_lines(&dir), 1);
         fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
-    fn entries_in_a_backup_left_by_an_earlier_run_are_skipped() {
+    fn entry_is_written_again_only_after_its_backup_is_dropped() {
+        let dir = state_dir();
+        append_diagnostic(&dir, observation("info")).unwrap();
+        for rotation in 0..DIAGNOSTIC_LOG_BACKUPS {
+            grow_log_past_limit(&dir);
+            append_diagnostic(&dir, numbered(rotation)).unwrap();
+        }
+        assert!(diagnostic_log_backup_path(&dir, DIAGNOSTIC_LOG_BACKUPS).exists());
+        append_diagnostic(&dir, observation("info")).unwrap();
+        assert_eq!(log_lines(&dir), 1);
+
+        grow_log_past_limit(&dir);
+        append_diagnostic(&dir, numbered(DIAGNOSTIC_LOG_BACKUPS)).unwrap();
+        assert_eq!(
+            fs::read_dir(dir.join("diagnostics")).unwrap().count(),
+            DIAGNOSTIC_LOG_BACKUPS + 1
+        );
+        append_diagnostic(&dir, observation("info")).unwrap();
+        assert_eq!(log_lines(&dir), 2);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn entries_in_backups_left_by_an_earlier_run_are_skipped() {
         let dir = state_dir();
         append_diagnostic_entry(&dir, observation("info"), false).unwrap();
         fs::rename(
             log_path(&dir),
-            dir.join(DIAGNOSTIC_LOG_BACKUP_RELATIVE_PATH),
+            diagnostic_log_backup_path(&dir, DIAGNOSTIC_LOG_BACKUPS),
         )
         .unwrap();
         append_diagnostic(&dir, observation("info")).unwrap();
         assert_eq!(log_lines(&dir), 0);
-        append_diagnostic(&dir, observation("info").event_id("event-2")).unwrap();
+        append_diagnostic(&dir, numbered(1)).unwrap();
         assert_eq!(log_lines(&dir), 1);
         fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
-    fn rotation_forgets_the_entries_of_the_backup_it_replaces() {
+    fn list_continues_into_the_backups_until_the_limit_is_reached() {
         let dir = state_dir();
-        append_diagnostic_entry(&dir, observation("info"), false).unwrap();
-        fs::rename(
-            log_path(&dir),
-            dir.join(DIAGNOSTIC_LOG_BACKUP_RELATIVE_PATH),
-        )
-        .unwrap();
-        append_diagnostic(&dir, observation("info")).unwrap();
-        assert_eq!(log_lines(&dir), 0);
-        fs::File::create(log_path(&dir)).unwrap();
+        append_diagnostic(&dir, numbered(1)).unwrap();
         grow_log_past_limit(&dir);
-        append_diagnostic(&dir, observation("info")).unwrap();
+        append_diagnostic(&dir, numbered(2)).unwrap();
         assert_eq!(log_lines(&dir), 1);
+        let event_ids = |limit| {
+            let filter = DiagnosticFilter {
+                limit,
+                ..Default::default()
+            };
+            list_diagnostics(&dir, &filter)
+                .unwrap()
+                .into_iter()
+                .map(|entry| entry.event_id.unwrap())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(event_ids(None), ["numbered-2", "numbered-1"]);
+        assert_eq!(event_ids(Some(1)), ["numbered-2"]);
         fs::remove_dir_all(dir).unwrap();
     }
 
@@ -736,57 +762,114 @@ fn append_diagnostic(state_dir: &Path, event: DiagnosticEvent) -> Result<()> {
 
 const MAX_DIAGNOSTIC_LOG_BYTES: u64 = 5 * 1024 * 1024;
 
-const DIAGNOSTIC_LOG_BACKUP_RELATIVE_PATH: &str = "diagnostics/wattswarm_node.jsonl.1";
+/// Rotated logs kept next to the current one. With the current log this bounds the
+/// diagnostics of a node to twenty files of `MAX_DIAGNOSTIC_LOG_BYTES`.
+const DIAGNOSTIC_LOG_BACKUPS: usize = 19;
 
-/// The dedupe keys of the entries in one diagnostics log and in its rotated backup, kept
-/// in memory so that a new entry is not checked by reading the files again.
+/// The `number`th rotated log, `1` being the newest.
+fn diagnostic_log_backup_path(state_dir: &Path, number: usize) -> PathBuf {
+    state_dir.join(format!("{DIAGNOSTIC_LOG_RELATIVE_PATH}.{number}"))
+}
+
+/// The dedupe keys of the entries in a diagnostics log and in its backups, kept in memory
+/// so that a new entry is not checked by reading the files again.
 ///
-/// Keys are held as 64-bit hashes, which keeps the index of a large log small.
+/// Keys are held as 64-bit hashes, which keeps the index of the retained logs small.
 struct DiagnosticLogIndex {
-    current: HashSet<u64>,
-    backup: HashSet<u64>,
-    /// Length of the log when `current` matched it.
+    log: HashSet<u64>,
+    /// One set per backup, newest first.
+    backups: VecDeque<HashSet<u64>>,
+    /// Length of the log when `log` matched it.
     log_len: u64,
 }
 
 impl DiagnosticLogIndex {
     fn read(state_dir: &Path) -> Result<Self> {
-        let (current, log_len) = read_dedupe_hashes(&state_dir.join(DIAGNOSTIC_LOG_RELATIVE_PATH))?;
-        let (backup, _) = read_dedupe_hashes(&state_dir.join(DIAGNOSTIC_LOG_BACKUP_RELATIVE_PATH))?;
+        let (log, log_len) = read_dedupe_hashes(&state_dir.join(DIAGNOSTIC_LOG_RELATIVE_PATH))?;
+        let backups = (1..=DIAGNOSTIC_LOG_BACKUPS)
+            .map(|number| {
+                read_dedupe_hashes(&diagnostic_log_backup_path(state_dir, number))
+                    .map(|(hashes, _)| hashes)
+            })
+            .collect::<Result<_>>()?;
         Ok(Self {
-            current,
-            backup,
+            log,
+            backups,
             log_len,
         })
     }
 
+    fn reread_log(&mut self, state_dir: &Path) -> Result<()> {
+        (self.log, self.log_len) =
+            read_dedupe_hashes(&state_dir.join(DIAGNOSTIC_LOG_RELATIVE_PATH))?;
+        Ok(())
+    }
+
     fn contains(&self, hash: u64) -> bool {
-        self.current.contains(&hash) || self.backup.contains(&hash)
+        self.log.contains(&hash) || self.backups.iter().any(|backup| backup.contains(&hash))
+    }
+
+    /// Follows `rotate_diagnostic_logs`: the log becomes the newest backup and the oldest
+    /// backup is dropped.
+    fn rotate(&mut self) {
+        self.backups.push_front(std::mem::take(&mut self.log));
+        self.backups.truncate(DIAGNOSTIC_LOG_BACKUPS);
+        self.log_len = 0;
     }
 }
 
 /// The dedupe hashes of the entries in a diagnostics file, and the length of the file.
 fn read_dedupe_hashes(path: &Path) -> Result<(HashSet<u64>, u64)> {
-    let raw = match fs::read_to_string(path) {
-        Ok(raw) => raw,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
-        Err(error) => {
-            return Err(error)
-                .with_context(|| format!("read Wattswarm diagnostics log {}", path.display()));
+    let read_context = || format!("read Wattswarm diagnostics log {}", path.display());
+    let file = match fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok((HashSet::new(), 0));
         }
+        Err(error) => return Err(error).with_context(read_context),
     };
-    let hashes = raw
-        .lines()
-        .filter_map(|line| serde_json::from_str::<DiagnosticEntry>(line).ok())
-        .map(|entry| diagnostic_dedupe_hash(&entry))
-        .collect();
-    Ok((hashes, raw.len() as u64))
+    let mut reader = BufReader::new(file);
+    let mut hashes = HashSet::new();
+    let mut len = 0;
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        let read = reader
+            .read_until(b'\n', &mut line)
+            .with_context(read_context)?;
+        if read == 0 {
+            return Ok((hashes, len));
+        }
+        len += read as u64;
+        let line = std::str::from_utf8(&line).with_context(read_context)?;
+        if let Ok(entry) = serde_json::from_str::<DiagnosticEntry>(line) {
+            hashes.insert(diagnostic_dedupe_hash(&entry));
+        }
+    }
 }
 
 fn diagnostic_dedupe_hash(entry: &DiagnosticEntry) -> u64 {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     diagnostic_dedupe_key(entry).hash(&mut hasher);
     hasher.finish()
+}
+
+/// Makes the log the newest backup, moves every backup one place back and drops the
+/// oldest one.
+fn rotate_diagnostic_logs(state_dir: &Path) -> Result<()> {
+    for number in (0..DIAGNOSTIC_LOG_BACKUPS).rev() {
+        let from = match number {
+            0 => state_dir.join(DIAGNOSTIC_LOG_RELATIVE_PATH),
+            number => diagnostic_log_backup_path(state_dir, number),
+        };
+        match fs::rename(&from, diagnostic_log_backup_path(state_dir, number + 1)) {
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+                return Err(error).context("rotate Wattswarm diagnostics log");
+            }
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 fn append_diagnostic_entry(state_dir: &Path, event: DiagnosticEvent, dedupe: bool) -> Result<()> {
@@ -813,21 +896,19 @@ fn append_diagnostic_entry(state_dir: &Path, event: DiagnosticEvent, dedupe: boo
         scope_hint: event.scope_hint,
         details: event.details,
     };
-    let mut log_len = fs::metadata(&path).map_or(0, |metadata| metadata.len());
-    let rotate = log_len > MAX_DIAGNOSTIC_LOG_BYTES;
-    if rotate {
-        fs::rename(&path, state_dir.join(DIAGNOSTIC_LOG_BACKUP_RELATIVE_PATH))
-            .context("rotate Wattswarm diagnostics log")?;
-        log_len = 0;
-    }
-    // The keys are read again once the files are no longer the ones they were read from:
-    // after a rotation, or when the transport layer has appended to the log.
-    if rotate
-        || indexes
-            .get(state_dir)
-            .is_some_and(|index| index.log_len != log_len)
+    let log_len = fs::metadata(&path).map_or(0, |metadata| metadata.len());
+    // The transport layer appends to the same log, which the index then has to read again.
+    if let Some(index) = indexes.get_mut(state_dir)
+        && index.log_len != log_len
+        && index.reread_log(state_dir).is_err()
     {
         indexes.remove(state_dir);
+    }
+    if log_len > MAX_DIAGNOSTIC_LOG_BYTES {
+        rotate_diagnostic_logs(state_dir)?;
+        if let Some(index) = indexes.get_mut(state_dir) {
+            index.rotate();
+        }
     }
     let hash = diagnostic_dedupe_hash(&entry);
     if dedupe && !entry.phase.starts_with("startup.") {
@@ -851,44 +932,52 @@ fn append_diagnostic_entry(state_dir: &Path, event: DiagnosticEvent, dedupe: boo
     line.push(b'\n');
     file.write_all(&line)?;
     if let Some(index) = indexes.get_mut(state_dir) {
-        index.current.insert(hash);
+        index.log.insert(hash);
         index.log_len += line.len() as u64;
     }
     Ok(())
 }
 
+/// The newest diagnostics that match `filter`, read from the log and then, while the
+/// limit is not reached, from its backups.
 pub fn list_diagnostics(
     state_dir: &Path,
     filter: &DiagnosticFilter,
 ) -> Result<Vec<DiagnosticEntry>> {
-    let path = state_dir.join(DIAGNOSTIC_LOG_RELATIVE_PATH);
-    if !path.exists() {
-        return Ok(Vec::new());
-    }
     let limit = filter.limit.unwrap_or(100).clamp(1, 1_000);
-    let raw = fs::read_to_string(&path)
-        .with_context(|| format!("read Wattswarm diagnostics log {}", path.display()))?;
     let mut entries = Vec::with_capacity(limit);
     let mut seen: HashSet<DiagnosticDedupeKey> = HashSet::new();
-    for line in raw.lines().rev() {
-        if line.trim().is_empty() {
-            continue;
-        }
-        let entry: DiagnosticEntry = match serde_json::from_str(line) {
-            Ok(entry) => entry,
-            Err(_) => continue,
-        };
-        if matches_filter(&entry, filter) {
-            let key = diagnostic_dedupe_key(&entry);
-            if entry.details.get("monitoring") != Some(&Value::Bool(true)) {
-                if seen.contains(&key) {
-                    continue;
-                }
-                seen.insert(key);
+    let backups =
+        (1..=DIAGNOSTIC_LOG_BACKUPS).map(|number| diagnostic_log_backup_path(state_dir, number));
+    for path in std::iter::once(state_dir.join(DIAGNOSTIC_LOG_RELATIVE_PATH)).chain(backups) {
+        let raw = match fs::read_to_string(&path) {
+            Ok(raw) => raw,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("read Wattswarm diagnostics log {}", path.display()));
             }
-            entries.push(entry);
-            if entries.len() >= limit {
-                break;
+        };
+        for line in raw.lines().rev() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let entry: DiagnosticEntry = match serde_json::from_str(line) {
+                Ok(entry) => entry,
+                Err(_) => continue,
+            };
+            if matches_filter(&entry, filter) {
+                let key = diagnostic_dedupe_key(&entry);
+                if entry.details.get("monitoring") != Some(&Value::Bool(true)) {
+                    if seen.contains(&key) {
+                        continue;
+                    }
+                    seen.insert(key);
+                }
+                entries.push(entry);
+                if entries.len() >= limit {
+                    return Ok(entries);
+                }
             }
         }
     }
