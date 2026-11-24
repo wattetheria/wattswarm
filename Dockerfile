@@ -128,6 +128,13 @@ RUN mkdir -p /var/lib/wattswarm \
 
 USER wattswarm
 
+# glibc keeps one memory pool per thread and, after the first large buffer is freed, serves
+# later large buffers from those pools, which then stay at their largest size. A backfill
+# response needs several MB for a moment, on a different thread each time, so the process
+# grew by that much per pool (90 MB to 194 MB in 11 hours). With a fixed threshold, buffers
+# of 128 KB and more are mapped separately and returned to the system when freed.
+ENV MALLOC_MMAP_THRESHOLD_=131072
+
 EXPOSE 7788
 EXPOSE 8787
 
