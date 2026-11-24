@@ -73,3 +73,30 @@ it from the workspace.
 
 **Remove** this directory and the `[patch.crates-io]` entry when upgrading iroh-gossip to
 0.102 or later. Check first that the release has fix 2: it is not known to be upstream.
+
+## noq-proto-0.16.0
+
+`noq-proto` 0.16.0 from crates.io plus one backport, wired in through `[patch.crates-io]`
+in the workspace `Cargo.toml`. iroh 0.97 uses it through `noq` 0.17. The crate's
+`Cargo.lock` is left out.
+
+**Backport:** [n0-computer/noq#782](https://github.com/n0-computer/noq/pull/782)
+(released in noq-proto 1.2.0), applied as
+`noq-proto-0.16-ignore-coalesced-tail-for-unknown-path.patch` to `src/connection/mod.rs`,
+with a test in `src/tests/multipath.rs`.
+
+**Why:** one UDP datagram can carry several QUIC packets. When a datagram arrives for a
+path id the connection does not have, the first packet is rejected, but the rest was
+passed to `handle_coalesced`, which looked the path up with `expect("known path")` and
+panicked. The panic poisoned the connection's mutex, the next use of that mutex panicked
+inside a destructor, and Rust aborted the process. `wattswarm-kernel` went down this way
+after 14 hours (`noq-proto-0.16.0/src/connection/mod.rs:3811:14: known path`).
+
+The patch drops the rest of such a datagram.
+
+`tests::multipath::coalesced_datagram_for_never_opened_path_is_ignored` in the patched
+crate reproduces the panic. It cannot be reached from the workspace: it needs the crate's
+own test endpoints to hand a connection a datagram with a path id of its choice.
+
+**Remove** this directory and the `[patch.crates-io]` entry when upgrading iroh to a
+release that uses noq-proto 1.2.0 or later.

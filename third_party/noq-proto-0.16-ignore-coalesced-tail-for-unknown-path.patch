@@ -1,0 +1,111 @@
+--- a/noq-proto-0.16.0/src/connection/mod.rs
++++ b/noq-proto-0.16.0/src/connection/mod.rs
+@@ -3808,8 +3808,11 @@
+         ecn: Option<EcnCodepoint>,
+         data: BytesMut,
+     ) {
+-        self.path_data_mut(path_id)
+-            .inc_total_recvd(data.len() as u64);
++        let Some(path) = self.paths.get_mut(&path_id) else {
++            trace!(%path_id, "discarding coalesced datagram tail for unknown path");
++            return;
++        };
++        path.data.inc_total_recvd(data.len() as u64);
+         let mut remaining = Some(data);
+         let cid_len = self
+             .local_cid_state
+--- a/noq-proto-0.16.0/src/tests/multipath.rs
++++ b/noq-proto-0.16.0/src/tests/multipath.rs
+@@ -12,9 +12,11 @@
+ use crate::tests::RoutingTable;
+ use crate::tests::util::{CLIENT_PORTS, ConnPair, SERVER_PORTS};
+ use crate::{
+-    ClientConfig, ClosePathError, ConnectionId, ConnectionIdGenerator, Endpoint, EndpointConfig,
+-    FourTuple, LOCAL_CID_COUNT, NetworkChangeHint, PathId, PathStatus, RandomConnectionIdGenerator,
+-    ServerConfig, Side::*, TransportConfig, cid_queue::CidQueue,
++    ClientConfig, ClosePathError, ConnectionEvent, ConnectionId, ConnectionIdGenerator,
++    DEFAULT_SUPPORTED_VERSIONS, Endpoint, EndpointConfig, FixedLengthConnectionIdParser, FourTuple,
++    LOCAL_CID_COUNT, NetworkChangeHint, PartialDecode, PathId, PathStatus,
++    RandomConnectionIdGenerator, ServerConfig, Side::*, TransportConfig, cid_queue::CidQueue,
++    shared::{ConnectionEventInner, DatagramConnectionEvent},
+ };
+ use crate::{Dir, Event, PathAbandonReason, PathEvent, StreamEvent, TransportErrorCode};
+ 
+@@ -985,4 +987,77 @@
+     );
+ 
+     Ok(())
++}
++
++/// A datagram that carries more than one QUIC packet can reach a connection with a path id
++/// the connection does not have. The first packet is rejected and the rest must be dropped
++/// as well instead of panicking.
++#[test]
++fn coalesced_datagram_for_never_opened_path_is_ignored() {
++    let _guard = subscribe();
++    let mut cfg = TransportConfig::default();
++    cfg.max_concurrent_multipath_paths(MAX_PATHS);
++    cfg.initial_rtt(Duration::from_millis(10));
++    let server_cfg = ServerConfig {
++        transport: Arc::new(cfg.clone()),
++        ..server_config()
++    };
++    let client_cfg = ClientConfig {
++        transport: Arc::new(cfg),
++        ..client_config()
++    };
++    let mut pair = Pair::new(Default::default(), server_cfg);
++    let client_ch = pair.begin_connect(client_cfg);
++    pair.drive_client();
++    pair.drive_server();
++
++    // The server's first flight coalesces its Initial and Handshake packets.
++    let cid_parser =
++        FixedLengthConnectionIdParser::new(RandomConnectionIdGenerator::default().cid_len());
++    let grease_quic_bit = pair.client.endpoint.config().grease_quic_bit;
++    let (first_decode, remaining, ecn, remote, dst_ip) = pair
++        .client
++        .inbound
++        .iter()
++        .find_map(|inbound| {
++            let (first_decode, remaining) = PartialDecode::new(
++                inbound.packet.clone(),
++                &cid_parser,
++                DEFAULT_SUPPORTED_VERSIONS,
++                grease_quic_bit,
++            )
++            .ok()?;
++            remaining.is_some().then_some((
++                first_decode,
++                remaining,
++                inbound.ecn,
++                inbound.remote,
++                inbound.dst_ip,
++            ))
++        })
++        .expect("server should have queued a coalesced handshake datagram for client");
++
++    pair.drive();
++    pair.server.assert_accept();
++
++    let never_opened = PathId::from(7u32);
++    let now = pair.time;
++    let client = pair.client.connections.get_mut(&client_ch).unwrap();
++    assert!(
++        !client.paths().contains(&never_opened),
++        "path 7 must not exist"
++    );
++    client.handle_event(ConnectionEvent(ConnectionEventInner::Datagram(
++        DatagramConnectionEvent {
++            now,
++            network_path: FourTuple {
++                remote,
++                local_ip: dst_ip,
++            },
++            path_id: never_opened,
++            ecn,
++            first_decode,
++            remaining,
++        },
++    )));
+ }

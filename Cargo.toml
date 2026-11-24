@@ -78,6 +78,12 @@ watt-did = { path = "../watt-did" }
 # killed. Fixed upstream in iroh-gossip 0.102, which needs iroh 1.x.
 # It also drops the messages queued for a peer whose dial failed, which otherwise pile up.
 # See third_party/README.md.
+#
+# noq-proto 0.16 with n0-computer/noq#782 backported: the rest of a datagram that arrives
+# for a path the connection does not have is dropped instead of panicking. The panic
+# aborted the whole process. Fixed upstream in noq-proto 1.2.0, which iroh 0.97 cannot use.
+# See third_party/README.md.
 [patch.crates-io]
 iroh = { path = "third_party/iroh-0.97.0" }
 iroh-gossip = { path = "third_party/iroh-gossip-0.97.0" }
+noq-proto = { path = "third_party/noq-proto-0.16.0" }
